@@ -348,6 +348,7 @@ impl EditorView {
                 self.save_session(id, pending, cx);
             }
         }
+        self.resolve_pending_tab_close(id, cx);
         cx.notify();
     }
 
@@ -496,6 +497,15 @@ impl EditorView {
         else {
             return;
         };
+        // Issue #411: a tab's "save and close" request must only ever close
+        // on this specific write landing (`SaveOutcome::Saved`). Any other
+        // outcome drops the request below rather than leaving it armed,
+        // because the document can already read as clean (and so pass
+        // `resolve_pending_tab_close`'s dirty check) when an unrelated
+        // earlier save landed first — this write's own failure, conflict, or
+        // staleness must not be papered over by that coincidence, and a
+        // later, unrelated save must not inherit and act on this request.
+        let saved = matches!(outcome, SaveOutcome::Saved);
         match outcome {
             SaveOutcome::Saved => {
                 self.status = Some("Saved".to_owned());
@@ -538,6 +548,11 @@ impl EditorView {
             .and_then(DocumentSession::take_pending_save)
         {
             self.save_session(id, pending, cx);
+        }
+        if saved {
+            self.resolve_pending_tab_close(id, cx);
+        } else {
+            self.tab_close_after_save.remove(&id);
         }
         cx.notify();
     }

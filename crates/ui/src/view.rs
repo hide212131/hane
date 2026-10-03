@@ -42,7 +42,7 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, PathPromptOptions, PinchEvent, Pixels, Render, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored,
-    div, point, prelude::FluentBuilder, px, rgb,
+    div, point, prelude::FluentBuilder, px, rgb, rgba,
 };
 use gpui_component::Disableable;
 use gpui_component::IconName;
@@ -71,13 +71,14 @@ use hane_presentation::{
     table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use hane_session::{
-    CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
+    CalendarDate, CloseDecision, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
     FileEventOutcome, FileService, LoadedFile, OpenDecision, OpenPolicy, OsDraftStore,
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
-    Settings, StateStores, TitleSyncAction, WorkFolder, WorkFolderNode, WorkFolderScanner,
-    date_badge_range, decide_title_sync, extract_h1_title, format_relative_date_label, local_today,
-    run_save_job, split_file_name_for_badge, unique_folder_name, unique_markdown_filename,
+    Settings, StateStores, TitleSyncAction, UnsavedChanges, WorkFolder, WorkFolderNode,
+    WorkFolderScanner, date_badge_range, decide_title_sync, extract_h1_title,
+    format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
+    unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -427,7 +428,15 @@ struct InlineRenameComposition {
 #[derive(Clone, Debug)]
 struct FileTabContextMenu {
     position: gpui::Point<Pixels>,
-    path: Option<PathBuf>,
+    id: SessionId,
+}
+
+/// A pending "close this tab" request whose session has unsaved changes, so
+/// the user is asked whether to save before it closes rather than losing the
+/// edits silently.
+#[derive(Clone, Copy, Debug)]
+struct TabCloseConfirm {
+    id: SessionId,
 }
 
 #[derive(Clone, Debug)]
@@ -653,10 +662,21 @@ pub struct EditorView {
     /// handle lets GPUI reveal a newly activated tab even when the main panel
     /// is narrower than the open session list.
     file_tabs_scroll: ScrollHandle,
-    /// The file tab context menu, if open. Its path is captured from the tab
+    /// The file tab context menu, if open. Its id is captured from the tab
     /// that was clicked so the menu action cannot accidentally fall back to
-    /// the active session.
+    /// the active session; the path it shows is re-read from that session on
+    /// every render instead of being snapshotted, so a rename that lands
+    /// while the menu is open is reflected rather than shown stale.
     file_tab_context_menu: Option<FileTabContextMenu>,
+    /// A tab middle-click-close request that hit unsaved changes and is
+    /// waiting on the user's save-or-cancel answer.
+    tab_close_confirm: Option<TabCloseConfirm>,
+    /// Sessions with a "save, then close" request in flight, keyed to the
+    /// generation the request was made against. A generation mismatch when a
+    /// write completes means the document was replaced meanwhile, so the
+    /// close is treated as canceled rather than applied to a different
+    /// document.
+    tab_close_after_save: HashMap<SessionId, u64>,
     /// Horizontal scroll state for the footer controls, so recent-file
     /// buttons remain reachable without allowing the footer to cover the
     /// editor viewport on a narrow main panel.
@@ -1291,6 +1311,8 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             file_tabs_scroll: ScrollHandle::new(),
             file_tab_context_menu: None,
+            tab_close_confirm: None,
+            tab_close_after_save: HashMap::new(),
             footer_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
@@ -1573,18 +1595,190 @@ impl EditorView {
         self.activate_session(id, cx);
     }
 
+    /// Switches to the next (`delta = 1`) or previous (`delta = -1`) tab in
+    /// display order, wrapping at either end. A no-op with zero or one tab
+    /// open.
+    fn step_file_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.sessions.len();
+        if len <= 1 {
+            return;
+        }
+        let Some(current) = self.file_tab_index(self.sessions.active_id()) else {
+            return;
+        };
+        let next = (current as isize + delta).rem_euclid(len as isize) as usize;
+        let Some(id) = self.sessions().nth(next).map(DocumentSession::id) else {
+            return;
+        };
+        self.activate_file_tab(id, cx);
+    }
+
+    pub(crate) fn next_file_tab(&mut self, cx: &mut Context<Self>) {
+        self.step_file_tab(1, cx);
+    }
+
+    pub(crate) fn prev_file_tab(&mut self, cx: &mut Context<Self>) {
+        self.step_file_tab(-1, cx);
+    }
+
+    /// Entry point for a tab's middle-click: closes it immediately if it has
+    /// nothing to lose, otherwise asks the user whether to save first. The id
+    /// is whatever the caller captured when the tab was rendered, so this
+    /// never substitutes the currently active session for the one actually
+    /// clicked.
+    fn request_tab_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        match session.close_decision() {
+            CloseDecision::Close => self.close_tab_now(id, cx),
+            CloseDecision::Reject(UnsavedChanges) => {
+                self.tab_close_confirm = Some(TabCloseConfirm { id });
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn dismiss_tab_close_confirm(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.tab_close_confirm.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The "save and close" answer to the confirmation prompt. Saves the
+    /// session by whatever route it needs (its own path, or Save As when it
+    /// has none yet) and arms `tab_close_after_save` so the close actually
+    /// happens once that write lands cleanly; see `resolve_pending_tab_close`.
+    fn confirm_save_and_close_tab(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self
+            .tab_close_confirm
+            .is_some_and(|confirm| confirm.id == id)
+        {
+            self.tab_close_confirm = None;
+        }
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        self.tab_close_after_save.insert(id, session.generation());
+        if session.path().is_some() {
+            self.save_session(id, SaveIntent::Current, cx);
+        } else {
+            self.prompt_save_as_for_close(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Save As for a specific session rather than the active one, so a
+    /// background tab's close-and-save does not depend on it being switched
+    /// to first. A canceled or failed dialog drops the close request and
+    /// leaves the document open, the same as canceling Save As normally does.
+    fn prompt_save_as_for_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let directory = session
+            .file()
+            .directory()
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.work_folder
+                    .as_ref()
+                    .map(|folder| folder.root().to_path_buf())
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(Some(path))) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.save_session(id, SaveIntent::To(path), cx);
+                });
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.tab_close_after_save.remove(&id);
+                    view.status = Some(format!("Save As failed: {error}"));
+                    cx.notify();
+                });
+            }
+            _ => {
+                let _ = view.update(cx, |view, cx| {
+                    view.tab_close_after_save.remove(&id);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Re-checked after any write or rename completes for a session with a
+    /// "save, then close" request pending: closes it only if that same
+    /// document instance is now clean and nothing else is still writing to
+    /// it. A generation mismatch (the document was replaced while the
+    /// request was pending) drops the request instead of closing a document
+    /// the user never asked to close; a save still in flight (an autosave
+    /// queued behind this one, or an H1 rename it triggered) leaves the
+    /// request armed for that write's own completion to re-check.
+    fn resolve_pending_tab_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(&requested_generation) = self.tab_close_after_save.get(&id) else {
+            return;
+        };
+        let Some(session) = self.sessions.get(id) else {
+            self.tab_close_after_save.remove(&id);
+            return;
+        };
+        if session.generation() != requested_generation {
+            self.tab_close_after_save.remove(&id);
+            return;
+        }
+        if session.save_in_flight() {
+            return;
+        }
+        self.tab_close_after_save.remove(&id);
+        if !session.is_dirty() {
+            self.close_tab_now(id, cx);
+        }
+    }
+
+    /// Closes a tab that is already known to have nothing to lose. The last
+    /// remaining tab is replaced with a blank untitled document by
+    /// `SessionSet::close` rather than leaving the window with none.
+    fn close_tab_now(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let was_active = self.sessions.active_id() == id;
+        if matches!(self.sessions.close(id, "Untitled"), CloseDecision::Reject(_)) {
+            return;
+        }
+        self.tab_close_after_save.remove(&id);
+        if self
+            .tab_close_confirm
+            .is_some_and(|confirm| confirm.id == id)
+        {
+            self.tab_close_confirm = None;
+        }
+        if self
+            .file_tab_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.id == id)
+        {
+            self.file_tab_context_menu = None;
+        }
+        if was_active {
+            self.on_document_replaced();
+            self.schedule_document_parse(cx);
+        }
+        self.reveal_file_tab(self.sessions.active_id());
+        cx.notify();
+    }
+
     fn open_file_tab_context_menu(
         &mut self,
         id: SessionId,
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let path = self
-            .sessions
-            .get(id)
-            .and_then(DocumentSession::path)
-            .map(Path::to_path_buf);
-        self.file_tab_context_menu = Some(FileTabContextMenu { position, path });
+        self.file_tab_context_menu = Some(FileTabContextMenu { position, id });
         cx.notify();
     }
 
@@ -1641,6 +1835,66 @@ impl EditorView {
             Ok(_) => self.status = Some("VSCodeで開きました".to_owned()),
             Err(error) => self.status = Some(format!("VSCodeで開けません: {error}")),
         }
+        cx.notify();
+    }
+
+    /// Reveals a file in the platform's file manager, selecting it, without
+    /// launching the file's own default application the way opening the bare
+    /// path would.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn reveal_launch_command(path: &Path) -> Command {
+        #[cfg(target_os = "macos")]
+        {
+            let mut command = Command::new("open");
+            command.arg("-R").arg(path);
+            command
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+
+            let mut command = Command::new("explorer.exe");
+            // Explorer does not use standard argv parsing: it scans its raw
+            // command line for the literal `/select,` switch immediately
+            // followed by a quoted path, e.g. `/select,"C:\a b\file.txt"`.
+            // `Command::arg` would apply Rust's own Windows quoting, which
+            // wraps the whole `/select,<path>` token in quotes whenever the
+            // path contains a space, so Explorer no longer sees the switch.
+            // `raw_arg` appends the text verbatim (no shell, no escaping),
+            // so the path is quoted explicitly here instead, preserving the
+            // original Unicode `OsStr` without a lossy UTF-8 conversion.
+            let mut argument = std::ffi::OsString::from("/select,\"");
+            argument.push(path.as_os_str());
+            argument.push("\"");
+            command.raw_arg(argument);
+            command
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn reveal_file_tab_in_file_manager(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.file_tab_context_menu = None;
+        let Some(path) = path else {
+            self.status = Some("保存場所を開くにはファイルを保存してください".to_owned());
+            cx.notify();
+            return;
+        };
+        match Self::reveal_launch_command(&path).spawn() {
+            Ok(_) => self.status = Some("保存場所を開きました".to_owned()),
+            Err(error) => self.status = Some(format!("保存場所を開けません: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn copy_file_tab_full_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.file_tab_context_menu = None;
+        let Some(path) = path else {
+            self.status = Some("フルパスをコピーするにはファイルを保存してください".to_owned());
+            cx.notify();
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+        self.status = Some("フルパスをコピーしました".to_owned());
         cx.notify();
     }
 
@@ -5079,6 +5333,24 @@ impl Render for EditorView {
         if self.settings_open {
             return self.settings_screen_element(window, cx);
         }
+        // Discards a context menu or close-confirmation left over for a tab
+        // that closed through some other route while it was still showing,
+        // rather than acting on (or displaying stale information about) a
+        // session that no longer exists.
+        if self
+            .file_tab_context_menu
+            .as_ref()
+            .is_some_and(|menu| self.sessions.get(menu.id).is_none())
+        {
+            self.file_tab_context_menu = None;
+        }
+        if self
+            .tab_close_confirm
+            .as_ref()
+            .is_some_and(|confirm| self.sessions.get(confirm.id).is_none())
+        {
+            self.tab_close_confirm = None;
+        }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height
@@ -5490,40 +5762,100 @@ impl Render for EditorView {
         } else {
             rendered
         };
+        let rendered = if let Some(confirm) = self.tab_close_confirm.as_ref() {
+            rendered.child(self.tab_close_confirm_element(confirm, cx))
+        } else {
+            rendered
+        };
         self.metrics.record_layout(layout_started.elapsed());
         rendered
     }
 }
 
+#[cfg(target_os = "macos")]
+const REVEAL_IN_FILE_MANAGER_LABEL: &str = "Finderで保存場所を開く";
+#[cfg(target_os = "windows")]
+const REVEAL_IN_FILE_MANAGER_LABEL: &str = "エクスプローラーで保存場所を開く";
+
 impl EditorView {
+    /// One row of the tab context menu. `on_click` is only wired when
+    /// `enabled` is true, so a path-less document (e.g. an untitled buffer)
+    /// does not connect a click action for path-dependent rows at all,
+    /// instead of relying on the handler to refuse the click after the fact.
+    fn file_tab_context_menu_item(
+        &self,
+        key: &'static str,
+        label: &'static str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(key)
+            .debug_selector(move || key.to_owned())
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .when(enabled, move |element| {
+                element
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
+                    .on_click(cx.listener(on_click))
+            })
+            .when(!enabled, |element| {
+                element.text_color(rgb(self.theme.quote_foreground))
+            })
+            .child(label)
+    }
+
     fn file_tab_context_menu_element(
         &self,
         menu: &FileTabContextMenu,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let path = menu.path.clone();
-        let can_open = path.is_some();
-        let item = div()
-            .id("file-tab-context-open-vscode")
-            .debug_selector(|| "file-tab-context-open-vscode".to_owned())
-            .w_full()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .when(can_open, |element| {
-                element
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
-            })
-            .when(!can_open, |element| {
-                element.text_color(rgb(self.theme.quote_foreground))
-            })
-            .child("VSCodeで開く")
-            .on_click(cx.listener(move |view, _, _, cx| {
-                view.open_file_tab_in_vscode(path.clone(), cx);
-            }));
+        // Re-read from the session on every render rather than trusting a
+        // snapshot taken when the menu was opened, so a rename that lands
+        // while it is still open (H1 auto-naming, a filer event) is reflected
+        // instead of acting on a path the file no longer has.
+        let path = self
+            .sessions
+            .get(menu.id)
+            .and_then(DocumentSession::path)
+            .map(Path::to_path_buf);
+        let can_use_path = path.is_some();
 
-        div()
+        let vscode_path = path.clone();
+        let vscode_item = self.file_tab_context_menu_item(
+            "file-tab-context-open-vscode",
+            "VSCodeで開く",
+            can_use_path,
+            cx,
+            move |view, _, _, cx| view.open_file_tab_in_vscode(vscode_path.clone(), cx),
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let reveal_item = {
+            let reveal_path = path.clone();
+            self.file_tab_context_menu_item(
+                "file-tab-context-reveal",
+                REVEAL_IN_FILE_MANAGER_LABEL,
+                can_use_path,
+                cx,
+                move |view, _, _, cx| view.reveal_file_tab_in_file_manager(reveal_path.clone(), cx),
+            )
+        };
+
+        let copy_path = path;
+        let copy_item = self.file_tab_context_menu_item(
+            "file-tab-context-copy-path",
+            "フルパスをコピー",
+            can_use_path,
+            cx,
+            move |view, _, _, cx| view.copy_file_tab_full_path(copy_path.clone(), cx),
+        );
+
+        let menu_element = div()
             .id("file-tab-context-menu")
             .debug_selector(|| "file-tab-context-menu".to_owned())
             .min_w(px(180.0))
@@ -5536,7 +5868,74 @@ impl EditorView {
             .bg(rgb(self.theme.code_background))
             .text_color(rgb(self.theme.foreground))
             .on_mouse_down_out(cx.listener(Self::close_file_tab_context_menu))
-            .child(item)
+            .child(vscode_item);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let menu_element = menu_element.child(reveal_item);
+        menu_element.child(copy_item)
+    }
+
+    fn tab_close_confirm_element(
+        &self,
+        confirm: &TabCloseConfirm,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id = confirm.id;
+        let label = self
+            .sessions
+            .get(id)
+            .map(DocumentSession::label)
+            .unwrap_or_default();
+        let cancel = self.file_tab_context_menu_item(
+            "tab-close-confirm-cancel",
+            "キャンセル",
+            true,
+            cx,
+            |view, _, _, cx| {
+                view.dismiss_tab_close_confirm(cx);
+            },
+        );
+        let save_and_close = self.file_tab_context_menu_item(
+            "tab-close-confirm-save",
+            "保存して閉じる",
+            true,
+            cx,
+            move |view, _, _, cx| view.confirm_save_and_close_tab(id, cx),
+        );
+        div()
+            .id("tab-close-confirm-overlay")
+            .debug_selector(|| "tab-close-confirm-overlay".to_owned())
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_0080))
+            .child(
+                div()
+                    .id("tab-close-confirm")
+                    .debug_selector(|| "tab-close-confirm".to_owned())
+                    .min_w(px(280.0))
+                    .max_w(px(420.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(self.theme.header_foreground))
+                    .bg(rgb(self.theme.code_background))
+                    .text_color(rgb(self.theme.foreground))
+                    .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                        view.dismiss_tab_close_confirm(cx);
+                    }))
+                    .child(div().child(format!("\"{label}\" の変更を保存しますか?")))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(cancel)
+                            .child(save_and_close),
+                    ),
+            )
     }
 
     fn header_element(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -5565,12 +5964,19 @@ impl EditorView {
                 let label_element = div().min_w_0().truncate().child(label.clone());
                 let tab_content = if session.path().is_some() {
                     let full_path = session.label();
-                    HoverCard::new(format!("file-tab-path-{index}"))
-                        .anchor(Anchor::BottomCenter)
+                    // Keyed by the session's own stable `SessionId`, not the
+                    // render `index`: closing or reordering an earlier tab
+                    // shifts later tabs into different indices every frame,
+                    // and an index-keyed `HoverCard` would let a session
+                    // that slides into a freed slot inherit whatever
+                    // hover/open UI state gpui already has cached under
+                    // that same id from the tab that used to live there.
+                    HoverCard::new(format!("file-tab-path-{}", id.0))
+                        .anchor(Anchor::TopCenter)
                         .trigger(label_element)
                         .content(move |_, _, _| {
                             let path_for_copy = full_path.clone();
-                            let copy_button = Button::new(format!("copy-file-path-{index}"))
+                            let copy_button = Button::new(format!("copy-file-path-{}", id.0))
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Copy)
@@ -5614,6 +6020,18 @@ impl EditorView {
                         MouseButton::Right,
                         cx.listener(move |view, event: &MouseDownEvent, _, cx| {
                             view.open_file_tab_context_menu(id, event.position, cx);
+                        }),
+                    )
+                    // Middle-click closes just this tab. `id` is the session
+                    // this specific tab was rendered for, captured fresh each
+                    // frame, so this can never drift onto whichever session
+                    // happens to be active. Wired to mousedown only (like the
+                    // right-click handler above), so a press-and-release pair
+                    // fires this once, not twice.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |view, _event: &MouseDownEvent, _, cx| {
+                            view.request_tab_close(id, cx);
                         }),
                     )
             })
@@ -5955,6 +6373,36 @@ mod tests {
         assert_eq!(command.get_program(), std::ffi::OsStr::new("code"));
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(args, vec![path.as_os_str()]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn reveal_launch_command_quotes_the_path_for_the_platform_shell() {
+        let path = Path::new("/tmp/日本語 フォルダ/file with spaces.md");
+        let command = EditorView::reveal_launch_command(path);
+        let args: Vec<_> = command.get_args().collect();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("open"));
+            assert_eq!(
+                args,
+                vec![std::ffi::OsStr::new("-R"), path.as_os_str()]
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Explorer parses its raw command line itself: `/select,` must
+            // stay unquoted and directly adjacent to the quoted path, with
+            // no space in between, or the switch is not recognized.
+            let mut expected = std::ffi::OsString::from("/select,\"");
+            expected.push(path.as_os_str());
+            expected.push("\"");
+
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("explorer.exe"));
+            assert_eq!(args, vec![expected.as_os_str()]);
+        }
     }
 
     #[test]
@@ -10187,18 +10635,18 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert_eq!(view.sessions.active_id(), SessionId(0));
-            assert_eq!(
-                view.file_tab_context_menu
-                    .as_ref()
-                    .and_then(|menu| menu.path.as_deref()),
-                Some(expected_clicked_path.as_path())
-            );
+            let menu_target_path = view
+                .file_tab_context_menu
+                .as_ref()
+                .and_then(|menu| view.sessions.get(menu.id))
+                .and_then(DocumentSession::path);
+            assert_eq!(menu_target_path, Some(expected_clicked_path.as_path()));
         });
         assert!(cx.debug_bounds("file-tab-context-menu").is_some());
     }
 
     #[gpui::test]
-    fn file_tab_context_menu_handles_an_untitled_session_without_spawning(
+    fn file_tab_context_menu_disables_path_dependent_items_for_an_untitled_session(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
@@ -10211,26 +10659,38 @@ mod tests {
         cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.run_until_parked();
-        let item = cx
+        let vscode_item = cx
             .debug_bounds("file-tab-context-open-vscode")
             .expect("context menu item rendered");
+        let copy_item = cx
+            .debug_bounds("file-tab-context-copy-path")
+            .expect("copy-path item rendered");
         view.read_with(cx, |view, _| {
-            assert!(
-                view.file_tab_context_menu
-                    .as_ref()
-                    .is_some_and(|menu| menu.path.is_none())
-            );
+            let menu_target_path = view
+                .file_tab_context_menu
+                .as_ref()
+                .and_then(|menu| view.sessions.get(menu.id))
+                .and_then(DocumentSession::path);
+            assert!(menu_target_path.is_none());
         });
 
-        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        // Path-dependent rows for an untitled document have no `on_click`
+        // wired at all, so clicking them must not invoke the handler, show
+        // a status message, or close the still-open menu.
+        cx.simulate_click(vscode_item.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(view.file_tab_context_menu.is_none());
-            assert_eq!(
-                view.status.as_deref(),
-                Some("VSCodeで開くにはファイルを保存してください")
-            );
+            assert!(view.file_tab_context_menu.is_some());
+            assert_eq!(view.status, None);
         });
+
+        cx.simulate_click(copy_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_some());
+            assert_eq!(view.status, None);
+        });
+        assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()), None);
     }
 
     #[gpui::test]
@@ -10260,6 +10720,1163 @@ mod tests {
         cx.simulate_click(point(px(620.0), px(220.0)), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn copying_a_file_tabs_full_path_writes_it_to_the_clipboard(cx: &mut gpui::TestAppContext) {
+        // A directory and file name with both whitespace and Japanese text,
+        // to demonstrate the copied string is exactly `Path::display()`
+        // rather than something reassembled through a shell.
+        let path = PathBuf::from("メモ帳 用フォルダ/日本語 ノート.md");
+        let expected = path.display().to_string();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("body\n"),
+                identity: hane_session::FileIdentity::lexical(path),
+                stamp: None,
+            });
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("file tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let copy_item = cx
+            .debug_bounds("file-tab-context-copy-path")
+            .expect("copy-path item rendered");
+        cx.simulate_click(copy_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(expected)
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_none());
+            assert_eq!(view.status.as_deref(), Some("フルパスをコピーしました"));
+        });
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_is_discarded_when_its_session_closes_through_a_work_folder_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let new_root = draft_test_root("context-menu-stale-switch");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("active\n"),
+                identity: hane_session::FileIdentity::lexical(active_path),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_mouse_down(
+            other_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            other_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        // Switching work folders discards every old session wholesale,
+        // through a route other than the menu's own item handlers or
+        // `close_tab_now`, leaving behind a menu that still targets a
+        // `SessionId` the new `SessionSet` knows nothing about.
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.file_tab_context_menu.is_none(),
+                "a menu left over from the discarded session must not linger"
+            );
+        });
+        assert!(cx.debug_bounds("file-tab-context-menu").is_none());
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    #[gpui::test]
+    fn left_clicking_a_path_bearing_file_tab_activates_its_session(cx: &mut gpui::TestAppContext) {
+        // Both sessions have a real path, so both tabs render their label
+        // through the `HoverCard` trigger (`session.path().is_some()`)
+        // instead of the bare label used by path-less sessions. Left-click
+        // selection, driven by `TabBar::on_click`, must still reach the tab
+        // through that trigger.
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("active\n"),
+                    identity: hane_session::FileIdentity::lexical(active_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let other = view.update(cx, |view, cx| {
+            let other = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(SessionId(0)));
+            cx.notify();
+            other
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_click(other_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), other);
+        });
+    }
+
+    #[gpui::test]
+    fn a_file_tabs_identity_follows_its_own_session_after_an_earlier_tab_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Three path-bearing tabs. Closing the first one shifts the other
+        // two tabs' *index* down by one, while the `HoverCard` and its copy
+        // button are keyed by each session's own stable `SessionId` rather
+        // than that index. Left-click, middle-click and right-click on the
+        // tab that slides into the freed slot must all still resolve to the
+        // session actually showing there, with no path left over from the
+        // session that used to occupy that slot.
+        let first_path = PathBuf::from("first.md");
+        let second_path = PathBuf::from("second.md");
+        let third_path = PathBuf::from("third.md");
+        let expected_second_path = second_path.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("first\n"),
+                    identity: hane_session::FileIdentity::lexical(first_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (first, second, third) = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            let second = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("second\n"),
+                    identity: hane_session::FileIdentity::lexical(second_path),
+                    stamp: None,
+                },
+            );
+            let third = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("third\n"),
+                    identity: hane_session::FileIdentity::lexical(third_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(third));
+            cx.notify();
+            (first, second, third)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        // Close the first (non-active) tab by the middle mouse button, the
+        // same way a user would.
+        let first_tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(
+            first_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            first_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(first).is_none(),
+                "the closed tab's session must be gone"
+            );
+            assert_eq!(
+                view.sessions.active_id(),
+                third,
+                "closing a non-active tab must not switch the active session"
+            );
+        });
+
+        // `second` now renders at index 0 (`file-tab-first`), the slot the
+        // closed tab used to own. Left-click there must activate `second`,
+        // not leave the identity pointing at whatever used to live in that
+        // slot.
+        let reused_slot = cx
+            .debug_bounds("file-tab-first")
+            .expect("remaining first tab rendered");
+        cx.simulate_click(reused_slot.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), second);
+        });
+
+        // Right-clicking that same reused slot must open a context menu
+        // targeting `second`'s own path, not a leftover reference to the
+        // closed tab or to `third`.
+        let reused_slot = cx
+            .debug_bounds("file-tab-first")
+            .expect("remaining first tab rendered");
+        cx.simulate_mouse_down(
+            reused_slot.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            reused_slot.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let menu_target_path = view
+                .file_tab_context_menu
+                .as_ref()
+                .and_then(|menu| view.sessions.get(menu.id))
+                .and_then(DocumentSession::path);
+            assert_eq!(menu_target_path, Some(expected_second_path.as_path()));
+        });
+    }
+
+    #[gpui::test]
+    fn a_long_path_file_tab_keeps_its_trigger_within_its_own_tab_bounds_in_a_narrow_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A very long absolute path, in a narrow window, so the
+        // always-visible tab trigger (as opposed to the `HoverCard`'s
+        // floating content, which this worker cannot drive a real hover
+        // into under `TestAppContext`) truncates to its own tab's width
+        // instead of pushing into, or overlapping, its neighbor, and does
+        // not grow the tab strip's fixed row height.
+        let long_path = PathBuf::from(
+            "very/deeply/nested/directory/structure/that/is/intentionally/long/document.md",
+        );
+        let other_path = PathBuf::from("b.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("body\n"),
+                    identity: hane_session::FileIdentity::lexical(long_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("body\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(SessionId(0)));
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+        cx.run_until_parked();
+
+        let header_height = view.read_with(cx, |view, _| view.theme.header_height);
+        let header = cx.debug_bounds("file-tabs").expect("tab strip rendered");
+        let first_tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("long-path tab rendered");
+        let last_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("other tab rendered");
+
+        assert!(
+            first_tab.right() <= last_tab.left(),
+            "the long-path tab's own trigger must not overlap its neighbor: {first_tab:?} vs {last_tab:?}"
+        );
+        assert_eq!(
+            header.size.height,
+            px(header_height),
+            "a long path must not grow the tab strip's fixed row height"
+        );
+    }
+
+    #[gpui::test]
+    fn middle_click_closes_a_clean_non_active_tab_without_switching_active_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("active\n"),
+                identity: hane_session::FileIdentity::lexical(active_path),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path.clone()),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_mouse_down(
+            other_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            other_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "closing a non-active tab must not switch the active session"
+            );
+            assert_eq!(view.sessions.len(), 1);
+            assert!(view.sessions.session_for_path(&other_path).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn middle_click_on_dirty_tab_prompts_and_cancel_leaves_it_open(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("tab-close-cancel");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("before"),
+                    identity: hane_session::FileIdentity::lexical(path.clone()),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let target_id = view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1, "the dirty session must still be open");
+            let confirm_id = view.tab_close_confirm.as_ref().map(|confirm| confirm.id);
+            assert_eq!(
+                confirm_id,
+                Some(view.sessions.active_id()),
+                "the confirm prompt must target the session that was actually clicked"
+            );
+            confirm_id.unwrap()
+        });
+
+        let cancel = cx
+            .debug_bounds("tab-close-confirm-cancel")
+            .expect("cancel button rendered");
+        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert_eq!(view.sessions.len(), 1);
+            assert!(
+                view.sessions
+                    .get(target_id)
+                    .is_some_and(DocumentSession::is_dirty),
+                "canceling must leave the unsaved edits in place"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn middle_click_dirty_tab_save_and_close_writes_then_closes(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("tab-close-save");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        // Loaded through the real service, like `open_with_policy` does, so
+        // the session records the file's actual stamp. Fabricating a `None`
+        // stamp instead would make the save's overwrite guard believe the
+        // path was free when it is not, refusing the write as a conflict.
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let save_button = cx
+            .debug_bounds("tab-close-confirm-save")
+            .expect("save button rendered");
+        cx.simulate_click(save_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before after");
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert_eq!(view.sessions.len(), 1);
+            // The last tab is replaced with a blank untitled document rather
+            // than leaving the window with none, the same rule any other
+            // close already follows.
+            assert!(view.sessions.active().path().is_none());
+            assert!(!view.sessions.active().is_dirty());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn middle_click_dirty_tab_save_and_close_failure_leaves_it_open(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("tab-close-save-fails");
+        // `atomic_write` creates any missing parent directories on its own
+        // (needed so a save can recreate a folder deleted out from under a
+        // dirty session), so a merely-absent parent would not fail here. A
+        // plain file occupying the parent's name instead makes
+        // `fs::create_dir_all` fail for real, on every platform, so the
+        // write fails and the tab must not close.
+        std::fs::create_dir_all(&root).unwrap();
+        let blocking_file = root.join("missing-dir");
+        std::fs::write(&blocking_file, "blocking").unwrap();
+        let missing_path = blocking_file.join("note.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("before"),
+                    identity: hane_session::FileIdentity::lexical(missing_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let save_button = cx
+            .debug_bounds("tab-close-confirm-save")
+            .expect("save button rendered");
+        cx.simulate_click(save_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1, "a failed save must not close the tab");
+            assert!(view.sessions.active().is_dirty());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a failed save must not leave a close request armed for a future, unrelated save"
+            );
+            assert!(view.status.as_deref().unwrap_or_default().contains("Save failed"));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // A keystroke landing while the close-and-save write is already in
+    // flight must not let the tab close on a snapshot that is already
+    // stale: `finish_save` reports `SavedStale` for it, which leaves the
+    // session dirty and must keep `resolve_pending_tab_close` from acting.
+    // `simulate_click`/`simulate_mouse_*` each drain the executor to
+    // completion before returning, so this drives `confirm_save_and_close_tab`
+    // and the interleaved edit directly, both inside one `view.update`, to
+    // land the edit before the write is ever polled.
+    #[gpui::test]
+    fn tab_close_after_save_stays_open_when_an_edit_lands_while_the_write_is_in_flight(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-stale");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.confirm_save_and_close_tab(id, cx);
+            assert!(view.sessions.active().save_in_flight());
+            // Lands before the executor ever polls the write started above.
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before after");
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "a keystroke landing mid-write must keep the tab open"
+            );
+            assert!(view.sessions.active().is_dirty());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a stale write must drop the close request rather than retry it against a later, unrelated save"
+            );
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Saved snapshot; newer edits pending")
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // The overwrite guard refuses a write once the file changed underneath
+    // it, the same rule any other save follows; a close-and-save request
+    // pending for that write must not close the tab on a refused save.
+    #[gpui::test]
+    fn tab_close_after_save_stays_open_when_the_file_changes_externally_during_the_write(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.confirm_save_and_close_tab(id, cx);
+            assert!(view.sessions.active().save_in_flight());
+        });
+        // Someone else changes the file on disk before this session's write
+        // is polled, so the overwrite guard's stamp check must fail it.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "a save refused as a conflict must not close the tab"
+            );
+            assert!(view.sessions.active().is_dirty());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a refused save must drop the close request rather than retry it blindly"
+            );
+            assert!(
+                view.status
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("changed on disk")
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "someone else's edit, longer than before",
+            "a refused save must never overwrite the conflicting content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Issue #411: `is_dirty()` alone cannot gate whether the close-and-save
+    // request's *own* write succeeded, because an unrelated earlier save can
+    // already have left the document reading as clean by the time this
+    // write's result comes back. Here the setup save lands and cleans the
+    // document *before* the close-and-close request's write is even
+    // started, so the session is clean for the request's entire lifetime;
+    // that write still refuses as a conflict, and it alone — not the
+    // coincidentally clean document — must decide whether the tab closes.
+    #[gpui::test]
+    fn tab_close_after_save_drops_request_when_its_own_write_conflicts_although_the_document_already_reads_as_clean(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict-after-clean");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+            id
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sessions.active().is_dirty(),
+                "the setup save must land and clean the document before the race begins"
+            );
+        });
+
+        // Someone else changes the file on disk only after the document is
+        // already clean, so nothing in the session's own state (revision,
+        // dirty flag) reflects the conflict the request's write is about to
+        // hit.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+
+        view.update(cx, |view, cx| {
+            view.confirm_save_and_close_tab(id, cx);
+            assert!(view.sessions.active().save_in_flight());
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "a conflicting save must not close the tab merely because the document already read as clean"
+            );
+            assert!(!view.sessions.active().is_dirty());
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a refused save must drop the close request rather than let a coincidentally clean document close it"
+            );
+            assert!(
+                view.status
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("changed on disk")
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "someone else's edit, longer than before",
+            "a refused save must never overwrite the conflicting content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Issue #411: a save queued behind the close-and-save write (in
+    // `DocumentSession`'s own `pending_save` slot, not a fresh, independent
+    // request) must not inherit a close request its predecessor already
+    // dropped. The predecessor here — the request's own write — refuses as a
+    // conflict; the queued save behind it is a resolved-conflict overwrite
+    // retry, which the requeue in `finish_save` starts immediately and which
+    // goes on to succeed. That success is real and unrelated to whether the
+    // *original* request should close anything, so it must not resurrect a
+    // close request `finish_save` already dropped for the conflict.
+    #[gpui::test]
+    fn a_save_queued_behind_a_conflicting_close_request_does_not_resurrect_the_dropped_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict-then-queued-overwrite-succeeds");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.confirm_save_and_close_tab(id, cx);
+            assert!(view.sessions.active().save_in_flight());
+            // Queued behind the close request's own write, which is still in
+            // flight: this is the same "save again to overwrite" retry the
+            // conflict status message below points the user at, arriving
+            // before that write's result is even known.
+            view.save_session(id, SaveIntent::Overwrite, cx);
+            id
+        });
+        // Someone else changes the file on disk before the close request's
+        // own write is polled, so its overwrite guard's stamp check fails
+        // it; the queued retry's `Force` guard is unaffected and must still
+        // land once it runs.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "the queued retry succeeding must not close a tab whose own close request conflicted"
+            );
+            assert!(!view.sessions.active().is_dirty(), "the queued retry must still land");
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "the conflicting write must drop the close request rather than let a later, unrelated write's success act on it"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before after",
+            "the queued overwrite retry must still land its own content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Canceling the Save As dialog that a close-and-save request opens for
+    // an untitled document must leave the document open, the same as
+    // canceling Save As any other time does; the close request must not
+    // linger to act on a future, unrelated save.
+    #[gpui::test]
+    fn middle_click_close_save_as_cancel_for_an_untitled_note_leaves_it_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("draft").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            view.confirm_save_and_close_tab(id, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_new_path_selection(|_| None);
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "canceling Save As must leave the untitled document open"
+            );
+            assert!(view.sessions.active().is_dirty());
+            assert!(view.sessions.active().path().is_none());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a canceled Save As must not leave a close request armed for a later, unrelated save"
+            );
+        });
+    }
+
+    // Regression for the "遅延通知" requirement: a close-and-save request
+    // armed for one document instance must not act on a different instance
+    // that later took the same session id (a reload/adopt bumps the
+    // generation the request was made against).
+    #[gpui::test]
+    fn resolve_pending_tab_close_ignores_a_stale_generation(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let requested_generation = view.sessions.active().generation();
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            assert_ne!(view.sessions.active().generation(), requested_generation);
+            view.tab_close_after_save.insert(id, requested_generation);
+            view.resolve_pending_tab_close(id, cx);
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the replaced document must stay open"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "the stale request must be dropped, not retried against the new document"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_cycles_file_tabs_in_order_and_wraps(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let ids = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            let second = view.sessions.open_untitled("two\n", "Second");
+            let third = view.sessions.open_untitled("three\n", "Third");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            [first, second, third]
+        });
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context, which ctrl-tab is
+        // scoped to, the same way a real click would before typing.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), ids[1]);
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), ids[2]);
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            ids[0],
+            "must wrap from the last tab back to the first"
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            ids[2],
+            "must wrap backward from the first tab to the last"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_is_a_no_op_with_a_single_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        let id = view.read_with(cx, |view, _| view.sessions.active_id());
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), id);
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context, which ctrl-tab is
+        // scoped to, the same way a real click would before typing, then
+        // move focus onto the sidebar filter the way a real click there
+        // does: setting the flag without changing the shared focus handle.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_is_focused()));
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_inline_rename_is_active(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_during_ime_composition(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "に", Some(1..1))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(
+            view.read_with(cx, |view, _| view.editor().ime().is_some()),
+            "an in-progress IME composition must not be interrupted by the tab switch"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_settings_is_open(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.settings_open));
     }
 
     #[gpui::test]
