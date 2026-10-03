@@ -18,13 +18,14 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/17"
+PROCEDURE_VERSION = "hosted-scroll-inertia/18"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
     "逆方向入力への切替、文書先頭/末尾のクランプ、Pixels の直接追従と安定を実画面で確認する。"
     "入力イベントは ScrollDelta 相当の Lines / Pixels を明示して発生させ、端末種別は推測しない。"
-    "Lines / Pixelsの80ms初回応答は、同じScreenCaptureKitサンプルの画像とWindowServer表示時刻で確認する。"
+    "Lines / Pixelsの80ms初回応答は、cghidEventTap後の実画面画像が80ms以内に取得完了した場合だけ確認する。"
+    "wheel-captureとwheel-measureを同じ文書先頭・同じ入力値で各2回比較し、画面画像と入力受信計測の差を記録する。"
     "余韻・減速・安定は従来の画面取得系列で135msの慣性窓内を確認し、callback遅延と表示時刻を分けて記録する。"
     "中間位置への位置決めは較正済みの通常画面取得経路で送り、複数時点の画面で位置のみ確認する。受入判定には使わない。"
     "Pixelsは応答付近を連続して撮影し、反転入力は複数の旧方向候補画面を撮影した直後に送り、OCRはその後に行って慣性窓を消費しない。"
@@ -61,6 +62,7 @@ MIDPOINT_BAND_END = LINE_COUNT * 2 // 3
 # Procedure /15 separately verifies the 80ms first visual response using the
 # WindowServer display timestamp attached to the same streamed image sample.
 VISIBLE_RESPONSE_WINDOW_MS = LINES_INERTIA_WINDOW_MS
+FIRST_RESPONSE_LIMIT_MS = 80.0
 
 
 def load_module(control_dir: Path, relative: str, name: str):
@@ -140,6 +142,64 @@ def last_visible(frame: dict) -> Optional[int]:
 def midpoint_band_is_visible(lines: list[int]) -> bool:
     """Require at least one OCR-recognized line from the fixture's middle third."""
     return any(MIDPOINT_BAND_START <= line <= MIDPOINT_BAND_END for line in lines)
+
+
+def evaluate_first_response(baseline: Optional[int], frames: list[dict], name: str,
+                            response_limit_ms: float = FIRST_RESPONSE_LIMIT_MS) -> dict:
+    """Require an actual captured screen image to show movement by the response limit."""
+    offsets = [first_visible(frame) for frame in frames]
+    times = [frame.get("elapsed_ms") for frame in frames]
+    if baseline is None or not offsets or any(value is None for value in offsets):
+        return step(name, "blocked", "初回応答を判定する可視行番号が足りない",
+                    baseline=baseline, offsets=offsets, elapsed_ms=times,
+                    response_limit_ms=response_limit_ms)
+    response_index = next((index for index, (offset, elapsed) in enumerate(zip(offsets, times))
+                           if offset > baseline and isinstance(elapsed, (int, float))), None)
+    if response_index is None:
+        return step(name, "fail", "取得した画面にスクロール応答が現れない",
+                    baseline=baseline, offsets=offsets, elapsed_ms=times,
+                    response_limit_ms=response_limit_ms)
+    response_ms = times[response_index]
+    passed = 0 <= response_ms <= response_limit_ms
+    return step(name, "pass" if passed else "fail",
+                None if passed else f"画面応答の取得完了が{response_limit_ms:g}msを超えた",
+                baseline=baseline, offsets=offsets, elapsed_ms=times,
+                first_response_frame=response_index, first_response_ms=response_ms,
+                response_limit_ms=response_limit_ms)
+
+
+def classify_measurement_path_comparison(capture_response: dict, measure_response: dict,
+                                         same_start_lines: bool) -> dict:
+    """Describe the two observers without changing product acceptance."""
+    capture_result = capture_response.get("result")
+    measure_result = measure_response.get("result")
+    complete = (same_start_lines and capture_result in {"pass", "fail"}
+                and measure_result in {"pass", "fail"})
+    if not complete:
+        classification = "unknown"
+    elif capture_result != measure_result:
+        classification = "measurement_path_divergence"
+    else:
+        classification = "same_observed_outcome"
+    return {
+        "result": "pass" if complete else "blocked",
+        "classification": classification,
+        "same_start_lines": same_start_lines,
+        "wheel_capture_response": capture_response,
+        "wheel_measure_response": measure_response,
+    }
+
+
+def aggregate_acceptance_result(steps: list[dict], priority: dict[str, int]) -> tuple[str, list[str]]:
+    """Aggregate product acceptance steps without treating a diagnostic as acceptance."""
+    acceptance_steps = [item for item in steps
+                        if item.get("name") != "wheel_measurement_path_comparison"]
+    considered = [item["result"] for item in acceptance_steps
+                  if item.get("result") in priority]
+    result = min(considered, key=lambda value: priority[value]) if considered else "blocked"
+    reasons = [item.get("reason") for item in acceptance_steps
+               if item.get("result") not in ("pass", "skipped") and item.get("reason")]
+    return result, reasons
 
 
 def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
@@ -921,11 +981,89 @@ def position_document_midpoint(interaction, module, env, config, helper, pid: in
     return attach_scroll_event_observation(failed, observation), lines, text
 
 
+def compare_wheel_measurement_paths(interaction, module, env, config, helper, pid: int,
+                                    window_id: str, scenario_dir: Path, helper_timeout: float,
+                                    downward_sign: int, timing_path: Path,
+                                    observation_module: Optional[object]) -> dict:
+    """Run both capture helpers from the same verified document-top state."""
+    comparisons = []
+    cases = (
+        ("lines", "lines", downward_sign * 8, FRAME_DELAYS_MS),
+        ("pixels", "pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS),
+    )
+    for label, unit, delta, delays in cases:
+        modes = {}
+        for mode in ("wheel_capture", "wheel_measure"):
+            baseline_step, baseline_lines, baseline_text = move_to_document_top(
+                interaction, module, env, config, helper, pid, window_id,
+                scenario_dir, f"compare-{label}-{mode}-baseline", helper_timeout)
+            if baseline_step["result"] != "pass" or not baseline_lines:
+                return step(
+                    "wheel_measurement_path_comparison", "blocked",
+                    baseline_step.get("reason") or f"{label} {mode} の開始位置を確認できない",
+                    comparisons=comparisons,
+                    failed_baseline={"unit": unit, "mode": mode,
+                                     "step": baseline_step, "visible_lines": baseline_lines,
+                                     "recognized_text": baseline_text},
+                )
+            kwargs = {}
+            if mode == "wheel_measure":
+                kwargs = {
+                    "scroll_event_timing_path": timing_path,
+                    "scroll_event_observation_module": observation_module,
+                }
+            frames, observation, error = capture_frames(
+                interaction, module, env, config, helper, pid, window_id,
+                scenario_dir / f"compare-{label}-{mode}", unit, delta, delays,
+                helper_timeout, **kwargs)
+            if error:
+                return step(
+                    "wheel_measurement_path_comparison", "blocked", error,
+                    comparisons=comparisons,
+                    failed_capture={"unit": unit, "mode": mode,
+                                    "baseline_visible_lines": baseline_lines,
+                                    "scroll_event_observation": observation},
+                )
+            modes[mode] = {
+                "baseline_visible_lines": baseline_lines,
+                "baseline_text": baseline_text,
+                "frames": frames,
+                "response": evaluate_first_response(
+                    min(baseline_lines), frames,
+                    f"{label}_{mode}_first_response_80ms"),
+                "scroll_event_observation": observation,
+            }
+
+        same_start_lines = (
+            modes["wheel_capture"]["baseline_visible_lines"]
+            == modes["wheel_measure"]["baseline_visible_lines"]
+        )
+        classified = classify_measurement_path_comparison(
+            modes["wheel_capture"]["response"],
+            modes["wheel_measure"]["response"],
+            same_start_lines,
+        )
+        comparisons.append({
+            "unit": unit,
+            "delta": delta,
+            "delays_ms": list(delays),
+            "same_document_position": same_start_lines,
+            "wheel_capture": modes["wheel_capture"],
+            "wheel_measure": modes["wheel_measure"],
+            **classified,
+        })
+    complete = all(item["result"] == "pass" for item in comparisons)
+    return step(
+        "wheel_measurement_path_comparison", "pass" if complete else "blocked",
+        None if complete else "同一位置・同一入力で両計測経路を比較できない",
+        comparisons=comparisons,
+        note="この比較は計測経路の診断であり、製品受入判定はwheel-captureの画面画像と別scenarioで行う",
+    )
+
+
 def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: int,
                                window_id: str, scenario_dir: Path,
-                               scroll_event_timing_path: Path, helper_timeout: float,
-                               downward_sign: int,
-                               scroll_event_observation_module: Optional[object]) -> list[dict]:
+                               helper_timeout: float, downward_sign: int) -> list[dict]:
     steps: list[dict] = []
     position, position_lines, _position_text = position_document_midpoint(
         interaction, module, env, config, helper, pid, window_id, scenario_dir,
@@ -933,24 +1071,25 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
     steps.append(position)
     if position["result"] != "pass":
         steps.extend(skipped(name, "文書中央の検査開始位置を確認できなかった") for name in (
-            "lines_coast", "direction_reversal", "document_edges", "pixels_direct_follow"))
+            "lines_coast", "lines_first_response_80ms", "direction_reversal",
+            "document_edges", "pixels_direct_follow", "pixels_first_response_80ms"))
         return steps
 
     baseline = min(position_lines) if position_lines else None
-    frames, scroll_event_observation, error = capture_frames(
+    frames, _scroll_event_observation, error = capture_frames(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir / "lines-coast", "lines", downward_sign * 8,
         FRAME_DELAYS_MS, helper_timeout,
-        scroll_event_timing_path=scroll_event_timing_path,
-        scroll_event_observation_module=scroll_event_observation_module,
     )
     if error:
         steps.append(attach_scroll_event_observation(
-            step("lines_coast", "blocked", error), scroll_event_observation))
+            step("lines_coast", "blocked", error), None))
+        steps.append(step("lines_first_response_80ms", "blocked", error))
         time.sleep(FRAME_DELAYS_MS[-1] / 1000)
     else:
         steps.append(attach_scroll_event_observation(
-            evaluate_lines_coast(baseline, frames), scroll_event_observation))
+            evaluate_lines_coast(baseline, frames), None))
+        steps.append(evaluate_first_response(baseline, frames, "lines_first_response_80ms"))
 
     reversal_baseline_capture, reversal_baseline_lines, reversal_baseline_text = capture_single(
         interaction, module, env, config, helper, window_id,
@@ -1034,25 +1173,31 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
         helper_timeout, downward_sign, "pixels-before")
     if pixel_position["result"] == "pass":
         before_pixel_offset = min(before_lines) if before_lines else None
-        frames, pixels_scroll_event_observation, error = capture_frames(
+        frames, _pixels_scroll_event_observation, error = capture_frames(
             interaction, module, env, config, helper, pid, window_id,
             scenario_dir / "pixels-direct-follow",
             "pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,
-            scroll_event_timing_path=scroll_event_timing_path,
-            scroll_event_observation_module=scroll_event_observation_module,
         )
         pixel_step = (
             step("pixels_direct_follow", "blocked", error)
             if error else evaluate_pixels(before_pixel_offset, frames)
         )
+        pixel_response_step = (
+            step("pixels_first_response_80ms", "blocked", error)
+            if error else evaluate_first_response(
+                before_pixel_offset, frames, "pixels_first_response_80ms")
+        )
         pixel_step = attach_scroll_event_observation(
-            pixel_step, pixels_scroll_event_observation)
+            pixel_step, None)
         pixel_step["baseline_visible_lines"] = before_lines
         pixel_step["baseline_text"] = before_text
     else:
         pixel_step = attach_scroll_event_observation(
             step("pixels_direct_follow", "blocked", pixel_position.get("reason")), None)
+        pixel_response_step = step(
+            "pixels_first_response_80ms", "blocked", pixel_position.get("reason"))
     steps.append(pixel_step)
+    steps.append(pixel_response_step)
     return steps
 
 
@@ -1067,12 +1212,9 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
     contents = "\n".join(f"LINE {number:03d}" for number in range(1, LINE_COUNT + 1)) + "\n"
     fixture.write_text(contents, encoding="utf-8")
     # Issue #427: Hane writes its own mach-clock scroll-timing record to this
-    # path only when launched with HANE_SCROLL_EVENT_TIMING_PATH set; Hane
-    # appends one line per ScrollWheelEvent it receives for as long as the one
-    # process launched below keeps running, so the same path and the one
-    # running process underneath also let the pixels_direct_follow capture
-    # later in this scenario pick up its own, separate scroll input's record
-    # without mixing it up with the lines_coast one above.
+    # path only when launched with HANE_SCROLL_EVENT_TIMING_PATH set. Version
+    # 18 uses the one running process and this path to compare the same
+    # Lines/Pixels inputs through wheel-capture and wheel-measure.
     scroll_event_timing_path = scenario_dir / "scroll-event-timing.log"
     config = interaction.make_config(
         gui_validate, workspace_dir=target_dir, scenario="scroll-inertia-focused",
@@ -1092,14 +1234,17 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
         pid = interaction.current_pid(holder)
         if pid is None or window_id is None:
             steps.extend(skipped(name, "launch/window discovery が pass しなかった") for name in (
-                "focus_editor", "lines_coast", "direction_reversal", "document_edges",
-                "pixels_direct_follow", "document_unchanged"))
+                "focus_editor", "wheel_measurement_path_comparison", "lines_coast",
+                "lines_first_response_80ms", "direction_reversal", "document_edges",
+                "pixels_direct_follow", "pixels_first_response_80ms", "document_unchanged"))
         else:
             ok, _output, error = interaction.run_helper(helper, ["focus-editor", str(pid)], helper_timeout)
             steps.append(step("focus_editor", "pass" if ok else "blocked", None if ok else error))
             if not ok:
                 steps.extend(skipped(name, "editorへのフォーカスを確認できなかった") for name in (
-                    "lines_coast", "direction_reversal", "document_edges", "pixels_direct_follow"))
+                    "wheel_measurement_path_comparison", "lines_coast",
+                    "lines_first_response_80ms", "direction_reversal", "document_edges",
+                    "pixels_direct_follow", "pixels_first_response_80ms"))
             else:
                 baseline_capture, baseline_lines, baseline_text = capture_single(
                     interaction, gui_validate, env, config, helper, window_id,
@@ -1111,7 +1256,9 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                     steps.append(step("scroll_direction_calibration", "blocked",
                                       "基準画面を取得できず、Linesの向きを確認できない"))
                     steps.extend(skipped(name, "Linesの向きを確認できなかった") for name in (
-                        "lines_coast", "direction_reversal", "document_edges", "pixels_direct_follow"))
+                        "wheel_measurement_path_comparison", "lines_coast",
+                        "lines_first_response_80ms", "direction_reversal", "document_edges",
+                        "pixels_direct_follow", "pixels_first_response_80ms"))
                 else:
                     downward_sign, calibration = calibrate_scroll_direction(
                         interaction, gui_validate, env, config, helper, pid,
@@ -1119,13 +1266,17 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                     steps.append(calibration)
                     if downward_sign is None:
                         steps.extend(skipped(name, "Linesの向きを確認できなかった") for name in (
-                            "lines_coast", "direction_reversal", "document_edges", "pixels_direct_follow"))
+                            "wheel_measurement_path_comparison", "lines_coast",
+                            "lines_first_response_80ms", "direction_reversal", "document_edges",
+                            "pixels_direct_follow", "pixels_first_response_80ms"))
                     else:
+                        steps.append(compare_wheel_measurement_paths(
+                            interaction, gui_validate, env, config, helper, pid,
+                            window_id, scenario_dir, helper_timeout, downward_sign,
+                            scroll_event_timing_path, scroll_event_observation_module))
                         steps.extend(run_scroll_behavior_checks(
                             interaction, gui_validate, env, config, helper, pid,
-                            window_id, scenario_dir, scroll_event_timing_path,
-                            helper_timeout, downward_sign,
-                            scroll_event_observation_module))
+                            window_id, scenario_dir, helper_timeout, downward_sign))
 
                 unchanged = fixture.read_bytes() == contents.encode("utf-8")
                 steps.append(step("document_unchanged", "pass" if unchanged else "fail",
@@ -1135,9 +1286,7 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
         if holder.get("process") is not None:
             steps.append(interaction.close_session(gui_validate, env, holder))
 
-    result = min((item["result"] for item in steps if item.get("result") in priority),
-                 key=lambda value: priority[value]) if any(item.get("result") in priority for item in steps) else "blocked"
-    reasons = [item.get("reason") for item in steps if item.get("result") not in ("pass", "skipped") and item.get("reason")]
+    result, reasons = aggregate_acceptance_result(steps, priority)
     return {"name": "scroll_inertia", "steps": steps, "result": result,
             "reason": "。".join(reasons) if reasons else "Issue #389 のスクロールGUI確認が成功した",
             "evidence": {"fixture_path": str(fixture), "line_count": LINE_COUNT,
