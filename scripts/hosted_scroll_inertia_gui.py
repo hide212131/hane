@@ -72,6 +72,11 @@ def step(name: str, result: str, reason: Optional[str] = None, **detail) -> dict
     return {"name": name, "result": result, "reason": reason, **detail}
 
 
+def bounded_wheel_measure_output(output: str) -> str:
+    excerpt = output[:WHEEL_MEASURE_ERROR_OUTPUT_LIMIT]
+    return excerpt if len(output) <= WHEEL_MEASURE_ERROR_OUTPUT_LIMIT else excerpt + "\n...(truncated)"
+
+
 def skipped(name: str, reason: str) -> dict:
     return step(name, "skipped", reason)
 
@@ -400,7 +405,9 @@ def parse_wheel_measure_capture_output(output: str, expected_frames: int) -> dic
     same elapsed-ms-since-event-post shape `parse_scroll_capture_helper_output`
     already produces, so swapping the capture command for the measurement
     build changes only how timing is extracted, never `evaluate_lines_coast`/
-    `evaluate_pixels`'s judgment itself."""
+    `evaluate_pixels`'s judgment itself. WindowServer response validation is
+    returned separately so a partial response collection cannot discard
+    already-captured positioning frames."""
     fields: dict[str, str] = {}
     route = None
     for line in output.splitlines():
@@ -453,74 +460,84 @@ def parse_wheel_measure_capture_output(output: str, expected_frames: int) -> dic
             or frame_completed != sorted(frame_completed)):
         raise ValueError("scroll helper frame times are invalid")
 
-    response_count = uint("display_response_count")
-    if (fields.get("display_response_collection_valid") != "true"
-            or response_count is None or not 1 <= response_count <= 64):
-        raise ValueError("WindowServer display response collection is missing, invalid, or incomplete")
-    display_responses = []
-    seen_sample_ids = set()
-    previous_display_ticks = event_post_ticks - 1
-    previous_callback_ticks = event_post_ticks
-    previous_image_ready_ticks = event_post_ticks
-    previous_artifact_written_ticks = event_post_ticks
-    for index in range(response_count):
-        prefix = f"display_response_{index:02d}_"
-        sample_id = uint(prefix + "sample_id")
-        display_ticks = uint(prefix + "display_time_ticks")
-        callback_ticks = uint(prefix + "callback_received_ticks")
-        image_ready_ticks = uint(prefix + "image_ready_ticks")
-        artifact_written_ticks = uint(prefix + "artifact_written_ticks")
-        if (fields.get(prefix + "frame_status") != "complete"
-                or fields.get(prefix + "timestamp_source") != "SCStreamFrameInfo.displayTime"
-                or fields.get(prefix + "image_source") != "same_CMSampleBuffer"
-                or sample_id is None or sample_id == 0 or sample_id in seen_sample_ids
-                or display_ticks is None or display_ticks == 0
-                or callback_ticks is None or image_ready_ticks is None
-                or artifact_written_ticks is None
-                or not (fields.get(prefix + "image_path") or "").endswith(
-                    f"display-response-{index:02d}.png")):
-            raise ValueError(f"WindowServer display response {index} is missing valid same-sample metadata")
-        if (display_ticks < event_post_ticks or callback_ticks < event_post_ticks
-                or display_ticks <= previous_display_ticks
-                or callback_ticks < previous_callback_ticks
-                or image_ready_ticks < max(callback_ticks, previous_image_ready_ticks)
-                or artifact_written_ticks < previous_artifact_written_ticks
-                or artifact_written_ticks < max(image_ready_ticks, display_ticks)):
-            raise ValueError(f"WindowServer display response {index} timestamps are out of order")
-        display_elapsed_ms = ticks_to_elapsed_ms(display_ticks)
-        callback_elapsed_ms = ticks_to_elapsed_ms(callback_ticks)
-        image_ready_elapsed_ms = ticks_to_elapsed_ms(image_ready_ticks)
-        artifact_written_elapsed_ms = ticks_to_elapsed_ms(artifact_written_ticks)
-        if (not all(math.isfinite(value) for value in (
-                display_elapsed_ms, callback_elapsed_ms, image_ready_elapsed_ms, artifact_written_elapsed_ms))
-                or display_elapsed_ms > LINES_INERTIA_WINDOW_MS):
-            raise ValueError(f"WindowServer display response {index} is late or not finite")
-        display_responses.append({
-            "sample_id": sample_id,
-            "frame_status": fields[prefix + "frame_status"],
-            "timestamp_source": fields[prefix + "timestamp_source"],
-            "image_source": fields[prefix + "image_source"],
-            "display_time_ticks": display_ticks,
-            "callback_received_ticks": callback_ticks,
-            "image_ready_ticks": image_ready_ticks,
-            "artifact_written_ticks": artifact_written_ticks,
-            "image_path": fields.get(prefix + "image_path"),
-            "display_time_elapsed_ms": display_elapsed_ms,
-            "callback_received_elapsed_ms": callback_elapsed_ms,
-            "image_ready_elapsed_ms": image_ready_elapsed_ms,
-            "artifact_written_elapsed_ms": artifact_written_elapsed_ms,
-        })
-        seen_sample_ids.add(sample_id)
-        previous_display_ticks = display_ticks
-        previous_callback_ticks = callback_ticks
-        previous_image_ready_ticks = image_ready_ticks
-        previous_artifact_written_ticks = artifact_written_ticks
+    def parse_display_responses() -> list[dict]:
+        response_count = uint("display_response_count")
+        if (fields.get("display_response_collection_valid") != "true"
+                or response_count is None or not 1 <= response_count <= 64):
+            raise ValueError("WindowServer display response collection is missing, invalid, or incomplete")
+        responses = []
+        seen_sample_ids = set()
+        previous_display_ticks = event_post_ticks - 1
+        previous_callback_ticks = event_post_ticks
+        previous_image_ready_ticks = event_post_ticks
+        previous_artifact_written_ticks = event_post_ticks
+        for index in range(response_count):
+            prefix = f"display_response_{index:02d}_"
+            sample_id = uint(prefix + "sample_id")
+            display_ticks = uint(prefix + "display_time_ticks")
+            callback_ticks = uint(prefix + "callback_received_ticks")
+            image_ready_ticks = uint(prefix + "image_ready_ticks")
+            artifact_written_ticks = uint(prefix + "artifact_written_ticks")
+            if (fields.get(prefix + "frame_status") != "complete"
+                    or fields.get(prefix + "timestamp_source") != "SCStreamFrameInfo.displayTime"
+                    or fields.get(prefix + "image_source") != "same_CMSampleBuffer"
+                    or sample_id is None or sample_id == 0 or sample_id in seen_sample_ids
+                    or display_ticks is None or display_ticks == 0
+                    or callback_ticks is None or image_ready_ticks is None
+                    or artifact_written_ticks is None
+                    or not (fields.get(prefix + "image_path") or "").endswith(
+                        f"display-response-{index:02d}.png")):
+                raise ValueError(f"WindowServer display response {index} is missing valid same-sample metadata")
+            if (display_ticks < event_post_ticks or callback_ticks < event_post_ticks
+                    or display_ticks <= previous_display_ticks
+                    or callback_ticks < previous_callback_ticks
+                    or image_ready_ticks < max(callback_ticks, previous_image_ready_ticks)
+                    or artifact_written_ticks < previous_artifact_written_ticks
+                    or artifact_written_ticks < max(image_ready_ticks, display_ticks)):
+                raise ValueError(f"WindowServer display response {index} timestamps are out of order")
+            display_elapsed_ms = ticks_to_elapsed_ms(display_ticks)
+            callback_elapsed_ms = ticks_to_elapsed_ms(callback_ticks)
+            image_ready_elapsed_ms = ticks_to_elapsed_ms(image_ready_ticks)
+            artifact_written_elapsed_ms = ticks_to_elapsed_ms(artifact_written_ticks)
+            if (not all(math.isfinite(value) for value in (
+                    display_elapsed_ms, callback_elapsed_ms, image_ready_elapsed_ms, artifact_written_elapsed_ms))
+                    or display_elapsed_ms > LINES_INERTIA_WINDOW_MS):
+                raise ValueError(f"WindowServer display response {index} is late or not finite")
+            responses.append({
+                "sample_id": sample_id,
+                "frame_status": fields[prefix + "frame_status"],
+                "timestamp_source": fields[prefix + "timestamp_source"],
+                "image_source": fields[prefix + "image_source"],
+                "display_time_ticks": display_ticks,
+                "callback_received_ticks": callback_ticks,
+                "image_ready_ticks": image_ready_ticks,
+                "artifact_written_ticks": artifact_written_ticks,
+                "image_path": fields.get(prefix + "image_path"),
+                "display_time_elapsed_ms": display_elapsed_ms,
+                "callback_received_elapsed_ms": callback_elapsed_ms,
+                "image_ready_elapsed_ms": image_ready_elapsed_ms,
+                "artifact_written_elapsed_ms": artifact_written_elapsed_ms,
+            })
+            seen_sample_ids.add(sample_id)
+            previous_display_ticks = display_ticks
+            previous_callback_ticks = callback_ticks
+            previous_image_ready_ticks = image_ready_ticks
+            previous_artifact_written_ticks = artifact_written_ticks
+        return responses
+
+    try:
+        display_responses = parse_display_responses()
+        display_response_error = None
+    except ValueError as exc:
+        display_responses = []
+        display_response_error = str(exc)
     return {
         "event_route": route,
         "frame_elapsed_ms": frame_completed,
         "frame_capture_started_ms": frame_started,
         "frame_capture_completed_ms": frame_completed,
         "display_responses": display_responses,
+        "display_response_error": display_response_error,
     }
 
 
@@ -621,10 +638,7 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         try:
             evidence = parse_wheel_measure_capture_output(output, len(delays))
         except ValueError as exc:
-            diagnostic_output = output[:WHEEL_MEASURE_ERROR_OUTPUT_LIMIT]
-            if len(output) > WHEEL_MEASURE_ERROR_OUTPUT_LIMIT:
-                diagnostic_output += "\n...(truncated)"
-            return [], None, f"{exc}\nwheel-measure output:\n{diagnostic_output}"
+            return [], None, f"{exc}\nwheel-measure output:\n{bounded_wheel_measure_output(output)}"
         # A separate observer classification of what the one shared scroll
         # input established on the mach clock (Issue #427); never feeds back
         # into `evidence`/the frames below, so it cannot change what
@@ -632,6 +646,9 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         scroll_event_observation = scroll_event_observation_module.assess_wheel_measurement(
             scroll_event_observation_module.parse_wheel_measure_output(output, len(delays))
         )
+        if evidence["display_response_error"] is not None:
+            scroll_event_observation["display_response_error"] = evidence["display_response_error"]
+            scroll_event_observation["wheel_measure_output_excerpt"] = bounded_wheel_measure_output(output)
     else:
         ok, output, error = interaction.run_helper(helper, [
             "wheel-capture", str(pid), unit, str(delta), str(window_id), str(frame_dir),
@@ -657,20 +674,21 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
                        "visible_lines": lines, "recognized_text": text})
     if use_wheel_measure:
         display_responses = []
-        for index, response in enumerate(evidence["display_responses"]):
-            response_path = frame_dir / f"display-response-{index:02d}.png"
-            if response.get("image_path") != str(response_path):
-                return frames, scroll_event_observation, "WindowServer response image path does not match its sample index"
-            response_lines, response_text, response_error = capture_ocr(
-                interaction, helper, response_path, helper_timeout)
-            if response_error:
-                return frames, scroll_event_observation, response_error
-            display_responses.append({
-                **response,
-                "path": str(response_path),
-                "visible_lines": response_lines,
-                "recognized_text": response_text,
-            })
+        if evidence["display_response_error"] is None:
+            for index, response in enumerate(evidence["display_responses"]):
+                response_path = frame_dir / f"display-response-{index:02d}.png"
+                if response.get("image_path") != str(response_path):
+                    return frames, scroll_event_observation, "WindowServer response image path does not match its sample index"
+                response_lines, response_text, response_error = capture_ocr(
+                    interaction, helper, response_path, helper_timeout)
+                if response_error:
+                    return frames, scroll_event_observation, response_error
+                display_responses.append({
+                    **response,
+                    "path": str(response_path),
+                    "visible_lines": response_lines,
+                    "recognized_text": response_text,
+                })
         scroll_event_observation["window_server_display_responses"] = display_responses
     return frames, scroll_event_observation, None
 

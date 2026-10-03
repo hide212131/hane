@@ -13,6 +13,12 @@ SPEC = importlib.util.spec_from_file_location("hosted_scroll_inertia_gui", MODUL
 assert SPEC is not None and SPEC.loader is not None
 gui = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gui)
+OBSERVATION_MODULE_PATH = MODULE_PATH.with_name("aadw_scroll_event_observation.py")
+OBSERVATION_SPEC = importlib.util.spec_from_file_location(
+    "aadw_scroll_event_observation", OBSERVATION_MODULE_PATH)
+assert OBSERVATION_SPEC is not None and OBSERVATION_SPEC.loader is not None
+scroll_event_observation = importlib.util.module_from_spec(OBSERVATION_SPEC)
+OBSERVATION_SPEC.loader.exec_module(scroll_event_observation)
 
 
 def frames(offsets, times):
@@ -674,6 +680,40 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertEqual(len(observation["window_server_display_responses"]), 2)
         self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 3)
 
+    def test_incomplete_display_response_collection_keeps_position_frames_and_receipt(self):
+        output = self.WHEEL_MEASURE_OUTPUT.replace(
+            "display_response_collection_valid=true", "display_response_collection_valid=false")
+        for index in range(1, 6):
+            started_ticks = 2_000_000 + index * 48_000_000
+            completed_ticks = started_ticks + 200_000
+            output += (
+                f"\nframe_{index:02d}_capture_started_ticks={started_ticks}"
+                f"\nframe_{index:02d}_capture_completed_ticks={completed_ticks}"
+            )
+        interaction = self._StubInteraction(output)
+        timing_path = Path("/tmp/hane-incomplete-display-collection-test/timing.log")
+        with patch.object(
+            gui, "move_to_document_top",
+            return_value=({"result": "pass"}, [1, 2], "LINE 001\nLINE 002"),
+        ):
+            result, lines, text = gui.position_document_midpoint(
+                interaction, None, None, None, "helper", 10, "window",
+                Path("/tmp/hane-incomplete-display-collection-test"), 1.0, -1,
+                "lines-positioning", timing_path, scroll_event_observation,
+            )
+
+        measurement = result["scroll_event_observation"]
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(lines, [100])
+        self.assertEqual(text, "LINE 100")
+        self.assertEqual(len(result["frames"]), 6)
+        self.assertEqual(result["frames"][0]["event_route"], "cghidEventTap")
+        self.assertEqual(measurement["observation"], "unavailable")
+        self.assertIn("WindowServer display response collection", measurement["display_response_error"])
+        self.assertIn("product_scroll_receipt_ticks=1100000", measurement["wheel_measure_output_excerpt"])
+        self.assertEqual(measurement["window_server_display_responses"], [])
+        self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 6)
+
     def test_measurement_parse_failure_preserves_stdout_for_diagnosis(self):
         output = self.WHEEL_MEASURE_OUTPUT.replace(
             "event_route=cghidEventTap", "event_route=target_pid")
@@ -745,15 +785,21 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         for old, new in mutations:
             with self.subTest(change=new):
                 output = self.WHEEL_MEASURE_OUTPUT.replace(old, new)
-                with self.assertRaises(ValueError):
-                    gui.parse_wheel_measure_capture_output(output, 1)
+                evidence = gui.parse_wheel_measure_capture_output(output, 1)
+                self.assertEqual(evidence["frame_elapsed_ms"], [1.2])
+                self.assertEqual(evidence["display_responses"], [])
+                self.assertIsNotNone(evidence["display_response_error"])
 
         for old, new in (
             ("display_response_collection_valid=true", "display_response_collection_valid=false"),
             ("display_response_count=2", "display_response_count=3"),
         ):
-            with self.subTest(change=new), self.assertRaises(ValueError):
-                gui.parse_wheel_measure_capture_output(self.WHEEL_MEASURE_OUTPUT.replace(old, new), 1)
+            with self.subTest(change=new):
+                evidence = gui.parse_wheel_measure_capture_output(
+                    self.WHEEL_MEASURE_OUTPUT.replace(old, new), 1)
+                self.assertEqual(evidence["frame_elapsed_ms"], [1.2])
+                self.assertEqual(evidence["display_responses"], [])
+                self.assertIsNotNone(evidence["display_response_error"])
 
     def test_wheel_measure_helper_failure_is_not_turned_into_a_pass(self):
         # A Vision warm-up crash (or any other helper failure) surfaces
