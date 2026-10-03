@@ -229,7 +229,7 @@ jobs:
               procedure_path='scripts/hosted_file_tabs_gui.py'
               validation_kind='file-tabs'
               ;;
-            'hosted-scroll-inertia/9')
+            'hosted-scroll-inertia/10')
               procedure_path='scripts/hosted_scroll_inertia_gui.py'
               validation_kind='scroll-inertia'
               ;;

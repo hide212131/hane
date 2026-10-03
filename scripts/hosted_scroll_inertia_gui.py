@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/9"
+PROCEDURE_VERSION = "hosted-scroll-inertia/10"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -39,7 +39,12 @@ LINE_COUNT = 500
 FRAME_DELAYS_MS = (0, 24, 40, 64, 108, 120, 144, 190, 240)
 REVERSE_FRAME_DELAYS_MS = (0, 24, 48, 80, 120, 180)
 PIXELS_FRAME_DELAYS_MS = (0, 24, 40, 64, 88, 112, 128, 160, 200)
-PRE_REVERSE_PROBE_DELAYS_MS = (64, 96, 120)
+# Run 37082138091 showed that a 120ms probe can finish after the existing
+# 135ms Lines window on the hosted macOS runner. The current window displayed
+# old-direction motion by 67ms, so keep three probes but start the last one at
+# 96ms, leaving 39ms for screen capture and scheduler delay. This changes only
+# when the observer samples; the 135ms acceptance window is unchanged.
+PRE_REVERSE_PROBE_DELAYS_MS = (48, 72, 96)
 LINES_INERTIA_WINDOW_MS = 135.0
 # The issue specifies a 100–150ms coast, but no separate 80ms latency target.
 # Use the 135ms measurement window for the first completed screenshot too, so
