@@ -49,6 +49,7 @@ PIXELS_FRAME_DELAYS_MS = (0, 24, 40, 64, 88, 112, 128, 160, 200)
 # when the observer samples; the 135ms acceptance window is unchanged.
 PRE_REVERSE_PROBE_DELAYS_MS = (32, 72)
 LINES_INERTIA_WINDOW_MS = 135.0
+WHEEL_MEASURE_ERROR_OUTPUT_LIMIT = 4000
 # The product trajectory evaluator uses the Issue's 135ms coast window.
 # Procedure /14 separately verifies the 80ms first visual response using the
 # WindowServer display timestamp attached to the same streamed image sample.
@@ -620,7 +621,10 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         try:
             evidence = parse_wheel_measure_capture_output(output, len(delays))
         except ValueError as exc:
-            return [], None, f"{exc}\nwheel-measure output:\n{output}"
+            diagnostic_output = output[:WHEEL_MEASURE_ERROR_OUTPUT_LIMIT]
+            if len(output) > WHEEL_MEASURE_ERROR_OUTPUT_LIMIT:
+                diagnostic_output += "\n...(truncated)"
+            return [], None, f"{exc}\nwheel-measure output:\n{diagnostic_output}"
         # A separate observer classification of what the one shared scroll
         # input established on the mach clock (Issue #427); never feeds back
         # into `evidence`/the frames below, so it cannot change what

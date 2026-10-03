@@ -677,6 +677,7 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
     def test_measurement_parse_failure_preserves_stdout_for_diagnosis(self):
         output = self.WHEEL_MEASURE_OUTPUT.replace(
             "event_route=cghidEventTap", "event_route=target_pid")
+        output += "\nextra=" + ("x" * (gui.WHEEL_MEASURE_ERROR_OUTPUT_LIMIT + 100))
         interaction = self._StubInteraction(output)
         observation_module = self._StubObservationModule()
         frames_out, observation, error = gui.capture_frames(
@@ -690,7 +691,11 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertIn("did not use the cghidEventTap route", error)
         self.assertIn("wheel-measure output:", error)
         self.assertIn("product_scroll_receipt_ticks=1100000", error)
-        self.assertIn(output, error)
+        diagnostic_output = error.split("wheel-measure output:\n", 1)[1]
+        self.assertEqual(
+            diagnostic_output,
+            output[:gui.WHEEL_MEASURE_ERROR_OUTPUT_LIMIT] + "\n...(truncated)",
+        )
         self.assertEqual(observation_module.parse_calls, [])
 
     def test_window_server_display_time_is_separate_from_late_callback(self):
