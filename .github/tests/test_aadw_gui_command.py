@@ -240,17 +240,17 @@ class TrustedProcedureTests(unittest.TestCase):
         )
 
     def test_scroll_inertia_route_points_to_its_trusted_versioned_procedure(self):
-        """Keep the scroll-inertia route bound to the trusted v19 procedure."""
+        """Keep the scroll-inertia route bound to the trusted v20 procedure."""
         route = command.parse_route("/gui-validate scroll-inertia merge")
         assert route is not None
         self.assertEqual(
             command.trusted_procedure(REPOSITORY_ROOT / route["procedure_path"]),
-            "hosted-scroll-inertia/19",
+            "hosted-scroll-inertia/20",
         )
         workflow = (REPOSITORY_ROOT / ".github" / "workflows" / route["workflow_file"]).read_text(
             encoding="utf-8"
         )
-        self.assertIn("'hosted-scroll-inertia/19'", workflow)
+        self.assertIn("'hosted-scroll-inertia/20'", workflow)
         self.assertIn(route["procedure_path"], workflow)
         self.assertIn("HANE_SCROLL_INERTIA_GUI_TARGET_DIR", workflow)
 

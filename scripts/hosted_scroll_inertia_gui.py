@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/19"
+PROCEDURE_VERSION = "hosted-scroll-inertia/20"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -129,14 +129,52 @@ def visible_lines(text: str) -> list[int]:
     return sorted({int(value) for value in re.findall(r"\bLINE\s+(\d+)\b", text, re.I)})
 
 
+def coherent_visible_line_run(lines: Optional[list[int]]) -> Optional[tuple[int, int]]:
+    """Return the strongest line-number sequence, ignoring isolated OCR outliers.
+
+    A screenshot normally contains one contiguous block of fixture line numbers.
+    Vision can occasionally misread a clipped first row (for example LINE 172 as
+    LINE 112); accepting the numeric minimum would then invent a large scroll
+    reversal. Require a unique strongest run; one omitted OCR row is tolerated,
+    while ambiguous evidence stays unavailable so it cannot become a pass.
+    Short but unambiguous captures keep their existing behavior.
+    """
+    normalized = sorted({value for value in (lines or []) if isinstance(value, int)})
+    if not normalized:
+        return None
+
+    runs: list[tuple[int, int, int]] = []
+    start = previous = normalized[0]
+    count = 1
+    for value in normalized[1:]:
+        if value <= previous + 2:
+            previous = value
+            count += 1
+            continue
+        runs.append((count, start, previous))
+        start = previous = value
+        count = 1
+    runs.append((count, start, previous))
+
+    strongest_score = max((count, last - first) for count, first, last in runs)
+    strongest = [
+        (first, last)
+        for count, first, last in runs
+        if (count, last - first) == strongest_score
+    ]
+    if len(strongest) != 1:
+        return None
+    return strongest[0]
+
+
 def first_visible(frame: dict) -> Optional[int]:
-    lines = frame.get("visible_lines", [])
-    return min(lines) if lines else None
+    run = coherent_visible_line_run(frame.get("visible_lines"))
+    return run[0] if run is not None else None
 
 
 def last_visible(frame: dict) -> Optional[int]:
-    lines = frame.get("visible_lines", [])
-    return max(lines) if lines else None
+    run = coherent_visible_line_run(frame.get("visible_lines"))
+    return run[1] if run is not None else None
 
 
 def midpoint_band_is_visible(lines: list[int]) -> bool:
@@ -641,11 +679,8 @@ def parse_wheel_measure_capture_output(output: str, expected_frames: int) -> dic
 
 def select_old_direction_candidate(baseline: int, candidates: list[dict]) -> Optional[dict]:
     for candidate in reversed(candidates):
-        lines = candidate.get("visible_lines")
-        if not lines:
-            continue
-        value = min(lines)
-        if value > baseline:
+        value = first_visible(candidate)
+        if value is not None and value > baseline:
             return {**candidate, "value": value}
     return None
 
@@ -1086,7 +1121,9 @@ def compare_wheel_measurement_paths(interaction, module, env, config, helper, pi
 
 def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: int,
                                window_id: str, scenario_dir: Path,
-                               helper_timeout: float, downward_sign: int) -> list[dict]:
+                               helper_timeout: float, downward_sign: int,
+                               scroll_event_timing_path: Path,
+                               scroll_event_observation_module: Optional[object]) -> list[dict]:
     steps: list[dict] = []
     position, position_lines, _position_text = position_document_midpoint(
         interaction, module, env, config, helper, pid, window_id, scenario_dir,
@@ -1098,26 +1135,29 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
             "document_edges", "pixels_direct_follow", "pixels_first_response_80ms"))
         return steps
 
-    baseline = min(position_lines) if position_lines else None
-    frames, _scroll_event_observation, error = capture_frames(
+    baseline = first_visible({"visible_lines": position_lines})
+    frames, lines_scroll_event_observation, error = capture_frames(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir / "lines-coast", "lines", downward_sign * 8,
         FRAME_DELAYS_MS, helper_timeout,
+        scroll_event_timing_path=scroll_event_timing_path,
+        scroll_event_observation_module=scroll_event_observation_module,
+        capture_scroll_event_timing=True,
     )
     if error:
         steps.append(attach_scroll_event_observation(
-            step("lines_coast", "blocked", error), None))
+            step("lines_coast", "blocked", error), lines_scroll_event_observation))
         steps.append(step("lines_first_response_80ms", "blocked", error))
         time.sleep(FRAME_DELAYS_MS[-1] / 1000)
     else:
         steps.append(attach_scroll_event_observation(
-            evaluate_lines_coast(baseline, frames), None))
+            evaluate_lines_coast(baseline, frames), lines_scroll_event_observation))
         steps.append(evaluate_first_response(baseline, frames, "lines_first_response_80ms"))
 
     reversal_baseline_capture, reversal_baseline_lines, reversal_baseline_text = capture_single(
         interaction, module, env, config, helper, window_id,
         scenario_dir, "reversal-baseline", helper_timeout)
-    reversal_baseline = min(reversal_baseline_lines) if reversal_baseline_lines else None
+    reversal_baseline = first_visible({"visible_lines": reversal_baseline_lines})
     reversal_frames, pre_frame, error = capture_frames(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir / "direction-reversal",
@@ -1299,7 +1339,8 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                             scroll_event_timing_path, scroll_event_observation_module))
                         steps.extend(run_scroll_behavior_checks(
                             interaction, gui_validate, env, config, helper, pid,
-                            window_id, scenario_dir, helper_timeout, downward_sign))
+                            window_id, scenario_dir, helper_timeout, downward_sign,
+                            scroll_event_timing_path, scroll_event_observation_module))
 
                 unchanged = fixture.read_bytes() == contents.encode("utf-8")
                 steps.append(step("document_unchanged", "pass" if unchanged else "fail",
