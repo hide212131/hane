@@ -1,4 +1,4 @@
-name: Sidebar Chrome GUI Infra CI
+name: Hosted GUI Infra CI
 
 on:
   pull_request:
@@ -7,10 +7,20 @@ on:
       - '.github/tests/test_aadw_gui_command.py'
       - '.github/scripts/stage_sidebar_chrome_gui_evidence.py'
       - '.github/workflows/aadw-sidebar-chrome-gui-validation.yml'
+      - '.github/workflows/aadw-gui-validation.yml'
       - '.github/workflows/sidebar-chrome-gui-infra-ci.yml'
       - 'scripts/hosted_sidebar_chrome_gui.py'
       - 'scripts/hosted_sidebar_chrome_gui.swift'
       - 'scripts/tests/test_hosted_sidebar_chrome_gui.py'
+      - 'scripts/aadw_gui_observation.py'
+      - 'scripts/aadw_scroll_event_observation.py'
+      - 'scripts/hosted_gui_interaction.swift'
+      - 'scripts/hosted_gui_interaction.py'
+      - 'scripts/hosted_scroll_inertia_gui.py'
+      - 'scripts/tests/test_aadw_gui_observation.py'
+      - 'scripts/tests/test_aadw_scroll_event_observation.py'
+      - 'scripts/tests/test_hosted_gui_interaction.py'
+      - 'scripts/tests/test_hosted_scroll_inertia_gui.py'
   workflow_dispatch:
 
 permissions:
@@ -29,11 +39,30 @@ jobs:
             .github/scripts/aadw_gui_command.py \
             .github/scripts/stage_sidebar_chrome_gui_evidence.py \
             scripts/hosted_sidebar_chrome_gui.py \
-            scripts/tests/test_hosted_sidebar_chrome_gui.py
+            scripts/tests/test_hosted_sidebar_chrome_gui.py \
+            scripts/aadw_gui_observation.py \
+            scripts/aadw_scroll_event_observation.py \
+            scripts/hosted_gui_interaction.py \
+            scripts/hosted_scroll_inertia_gui.py \
+            scripts/tests/test_aadw_gui_observation.py \
+            scripts/tests/test_aadw_scroll_event_observation.py \
+            scripts/tests/test_hosted_gui_interaction.py \
+            scripts/tests/test_hosted_scroll_inertia_gui.py
       - name: Run GUI router tests
         run: python3 .github/tests/test_aadw_gui_command.py
       - name: Run focused validator unit tests
         run: python3 -m unittest scripts/tests/test_hosted_sidebar_chrome_gui.py
+      - name: Run scroll-inertia measurement tests
+        run: |
+          python3 -m unittest \
+            scripts/tests/test_aadw_gui_observation.py \
+            scripts/tests/test_aadw_scroll_event_observation.py \
+            scripts/tests/test_hosted_scroll_inertia_gui.py
+      - name: Run GUI activation tests
+        run: |
+          python3 -m unittest \
+            scripts.tests.test_hosted_gui_interaction.ActivationStateFreshnessTests \
+            scripts.tests.test_hosted_gui_interaction.OpenSessionActivationOrderingTests
 
   swift-helper-build:
     runs-on: macos-15
@@ -43,3 +72,5 @@ jobs:
           persist-credentials: false
       - name: Compile trusted sidebar chrome helper
         run: swiftc scripts/hosted_sidebar_chrome_gui.swift -o "$RUNNER_TEMP/sidebar-chrome-helper"
+      - name: Compile hosted GUI interaction helper
+        run: swiftc scripts/hosted_gui_interaction.swift -o "$RUNNER_TEMP/hosted-gui-interaction-helper"

@@ -3103,6 +3103,7 @@ name = "hane-metrics"
 version = "0.20.0"
 dependencies = [
  "libc",
+ "mach2",
 ]
 
 [[package]]
