@@ -398,6 +398,7 @@ class ReversalHelperTimingTests(unittest.TestCase):
         self.assertEqual(evidence["frame_capture_completed_ms"], [4.5, 27.1])
 
     def test_normal_frame_capture_posts_and_captures_inside_one_helper(self):
+        """Keep wheel posting and the timed screenshot loop in one helper."""
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         normal_capture = source.split("func wheelCapture(", 1)[1].split("\n}", 1)[0]
         self.assertEqual(normal_capture.count("postScroll(pid, unit, delta)"), 1)
@@ -680,6 +681,7 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
             self.calls: list[list[str]] = []
 
         def run_helper(self, _helper, args, _timeout):
+            """Record helper calls and return the configured timing or OCR data."""
             self.calls.append(args)
             if args[0] in {"wheel-measure", "wheel-capture-timed"}:
                 if self.timing_delta:
@@ -708,10 +710,12 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
             return self.assessed
 
         def parse_wheel_capture_timing_output(self, output):
+            """Record capture-path timing output and return a representative record."""
             self.capture_parse_calls.append(output)
             return {"stub_capture_record": True}
 
         def assess_wheel_capture_timing(self, record):
+            """Return the configured assessment for the representative record."""
             assert record == {"stub_capture_record": True}
             return self.capture_assessed
 
@@ -774,6 +778,7 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
     )
 
     def test_timed_capture_keeps_the_wheel_capture_path_and_attaches_product_timing(self):
+        """Attach timing diagnostics without replacing screenshot evidence."""
         with tempfile.TemporaryDirectory() as directory:
             timing_path = Path(directory) / "timing.log"
             interaction = self._StubInteraction(
@@ -1267,6 +1272,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayTicks: displayTicks", callback)
 
     def test_measurement_uses_stream_response_without_repurposing_product_presentation(self):
+        """Keep display-stream response separate from product presentation time."""
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         measure = source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0]
         self.assertLess(measure.index("displayCapture.start()"), measure.index("postScrollTicks(pid, unit, delta)"))
@@ -1279,6 +1285,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
 
 class ProductScrollTimingReaderContractTests(unittest.TestCase):
     def test_reader_scans_complete_rows_and_matches_current_event_receipt(self):
+        """Skip incomplete or stale log rows while selecting the current event."""
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         reader = source.split("func readScrollEventTiming(", 1)[1].split("\n}", 1)[0]
         self.assertIn("data.lastIndex(of: 10)", reader)
@@ -1289,6 +1296,7 @@ class ProductScrollTimingReaderContractTests(unittest.TestCase):
         self.assertIn("continue", reader)
 
     def test_capture_and_measure_paths_match_timing_to_their_posted_event(self):
+        """Use each helper's posted-event tick for timing-record correlation."""
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         capture = " ".join(source.split("func wheelCapture(", 1)[1].split("\n}", 1)[0].split())
         measure = " ".join(source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0].split())
@@ -1297,6 +1305,7 @@ class ProductScrollTimingReaderContractTests(unittest.TestCase):
         self.assertNotIn("readScrollEventTimingLine", source)
 
     def test_timed_capture_rejects_every_unparseable_delay_token(self):
+        """Reject malformed delay tokens before checking their order and range."""
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         command = source.split('case "wheel-capture-timed":', 1)[1].split('case "wheel-measure":', 1)[0]
         self.assertIn('split(separator: ",", omittingEmptySubsequences: false)', command)

@@ -219,6 +219,7 @@ class AssessWheelMeasurementTests(unittest.TestCase):
 
 class AssessWheelCaptureTimingTests(unittest.TestCase):
     def setUp(self):
+        """Provide one ordered event, receipt, and paint timing sample."""
         self.output = "\n".join([
             "event_route=cghidEventTap",
             "event_post_ticks=1000000",
@@ -232,6 +233,7 @@ class AssessWheelCaptureTimingTests(unittest.TestCase):
         ]) + "\n"
 
     def test_observes_event_receipt_and_paint_on_regular_capture_path(self):
+        """Report the three capture-path stages on the shared clock."""
         record = scroll_event_observation.parse_wheel_capture_timing_output(self.output)
         result = scroll_event_observation.assess_wheel_capture_timing(record)
         self.assertEqual(result["observation"], "observed_ordered")
@@ -241,6 +243,7 @@ class AssessWheelCaptureTimingTests(unittest.TestCase):
         self.assertEqual(result["presentation_observation"], "unavailable")
 
     def test_missing_product_receipt_stays_unavailable(self):
+        """Keep missing application timing unavailable instead of guessing."""
         output = self.output.replace(
             "product_scroll_receipt_ticks=1100000", "product_scroll_receipt_ticks=unavailable")
         record = scroll_event_observation.parse_wheel_capture_timing_output(output)
@@ -250,6 +253,7 @@ class AssessWheelCaptureTimingTests(unittest.TestCase):
         self.assertEqual(result["presentation_observation"], "unavailable")
 
     def test_out_of_order_product_ticks_are_not_reported_as_ordered(self):
+        """Flag a paint timestamp that precedes the recorded receipt."""
         output = self.output.replace(
             "product_frame_paint_ticks=1400000", "product_frame_paint_ticks=900000")
         record = scroll_event_observation.parse_wheel_capture_timing_output(output)

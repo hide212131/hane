@@ -1049,6 +1049,8 @@ func prepareWindowCaptureContext(_ windowID: CGWindowID) -> WindowCapture {
     return capture
 }
 
+/// Captures the target window after one wheel event, optionally attaching
+/// Hane's matching event-receipt and frame-paint timestamps.
 func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
                   _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int],
                   timingPath: String? = nil, pollTimeoutMs: Int = 0) {
@@ -1171,6 +1173,7 @@ struct ProductScrollTiming {
     let timebaseDenom: UInt32
 }
 
+/// Parses the required fields from one product scroll-timing record.
 func parseScrollEventTimingLine(_ line: String) -> ProductScrollTiming? {
     var fields: [String: String] = [:]
     for pair in line.split(separator: " ") {
@@ -1188,16 +1191,7 @@ func parseScrollEventTimingLine(_ line: String) -> ProductScrollTiming? {
                                timebaseNumer: numer, timebaseDenom: denom)
 }
 
-// Measurement-only path (Issue #427): distinguishes the OS event post, Hane's
-// ScrollWheelEvent receipt, the frame paint/submission Hane committed in
-// response, and this helper's own screenshot capture start/end, all read
-// from the one mach clock both processes share. Hane's own paint timestamp
-// is not compositor presentation (see `ProductScrollTiming`/
-// `instrument.rs::ScrollEventTimingOutput`), so true presentation is always
-// reported unavailable rather than inferred from paint. It does not evaluate
-// Issue #389's product thresholds (80ms/55ms/135ms) and must not be read as
-// proof of their pass/fail; a separate observer judges only what this
-// command actually measured.
+/// Returns the timing file size before an input event, or zero if unavailable.
 func fileSizeOrZero(_ path: String) -> UInt64 {
     guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
           let size = attributes[.size] as? UInt64 else {
@@ -1206,6 +1200,8 @@ func fileSizeOrZero(_ path: String) -> UInt64 {
     return size
 }
 
+/// Captures screen and product timing for diagnosis without evaluating
+/// Issue #389 acceptance thresholds or inferring compositor presentation.
 func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
                   _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int],
                   _ timingPath: String, _ pollTimeoutMs: Int) {
