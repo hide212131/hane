@@ -43,6 +43,14 @@ class VisibleLinesTests(unittest.TestCase):
         self.assertTrue(gui.midpoint_band_is_visible([gui.MIDPOINT_BAND_END]))
         self.assertFalse(gui.midpoint_band_is_visible([gui.MIDPOINT_BAND_END + 1]))
 
+    def test_first_visible_ignores_an_isolated_clipped_row_ocr_outlier(self):
+        frame = {"visible_lines": [112, *range(172, 193)]}
+        self.assertEqual(gui.first_visible(frame), 172)
+
+    def test_first_visible_stays_unavailable_when_line_sequence_is_ambiguous(self):
+        frame = {"visible_lines": [10, 11, 12, 100, 101, 102]}
+        self.assertIsNone(gui.first_visible(frame))
+
 
 class CaptureSingleTests(unittest.TestCase):
     def test_ocr_failure_marks_capture_blocked_with_reason(self):
@@ -425,6 +433,15 @@ class OldDirectionCandidateSelectionTests(unittest.TestCase):
         selected = gui.select_old_direction_candidate(100, candidates)
         self.assertEqual(selected["capture_completed_after_initial_ms"], 118)
         self.assertEqual(selected["value"], 108)
+
+    def test_ignores_a_clipped_row_ocr_outlier_when_selecting_old_direction(self):
+        candidates = [{
+            "visible_lines": [112, *range(172, 193)],
+            "capture_completed_after_initial_ms": 78,
+        }]
+        selected = gui.select_old_direction_candidate(161, candidates)
+        self.assertEqual(selected["value"], 172)
+        self.assertEqual(selected["capture_completed_after_initial_ms"], 78)
 
 
 class ReversalCaptureFramesTests(unittest.TestCase):
@@ -1089,9 +1106,10 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
 
 
 class ScrollHelperMeasurementComparisonTests(unittest.TestCase):
-    # The two helpers are compared diagnostically at the same document top;
-    # product acceptance uses the captured screen images from wheel-capture.
-    def test_lines_and_pixels_acceptance_use_the_regular_capture_path(self):
+    # Lines acceptance uses the timed wheel-capture variant so the exact
+    # center-position screenshot result has matching Hane receipt/paint timing.
+    # Pixels acceptance continues using the regular capture path.
+    def test_lines_acceptance_captures_timing_and_pixels_uses_regular_path(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         body = source.split("def run_scroll_behavior_checks(", 1)[1]
         pixels_call = body.split('"pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', 1)[1]
@@ -1100,8 +1118,9 @@ class ScrollHelperMeasurementComparisonTests(unittest.TestCase):
         self.assertNotIn("scroll_event_observation_module", pixels_call)
         lines_call = body.split('"lines-coast", "lines", downward_sign * 8,', 1)[1]
         lines_call = lines_call.split("if error:", 1)[0]
-        self.assertNotIn("scroll_event_timing_path", lines_call)
-        self.assertNotIn("scroll_event_observation_module", lines_call)
+        self.assertIn("scroll_event_timing_path=scroll_event_timing_path", lines_call)
+        self.assertIn("scroll_event_observation_module=scroll_event_observation_module", lines_call)
+        self.assertIn("capture_scroll_event_timing=True", lines_call)
 
     def test_comparison_replays_both_units_from_the_same_document_top(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
@@ -1280,7 +1299,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/19")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/20")
 
 
 class ProductScrollTimingReaderContractTests(unittest.TestCase):
