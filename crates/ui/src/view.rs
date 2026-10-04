@@ -149,10 +149,12 @@ const WHEEL_ZOOM_SETTLE_EPSILON: f32 = 0.001;
 /// The time constant for the main panel's short post-wheel scroll inertia
 /// (issue #389): a plain `ScrollDelta::Lines` scroll keeps coasting after the
 /// input stops, decaying exponentially like `eased_wheel_zoom_step` so the
-/// response is independent of display refresh rate. `3 *
-/// SCROLL_INERTIA_TIME_CONSTANT` (roughly 135 ms) is where the coast is
-/// effectively over, landing inside the requested 100-150 ms window.
-const SCROLL_INERTIA_TIME_CONSTANT: Duration = Duration::from_millis(45);
+/// response is independent of display refresh rate. A shorter time constant
+/// also bounds the visible tail after a rapid burst of large Lines deltas:
+/// a small fraction of a large pending distance can still move many pixels.
+/// The measured seven-event physical-wheel burst settles within roughly
+/// 100-150 ms after its last event with this value.
+const SCROLL_INERTIA_TIME_CONSTANT: Duration = Duration::from_millis(20);
 /// See `WHEEL_ZOOM_MIN_FRAME_TIME`: the same deterministic-at-120Hz clamp,
 /// kept separate so it stays scoped to scroll inertia's own animation frames.
 /// This floor only models the gap between two frames of an *already-running*
@@ -7400,14 +7402,13 @@ mod tests {
              coast_distance={coast_distance}"
         );
 
-        // Roughly 100-150 ms after the input stops (three time constants),
-        // the coast has already covered the large majority of its distance,
-        // matching the requested smooth convergence window.
+        // Three time constants cover the large majority of a single delta;
+        // the burst test below checks when a large visible tail actually ends.
         let covered = travelled_by_three_time_constants
             .expect("the loop must reach three time constants before settling");
         assert!(
             covered / coast_distance > 0.9,
-            "expected most of the coast distance to be covered within ~135ms: {covered} of \
+            "expected most of the coast distance to be covered within three time constants: {covered} of \
              {coast_distance}"
         );
 
@@ -7418,8 +7419,67 @@ mod tests {
         let (long_distance, long_next_velocity) =
             eased_scroll_inertia_step(velocity, Duration::from_secs(1))
                 .expect("a long-elapsed step must still return the remaining coast distance");
-        assert!((long_distance - coast_distance).abs() < 1e-3, "{long_distance}");
+        assert!(
+            (long_distance - coast_distance).abs() < 1e-3,
+            "{long_distance}"
+        );
         assert!(eased_scroll_inertia_step(long_next_velocity, Duration::from_millis(16)).is_none());
+    }
+
+    #[test]
+    fn physical_wheel_burst_settles_within_150ms_of_its_last_event() {
+        // The observed physical mouse sent seven non-precise Lines events
+        // over 72 ms. A one-pixel settle threshold with a long exponential
+        // tail previously kept this large burst visibly moving for ~296 ms
+        // after the last event. Use a generous 72 px per line so this checks
+        // the visible tail of a large document movement, not just a detent.
+        let burst = [
+            (0, 1.0),
+            (8, 1.0),
+            (19, 4.0),
+            (31, 5.0),
+            (44, 6.0),
+            (58, 7.0),
+            (72, 7.0),
+        ];
+        let mut velocity = 0.0;
+        let mut previous_ms = 0;
+        for (index, (at_ms, lines)) in burst.into_iter().enumerate() {
+            velocity += scroll_inertia_velocity_for_lines_delta(lines * 72.0);
+            let elapsed = if index == 0 {
+                SCROLL_INERTIA_COLD_START_FRAME_TIME
+            } else {
+                Duration::from_millis(at_ms - previous_ms)
+            };
+            let (_, next_velocity) = eased_scroll_inertia_step(velocity, elapsed)
+                .expect("a physical wheel burst must keep the coast armed");
+            velocity = next_velocity;
+            previous_ms = at_ms;
+        }
+
+        let mut last_motion_ms = 0;
+        for after_last_ms in (16..=160).step_by(16) {
+            let Some((distance, next_velocity)) =
+                eased_scroll_inertia_step(velocity, Duration::from_millis(16))
+            else {
+                break;
+            };
+            assert!(distance > 0.0, "coast must not reverse: {distance}");
+            last_motion_ms = after_last_ms;
+            velocity = next_velocity;
+        }
+        assert!(
+            last_motion_ms >= 100,
+            "coast stopped too abruptly: {last_motion_ms} ms"
+        );
+        assert!(
+            last_motion_ms <= 150,
+            "visible coast continued too long: {last_motion_ms} ms"
+        );
+        assert!(
+            eased_scroll_inertia_step(velocity, Duration::from_millis(16)).is_none(),
+            "the burst must be fully settled after its final visible frame"
+        );
     }
 
     #[test]
@@ -11504,7 +11564,9 @@ mod tests {
     // Issue #389: short post-wheel scroll inertia for the main panel.
 
     #[gpui::test]
-    fn plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops(cx: &mut gpui::TestAppContext) {
+    fn plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let text = (1..=60)
             .map(|n| format!("line {n:02}"))
             .collect::<Vec<_>>()
@@ -12049,8 +12111,12 @@ mod tests {
             modifiers: gpui::Modifiers::none(),
             touch_phase: gpui::TouchPhase::Moved,
         };
-        let expected_reverse_delta =
-            -f32::from(reverse.delta.pixel_delta(px(view.read_with(cx, |view, _| view.line_height()))).y);
+        let expected_reverse_delta = -f32::from(
+            reverse
+                .delta
+                .pixel_delta(px(view.read_with(cx, |view, _| view.line_height())))
+                .y,
+        );
         assert!(expected_reverse_delta < 0.0, "{expected_reverse_delta}");
 
         // Prime well away from the document start (and, with 600 lines,
@@ -12257,7 +12323,9 @@ mod tests {
         // relies on cannot tell the switch apart from an ordinary unmoved
         // frame (issue #389). `on_document_replaced` must cancel the coast
         // explicitly instead of depending on that check.
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\nthree\n", "Untitled", cx));
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
         view.update(cx, |view, _cx| {
             view.scroll_y = 0.0;
             view.scroll_inertia = Some(ScrollInertia {
@@ -12395,7 +12463,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn height_anchor_recompute_resyncs_a_still_tracking_inertia_coast(cx: &mut gpui::TestAppContext) {
+    fn height_anchor_recompute_resyncs_a_still_tracking_inertia_coast(
+        cx: &mut gpui::TestAppContext,
+    ) {
         // Issue #389: `render` calls `step_scroll_inertia` before laying out
         // and remeasuring visible blocks. When a block being remeasured (e.g.
         // mid-resize) has a different height than before, the height-anchor
@@ -12403,7 +12473,9 @@ mod tests {
         // that still owned `scroll_y` going into that recompute must not then
         // read as stale on the next frame just because of this frame's own
         // correction.
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\nthree\n", "Untitled", cx));
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
         view.update(cx, |view, _cx| {
             view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
             view.scroll_y = 50.0;
@@ -12442,7 +12514,9 @@ mod tests {
         // `scroll_y` before layout is a genuine change of ownership; the
         // height-anchor recompute must not paper over that by resyncing
         // anyway.
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\nthree\n", "Untitled", cx));
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
         view.update(cx, |view, _cx| {
             view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
             view.scroll_y = 50.0;
