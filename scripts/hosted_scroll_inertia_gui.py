@@ -1135,7 +1135,7 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
             "document_edges", "pixels_direct_follow", "pixels_first_response_80ms"))
         return steps
 
-    baseline = min(position_lines) if position_lines else None
+    baseline = first_visible({"visible_lines": position_lines})
     frames, lines_scroll_event_observation, error = capture_frames(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir / "lines-coast", "lines", downward_sign * 8,
@@ -1157,7 +1157,7 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
     reversal_baseline_capture, reversal_baseline_lines, reversal_baseline_text = capture_single(
         interaction, module, env, config, helper, window_id,
         scenario_dir, "reversal-baseline", helper_timeout)
-    reversal_baseline = min(reversal_baseline_lines) if reversal_baseline_lines else None
+    reversal_baseline = first_visible({"visible_lines": reversal_baseline_lines})
     reversal_frames, pre_frame, error = capture_frames(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir / "direction-reversal",
