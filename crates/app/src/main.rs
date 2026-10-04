@@ -5,10 +5,15 @@
 
 #[cfg(any(target_os = "windows", not(feature = "instrument")))]
 use gpui::Focusable;
-use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
-use hane_session::StateStores;
+use gpui::{App, AppContext, Bounds, Global, WindowBounds, WindowOptions, px, size};
+use hane_ai::{
+    AiService, AiServiceConfig, OsCredentialStore, ShellEnvironmentPolicyFormat,
+    SystemBrowserOpener,
+};
+use hane_session::{FileStateStore, StateStores};
 use hane_ui::{AppAssets, EditorView, register_key_bindings};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(target_os = "windows")]
 mod open_request;
@@ -17,6 +22,36 @@ mod open_request;
 mod instrument;
 
 const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、Undo / Redo、Markdown記号の段階表示に加えて、画像、表、保存、自動保存、Recent Files、themeを試せます。\n\n![Hane feather](assets/phase4-feather.svg)\n\n| Feature | Status |\n|:---|---:|\n| Typora-style editing | ✓ |\n| Atomic autosave | ✓ |\n| Light / Dark theme | ✓ |\n\n## Polish\n\n画像と表も元Markdownを唯一の正として保持します。行へカーソルを移動するとsourceを編集できます。\n";
+
+struct AppOwnedAiService(AiService);
+
+impl Global for AppOwnedAiService {}
+
+fn start_ai_service() -> Option<AiService> {
+    let state = FileStateStore::from_environment().ok()?;
+    let binary_path = std::env::var_os("HANE_CODEX_APP_SERVER")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let executable = std::env::current_exe().ok()?;
+            let directory = executable.parent()?;
+            #[cfg(target_os = "windows")]
+            let name = "codex-app-server.exe";
+            #[cfg(not(target_os = "windows"))]
+            let name = "codex-app-server";
+            Some(directory.join(name))
+        })?;
+    if !binary_path.is_absolute() {
+        return None;
+    }
+    AiService::spawn(AiServiceConfig {
+        app_data_root: state.root().to_path_buf(),
+        binary_path,
+        credential_store: Arc::new(OsCredentialStore::new("com.hide212131.hane.ai")),
+        browser_opener: Arc::new(SystemBrowserOpener),
+        shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+    })
+    .ok()
+}
 
 #[cfg(target_os = "windows")]
 fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
@@ -107,6 +142,9 @@ fn main() {
     let process_started = std::time::Instant::now();
     #[cfg(feature = "instrument")]
     let config = hane_ui::InstrumentationConfig::from_environment();
+    // AI is an optional app-owned service. Failure to resolve its state or
+    // start its worker must never prevent the Markdown editor from opening.
+    let ai_service = start_ai_service();
     #[cfg(feature = "instrument")]
     let untitled_source: &str = if config.start_empty {
         ""
@@ -118,6 +156,14 @@ fn main() {
     gpui_platform::application()
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
+            if let Some(service) = ai_service {
+                // GPUI owns this value for the full application lifetime;
+                // views receive handles and may come and go independently.
+                cx.set_global(AppOwnedAiService(service));
+            }
+            let ai_service_handle = cx
+                .try_global::<AppOwnedAiService>()
+                .map(|owner| owner.0.handle());
             register_key_bindings(cx);
             let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
             let window = cx
@@ -142,6 +188,7 @@ fn main() {
                                 }),
                                 None => EditorView::new(untitled_source, "Untitled", cx),
                             };
+                            view.attach_ai_service(ai_service_handle.clone(), cx);
                             #[cfg(any(feature = "instrument", feature = "timing-probe"))]
                             view.arm_startup_timing(process_started);
                             view
@@ -184,7 +231,9 @@ fn main() {
                             .update(cx, |view, window, cx| {
                                 view.open_external_path(&path, cx);
                                 window.activate_window();
-                                window.focus(&view.focus_handle(cx), cx);
+                                if !view.settings_is_open() {
+                                    window.focus(&view.focus_handle(cx), cx);
+                                }
                             })
                             .is_err()
                         {

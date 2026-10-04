@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists, AtomicWriteError};
+use crate::atomic_file::{AtomicWriteError, atomic_write_bytes, read_to_string_if_exists};
 use crate::owner_lock::OwnerLockGuard;
 use crate::secrets::CredentialRef;
 use crate::settings_lock::{AiSettingsExclusiveGuard, AiSettingsLock};
@@ -116,11 +116,16 @@ pub enum SaveError {
     /// The `expected_revision` the caller read no longer matches the
     /// persisted `revision`: another save landed in between. The caller must
     /// reload and must not blindly overwrite fields with a stale snapshot.
-    RevisionConflict { current: Box<AiSettings> },
+    RevisionConflict {
+        current: Box<AiSettings>,
+    },
     /// A credential operation journal entry is still unresolved. Per section
     /// 7.3, no ordinary `AiSettings` save may proceed until journal recovery
     /// has completed and removed it.
     PendingCredentialJournal,
+    /// A plain save cannot add, replace or delete a credential reference:
+    /// those changes must use the journaled credential transaction API.
+    CredentialRefMutationRequiresJournal,
     /// `owner` was acquired against a different path than this store's own
     /// [`AiSettingsStore::new`] `owner_lock_path`: it proves ownership of
     /// *some* runtime owner lock, but not the one this store is scoped to,
@@ -152,16 +157,31 @@ impl std::fmt::Display for SaveError {
             SaveError::Io(e) => write!(f, "I/O error saving AI settings: {e}"),
             SaveError::Busy => write!(f, "AI settings are locked by another AI operation"),
             SaveError::RevisionConflict { .. } => {
-                write!(f, "AI settings were changed concurrently; reload before saving")
+                write!(
+                    f,
+                    "AI settings were changed concurrently; reload before saving"
+                )
             }
             SaveError::PendingCredentialJournal => {
-                write!(f, "a credential operation journal entry must be recovered before saving AI settings")
+                write!(
+                    f,
+                    "a credential operation journal entry must be recovered before saving AI settings"
+                )
             }
+            SaveError::CredentialRefMutationRequiresJournal => f.write_str(
+                "Custom Provider credentials must be changed through the credential transaction",
+            ),
             SaveError::OwnerLockMismatch => {
-                write!(f, "the supplied runtime owner lock guard does not belong to this AI settings store")
+                write!(
+                    f,
+                    "the supplied runtime owner lock guard does not belong to this AI settings store"
+                )
             }
             SaveError::SettingsLockMismatch => {
-                write!(f, "the supplied AI settings lock guard does not belong to this AI settings store")
+                write!(
+                    f,
+                    "the supplied AI settings lock guard does not belong to this AI settings store"
+                )
             }
             SaveError::PersistedDurabilityUnconfirmed(e) => write!(
                 f,
@@ -185,7 +205,11 @@ pub struct AiSettingsStore {
 }
 
 impl AiSettingsStore {
-    pub fn new(path: impl Into<PathBuf>, lock_path: impl Into<PathBuf>, owner_lock_path: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        lock_path: impl Into<PathBuf>,
+        owner_lock_path: impl Into<PathBuf>,
+    ) -> Self {
         AiSettingsStore {
             path: path.into(),
             lock: AiSettingsLock::new(lock_path),
@@ -270,10 +294,32 @@ impl AiSettingsStore {
     ) -> Result<AiSettings, SaveError> {
         self.check_owner(owner)?;
 
-        let guard = self.lock.try_acquire_exclusive().map_err(SaveError::Io)?.ok_or(SaveError::Busy)?;
+        let guard = self
+            .lock
+            .try_acquire_exclusive()
+            .map_err(SaveError::Io)?
+            .ok_or(SaveError::Busy)?;
 
         if !journal_is_empty().map_err(SaveError::Io)? {
             return Err(SaveError::PendingCredentialJournal);
+        }
+
+        let current = self.load().map_err(SaveError::Io)?;
+        if current.revision != expected_revision {
+            return Err(SaveError::RevisionConflict {
+                current: Box::new(current),
+            });
+        }
+        let current_ref = current
+            .custom
+            .as_ref()
+            .and_then(|custom| custom.credential_ref.as_ref());
+        let proposed_ref = new_settings
+            .custom
+            .as_ref()
+            .and_then(|custom| custom.credential_ref.as_ref());
+        if current_ref != proposed_ref {
+            return Err(SaveError::CredentialRefMutationRequiresJournal);
         }
 
         self.write_while_locked(owner, &guard, expected_revision, new_settings)
@@ -322,16 +368,19 @@ impl AiSettingsStore {
         }
         let current = self.load().map_err(SaveError::Io)?;
         if current.revision != expected_revision {
-            return Err(SaveError::RevisionConflict { current: Box::new(current) });
+            return Err(SaveError::RevisionConflict {
+                current: Box::new(current),
+            });
         }
 
         new_settings.schema_version = AI_SETTINGS_SCHEMA_VERSION;
         new_settings.revision = current.revision + 1;
-        new_settings.settings_generation = if new_settings.is_runtime_affecting_change_from(&current) {
-            current.settings_generation + 1
-        } else {
-            current.settings_generation
-        };
+        new_settings.settings_generation =
+            if new_settings.is_runtime_affecting_change_from(&current) {
+                current.settings_generation + 1
+            } else {
+                current.settings_generation
+            };
 
         let bytes = serde_json::to_vec_pretty(&new_settings)
             .map_err(|e| SaveError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
@@ -353,7 +402,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("hane-ai-settings-test-{}-{name}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hane-ai-settings-test-{}-{name}-{n}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -365,9 +417,15 @@ mod tests {
     fn store(name: &str) -> (AiSettingsStore, OwnerLockGuard) {
         let dir = unique_dir(name);
         let owner_lock_path = dir.join("owner.lock");
-        let store =
-            AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
-        let owner = crate::owner_lock::OwnerLock::new(owner_lock_path).try_acquire().unwrap().unwrap();
+        let store = AiSettingsStore::new(
+            dir.join("ai-settings.json"),
+            dir.join("ai-settings.lock"),
+            owner_lock_path.clone(),
+        );
+        let owner = crate::owner_lock::OwnerLock::new(owner_lock_path)
+            .try_acquire()
+            .unwrap()
+            .unwrap();
         (store, owner)
     }
 
@@ -411,7 +469,9 @@ mod tests {
         let (store, owner) = store("current_schema_version");
         let mut settings = AiSettings::default();
         settings.chatgpt.model_id = Some("gpt-test".to_string());
-        store.save(&owner, 0, settings.clone(), always_empty_journal).unwrap();
+        store
+            .save(&owner, 0, settings.clone(), always_empty_journal)
+            .unwrap();
 
         let loaded = store.load().unwrap();
         assert_eq!(loaded.schema_version, AI_SETTINGS_SCHEMA_VERSION);
@@ -424,7 +484,9 @@ mod tests {
         let mut settings = AiSettings::default();
         settings.chatgpt.model_id = Some("gpt-test".to_string());
 
-        let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
+        let saved = store
+            .save(&owner, 0, settings, always_empty_journal)
+            .unwrap();
         assert_eq!(saved.revision, 1);
         assert_eq!(saved.settings_generation, 1);
 
@@ -447,15 +509,48 @@ mod tests {
             custom: Some(custom.clone()),
             ..AiSettings::default()
         };
-        let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
+        let saved = store
+            .save(&owner, 0, settings, always_empty_journal)
+            .unwrap();
         assert_eq!(saved.settings_generation, 1);
 
         let mut renamed = saved.clone();
         renamed.custom.as_mut().unwrap().name = "Renamed Provider".to_string();
-        let saved_again = store.save(&owner, saved.revision, renamed, always_empty_journal).unwrap();
+        let saved_again = store
+            .save(&owner, saved.revision, renamed, always_empty_journal)
+            .unwrap();
 
         assert_eq!(saved_again.revision, 2);
-        assert_eq!(saved_again.settings_generation, 1, "a display-name-only change must not bump settings_generation");
+        assert_eq!(
+            saved_again.settings_generation, 1,
+            "a display-name-only change must not bump settings_generation"
+        );
+    }
+
+    #[test]
+    fn ordinary_save_cannot_mutate_a_custom_credential_reference() {
+        let (store, owner) = store("credential_ref_requires_journal");
+        let mut settings = AiSettings {
+            custom: Some(CustomConnectionSettings {
+                id: "custom-1".to_string(),
+                name: "Local test".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                model_id: "test-model".to_string(),
+                credential_ref: None,
+            }),
+            ..AiSettings::default()
+        };
+        let first = store
+            .save(&owner, 0, settings.clone(), always_empty_journal)
+            .unwrap();
+
+        settings.custom.as_mut().unwrap().credential_ref =
+            Some(CredentialRef::from_persisted("secret-ref"));
+        assert!(matches!(
+            store.save(&owner, first.revision, settings, always_empty_journal),
+            Err(SaveError::CredentialRefMutationRequiresJournal)
+        ));
+        assert_eq!(store.load().unwrap(), first);
     }
 
     #[test]
@@ -473,13 +568,20 @@ mod tests {
             custom: Some(custom.clone()),
             ..AiSettings::default()
         };
-        let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
+        let saved = store
+            .save(&owner, 0, settings, always_empty_journal)
+            .unwrap();
 
         let mut changed = saved.clone();
         changed.custom.as_mut().unwrap().base_url = "https://other.example/v1".to_string();
-        let saved_again = store.save(&owner, saved.revision, changed, always_empty_journal).unwrap();
+        let saved_again = store
+            .save(&owner, saved.revision, changed, always_empty_journal)
+            .unwrap();
 
-        assert_eq!(saved_again.settings_generation, saved.settings_generation + 1);
+        assert_eq!(
+            saved_again.settings_generation,
+            saved.settings_generation + 1
+        );
     }
 
     #[test]
@@ -493,7 +595,9 @@ mod tests {
         // tries to save with a snapshot that is now stale.
         let mut stale = AiSettings::default();
         stale.chatgpt.model_id = Some("gpt-b".to_string());
-        let err = store.save(&owner, 0, stale, always_empty_journal).unwrap_err();
+        let err = store
+            .save(&owner, 0, stale, always_empty_journal)
+            .unwrap_err();
         match err {
             SaveError::RevisionConflict { current } => assert_eq!(*current, saved_first),
             other => panic!("expected RevisionConflict, got {other:?}"),
@@ -508,17 +612,23 @@ mod tests {
         let (store, owner) = store("busy_shared_holder");
         let shared = store.settings_lock().try_acquire_shared().unwrap().unwrap();
 
-        let err = store.save(&owner, 0, AiSettings::default(), always_empty_journal).unwrap_err();
+        let err = store
+            .save(&owner, 0, AiSettings::default(), always_empty_journal)
+            .unwrap_err();
         assert!(matches!(err, SaveError::Busy));
 
         drop(shared);
-        store.save(&owner, 0, AiSettings::default(), always_empty_journal).unwrap();
+        store
+            .save(&owner, 0, AiSettings::default(), always_empty_journal)
+            .unwrap();
     }
 
     #[test]
     fn save_is_rejected_while_a_credential_journal_entry_is_pending() {
         let (store, owner) = store("pending_journal");
-        let err = store.save(&owner, 0, AiSettings::default(), || Ok(false)).unwrap_err();
+        let err = store
+            .save(&owner, 0, AiSettings::default(), || Ok(false))
+            .unwrap_err();
         assert!(matches!(err, SaveError::PendingCredentialJournal));
         // Nothing was written.
         assert_eq!(store.load().unwrap(), AiSettings::default());
@@ -538,9 +648,15 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let err = store.save(&other_owner, 0, AiSettings::default(), always_empty_journal).unwrap_err();
+        let err = store
+            .save(&other_owner, 0, AiSettings::default(), always_empty_journal)
+            .unwrap_err();
         assert!(matches!(err, SaveError::OwnerLockMismatch));
-        assert_eq!(store.load().unwrap(), AiSettings::default(), "a mismatched guard must never write settings");
+        assert_eq!(
+            store.load().unwrap(),
+            AiSettings::default(),
+            "a mismatched guard must never write settings"
+        );
     }
 
     /// Regression coverage for the root cause behind the mismatch being
@@ -566,12 +682,18 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, SaveError::OwnerLockMismatch));
-        assert!(!journal_called.load(Ordering::SeqCst), "the journal check must never run for a mismatched owner");
+        assert!(
+            !journal_called.load(Ordering::SeqCst),
+            "the journal check must never run for a mismatched owner"
+        );
 
         // The settings lock itself must still be free: a mismatched owner
         // must not have taken it.
         let shared = store.settings_lock().try_acquire_shared().unwrap();
-        assert!(shared.is_some(), "the settings lock must never be acquired for a mismatched owner");
+        assert!(
+            shared.is_some(),
+            "the settings lock must never be acquired for a mismatched owner"
+        );
     }
 
     /// Regression coverage for the root cause behind `write_while_locked`
@@ -584,10 +706,13 @@ mod tests {
     fn write_while_locked_rejects_a_guard_acquired_from_a_different_settings_lock_path() {
         let (store, owner) = store("settings_lock_mismatch");
         let other_dir = unique_dir("settings_lock_mismatch_other");
-        let other_lock = crate::settings_lock::AiSettingsLock::new(other_dir.join("ai-settings.lock"));
+        let other_lock =
+            crate::settings_lock::AiSettingsLock::new(other_dir.join("ai-settings.lock"));
         let other_guard = other_lock.try_acquire_exclusive().unwrap().unwrap();
 
-        let err = store.write_while_locked(&owner, &other_guard, 0, AiSettings::default()).unwrap_err();
+        let err = store
+            .write_while_locked(&owner, &other_guard, 0, AiSettings::default())
+            .unwrap_err();
         assert!(matches!(err, SaveError::SettingsLockMismatch));
         assert_eq!(
             store.load().unwrap(),
@@ -598,7 +723,7 @@ mod tests {
 
     #[test]
     fn a_rename_that_landed_but_could_not_confirm_parent_dir_sync_durability_still_persists_and_is_reported_distinctly()
-    {
+     {
         // Regression coverage for the "rename succeeded, parent directory
         // fsync failed" case: the write must still take effect (the settings
         // file already has the new content) and the error returned must be
@@ -611,7 +736,9 @@ mod tests {
 
         let mut settings = AiSettings::default();
         settings.chatgpt.model_id = Some("gpt-test".to_string());
-        let err = store.save(&owner, 0, settings.clone(), always_empty_journal).unwrap_err();
+        let err = store
+            .save(&owner, 0, settings.clone(), always_empty_journal)
+            .unwrap_err();
         match err {
             SaveError::PersistedDurabilityUnconfirmed(_) => {}
             other => panic!("expected PersistedDurabilityUnconfirmed, got {other:?}"),

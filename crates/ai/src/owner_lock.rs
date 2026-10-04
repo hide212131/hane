@@ -78,7 +78,10 @@ impl OwnerLock {
             .truncate(false)
             .open(&self.path)?;
         if platform::try_lock_exclusive(&file)? {
-            Ok(Some(OwnerLockGuard { path: self.path.clone(), file }))
+            Ok(Some(OwnerLockGuard {
+                path: self.path.clone(),
+                file,
+            }))
         } else {
             Ok(None)
         }
@@ -283,7 +286,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn parent_can_reacquire_immediately_after_dropping_the_guard_even_while_a_forked_child_still_holds_the_inherited_pre_exec_fd()
-    {
+     {
         let dir = std::env::temp_dir().join(format!(
             "hane-ai-owner-lock-test-{}-{}",
             std::process::id(),
@@ -293,7 +296,10 @@ mod tests {
         let lock_path = dir.join("runtime.lock");
 
         let lock = OwnerLock::new(&lock_path);
-        let guard = lock.try_acquire().unwrap().expect("first acquire must succeed");
+        let guard = lock
+            .try_acquire()
+            .unwrap()
+            .expect("first acquire must succeed");
 
         // Two pipes synchronize with the forked child without relying on
         // sleeps: `ready` lets the child tell the parent it is alive and
@@ -302,8 +308,16 @@ mod tests {
         // produces); `go` lets the parent tell the child it may now exit.
         let mut ready_fds = [0i32; 2];
         let mut go_fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(ready_fds.as_mut_ptr()) }, 0, "pipe() for readiness signal failed");
-        assert_eq!(unsafe { libc::pipe(go_fds.as_mut_ptr()) }, 0, "pipe() for exit signal failed");
+        assert_eq!(
+            unsafe { libc::pipe(ready_fds.as_mut_ptr()) },
+            0,
+            "pipe() for readiness signal failed"
+        );
+        assert_eq!(
+            unsafe { libc::pipe(go_fds.as_mut_ptr()) },
+            0,
+            "pipe() for exit signal failed"
+        );
         let [ready_r, ready_w] = ready_fds;
         let [go_r, go_w] = go_fds;
 
@@ -335,7 +349,10 @@ mod tests {
         }
         let mut buf: u8 = 0;
         let n = unsafe { libc::read(ready_r, &mut buf as *mut u8 as *mut libc::c_void, 1) };
-        assert_eq!(n, 1, "child must signal it is alive, still holding its inherited fd, before the parent proceeds");
+        assert_eq!(
+            n, 1,
+            "child must signal it is alive, still holding its inherited fd, before the parent proceeds"
+        );
         unsafe { libc::close(ready_r) };
 
         // The child now holds its own inherited fd referring to the same

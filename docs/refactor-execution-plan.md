@@ -515,3 +515,30 @@ autosaveのactive-ID/ticket確認とdraftの元session-ID/revision確認の違�
 **残件**
 
 session I/O、background parse、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は引き続き #301 の後続として実行計画で追跡する。#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置（`view/session_save.rs` を参照する `view/inline_rename.rs` の呼び出し）に依存する後続がある場合は逆順に戻す。
+
+### 9.13 RF2-A: EditorView機械的分割 第6PR — background parse分離（#301）
+
+実装はPR [#419](https://github.com/hide212131/hane/pull/419)、starting head `178464102f9daeed3bec2fa28adc9fd458f9dbee`（基準main `145188eef1f1353cfd903b0277458ece71ea8831` と同一tree、対象 `view.rs` 基準blob `95a5c02713198a0013ebf969bd4f06dda53da61b`）に対して行った。PR本文は `Refs #301` とし、#301全体は閉じない。保存済み設計はPR #418のcommit `4255fd91357067018d4f213bba61316513f4eb74`、`docs/refactor-rf2a-background-parse-implementation-spec.md`。#418は未マージのためtarget treeに存在しないが、本節の対応表・理由は保存済み設計の転記であり、#418自体は変更していない。#397/#415/#416/#417のcurrent差分（タブclose、open/session/search接続など）は今回移動した2メソッド本体を変更しておらず、未受入branchからのコピーも行っていない。#395は停止中のまま再開・移植していない。
+
+**実際の旧→新対応と可視性**
+
+`crates/ui/src/view.rs` の既存 `impl EditorView` ブロックにあった background parse専用の2メソッドを、新規 `crates/ui/src/view/background_parse.rs` の新しい `impl EditorView` ブロックへ、`schedule_document_parse` → `schedule_joined_parse` の順のまま機械的に移した。署名・引数・戻り値・属性・doc comment（`[Self::schedule_document_parse]` を含む）・inline commentとbodyは変更していない。
+
+| 旧定義（`view.rs`） | 新定義（`view/background_parse.rs`） | 可視性 | 理由 |
+| --- | --- | --- | --- |
+| `schedule_document_parse` | `schedule_document_parse` | private → `pub(super)` | 親 `view.rs` に残る `impl Render for EditorView` など既存callerが呼べるようにする最小可視性 |
+| `schedule_joined_parse` | `schedule_joined_parse` | private → `pub(super)` | 同上。親に残る既存callerが呼べるようにする最小可視性 |
+
+変更した意味上の差はこの2件の可視性だけで、名前・引数・戻り値・関数本体・属性・doc/inline comment・相対順は原文どおり維持した。`view.rs` には `mod background_parse;` を既存の `mod inline_rename;` の直前に追加した。新moduleの冒頭は既存の兄弟module（`view/viewport.rs` 等）と同じ `use super::*;` を使う。
+
+**親 `view.rs` に残した責務**
+
+`EditorView` の全field、`from_sessions` 初期化、`on_document_replaced`、`DocumentKey`、`JoinedParseJob`、`JoinedBlockCache`、`Granularity`、`HeightBlocks`、`MAX_JOINED_PARSE_JOBS`、`document_key`、`block_context_revision_is_current`、`height_snapshot_matches_line_height`、index/height/cache共有helper、`after_input`、`activate_session`、新規note/`finish_open`、render、既存tests/fixtureは親 `view.rs` に残した。新規Manager/trait/Entity/状態所有者の追加や既存fieldのpub化は行っていない。`actions.rs`、`input.rs`、`capture.rs`、既存 `view` 子module、他crate、Cargo設定・lock、workflowは変更していない。
+
+**検証**
+
+このPRの実装工程はshell/test/build/lint/git/commit/push/CI/review/GUI/merge実行権限を持たないworkerが行い、対象headのコード読解と、Read/Edit/Writeによる2件の純粋な移動・可視性確認だけを行った。`cargo test` / `cargo test --all-features` / `cargo clippy` / fmt / CI / GUI validationは本working sessionで実行していない。これらの結果はCommanderが別途取得し、本節に追記するのではなくPR #419のコメントに記録する。本節を含むこの文書更新の時点では上記検証は未実施であり、成功・失敗のいずれとも記載しない。
+
+**残件**
+
+session I/O、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は引き続き #301 の後続として実行計画で追跡する。#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置（`view/background_parse.rs` の2メソッド）に依存する後続がある場合は逆順に戻す。

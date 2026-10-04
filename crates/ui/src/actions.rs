@@ -262,7 +262,7 @@ command_actions! {
     },
     CancelComposition ("escape") => cancel_composition |view, _window, cx| {
         if view.settings_open() {
-            view.close_settings(_window, cx);
+            view.handle_settings_escape(_window, cx);
             return;
         }
         if view.dismiss_file_tab_context_menu(cx) {
