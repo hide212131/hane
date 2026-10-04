@@ -87,6 +87,69 @@ def parse_wheel_measure_output(output: str, expected_frames: int) -> dict:
     }
 
 
+def parse_wheel_capture_timing_output(output: str) -> dict:
+    """Reads only the shared-clock event/receipt/paint fields from the
+    regular wheel-capture helper. It deliberately does not infer compositor
+    presentation from Hane's paint timestamp."""
+    fields = _parse_fields(output)
+    return {
+        "event_route": fields.get("event_route"),
+        "event_post_ticks": _uint(fields, "event_post_ticks"),
+        "helper_mach_timebase_numer": _uint(fields, "mach_timebase_numer"),
+        "helper_mach_timebase_denom": _uint(fields, "mach_timebase_denom"),
+        "product_scroll_receipt_ticks": _uint(fields, "product_scroll_receipt_ticks"),
+        "product_frame_paint_ticks": _uint(fields, "product_frame_paint_ticks"),
+        "product_mach_timebase_numer": _uint(fields, "product_mach_timebase_numer"),
+        "product_mach_timebase_denom": _uint(fields, "product_mach_timebase_denom"),
+    }
+
+
+def assess_wheel_capture_timing(record: dict) -> dict:
+    """Classifies whether the existing screenshot helper established the
+    event-post -> product-receipt -> product-paint chain on a shared mach
+    clock. This is timing diagnosis only, never Issue #389 acceptance."""
+    if record.get("event_route") != "cghidEventTap":
+        return _unavailable("OSイベント経路がcghidEventTapではない。")
+    numer = record.get("helper_mach_timebase_numer")
+    denom = record.get("helper_mach_timebase_denom")
+    product_numer = record.get("product_mach_timebase_numer")
+    product_denom = record.get("product_mach_timebase_denom")
+    event_ticks = record.get("event_post_ticks")
+    receipt_ticks = record.get("product_scroll_receipt_ticks")
+    paint_ticks = record.get("product_frame_paint_ticks")
+    if (type(event_ticks) is not int or type(receipt_ticks) is not int
+            or type(paint_ticks) is not int or not numer or not denom
+            or numer > 0xFFFFFFFF or denom > 0xFFFFFFFF):
+        return _unavailable("イベント送出・Hane受信・描画時刻のいずれかが欠落している。")
+    if (not product_numer or not product_denom
+            or product_numer > 0xFFFFFFFF or product_denom > 0xFFFFFFFF
+            or numer != product_numer or denom != product_denom):
+        return _unavailable("ヘルパーとHaneのmach timebaseが一致しない。")
+
+    event_ms = _ticks_to_ms(event_ticks, numer, denom)
+    receipt_ms = _ticks_to_ms(receipt_ticks, numer, denom)
+    paint_ms = _ticks_to_ms(paint_ticks, numer, denom)
+    if any(value is None or not math.isfinite(value) for value in (event_ms, receipt_ms, paint_ms)):
+        return _unavailable("共有mach時刻をミリ秒へ変換できない。")
+    ordered = event_ticks <= receipt_ticks <= paint_ticks
+    stages = {
+        "event_post_ms": event_ms,
+        "scroll_receipt_ms": receipt_ms,
+        "frame_paint_ms": paint_ms,
+        "event_to_receipt_ms": receipt_ms - event_ms,
+        "receipt_to_paint_ms": paint_ms - receipt_ms,
+        "event_to_paint_ms": paint_ms - event_ms,
+    }
+    return {
+        "observation": "observed_ordered" if ordered else "observed_disordered",
+        "reason": None if ordered else "イベント受信と描画の時刻が因果順になっていない。",
+        "stages_ms": stages,
+        "clock_consistent": True,
+        "window_server_display_observation": "unavailable",
+        "presentation_observation": "unavailable",
+    }
+
+
 def _ticks_to_ms(ticks: Optional[int], numer: Optional[int], denom: Optional[int]) -> Optional[float]:
     if ticks is None or not numer or not denom:
         return None
