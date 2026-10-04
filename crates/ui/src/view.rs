@@ -11544,19 +11544,33 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Open the confirm overlay by middle-clicking the dirty active tab,
-        // the same trigger the other tests in this group use.
         let first_tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
-        cx.simulate_mouse_down(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
-        cx.simulate_mouse_up(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
-        cx.run_until_parked();
 
-        view.read_with(cx, |view, _| {
-            assert!(
-                view.tab_close_confirm.is_some(),
-                "the confirm overlay must be open for the rest of this test to be meaningful"
-            );
+        // Open the confirm overlay by middle-clicking the dirty active tab,
+        // the same trigger the other tests in this group use. The dialog's
+        // own `on_mouse_down_out` dismisses the confirm as soon as a click
+        // lands outside it, so each probe below reopens the confirm for
+        // itself right before checking whether its click reached through
+        // the overlay, instead of sharing one overlay across all probes.
+        let target_id = view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 2, "both sessions must still be open");
+            view.sessions.active_id()
         });
+        let open_confirm = |cx: &mut gpui::VisualTestContext| {
+            cx.simulate_mouse_down(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+            cx.simulate_mouse_up(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.tab_close_confirm.as_ref().map(|confirm| confirm.id),
+                    Some(target_id),
+                    "the confirm overlay must be (re)opened and target the dirty session \
+                     for the rest of this probe to be meaningful"
+                );
+            });
+        };
+
+        open_confirm(cx);
 
         let other_tab = cx
             .debug_bounds("file-tab-last")
@@ -11573,10 +11587,15 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.sessions.active_id(),
-                SessionId(0),
+                target_id,
                 "a click on the background tab must not reach it through the confirm overlay"
             );
         });
+
+        // The click above already dismissed the confirm via the dialog's
+        // outside-click handler, so reopen it before the next, independent
+        // probe.
+        open_confirm(cx);
 
         // A middle-click on the background tab must not close it either.
         cx.simulate_mouse_down(other_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
@@ -11590,6 +11609,9 @@ mod tests {
             );
             assert!(view.sessions.session_for_path(&other_path).is_some());
         });
+
+        // Reopen the confirm once more before the last, independent probe.
+        open_confirm(cx);
 
         // A click into the document body must not move the caret.
         cx.simulate_mouse_down(row.center(), MouseButton::Left, gpui::Modifiers::none());
