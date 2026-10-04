@@ -1748,6 +1748,15 @@ impl EditorView {
     /// session by whatever route it needs (its own path, or Save As when it
     /// has none yet) and arms `tab_close_after_save` so the close actually
     /// happens once that write lands cleanly; see `resolve_pending_tab_close`.
+    ///
+    /// For a session with no path yet, arming happens only once the user has
+    /// actually picked a Save As target, inside `prompt_save_as_for_close`
+    /// — not here. Arming now, before any write tied to this close request
+    /// even exists, would let an unrelated write for the same untitled
+    /// document (e.g. the H1 title-sync create racing the still-open Save As
+    /// dialog) read as satisfying this request the moment it lands the
+    /// document clean, closing the tab out from under a dialog the user has
+    /// not finished answering yet.
     fn confirm_save_and_close_tab(&mut self, id: SessionId, cx: &mut Context<Self>) {
         if self
             .tab_close_confirm
@@ -1758,8 +1767,8 @@ impl EditorView {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
-        self.tab_close_after_save.insert(id, session.generation());
         if session.path().is_some() {
+            self.tab_close_after_save.insert(id, session.generation());
             self.save_session(id, SaveIntent::Current, cx);
         } else {
             self.prompt_save_as_for_close(id, cx);
@@ -1789,6 +1798,14 @@ impl EditorView {
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(Some(path))) => {
                 let _ = view.update(cx, |view, cx| {
+                    // Armed now, against the generation as of this specific
+                    // write, so only this user-chosen write's own landing
+                    // (checked by `resolve_pending_tab_close`) can close the
+                    // tab: nothing landed for this session before the user
+                    // chose a target is eligible to satisfy this request.
+                    if let Some(session) = view.sessions.get(id) {
+                        view.tab_close_after_save.insert(id, session.generation());
+                    }
                     view.save_session(id, SaveIntent::To(path), cx);
                 });
             }
@@ -12025,6 +12042,90 @@ mod tests {
                 "a canceled Save As must not leave a close request armed for a later, unrelated save"
             );
         });
+    }
+
+    // CodeRabbit follow-up on Issue #411: a close-and-save request for an
+    // untitled work-folder note opens a Save As dialog and must wait for the
+    // user's own chosen write, not for whatever other write happens to land
+    // the same untitled document clean in the meantime — such as the H1
+    // title-sync create racing the still-open dialog here. Arming
+    // `tab_close_after_save` before the user has picked a path (i.e. before
+    // any write tied to this request even exists) let that unrelated create
+    // satisfy the request the moment it landed, closing the tab out from
+    // under the open dialog.
+    #[gpui::test]
+    fn save_and_close_on_an_untitled_note_waits_for_its_own_save_as_not_an_unrelated_h1_create(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("close-save-as-vs-h1-create");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let save_as_path = root.join("Chosen.md");
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        let id = view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("LangChain4j").unwrap();
+            view.after_input(cx);
+            let id = view.sessions.active_id();
+            // Opens the Save As dialog: the session is still untitled, so
+            // this is the same "no path yet" branch `new_work_folder_note`
+            // leaves it in, before the H1 title-sync debounce has fired.
+            view.request_tab_close(id, cx);
+            view.confirm_save_and_close_tab(id, cx);
+            id
+        });
+
+        // Lets the H1 title-sync create for this same untitled document run
+        // to completion while the Save As dialog above is still unanswered.
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the H1 title-sync create landing must not close the tab out from under the open Save As dialog"
+            );
+            assert!(
+                view.sessions
+                    .get(id)
+                    .and_then(|session| session.path())
+                    .is_some(),
+                "the unrelated title-sync create should still have landed its own file"
+            );
+            assert!(
+                !view.sessions.get(id).unwrap().is_dirty(),
+                "the title-sync create leaves the document reading as clean, which is exactly what must not be mistaken for the pending Save As landing"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a close request waiting on a Save As path the user has not chosen yet must not be armed"
+            );
+        });
+
+        cx.simulate_new_path_selection(|_| Some(save_as_path.clone()));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_none(),
+                "the tab must close once the user's own chosen Save As write lands"
+            );
+        });
+        assert!(
+            save_as_path.exists(),
+            "the user's chosen Save As target must be written before the tab closes"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     // Regression for the "遅延通知" requirement: a close-and-save request
