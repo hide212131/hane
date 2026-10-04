@@ -1087,8 +1087,10 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     if let timingPath {
         let pollDeadline = Date().addingTimeInterval(Double(max(0, pollTimeoutMs)) / 1000)
         while productTiming == nil && Date() < pollDeadline {
-            if let line = readScrollEventTimingLine(timingPath, since: timingOffsetBefore) {
-                productTiming = parseScrollEventTimingLine(line)
+            if let eventPostedTicks {
+                productTiming = readScrollEventTiming(
+                    timingPath, since: timingOffsetBefore, forEventPostedAt: eventPostedTicks
+                )
             }
             if productTiming == nil { Thread.sleep(forTimeInterval: 0.01) }
         }
@@ -1129,15 +1131,13 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     }
 }
 
-/// Reads whatever Hane appended to the product scroll-timing file at `path`
-/// since byte `offset`, and parses only the first full line found there.
-/// A line only counts as "full" once it is non-empty and terminated by its
-/// own `\n`; a partial append (no trailing newline yet) is treated the same
-/// as nothing written yet, so the caller polls again instead of parsing a
-/// truncated line. Anything not written yet, or written in a form this does
-/// not recognize, is the caller's cue to treat the product side as
-/// measurement-unavailable rather than guess at a value (Issue #427).
-func readScrollEventTimingLine(_ path: String, since offset: UInt64) -> String? {
+/// Reads complete timing records appended since `offset` and returns the
+/// first parseable record received at or after the current event post. A late
+/// record for an earlier event, malformed rows, and a final partial line are
+/// ignored; if no matching record is available, the caller reports product
+/// timing as unavailable rather than guessing (Issue #427).
+func readScrollEventTiming(_ path: String, since offset: UInt64,
+                           forEventPostedAt eventPostedTicks: UInt64) -> ProductScrollTiming? {
     guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
     defer { try? handle.close() }
     do {
@@ -1146,11 +1146,17 @@ func readScrollEventTimingLine(_ path: String, since offset: UInt64) -> String? 
         return nil
     }
     let data = handle.readDataToEndOfFile()
-    guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return nil }
-    guard let newlineIndex = text.firstIndex(of: "\n") else { return nil }
-    let line = text[text.startIndex..<newlineIndex]
-    guard !line.isEmpty else { return nil }
-    return String(line)
+    guard let lastNewline = data.lastIndex(of: 10) else { return nil }
+    let completeLines = data.prefix(through: lastNewline)
+    for lineData in completeLines.split(separator: 10, omittingEmptySubsequences: true) {
+        guard let line = String(data: lineData, encoding: .utf8),
+              let timing = parseScrollEventTimingLine(line),
+              timing.receiptTicks >= eventPostedTicks else {
+            continue
+        }
+        return timing
+    }
+    return nil
 }
 
 struct ProductScrollTiming {
@@ -1237,9 +1243,9 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     let pollDeadline = Date().addingTimeInterval(Double(pollTimeoutMs) / 1000)
     var productTiming: ProductScrollTiming?
     while productTiming == nil && Date() < pollDeadline {
-        if let line = readScrollEventTimingLine(timingPath, since: timingOffsetBefore) {
-            productTiming = parseScrollEventTimingLine(line)
-        }
+        productTiming = readScrollEventTiming(
+            timingPath, since: timingOffsetBefore, forEventPostedAt: eventPostedTicks
+        )
         if productTiming == nil { Thread.sleep(forTimeInterval: 0.01) }
     }
 

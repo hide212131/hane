@@ -1277,6 +1277,26 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/19")
 
 
+class ProductScrollTimingReaderContractTests(unittest.TestCase):
+    def test_reader_scans_complete_rows_and_matches_current_event_receipt(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        reader = source.split("func readScrollEventTiming(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("data.lastIndex(of: 10)", reader)
+        self.assertIn("data.prefix(through: lastNewline)", reader)
+        self.assertIn("completeLines.split(separator: 10", reader)
+        self.assertIn("parseScrollEventTimingLine(line)", reader)
+        self.assertIn("timing.receiptTicks >= eventPostedTicks", reader)
+        self.assertIn("continue", reader)
+
+    def test_capture_and_measure_paths_match_timing_to_their_posted_event(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        capture = " ".join(source.split("func wheelCapture(", 1)[1].split("\n}", 1)[0].split())
+        measure = " ".join(source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0].split())
+        self.assertIn("since: timingOffsetBefore, forEventPostedAt: eventPostedTicks", capture)
+        self.assertIn("since: timingOffsetBefore, forEventPostedAt: eventPostedTicks", measure)
+        self.assertNotIn("readScrollEventTimingLine", source)
+
+
 class DocumentEdgeTests(unittest.TestCase):
     def test_accepts_reaching_and_staying_at_each_edge(self):
         top = gui.evaluate_document_edge(
