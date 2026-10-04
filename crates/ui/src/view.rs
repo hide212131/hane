@@ -6013,6 +6013,7 @@ impl EditorView {
         div()
             .id("tab-close-confirm-overlay")
             .debug_selector(|| "tab-close-confirm-overlay".to_owned())
+            .occlude()
             .absolute()
             .inset_0()
             .flex()
@@ -11500,6 +11501,106 @@ mod tests {
             // close already follows.
             assert!(view.sessions.active().path().is_none());
             assert!(!view.sessions.active().is_dirty());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn tab_close_confirm_overlay_blocks_clicks_to_background_elements(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-confirm-occlude");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let other_path = PathBuf::from("other.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("before"),
+                identity: hane_session::FileIdentity::lexical(path.clone()),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path.clone()),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let caret = view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.editor().selection()
+        });
+        cx.run_until_parked();
+
+        // Open the confirm overlay by middle-clicking the dirty active tab,
+        // the same trigger the other tests in this group use.
+        let first_tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.tab_close_confirm.is_some(),
+                "the confirm overlay must be open for the rest of this test to be meaningful"
+            );
+        });
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("background tab is still rendered under the overlay");
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("document body is still rendered under the overlay");
+
+        // A click on the background tab must not activate it: without
+        // `.occlude()` on the overlay, the tab underneath is still
+        // considered hovered and receives the click through the modal.
+        cx.simulate_click(other_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "a click on the background tab must not reach it through the confirm overlay"
+            );
+        });
+
+        // A middle-click on the background tab must not close it either.
+        cx.simulate_mouse_down(other_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(other_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                2,
+                "a middle-click on the background tab must not close it through the confirm overlay"
+            );
+            assert!(view.sessions.session_for_path(&other_path).is_some());
+        });
+
+        // A click into the document body must not move the caret.
+        cx.simulate_mouse_down(row.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(row.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                caret,
+                "a click into the document body must not move the caret through the confirm overlay"
+            );
         });
 
         std::fs::remove_dir_all(root).unwrap();
