@@ -1451,7 +1451,14 @@ case "wheel-capture-timed":
           let pollTimeoutMs = Int(arguments[8]) else {
         fail("wheel-capture-timed requires PID, lines|pixels, delta, window ID, frame directory, comma-separated delays, product timing path and poll timeout ms")
     }
-    let timedFrameDelays = arguments[6].split(separator: ",").compactMap { Int($0) }
+    let timedFrameDelayTokens = arguments[6].split(separator: ",", omittingEmptySubsequences: false)
+    var timedFrameDelays: [Int] = []
+    for token in timedFrameDelayTokens {
+        guard let delay = Int(token) else {
+            fail("wheel-capture-timed frame delays must be comma-separated integers")
+        }
+        timedFrameDelays.append(delay)
+    }
     guard !timedFrameDelays.isEmpty,
           timedFrameDelays.first == 0,
           timedFrameDelays == timedFrameDelays.sorted(),

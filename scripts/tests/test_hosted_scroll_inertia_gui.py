@@ -1296,6 +1296,16 @@ class ProductScrollTimingReaderContractTests(unittest.TestCase):
         self.assertIn("since: timingOffsetBefore, forEventPostedAt: eventPostedTicks", measure)
         self.assertNotIn("readScrollEventTimingLine", source)
 
+    def test_timed_capture_rejects_every_unparseable_delay_token(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        command = source.split('case "wheel-capture-timed":', 1)[1].split('case "wheel-measure":', 1)[0]
+        self.assertIn('split(separator: ",", omittingEmptySubsequences: false)', command)
+        self.assertIn("for token in timedFrameDelayTokens", command)
+        self.assertIn("guard let delay = Int(token)", command)
+        self.assertIn("timedFrameDelays.append(delay)", command)
+        self.assertLess(command.index("guard let delay = Int(token)"), command.index("timedFrameDelays.sorted()"))
+        self.assertNotIn("compactMap", command)
+
 
 class DocumentEdgeTests(unittest.TestCase):
     def test_accepts_reaching_and_staying_at_each_edge(self):
