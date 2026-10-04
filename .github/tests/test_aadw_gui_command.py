@@ -240,7 +240,7 @@ class TrustedProcedureTests(unittest.TestCase):
         )
 
     def test_scroll_inertia_route_points_to_its_trusted_versioned_procedure(self):
-        """Keep the scroll-inertia route bound to the trusted v19 procedure."""
+        """Keep the scroll-inertia route bound to the trusted v20 procedure."""
         route = command.parse_route("/gui-validate scroll-inertia merge")
         assert route is not None
         self.assertEqual(
