@@ -217,5 +217,47 @@ class AssessWheelMeasurementTests(unittest.TestCase):
         self.assertEqual(result["observation"], "unavailable")
 
 
+class AssessWheelCaptureTimingTests(unittest.TestCase):
+    def setUp(self):
+        self.output = "\n".join([
+            "event_route=cghidEventTap",
+            "event_post_ticks=1000000",
+            f"mach_timebase_numer={NUMER}",
+            f"mach_timebase_denom={DENOM}",
+            "product_scroll_receipt_ticks=1100000",
+            "product_frame_paint_ticks=1400000",
+            "product_frame_presented_ticks=unavailable",
+            f"product_mach_timebase_numer={NUMER}",
+            f"product_mach_timebase_denom={DENOM}",
+        ]) + "\n"
+
+    def test_observes_event_receipt_and_paint_on_regular_capture_path(self):
+        record = scroll_event_observation.parse_wheel_capture_timing_output(self.output)
+        result = scroll_event_observation.assess_wheel_capture_timing(record)
+        self.assertEqual(result["observation"], "observed_ordered")
+        self.assertTrue(result["clock_consistent"])
+        self.assertAlmostEqual(result["stages_ms"]["event_to_receipt_ms"], 4.166666666666667)
+        self.assertAlmostEqual(result["stages_ms"]["receipt_to_paint_ms"], 12.5)
+        self.assertEqual(result["presentation_observation"], "unavailable")
+
+    def test_missing_product_receipt_stays_unavailable(self):
+        output = self.output.replace(
+            "product_scroll_receipt_ticks=1100000", "product_scroll_receipt_ticks=unavailable")
+        record = scroll_event_observation.parse_wheel_capture_timing_output(output)
+        result = scroll_event_observation.assess_wheel_capture_timing(record)
+        self.assertEqual(result["observation"], "unavailable")
+        self.assertFalse(result["clock_consistent"])
+        self.assertEqual(result["presentation_observation"], "unavailable")
+
+    def test_out_of_order_product_ticks_are_not_reported_as_ordered(self):
+        output = self.output.replace(
+            "product_frame_paint_ticks=1400000", "product_frame_paint_ticks=900000")
+        record = scroll_event_observation.parse_wheel_capture_timing_output(output)
+        result = scroll_event_observation.assess_wheel_capture_timing(record)
+        self.assertEqual(result["observation"], "observed_disordered")
+        self.assertTrue(result["clock_consistent"])
+        self.assertIsNotNone(result["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

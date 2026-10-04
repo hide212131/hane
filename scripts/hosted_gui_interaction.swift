@@ -1050,14 +1050,25 @@ func prepareWindowCaptureContext(_ windowID: CGWindowID) -> WindowCapture {
 }
 
 func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
-                  _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int]) {
+                  _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int],
+                  timingPath: String? = nil, pollTimeoutMs: Int = 0) {
     let capture = prepareWindowCaptureContext(windowID)
     // This is a short-lived command-line helper. Reassert the app foreground
     // after the capture warmup and immediately before posting the wheel event.
     // The activation stays outside the measured input-to-frame interval.
     focus(pid)
     let commandStarted = monotonicSeconds()
-    let eventPosted = postScroll(pid, unit, delta)
+    let timingOffsetBefore = timingPath.map(fileSizeOrZero) ?? 0
+    let eventPostedTicks: UInt64?
+    let eventPosted: TimeInterval
+    if timingPath != nil {
+        let ticks = postScrollTicks(pid, unit, delta)
+        eventPostedTicks = ticks
+        eventPosted = Double(ticks) * machSecondsPerTick
+    } else {
+        eventPostedTicks = nil
+        eventPosted = postScroll(pid, unit, delta)
+    }
     guard eventPosted >= commandStarted else { fail("scroll event timing was invalid") }
 
     var frames: [(Int, CapturedWindowFrame)] = []
@@ -1072,6 +1083,17 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         frames.append((index, frame))
     }
 
+    var productTiming: ProductScrollTiming?
+    if let timingPath {
+        let pollDeadline = Date().addingTimeInterval(Double(max(0, pollTimeoutMs)) / 1000)
+        while productTiming == nil && Date() < pollDeadline {
+            if let line = readScrollEventTimingLine(timingPath, since: timingOffsetBefore) {
+                productTiming = parseScrollEventTimingLine(line)
+            }
+            if productTiming == nil { Thread.sleep(forTimeInterval: 0.01) }
+        }
+    }
+
     try? FileManager.default.createDirectory(
         at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
         withIntermediateDirectories: true
@@ -1083,6 +1105,24 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     }
     print("event_route=cghidEventTap")
     print("event_post_elapsed_ms=\(milliseconds(eventPosted - commandStarted))")
+    if let eventPostedTicks {
+        print("event_post_ticks=\(eventPostedTicks)")
+        print("mach_timebase_numer=\(machTimebaseInfo.numer)")
+        print("mach_timebase_denom=\(machTimebaseInfo.denom)")
+        if let productTiming {
+            print("product_scroll_receipt_ticks=\(productTiming.receiptTicks)")
+            print("product_frame_paint_ticks=\(productTiming.paintTicks)")
+            print("product_frame_presented_ticks=unavailable")
+            print("product_mach_timebase_numer=\(productTiming.timebaseNumer)")
+            print("product_mach_timebase_denom=\(productTiming.timebaseDenom)")
+        } else {
+            print("product_scroll_receipt_ticks=unavailable")
+            print("product_frame_paint_ticks=unavailable")
+            print("product_frame_presented_ticks=unavailable")
+            print("product_mach_timebase_numer=unavailable")
+            print("product_mach_timebase_denom=unavailable")
+        }
+    }
     for (index, frame) in frames {
         print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - eventPosted))
         print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - eventPosted))
@@ -1360,7 +1400,7 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|wheel-capture|wheel-measure|wheel-reversal|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|wheel-capture|wheel-capture-timed|wheel-measure|wheel-reversal|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -1397,6 +1437,23 @@ case "wheel-capture":
         fail("wheel-capture frame delays must be ascending milliseconds beginning at 0")
     }
     wheelCapture(pid, scrollUnit(arguments[2]), delta, windowID, arguments[5], frameDelays)
+case "wheel-capture-timed":
+    guard arguments.count == 9,
+          let pid = pid_t(arguments[1]),
+          let delta = Int32(arguments[3]),
+          let windowID = UInt32(arguments[4]),
+          let pollTimeoutMs = Int(arguments[8]) else {
+        fail("wheel-capture-timed requires PID, lines|pixels, delta, window ID, frame directory, comma-separated delays, product timing path and poll timeout ms")
+    }
+    let timedFrameDelays = arguments[6].split(separator: ",").compactMap { Int($0) }
+    guard !timedFrameDelays.isEmpty,
+          timedFrameDelays.first == 0,
+          timedFrameDelays == timedFrameDelays.sorted(),
+          timedFrameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
+        fail("wheel-capture-timed frame delays must be ascending milliseconds beginning at 0")
+    }
+    wheelCapture(pid, scrollUnit(arguments[2]), delta, windowID, arguments[5], timedFrameDelays,
+                 timingPath: arguments[7], pollTimeoutMs: pollTimeoutMs)
 case "wheel-measure":
     guard arguments.count == 9,
           let pid = pid_t(arguments[1]),
