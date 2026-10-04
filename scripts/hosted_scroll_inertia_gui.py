@@ -18,14 +18,14 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/18"
+PROCEDURE_VERSION = "hosted-scroll-inertia/19"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
     "逆方向入力への切替、文書先頭/末尾のクランプ、Pixels の直接追従と安定を実画面で確認する。"
     "入力イベントは ScrollDelta 相当の Lines / Pixels を明示して発生させ、端末種別は推測しない。"
     "Lines / Pixelsの80ms初回応答は、cghidEventTap後の実画面画像が80ms以内に取得完了した場合だけ確認する。"
-    "wheel-captureとwheel-measureを同じ文書先頭・同じ入力値で各2回比較し、画面画像と入力受信計測の差を記録する。"
+    "wheel-captureとwheel-measureを同じ文書先頭・同じ入力値で各2回比較する。wheel-captureは実際の画像取得経路を維持したままHane側の受信・描画時刻も記録する。"
     "余韻・減速・安定は従来の画面取得系列で135msの慣性窓内を確認し、callback遅延と表示時刻を分けて記録する。"
     "中間位置への位置決めは較正済みの通常画面取得経路で送り、複数時点の画面で位置のみ確認する。受入判定には使わない。"
     "Pixelsは応答付近を連続して撮影し、反転入力は複数の旧方向候補画面を撮影した直後に送り、OCRはその後に行って慣性窓を消費しない。"
@@ -657,16 +657,14 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
                    pre_reverse_probe_delays_ms: tuple[int, ...] = PRE_REVERSE_PROBE_DELAYS_MS,
                    scroll_event_timing_path: Optional[Path] = None,
                    scroll_event_observation_module: Optional[object] = None,
+                   capture_scroll_event_timing: bool = False,
                    scroll_event_poll_timeout_ms: int = 1500,
                    ) -> tuple[list[dict], Optional[dict], Optional[str]]:
-    """`scroll_event_timing_path`/`scroll_event_observation_module` opt a
-    plain (non-reversal) capture into Issue #427's `wheel-measure` helper
-    command instead of `wheel-capture`, so the exact same scroll input also
-    produces Hane's own mach-clock scroll-timing record and a separate
-    observer classification of it. The returned frames and the second tuple
-    element's existing contract are otherwise unchanged: callers that do not
-    pass these keep using `wheel-capture` and always get `None` back for
-    this slot, exactly as before."""
+    """Optionally correlates the existing screenshot capture with Hane's
+    event-receipt and frame-paint ticks. `capture_scroll_event_timing` keeps
+    the normal `wheel-capture` input/screenshot path and adds only timing
+    fields; the measurement-only `wheel-measure` path remains separately
+    selectable. Neither observation changes product acceptance."""
     if reverse_delta is not None and baseline is None:
         return [], None, "反転前の基準可視行を読み取れず、方向反転を実行できない"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -724,14 +722,22 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
     frame_dir = run_dir / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
     scroll_event_observation = None
-    use_wheel_measure = scroll_event_timing_path is not None and scroll_event_observation_module is not None
-    if use_wheel_measure:
+    use_wheel_measure = (
+        not capture_scroll_event_timing
+        and scroll_event_timing_path is not None
+        and scroll_event_observation_module is not None
+    )
+    use_timed_wheel_capture = capture_scroll_event_timing
+    if use_timed_wheel_capture and (scroll_event_timing_path is None
+                                    or scroll_event_observation_module is None):
+        return [], None, "Hane側スクロール時刻を取得するcapture pathの設定が不足している"
+    timing_log_offset = 0
+    if scroll_event_timing_path is not None:
         try:
             timing_log_offset = scroll_event_timing_path.stat().st_size
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             timing_log_offset = 0
-        except OSError:
-            timing_log_offset = 0
+    if use_wheel_measure:
         ok, output, error = interaction.run_helper(helper, [
             "wheel-measure", str(pid), unit, str(delta), str(window_id), str(frame_dir),
             ",".join(str(delay) for delay in delays),
@@ -756,16 +762,27 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         if evidence["display_response_error"] is not None:
             scroll_event_observation["display_response_error"] = evidence["display_response_error"]
     else:
-        ok, output, error = interaction.run_helper(helper, [
-            "wheel-capture", str(pid), unit, str(delta), str(window_id), str(frame_dir),
+        capture_command = "wheel-capture-timed" if use_timed_wheel_capture else "wheel-capture"
+        capture_args = [
+            capture_command, str(pid), unit, str(delta), str(window_id), str(frame_dir),
             ",".join(str(delay) for delay in delays),
-        ], helper_timeout)
+        ]
+        if use_timed_wheel_capture:
+            capture_args.extend((str(scroll_event_timing_path), str(scroll_event_poll_timeout_ms)))
+        ok, output, error = interaction.run_helper(helper, capture_args, helper_timeout)
         if not ok:
             return [], None, error
         try:
             evidence = parse_scroll_capture_helper_output(output, len(delays))
         except ValueError as exc:
             return [], None, str(exc)
+        if use_timed_wheel_capture:
+            scroll_event_observation = scroll_event_observation_module.assess_wheel_capture_timing(
+                scroll_event_observation_module.parse_wheel_capture_timing_output(output)
+            )
+            scroll_event_observation["wheel_capture_timing_output_excerpt"] = bounded_wheel_measure_output(output)
+            scroll_event_observation["scroll_event_timing_log_delta"] = scroll_event_timing_log_delta(
+                scroll_event_timing_path, timing_log_offset)
     frames = []
     for index, elapsed in enumerate(evidence["frame_elapsed_ms"]):
         path = frame_dir / f"frame-{index:02d}.png"
@@ -1007,7 +1024,13 @@ def compare_wheel_measurement_paths(interaction, module, env, config, helper, pi
                                      "recognized_text": baseline_text},
                 )
             kwargs = {}
-            if mode == "wheel_measure":
+            if mode == "wheel_capture":
+                kwargs = {
+                    "scroll_event_timing_path": timing_path,
+                    "scroll_event_observation_module": observation_module,
+                    "capture_scroll_event_timing": True,
+                }
+            else:
                 kwargs = {
                     "scroll_event_timing_path": timing_path,
                     "scroll_event_observation_module": observation_module,

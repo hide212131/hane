@@ -398,9 +398,11 @@ class ReversalHelperTimingTests(unittest.TestCase):
         self.assertEqual(evidence["frame_capture_completed_ms"], [4.5, 27.1])
 
     def test_normal_frame_capture_posts_and_captures_inside_one_helper(self):
+        """Keep wheel posting and the timed screenshot loop in one helper."""
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         normal_capture = source.split("func wheelCapture(", 1)[1].split("\n}", 1)[0]
         self.assertEqual(normal_capture.count("postScroll(pid, unit, delta)"), 1)
+        self.assertIn("postScrollTicks(pid, unit, delta)", normal_capture)
         self.assertIn("captureImageWithTimes(capture)", normal_capture)
         self.assertIn('print("event_route=cghidEventTap")', normal_capture)
 
@@ -679,8 +681,9 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
             self.calls: list[list[str]] = []
 
         def run_helper(self, _helper, args, _timeout):
+            """Record helper calls and return the configured timing or OCR data."""
             self.calls.append(args)
-            if args[0] == "wheel-measure":
+            if args[0] in {"wheel-measure", "wheel-capture-timed"}:
                 if self.timing_delta:
                     timing_path = Path(args[7])
                     timing_path.parent.mkdir(parents=True, exist_ok=True)
@@ -705,6 +708,22 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         def assess_wheel_measurement(self, record):
             assert record == {"stub_record": True}
             return self.assessed
+
+        def parse_wheel_capture_timing_output(self, output):
+            """Record capture-path timing output and return a representative record."""
+            self.capture_parse_calls.append(output)
+            return {"stub_capture_record": True}
+
+        def assess_wheel_capture_timing(self, record):
+            """Return the configured assessment for the representative record."""
+            assert record == {"stub_capture_record": True}
+            return self.capture_assessed
+
+        capture_parse_calls: list[str] = []
+        capture_assessed = {"observation": "observed_ordered", "reason": None,
+                            "stages_ms": {"event_to_paint_ms": 16.0},
+                            "clock_consistent": True,
+                            "presentation_observation": "unavailable"}
 
     WHEEL_MEASURE_OUTPUT = (
         "event_route=cghidEventTap\n"
@@ -743,6 +762,45 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         "display_response_01_artifact_written_ticks=3400000\n"
         "display_response_01_image_path=/tmp/hane-wheel-measure-wiring-test/frames/display-response-01.png\n"
     )
+    WHEEL_CAPTURE_TIMING_OUTPUT = (
+        "event_route=cghidEventTap\n"
+        "event_post_elapsed_ms=0.1\n"
+        "event_post_ticks=1000000\n"
+        "mach_timebase_numer=125\n"
+        "mach_timebase_denom=3\n"
+        "product_scroll_receipt_ticks=1100000\n"
+        "product_frame_paint_ticks=1400000\n"
+        "product_frame_presented_ticks=unavailable\n"
+        "product_mach_timebase_numer=125\n"
+        "product_mach_timebase_denom=3\n"
+        "frame_00_capture_started_ms=1.0\n"
+        "frame_00_capture_completed_ms=1.2\n"
+    )
+
+    def test_timed_capture_keeps_the_wheel_capture_path_and_attaches_product_timing(self):
+        """Attach timing diagnostics without replacing screenshot evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            timing_path = Path(directory) / "timing.log"
+            interaction = self._StubInteraction(
+                self.WHEEL_CAPTURE_TIMING_OUTPUT, timing_delta=b"scroll receipt and paint\n")
+            observation_module = self._StubObservationModule()
+            observation_module.capture_parse_calls = []
+            frames_out, observation, error = gui.capture_frames(
+                interaction, None, None, None, "helper", 10, "window",
+                Path(directory) / "capture", "lines", -8, (0,), 1.0,
+                scroll_event_timing_path=timing_path,
+                scroll_event_observation_module=observation_module,
+                capture_scroll_event_timing=True,
+            )
+            self.assertIsNone(error)
+            self.assertEqual(interaction.calls[0][0], "wheel-capture-timed")
+            self.assertIn(str(timing_path), interaction.calls[0])
+            self.assertEqual(len(frames_out), 1)
+            self.assertEqual(observation["observation"], "observed_ordered")
+            self.assertIn("product_scroll_receipt_ticks=1100000", observation[
+                "wheel_capture_timing_output_excerpt"])
+            self.assertEqual(observation["scroll_event_timing_log_delta"]["status"], "appended")
+            self.assertEqual(observation_module.capture_parse_calls, [self.WHEEL_CAPTURE_TIMING_OUTPUT])
 
     def test_uses_wheel_measure_and_preserves_stdout_focus_and_exact_timing_delta(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1214,6 +1272,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayTicks: displayTicks", callback)
 
     def test_measurement_uses_stream_response_without_repurposing_product_presentation(self):
+        """Keep display-stream response separate from product presentation time."""
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         measure = source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0]
         self.assertLess(measure.index("displayCapture.start()"), measure.index("postScrollTicks(pid, unit, delta)"))
@@ -1221,7 +1280,44 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/18")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/19")
+
+
+class ProductScrollTimingReaderContractTests(unittest.TestCase):
+    def test_reader_scans_complete_rows_and_matches_current_event_receipt(self):
+        """Skip incomplete or stale log rows while selecting the current event."""
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        reader = source.split("func readScrollEventTiming(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("data.lastIndex(of: 10)", reader)
+        self.assertIn("data.prefix(through: lastNewline)", reader)
+        self.assertIn("completeLines.split(separator: 10", reader)
+        self.assertIn("parseScrollEventTimingLine(line)", reader)
+        self.assertIn("timing.receiptTicks >= eventPostedTicks", reader)
+        self.assertIn("continue", reader)
+
+    def test_capture_and_measure_paths_match_timing_to_their_posted_event(self):
+        """Use each helper's posted-event tick for timing-record correlation."""
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        capture = " ".join(source.split("func wheelCapture(", 1)[1].split("\n}", 1)[0].split())
+        measure = " ".join(source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0].split())
+        self.assertIn("since: timingOffsetBefore, forEventPostedAt: eventPostedTicks", capture)
+        self.assertIn("since: timingOffsetBefore, forEventPostedAt: eventPostedTicks", measure)
+        self.assertIn("repeat {", capture)
+        self.assertIn("repeat {", measure)
+        self.assertLess(capture.index("readScrollEventTiming("), capture.index("while productTiming == nil && Date() < pollDeadline"))
+        self.assertLess(measure.index("readScrollEventTiming("), measure.index("while productTiming == nil && Date() < pollDeadline"))
+        self.assertNotIn("readScrollEventTimingLine", source)
+
+    def test_timed_capture_rejects_every_unparseable_delay_token(self):
+        """Reject malformed delay tokens before checking their order and range."""
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        command = source.split('case "wheel-capture-timed":', 1)[1].split('case "wheel-measure":', 1)[0]
+        self.assertIn('split(separator: ",", omittingEmptySubsequences: false)', command)
+        self.assertIn("for token in timedFrameDelayTokens", command)
+        self.assertIn("guard let delay = Int(token)", command)
+        self.assertIn("timedFrameDelays.append(delay)", command)
+        self.assertLess(command.index("guard let delay = Int(token)"), command.index("timedFrameDelays.sorted()"))
+        self.assertNotIn("compactMap", command)
 
 
 class DocumentEdgeTests(unittest.TestCase):
