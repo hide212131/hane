@@ -11886,6 +11886,11 @@ mod tests {
                 "a conflicting save must not close the tab merely because the document already read as clean"
             );
             assert!(!view.sessions.active().is_dirty());
+            assert_eq!(
+                view.sessions.get(id).and_then(|session| session.path()),
+                Some(path.as_path()),
+                "the original file session must still be open, not replaced by a clean Untitled session"
+            );
             assert!(
                 !view.tab_close_after_save.contains_key(&id),
                 "a refused save must drop the close request rather than let a coincidentally clean document close it"
@@ -11963,6 +11968,11 @@ mod tests {
                 "the queued retry succeeding must not close a tab whose own close request conflicted"
             );
             assert!(!view.sessions.active().is_dirty(), "the queued retry must still land");
+            assert_eq!(
+                view.sessions.get(id).and_then(|session| session.path()),
+                Some(path.as_path()),
+                "the original file session must still be open, not replaced by a clean Untitled session"
+            );
             assert!(
                 !view.tab_close_after_save.contains_key(&id),
                 "the conflicting write must drop the close request rather than let a later, unrelated write's success act on it"
