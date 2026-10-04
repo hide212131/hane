@@ -1088,13 +1088,15 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     var productTiming: ProductScrollTiming?
     if let timingPath {
         let pollDeadline = Date().addingTimeInterval(Double(max(0, pollTimeoutMs)) / 1000)
-        while productTiming == nil && Date() < pollDeadline {
-            if let eventPostedTicks {
+        if let eventPostedTicks {
+            repeat {
                 productTiming = readScrollEventTiming(
                     timingPath, since: timingOffsetBefore, forEventPostedAt: eventPostedTicks
                 )
-            }
-            if productTiming == nil { Thread.sleep(forTimeInterval: 0.01) }
+                if productTiming == nil && Date() < pollDeadline {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+            } while productTiming == nil && Date() < pollDeadline
         }
     }
 
@@ -1238,12 +1240,14 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     // poll budget.
     let pollDeadline = Date().addingTimeInterval(Double(pollTimeoutMs) / 1000)
     var productTiming: ProductScrollTiming?
-    while productTiming == nil && Date() < pollDeadline {
+    repeat {
         productTiming = readScrollEventTiming(
             timingPath, since: timingOffsetBefore, forEventPostedAt: eventPostedTicks
         )
-        if productTiming == nil { Thread.sleep(forTimeInterval: 0.01) }
-    }
+        if productTiming == nil && Date() < pollDeadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    } while productTiming == nil && Date() < pollDeadline
 
     if let stopError = displayCapture.stop() {
         fail("could not stop WindowServer display measurement: \(stopError)")

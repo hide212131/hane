@@ -1302,6 +1302,10 @@ class ProductScrollTimingReaderContractTests(unittest.TestCase):
         measure = " ".join(source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0].split())
         self.assertIn("since: timingOffsetBefore, forEventPostedAt: eventPostedTicks", capture)
         self.assertIn("since: timingOffsetBefore, forEventPostedAt: eventPostedTicks", measure)
+        self.assertIn("repeat {", capture)
+        self.assertIn("repeat {", measure)
+        self.assertLess(capture.index("readScrollEventTiming("), capture.index("while productTiming == nil && Date() < pollDeadline"))
+        self.assertLess(measure.index("readScrollEventTiming("), measure.index("while productTiming == nil && Date() < pollDeadline"))
         self.assertNotIn("readScrollEventTimingLine", source)
 
     def test_timed_capture_rejects_every_unparseable_delay_token(self):
