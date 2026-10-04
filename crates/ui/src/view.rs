@@ -11557,7 +11557,11 @@ mod tests {
             view.sessions.active_id()
         });
         let open_confirm = |cx: &mut gpui::VisualTestContext| {
-            cx.simulate_mouse_down(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+            cx.simulate_mouse_down(
+                first_tab.center(),
+                MouseButton::Middle,
+                gpui::Modifiers::none(),
+            );
             cx.simulate_mouse_up(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
             cx.run_until_parked();
             view.read_with(cx, |view, _| {
