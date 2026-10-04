@@ -155,12 +155,9 @@ const WHEEL_ZOOM_SETTLE_EPSILON: f32 = 0.001;
 /// The measured seven-event physical-wheel burst settles within roughly
 /// 100-150 ms after its last event with this value.
 const SCROLL_INERTIA_TIME_CONSTANT: Duration = Duration::from_millis(20);
-/// See `WHEEL_ZOOM_MIN_FRAME_TIME`: the same deterministic-at-120Hz clamp,
-/// kept separate so it stays scoped to scroll inertia's own animation frames.
-/// This floor only models the gap between two frames of an *already-running*
-/// `request_animation_frame` loop; see `SCROLL_INERTIA_COLD_START_FRAME_TIME`
-/// for the different, larger gap a coast armed from an idle view faces before
-/// its very first paint.
+/// Minimum synchronous first step when another Lines event arrives before the
+/// next paint. Already-running animation frames use their actual elapsed time
+/// so the decay is independent of display refresh rate.
 const SCROLL_INERTIA_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
 /// The elapsed time `queue_scroll_inertia_at` assumes for a brand-new coast's
 /// own synchronous first step (issue #389), as opposed to a step that folds a
@@ -386,7 +383,7 @@ fn scroll_inertia_velocity_for_lines_delta(scroll_delta: f32) -> f32 {
 /// whatever fraction was left unapplied (issue #389: this previously left
 /// the coast short of the delta it was supposed to land on).
 fn eased_scroll_inertia_step(velocity: f32, elapsed: Duration) -> Option<(f32, f32)> {
-    let elapsed = elapsed.max(SCROLL_INERTIA_MIN_FRAME_TIME).as_secs_f32();
+    let elapsed = elapsed.as_secs_f32();
     let tau = SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
     if (velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
         return None;
@@ -7480,6 +7477,27 @@ mod tests {
             eased_scroll_inertia_step(velocity, Duration::from_millis(16)).is_none(),
             "the burst must be fully settled after its final visible frame"
         );
+    }
+
+    #[test]
+    fn scroll_inertia_uses_real_time_on_a_240hz_display() {
+        // A frame at 240 Hz arrives in about 4.2 ms. Rounding every frame up
+        // to 8.3 ms would halve the visible coast's real duration.
+        let mut velocity = scroll_inertia_velocity_for_lines_delta(1_000.0);
+        let frame_time = Duration::from_micros(4_167);
+        let mut last_motion = Duration::ZERO;
+        for _ in 0..100 {
+            let Some((distance, next_velocity)) = eased_scroll_inertia_step(velocity, frame_time)
+            else {
+                break;
+            };
+            assert!(distance > 0.0, "coast must not reverse: {distance}");
+            last_motion += frame_time;
+            velocity = next_velocity;
+        }
+        assert!(last_motion >= Duration::from_millis(100), "{last_motion:?}");
+        assert!(last_motion <= Duration::from_millis(150), "{last_motion:?}");
+        assert!(eased_scroll_inertia_step(velocity, frame_time).is_none());
     }
 
     #[test]

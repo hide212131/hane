@@ -300,7 +300,9 @@ impl EditorView {
     pub(super) fn queue_scroll_inertia_at(&mut self, velocity: f32, now: Instant, cx: &mut Context<Self>) {
         let (velocity, elapsed) = match self.scroll_inertia {
             Some(inertia) => {
-                let elapsed = now.saturating_duration_since(inertia.last_frame);
+                let elapsed = now
+                    .saturating_duration_since(inertia.last_frame)
+                    .max(SCROLL_INERTIA_MIN_FRAME_TIME);
                 let velocity = if self.scroll_y == inertia.last_applied
                     && inertia.velocity * velocity > 0.0
                 {
