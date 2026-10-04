@@ -146,6 +146,33 @@ const WHEEL_ZOOM_TIME_CONSTANT: Duration = Duration::from_millis(35);
 const WHEEL_ZOOM_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
 /// Stop scheduling frames once the remaining zoom error is below 0.1%.
 const WHEEL_ZOOM_SETTLE_EPSILON: f32 = 0.001;
+/// The time constant for the main panel's short post-wheel scroll inertia
+/// (issue #389): a plain `ScrollDelta::Lines` scroll keeps coasting after the
+/// input stops, decaying exponentially like `eased_wheel_zoom_step` so the
+/// response is independent of display refresh rate. A shorter time constant
+/// also bounds the visible tail after a rapid burst of large Lines deltas:
+/// a small fraction of a large pending distance can still move many pixels.
+/// The measured seven-event physical-wheel burst settles within roughly
+/// 100-150 ms after its last event with this value.
+const SCROLL_INERTIA_TIME_CONSTANT: Duration = Duration::from_millis(20);
+/// Minimum synchronous first step when another Lines event arrives before the
+/// next paint. Already-running animation frames use their actual elapsed time
+/// so the decay is independent of display refresh rate.
+const SCROLL_INERTIA_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
+/// The elapsed time `queue_scroll_inertia_at` assumes for a brand-new coast's
+/// own synchronous first step (issue #389), as opposed to a step that folds a
+/// still-live coast's real, measured gap (see `queue_scroll_inertia_at`'s own
+/// doc comment). A coast armed from an idle view has no
+/// `request_animation_frame` already in flight the way a still-running coast
+/// does, so `SCROLL_INERTIA_MIN_FRAME_TIME`'s 120Hz-optimistic
+/// already-animating gap understates how long `cx.notify()` actually takes to
+/// reach that first real paint. Using it anyway left the first frame actually
+/// painted after a plain Lines scroll still reading as unchanged. This models
+/// a conservative single 60Hz frame instead.
+const SCROLL_INERTIA_COLD_START_FRAME_TIME: Duration = Duration::from_micros(16_667);
+/// Stop scheduling scroll-inertia frames once the remaining coast distance
+/// would move the content by less than a device pixel.
+const SCROLL_INERTIA_SETTLE_EPSILON: f32 = 1.0;
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
@@ -330,6 +357,47 @@ fn eased_wheel_zoom_step(current: f32, target: f32, elapsed: Duration) -> f32 {
     }
 }
 
+/// Converts one `ScrollDelta::Lines` wheel event's `scroll_y` delta (already
+/// negated to content-space, matching how `on_scroll` moves `scroll_y`) into
+/// the initial velocity of the short inertia that continues after the input
+/// stops. Sized so the full coast distance (`velocity *
+/// SCROLL_INERTIA_TIME_CONSTANT`) equals the delta itself: a discrete wheel
+/// step keeps moving a little further rather than stopping dead, without
+/// traveling noticeably past what the user actually scrolled.
+fn scroll_inertia_velocity_for_lines_delta(scroll_delta: f32) -> f32 {
+    scroll_delta / SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32()
+}
+
+/// Advances one frame of exponential-decay scroll inertia. Returns the
+/// distance to add to `scroll_y` this frame and the velocity remaining
+/// afterward, or `None` once the remaining coast distance is imperceptible
+/// and the animation should stop.
+///
+/// The total coast distance still owed at the start of this call is
+/// `velocity * tau` (see `scroll_inertia_velocity_for_lines_delta`'s doc
+/// comment on this telescoping identity). Once decaying `velocity` for one
+/// more frame would leave less than `SCROLL_INERTIA_SETTLE_EPSILON` of that
+/// distance remaining, this step folds the *entire* remaining distance into
+/// its own `distance` instead of only this frame's fractional share,
+/// because the next call would otherwise return `None` and silently drop
+/// whatever fraction was left unapplied (issue #389: this previously left
+/// the coast short of the delta it was supposed to land on).
+fn eased_scroll_inertia_step(velocity: f32, elapsed: Duration) -> Option<(f32, f32)> {
+    let elapsed = elapsed.as_secs_f32();
+    let tau = SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
+    if (velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
+        return None;
+    }
+    let decay = (-elapsed / tau).exp();
+    let next_velocity = velocity * decay;
+    let distance = if (next_velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
+        velocity * tau
+    } else {
+        velocity * tau * (1.0 - decay)
+    };
+    Some((distance, next_velocity))
+}
+
 fn height_snapshot_matches_line_height(current: f32, snapshot: f32) -> bool {
     current.to_bits() == snapshot.to_bits()
 }
@@ -365,6 +433,30 @@ struct PendingZoomAnchor {
 struct WheelZoomAnimation {
     window_offset: f32,
     last_frame: Instant,
+}
+
+/// State for the short post-wheel scroll inertia that continues after a
+/// `ScrollDelta::Lines` input stops (issue #389). `ScrollDelta::Pixels` never
+/// gets one of these: the OS already supplies trackpad momentum for pixel
+/// deltas, so the app must track it directly instead of layering more
+/// inertia on top.
+#[derive(Clone, Copy, Debug)]
+struct ScrollInertia {
+    /// Remaining velocity, in the same units and sign convention as
+    /// `scroll_y`, per second.
+    velocity: f32,
+    last_frame: Instant,
+    /// The `scroll_y` this animation itself produced, as of `last_frame`
+    /// unless `Render::render`'s height-anchor recompute has since resynced
+    /// it (issue #389: that recompute runs after this frame's step and can
+    /// nudge `scroll_y` on its own, which is not a change of ownership). If
+    /// `scroll_y` no longer matches this when the next frame steps, some
+    /// other action (cursor follow, selection autoscroll, a scrollbar drag,
+    /// a document switch, zoom, a pinch, or a render-time clamp against a
+    /// shrunk document/viewport) has taken ownership of the position since,
+    /// and the stale inertia must stop instead of layering a further step on
+    /// top of it.
+    last_applied: f32,
 }
 
 /// Identifies the document a background job was started for. A result that
@@ -807,6 +899,9 @@ pub struct EditorView {
     /// `zoom` converges to it once per animation frame. Pinch and reset paths
     /// bypass this state and remain directly coupled to their input.
     wheel_zoom_animation: Option<WheelZoomAnimation>,
+    /// Short post-wheel scroll inertia still coasting after a plain
+    /// `ScrollDelta::Lines` input stopped. See `ScrollInertia`.
+    scroll_inertia: Option<ScrollInertia>,
     /// Set by a zoom-changing gesture, consumed after the visible blocks have
     /// been remeasured for the new zoom. See `PendingZoomAnchor`.
     pending_zoom_anchor: Option<PendingZoomAnchor>,
@@ -1334,6 +1429,7 @@ impl EditorView {
             zoom: 1.0,
             raw_zoom: 1.0,
             wheel_zoom_animation: None,
+            scroll_inertia: None,
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
@@ -1664,6 +1760,13 @@ impl EditorView {
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
         self.cancel_text_selection_autoscroll();
+        // A coast belongs to the document it started on. Relying on the
+        // `scroll_y` staleness check in `advance_scroll_inertia` alone is not
+        // enough here: the incoming document can restore a `scroll_y` equal
+        // to the outgoing coast's `last_applied`, in which case that check
+        // would mistake the switch for an ordinary unmoved frame and let the
+        // old document's inertia keep coasting into the new one (issue #389).
+        self.scroll_inertia = None;
         // Whatever the sidebar had highlighted before, the document on
         // screen just changed to a specific file or draft, so that is what
         // should be highlighted now instead.
@@ -4658,6 +4761,12 @@ impl EditorView {
             viewport_height: self.viewport_height,
             content_height,
         });
+        // `advance_scroll_inertia` only detects a lost coast by comparing
+        // `scroll_y` against its own `last_applied` snapshot, which misses a
+        // drag that starts before the coast's next step has moved `scroll_y`
+        // away from that value. Clearing it explicitly here stops the coast
+        // from fighting the drag once it does resume (issue #389).
+        self.scroll_inertia = None;
         cx.stop_propagation();
         cx.notify();
     }
@@ -5076,6 +5185,17 @@ impl Render for EditorView {
             self.install_heights(granularity, heights);
         }
         self.step_wheel_zoom_animation(window);
+        self.step_scroll_inertia(window);
+        // Whether a live coast is still eligible to resync onto the
+        // height-anchor recompute below instead of reading as stale on the
+        // next frame (issue #389). Tracked separately from
+        // `self.scroll_inertia` so the render-entry clamp further down can
+        // disqualify it: if that clamp itself moves `scroll_y`, this is a
+        // genuine external change (e.g. a viewport shrink), not the
+        // height-anchor's own correction, and the coast must still stop.
+        let mut scroll_inertia_tracks_layout = self
+            .scroll_inertia
+            .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         if self.settings_open {
             return self.settings_screen_element(window, cx);
         }
@@ -5117,6 +5237,9 @@ impl Render for EditorView {
             self.scrollable_content_height(),
             self.viewport_height,
         );
+        scroll_inertia_tracks_layout &= self
+            .scroll_inertia
+            .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         let visible =
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
@@ -5208,22 +5331,8 @@ impl Render for EditorView {
         // same block and the same position inside it at the top instead of
         // letting those corrections visibly move the document, unless the
         // zoom gesture has a more specific pointer/pinch anchor.
-        if !zoom_anchor_applied && let Some((old_ordinal, intra)) = height_anchor {
-            let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
-            let inside = if ordinal + 1 == self.heights.len() {
-                // At the document's last item, `intra` can already be
-                // carrying the `CARET_MODE_BADGE_HEIGHT` clearance
-                // `scroll_cursor_into_view` reserved past its bottom.
-                // Clamping it to the item's own height would throw that
-                // clearance away before the badge is ever drawn (issue
-                // #240); the clamp below still bounds the result.
-                intra.max(0.0)
-            } else {
-                self.heights
-                    .height(ordinal)
-                    .map_or(0.0, |height| intra.clamp(0.0, height))
-            };
-            self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
+        if !zoom_anchor_applied {
+            self.apply_height_anchor(height_anchor, scroll_inertia_tracks_layout);
         }
         // A newly measured block can shrink at the old bottom. Anchoring
         // preserves its block-relative position, which can now sit below the
@@ -7228,6 +7337,172 @@ mod tests {
 
         let settled = eased_wheel_zoom_step(1.1995, 1.2, Duration::from_millis(16));
         assert_eq!(settled, 1.2);
+    }
+
+    // Issue #389: short post-wheel scroll inertia for the main panel.
+
+    #[test]
+    fn scroll_inertia_velocity_for_lines_delta_matches_the_sign_and_size_of_the_input() {
+        let forward = scroll_inertia_velocity_for_lines_delta(30.0);
+        let backward = scroll_inertia_velocity_for_lines_delta(-30.0);
+        assert!(forward > 0.0, "{forward}");
+        assert!(backward < 0.0, "{backward}");
+        assert_eq!(forward, -backward);
+
+        // The full coast distance (velocity integrated over the exponential
+        // decay) is `velocity * SCROLL_INERTIA_TIME_CONSTANT`, i.e. it must
+        // land back on the delta that produced it.
+        let coast_distance = forward * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
+        assert!((coast_distance - 30.0).abs() < 1e-4, "{coast_distance}");
+    }
+
+    #[test]
+    fn eased_scroll_inertia_step_decays_without_overshooting_the_coast_distance() {
+        let velocity = scroll_inertia_velocity_for_lines_delta(40.0);
+        let coast_distance = velocity * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
+
+        let mut current_velocity = velocity;
+        let mut travelled = 0.0;
+        let mut travelled_by_three_time_constants = None;
+        let mut elapsed_total = Duration::ZERO;
+        for _ in 0..256 {
+            let Some((distance, next_velocity)) =
+                eased_scroll_inertia_step(current_velocity, Duration::from_millis(16))
+            else {
+                break;
+            };
+            assert!(
+                distance.signum() == coast_distance.signum() || distance == 0.0,
+                "inertia must not reverse direction mid-coast: {distance}"
+            );
+            travelled += distance;
+            elapsed_total += Duration::from_millis(16);
+            assert!(
+                travelled <= coast_distance + 1e-3,
+                "inertia overshot its total coast distance: travelled={travelled}, \
+                 coast_distance={coast_distance}"
+            );
+            assert!(
+                next_velocity.abs() <= current_velocity.abs(),
+                "velocity must monotonically decay: {next_velocity} vs {current_velocity}"
+            );
+            if travelled_by_three_time_constants.is_none()
+                && elapsed_total >= SCROLL_INERTIA_TIME_CONSTANT * 3
+            {
+                travelled_by_three_time_constants = Some(travelled);
+            }
+            current_velocity = next_velocity;
+        }
+        assert!(
+            (travelled - coast_distance).abs() < 0.5,
+            "inertia must settle near its full coast distance: travelled={travelled}, \
+             coast_distance={coast_distance}"
+        );
+
+        // Three time constants cover the large majority of a single delta;
+        // the burst test below checks when a large visible tail actually ends.
+        let covered = travelled_by_three_time_constants
+            .expect("the loop must reach three time constants before settling");
+        assert!(
+            covered / coast_distance > 0.9,
+            "expected most of the coast distance to be covered within three time constants: {covered} of \
+             {coast_distance}"
+        );
+
+        // A long-settled duration decays the velocity below the
+        // imperceptible-motion threshold, but the step must still deliver
+        // the full remaining coast distance instead of silently dropping it
+        // (issue #389); a further call then settles with no motion left.
+        let (long_distance, long_next_velocity) =
+            eased_scroll_inertia_step(velocity, Duration::from_secs(1))
+                .expect("a long-elapsed step must still return the remaining coast distance");
+        assert!(
+            (long_distance - coast_distance).abs() < 1e-3,
+            "{long_distance}"
+        );
+        assert!(eased_scroll_inertia_step(long_next_velocity, Duration::from_millis(16)).is_none());
+    }
+
+    #[test]
+    fn physical_wheel_burst_settles_within_150ms_of_its_last_event() {
+        // The observed physical mouse sent seven non-precise Lines events
+        // over 72 ms. A one-pixel settle threshold with a long exponential
+        // tail previously kept this large burst visibly moving for ~296 ms
+        // after the last event. Use a generous 72 px per line so this checks
+        // the visible tail of a large document movement, not just a detent.
+        let burst = [
+            (0, 1.0),
+            (8, 1.0),
+            (19, 4.0),
+            (31, 5.0),
+            (44, 6.0),
+            (58, 7.0),
+            (72, 7.0),
+        ];
+        let mut velocity = 0.0;
+        let mut previous_ms = 0;
+        for (index, (at_ms, lines)) in burst.into_iter().enumerate() {
+            velocity += scroll_inertia_velocity_for_lines_delta(lines * 72.0);
+            let elapsed = if index == 0 {
+                SCROLL_INERTIA_COLD_START_FRAME_TIME
+            } else {
+                Duration::from_millis(at_ms - previous_ms)
+            };
+            let (_, next_velocity) = eased_scroll_inertia_step(velocity, elapsed)
+                .expect("a physical wheel burst must keep the coast armed");
+            velocity = next_velocity;
+            previous_ms = at_ms;
+        }
+
+        let mut last_motion_ms = 0;
+        for after_last_ms in (16..=160).step_by(16) {
+            let Some((distance, next_velocity)) =
+                eased_scroll_inertia_step(velocity, Duration::from_millis(16))
+            else {
+                break;
+            };
+            assert!(distance > 0.0, "coast must not reverse: {distance}");
+            last_motion_ms = after_last_ms;
+            velocity = next_velocity;
+        }
+        assert!(
+            last_motion_ms >= 100,
+            "coast stopped too abruptly: {last_motion_ms} ms"
+        );
+        assert!(
+            last_motion_ms <= 150,
+            "visible coast continued too long: {last_motion_ms} ms"
+        );
+        assert!(
+            eased_scroll_inertia_step(velocity, Duration::from_millis(16)).is_none(),
+            "the burst must be fully settled after its final visible frame"
+        );
+    }
+
+    #[test]
+    fn scroll_inertia_uses_real_time_on_a_240hz_display() {
+        // A frame at 240 Hz arrives in about 4.2 ms. Rounding every frame up
+        // to 8.3 ms would halve the visible coast's real duration.
+        let mut velocity = scroll_inertia_velocity_for_lines_delta(1_000.0);
+        let frame_time = Duration::from_micros(4_167);
+        let mut last_motion = Duration::ZERO;
+        for _ in 0..100 {
+            let Some((distance, next_velocity)) = eased_scroll_inertia_step(velocity, frame_time)
+            else {
+                break;
+            };
+            assert!(distance > 0.0, "coast must not reverse: {distance}");
+            last_motion += frame_time;
+            velocity = next_velocity;
+        }
+        assert!(last_motion >= Duration::from_millis(100), "{last_motion:?}");
+        assert!(last_motion <= Duration::from_millis(150), "{last_motion:?}");
+        assert!(eased_scroll_inertia_step(velocity, frame_time).is_none());
+    }
+
+    #[test]
+    fn eased_scroll_inertia_step_settles_immediately_for_a_negligible_velocity() {
+        assert!(eased_scroll_inertia_step(0.5, Duration::from_millis(16)).is_none());
     }
 
     #[gpui::test]
@@ -11302,6 +11577,1110 @@ mod tests {
         cx.run_until_parked();
         let zoomed = view.read_with(cx, |view, _| view.zoom);
         assert!(zoomed > 1.0, "{zoomed}");
+    }
+
+    // Issue #389: short post-wheel scroll inertia for the main panel.
+
+    #[gpui::test]
+    fn plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        let immediate = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            view.scroll_y
+        });
+        // The main-panel scroll responds from the very first update, not
+        // after a delay for the inertia to ramp up.
+        assert!(immediate > 0.0, "{immediate}");
+
+        let coasted = view.update(cx, |view, _cx| {
+            let inertia = view
+                .scroll_inertia
+                .as_mut()
+                .expect("a plain Lines wheel scroll must arm short inertia");
+            inertia.last_frame -= Duration::from_millis(20);
+            // `advance_scroll_inertia` steps the coast state without touching
+            // `window`, so it can be called outside a real render frame (see
+            // issue #389's macOS CI failure: `window.request_animation_frame()`
+            // may only be called during request_layout, prepaint, or paint).
+            view.advance_scroll_inertia();
+            view.scroll_y
+        });
+        assert!(
+            coasted > immediate,
+            "inertia must keep moving briefly after the wheel input stops: \
+             immediate={immediate}, coasted={coasted}"
+        );
+    }
+
+    #[gpui::test]
+    fn plain_wheel_lines_scroll_from_an_idle_view_uses_the_cold_start_frame_time(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: a coast armed from an idle view (no coast already
+        // running `request_animation_frame`) previously sized its own
+        // synchronous first step off `SCROLL_INERTIA_MIN_FRAME_TIME`, the
+        // floor meant for the gap between two frames of an *already-running*
+        // animation loop. That understated how long the state actually takes
+        // to reach the first real paint and left that first frame reading as
+        // unchanged on screen. `queue_scroll_inertia_at` must instead use the
+        // larger `SCROLL_INERTIA_COLD_START_FRAME_TIME` for a brand-new
+        // coast's own first step.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (before, raw_velocity, immediate) = view.update_in(cx, |view, window, cx| {
+            let before = view.scroll_y;
+            let raw_velocity = scroll_inertia_velocity_for_lines_delta(-f32::from(
+                event.delta.pixel_delta(px(view.line_height())).y,
+            ));
+            view.on_scroll(&event, window, cx);
+            (before, raw_velocity, view.scroll_y)
+        });
+
+        let moved = immediate - before;
+        let (min_frame_time_distance, _) =
+            eased_scroll_inertia_step(raw_velocity, SCROLL_INERTIA_MIN_FRAME_TIME)
+                .expect("a full-size delta must still be animating, not settled");
+        let (cold_start_distance, _) =
+            eased_scroll_inertia_step(raw_velocity, SCROLL_INERTIA_COLD_START_FRAME_TIME)
+                .expect("a full-size delta must still be animating, not settled");
+        assert!(
+            (moved - cold_start_distance).abs() < 1e-3,
+            "moved={moved}, cold_start_distance={cold_start_distance}"
+        );
+        assert!(
+            moved > min_frame_time_distance,
+            "a brand-new coast's own first step must move further than the smaller \
+             already-animating frame gap would, or the first painted frame regresses to reading \
+             as unchanged: moved={moved}, min_frame_time_distance={min_frame_time_distance}"
+        );
+    }
+
+    #[gpui::test]
+    fn plain_wheel_lines_scroll_settles_without_doubling_the_input_distance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (before, expected_delta, immediate) = view.update_in(cx, |view, window, cx| {
+            let before = view.scroll_y;
+            let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+            view.on_scroll(&event, window, cx);
+            (before, expected_delta, view.scroll_y)
+        });
+        assert!(expected_delta > 0.0, "{expected_delta}");
+        // The main-panel scroll responds from the very first update, not
+        // after a delay for the inertia to ramp up.
+        assert!(immediate > before, "before={before}, immediate={immediate}");
+
+        // Run the coast to completion, as `step_scroll_inertia` would across
+        // real animation frames, until it settles on its own. Steps via
+        // `advance_scroll_inertia` (see `plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops`)
+        // to avoid calling `window.request_animation_frame()` outside a real frame.
+        let settled = view.update(cx, |view, _cx| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.advance_scroll_inertia();
+            }
+            view.scroll_y
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the coast must settle instead of coasting forever"
+        );
+
+        let total_moved = settled - before;
+        assert!(
+            total_moved <= expected_delta + 1.0,
+            "combined immediate and inertial movement must not exceed a single plain scroll's \
+             pre-clamp distance: total_moved={total_moved}, expected_delta={expected_delta}"
+        );
+        assert!(
+            (total_moved - expected_delta).abs() < 1.0,
+            "the fully settled position must land at the same distance a single plain scroll of \
+             this delta would have, not double it: total_moved={total_moved}, \
+             expected_delta={expected_delta}"
+        );
+    }
+
+    fn assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(
+        cx: &mut gpui::TestAppContext,
+        lines: f32,
+    ) {
+        // Issue #389: a high-precision wheel/trackpad device can send a
+        // `ScrollDelta::Lines` event so small that its pixel-space distance
+        // never clears `eased_scroll_inertia_step`'s settle epsilon.
+        // `queue_scroll_inertia_at` must still apply that distance once instead
+        // of silently dropping it, and must not arm a new coast for it.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, lines)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (expected_delta, before, after, armed_inertia) =
+            view.update_in(cx, |view, window, cx| {
+                let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+                assert!(
+                    (expected_delta * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32()).abs()
+                        <= SCROLL_INERTIA_SETTLE_EPSILON,
+                    "this test only exercises the settle-epsilon path: expected_delta={expected_delta}"
+                );
+                // Start away from both document edges so a small move in
+                // either direction is not itself clamped away, which would
+                // otherwise be indistinguishable from the drop this test
+                // guards against.
+                view.scroll_y = 500.0;
+                let before = view.scroll_y;
+                view.on_scroll(&event, window, cx);
+                (expected_delta, before, view.scroll_y, view.scroll_inertia)
+            });
+
+        let moved = after - before;
+        assert!(
+            (moved - expected_delta).abs() < 0.01,
+            "lines={lines}: a sub-settle-epsilon Lines input must still move scroll_y by its own \
+             delta instead of being dropped: moved={moved}, expected_delta={expected_delta}"
+        );
+        assert!(
+            armed_inertia.is_none(),
+            "lines={lines}: a sub-settle-epsilon input must not arm a new inertia coast"
+        );
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_moves_scroll_y_forward(cx: &mut gpui::TestAppContext) {
+        assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(cx, -0.02);
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_moves_scroll_y_backward(cx: &mut gpui::TestAppContext) {
+        assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(cx, 0.02);
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_clamps_at_the_document_start(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        assert_eq!(view.read_with(cx, |view, _| view.scroll_y), 0.0);
+
+        // A small "scroll up" Lines input while already at the document
+        // start must clamp at 0 rather than going negative.
+        let (after, armed_inertia) = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 0.02)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            (view.scroll_y, view.scroll_inertia)
+        });
+        assert_eq!(
+            after, 0.0,
+            "a sub-settle-epsilon input must clamp at the document start, not go negative"
+        );
+        assert!(armed_inertia.is_none());
+    }
+
+    #[gpui::test]
+    fn repeated_same_direction_wheel_events_keep_refreshing_the_inertia(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        for _ in 0..5 {
+            let velocity = view.update_in(cx, |view, window, cx| {
+                view.on_scroll(
+                    &ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, -3.0)),
+                        modifiers: gpui::Modifiers::none(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    },
+                    window,
+                    cx,
+                );
+                view.scroll_inertia
+                    .expect("continuous scrolling in the same direction must keep inertia armed")
+                    .velocity
+            });
+            assert!(velocity > 0.0, "{velocity}");
+        }
+    }
+
+    #[gpui::test]
+    fn repeated_same_direction_wheel_events_accumulate_the_unmoved_inertia_distance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=600)
+            .map(|n| format!("line {n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        // Move well away from the document's start first (and, with 600
+        // lines, nowhere near its end either), then let that priming
+        // scroll's own inertia fully settle before the burst this test
+        // actually measures.
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..10 {
+                view.on_scroll(&event, window, cx);
+            }
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                // Steps via `advance_scroll_inertia` (see
+                // `plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops`)
+                // to avoid calling `window.request_animation_frame()` outside a
+                // real frame.
+                view.advance_scroll_inertia();
+            }
+        });
+        let (before, max_scroll_y) = view.read_with(cx, |view, _| {
+            (
+                view.scroll_y,
+                (view.scrollable_content_height() - view.viewport_height).max(0.0),
+            )
+        });
+        assert!(
+            before > 0.0 && before < max_scroll_y - 200.0,
+            "before={before}, max_scroll_y={max_scroll_y}"
+        );
+
+        // Two Lines events back to back, before either one's inertia has run
+        // any animation frame, so the second sees the first event's coast
+        // still live (issue #389).
+        let expected_total_delta = view.update_in(cx, |view, window, cx| {
+            let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+            view.on_scroll(&event, window, cx);
+            view.on_scroll(&event, window, cx);
+            expected_delta * 2.0
+        });
+
+        let settled = view.update(cx, |view, _cx| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.advance_scroll_inertia();
+            }
+            view.scroll_y
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the coast must settle instead of coasting forever"
+        );
+
+        let total_moved = settled - before;
+        assert!(
+            (total_moved - expected_total_delta).abs() < 1.0,
+            "settled displacement must reflect the sum of the burst's signed deltas, not drop \
+             an earlier event's unmoved coast distance: total_moved={total_moved}, \
+             expected_total_delta={expected_total_delta}"
+        );
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_replaces_rather_than_accumulates_inertia_velocity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let line_height = view.read_with(cx, |view, _| view.line_height());
+        let reverse_event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let reverse_raw_velocity = scroll_inertia_velocity_for_lines_delta(-f32::from(
+            reverse_event.delta.pixel_delta(px(line_height)).y,
+        ));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        let forward_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("forward scroll must arm inertia")
+            .velocity;
+        assert!(forward_velocity > 0.0, "{forward_velocity}");
+
+        // `queue_scroll_inertia_at`'s immediate step for a *live, already
+        // in-flight* coast is sized off the real time since that coast's own
+        // last frame (issue #389). Pin `last_frame` and the reversal's own
+        // "now" to the exact same `Instant`, read once inside a single
+        // closure, via `on_scroll_at` (see its doc comment), so the elapsed
+        // gap this test exercises is exactly zero — and thus deterministically
+        // floored to `SCROLL_INERTIA_MIN_FRAME_TIME` below — instead of
+        // depending on how long the test harness itself takes between two
+        // separate `Instant::now()` reads (which can exceed
+        // `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI runner). This still
+        // exercises the same replace path a real, promptly-delivered
+        // reversal would take.
+        //
+        // `reversed_velocity` is read inside this same closure, immediately
+        // after `on_scroll_at`, rather than via a later, separate
+        // `read_with`: `cx.notify()` (from `queue_scroll_inertia_at`) can
+        // schedule a render before that later read runs, and `render` calls
+        // `step_scroll_inertia` unconditionally (see its doc comment), which
+        // would advance the coast again by however much real wall-clock time
+        // actually elapsed before that render — nondeterministic, and can
+        // exceed `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI runner,
+        // decaying the value this asserts against without changing any
+        // production real-time behavior.
+        let reversed_velocity = view.update_in(cx, |view, _window, cx| {
+            let now = Instant::now();
+            if let Some(inertia) = view.scroll_inertia.as_mut() {
+                inertia.last_frame = now;
+            }
+            // Scrolling the other way must cancel the old coast immediately
+            // instead of fighting it.
+            view.on_scroll_at(&reverse_event, now, cx);
+            view.scroll_inertia
+                .expect("the reversed scroll must still arm inertia")
+                .velocity
+        });
+        assert!(reversed_velocity < 0.0, "{reversed_velocity}");
+        // Replacing, not accumulating, means the result depends only on the
+        // reversal's own input velocity and the (here, exactly zero, so
+        // floored to `SCROLL_INERTIA_MIN_FRAME_TIME`) gap since the old
+        // coast's last touch, not on `forward_velocity`'s already-decayed
+        // remainder. `forward_velocity` itself now uses the larger, distinct
+        // `SCROLL_INERTIA_COLD_START_FRAME_TIME` (see `queue_scroll_inertia_at`),
+        // so it is deliberately no longer expected to equal
+        // `-reversed_velocity`.
+        let (_, expected_reversed_velocity) =
+            eased_scroll_inertia_step(reverse_raw_velocity, SCROLL_INERTIA_MIN_FRAME_TIME)
+                .expect("a full-size reversal delta must still be animating, not settled");
+        assert_eq!(reversed_velocity, expected_reversed_velocity);
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_after_accumulated_inertia_still_replaces_the_velocity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // Two same-direction events back to back accumulate inertia velocity
+        // instead of one replacing the other's remaining coast (issue #389).
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..2 {
+                view.on_scroll(
+                    &ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                        modifiers: gpui::Modifiers::none(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+        let accumulated_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("accumulated forward scroll must keep inertia armed")
+            .velocity;
+        assert!(accumulated_velocity > 0.0, "{accumulated_velocity}");
+
+        // Reversing direction must still cancel the accumulated coast
+        // outright rather than fighting or partially carrying it.
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        let reversed_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("the reversed scroll must still arm inertia")
+            .velocity;
+        assert!(
+            reversed_velocity < 0.0,
+            "reversing must not drag the accumulated forward velocity along: {reversed_velocity}"
+        );
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_after_a_delayed_event_moves_promptly_instead_of_staying_flat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: a real reversal input does not always land exactly one
+        // nominal animation frame after the old coast's last step; delivery
+        // can lag noticeably (e.g. under system load). `queue_scroll_inertia_at`
+        // must fold that whole real gap into its own synchronous immediate
+        // step instead of only ever advancing by one nominal frame's worth,
+        // or the screen would still read as unchanged in the new direction
+        // for several subsequent frames after a hard reversal.
+        let text = (1..=600)
+            .map(|n| format!("line {n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let forward = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -8.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let reverse = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 12.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let expected_reverse_delta = -f32::from(
+            reverse
+                .delta
+                .pixel_delta(px(view.read_with(cx, |view, _| view.line_height())))
+                .y,
+        );
+        assert!(expected_reverse_delta < 0.0, "{expected_reverse_delta}");
+
+        // Prime well away from the document start (and, with 600 lines,
+        // nowhere near its end either) so the reversal below moves freely
+        // instead of clamping at an edge, which would make the assertions
+        // below indistinguishable from a genuine prompt-movement failure.
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..10 {
+                view.on_scroll(&forward, window, cx);
+            }
+        });
+        view.update(cx, |view, _| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.advance_scroll_inertia();
+            }
+        });
+        assert!(view.read_with(cx, |view, _| view.scroll_inertia.is_none()));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(&forward, window, cx);
+        });
+        let before = view.read_with(cx, |view, _| view.scroll_y);
+
+        // Simulate the reversal event landing well after the old coast's own
+        // last recorded frame, the same gap `step_scroll_inertia` would
+        // otherwise need several real animation frames to close.
+        view.update(cx, |view, _| {
+            let inertia = view
+                .scroll_inertia
+                .as_mut()
+                .expect("forward scroll must arm inertia");
+            inertia.last_frame -= Duration::from_millis(120);
+        });
+
+        let after = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(&reverse, window, cx);
+            view.scroll_y
+        });
+
+        let moved = after - before;
+        assert!(moved < 0.0, "before={before}, after={after}");
+        // A 120ms-old coast is most of the way through its three-time-constant
+        // (~135ms) window, so the reversal's own synchronous catch-up step
+        // must already cover most of its own total distance here, not the
+        // roughly 17% a fixed one-nominal-frame step would apply.
+        assert!(
+            moved.abs() > 0.5 * expected_reverse_delta.abs(),
+            "reversal must move promptly, not stay flat: moved={moved}, \
+             expected_reverse_delta={expected_reverse_delta}"
+        );
+        assert!(
+            moved.abs() <= expected_reverse_delta.abs() + 1.0,
+            "reversal must not overshoot its own total coast distance: moved={moved}, \
+             expected_reverse_delta={expected_reverse_delta}"
+        );
+    }
+
+    #[gpui::test]
+    fn pixel_wheel_scroll_tracks_directly_without_app_added_inertia(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // Arm inertia with a plain Lines scroll first, so this also covers a
+        // device switching mid-gesture: the Pixels event below must still
+        // clear the stale Lines coast rather than adding trackpad momentum
+        // on top of it.
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(view.read_with(cx, |view, _| view.scroll_inertia.is_some()));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "a Pixels wheel event must not carry or add app-side inertia"
+        );
+    }
+
+    #[gpui::test]
+    fn an_external_scroll_position_change_stops_stale_wheel_inertia(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        let armed = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(armed > 0.0, "{armed}");
+
+        // A scrollbar drag (or cursor follow, selection autoscroll, a
+        // document switch, zoom, or a pinch) sets `scroll_y` directly,
+        // without going through the wheel path.
+        let moved = view.update_in(cx, |view, window, _cx| {
+            view.scroll_y = 0.0;
+            view.step_scroll_inertia(window);
+            view.scroll_y
+        });
+        assert_eq!(
+            moved, 0.0,
+            "stale wheel inertia must not overwrite a position another action just set"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the stale inertia must be cancelled once it observes the position moved out from \
+             under it"
+        );
+    }
+
+    #[gpui::test]
+    fn starting_a_scrollbar_drag_cancels_a_live_inertia_coast_that_has_not_moved_yet(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A drag can start on the very frame a coast's next step has not run
+        // yet, so `scroll_y` still equals the coast's own `last_applied` and
+        // the floating-point staleness check `advance_scroll_inertia` relies
+        // on cannot by itself tell the drag apart from an ordinary unmoved
+        // frame (issue #389). `begin_editor_scrollbar_drag` must cancel the
+        // coast explicitly instead of depending on that check.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        view.update(cx, |view, _cx| {
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 50.0,
+            });
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.begin_editor_scrollbar_drag(
+                &MouseDownEvent {
+                    position: point(px(950.0), px(400.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                },
+                600.0,
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "beginning a scrollbar drag must cancel a live coast even when scroll_y has not \
+             moved away from the coast's last_applied yet"
+        );
+    }
+
+    #[gpui::test]
+    fn replacing_the_document_cancels_a_live_inertia_coast_at_the_same_scroll_y(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The incoming document can restore a `scroll_y` equal to the
+        // outgoing coast's `last_applied` (e.g. both start at the top), in
+        // which case the floating-point staleness check `advance_scroll_inertia`
+        // relies on cannot tell the switch apart from an ordinary unmoved
+        // frame (issue #389). `on_document_replaced` must cancel the coast
+        // explicitly instead of depending on that check.
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
+        view.update(cx, |view, _cx| {
+            view.scroll_y = 0.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 0.0,
+            });
+
+            view.on_document_replaced();
+
+            assert!(
+                view.scroll_inertia.is_none(),
+                "replacing the document must cancel a live coast even when the new document's \
+                 scroll_y matches the coast's last_applied"
+            );
+            assert!(
+                !view.advance_scroll_inertia(),
+                "the cancelled coast must not resume advancing after the document switch"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn starting_a_wheel_zoom_cancels_a_live_inertia_coast(cx: &mut gpui::TestAppContext) {
+        // A modifier-wheel event that starts a zoom can arrive while a plain
+        // wheel scroll's inertia is still coasting (issue #389). Without
+        // cancelling that coast explicitly, `step_scroll_inertia` would keep
+        // advancing `scroll_y` every frame in parallel with the zoom
+        // animation instead of the zoom gesture taking over the wheel
+        // stream outright.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_some()),
+            "a plain wheel scroll must arm inertia before the zoom event arrives"
+        );
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 5.0)),
+                    modifiers: secondary_scroll_modifiers(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "switching to a modifier-wheel zoom must cancel the still-live scroll inertia coast"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.wheel_zoom_animation.is_some()),
+            "the zoom request itself must still be queued"
+        );
+    }
+
+    #[gpui::test]
+    fn starting_a_trackpad_pinch_cancels_a_live_inertia_coast(cx: &mut gpui::TestAppContext) {
+        // A neutral first pinch event can establish gesture ownership before
+        // the scale changes. The old Lines-wheel coast must stop at that
+        // point, just as it does when modifier-wheel starts zooming (issue
+        // #389).
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_some()),
+            "a plain wheel scroll must arm inertia before the pinch arrives"
+        );
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_pinch(
+                &gpui::PinchEvent {
+                    position,
+                    delta: 0.0,
+                    modifiers: gpui::Modifiers::none(),
+                    phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "even a neutral pinch-begin event must cancel the old scroll coast"
+        );
+        assert_eq!(view.read_with(cx, |view, _| view.zoom), 1.0);
+        let scroll_y_after_pinch = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            !view.update(cx, |view, _cx| view.advance_scroll_inertia()),
+            "the cancelled coast must not advance after the pinch takes ownership"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.scroll_y),
+            scroll_y_after_pinch
+        );
+    }
+
+    #[gpui::test]
+    fn height_anchor_recompute_resyncs_a_still_tracking_inertia_coast(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: `render` calls `step_scroll_inertia` before laying out
+        // and remeasuring visible blocks. When a block being remeasured (e.g.
+        // mid-resize) has a different height than before, the height-anchor
+        // recompute below moves `scroll_y` again in the same frame. A coast
+        // that still owned `scroll_y` going into that recompute must not then
+        // read as stale on the next frame just because of this frame's own
+        // correction.
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
+        view.update(cx, |view, _cx| {
+            view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 50.0,
+            });
+
+            view.apply_height_anchor(Some((0, 20.0)), true);
+
+            assert_eq!(
+                view.scroll_y, 20.0,
+                "the anchor moves scroll_y to the corrected position"
+            );
+            assert_eq!(
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                Some(20.0),
+                "a still-tracking coast's last_applied must resync onto this frame's own \
+                 height-anchor correction"
+            );
+            assert!(
+                view.advance_scroll_inertia(),
+                "the coast must keep running instead of reading this frame's own correction as \
+                 an unrelated ownership change"
+            );
+            assert!(view.scroll_inertia.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn height_anchor_recompute_does_not_resync_inertia_that_already_lost_scroll_y(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The render-entry clamp (or any other direct assignment) moving
+        // `scroll_y` before layout is a genuine change of ownership; the
+        // height-anchor recompute must not paper over that by resyncing
+        // anyway.
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
+        view.update(cx, |view, _cx| {
+            view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 999.0,
+            });
+
+            view.apply_height_anchor(Some((0, 20.0)), false);
+
+            assert_eq!(view.scroll_y, 20.0);
+            assert_eq!(
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                Some(999.0),
+                "an already-stale coast's last_applied must not be resynced"
+            );
+            assert!(
+                !view.advance_scroll_inertia(),
+                "the coast must still stop once it observes the position moved out from under it"
+            );
+            assert!(view.scroll_inertia.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn scroll_inertia_clamps_each_frame_and_tracks_the_document_end(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+        assert!(max_scroll_y > 1.0, "the test document must scroll");
+
+        let (scroll_y, last_applied, still_coasting) = view.update(cx, |view, _cx| {
+            view.scroll_y = max_scroll_y - 0.25;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 1_000.0,
+                last_frame: Instant::now() - Duration::from_millis(20),
+                last_applied: view.scroll_y,
+            });
+
+            let still_coasting = view.advance_scroll_inertia();
+            (
+                view.scroll_y,
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                still_coasting,
+            )
+        });
+
+        assert!(
+            still_coasting,
+            "the coast must remain live at a document edge"
+        );
+        assert_eq!(
+            scroll_y, max_scroll_y,
+            "an inertia frame must clamp its own position at the document end"
+        );
+        assert_eq!(
+            last_applied,
+            Some(max_scroll_y),
+            "inertia tracking must store the clamped position at the document end"
+        );
+    }
+
+    #[gpui::test]
+    fn scroll_inertia_does_not_carry_scroll_y_past_the_document_end(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // Scroll far past the document end so both the direct delta and any
+        // armed inertia would overshoot it without the existing render-time
+        // clamp.
+        for _ in 0..10 {
+            view.update_in(cx, |view, window, cx| {
+                view.on_scroll(
+                    &ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, -20.0)),
+                        modifiers: gpui::Modifiers::none(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        }
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+
+        cx.run_until_parked();
+
+        let after = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            (after - max_scroll_y).abs() < 1.0,
+            "scroll inertia must not carry scroll_y past the document end: after={after}, \
+             max={max_scroll_y}"
+        );
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_clamps_at_the_document_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+        view.update(cx, |view, _cx| {
+            view.scroll_y = max_scroll_y;
+        });
+
+        // A small "scroll down" Lines input while already at the document
+        // end must clamp at max_scroll_y rather than overshooting it.
+        let (after, armed_inertia) = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -0.02)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            (view.scroll_y, view.scroll_inertia)
+        });
+        assert_eq!(
+            after, max_scroll_y,
+            "a sub-settle-epsilon input must clamp at the document end, not overshoot it"
+        );
+        assert!(armed_inertia.is_none());
     }
 
     #[gpui::test]
