@@ -37,10 +37,15 @@ func key(_ p:pid_t,_ name:String) {
     if name != "escape" { flags.insert(.maskControl) }; if name=="previous" { flags.insert(.maskShift) }
     guard let d=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:true),let u=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:false) else { fail("keyboard event unavailable") }; d.flags=flags;u.flags=flags;d.post(tap:.cghidEventTap);Thread.sleep(forTimeInterval:0.05);u.post(tap:.cghidEventTap);Thread.sleep(forTimeInterval:0.35);output(["key":name])
 }
+func hover(_ p:pid_t,_ path:String,_ pat:String,_ region:String) {
+    focus(p);guard let m=match(path,pat,region) else {fail("no observed hover target: \(pat)")};let b=bounds(p);let point=CGPoint(x:b.minX+m.1.midX*b.width,y:b.minY+(1-m.1.midY)*b.height)
+    guard let e=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:point,mouseButton:.left) else {fail("hover event unavailable")};e.post(tap:.cghidEventTap);Thread.sleep(forTimeInterval:0.8);var info=details(m);info["hovered"]=true;output(info)
+}
 let a=Array(CommandLine.arguments.dropFirst()); guard let c=a.first else { fail("command required") }
 switch c {
 case "find": guard a.count==4 else { fail("find image regex region") }; output(details(match(a[1],a[2],a[3])))
 case "click": guard a.count==6,let p=pid_t(a[1]) else { fail("click pid image regex region button") }; click(p,a[2],a[3],a[4],a[5])
+case "hover": guard a.count==5,let p=pid_t(a[1]) else {fail("hover pid image regex region")};hover(p,a[2],a[3],a[4])
 case "key": guard a.count==3,let p=pid_t(a[1]),["next","previous","escape"].contains(a[2]) else { fail("key pid next|previous|escape") }; key(p,a[2])
 case "move": guard a.count==2,let p=pid_t(a[1]) else { fail("move pid") }; focus(p);let b=bounds(p);let q=CGPoint(x:b.maxX-20,y:b.midY);CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:q,mouseButton:.left)?.post(tap:.cghidEventTap);Thread.sleep(forTimeInterval:0.4);output(["moved":true])
 case "clipboard": output(["text":NSPasteboard.general.string(forType:.string) ?? ""])
