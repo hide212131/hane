@@ -718,7 +718,7 @@ impl EditorView {
     /// that document never opened. In particular, a chosen path is saved to
     /// the original session by id, never to whatever session happens to be
     /// active when the user finally answers.
-    fn handle_save_as_response(
+    pub(super) fn handle_save_as_response(
         &mut self,
         id: SessionId,
         instance: Option<DocumentInstance>,
