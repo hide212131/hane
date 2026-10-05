@@ -6166,6 +6166,14 @@ impl EditorView {
         let menu_element = div()
             .id("file-tab-context-menu")
             .debug_selector(|| "file-tab-context-menu".to_owned())
+            // The menu floats over the tab bar and document body via
+            // `anchored()`, and can land on top of either depending on
+            // where the triggering tab sits. Without occluding its own
+            // hitbox, a click that lands within the menu's painted bounds
+            // but outside an item (padding, a disabled row, the border)
+            // still reaches whatever row/tab is underneath, moving the
+            // caret or selection in the background document.
+            .occlude()
             .min_w(px(180.0))
             .flex()
             .flex_col()
@@ -11298,6 +11306,69 @@ mod tests {
         cx.simulate_click(point(px(620.0), px(220.0)), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_blocks_clicks_to_background_document(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::new("first line\nsecond line\nthird line\n", "Untitled", cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(400.0)));
+        cx.run_until_parked();
+
+        let caret = view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.after_input(cx);
+            view.editor().selection()
+        });
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("first document row rendered");
+        let id = view.read_with(cx, |view, _| view.sessions.active_id());
+
+        // Anchor the menu's own top-left corner exactly at the first row's
+        // top-left corner, the same way a real right-click elsewhere in the
+        // window can land a menu row over the active document body
+        // depending on where the triggering tab sits. The session has no
+        // path, so every item below is a disabled row with no `on_click`
+        // wired, exercising the "disabled row / empty padding" case the fix
+        // must also cover, not just an active item's own click handler.
+        view.update(cx, |view, cx| {
+            view.open_file_tab_context_menu(id, row.origin, cx);
+        });
+        cx.run_until_parked();
+
+        let menu = cx
+            .debug_bounds("file-tab-context-menu")
+            .expect("context menu rendered");
+        let overlap = menu.intersect(&row);
+        assert!(
+            overlap.size.width > px(0.0) && overlap.size.height > px(0.0),
+            "test setup must position the menu over the document body for this probe to be meaningful: \
+             menu={menu:?} row={row:?}"
+        );
+
+        // A click inside the overlap must land on the menu (which occludes
+        // its own hitbox), not fall through to the row underneath.
+        cx.simulate_mouse_down(overlap.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(overlap.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                caret,
+                "a click on the context menu, even over a disabled row, must not move the \
+                 caret in the background document"
+            );
+            assert!(
+                view.file_tab_context_menu.is_some(),
+                "the menu only closes via its own outside-click/escape handling, not by a \
+                 click on itself"
+            );
+        });
     }
 
     #[gpui::test]
