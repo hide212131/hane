@@ -9,8 +9,9 @@ func apple(_ s: String) -> NSAppleEventDescriptor { var e:NSDictionary?; let r=N
 func focus(_ p:pid_t) { guard let a=NSRunningApplication(processIdentifier:p) else { fail("missing process") }; _=a.activate(options:[.activateAllWindows]); _=apple("tell application \"System Events\" to set frontmost of first process whose unix id is \(p) to true"); Thread.sleep(forTimeInterval:0.2) }
 func bounds(_ p:pid_t) -> CGRect { let ws=CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []; guard let w=ws.first(where:{ ($0[kCGWindowOwnerPID as String] as? Int)==Int(p) && ($0[kCGWindowLayer as String] as? Int)==0 }), let b=w[kCGWindowBounds as String] as? [String:Any], let r=CGRect(dictionaryRepresentation:b as CFDictionary) else { fail("no target window") }; return r }
 func match(_ path:String,_ pat:String,_ region:String) -> (String,CGRect)? {
-    let q=VNRecognizeTextRequest(); q.recognitionLevel = .accurate; q.usesLanguageCorrection=false; q.recognitionLanguages=["en-US","ja-JP"]
+    let q=VNRecognizeTextRequest(); q.recognitionLevel = .accurate; q.usesLanguageCorrection=false; q.recognitionLanguages=["ja-JP","en-US"]
     do { try VNImageRequestHandler(url:URL(fileURLWithPath:path),options:[:]).perform([q]) } catch { fail("OCR: \(error)") }
+    let observed = (q.results ?? []).compactMap { $0.topCandidates(1).first?.string }; FileHandle.standardError.write(Data(("OCR observed: " + observed.joined(separator: " | ") + "\n").utf8))
     guard let re=try? NSRegularExpression(pattern:pat,options:[.caseInsensitive]) else { fail("invalid regex") }
     for o in q.results ?? [] {
         guard let t=o.topCandidates(1).first, let m=re.firstMatch(in:t.string,range:NSRange(t.string.startIndex..<t.string.endIndex,in:t.string)), let r=Range(m.range,in:t.string), let box=try? t.boundingBox(for:r) else { continue }
