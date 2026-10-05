@@ -548,6 +548,20 @@ struct TabCloseConfirm {
     instance: DocumentInstance,
 }
 
+/// How the native Save As dialog `prompt_save_as_for_close` opens resolved,
+/// collapsed to one type so `handle_save_as_for_close_response` can check
+/// every case against the same document-instance authority instead of each
+/// one being guarded separately.
+#[derive(Clone, Debug)]
+enum SaveAsForCloseResponse {
+    Chosen(PathBuf),
+    Canceled,
+    /// The dialog's own error, already rendered to text: its concrete
+    /// error type is `anyhow::Error`, which this crate has no direct
+    /// dependency on to name.
+    Failed(String),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct InlineRenameRenderState {
     pub(crate) text: String,
@@ -1840,62 +1854,69 @@ impl EditorView {
             workspace: self.work_folder_generation,
         };
         let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
-        cx.spawn(async move |view, cx| match receiver.await {
-            Ok(Ok(Some(path))) => {
-                let _ = view.update(cx, |view, cx| {
-                    // Armed now, against the instance as of this specific
-                    // write, so only this user-chosen write's own landing
-                    // (checked by `resolve_pending_tab_close`) can close the
-                    // tab: nothing landed for this session before the user
-                    // chose a target is eligible to satisfy this request.
-                    // If the id no longer names the same document instance
-                    // the dialog was opened for, the chosen path is not
-                    // written at all — it must not land on whatever
-                    // unrelated document now holds this id.
-                    if view.document_instance(id) == Some(instance) {
-                        view.tab_close_after_save.insert(id, instance);
-                        view.save_session(id, SaveIntent::To(path), cx);
-                    } else {
-                        view.status = Some(
-                            "保存先の選択中にタブの文書が入れ替わったため、保存されませんでした"
-                                .to_owned(),
-                        );
-                        cx.notify();
-                    }
-                });
-            }
-            Ok(Err(error)) => {
-                let _ = view.update(cx, |view, cx| {
-                    // Only this dialog's own instance may act at all: by the
-                    // time this lands, the id may already belong to an
-                    // unrelated, newer document (a work-folder switch, or an
-                    // in-place reopen), and acting unconditionally would
-                    // cancel that document's own close request instead of
-                    // this one, or overwrite the status it is currently
-                    // showing with a message about a dialog it never opened.
-                    if view.document_instance(id) != Some(instance) {
-                        return;
-                    }
-                    if view.tab_close_after_save.get(&id) == Some(&instance) {
-                        view.tab_close_after_save.remove(&id);
-                    }
-                    view.status = Some(format!("Save As failed: {error}"));
-                    cx.notify();
-                });
-            }
-            _ => {
-                let _ = view.update(cx, |view, cx| {
-                    if view.document_instance(id) != Some(instance) {
-                        return;
-                    }
-                    if view.tab_close_after_save.get(&id) == Some(&instance) {
-                        view.tab_close_after_save.remove(&id);
-                    }
-                    cx.notify();
-                });
-            }
+        cx.spawn(async move |view, cx| {
+            // Collapsed to one small response type before the single entry
+            // gate in `handle_save_as_for_close_response` runs, so every
+            // way this native, unboundedly long-lived dialog can resolve —
+            // chosen, canceled, failed, or its channel simply dropped — is
+            // checked against the same document-instance authority instead
+            // of each arm re-deriving (and risking drifting from) its own
+            // guard.
+            let response = match receiver.await {
+                Ok(Ok(Some(path))) => SaveAsForCloseResponse::Chosen(path),
+                Ok(Ok(None)) => SaveAsForCloseResponse::Canceled,
+                Ok(Err(error)) => SaveAsForCloseResponse::Failed(error.to_string()),
+                Err(_) => SaveAsForCloseResponse::Canceled,
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.handle_save_as_for_close_response(id, instance, response, cx);
+            });
         })
         .detach();
+    }
+
+    /// The single entry point every resolution of the Save As dialog
+    /// `prompt_save_as_for_close` opens must pass through. Only this
+    /// dialog's own document instance may act at all: by the time this
+    /// runs, the id may already belong to an unrelated, newer document (a
+    /// work-folder switch, or an in-place `adopt`), and none of them —
+    /// not a path landing on disk, not clearing a close request, not even
+    /// the status message — may be touched on behalf of a dialog that
+    /// document never opened.
+    fn handle_save_as_for_close_response(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        response: SaveAsForCloseResponse,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document_instance(id) != Some(instance) {
+            return;
+        }
+        match response {
+            SaveAsForCloseResponse::Chosen(path) => {
+                // Armed now, against the instance as of this specific
+                // write, so only this user-chosen write's own landing
+                // (checked by `resolve_pending_tab_close`) can close the
+                // tab: nothing landed for this session before the user
+                // chose a target is eligible to satisfy this request.
+                self.tab_close_after_save.insert(id, instance);
+                self.save_session(id, SaveIntent::To(path), cx);
+            }
+            SaveAsForCloseResponse::Failed(error) => {
+                if self.tab_close_after_save.get(&id) == Some(&instance) {
+                    self.tab_close_after_save.remove(&id);
+                }
+                self.status = Some(format!("Save As failed: {error}"));
+                cx.notify();
+            }
+            SaveAsForCloseResponse::Canceled => {
+                if self.tab_close_after_save.get(&id) == Some(&instance) {
+                    self.tab_close_after_save.remove(&id);
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Re-checked after any write or rename completes for a session with a
@@ -12702,6 +12723,249 @@ mod tests {
                 "the replacement document's own path must be untouched"
             );
         });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // PR #416 review follow-up: `DocumentSession::adopt` bumps the
+    // generation without touching the workspace at all — an in-place
+    // reopen into the same tab, not a work-folder switch. `finish_save`'s
+    // guard used to compare only the workspace, so a write started before
+    // an in-place `adopt` could still reach the tail of `finish_save` and
+    // clear title-sync and close-and-save bookkeeping that belongs
+    // entirely to the document the `adopt` replaced it with.
+    #[gpui::test]
+    fn a_stale_save_completion_from_before_an_in_place_adopt_does_not_clear_the_replacement_documents_bookkeeping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-save-no-clear-adopt");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_target = old_root.join("Old.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        // Starts the old document's first write and leaves its result
+        // unpolled: nothing here calls `cx.run_until_parked()` before the
+        // `adopt` below replaces the document in place.
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("first").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(old_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+            id
+        });
+
+        // Replaces the document in place — same `SessionId`, same
+        // workspace, generation bumped — while the write above is still
+        // unpolled.
+        let new_instance = view.update(cx, |view, _cx| {
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            }
+        });
+
+        // Bookkeeping belonging entirely to the replacement document — a
+        // pending title-sync create and a close-and-save request, armed
+        // for writes of its own that have nothing to do with the stale
+        // one above — must survive the stale completion below untouched.
+        view.update(cx, |view, _cx| {
+            view.title_sync_pending.insert(id, "Kept".to_owned());
+            view.tab_close_after_save.insert(id, new_instance);
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            old_target.exists(),
+            "the stale write itself must still have landed on disk"
+        );
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the replacement document must still be open"
+            );
+            assert_eq!(
+                view.title_sync_pending.get(&id).map(String::as_str),
+                Some("Kept"),
+                "the stale completion must not clear title-sync bookkeeping armed for the \
+                 replacement document"
+            );
+            assert_eq!(
+                view.tab_close_after_save.get(&id),
+                Some(&new_instance),
+                "the stale completion must not clear a close-and-save request armed for the \
+                 replacement document"
+            );
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the stale completion must not give the replacement document the old write's \
+                 file identity"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+    }
+
+    // PR #416 review follow-up: the native Save As dialog
+    // `prompt_save_as_for_close` opens is not bounded by this process at
+    // all, so every way it can resolve — chosen, canceled, or failed — is
+    // collapsed to one `SaveAsForCloseResponse` before reaching the single
+    // entry gate in `handle_save_as_for_close_response`. A failed dialog
+    // used to skip that gate's status-message guard: this exercises it
+    // directly, since the test platform's own `simulate_new_path_selection`
+    // has no way to produce an error from the dialog itself.
+    #[gpui::test]
+    fn handle_save_as_for_close_response_ignores_a_failure_for_a_stale_document_instance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("save-as-close-response-stale-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, stale_instance, new_instance) = view.update(cx, |view, _cx| {
+            let id = view.sessions.active_id();
+            // The instance the (now long-gone) dialog was opened against.
+            let stale_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            // Bookkeeping belonging entirely to the replacement document —
+            // a close-and-save request of its own, armed after the dialog
+            // above was already opened for the document it replaced.
+            let new_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.tab_close_after_save.insert(id, new_instance);
+            view.status = Some("current document status".to_owned());
+            (id, stale_instance, new_instance)
+        });
+
+        view.update(cx, |view, cx| {
+            view.handle_save_as_for_close_response(
+                id,
+                stale_instance,
+                SaveAsForCloseResponse::Failed("disk full".to_owned()),
+                cx,
+            );
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("current document status"),
+                "a stale dialog's own failure must not overwrite the replacement document's \
+                 status"
+            );
+            assert_eq!(
+                view.tab_close_after_save.get(&id),
+                Some(&new_instance),
+                "a stale dialog's own failure must not clear a close-and-save request armed \
+                 for the replacement document"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Companion to the failure case above, for the chosen-path branch:
+    // before this fix, a mismatched instance here still overwrote the
+    // status with a message about the stale dialog, the one branch of
+    // `prompt_save_as_for_close`'s old three that was not consistent with
+    // the other two's silent drop.
+    #[gpui::test]
+    fn handle_save_as_for_close_response_ignores_a_chosen_path_for_a_stale_document_instance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("save-as-close-response-stale-chosen");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let chosen_path = root.join("Chosen.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, stale_instance) = view.update(cx, |view, _cx| {
+            let id = view.sessions.active_id();
+            let stale_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            view.status = Some("current document status".to_owned());
+            (id, stale_instance)
+        });
+
+        view.update(cx, |view, cx| {
+            view.handle_save_as_for_close_response(
+                id,
+                stale_instance,
+                SaveAsForCloseResponse::Chosen(chosen_path.clone()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("current document status"),
+                "a stale dialog's own chosen path must not overwrite the replacement \
+                 document's status"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a stale dialog's own chosen path must not arm a close-and-save request for \
+                 the replacement document"
+            );
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the replacement document's own path must be untouched"
+            );
+        });
+        assert!(
+            !chosen_path.exists(),
+            "the stale dialog's own chosen path must not be written to disk under the \
+             replacement document's identity"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -268,13 +268,19 @@ impl EditorView {
         let Some(ticket) = session.begin_rename() else {
             return;
         };
+        // Captured now, not re-read once the rename lands: a work-folder
+        // switch installs a fresh `SessionSet` whose ids restart at the
+        // same values the old one used, and `DocumentSession::adopt` bumps
+        // the generation without touching the workspace at all, so either
+        // kind of document exchange can leave a stale completion naming the
+        // same id as a document that was never the one this rename was
+        // for. Binding the full instance here, before the completion ever
+        // reaches `finish_title_rename`, is what tells them apart.
+        let instance = DocumentInstance {
+            generation: session.generation(),
+            workspace: self.work_folder_generation,
+        };
         self.title_sync_in_flight.insert(id);
-        // Captured now, not re-read once the rename lands: the same
-        // workspace/document boundary `save_session` binds for a write's own
-        // `SaveTicket` applies here too, since `begin_rename` reserves the
-        // same save slot and its ticket is subject to the same generation
-        // collision across a work-folder switch's fresh `SessionSet`.
-        let workspace = self.work_folder_generation;
         let files = self.files.clone();
         let probe_title = title.clone();
         let probe_from = from.clone();
@@ -295,12 +301,16 @@ impl EditorView {
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                if workspace != view.work_folder_generation {
-                    // The work folder was switched away while this rename
-                    // was in flight: `id` may now name an unrelated document
-                    // that reused the same slot, whose own, unrelated
-                    // title-sync in-flight marker and save/close state this
-                    // stale completion must not touch.
+                if view.document_instance(id) != Some(instance) {
+                    // The document this rename was for is gone, or this id
+                    // now names a different instance of it — a work-folder
+                    // switch, or an in-place `adopt` that replaced the
+                    // document without touching the workspace. The rename
+                    // itself already ran against the old path on disk and
+                    // cannot be undone from here, but no bookkeeping for
+                    // whatever document now holds `id` may be touched: not
+                    // its in-flight marker, not its queued save, not its
+                    // pending-close request.
                     return;
                 }
                 view.title_sync_in_flight.remove(&id);
@@ -484,10 +494,14 @@ impl EditorView {
                 // (and each fresh session's own generation) restart at the
                 // same values the old one used, so an old-workspace write's
                 // `SaveTicket` can coincidentally equal a new document's own
-                // first ticket. Binding the workspace here, before the
-                // completion ever reaches `finish_save`, is what tells the
-                // two apart instead of letting the ticket alone decide.
-                let workspace = self.work_folder_generation;
+                // first ticket. `DocumentSession::adopt` bumps the
+                // generation without touching the workspace at all, so an
+                // in-place reopen within the same workspace is the same kind
+                // of document exchange too. Binding the full instance here,
+                // before the completion ever reaches `finish_save`, is what
+                // tells the two apart instead of letting the ticket alone
+                // decide.
+                let instance = self.document_instance(id);
                 cx.spawn(async move |view, cx| {
                     let result = cx
                         .background_executor()
@@ -496,7 +510,7 @@ impl EditorView {
                         })
                         .await;
                     let _ = view.update(cx, |view, cx| {
-                        view.finish_save(id, ticket, workspace, &path, result, cx);
+                        view.finish_save(id, ticket, instance, &path, result, cx);
                     });
                 })
                 .detach();
@@ -509,21 +523,23 @@ impl EditorView {
         &mut self,
         id: SessionId,
         ticket: SaveTicket,
-        workspace: u64,
+        instance: Option<DocumentInstance>,
         path: &Path,
         result: Result<SavedFile, SaveFailure>,
         cx: &mut Context<Self>,
     ) {
-        if workspace != self.work_folder_generation {
-            // The work folder was switched away while this write was in
-            // flight. `id` may now name an unrelated document that reused
-            // the same slot in the fresh `SessionSet`, so this completion
-            // must not touch any of its state at all — not the file
-            // identity or saved revision a `finish_save` call below would
-            // apply, and not the title-sync or pending-close bookkeeping the
-            // outcome match and the tail of this function would otherwise
-            // clear for it. Dropped silently, the same as any other result
-            // that no longer belongs to anything open.
+        if self.document_instance(id) != instance {
+            // The document this write was for is gone, or this id now
+            // names a different instance of it — a work-folder switch that
+            // reused the same slot in a fresh `SessionSet`, or an in-place
+            // `adopt` that replaced the document without touching the
+            // workspace. Either way this completion must not touch any
+            // state at all — not the file identity or saved revision a
+            // `finish_save` call below would apply, and not the title-sync
+            // or pending-close bookkeeping the outcome match and the tail
+            // of this function would otherwise clear for it. Dropped
+            // silently, the same as any other result that no longer
+            // belongs to anything open.
             return;
         }
         let Some(outcome) = self
@@ -620,5 +636,133 @@ impl EditorView {
             _ => {}
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hane_session::FileIdentity;
+
+    fn rename_test_root(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "hane-rename-adopt-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    // PR #416 review follow-up: `DocumentSession::adopt` bumps the
+    // generation without touching the workspace at all — an in-place
+    // reopen into the same tab, not a work-folder switch.
+    // `begin_title_rename`'s completion used to compare only the
+    // workspace, so a rename started before an in-place `adopt` could
+    // still reach `finish_title_rename` and release the save slot, drain
+    // a save queued behind it, and resolve the close request of the
+    // document the `adopt` replaced it with.
+    #[gpui::test]
+    fn a_stale_rename_completion_from_before_an_in_place_adopt_does_not_touch_the_replacement_documents_bookkeeping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = rename_test_root("stale-rename-adopt");
+        std::fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("Old.md");
+        std::fs::write(&old_path, "body\n").unwrap();
+        let loaded = OsFileService.load(&old_path).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Reserves the save slot and spawns the rename's background
+        // probe/IO synchronously, with no debounce timer involved — the
+        // title passed directly, bypassing `decide_title_sync`, since
+        // only `begin_title_rename`'s own race protection is under test
+        // here. Leaves the result unpolled: nothing here calls
+        // `cx.run_until_parked()` before the `adopt` below replaces the
+        // document in place.
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.begin_title_rename(id, "New".to_owned(), cx);
+            assert!(view.sessions.active().save_in_flight());
+            id
+        });
+
+        // Replaces the document in place — same `SessionId`, same
+        // workspace, generation bumped — while the rename above is still
+        // unpolled. The replacement document then reserves its own save
+        // slot and queues a save behind it, entirely independent of the
+        // stale rename above.
+        let new_instance = view.update(cx, |view, _cx| {
+            let session = view.sessions.active_mut();
+            session.adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            assert!(session.begin_rename().is_some());
+            assert!(matches!(
+                session.request_save(SaveIntent::Current),
+                SaveDecision::Queued
+            ));
+            DocumentInstance {
+                generation: session.generation(),
+                workspace: view.work_folder_generation,
+            }
+        });
+        view.update(cx, |view, _cx| {
+            view.title_sync_in_flight.insert(id);
+            view.tab_close_after_save.insert(id, new_instance);
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            !old_path.exists(),
+            "the stale rename itself must still have landed on disk"
+        );
+
+        view.update(cx, |view, _cx| {
+            let session = view
+                .sessions
+                .get_mut(id)
+                .expect("the replacement document must still be open");
+            assert_eq!(
+                session.path(),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the stale rename completion must not touch the replacement document's path"
+            );
+            assert!(
+                session.save_in_flight(),
+                "the stale rename completion must not release the replacement document's own \
+                 save slot"
+            );
+            assert!(
+                matches!(session.take_pending_save(), Some(SaveIntent::Current)),
+                "the stale rename completion must not drain the replacement document's own \
+                 queued save"
+            );
+            assert!(
+                view.title_sync_in_flight.contains(&id),
+                "the stale rename completion must not clear a title-sync in-flight marker \
+                 armed for the replacement document"
+            );
+            assert_eq!(
+                view.tab_close_after_save.get(&id),
+                Some(&new_instance),
+                "the stale rename completion must not clear a close-and-save request armed \
+                 for the replacement document"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
