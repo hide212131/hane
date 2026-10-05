@@ -1,0 +1,18 @@
+{
+  "os": "Windows 11 Home 25H2 ARM64 26200.9457",
+  "result": "fail",
+  "images": [
+    {
+      "file": "pr416-identity-before-fix-before.jpg",
+      "sha256": "7a902dce417df4b6f1f2d225fcfc400aba6eb96f0936c25bd8b7579967078c5f"
+    },
+    {
+      "file": "pr416-identity-before-fix-after.jpg",
+      "sha256": "d48121d038bca60c376a0ba240ac48f09220b9a6aee679e30b2a7d8dccd4ebcf"
+    }
+  ],
+  "base": "3f738b57d033689832183469e1751248530f204d",
+  "observation": "native right-clickでタブメニューを開いてから、実行中HaneのCLI/IPC経路で別フォルダーを開くと、id0の新しい文書になっても古いメニューが残った。メニューの保存・削除操作は実行していない。",
+  "head": "49b4a377cd4d62e21adb01f6a338c817351bd562",
+  "note": "修正前の再現証拠。新しいheadの合格証拠として使用しない。"
+}
