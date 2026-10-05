@@ -1,12 +1,17 @@
-name: PR416 current-main GUI diagnostic baseline
-run-name: PR416 baseline 3f738b5 comparison with 37266328180
+name: PR416 current-head native tab actions
+run-name: PR416 native tab actions ${{ inputs.expected_sha }}
 on:
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: 検証対象のPR416 current head
+        required: true
+        type: string
 permissions:
   contents: read
   pull-requests: read
 jobs:
-  baseline:
+  focused:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -16,42 +21,48 @@ jobs:
           ref: 3f738b57d033689832183469e1751248530f204d
           path: control
           persist-credentials: false
-      - name: Check out pinned current-main baseline
+      - name: Check out exact candidate
         uses: actions/checkout@v6
         with:
-          ref: 3f738b57d033689832183469e1751248530f204d
-          path: baseline
+          ref: ${{ inputs.expected_sha }}
+          path: candidate
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify current PR head and baseline
+      - name: Check out diagnostic procedure
+        uses: actions/checkout@v6
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - name: Verify current PR head and base
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -C control rev-parse HEAD)" = 3f738b57d033689832183469e1751248530f204d
-          test "$(git -C baseline rev-parse HEAD)" = 3f738b57d033689832183469e1751248530f204d
-          test -z "$(git -C baseline status --porcelain)"
+          test "$(git -C candidate rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git -C candidate status --porcelain)"
           gh api repos/hide212131/hane/pulls/416 > "$RUNNER_TEMP/pr-context.json"
-          jq -e '.state == "open" and .head.sha == "49b4a377cd4d62e21adb01f6a338c817351bd562" and .base.sha == "3f738b57d033689832183469e1751248530f204d"' "$RUNNER_TEMP/pr-context.json"
+          jq -e --arg expected "$EXPECTED_SHA" '.state == "open" and .head.sha == $expected and .base.sha == "3f738b57d033689832183469e1751248530f204d"' "$RUNNER_TEMP/pr-context.json"
           test "$(gh api repos/hide212131/hane/branches/main --jq '.commit.sha')" = 3f738b57d033689832183469e1751248530f204d
-          echo 'Read-only diagnostic baseline. This run does not waive or replace the original candidate GUI result.'
-      - name: Execute unchanged trusted GUI procedure on baseline
+      - name: Observe native tab actions and Finder selection
         env:
-          HANE_GUI_INTERACTION_TARGET_DIR: ${{ github.workspace }}/baseline
-          HANE_GUI_INTERACTION_CONTROL_DIR: ${{ github.workspace }}/control
-          HANE_GUI_INTERACTION_EXPECTED_SHA: 3f738b57d033689832183469e1751248530f204d
-          HANE_GUI_INTERACTION_RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
-          HANE_GUI_INTERACTION_REQUEST_ID: pr416-baseline-${{ github.run_id }}
-        run: python3 control/scripts/hosted_gui_interaction.py
+          PR416_TARGET_DIR: ${{ github.workspace }}/candidate
+          PR416_CONTROL_DIR: ${{ github.workspace }}/control
+          PR416_DIAGNOSTIC_DIR: ${{ github.workspace }}/diagnostic/evidence/pr416-macos-focused
+          PR416_EXPECTED_SHA: ${{ inputs.expected_sha }}
+          PR416_RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
+        run: python3 diagnostic/evidence/pr416-macos-focused/pr416-macos-focused.py
       - name: Stage allowlisted diagnostic evidence
         if: always()
         run: python3 -I control/.github/scripts/stage_gui_evidence.py
-      - name: Upload current-main baseline evidence
+      - name: Upload current-head tab evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr416-current-main-baseline-${{ github.run_id }}
+          name: pr416-native-tabs-${{ github.run_id }}
           path: ${{ runner.temp }}/hane-gui-artifact
           if-no-files-found: error
           retention-days: 14
