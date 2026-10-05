@@ -12,13 +12,23 @@ impl EditorView {
             return;
         };
         let id = session.id();
+        // Captured now, not re-read once the timer fires: a work-folder
+        // switch installs a fresh `SessionSet` whose ids (and each fresh
+        // session's own generation) restart at the same values the old one
+        // used, so `AutosaveTicket`'s own generation field — scoped to a
+        // single document, not a workspace — can coincidentally still read
+        // as current for an unrelated document that now holds `id`. Only
+        // the full instance, including the workspace epoch, tells them
+        // apart.
+        let instance = self.document_instance(id);
         cx.spawn(async move |view, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
             let should_save = view
                 .read_with(cx, |view, _| {
-                    view.sessions.active_id() == id
+                    view.document_instance(id) == instance
+                        && view.sessions.active_id() == id
                         && view
                             .sessions
                             .active()
@@ -56,6 +66,15 @@ impl EditorView {
             return;
         };
         let revision = self.sessions.active().revision();
+        // Captured now, not re-read once the timer fires: a work-folder
+        // switch or an in-place `adopt` can leave `id` naming an unrelated
+        // document whose own revision coincidentally matches this one (both
+        // freshly created documents restart their counters at the same
+        // values). `work_folder_drafts.contains_key` alone cannot tell that
+        // unrelated document's own draft apart from the one this timer was
+        // armed for, so the completion below also requires the draft id
+        // itself, not merely some draft, to still be the one captured here.
+        let instance = self.document_instance(id);
         let draft_store = self.draft_store.clone();
         cx.spawn(async move |view, cx| {
             cx.background_executor()
@@ -63,9 +82,12 @@ impl EditorView {
                 .await;
             let text = view
                 .read_with(cx, |view, _| {
+                    if view.document_instance(id) != instance {
+                        return None;
+                    }
                     let session = view.sessions.get(id)?;
-                    let current =
-                        session.revision() == revision && view.work_folder_drafts.contains_key(&id);
+                    let draft = view.work_folder_drafts.get(&id)?;
+                    let current = session.revision() == revision && draft.draft_id == draft_id;
                     current.then(|| session.editor().document().full_text())
                 })
                 .ok()
@@ -112,17 +134,31 @@ impl EditorView {
             return;
         }
         let id = self.sessions.active_id();
-        let generation = self.sessions.active().generation();
         let revision = self.sessions.active().revision();
+        // Captured now, not re-read once the timer fires: a work-folder
+        // switch or an in-place `adopt` can leave `id` naming an unrelated
+        // document whose own revision coincidentally matches this one (both
+        // freshly created documents restart their counters at the same
+        // values), which `title_sync_scheduled`'s revision-only check
+        // cannot tell apart on its own. Only the full instance, including
+        // the workspace epoch, tells them apart; it must be checked before
+        // this completion touches the scheduled-map entry or decides
+        // anything for `id`, not only inside `run_title_sync` afterwards.
+        let Some(instance) = self.document_instance(id) else {
+            return;
+        };
         self.title_sync_scheduled.insert(id, revision);
         cx.spawn(async move |view, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
             let _ = view.update(cx, |view, cx| {
+                if view.document_instance(id) != Some(instance) {
+                    return;
+                }
                 if view.title_sync_scheduled.get(&id).copied() == Some(revision) {
                     view.title_sync_scheduled.remove(&id);
-                    view.run_title_sync(id, generation, revision, cx);
+                    view.run_title_sync(id, instance.generation, revision, cx);
                 }
             });
         })
@@ -208,6 +244,19 @@ impl EditorView {
     ) {
         let root = target_directory;
         self.title_sync_in_flight.insert(id);
+        // Captured now, before any `await`: a work-folder switch installs a
+        // fresh `SessionSet` whose ids restart at the same values the old
+        // one used, and `DocumentSession::adopt` bumps the generation
+        // without touching the workspace at all, so either kind of document
+        // exchange can leave this probe's completion naming an id that now
+        // belongs to an unrelated document — one with no path and no save
+        // in flight of its own yet, which `should_defer_h1_create` alone
+        // cannot tell apart from the untitled document this probe actually
+        // started for. Binding the full instance here, before the probe
+        // ever reaches its completion below, is what tells them apart,
+        // the same as `save_session` and `begin_title_rename` already do
+        // for their own completions.
+        let instance = self.document_instance(id);
         let files = self.files.clone();
         let probe_title = title.clone();
         cx.spawn(async move |view, cx| {
@@ -222,9 +271,20 @@ impl EditorView {
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
+                if view.document_instance(id) != instance {
+                    // The document this probe was started for is gone, or
+                    // this id now names a different instance of it. Nothing
+                    // may be touched on behalf of whatever unrelated
+                    // document now holds `id`: not its in-flight marker,
+                    // not a title-sync pending entry, and no write is
+                    // started against it — a fresh `run_title_sync` for
+                    // that document decides its own title-sync from
+                    // scratch.
+                    return;
+                }
                 view.title_sync_in_flight.remove(&id);
-                // A session that no longer exists (closed, or replaced while
-                // the probe was running) defers the same as one that reports
+                // A session that no longer exists (closed in the meantime)
+                // defers the same as one that reports
                 // `should_defer_h1_create`; `retry_title_sync` picks this
                 // back up once whatever holds the slot finishes.
                 let should_skip = view
@@ -610,9 +670,9 @@ impl EditorView {
     }
 
     pub(crate) fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
-        let directory = self
-            .sessions
-            .active()
+        let session = self.sessions.active();
+        let id = session.id();
+        let directory = session
             .file()
             .directory()
             .map(Path::to_path_buf)
@@ -622,20 +682,62 @@ impl EditorView {
                     .map(|folder| folder.root().to_path_buf())
             })
             .unwrap_or_else(|| PathBuf::from("."));
+        // Captured before the native dialog is even shown — not re-read once
+        // it resolves — the same reason `prompt_save_as_for_close` captures
+        // its own instance: this (native, unboundedly long-lived) dialog's
+        // eventual answer must not be mistaken for an answer about whatever
+        // document happens to be active by the time it resolves, whether
+        // because a work-folder switch or an in-place reopen replaced this
+        // one, or simply because the user switched to another tab while the
+        // dialog was still open.
+        let instance = self.document_instance(id);
         let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
-        cx.spawn(async move |view, cx| match receiver.await {
-            Ok(Ok(Some(path))) => {
-                let _ = view.update(cx, |view, cx| view.save_active(SaveIntent::To(path), cx));
-            }
-            Ok(Err(error)) => {
-                let _ = view.update(cx, |view, cx| {
-                    view.status = Some(format!("Save As failed: {error}"));
-                    cx.notify();
-                });
-            }
-            _ => {}
+        cx.spawn(async move |view, cx| {
+            let response = match receiver.await {
+                Ok(Ok(Some(path))) => SaveAsResponse::Chosen(path),
+                Ok(Ok(None)) => SaveAsResponse::Canceled,
+                Ok(Err(error)) => SaveAsResponse::Failed(error.to_string()),
+                Err(_) => SaveAsResponse::Canceled,
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.handle_save_as_response(id, instance, response, cx);
+            });
         })
         .detach();
+    }
+
+    /// The single entry point every resolution of the Save As dialog
+    /// `prompt_save_as` opens must pass through, mirroring
+    /// `handle_save_as_for_close_response`'s contract: only the document
+    /// instance the dialog was actually opened for may act on its answer.
+    /// By the time this runs the id may already belong to an unrelated,
+    /// newer document — a work-folder switch, an in-place `adopt`, or
+    /// simply the user having switched to another, unrelated tab while the
+    /// dialog was open — and none of them, not a path landing on disk and
+    /// not even the status message, may be touched on behalf of a dialog
+    /// that document never opened. In particular, a chosen path is saved to
+    /// the original session by id, never to whatever session happens to be
+    /// active when the user finally answers.
+    fn handle_save_as_response(
+        &mut self,
+        id: SessionId,
+        instance: Option<DocumentInstance>,
+        response: SaveAsResponse,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document_instance(id) != instance {
+            return;
+        }
+        match response {
+            SaveAsResponse::Chosen(path) => {
+                self.save_session(id, SaveIntent::To(path), cx);
+            }
+            SaveAsResponse::Failed(error) => {
+                self.status = Some(format!("Save As failed: {error}"));
+                cx.notify();
+            }
+            SaveAsResponse::Canceled => {}
+        }
     }
 }
 
