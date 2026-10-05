@@ -1,0 +1,1726 @@
+{
+  "head": "dac7353b801168a210340d0f297dadda60e629db",
+  "base": "6a5f028fafc713a3fa78bcae6ede97c4548e782e",
+  "merge_base": "3f738b57d033689832183469e1751248530f204d",
+  "os": "Windows 11 Home 25H2 ARM64 build 26200.9457",
+  "rust": "1.98.1 aarch64-pc-windows-msvc",
+  "steps": [
+    {
+      "name": "native_caret_probe_baseline",
+      "result": "pass",
+      "observation": "本文two body.末尾へqを入力してdisk bytesがtwo body.qとなり、Ctrl+Zでtwo body.へ復元。"
+    },
+    {
+      "name": "inactive_copy_preserves_caret",
+      "result": "pass",
+      "observation": "非選択タブのcopy行が本文に重なる位置をクリック。選択中secondのcaretはtwo body.末尾を保持。q入力でdisk sourceがtwo body.qとなりUndoで復元。"
+    },
+    {
+      "name": "inactive_japanese_space_path_copy",
+      "result": "pass",
+      "expected": "C:\\Users\\hide2\\AppData\\Local\\Temp\\PR416 occlusion final 日本語 20261006\\資料 folder\\01 first 日本語.md",
+      "observation": "実メモ帳へ編集メニューで貼り付け。94文字・1行・引用符なしで非選択01 first日本語の新fixture絶対パスを表示。",
+      "method": "native screenshot / Notepad character count",
+      "expected_character_count": 94
+    },
+    {
+      "name": "explorer_exact_inactive_file",
+      "result": "pass",
+      "observation": "新fixtureのExplorerで01 first日本語を1件選択、31bytes。UIA Detailsに対象名とPR416 occlusion finalの親フォルダーを確認。"
+    },
+    {
+      "name": "inactive_reveal_preserves_caret",
+      "result": "pass",
+      "observation": "Explorer表示後も選択中secondのtwo body.末尾へqが入り、disk source確認後Ctrl+Zで復元。"
+    },
+    {
+      "name": "control_tab_wrap_both_directions",
+      "result": "pass",
+      "observation": "末尾second→Ctrl+Tab→first、先頭first→Ctrl+Shift+Tab→second。本文caret末尾保持、挿入なし。"
+    },
+    {
+      "name": "middle_close_inactive_clean",
+      "result": "pass",
+      "observation": "firstのみ閉じ、selected secondと末尾caret保持。"
+    },
+    {
+      "name": "middle_close_last_to_untitled",
+      "result": "pass",
+      "observation": "最後のsaved secondを中央クリックで閉じ、空Untitledが1つ。"
+    },
+    {
+      "name": "untitled_disabled_path_menu",
+      "result": "pass",
+      "observation": "3パス操作が灰色。Copyクリックは無効、menu維持・空Untitled維持。"
+    },
+    {
+      "name": "settings_cycle_guard",
+      "result": "pass",
+      "observation": "設定を開いた状態のCtrl+Tabで設定維持。"
+    },
+    {
+      "name": "middle_close_dirty_cancel",
+      "result": "pass",
+      "observation": "保存確認Cancel後、secondのdirty marker・two body.q・caret末尾を維持。"
+    },
+    {
+      "name": "middle_close_dirty_save_and_close",
+      "result": "pass",
+      "saved_source": "# PR416 Windows two\n\ntwo body.q\n",
+      "observation": "保存して閉じるでsecondのみ閉じ、diskにtwo body.qを確認。残るUntitled保持。"
+    },
+    {
+      "name": "filter_cycle_guard",
+      "result": "pass",
+      "observation": "filter focusのCtrl+Tabでactive first維持、文字挿入なし。"
+    },
+    {
+      "name": "inline_rename_cycle_guard",
+      "result": "pass",
+      "observation": "sidebar double-clickでbasename選択のRename入力を開き、Ctrl+Tabでactivefirst/入力欄保持。"
+    },
+    {
+      "name": "native_ime_preedit_cycle_guard",
+      "result": "pass",
+      "observation": "native IME未確定あ＋候補windowを確認。Ctrl+Tabでfirst維持、preedit保持。"
+    },
+    {
+      "name": "native_ime_cancel_reenables_cycle",
+      "result": "pass",
+      "observation": "Escape後Ctrl+Tabがfirst→Untitledへ切り替わり、本文へのTab文字挿入なし。"
+    },
+    {
+      "name": "cycle_retains_scroll_caret_undo",
+      "result": "pass",
+      "observation": "line017末尾へq、CtrlTab→Untitled→CtrlShiftTabでline012〜023のスクロールとline017末尾caret維持。CtrlZで2977→2976bytes/原本文へ戻る。"
+    },
+    {
+      "name": "long_path_narrow_tab_arrival",
+      "result": "pass",
+      "observation": "幅690pxで右端の長い日本語パスタブへhover tooltip、right menuは左に収まる。Copy後status成功、左側firstのleft選択、右端非選択longのmiddle close成功。全文パスのclipboard一致はこの長いfixtureでは未検証。"
+    },
+    {
+      "name": "native_save_as_chosen_after_id0_folder_replacement",
+      "result": "pass",
+      "observation": "empty Cのdirty Untitled id0でSave&Close→nativeSaveAsを開く。dialog回答前にCLIでBへ切替しUIAにreplacement tabとSaveAsdialogの共存を直接確認。FileNameへ検証先指定→Alt+Sで確定。destination不在、replacement bytes不変、tab保持/Opened。",
+      "evidence": {
+        "before_dialog_answer": [
+          "14 ダイアログ 名前を付けて保存",
+          "8 タブ項目 (selectable) replacement 日本語",
+          "65 編集 ファイル名 Untitled",
+          "75 ボタン 保存(S)"
+        ],
+        "observed_tree_contains_replacement_tab": true,
+        "replacement_before": "# Replacement Windows\n\nreplacement body.\n",
+        "after_dialog_answer": {
+          "destination_exists": false,
+          "replacement_after": "# Replacement Windows\n\nreplacement body.\n",
+          "visible_status": "Opened",
+          "visible_tab": "replacement 日本語"
+        }
+      }
+    },
+    {
+      "name": "stale_context_menu_id0_folder_replacement",
+      "result": "pass",
+      "observation": "B replacement(id0)のrightmenuを開いたままCLIでAへ切替。first(id0)へ置換し古いメニューが消失。"
+    },
+    {
+      "name": "single_tab_cycle_no_insertion",
+      "result": "pass",
+      "observation": "AのfirstのみのCtrl+Tabで同タブ・原本文保持。"
+    }
+  ],
+  "status": "pass",
+  "prior_head_evidence": "2332581の記録は履歴として保持し、本headのpassには使用しない。",
+  "executable": {
+    "sha256": "47bf44e0c49094985783c279a3a909c00171dc12b53bbebd5c8eff23ba68d20a",
+    "pid": 4456,
+    "path": "target/windows-arm64-1.98.1/release/hane.exe",
+    "features": "default",
+    "profile": "release"
+  },
+  "completed_at": "2026-10-05T23:57:26.285Z",
+  "procedure_version": "pr416-windows-native/3",
+  "restore": {
+    "folder": "original Documents folder",
+    "autosave": "on",
+    "ime": "English A",
+    "user_document_edit": "none"
+  },
+  "base_sensitivity": {
+    "current_main": "6a5f028fafc713a3fa78bcae6ede97c4548e782e",
+    "validated_control": "3f738b57d033689832183469e1751248530f204d",
+    "difference": "main PR442 Cargo.toml/Cargo.lock version 0.20→0.21 only; product source/dependencies/GUI unchanged"
+  },
+  "limitations": [
+    "native GUI focused acceptance matrix; not exhaustive app QA",
+    "long path fixture full clipboard text not independently checked; normal Japanese/space absolute path checked in real Notepad",
+    "native save failure/conflict automated regression and CI; native Chosen stale SaveAs tested separately",
+    "closed-draft restoration excluded by Issue411, unresolved follow-up retained"
+  ],
+  "macos": {
+    "run_url": "https://github.com/hide212131/hane/actions/runs/37389411944",
+    "procedure_version": "pr416-macos-focused/2",
+    "runner": {
+      "os": "macOS",
+      "version": "15.7.9",
+      "arch": "arm64",
+      "image": "20260907.0337.1"
+    },
+    "build": {
+      "profile": "debug",
+      "features": [
+        "timing-probe"
+      ],
+      "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+      "cargo_version": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+      "binary_path": "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/hane-gui-build-6ac373n4/target/debug/hane",
+      "binary_sha256": "37b1389253d65afcb39ebf0321e354d1a6777bddd3ebd0f980f60f85f8ef81d1",
+      "source_snapshot_sha": "dac7353b801168a210340d0f297dadda60e629db",
+      "source_snapshot_dir": "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/hane-gui-build-6ac373n4/source",
+      "source_snapshot_clean": true,
+      "validated_sha": "dac7353b801168a210340d0f297dadda60e629db",
+      "working_copy_clean_after_build": true
+    },
+    "overall_result": "pass",
+    "source_result": {
+      "procedure_version": "pr416-macos-focused/2",
+      "target": {
+        "expected_sha": "dac7353b801168a210340d0f297dadda60e629db",
+        "actual_sha": "dac7353b801168a210340d0f297dadda60e629db",
+        "sha_matches": true,
+        "working_copy_clean": true,
+        "dirty_paths": []
+      },
+      "control_sha": "3f738b57d033689832183469e1751248530f204d",
+      "build": {
+        "profile": "debug",
+        "features": [
+          "timing-probe"
+        ],
+        "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+        "cargo_version": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+        "binary_path": "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/hane-gui-build-6ac373n4/target/debug/hane",
+        "binary_sha256": "37b1389253d65afcb39ebf0321e354d1a6777bddd3ebd0f980f60f85f8ef81d1",
+        "source_snapshot_sha": "dac7353b801168a210340d0f297dadda60e629db",
+        "source_snapshot_dir": "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/hane-gui-build-6ac373n4/source",
+        "source_snapshot_clean": true,
+        "validated_sha": "dac7353b801168a210340d0f297dadda60e629db",
+        "working_copy_clean_after_build": true
+      },
+      "runner": {
+        "os": "macOS",
+        "version": "15.7.9",
+        "arch": "arm64",
+        "image": "20260907.0337.1"
+      },
+      "steps": [
+        {
+          "name": "preflight",
+          "result": "pass",
+          "reason": null,
+          "expected_sha": "dac7353b801168a210340d0f297dadda60e629db",
+          "actual_sha": "dac7353b801168a210340d0f297dadda60e629db",
+          "sha_matches": true,
+          "working_copy_clean": true,
+          "dirty_paths": []
+        },
+        {
+          "name": "prepare_action_helper",
+          "result": "pass",
+          "sha256": "35b19a3bacb32685cdfdc4eea6eeb59f3071b85df166ea90cd97846d53ad2e71"
+        },
+        {
+          "name": "build",
+          "result": "pass",
+          "reason": null,
+          "profile": "debug",
+          "features": [
+            "timing-probe"
+          ],
+          "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+          "cargo_version": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+          "binary_path": "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/hane-gui-build-6ac373n4/target/debug/hane",
+          "binary_sha256": "37b1389253d65afcb39ebf0321e354d1a6777bddd3ebd0f980f60f85f8ef81d1",
+          "source_snapshot_sha": "dac7353b801168a210340d0f297dadda60e629db",
+          "source_snapshot_dir": "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/hane-gui-build-6ac373n4/source",
+          "source_snapshot_clean": true,
+          "validated_sha": "dac7353b801168a210340d0f297dadda60e629db",
+          "working_copy_clean_after_build": true
+        },
+        {
+          "name": "launch",
+          "result": "pass",
+          "reason": null,
+          "pid": 7834,
+          "elapsed_seconds": 0.389
+        },
+        {
+          "name": "activate",
+          "result": "pass",
+          "reason": null
+        },
+        {
+          "name": "window_discovery",
+          "result": "pass",
+          "reason": null,
+          "window_id": "30",
+          "elapsed_seconds": 0.684
+        },
+        {
+          "name": "capture_initial",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/initial.png"
+        },
+        {
+          "name": "capture_folder_first",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/folder_first.png"
+        },
+        {
+          "name": "visible_Alpha.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12513739267985027,
+              "x": 0.24353448241912948,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30610317875905463,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Alpha unique body"
+          }
+        },
+        {
+          "name": "open_second_sidebar",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.030701754385964897,
+              "width": 0.09166666666666666,
+              "x": 0.04375000077959461,
+              "y": 0.7485380116959064
+            },
+            "button": "left",
+            "found": true,
+            "fraction": {
+              "x": 0.08958333411292793,
+              "y_from_top": 0.23611111111111116
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 118.00000074841081,
+              "y": 186.50000000000003
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "second-note"
+          }
+        },
+        {
+          "name": "capture_open_second_sidebar",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/open_second_sidebar.png"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.11810614267985028,
+              "x": 0.24353448241915623,
+              "y": 0.7643504536444663
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30258755375908136,
+              "y_from_top": 0.22205438079053375
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "focus_second_editor",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.11810614267985028,
+              "x": 0.24353448241915623,
+              "y": 0.7643504536444663
+            },
+            "button": "left",
+            "found": true,
+            "fraction": {
+              "x": 0.30258755375908136,
+              "y_from_top": 0.22205438079053375
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 322.4840516087181,
+              "y": 176.88519646072507
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "capture_focus_second_editor",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/focus_second_editor.png"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.030211479343168923,
+              "width": 0.1208602746327718,
+              "x": 0.24137930870148985,
+              "y": 0.7643504535308324
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30180944601787574,
+              "y_from_top": 0.22054380679758312
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "caret_to_document_end",
+          "result": "pass",
+          "observation": {
+            "key": "end",
+            "sent_down_flags": 537919488,
+            "sent_up_flags": 537919488,
+            "session_flags_after": 537919488
+          }
+        },
+        {
+          "name": "capture_caret_to_document_end",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/caret_to_document_end.png"
+        },
+        {
+          "name": "baseline_native_caret_type",
+          "result": "pass",
+          "observation": {
+            "key": "probe",
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "session_flags_after": 536870912
+          }
+        },
+        {
+          "name": "capture_baseline_native_caret_type",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/baseline_native_caret_type.png"
+        },
+        {
+          "name": "baseline_native_caret_exact_append",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "sha256": "f0e3bd14031a99c98b477d91e585e34b04291df186f52e5ed293c0b22bc9cdec"
+        },
+        {
+          "name": "baseline_native_caret_undo",
+          "result": "pass",
+          "observation": {
+            "key": "undo",
+            "sent_down_flags": 537919488,
+            "sent_up_flags": 537919488,
+            "session_flags_after": 537919488
+          }
+        },
+        {
+          "name": "capture_baseline_native_caret_undo",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/baseline_native_caret_undo.png"
+        },
+        {
+          "name": "baseline_native_caret_exact_restore",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\n",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\n",
+          "sha256": "a1dd0d53ec4fe86848309305170486aeef4500824db4f347ecf81d472479316b"
+        },
+        {
+          "name": "hover_before_inactive_right",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.024853801169590573,
+              "width": 0.07091863950093588,
+              "x": 0.24353448503969197,
+              "y": 0.9152046783625731
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.2789938047901599,
+              "y_from_top": 0.07236842105263164
+            },
+            "hovered": true,
+            "inherited_flags": 537919488,
+            "sent_flags": 536870912,
+            "text": "first-note"
+          }
+        },
+        {
+          "name": "capture_hover_before_inactive_right",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/hover_before_inactive_right.png"
+        },
+        {
+          "name": "inactive_first_context",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.02777777777777779,
+              "width": 0.06647808551788328,
+              "x": 0.24784483035554886,
+              "y": 0.9122807017543859
+            },
+            "button": "right",
+            "found": true,
+            "fraction": {
+              "x": 0.2810838731144905,
+              "y_from_top": 0.07383040935672525
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 301.8405181899109,
+              "y": 75.50000000000007
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "first-note"
+          }
+        },
+        {
+          "name": "capture_inactive_first_context",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/inactive_first_context.png"
+        },
+        {
+          "name": "clear_hover_before_copy",
+          "result": "pass",
+          "observation": {
+            "inherited_flags": 536870912,
+            "moved": true,
+            "sent_flags": 536870912
+          }
+        },
+        {
+          "name": "capture_clear_hover_before_copy",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/clear_hover_before_copy.png"
+        },
+        {
+          "name": "copy_inactive_first",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.0277777777777779,
+              "width": 0.06714394887288411,
+              "x": 0.29310344737322847,
+              "y": 0.7792397660818713
+            },
+            "button": "left",
+            "found": true,
+            "fraction": {
+              "x": 0.3266754218096705,
+              "y_from_top": 0.20687134502923976
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 345.6084049372837,
+              "y": 166.5
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "フルパス"
+          }
+        },
+        {
+          "name": "capture_copy_inactive_first",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/copy_inactive_first.png"
+        },
+        {
+          "name": "clipboard_exact_inactive_path",
+          "result": "pass",
+          "expected": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/資料 folder with spaces/first-note 日本語.md",
+          "actual": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/資料 folder with spaces/first-note 日本語.md"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12052173614501954,
+              "x": 0.24137930568279203,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30164017375530183,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "caret_after_inactive_copy_type",
+          "result": "pass",
+          "observation": {
+            "key": "probe",
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "session_flags_after": 536870912
+          }
+        },
+        {
+          "name": "capture_caret_after_inactive_copy_type",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/caret_after_inactive_copy_type.png"
+        },
+        {
+          "name": "caret_after_inactive_copy_exact_append",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "sha256": "f0e3bd14031a99c98b477d91e585e34b04291df186f52e5ed293c0b22bc9cdec"
+        },
+        {
+          "name": "caret_after_inactive_copy_undo",
+          "result": "pass",
+          "observation": {
+            "key": "undo",
+            "sent_down_flags": 537919488,
+            "sent_up_flags": 537919488,
+            "session_flags_after": 537919488
+          }
+        },
+        {
+          "name": "capture_caret_after_inactive_copy_undo",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/caret_after_inactive_copy_undo.png"
+        },
+        {
+          "name": "caret_after_inactive_copy_exact_restore",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\n",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\n",
+          "sha256": "a1dd0d53ec4fe86848309305170486aeef4500824db4f347ecf81d472479316b"
+        },
+        {
+          "name": "hover_before_left",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.024853801169590573,
+              "width": 0.07091863950093588,
+              "x": 0.24353448503969197,
+              "y": 0.9152046783625731
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.2789938047901599,
+              "y_from_top": 0.07236842105263164
+            },
+            "hovered": true,
+            "inherited_flags": 537919488,
+            "sent_flags": 536870912,
+            "text": "first-note"
+          }
+        },
+        {
+          "name": "capture_hover_before_left",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/hover_before_left.png"
+        },
+        {
+          "name": "select_first_with_tooltip",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.02777777777777779,
+              "width": 0.06647808551788328,
+              "x": 0.24784483035554886,
+              "y": 0.9122807017543859
+            },
+            "button": "left",
+            "found": true,
+            "fraction": {
+              "x": 0.2810838731144905,
+              "y_from_top": 0.07383040935672525
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 301.8405181899109,
+              "y": 75.50000000000007
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "first-note"
+          }
+        },
+        {
+          "name": "capture_select_first_with_tooltip",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/select_first_with_tooltip.png"
+        },
+        {
+          "name": "clear_hover_after_left",
+          "result": "pass",
+          "observation": {
+            "inherited_flags": 536870912,
+            "moved": true,
+            "sent_flags": 536870912
+          }
+        },
+        {
+          "name": "capture_clear_hover_after_left",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/clear_hover_after_left.png"
+        },
+        {
+          "name": "visible_Alpha.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12513739267985027,
+              "x": 0.24353448241912948,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30610317875905463,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Alpha unique body"
+          }
+        },
+        {
+          "name": "next_from_selected_first",
+          "result": "pass",
+          "observation": {
+            "key": "next",
+            "sent_down_flags": 537133056,
+            "sent_up_flags": 537133056,
+            "session_flags_after": 537133056
+          }
+        },
+        {
+          "name": "capture_next_from_selected_first",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/next_from_selected_first.png"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12052173614501954,
+              "x": 0.24137930568279203,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30164017375530183,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "next_wrap",
+          "result": "pass",
+          "observation": {
+            "key": "next",
+            "sent_down_flags": 537133056,
+            "sent_up_flags": 537133056,
+            "session_flags_after": 537133056
+          }
+        },
+        {
+          "name": "capture_next_wrap",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/next_wrap.png"
+        },
+        {
+          "name": "visible_Alpha.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12513739267985027,
+              "x": 0.24353448241912948,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30610317875905463,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Alpha unique body"
+          }
+        },
+        {
+          "name": "next_forward",
+          "result": "pass",
+          "observation": {
+            "key": "next",
+            "sent_down_flags": 537133056,
+            "sent_up_flags": 537133056,
+            "session_flags_after": 537133056
+          }
+        },
+        {
+          "name": "capture_next_forward",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/next_forward.png"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12052173614501954,
+              "x": 0.24137930568279203,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30164017375530183,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "previous_backward",
+          "result": "pass",
+          "observation": {
+            "key": "previous",
+            "sent_down_flags": 537264128,
+            "sent_up_flags": 537264128,
+            "session_flags_after": 537264128
+          }
+        },
+        {
+          "name": "capture_previous_backward",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/previous_backward.png"
+        },
+        {
+          "name": "visible_Alpha.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12513739267985027,
+              "x": 0.24353448241912948,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30610317875905463,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Alpha unique body"
+          }
+        },
+        {
+          "name": "previous_wrap",
+          "result": "pass",
+          "observation": {
+            "key": "previous",
+            "sent_down_flags": 537264128,
+            "sent_up_flags": 537264128,
+            "session_flags_after": 537264128
+          }
+        },
+        {
+          "name": "capture_previous_wrap",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/previous_wrap.png"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12052173614501954,
+              "x": 0.24137930568279203,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30164017375530183,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "caret_after_control_tab_cycle_type",
+          "result": "pass",
+          "observation": {
+            "key": "probe",
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "session_flags_after": 536870912
+          }
+        },
+        {
+          "name": "capture_caret_after_control_tab_cycle_type",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/caret_after_control_tab_cycle_type.png"
+        },
+        {
+          "name": "caret_after_control_tab_cycle_exact_append",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "sha256": "f0e3bd14031a99c98b477d91e585e34b04291df186f52e5ed293c0b22bc9cdec"
+        },
+        {
+          "name": "caret_after_control_tab_cycle_undo",
+          "result": "pass",
+          "observation": {
+            "key": "undo",
+            "sent_down_flags": 537919488,
+            "sent_up_flags": 537919488,
+            "session_flags_after": 537919488
+          }
+        },
+        {
+          "name": "capture_caret_after_control_tab_cycle_undo",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/caret_after_control_tab_cycle_undo.png"
+        },
+        {
+          "name": "caret_after_control_tab_cycle_exact_restore",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\n",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\n",
+          "sha256": "a1dd0d53ec4fe86848309305170486aeef4500824db4f347ecf81d472479316b"
+        },
+        {
+          "name": "inactive_first_reveal_menu",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.024853801169590573,
+              "width": 0.07091863950093588,
+              "x": 0.24353448503969197,
+              "y": 0.9152046783625731
+            },
+            "button": "right",
+            "found": true,
+            "fraction": {
+              "x": 0.2789938047901599,
+              "y_from_top": 0.07236842105263164
+            },
+            "inherited_down_flags": 537919488,
+            "inherited_up_flags": 537919488,
+            "point": {
+              "x": 299.8340525985535,
+              "y": 74.50000000000004
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "first-note"
+          }
+        },
+        {
+          "name": "capture_inactive_first_reveal_menu",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/inactive_first_reveal_menu.png"
+        },
+        {
+          "name": "clear_hover_before_reveal",
+          "result": "pass",
+          "observation": {
+            "inherited_flags": 536870912,
+            "moved": true,
+            "sent_flags": 536870912
+          }
+        },
+        {
+          "name": "capture_clear_hover_before_reveal",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/clear_hover_before_reveal.png"
+        },
+        {
+          "name": "reveal_inactive_first",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.030701754385964897,
+              "width": 0.05532821416854855,
+              "x": 0.28663793164508783,
+              "y": 0.827485380116959
+            },
+            "button": "left",
+            "found": true,
+            "fraction": {
+              "x": 0.31430203872936213,
+              "y_from_top": 0.1571637426900585
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 333.7299571801876,
+              "y": 132.5
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "Finder"
+          }
+        },
+        {
+          "name": "capture_reveal_inactive_first",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/reveal_inactive_first.png"
+        },
+        {
+          "name": "finder_exact_selected_file",
+          "result": "pass",
+          "expected": [
+            "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/資料 folder with spaces/first-note 日本語.md"
+          ],
+          "observation": {
+            "active": true,
+            "paths": [
+              "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/資料 folder with spaces/first-note 日本語.md"
+            ],
+            "pid": 341,
+            "windows": [
+              34
+            ]
+          }
+        },
+        {
+          "name": "capture_finder_selected_0",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/finder_selected_0.png"
+        },
+        {
+          "name": "return_from_finder",
+          "result": "pass",
+          "observation": {
+            "inherited_flags": 536870912,
+            "moved": true,
+            "sent_flags": 536870912
+          }
+        },
+        {
+          "name": "capture_return_from_finder",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/return_from_finder.png"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12052173614501954,
+              "x": 0.24137930568279203,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30164017375530183,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "caret_after_inactive_reveal_type",
+          "result": "pass",
+          "observation": {
+            "key": "probe",
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "session_flags_after": 536870912
+          }
+        },
+        {
+          "name": "capture_caret_after_inactive_reveal_type",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/caret_after_inactive_reveal_type.png"
+        },
+        {
+          "name": "caret_after_inactive_reveal_exact_append",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\nq",
+          "sha256": "f0e3bd14031a99c98b477d91e585e34b04291df186f52e5ed293c0b22bc9cdec"
+        },
+        {
+          "name": "caret_after_inactive_reveal_undo",
+          "result": "pass",
+          "observation": {
+            "key": "undo",
+            "sent_down_flags": 537919488,
+            "sent_up_flags": 537919488,
+            "session_flags_after": 537919488
+          }
+        },
+        {
+          "name": "capture_caret_after_inactive_reveal_undo",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/caret_after_inactive_reveal_undo.png"
+        },
+        {
+          "name": "caret_after_inactive_reveal_exact_restore",
+          "result": "pass",
+          "expected_utf8": "# Beta note\n\nBeta unique body.\n",
+          "actual_utf8": "# Beta note\n\nBeta unique body.\n",
+          "sha256": "a1dd0d53ec4fe86848309305170486aeef4500824db4f347ecf81d472479316b"
+        },
+        {
+          "name": "hover_before_inactive_middle",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.024853801169590573,
+              "width": 0.07091863950093588,
+              "x": 0.24353448503969197,
+              "y": 0.9152046783625731
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.2789938047901599,
+              "y_from_top": 0.07236842105263164
+            },
+            "hovered": true,
+            "inherited_flags": 537919488,
+            "sent_flags": 536870912,
+            "text": "first-note"
+          }
+        },
+        {
+          "name": "capture_hover_before_inactive_middle",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/hover_before_inactive_middle.png"
+        },
+        {
+          "name": "middle_close_inactive_first",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.02777777777777779,
+              "width": 0.06647808551788328,
+              "x": 0.24784483035554886,
+              "y": 0.9122807017543859
+            },
+            "button": "middle",
+            "found": true,
+            "fraction": {
+              "x": 0.2810838731144905,
+              "y_from_top": 0.07383040935672525
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 301.8405181899109,
+              "y": 75.50000000000007
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "first-note"
+          }
+        },
+        {
+          "name": "capture_middle_close_inactive_first",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/middle_close_inactive_first.png"
+        },
+        {
+          "name": "clear_hover_after_middle",
+          "result": "pass",
+          "observation": {
+            "inherited_flags": 536870912,
+            "moved": true,
+            "sent_flags": 536870912
+          }
+        },
+        {
+          "name": "capture_clear_hover_after_middle",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/clear_hover_after_middle.png"
+        },
+        {
+          "name": "visible_Beta.*body",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.027190331129999912,
+              "width": 0.12052173614501954,
+              "x": 0.24137930568279203,
+              "y": 0.7643504536570545
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.30164017375530183,
+              "y_from_top": 0.2220543807779456
+            },
+            "text": "Beta unique body"
+          }
+        },
+        {
+          "name": "first_tab_closed_only",
+          "result": "pass",
+          "observation": {
+            "found": false
+          }
+        },
+        {
+          "name": "middle_close_last_second",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.030701754385965008,
+              "width": 0.09526759783426922,
+              "x": 0.24353448580411766,
+              "y": 0.9122807017543859
+            },
+            "button": "middle",
+            "found": true,
+            "fraction": {
+              "x": 0.2911682847212523,
+              "y_from_top": 0.07236842105263164
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 311.52155333240216,
+              "y": 74.50000000000004
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "second-note"
+          }
+        },
+        {
+          "name": "capture_middle_close_last_second",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/middle_close_last_second.png"
+        },
+        {
+          "name": "visible_Untitled",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.02620075320639803,
+              "width": 0.05860245426495869,
+              "x": 0.24548325456420084,
+              "y": 0.9143920699176776
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.2747844816966802,
+              "y_from_top": 0.0725075534791233
+            },
+            "text": "Untitled"
+          }
+        },
+        {
+          "name": "single_tab_control_tab",
+          "result": "pass",
+          "observation": {
+            "key": "next",
+            "sent_down_flags": 537133056,
+            "sent_up_flags": 537133056,
+            "session_flags_after": 537133056
+          }
+        },
+        {
+          "name": "capture_single_tab_control_tab",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/single_tab_control_tab.png"
+        },
+        {
+          "name": "visible_Untitled",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.02620075320639803,
+              "width": 0.05860245426495869,
+              "x": 0.24548325456420084,
+              "y": 0.9143920699176776
+            },
+            "found": true,
+            "fraction": {
+              "x": 0.2747844816966802,
+              "y_from_top": 0.0725075534791233
+            },
+            "text": "Untitled"
+          }
+        },
+        {
+          "name": "untitled_context",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.02620075320639803,
+              "width": 0.05860245426495869,
+              "x": 0.24548325456420084,
+              "y": 0.9143920699176776
+            },
+            "button": "right",
+            "found": true,
+            "fraction": {
+              "x": 0.2747844816966802,
+              "y_from_top": 0.0725075534791233
+            },
+            "inherited_down_flags": 537133056,
+            "inherited_up_flags": 537133056,
+            "point": {
+              "x": 295.793102428813,
+              "y": 74.59516657972034
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "Untitled"
+          }
+        },
+        {
+          "name": "capture_untitled_context",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/untitled_context.png"
+        },
+        {
+          "name": "untitled_disabled_copy",
+          "result": "pass",
+          "observation": {
+            "box": {
+              "height": 0.0277777777777779,
+              "width": 0.06481366554896034,
+              "x": 0.28879310572751304,
+              "y": 0.7792397660818713
+            },
+            "button": "left",
+            "found": true,
+            "fraction": {
+              "x": 0.32119993850199324,
+              "y_from_top": 0.20687134502923976
+            },
+            "inherited_down_flags": 536870912,
+            "inherited_up_flags": 536870912,
+            "point": {
+              "x": 340.3519409619135,
+              "y": 166.5
+            },
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "text": "フルパス"
+          }
+        },
+        {
+          "name": "capture_untitled_disabled_copy",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/untitled_disabled_copy.png"
+        },
+        {
+          "name": "untitled_copy_disabled",
+          "result": "pass",
+          "actual": "PR416 disabled path sentinel"
+        },
+        {
+          "name": "dismiss_untitled_context",
+          "result": "pass",
+          "observation": {
+            "key": "escape",
+            "sent_down_flags": 536870912,
+            "sent_up_flags": 536870912,
+            "session_flags_after": 536870912
+          }
+        },
+        {
+          "name": "capture_dismiss_untitled_context",
+          "result": "pass",
+          "reason": null,
+          "image_path": "/Users/runner/work/_temp/hane-gui-interaction/pr416_tab_actions/dismiss_untitled_context.png"
+        },
+        {
+          "name": "unchanged_first-note 日本語.md",
+          "result": "pass",
+          "sha256": "986e4704456c931d2e56adf979aa5105927a55b61313cffff947c735297be2ff"
+        },
+        {
+          "name": "unchanged_second-note 日本語.md",
+          "result": "pass",
+          "sha256": "a1dd0d53ec4fe86848309305170486aeef4500824db4f347ecf81d472479316b"
+        }
+      ],
+      "scenarios": [
+        {
+          "name": "file_tabs_focused",
+          "steps": [
+            {
+              "name": "launch",
+              "result": "pass",
+              "reason": null,
+              "pid": 7169,
+              "elapsed_seconds": 2.534
+            },
+            {
+              "name": "activate",
+              "result": "pass",
+              "reason": null
+            },
+            {
+              "name": "window_discovery",
+              "result": "pass",
+              "reason": null,
+              "window_id": "23",
+              "elapsed_seconds": 9.583
+            },
+            {
+              "name": "capture_initial",
+              "result": "pass",
+              "reason": null,
+              "image_path": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/initial.png"
+            },
+            {
+              "name": "initial_theme_is_system",
+              "result": "pass",
+              "reason": null,
+              "matched_text": "Theme System"
+            },
+            {
+              "name": "capture_theme-light",
+              "result": "pass",
+              "reason": null,
+              "image_path": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/theme-light.png"
+            },
+            {
+              "name": "switch_theme_to_light",
+              "result": "pass",
+              "reason": null,
+              "click_event": {
+                "bounding_box": {
+                  "maxX": 0.24348958333333334,
+                  "maxY": 0.030791788856304958,
+                  "minX": 0.15611979166666667,
+                  "minY": 0.014662756598240456
+                },
+                "click_point": {
+                  "x": 223.81250000000003,
+                  "y": 690.5227272727273
+                },
+                "matched_text": "Theme System",
+                "window_bounds": {
+                  "height": 681,
+                  "width": 960,
+                  "x": 32,
+                  "y": 25
+                }
+              },
+              "matched_text": "Theme Light",
+              "selected_tab_background": "#ffffff"
+            },
+            {
+              "name": "capture_theme-dark",
+              "result": "pass",
+              "reason": null,
+              "image_path": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/theme-dark.png"
+            },
+            {
+              "name": "switch_theme_to_dark",
+              "result": "pass",
+              "reason": null,
+              "click_event": {
+                "bounding_box": {
+                  "maxX": 0.23203125,
+                  "maxY": 0.030791788856304958,
+                  "minX": 0.15611979166666667,
+                  "minY": 0.014662756598240456
+                },
+                "click_point": {
+                  "x": 218.3125,
+                  "y": 690.5227272727273
+                },
+                "matched_text": "Theme Light",
+                "window_bounds": {
+                  "height": 681,
+                  "width": 960,
+                  "x": 32,
+                  "y": 25
+                }
+              },
+              "matched_text": "Theme Dark",
+              "selected_tab_background": "#0a0a0a"
+            },
+            {
+              "name": "dark_selected_tab_background_rejects_near_white",
+              "result": "pass",
+              "reason": null,
+              "background_color": "#0a0a0a"
+            },
+            {
+              "name": "light_dark_selected_tab_background_differs",
+              "result": "pass",
+              "reason": null,
+              "light_background": "#ffffff",
+              "dark_background": "#0a0a0a"
+            },
+            {
+              "name": "capture_hover-path",
+              "result": "pass",
+              "reason": null,
+              "image_path": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/hover-path.png"
+            },
+            {
+              "name": "hover_shows_hover_card_path",
+              "result": "pass",
+              "reason": null,
+              "hover_event": {
+                "bounding_box": {
+                  "maxX": 0.11422413866992115,
+                  "maxY": 0.9393939392354816,
+                  "minX": 0.012931035769733985,
+                  "minY": 0.9212121216130033
+                },
+                "hover_point": {
+                  "x": 93.03448373103447,
+                  "y": 72.46363628109088
+                },
+                "matched_text": "file-tabs-focus",
+                "window_bounds": {
+                  "height": 681,
+                  "width": 960,
+                  "x": 32,
+                  "y": 25
+                }
+              },
+              "expected_absolute_path": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/file-tabs-focus.md",
+              "ocr_fragments": [
+                "file-tabs-focus",
+                "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/file-tabs-focu"
+              ],
+              "coverage": 1
+            },
+            {
+              "name": "copy_icon_visible_pixel_contrast",
+              "result": "pass",
+              "reason": null,
+              "probe": {
+                "background_color": "#151618",
+                "contrast_pixel_count": 38,
+                "contrast_run": 5,
+                "icon_center_fraction": {
+                  "x": 0.5932291666666667,
+                  "y_from_top": 0.12041116005873716
+                },
+                "icon_pixel_rect": {
+                  "x0": 567,
+                  "x1": 572,
+                  "y0": 76,
+                  "y1": 88
+                },
+                "search_rect": {
+                  "x0": 545,
+                  "x1": 797,
+                  "y0": 33,
+                  "y1": 98
+                }
+              }
+            },
+            {
+              "name": "click_copy_icon",
+              "result": "pass",
+              "reason": null,
+              "click_event": {
+                "click_point": {
+                  "x": 601.5,
+                  "y": 107
+                },
+                "fraction": {
+                  "x": 0.5932291666666667,
+                  "y_from_top": 0.12041116005873716
+                },
+                "window_bounds": {
+                  "height": 681,
+                  "width": 960,
+                  "x": 32,
+                  "y": 25
+                }
+              }
+            },
+            {
+              "name": "clipboard_matches_absolute_path",
+              "result": "pass",
+              "reason": null,
+              "expected": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/file-tabs-focus.md",
+              "actual": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/file-tabs-focus.md"
+            },
+            {
+              "name": "cleanup",
+              "result": "pass",
+              "reason": null,
+              "terminated_pid": 7169
+            },
+            {
+              "name": "fixture_unchanged",
+              "result": "pass",
+              "reason": null
+            }
+          ],
+          "result": "pass",
+          "reason": "Issue #354 focused file-tabs GUI checks passed",
+          "evidence": {
+            "fixture_path": "/Users/runner/work/_temp/hane-gui-interaction/file_tabs_focused/file-tabs-focus.md",
+            "theme_backgrounds": {
+              "light": "#ffffff",
+              "dark": "#0a0a0a"
+            }
+          }
+        }
+      ],
+      "overall_result": "pass",
+      "scope_note": "Issue411のnative middle/right-click、Control+Tab、Finder選択と、copy/reveal後の本文caretを実キー入力+disk bytes+Undoで確認。旧Issue354 helperのhoverは別scenarioとして区別。SaveAs native raceはWindows実機とcurrent-head regressionを別途確認する。"
+    },
+    "manual_image_inspection": [
+      "finder_selected_0.png",
+      "caret_after_inactive_copy_type.png",
+      "caret_after_inactive_reveal_type.png",
+      "clear_hover_after_middle.png",
+      "middle_close_last_second.png",
+      "untitled_context.png"
+    ],
+    "observation": "実画面を手動確認し、Finderのfirst日本語選択、copy/reveal後のq入力位置、非選択middle後のBeta保持、最後を閉じたUntitled、無効メニューを確認。全source bytes・Undo・clipboard・Finder選択はresult.jsonで一致。"
+  },
+  "images": [
+    {
+      "file": "01-inactive-menu-before-copy.jpg",
+      "sha256": "915513d00cfe9f43bfd82c54ae57c860b73723d7d610aa6d19ba182748f13316"
+    },
+    {
+      "file": "02-copy-keeps-caret-input.jpg",
+      "sha256": "8042e643a0d08128d8ef9701785062ecb7f3241acf379e3c18b4b9a429161371"
+    },
+    {
+      "file": "03-inactive-path-notepad.jpg",
+      "sha256": "2e77a4e3a4f7bfff549e9b810204eefb9dd619b2e8dc7b58cb67bbdb745c19a4"
+    },
+    {
+      "file": "04-reveal-keeps-caret.jpg",
+      "sha256": "7f3901f62cd4ecb862bc65d2f47aaa13d35c97bbdd4ee9b0ba99b2adce890d5b"
+    },
+    {
+      "file": "05-reveal-keeps-caret-input.jpg",
+      "sha256": "a4309a597cee6ad3d55dac5b2d5c0cfadaaa867d36fb1172bd276a761dce4fb5"
+    },
+    {
+      "file": "06-save-and-close.jpg",
+      "sha256": "8513b676470d88ce59d754bb5d45ab4f6d016605844a767944339452a19cd9ca"
+    },
+    {
+      "file": "07-ime-guard.jpg",
+      "sha256": "055fa201126e129c795efacb303ee5c092d14a71781e23c62ab42197d4620cdf"
+    },
+    {
+      "file": "08-scroll-caret-undo.jpg",
+      "sha256": "122546ef27d65d94b35c98172524fbb0f20e7ebb80ee1a2da1379e60cdda8e8e"
+    },
+    {
+      "file": "09-narrow-tab-close.jpg",
+      "sha256": "8f4ed36cb55148482885b81b1724da969a67541fa7d4711f16c91f51cdd4805b"
+    },
+    {
+      "file": "10-stale-save-as-result.jpg",
+      "sha256": "71bde8df0b6a92433cc8f0a162375a08ef253ee1f8935a17284666606a9a7b8d"
+    },
+    {
+      "file": "11-stale-menu-result.jpg",
+      "sha256": "7e354280c7f6e4afdbaf3b02c8833af5efe36522546b00857a64b614ac8284cf"
+    },
+    {
+      "file": "macos-caret_after_inactive_copy_type.png",
+      "sha256": "aee50d225aa82b509646195ed3345f6e40a39091a0caa218e98f86ae1a01b448"
+    },
+    {
+      "file": "macos-caret_after_inactive_reveal_type.png",
+      "sha256": "928eaf6235f657c7d2ae420bfb5d0b7bacdd91bb2aa52b2380dc08e8179e2410"
+    },
+    {
+      "file": "macos-clear_hover_after_middle.png",
+      "sha256": "f8d0b97f6090fe5adddd896e6600a593e371f4ab28f572784d4bdd059d92be5a"
+    },
+    {
+      "file": "macos-finder_selected_0.png",
+      "sha256": "3bf3183368b49324508eeace68ffa610a8f878efdf05216c56513572a224b93e"
+    },
+    {
+      "file": "macos-middle_close_last_second.png",
+      "sha256": "61a57d6e9a6b4e37a9ba92929038ae856d565156f201a9b51de3d59cdb5cb2e3"
+    },
+    {
+      "file": "macos-untitled_context.png",
+      "sha256": "8cf156552e006f390cd57e433d4b9cc64d29bb86bacdc6663c74927ffc6ef5e9"
+    }
+  ]
+}
