@@ -1,0 +1,347 @@
+{
+  "candidate_run": 37266328180,
+  "baseline_run": 37344835350,
+  "candidate_target": {
+    "expected_sha": "c1bca2400ec0e9120085940ec3cbedb661218a81",
+    "actual_sha": "c1bca2400ec0e9120085940ec3cbedb661218a81",
+    "sha_matches": true,
+    "working_copy_clean": true,
+    "dirty_paths": []
+  },
+  "baseline_target": {
+    "expected_sha": "3f738b57d033689832183469e1751248530f204d",
+    "actual_sha": "3f738b57d033689832183469e1751248530f204d",
+    "sha_matches": true,
+    "working_copy_clean": true,
+    "dirty_paths": []
+  },
+  "same_runner": true,
+  "runner": {
+    "os": "macOS",
+    "arch": "ARM64",
+    "image_os": "macos15",
+    "image_version": "20260907.0337.1",
+    "macos_version": "15.7.9",
+    "machine": "arm64"
+  },
+  "same_procedure": true,
+  "procedure": "hosted-gui-interaction/7",
+  "rust": [
+    "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "rustc 1.98.1 (48a229cea 2026-09-01)"
+  ],
+  "failed_steps": [
+    {
+      "name": "boundary_click_edit_bold_italic_check_1",
+      "candidate_result": "blocked",
+      "baseline_result": "blocked",
+      "factual_fields_identical": true,
+      "observed": {
+        "expected_canonical_source_offset": 67,
+        "actual_landing_source_offset": 70,
+        "confirmation_landing_source_offset": 70,
+        "landing_offset_delta": 3,
+        "click_evidence": {
+          "pattern": "bold italic combo",
+          "matched_text": "bold italic combo",
+          "bounding_box": {
+            "minY": 0.7703927494132744,
+            "maxX": 0.13828124322360516,
+            "maxY": 0.7915407855111969,
+            "minX": 0.012931038120048833
+          },
+          "window_bounds": {
+            "x": 32,
+            "height": 684,
+            "width": 960,
+            "y": 25
+          },
+          "click_point": {
+            "x": 164.74999349466094,
+            "y": 174.81873105583085
+          },
+          "edge": "end"
+        },
+        "expected_after_insert": "# hosted gui interaction inline syntax spike\n\n**bold *italic* comboZ** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n",
+        "actual_after_insert": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** Zboundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n"
+      },
+      "note": null
+    },
+    {
+      "name": "boundary_click_edit_bold_italic_1_confirm_check",
+      "candidate_result": "blocked",
+      "baseline_result": "blocked",
+      "factual_fields_identical": true,
+      "observed": {
+        "expected_canonical_source_offset": 67,
+        "actual_landing_source_offset": 70,
+        "landing_offset_delta": 3,
+        "click_evidence": {
+          "click_point": {
+            "x": 164.74999349466094,
+            "y": 174.81873105583085
+          },
+          "bounding_box": {
+            "maxX": 0.13828124322360516,
+            "minY": 0.7703927494132744,
+            "minX": 0.012931038120048833,
+            "maxY": 0.7915407855111969
+          },
+          "matched_text": "bold italic combo",
+          "edge": "end",
+          "window_bounds": {
+            "height": 684,
+            "width": 960,
+            "x": 32,
+            "y": 25
+          },
+          "pattern": "bold italic combo"
+        },
+        "expected_after_insert": "# hosted gui interaction inline syntax spike\n\n**bold *italic* comboZ** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n",
+        "actual_after_insert": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** Zboundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n"
+      },
+      "note": null
+    },
+    {
+      "name": "boundary_click_edit_bold_italic",
+      "candidate_result": "blocked",
+      "baseline_result": "blocked",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": null
+    },
+    {
+      "name": "boundary_caret_navigation_check_2",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {
+        "case": "up_from_multiline_code_close",
+        "direction": "up",
+        "count": 1,
+        "expected_after_move_insert": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthisN inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n",
+        "actual_after_move_insert": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis iNnline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n"
+      },
+      "note": null
+    },
+    {
+      "name": "boundary_caret_navigation",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": null
+    },
+    {
+      "name": "boundary_ime_input_check",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {
+        "expected_after_insert": "# hosted gui interaction inline syntax spike\n\n**日本語bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n",
+        "actual_after_insert": "# hosted gui interaction inline syntax spike\n\n**日本語bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n",
+        "expected_after_undo": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n",
+        "actual_after_undo": "# hosted gui interaction inline syntax spike\n\n**日本語bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n"
+      },
+      "note": null
+    },
+    {
+      "name": "boundary_ime_input",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": null
+    },
+    {
+      "name": "drag_select_delete_undo_redo_check",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {
+        "deleted_expected": "# hosted gui interaction inline syntax spike\n\n**bbo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n",
+        "deleted_actual": "# hosted gui interaction inline syntax spike\n\n**bo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n"
+      },
+      "note": null
+    },
+    {
+      "name": "drag_select_delete_undo_redo",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": null
+    },
+    {
+      "name": "delimiter_toggle_star_check",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {
+        "unclosed_expected": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n *loose tail",
+        "unclosed_actual": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n *loose tail",
+        "closed_expected": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n *loose* tail",
+        "closed_actual": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n *loose* tail"
+      },
+      "note": null
+    },
+    {
+      "name": "delimiter_toggle_star",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": null
+    },
+    {
+      "name": "delimiter_toggle_bold_check",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {
+        "unclosed_expected": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n **loose tail",
+        "unclosed_actual": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n **loose tail",
+        "closed_expected": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n **loose** tail",
+        "closed_actual": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n **loose** tail"
+      },
+      "note": null
+    },
+    {
+      "name": "delimiter_toggle_bold",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": null
+    },
+    {
+      "name": "delimiter_toggle_code_check",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {
+        "unclosed_expected": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n `loose tail",
+        "unclosed_actual": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n `loose tail",
+        "closed_expected": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n `loose` tail",
+        "closed_actual": "# hosted gui interaction inline syntax spike\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold** inside.\n\n- list item with *italic* inside.\n `loose` tail"
+      },
+      "note": null
+    },
+    {
+      "name": "delimiter_toggle_code",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": null
+    },
+    {
+      "name": "multiline_code_span_close_toggle",
+      "candidate_result": "fail",
+      "baseline_result": "fail",
+      "factual_fields_identical": true,
+      "observed": {},
+      "note": "multiline toggle は失敗時のactual bytesをresultへ記録しないため、同じ失敗工程の再現まで確認"
+    }
+  ],
+  "pixel_analysis": [
+    {
+      "context": "candidate",
+      "delimiter": "star",
+      "image_size": [
+        960,
+        582
+      ],
+      "difference_bbox": [
+        39,
+        535,
+        264,
+        547
+      ],
+      "editor_pixels_identical": true,
+      "note": "差分は本文の下にあるfooterのrevision/計測値。原resultのfailを変更しない"
+    },
+    {
+      "context": "candidate",
+      "delimiter": "bold",
+      "image_size": [
+        960,
+        582
+      ],
+      "difference_bbox": [
+        39,
+        535,
+        262,
+        547
+      ],
+      "editor_pixels_identical": true,
+      "note": "差分は本文の下にあるfooterのrevision/計測値。原resultのfailを変更しない"
+    },
+    {
+      "context": "candidate",
+      "delimiter": "code",
+      "image_size": [
+        960,
+        582
+      ],
+      "difference_bbox": [
+        39,
+        535,
+        263,
+        546
+      ],
+      "editor_pixels_identical": true,
+      "note": "差分は本文の下にあるfooterのrevision/計測値。原resultのfailを変更しない"
+    },
+    {
+      "context": "baseline",
+      "delimiter": "star",
+      "image_size": [
+        960,
+        582
+      ],
+      "difference_bbox": [
+        39,
+        535,
+        264,
+        547
+      ],
+      "editor_pixels_identical": true,
+      "note": "差分は本文の下にあるfooterのrevision/計測値。原resultのfailを変更しない"
+    },
+    {
+      "context": "baseline",
+      "delimiter": "bold",
+      "image_size": [
+        960,
+        582
+      ],
+      "difference_bbox": [
+        39,
+        535,
+        262,
+        547
+      ],
+      "editor_pixels_identical": true,
+      "note": "差分は本文の下にあるfooterのrevision/計測値。原resultのfailを変更しない"
+    },
+    {
+      "context": "baseline",
+      "delimiter": "code",
+      "image_size": [
+        960,
+        582
+      ],
+      "difference_bbox": [
+        39,
+        535,
+        262,
+        547
+      ],
+      "editor_pixels_identical": true,
+      "note": "差分は本文の下にあるfooterのrevision/計測値。原resultのfailを変更しない"
+    }
+  ],
+  "prior_independent_acceptance": "https://github.com/hide212131/hane/issues/101#issuecomment-5706122131",
+  "classification": "描画digestはmeasurement。OCR位置依存の残項目は比較可能なcurrent-main baselineにも再現する既存の検証経路の制約。PR416の新タブ操作は別の実機GUIとcurrent-head CIで確認。元の包括GUI結果はfail/blockedを保持。"
+}

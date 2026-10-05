@@ -11,13 +11,19 @@
     "Untitledの3つのパス関連メニューが無効",
     "フィルターfocus時のCtrl+Tabはタブを切り替えない",
     "日本語IME未確定入力中のCtrl+Tabは候補/タブを維持。確定後は往復でき、戻った文書で1回のUndoで入力前に復元",
-    "幅682pxの長いパスタブでtooltipがタブ列より下・画面内に表示。左/右/中クリックが到達し保存場所表示でも長い対象ファイルが選択"
+    "幅682pxの長いパスタブでtooltipがタブ列より下・画面内に表示。左/右/中クリックが到達し保存場所表示でも長い対象ファイルが選択",
+    "rename入力中のCtrl+Tabはrename fieldと対象tabを保持。Escapeでcancelしファイル名は変更なし",
+    "設定ページのCtrl+Tabは設定ページを維持。戻ると元の文書を保持",
+    "dirty Untitledの保存して閉じる→native SaveAs→cancelで未保存xを保持。その後の通常SaveAsで新規xへ保存してもタブは閉じず、キャンセル済みclose要求は残らない",
+    "長文で安定したviewportとcaretを記録し別tabへCtrl+Tab→Ctrl+Shift+Tabで戻す。line014/019/026の位置とcaretが同じ、3990bytes/rev0は変更なし。before/after画像を保存",
+    "Autosave onと元のDocuments作業フォルダーへ復元しユーザー文書は編集していない"
   ],
   "limitations": [
-    "macOS hosted comprehensive run37266328180のinlineクリック・caret・IME undoは別途baseline比較が必要であり未確定をpass扱いしない",
-    "file-tabs run37265844071はIssue354のHoverCardコピーアイコン検証でありIssue411の新操作を網羅しない",
-    "描画digest3件は保存本文・本文ピクセル一致。差分bbox star=[39,535,264,547],bold=[39,535,262,547],code=[39,535,263,546]でfooterの動的revision/metricsだけ。元fail記録は維持",
-    "Windowsの長い文書でscroll保持・設定/rename focus・Untitled SaveAsキャンセルはこのmanifest時点では未確認"
+    "元の包括GUI result.jsonのfail/blockedは維持。current-main baseline37344835350との比較とIssue101既存独立GUI acceptanceによりPR差分から独立した検証経路の制約と分類",
+    "file-tabs run37265844071はIssue354のHoverCard検証でありIssue411新操作の証拠にはしない",
+    "WindowsのOS固有Explorer実画面と新しいタブ操作を確認。macOS固有Finderは既存Mac実機記録を採用。長文scroll/rename/settings/SaveAs cancelの今回追加の実機確認はWindowsのみでありMacでも実施したとは主張しない",
+    "初回長文往復時にheading marker再描画で16pxの位置調整を観測。添付before/afterはその後の安定した表示での追加往復を比較",
+    "multiline backtick failureはresultにactual bytesが記録されないため、両runの同じ失敗工程を確認した範囲に限定する"
   ],
   "date_jst": "2026-10-06",
   "images": [
@@ -44,6 +50,14 @@
     {
       "file": "pr416-windows-narrow-long-tooltip-20261006.jpg",
       "sha256": "266e3ef306c29ec8f3551d83ef1a797af29c6e5919e49dfaa53b28dcbdddb636"
+    },
+    {
+      "sha256": "c5274aaab1cc7e39cd44e9c3ae28954af81cc3d15389cbe2868927595e1cd32f",
+      "file": "pr416-windows-scroll-cursor-before-20261006.jpg"
+    },
+    {
+      "sha256": "c5274aaab1cc7e39cd44e9c3ae28954af81cc3d15389cbe2868927595e1cd32f",
+      "file": "pr416-windows-scroll-cursor-after-20261006.jpg"
     }
   ],
   "local_binary": "target/windows-arm64-1.98.1/release/hane.exe",
