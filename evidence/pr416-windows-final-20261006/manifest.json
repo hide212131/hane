@@ -1,0 +1,236 @@
+{
+  "head": "233258141e7eeb664ed70463f1eecad5eae5d664",
+  "base": "6a5f028fafc713a3fa78bcae6ede97c4548e782e",
+  "merge_base": "3f738b57d033689832183469e1751248530f204d",
+  "os": "Windows 11 Home 25H2 ARM64 build 26200.9457",
+  "rust": "1.98.1 aarch64-pc-windows-msvc",
+  "ci": {
+    "exact_worker": "https://github.com/hide212131/hane/actions/runs/37371260319",
+    "required": "https://github.com/hide212131/hane/actions/runs/37382467759",
+    "tests": "success",
+    "clippy": "success",
+    "macos": "success",
+    "windows": "success"
+  },
+  "base_change": "mainの差分はCargo workspace version 0.20.0→0.21.0のみ。製品実装と依存関係に変更なし。",
+  "status": "Windows focused GUI 完了。macOS Finder/middle の受入は未完了。PR未マージ。",
+  "steps": [
+    {
+      "name": "stale_menu_id0_folder_exchange",
+      "result": "pass",
+      "observation": "旧タブの右クリックメニューはSessionSet交換後に消失。同IDのreplacement文書に旧メニューは作用しない。新ツールチップはreplacementのパス。"
+    },
+    {
+      "name": "copy_inactive_japanese_space_path",
+      "result": "pass",
+      "expected": "C:\\Users\\hide2\\AppData\\Local\\Temp\\PR416 final 日本語 20261006\\資料 folder\\対象 日本語 file.md",
+      "observation": "非選択タブのコピーをメモ帳の編集→貼り付けで確認。83文字、1行、引用符なし。選択中の本文はfile twoのまま。",
+      "method": "native screenshot and Notepad character count",
+      "accessibility": "このセッションのSky UIA出力はnull。selected_textの取得成功とは主張しない。"
+    },
+    {
+      "name": "explorer_inactive_exact_file",
+      "result": "pass",
+      "observation": "資料 folderの実ウィンドウで対象 日本語 fileを選択、43バイトと新fixture親フォルダーをUIAと画像で確認。"
+    },
+    {
+      "name": "control_tab_display_order_both_wraps",
+      "result": "pass",
+      "observation": "本文フォーカスでfile two→先頭scroll→file one、逆でfile one→先頭scroll→末尾file two。本文にタブ文字や文字は増えていない。"
+    },
+    {
+      "name": "middle_dirty_cancel",
+      "result": "pass",
+      "observation": "file twoの未保存xが確認後のキャンセルで残り、タブも保持。"
+    },
+    {
+      "name": "middle_inactive_clean",
+      "result": "pass",
+      "observation": "非選択file oneだけ閉じ、選択中file twoの未保存xとカーソル位置は保持。"
+    },
+    {
+      "name": "middle_selected_save_close",
+      "result": "pass",
+      "observation": "保存して閉じるでfile twoだけ閉じ、ファイル読み取りでsecond bodyxを確認。"
+    },
+    {
+      "name": "middle_last_tab",
+      "result": "pass",
+      "observation": "最後の保存済みタブを閉じると空のUntitledへ移行し、ウィンドウは維持。"
+    },
+    {
+      "name": "empty_untitled_control_tab",
+      "result": "pass",
+      "observation": "最後のファイルがない空Untitledでエラー・文字挿入なし。SessionSetは0→空Untitledの既存契約。"
+    },
+    {
+      "name": "untitled_path_disabled",
+      "result": "pass",
+      "observation": "無題のコピー/保存場所表示が灰色で、コピークリックでもOpened/Saved状態と空本文を保持。"
+    },
+    {
+      "name": "native_close_save_as_id0_exchange_chosen",
+      "result": "pass",
+      "observation": "無題id0のSave As表示中にCLIでfolder Bを交換。ダイアログを閉じる前のUIAがreplacement日本語タブを示した後にChosen回答。指定ファイル未作成、replacement本文/48bytes SHA256は不変、閉じずOpened状態保持。",
+      "evidence": [
+        "10-native-save-as-during-ipc-uia.txt",
+        "11-native-stale-save-as-chosen-result.jpg"
+      ]
+    },
+    {
+      "name": "caret_scroll_undo_after_tab_switch",
+      "result": "pass",
+      "observation": "line014途中の1文字編集後に別タブへ移動・復帰。line008〜019の同じ画面位置、同じcaretを保持。Ctrl+Zで追加xを除去し3990bytesへ戻る。"
+    },
+    {
+      "name": "filter_focus_tab_guard",
+      "result": "pass",
+      "observation": "フィルターのcaretが残り、選択scroll文書と本文は変化しない。"
+    },
+    {
+      "name": "settings_tab_guard",
+      "result": "pass",
+      "observation": "設定中Ctrl+Tabで設定画面保持、戻ると元scroll文書。"
+    },
+    {
+      "name": "inline_rename_tab_guard",
+      "result": "pass",
+      "observation": "F2入力欄の選択テキストと元scrollタブを保持。別タブへ移動しない。"
+    },
+    {
+      "name": "narrow_long_path_context_reveal",
+      "result": "pass",
+      "window_width": 691,
+      "observation": "Tooltip表示中の右クリックでメニューを開き、Explorerで長い日本語ファイル名を1件選択、34 bytes。UIA Detailsの対象名・場所を確認。"
+    },
+    {
+      "name": "narrow_long_tooltip_middle",
+      "result": "pass",
+      "observation": "長いパスのtooltip表示中に中クリック。長い名前のタブだけ消え、他の2タブとscroll文書のviewport/caretが保持された。"
+    },
+    {
+      "name": "narrow_tooltip_left_neighbor_edge",
+      "result": "pass",
+      "observation": "隣接した非選択タブのtooltip表示中、左端付近の左クリックで対象文書に切替。他タブを閉じない。"
+    },
+    {
+      "name": "native_ime_preedit_tab_guard",
+      "result": "pass",
+      "observation": "実IMEの未確定「あ」入力でCtrl+Tab。候補一覧が表示され、同じ文書のまま。Escapeで43bytesに戻り、続くCtrl+Tabは別文書に移動。disk SHA256も元の値。"
+    }
+  ],
+  "executable": {
+    "path": "target/windows-arm64-1.98.1/release/hane.exe",
+    "sha256": "3469e57ea6f0448a7db5c8605f1cba49b31459ab6b571c56b41f7d6a01eec21c",
+    "pid": 13784,
+    "started": "2026-10-06T07:45:05+09:00",
+    "build": "cargo build --release --locked -p hane; default features; Rust 1.98.1 ARM64"
+  },
+  "review": {
+    "request": "https://github.com/hide212131/hane/pull/416#issuecomment-6004583655",
+    "walkthrough": "https://github.com/hide212131/hane/pull/416#issuecomment-5914337873",
+    "head": "233258141e7eeb664ed70463f1eecad5eae5d664",
+    "full_review": "completed",
+    "architecture_read": "completed",
+    "risk": "Minimal / Security Low",
+    "remaining_concern": "文書差し替え後のH1 rename busy marker残留はinferredの独立したavailability懸念。修正済み・実機再現済みとは主張しない。"
+  },
+  "native_save_as_ordering_uia": [
+    "\t\t16 ダイアログ 名前を付けて保存 Secondary Actions: Raise",
+    "\t\t\t\t65 テキスト ファイル名: Description: ファイル名: ID: SaveDialogLabel",
+    "\t\t\t\t66 コンボ ボックス (settable, string) ファイル名: Value: Untitled ID: FileNameControlHost",
+    "\t\t\t\t\t67 編集 (settable, string) ファイル名: Value: Untitled ID: 1001",
+    "\t\t\t105 タイトル バー (settable, string) Value: 名前を付けて保存",
+    "\t\t\t8 タブ項目 (selectable) replacement 日本語",
+    "\t\t16 ダイアログ 名前を付けて保存 Secondary Actions: Raise",
+    "\t\t\t\t65 テキスト ファイル名: Description: ファイル名: ID: SaveDialogLabel",
+    "\t\t\t\t66 コンボ ボックス (settable, string) ファイル名: Value: Untitled ID: FileNameControlHost",
+    "\t\t\t\t\t67 編集 (settable, string) ファイル名: Value: Untitled ID: 1001",
+    "\t\t\t105 タイトル バー (settable, string) Value: 名前を付けて保存"
+  ],
+  "fixture_changes": {
+    "intentional_saved_change": "別タブ sample.md = # PR416 Windows file two\nsecond bodyx\n (40 bytes)",
+    "ime_target_disk_sha256": "c27c118a960bff3301908988e147039132b90c091775369ce440815f5c361a82",
+    "stale_dialog_destination": "stale-dialog-should-not-write.md は未作成",
+    "scroll_disk_sha256": "46cbc214f105d5078cb52e2328552a8468a0bc0e07866c1adda2df7a2c2fb46d"
+  },
+  "limits": [
+    "Windows clipboardはメモ帳の実表示と83文字・1行を観測。UIA selected_text取得はnull。",
+    "今回Ctrl+Sでclean化したとの主張はしない。保存成功はmiddle selected Save&Closeでdisk bytesを観測。",
+    "native UIA raw全文はlocalに保存し、manifestにはsynthetic対象の関連行だけを含める。"
+  ],
+  "images": [
+    {
+      "sha256": "245d945879f7658217526acb853363696fd7c86453afed756b03cccba40b97cc",
+      "file": "01-menu-before-folder-exchange.jpg"
+    },
+    {
+      "sha256": "74387d6e67e8d840bc2c04e3c991c1d1f1650cc2c1c77fdb7153a249fc706426",
+      "file": "02-menu-after-folder-exchange.jpg"
+    },
+    {
+      "sha256": "6560c3b9822dbec819f6d147920c951340a738e4c290a50c200bfd4fee3c5f57",
+      "file": "03-replacement-body.jpg"
+    },
+    {
+      "sha256": "c9ba3d4a2a53653ab1fcaa73c882f72e8c40b4ce380ff3edf1696d29f4a7e47f",
+      "file": "04-inactive-copy-notepad.jpg"
+    },
+    {
+      "sha256": "e353f0ee991fce3bfd01ed8076fa162ac633b6a0d61e17a1782a2d961b9419df",
+      "file": "05-explorer-exact-japanese-selection.jpg"
+    },
+    {
+      "sha256": "5ac42f4e5bacc78886a8133e372c8a06e4edd786d7b94d26259eb7b146810f43",
+      "file": "06-control-shift-tab-wrap.jpg"
+    },
+    {
+      "sha256": "05c9974e3c79eb0e034e7b55962fd283e2d38a6a6029480199d7b91a50d644b3",
+      "file": "07-dirty-middle-confirm.jpg"
+    },
+    {
+      "sha256": "4614f9a4a3c52620f1449e29809c1b81061bb2e94b446fb565a02b1949fdfae1",
+      "file": "08-save-close-selected.jpg"
+    },
+    {
+      "sha256": "14c40ab1c2df079ddb2d7c90f3d8c96a9e189e8c5851ab4d56bb3bb6a312982d",
+      "file": "09-untitled-disabled-path.jpg"
+    },
+    {
+      "sha256": "5a26262cba33d179393cd9260d105a653419f0016070ac058e64695a0e478f81",
+      "file": "10-native-save-as-during-ipc.jpg"
+    },
+    {
+      "sha256": "e8c8addd57943f8071152bd2ff47be27f382705925840663d653d4112a6ba637",
+      "file": "11-native-stale-save-as-chosen-result.jpg"
+    },
+    {
+      "sha256": "77ef459c8134b55b35309d37e641cedb32a8a1fb776eaa57ab4c96852103bfd3",
+      "file": "12-scroll-caret-edited-before-switch.jpg"
+    },
+    {
+      "sha256": "77ef459c8134b55b35309d37e641cedb32a8a1fb776eaa57ab4c96852103bfd3",
+      "file": "13-scroll-caret-return.jpg"
+    },
+    {
+      "sha256": "a49d5ea1e97fd26feb4d717b7b6fb9b5275fdc5f21f5e5200516088ff02ff856",
+      "file": "14-undo-after-switch.jpg"
+    },
+    {
+      "sha256": "8d99fef505a68fd4d79cb434216dab7809c6a7012e4d55efd88c6cf5fc8e24c0",
+      "file": "15-narrow-long-tooltip.jpg"
+    },
+    {
+      "sha256": "552d9b8d835cb2c0fb9c987f5c5e6bf47be73e552789c4562e022fa1d53ee9ff",
+      "file": "16-narrow-tooltip-middle-result.jpg"
+    },
+    {
+      "sha256": "549557a1c1f03524f38b2d29ef91cab7d5f0a1849b4e23da9999cda005477a3d",
+      "file": "17-ime-preedit-before-tab.jpg"
+    },
+    {
+      "sha256": "3e9125d83c3ce30880a1f6febdc97b51d67459211e4cbc1405f68d79fdd744e8",
+      "file": "18-ime-ctrl-tab-guard.jpg"
+    }
+  ]
+}
