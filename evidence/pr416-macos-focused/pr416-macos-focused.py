@@ -59,6 +59,7 @@ try:
     if pid is None or window_id is None:raise RuntimeError('launch/window failed')
     image=capture('folder_first');visible('Alpha.*body')
     image=click('open_second_sidebar','second-note','sidebar');visible('Beta.*body')
+    image=click('focus_second_editor','Beta.*body','body');visible('Beta.*body')
     image=action('hover_before_inactive_right',['hover',pid,image,'first-note','tab'])
     image=click('inactive_first_context','first-note','tab','right')
     image=action('clear_hover_before_copy',['move',pid])
