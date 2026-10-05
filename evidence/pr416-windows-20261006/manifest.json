@@ -16,7 +16,8 @@
     "設定ページのCtrl+Tabは設定ページを維持。戻ると元の文書を保持",
     "dirty Untitledの保存して閉じる→native SaveAs→cancelで未保存xを保持。その後の通常SaveAsで新規xへ保存してもタブは閉じず、キャンセル済みclose要求は残らない",
     "長文で安定したviewportとcaretを記録し別tabへCtrl+Tab→Ctrl+Shift+Tabで戻す。line014/019/026の位置とcaretが同じ、3990bytes/rev0は変更なし。before/after画像を保存",
-    "Autosave onと元のDocuments作業フォルダーへ復元しユーザー文書は編集していない"
+    "Autosave onと元のDocuments作業フォルダーへ復元しユーザー文書は編集していない",
+    "長い日本語/空白パスの保存場所表示によりExplorerで対象ファイルが選択された実画面を保存。検証後の画面記録ではナビゲーションpaneを一時非表示にしてテストフォルダーだけを表示し、ファイル選択は変更していない"
   ],
   "limitations": [
     "元の包括GUI result.jsonのfail/blockedは維持。current-main baseline37344835350との比較とIssue101既存独立GUI acceptanceによりPR差分から独立した検証経路の制約と分類",
@@ -58,6 +59,10 @@
     {
       "sha256": "c5274aaab1cc7e39cd44e9c3ae28954af81cc3d15389cbe2868927595e1cd32f",
       "file": "pr416-windows-scroll-cursor-after-20261006.jpg"
+    },
+    {
+      "sha256": "31c508451c19f5d551c044ebebbf8ae7ae43d9dfc9abdd487de185108ad3b4d2",
+      "file": "pr416-windows-explorer-proof-20261006.jpg"
     }
   ],
   "local_binary": "target/windows-arm64-1.98.1/release/hane.exe",
