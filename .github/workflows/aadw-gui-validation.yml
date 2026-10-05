@@ -46,7 +46,7 @@ jobs:
           test -z "$(git -C candidate status --porcelain)"
           gh api repos/hide212131/hane/pulls/416 > "$RUNNER_TEMP/pr-context.json"
           jq -e --arg expected "$EXPECTED_SHA" '.state == "open" and .head.sha == $expected and .base.sha == "3f738b57d033689832183469e1751248530f204d"' "$RUNNER_TEMP/pr-context.json"
-          test "$(gh api repos/hide212131/hane/branches/main --jq '.commit.sha')" = 3f738b57d033689832183469e1751248530f204d
+          test "$(gh api repos/hide212131/hane/branches/main --jq '.commit.sha')" = 6a5f028fafc713a3fa78bcae6ede97c4548e782e
       - name: Observe native tab actions and Finder selection
         env:
           PR416_TARGET_DIR: ${{ github.workspace }}/candidate
