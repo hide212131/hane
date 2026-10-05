@@ -39,8 +39,8 @@ func click(_ p:pid_t,_ path:String,_ pat:String,_ region:String,_ button:String)
     var info=details(m); info["button"]=button; info["point"]=["x":point.x,"y":point.y]; info["inherited_down_flags"]=inheritedDownFlags; info["inherited_up_flags"]=inheritedUpFlags; info["sent_down_flags"]=d.flags.rawValue; info["sent_up_flags"]=u.flags.rawValue; output(info)
 }
 func key(_ p:pid_t,_ name:String) {
-    focus(p); let code:CGKeyCode = name=="escape" ? 53 : 48; var flags:CGEventFlags=[]
-    if name != "escape" { flags.insert(.maskControl) }; if name=="previous" { flags.insert(.maskShift) }
+    focus(p); let codes:[String:CGKeyCode]=["next":48,"previous":48,"escape":53,"end":125,"undo":6,"probe":12]; guard let code=codes[name] else {fail("unsupported key")}; var flags:CGEventFlags=[]
+    if name=="next" || name=="previous" { flags.insert(.maskControl) }; if name=="previous" { flags.insert(.maskShift) }; if name=="end" || name=="undo" {flags.insert(.maskCommand)}
     guard let d=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:true),let u=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:false) else { fail("keyboard event unavailable") }; d.flags=flags;u.flags=flags;d.post(tap:.cghidEventTap);Thread.sleep(forTimeInterval:0.05);u.post(tap:.cghidEventTap);Thread.sleep(forTimeInterval:0.35);output(["key":name,"sent_down_flags":d.flags.rawValue,"sent_up_flags":u.flags.rawValue,"session_flags_after":CGEventSource.flagsState(.combinedSessionState).rawValue])
 }
 func hover(_ p:pid_t,_ path:String,_ pat:String,_ region:String) {
@@ -52,7 +52,7 @@ switch c {
 case "find": guard a.count==4 else { fail("find image regex region") }; output(details(match(a[1],a[2],a[3])))
 case "click": guard a.count==6,let p=pid_t(a[1]) else { fail("click pid image regex region button") }; click(p,a[2],a[3],a[4],a[5])
 case "hover": guard a.count==5,let p=pid_t(a[1]) else {fail("hover pid image regex region")};hover(p,a[2],a[3],a[4])
-case "key": guard a.count==3,let p=pid_t(a[1]),["next","previous","escape"].contains(a[2]) else { fail("key pid next|previous|escape") }; key(p,a[2])
+case "key": guard a.count==3,let p=pid_t(a[1]),["next","previous","escape","end","undo","probe"].contains(a[2]) else { fail("key pid next|previous|escape|end|undo|probe") }; key(p,a[2])
 case "move": guard a.count==2,let p=pid_t(a[1]) else { fail("move pid") }; focus(p);let b=bounds(p);let q=CGPoint(x:b.maxX-20,y:b.midY);guard let e=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:q,mouseButton:.left) else {fail("move unavailable")};let inherited=e.flags.rawValue;e.flags=[];e.post(tap:.cghidEventTap);Thread.sleep(forTimeInterval:0.4);output(["moved":true,"inherited_flags":inherited,"sent_flags":e.flags.rawValue])
 case "clipboard": output(["text":NSPasteboard.general.string(forType:.string) ?? ""])
 case "clipboard-set": guard a.count==2 else { fail("clipboard-set text") };NSPasteboard.general.clearContents();NSPasteboard.general.setString(a[1],forType:.string);output(["set":true])

@@ -32,6 +32,25 @@ def action(name,args):
     return capture(name)
 def click(name,pattern,region,button='left'):
     return action(name,['click',pid,image,pattern,region,button])
+
+def expect_bytes(name,path,expected_bytes):
+    deadline=time.monotonic()+8
+    while time.monotonic()<deadline:
+        actual=path.read_bytes()
+        if actual==expected_bytes:break
+        time.sleep(0.1)
+    passed=actual==expected_bytes
+    step(name,'pass' if passed else 'fail',expected_utf8=expected_bytes.decode(),actual_utf8=actual.decode(),sha256=hashlib.sha256(actual).hexdigest())
+    if not passed:raise AssertionError('native caret/source probe mismatch: '+name)
+
+def probe_caret_at_end(name,path,original):
+    # No caret repositioning here: the actual native key lands wherever the
+    # preceding interaction left it. Disk bytes are independently observed.
+    probe_image=action(name+'_type',['key',pid,'probe'])
+    expect_bytes(name+'_exact_append',path,original+b'q')
+    probe_image=action(name+'_undo',['key',pid,'undo'])
+    expect_bytes(name+'_exact_restore',path,original)
+    return probe_image
 try:
     env.acquire_execution()
     config=inter.make_config(gv,workspace_dir=target,scenario='pr416-preflight',expected_sha=expected,request_id='pr416-'+os.environ['GITHUB_RUN_ID'],generation='0',run_dir=root/'preflight',fixture_path=None,features=['timing-probe'],extra_env={},startup_timeout=15,window_timeout=30)
@@ -60,6 +79,8 @@ try:
     image=capture('folder_first');visible('Alpha.*body')
     image=click('open_second_sidebar','second-note','sidebar');visible('Beta.*body')
     image=click('focus_second_editor','Beta.*body','body');visible('Beta.*body')
+    image=action('caret_to_document_end',['key',pid,'end'])
+    image=probe_caret_at_end('baseline_native_caret',second,originals[second])
     image=action('hover_before_inactive_right',['hover',pid,image,'first-note','tab'])
     image=click('inactive_first_context','first-note','tab','right')
     image=action('clear_hover_before_copy',['move',pid])
@@ -67,12 +88,14 @@ try:
     clip=call(['clipboard'])['text'];step('clipboard_exact_inactive_path','pass' if clip==str(first) else 'fail',expected=str(first),actual=clip)
     if clip!=str(first):raise AssertionError('clipboard mismatch')
     visible('Beta.*body')
+    image=probe_caret_at_end('caret_after_inactive_copy',second,originals[second])
     image=action('hover_before_left',['hover',pid,image,'first-note','tab'])
     image=click('select_first_with_tooltip','first-note','tab')
     image=action('clear_hover_after_left',['move',pid]);visible('Alpha.*body')
     image=action('next_from_selected_first',['key',pid,'next']);visible('Beta.*body')
     for name,key,body in [('next_wrap','next','Alpha.*body'),('next_forward','next','Beta.*body'),('previous_backward','previous','Alpha.*body'),('previous_wrap','previous','Beta.*body')]:
         image=action(name,['key',pid,key]);visible(body)
+    image=probe_caret_at_end('caret_after_control_tab_cycle',second,originals[second])
     image=click('inactive_first_reveal_menu','first-note','tab','right')
     image=action('clear_hover_before_reveal',['move',pid])
     image=click('reveal_inactive_first','Finder','all')
@@ -86,6 +109,7 @@ try:
     if not passed or not finder['windows']:raise AssertionError('Finder did not select expected file with a visible window')
     for index,w in enumerate(finder['windows']):capture('finder_selected_'+str(index),str(w))
     image=action('return_from_finder',['move',pid]);visible('Beta.*body')
+    image=probe_caret_at_end('caret_after_inactive_reveal',second,originals[second])
     image=action('hover_before_inactive_middle',['hover',pid,image,'first-note','tab'])
     image=click('middle_close_inactive_first','first-note','tab','middle')
     image=action('clear_hover_after_middle',['move',pid]);visible('Beta.*body')
@@ -115,7 +139,7 @@ finally:
     except Exception as exc:step('release','blocked',reason=str(exc))
     outcomes=[s['result'] for s in steps if s.get('result') in gv.RESULT_PRIORITY]+[s['result'] for s in scenarios]
     result=min(outcomes,key=lambda x:gv.RESULT_PRIORITY[x]) if outcomes else 'blocked'
-    document=dict(procedure_version='pr416-macos-focused/1',target=target_info,control_sha=subprocess.check_output(['git','-C',str(control),'rev-parse','HEAD'],text=True).strip(),build=build,runner=dict(os='macOS',version=subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),arch=subprocess.check_output(['uname','-m'],text=True).strip(),image=os.environ.get('ImageVersion')),steps=steps,scenarios=scenarios,overall_result=result,scope_note='Issue411のnative middle/right-click、Control+Tab、Finder選択を新headの実OS入力で確認。旧Issue354 helperのhoverは別scenarioとして区別。SaveAs native raceはWindows実機とcurrent-head regressionを別途確認する。')
+    document=dict(procedure_version='pr416-macos-focused/2',target=target_info,control_sha=subprocess.check_output(['git','-C',str(control),'rev-parse','HEAD'],text=True).strip(),build=build,runner=dict(os='macOS',version=subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),arch=subprocess.check_output(['uname','-m'],text=True).strip(),image=os.environ.get('ImageVersion')),steps=steps,scenarios=scenarios,overall_result=result,scope_note='Issue411のnative middle/right-click、Control+Tab、Finder選択と、copy/reveal後の本文caretを実キー入力+disk bytes+Undoで確認。旧Issue354 helperのhoverは別scenarioとして区別。SaveAs native raceはWindows実機とcurrent-head regressionを別途確認する。')
     (root/'result.json').write_text(json.dumps(document,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps(dict(overall_result=result,target=target_info),ensure_ascii=False))
 sys.exit(0 if result=='pass' else 2)
