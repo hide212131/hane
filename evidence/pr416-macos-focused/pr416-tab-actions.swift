@@ -30,7 +30,7 @@ func click(_ p:pid_t,_ path:String,_ pat:String,_ region:String,_ button:String)
     let dn:CGEventType = button=="right" ? .rightMouseDown : button=="middle" ? .otherMouseDown : .leftMouseDown
     let up:CGEventType = button=="right" ? .rightMouseUp : button=="middle" ? .otherMouseUp : .leftMouseUp
     guard let d=CGEvent(mouseEventSource:nil,mouseType:dn,mouseCursorPosition:point,mouseButton:mb), let u=CGEvent(mouseEventSource:nil,mouseType:up,mouseCursorPosition:point,mouseButton:mb) else { fail("mouse event unavailable") }
-    d.post(tap:.cghidEventTap); Thread.sleep(forTimeInterval:0.05); u.post(tap:.cghidEventTap); Thread.sleep(forTimeInterval:0.35)
+    guard let move=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:point,mouseButton:.left) else { fail("pointer move unavailable") }; move.post(tap:.cghidEventTap); Thread.sleep(forTimeInterval:0.2); d.post(tap:.cghidEventTap); Thread.sleep(forTimeInterval:0.1); u.post(tap:.cghidEventTap); Thread.sleep(forTimeInterval:0.5)
     var info=details(m); info["button"]=button; info["point"]=["x":point.x,"y":point.y]; output(info)
 }
 func key(_ p:pid_t,_ name:String) {
