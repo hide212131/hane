@@ -517,10 +517,26 @@ struct InlineRenameComposition {
     selection_reversed: bool,
 }
 
+/// Snapshot of which document instance a tab-scoped action (the context
+/// menu, a close confirmation, or a pending "save then close" request) was
+/// taken against: the session's own per-document generation, together with
+/// the work-folder epoch it was opened under. `switch_to_work_folder`
+/// installs a fresh `SessionSet` whose ids restart at the same values the
+/// old one used and whose fresh sessions restart at generation 0 too, so
+/// neither the id nor the per-document generation alone can tell the new
+/// document apart from the one the action was started against; the epoch
+/// is what still can.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DocumentInstance {
+    generation: u64,
+    workspace: u64,
+}
+
 #[derive(Clone, Debug)]
 struct FileTabContextMenu {
     position: gpui::Point<Pixels>,
     id: SessionId,
+    instance: DocumentInstance,
 }
 
 /// A pending "close this tab" request whose session has unsaved changes, so
@@ -529,6 +545,7 @@ struct FileTabContextMenu {
 #[derive(Clone, Copy, Debug)]
 struct TabCloseConfirm {
     id: SessionId,
+    instance: DocumentInstance,
 }
 
 #[derive(Clone, Debug)]
@@ -764,11 +781,11 @@ pub struct EditorView {
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
     /// Sessions with a "save, then close" request in flight, keyed to the
-    /// generation the request was made against. A generation mismatch when a
-    /// write completes means the document was replaced meanwhile, so the
-    /// close is treated as canceled rather than applied to a different
-    /// document.
-    tab_close_after_save: HashMap<SessionId, u64>,
+    /// document instance the request was made against. An instance mismatch
+    /// when a write completes means the document was replaced meanwhile —
+    /// in place, or by a work-folder switch — so the close is treated as
+    /// canceled rather than applied to a different document.
+    tab_close_after_save: HashMap<SessionId, DocumentInstance>,
     /// Horizontal scroll state for the footer controls, so recent-file
     /// buttons remain reachable without allowing the footer to cover the
     /// editor viewport on a narrow main panel.
@@ -1729,7 +1746,11 @@ impl EditorView {
         match session.close_decision() {
             CloseDecision::Close => self.close_tab_now(id, cx),
             CloseDecision::Reject(UnsavedChanges) => {
-                self.tab_close_confirm = Some(TabCloseConfirm { id });
+                let instance = DocumentInstance {
+                    generation: session.generation(),
+                    workspace: self.work_folder_generation,
+                };
+                self.tab_close_confirm = Some(TabCloseConfirm { id, instance });
                 cx.notify();
             }
         }
@@ -1768,7 +1789,11 @@ impl EditorView {
             return;
         };
         if session.path().is_some() {
-            self.tab_close_after_save.insert(id, session.generation());
+            let instance = DocumentInstance {
+                generation: session.generation(),
+                workspace: self.work_folder_generation,
+            };
+            self.tab_close_after_save.insert(id, instance);
             self.save_session(id, SaveIntent::Current, cx);
         } else {
             self.prompt_save_as_for_close(id, cx);
@@ -1794,31 +1819,62 @@ impl EditorView {
                     .map(|folder| folder.root().to_path_buf())
             })
             .unwrap_or_else(|| PathBuf::from("."));
+        // Captured before the native dialog is even shown — not re-read once
+        // it resolves — so a work-folder switch or an in-place reopen that
+        // replaces this document while the (native, unboundedly long-lived)
+        // dialog is still open is told apart from the document the dialog
+        // was actually opened for, instead of the id's current occupant
+        // being trusted as this request's authority just because the dialog
+        // answered.
+        let instance = DocumentInstance {
+            generation: session.generation(),
+            workspace: self.work_folder_generation,
+        };
         let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(Some(path))) => {
                 let _ = view.update(cx, |view, cx| {
-                    // Armed now, against the generation as of this specific
+                    // Armed now, against the instance as of this specific
                     // write, so only this user-chosen write's own landing
                     // (checked by `resolve_pending_tab_close`) can close the
                     // tab: nothing landed for this session before the user
                     // chose a target is eligible to satisfy this request.
-                    if let Some(session) = view.sessions.get(id) {
-                        view.tab_close_after_save.insert(id, session.generation());
+                    // If the id no longer names the same document instance
+                    // the dialog was opened for, the chosen path is not
+                    // written at all — it must not land on whatever
+                    // unrelated document now holds this id.
+                    if view.document_instance(id) == Some(instance) {
+                        view.tab_close_after_save.insert(id, instance);
+                        view.save_session(id, SaveIntent::To(path), cx);
+                    } else {
+                        view.status = Some(
+                            "保存先の選択中にタブの文書が入れ替わったため、保存されませんでした"
+                                .to_owned(),
+                        );
+                        cx.notify();
                     }
-                    view.save_session(id, SaveIntent::To(path), cx);
                 });
             }
             Ok(Err(error)) => {
                 let _ = view.update(cx, |view, cx| {
-                    view.tab_close_after_save.remove(&id);
+                    // Only this dialog's own instance may be dropped: by the
+                    // time this lands, the id may already belong to an
+                    // unrelated, newer close-and-save request (a later
+                    // reopen, or another request made after a work-folder
+                    // switch), and clearing unconditionally would cancel
+                    // that request instead of this one.
+                    if view.tab_close_after_save.get(&id) == Some(&instance) {
+                        view.tab_close_after_save.remove(&id);
+                    }
                     view.status = Some(format!("Save As failed: {error}"));
                     cx.notify();
                 });
             }
             _ => {
                 let _ = view.update(cx, |view, cx| {
-                    view.tab_close_after_save.remove(&id);
+                    if view.tab_close_after_save.get(&id) == Some(&instance) {
+                        view.tab_close_after_save.remove(&id);
+                    }
                     cx.notify();
                 });
             }
@@ -1835,14 +1891,18 @@ impl EditorView {
     /// queued behind this one, or an H1 rename it triggered) leaves the
     /// request armed for that write's own completion to re-check.
     fn resolve_pending_tab_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(&requested_generation) = self.tab_close_after_save.get(&id) else {
+        let Some(&requested_instance) = self.tab_close_after_save.get(&id) else {
             return;
         };
         let Some(session) = self.sessions.get(id) else {
             self.tab_close_after_save.remove(&id);
             return;
         };
-        if session.generation() != requested_generation {
+        let current_instance = DocumentInstance {
+            generation: session.generation(),
+            workspace: self.work_folder_generation,
+        };
+        if current_instance != requested_instance {
             self.tab_close_after_save.remove(&id);
             return;
         }
@@ -1891,7 +1951,14 @@ impl EditorView {
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.file_tab_context_menu = Some(FileTabContextMenu { position, id });
+        let Some(instance) = self.document_instance(id) else {
+            return;
+        };
+        self.file_tab_context_menu = Some(FileTabContextMenu {
+            position,
+            id,
+            instance,
+        });
         cx.notify();
     }
 
@@ -2016,6 +2083,17 @@ impl EditorView {
             session: self.sessions.active_id(),
             generation: self.sessions.active().generation(),
         }
+    }
+
+    /// The document instance `id` currently names, if any. `None` both when
+    /// the id is not open at all and (implicitly, via equality against a
+    /// snapshot taken earlier) when a work-folder switch or an in-place
+    /// reopen replaced whatever the id named before.
+    fn document_instance(&self, id: SessionId) -> Option<DocumentInstance> {
+        self.sessions.get(id).map(|session| DocumentInstance {
+            generation: session.generation(),
+            workspace: self.work_folder_generation,
+        })
     }
 
     /// Cancels a selection drag before the state for another document is
@@ -2431,10 +2509,26 @@ impl EditorView {
         self.title_sync_deferred.clear();
         self.loading_paths.clear();
         self.latest_open_target = None;
+        // The new `SessionSet` restarts ids (and each fresh session's own
+        // generation) at the same values the old one used, so a tab context
+        // menu, close confirmation, or pending "save then close" request
+        // left over from the old sessions would otherwise keep matching by
+        // id alone and act on whichever unrelated document now holds it.
+        // Dropped outright rather than left for the generation check below
+        // to catch lazily, since a still-open native Save As dialog for the
+        // old document is not reachable from here to cancel; `document_instance`
+        // comparisons elsewhere are what keep that dialog's eventual answer
+        // from acting on the replacement document.
+        self.file_tab_context_menu = None;
+        self.tab_close_confirm = None;
+        self.tab_close_after_save.clear();
         // Any background read still in flight for the old folder (or for
         // single-file state) is now for a session that no longer exists;
         // bumping this makes `finish_open` discard it instead of merging a
-        // stale file into the sessions just installed above.
+        // stale file into the sessions just installed above. It also backs
+        // `DocumentInstance`, which is how the tab-scoped state above tells
+        // a document from before this switch apart from one that reuses the
+        // same session id afterward.
         self.work_folder_generation = self.work_folder_generation.wrapping_add(1);
         self.on_document_replaced();
         self.begin_work_folder_scan(root, cx);
@@ -5472,19 +5566,21 @@ impl Render for EditorView {
         }
         // Discards a context menu or close-confirmation left over for a tab
         // that closed through some other route while it was still showing,
-        // rather than acting on (or displaying stale information about) a
-        // session that no longer exists.
+        // or whose id now names a different document instance (a
+        // work-folder switch reusing the id, or an in-place reopen), rather
+        // than acting on (or displaying stale information about) a document
+        // the action was never taken against.
         if self
             .file_tab_context_menu
             .as_ref()
-            .is_some_and(|menu| self.sessions.get(menu.id).is_none())
+            .is_some_and(|menu| self.document_instance(menu.id) != Some(menu.instance))
         {
             self.file_tab_context_menu = None;
         }
         if self
             .tab_close_confirm
             .as_ref()
-            .is_some_and(|confirm| self.sessions.get(confirm.id).is_none())
+            .is_some_and(|confirm| self.document_instance(confirm.id) != Some(confirm.instance))
         {
             self.tab_close_confirm = None;
         }
@@ -11121,6 +11217,104 @@ mod tests {
         std::fs::remove_dir_all(&new_root).unwrap();
     }
 
+    // Companion to the test above, but for `SessionId(0)` specifically: a
+    // work-folder switch installs a fresh `SessionSet::with_untitled`, whose
+    // one new session reuses id 0 at generation 0 — the exact id and
+    // generation the very first tab of any window starts at. The sibling
+    // test's `SessionId(1)` happens to vanish outright, so it cannot catch a
+    // check that only compares ids; this one exercises the id the old and
+    // new documents actually share.
+    #[gpui::test]
+    fn file_tab_context_menu_for_the_first_tab_is_discarded_when_a_work_folder_switch_reuses_its_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let new_root = draft_test_root("context-menu-stale-switch-id-zero");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "the replacement untitled session reuses the old SessionId(0)"
+            );
+            assert!(
+                view.file_tab_context_menu.is_none(),
+                "a menu opened for the old SessionId(0) document must not linger for the \
+                 unrelated document that now reuses that id"
+            );
+        });
+        assert!(cx.debug_bounds("file-tab-context-menu").is_none());
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Same id-reuse hazard as the test above, for the close-confirmation
+    // overlay rather than the context menu.
+    #[gpui::test]
+    fn tab_close_confirm_for_the_first_tab_is_discarded_when_a_work_folder_switch_reuses_its_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let new_root = draft_test_root("close-confirm-stale-switch-id-zero");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("draft").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.tab_close_confirm.is_some()));
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), SessionId(0));
+            assert!(
+                view.tab_close_confirm.is_none(),
+                "a close confirmation opened for the old SessionId(0) document must not linger \
+                 for the unrelated document that now reuses that id"
+            );
+            assert!(
+                !view.sessions.active().is_dirty(),
+                "the replacement document must be the fresh, clean untitled session \
+                 `switch_to_work_folder` installed, not treated as still having the old \
+                 document's unsaved edits"
+            );
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "no close-then-save request must be armed for the replacement document either"
+            );
+        });
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
     #[gpui::test]
     fn left_clicking_a_path_bearing_file_tab_activates_its_session(cx: &mut gpui::TestAppContext) {
         // Both sessions have a real path, so both tabs render their label
@@ -12139,14 +12333,20 @@ mod tests {
 
         view.update(cx, |view, cx| {
             let id = view.sessions.active_id();
-            let requested_generation = view.sessions.active().generation();
+            let requested_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
             view.sessions.active_mut().adopt(LoadedFile {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
             });
-            assert_ne!(view.sessions.active().generation(), requested_generation);
-            view.tab_close_after_save.insert(id, requested_generation);
+            assert_ne!(
+                view.sessions.active().generation(),
+                requested_instance.generation
+            );
+            view.tab_close_after_save.insert(id, requested_instance);
             view.resolve_pending_tab_close(id, cx);
             assert!(
                 view.sessions.get(id).is_some(),
@@ -12157,6 +12357,87 @@ mod tests {
                 "the stale request must be dropped, not retried against the new document"
             );
         });
+    }
+
+    // Security-relevant identity regression (PR #416 review): the native
+    // Save As dialog a close-and-save request opens for an untitled
+    // document is not bounded by this process at all — the user can leave
+    // it open indefinitely. If a work-folder switch lands while it is still
+    // open, the dialog's eventual answer must not be mistaken for an answer
+    // about whatever unrelated document now occupies the same `SessionId`:
+    // neither writing the user's old content to their newly chosen path
+    // under the new document's identity, nor closing or otherwise mutating
+    // the new document.
+    #[gpui::test]
+    fn save_as_answered_after_a_work_folder_switch_does_not_act_on_the_replacement_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let new_root = draft_test_root("save-as-across-work-folder-switch");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let chosen_path = new_root.join("Chosen.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("secret draft").unwrap();
+            view.after_input(cx);
+            // Opens the confirmation and then the native Save As dialog for
+            // this untitled, unsaved document, and leaves the dialog
+            // unanswered — exactly the window during which the user could
+            // instead act on the work-folder switch below.
+            view.request_tab_close(id, cx);
+            view.confirm_save_and_close_tab(id, cx);
+            id
+        });
+        cx.run_until_parked();
+        assert_eq!(id, SessionId(0));
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "the replacement untitled session reuses the old SessionId(0)"
+            );
+            assert!(!view.sessions.active().is_dirty());
+            assert!(view.sessions.active().path().is_none());
+        });
+
+        // The user finally answers the dialog that was opened before the
+        // switch, long after the replacement document was installed.
+        cx.simulate_new_path_selection(|_| Some(chosen_path.clone()));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let replacement = view
+                .sessions
+                .get(SessionId(0))
+                .expect("the replacement document must stay open");
+            assert!(
+                replacement.path().is_none(),
+                "the stale Save As answer must not give the replacement document a path"
+            );
+            assert!(
+                !replacement.is_dirty(),
+                "the stale Save As answer must not mark the replacement document dirty"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&SessionId(0)),
+                "the stale request must not arm a close against the replacement document"
+            );
+        });
+        assert!(
+            !chosen_path.exists(),
+            "the stale Save As answer must not write the old document's content to disk \
+             under the replacement document's identity"
+        );
+
+        std::fs::remove_dir_all(&new_root).unwrap();
     }
 
     #[gpui::test]
