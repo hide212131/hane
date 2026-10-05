@@ -1779,12 +1779,21 @@ impl EditorView {
     /// document clean, closing the tab out from under a dialog the user has
     /// not finished answering yet.
     fn confirm_save_and_close_tab(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if self
-            .tab_close_confirm
-            .is_some_and(|confirm| confirm.id == id)
-        {
-            self.tab_close_confirm = None;
+        // Requires a live confirmation for this exact document instance, not
+        // just a matching id: the render-time cleanup that discards a
+        // confirmation left over for a document instance that no longer
+        // exists (see the top of the main render pass) runs once per frame,
+        // not before every action this button's own click could still fire
+        // after. Trusting the id alone here would let a click queued against
+        // an already-invalidated confirmation create a fresh save/close
+        // authority for whatever unrelated document now holds the id.
+        let Some(confirm) = self.tab_close_confirm else {
+            return;
+        };
+        if confirm.id != id || self.document_instance(id) != Some(confirm.instance) {
+            return;
         }
+        self.tab_close_confirm = None;
         let Some(session) = self.sessions.get(id) else {
             return;
         };
@@ -1857,12 +1866,16 @@ impl EditorView {
             }
             Ok(Err(error)) => {
                 let _ = view.update(cx, |view, cx| {
-                    // Only this dialog's own instance may be dropped: by the
+                    // Only this dialog's own instance may act at all: by the
                     // time this lands, the id may already belong to an
-                    // unrelated, newer close-and-save request (a later
-                    // reopen, or another request made after a work-folder
-                    // switch), and clearing unconditionally would cancel
-                    // that request instead of this one.
+                    // unrelated, newer document (a work-folder switch, or an
+                    // in-place reopen), and acting unconditionally would
+                    // cancel that document's own close request instead of
+                    // this one, or overwrite the status it is currently
+                    // showing with a message about a dialog it never opened.
+                    if view.document_instance(id) != Some(instance) {
+                        return;
+                    }
                     if view.tab_close_after_save.get(&id) == Some(&instance) {
                         view.tab_close_after_save.remove(&id);
                     }
@@ -1872,6 +1885,9 @@ impl EditorView {
             }
             _ => {
                 let _ = view.update(cx, |view, cx| {
+                    if view.document_instance(id) != Some(instance) {
+                        return;
+                    }
                     if view.tab_close_after_save.get(&id) == Some(&instance) {
                         view.tab_close_after_save.remove(&id);
                     }
@@ -11938,6 +11954,7 @@ mod tests {
             view.editor_mut().set_selection(Selection::caret(end)).unwrap();
             view.editor_mut().insert_text(" after").unwrap();
             view.after_input(cx);
+            view.request_tab_close(id, cx);
             view.confirm_save_and_close_tab(id, cx);
             assert!(view.sessions.active().save_in_flight());
             // Lands before the executor ever polls the write started above.
@@ -11997,6 +12014,7 @@ mod tests {
             view.editor_mut().set_selection(Selection::caret(end)).unwrap();
             view.editor_mut().insert_text(" after").unwrap();
             view.after_input(cx);
+            view.request_tab_close(id, cx);
             view.confirm_save_and_close_tab(id, cx);
             assert!(view.sessions.active().save_in_flight());
         });
@@ -12067,6 +12085,12 @@ mod tests {
             view.editor_mut().set_selection(Selection::caret(end)).unwrap();
             view.editor_mut().insert_text(" after").unwrap();
             view.after_input(cx);
+            // Opens the confirmation while the document is still genuinely
+            // dirty, exactly as a real middle-click would; the save below
+            // that cleans it lands for this same confirmed instance, the
+            // same as an unrelated autosave racing ahead of the user's own
+            // click would.
+            view.request_tab_close(id, cx);
             view.save_current(cx);
             id
         });
@@ -12156,6 +12180,7 @@ mod tests {
             view.editor_mut().set_selection(Selection::caret(end)).unwrap();
             view.editor_mut().insert_text(" after").unwrap();
             view.after_input(cx);
+            view.request_tab_close(id, cx);
             view.confirm_save_and_close_tab(id, cx);
             assert!(view.sessions.active().save_in_flight());
             // Queued behind the close request's own write, which is still in
@@ -12438,6 +12463,247 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // PR #416 review follow-up: a work-folder switch installs a fresh
+    // `SessionSet` whose ids — and each fresh `DocumentSession`'s own
+    // generation and `save_sequence` — restart at the same values the old
+    // one used. A write started under the old workspace and a write
+    // started under the replacement document can therefore earn the exact
+    // same `SaveTicket` (same restarted generation, same restarted
+    // sequence, same `Revision` after one edit each), which `finish_save`'s
+    // own ticket check alone cannot tell apart. `save_session` now binds
+    // the workspace epoch the write actually started under, so a stale
+    // completion from before the switch is dropped before it ever reaches
+    // the replacement document's own, colliding in-flight write.
+    #[gpui::test]
+    fn a_stale_save_completion_from_before_a_work_folder_switch_does_not_land_on_a_colliding_new_ticket(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-save-ticket-collision-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_target = old_root.join("Old.md");
+
+        let new_root = draft_test_root("stale-save-ticket-collision-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let new_target = new_root.join("New.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        // Starts the old, untitled document's first write — the same
+        // `SaveIntent::CreateNew` route `begin_title_create` uses for an
+        // H1-derived filename, reachable here directly without the
+        // debounce — and leaves its result unpolled: nothing here calls
+        // `cx.run_until_parked()` before the switch below replaces
+        // `sessions`.
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("first").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(old_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+            id
+        });
+
+        // The switch replaces `sessions` with a fresh `SessionSet`: same
+        // id, generation restarted at 0, `save_sequence` restarted at 0 —
+        // exactly as `switch_to_work_folder` does — without depending on
+        // its own (irrelevant here) background folder scan to do it.
+        view.update(cx, |view, cx| {
+            view.sessions = SessionSet::with_untitled("", "Untitled");
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            view.on_document_replaced();
+            cx.notify();
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), id);
+
+        // The replacement document's own first write earns the exact same
+        // `SaveTicket`: same restarted generation (0), same restarted
+        // sequence (1), and the same `Revision` after one edit.
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("second").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(new_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            old_target.exists(),
+            "the stale write itself must still have landed on disk"
+        );
+        assert!(
+            new_target.exists(),
+            "the replacement document's own write must still have landed on disk"
+        );
+
+        view.read_with(cx, |view, _| {
+            let session = view
+                .sessions
+                .get(id)
+                .expect("the replacement document must still be open");
+            assert_eq!(
+                session.path(),
+                Some(new_target.as_path()),
+                "a stale, colliding completion from before the switch must not give the \
+                 replacement document the old write's file identity"
+            );
+            assert!(
+                !session.is_dirty(),
+                "the replacement document's own write, not the stale one, must be what marks \
+                 it clean"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Companion to the collision test above: even when nothing about the
+    // replacement document's own state could be confused with the stale
+    // write's `SaveTicket` (nothing of its own is in flight at all here),
+    // `finish_save`'s `Superseded` branch and the bookkeeping cleanup at
+    // its tail are keyed only by `SessionId`, not by workspace — so without
+    // binding the stale completion to the workspace it actually started
+    // under, it would still unconditionally clear title-sync and
+    // close-and-save bookkeeping that belongs entirely to the replacement
+    // document.
+    #[gpui::test]
+    fn a_stale_save_completion_from_before_a_work_folder_switch_does_not_clear_the_replacement_documents_bookkeeping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-save-no-clear-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_target = old_root.join("Old.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("first").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(old_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+            id
+        });
+
+        // The switch replaces `sessions` while the old write above is
+        // still unpolled, the same as `switch_to_work_folder` would.
+        view.update(cx, |view, cx| {
+            view.sessions = SessionSet::with_untitled("", "Untitled");
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            view.on_document_replaced();
+            cx.notify();
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), id);
+
+        // Bookkeeping belonging entirely to the replacement document — a
+        // pending title-sync create and a close-and-save request, armed
+        // for writes of its own that have nothing to do with the stale one
+        // above — must survive the stale completion below untouched.
+        let new_instance = view.read_with(cx, |view, _| DocumentInstance {
+            generation: view.sessions.active().generation(),
+            workspace: view.work_folder_generation,
+        });
+        view.update(cx, |view, _cx| {
+            view.title_sync_pending.insert(id, "Kept".to_owned());
+            view.tab_close_after_save.insert(id, new_instance);
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            old_target.exists(),
+            "the stale write itself must still have landed on disk"
+        );
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the replacement document must still be open"
+            );
+            assert_eq!(
+                view.title_sync_pending.get(&id).map(String::as_str),
+                Some("Kept"),
+                "the stale completion must not clear title-sync bookkeeping armed for the \
+                 replacement document"
+            );
+            assert_eq!(
+                view.tab_close_after_save.get(&id),
+                Some(&new_instance),
+                "the stale completion must not clear a close-and-save request armed for the \
+                 replacement document"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+    }
+
+    // PR #416 review follow-up: `confirm_save_and_close_tab` used to trust
+    // a matching `SessionId` alone. The render-time cleanup that discards a
+    // confirmation left over for a document instance that no longer exists
+    // (see the top of the main render pass) runs once per frame, not
+    // necessarily before every click already dispatched against the old
+    // confirmation's button, so a document-instance check belongs in the
+    // handler itself, not only in render.
+    #[gpui::test]
+    fn confirm_save_and_close_tab_ignores_a_stale_click_after_the_document_instance_changed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("confirm-save-close-stale-instance");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            assert!(view.tab_close_confirm.is_some());
+            // The document instance changes — a reload/adopt bumps the
+            // generation the confirmation was opened against — without the
+            // confirmation itself being cleared.
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            id
+        });
+
+        view.update(cx, |view, cx| {
+            view.confirm_save_and_close_tab(id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sessions.active().save_in_flight(),
+                "a stale click against an invalidated confirmation must not start a new save"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a stale click must not arm a close-and-save request for the replacement document"
+            );
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the replacement document's own path must be untouched"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]

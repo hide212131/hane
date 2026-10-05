@@ -269,6 +269,12 @@ impl EditorView {
             return;
         };
         self.title_sync_in_flight.insert(id);
+        // Captured now, not re-read once the rename lands: the same
+        // workspace/document boundary `save_session` binds for a write's own
+        // `SaveTicket` applies here too, since `begin_rename` reserves the
+        // same save slot and its ticket is subject to the same generation
+        // collision across a work-folder switch's fresh `SessionSet`.
+        let workspace = self.work_folder_generation;
         let files = self.files.clone();
         let probe_title = title.clone();
         let probe_from = from.clone();
@@ -289,6 +295,14 @@ impl EditorView {
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
+                if workspace != view.work_folder_generation {
+                    // The work folder was switched away while this rename
+                    // was in flight: `id` may now name an unrelated document
+                    // that reused the same slot, whose own, unrelated
+                    // title-sync in-flight marker and save/close state this
+                    // stale completion must not touch.
+                    return;
+                }
                 view.title_sync_in_flight.remove(&id);
                 let attempt = TitleRenameAttempt {
                     id,
@@ -465,6 +479,15 @@ impl EditorView {
                 let files = self.files.clone();
                 let path = job.path.clone();
                 let ticket = job.ticket;
+                // Captured now, not re-read once the write lands: a
+                // work-folder switch installs a fresh `SessionSet` whose ids
+                // (and each fresh session's own generation) restart at the
+                // same values the old one used, so an old-workspace write's
+                // `SaveTicket` can coincidentally equal a new document's own
+                // first ticket. Binding the workspace here, before the
+                // completion ever reaches `finish_save`, is what tells the
+                // two apart instead of letting the ticket alone decide.
+                let workspace = self.work_folder_generation;
                 cx.spawn(async move |view, cx| {
                     let result = cx
                         .background_executor()
@@ -473,7 +496,7 @@ impl EditorView {
                         })
                         .await;
                     let _ = view.update(cx, |view, cx| {
-                        view.finish_save(id, ticket, &path, result, cx);
+                        view.finish_save(id, ticket, workspace, &path, result, cx);
                     });
                 })
                 .detach();
@@ -486,10 +509,23 @@ impl EditorView {
         &mut self,
         id: SessionId,
         ticket: SaveTicket,
+        workspace: u64,
         path: &Path,
         result: Result<SavedFile, SaveFailure>,
         cx: &mut Context<Self>,
     ) {
+        if workspace != self.work_folder_generation {
+            // The work folder was switched away while this write was in
+            // flight. `id` may now name an unrelated document that reused
+            // the same slot in the fresh `SessionSet`, so this completion
+            // must not touch any of its state at all — not the file
+            // identity or saved revision a `finish_save` call below would
+            // apply, and not the title-sync or pending-close bookkeeping the
+            // outcome match and the tail of this function would otherwise
+            // clear for it. Dropped silently, the same as any other result
+            // that no longer belongs to anything open.
+            return;
+        }
         let Some(outcome) = self
             .sessions
             .get_mut(id)
