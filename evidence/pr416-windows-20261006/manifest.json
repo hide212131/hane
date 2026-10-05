@@ -1,0 +1,52 @@
+{
+  "baseline_sha": "3f738b57d033689832183469e1751248530f204d",
+  "passed": [
+    "日本語・空白を含む選択タブのフルパスコピーをメモ帳の貼り付けメニューで95文字・改行なしと照合",
+    "非選択タブのフルパスコピーで別タブ sample.mdを94文字・改行なしと照合し選択文書は維持",
+    "Ctrl+TabとCtrl+Shift+Tabで表示順の循環を確認",
+    "非選択のcleanタブの中クリックは対象だけを閉じ選択文書を維持",
+    "非選択dirtyタブの中クリックで正しいパスの保存確認を表示。キャンセルで両タブを維持し元ファイルは変更なし",
+    "保存して閉じるで対象ファイルのみ更新し対象タブのみ閉じる",
+    "最後の選択タブを閉じると0bytesのUntitled。1タブのCtrl+Tabは内容変更なし",
+    "Untitledの3つのパス関連メニューが無効",
+    "フィルターfocus時のCtrl+Tabはタブを切り替えない",
+    "日本語IME未確定入力中のCtrl+Tabは候補/タブを維持。確定後は往復でき、戻った文書で1回のUndoで入力前に復元",
+    "幅682pxの長いパスタブでtooltipがタブ列より下・画面内に表示。左/右/中クリックが到達し保存場所表示でも長い対象ファイルが選択"
+  ],
+  "limitations": [
+    "macOS hosted comprehensive run37266328180のinlineクリック・caret・IME undoは別途baseline比較が必要であり未確定をpass扱いしない",
+    "file-tabs run37265844071はIssue354のHoverCardコピーアイコン検証でありIssue411の新操作を網羅しない",
+    "描画digest3件は保存本文・本文ピクセル一致。差分bbox star=[39,535,264,547],bold=[39,535,262,547],code=[39,535,263,546]でfooterの動的revision/metricsだけ。元fail記録は維持",
+    "Windowsの長い文書でscroll保持・設定/rename focus・Untitled SaveAsキャンセルはこのmanifest時点では未確認"
+  ],
+  "date_jst": "2026-10-06",
+  "images": [
+    {
+      "file": "pr416-windows-full-path-copy-20261006.jpg",
+      "sha256": "365f2a7c2eb600f5ba11eb998bc8300aab1550fa8d0a3d7724542fa32aa4a850"
+    },
+    {
+      "file": "pr416-windows-inactive-copy-20261006.jpg",
+      "sha256": "9135d820033a337fde5109664fd9eb8c01f89973871c694502c02af05f2f5277"
+    },
+    {
+      "file": "pr416-windows-dirty-middle-save-dialog-20261006.jpg",
+      "sha256": "a17fd34aa55b93f2796d1c7be3deb9e8d87b50a5289a532552cfad02b1d5c986"
+    },
+    {
+      "file": "pr416-windows-untitled-disabled-20261006.jpg",
+      "sha256": "bdd0e08d4df5b2c3c66cd129eb7bc80c0173670e0bc1415394260b3522d2fac6"
+    },
+    {
+      "file": "pr416-windows-ime-ctrl-tab-guard-20261006.jpg",
+      "sha256": "4e7da1e94518b901878ababf6311bc580841d637059734c898f6fc2698c5eda6"
+    },
+    {
+      "file": "pr416-windows-narrow-long-tooltip-20261006.jpg",
+      "sha256": "266e3ef306c29ec8f3551d83ef1a797af29c6e5919e49dfaa53b28dcbdddb636"
+    }
+  ],
+  "local_binary": "target/windows-arm64-1.98.1/release/hane.exe",
+  "head_sha": "49b4a377cd4d62e21adb01f6a338c817351bd562",
+  "os": "Windows 11 Home 25H2 ARM64 26200.9457"
+}
