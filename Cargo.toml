@@ -16,8 +16,7 @@ exclude = ["vendor/gpui", "vendor/gpui-pre-macos"]
 
 [workspace.package]
 # Source of truth for release version; Cargo.lock must stay in sync.
-# 次回リリース v0.22.0 の準備中。番号と Cargo.lock の同期時にこの行を削除する。
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.98.1"
