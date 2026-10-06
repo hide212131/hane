@@ -1572,6 +1572,11 @@ impl EditorView {
             self.instrumentation.work_folder_scan_completed_at = None;
         }
         let draft_store = self.draft_store.clone();
+        // Captured before the scan starts so a scan started for an earlier
+        // root (e.g. switched away from before this one finishes) can be
+        // told apart from the current one once both land; see the
+        // `generation` check at the top of `finish_work_folder_scan`.
+        let generation = self.work_folder_generation;
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
             let scanned = cx
@@ -1586,7 +1591,9 @@ impl EditorView {
                     (work_folder, drafts, scan_completed_at)
                 })
                 .await;
-            let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
+            let _ = view.update(cx, |view, cx| {
+                view.finish_work_folder_scan(generation, scanned, cx);
+            });
         })
         .detach();
         cx.notify();
@@ -1594,6 +1601,7 @@ impl EditorView {
 
     fn finish_work_folder_scan(
         &mut self,
+        generation: u64,
         scanned: (
             std::io::Result<WorkFolder>,
             std::io::Result<RecoveredDrafts>,
@@ -1601,6 +1609,15 @@ impl EditorView {
         ),
         cx: &mut Context<Self>,
     ) {
+        if generation != self.work_folder_generation {
+            // A newer `begin_work_folder_scan` (from `switch_to_work_folder`
+            // or another folder open) has already bumped
+            // `work_folder_generation` past what this scan started with.
+            // Installing this result now — regardless of which of the two
+            // scans actually finishes first — would overwrite the current
+            // folder, sessions, and drafts with a stale, unrelated root's.
+            return;
+        }
         let (work_folder, drafts, _scan_completed_at) = scanned;
         match work_folder {
             Err(error) => {
@@ -10724,6 +10741,91 @@ mod tests {
         std::fs::remove_dir_all(&new_root).unwrap();
     }
 
+    // Issue #414: `begin_work_folder_scan` starts the scan/recovery pair on a
+    // background thread, and `switch_to_work_folder` can start a second one
+    // before the first lands — switching folder A then B in quick
+    // succession. If A's scan happens to finish *after* B's, a
+    // `finish_work_folder_scan` that only looked at completion order (not
+    // which request it belongs to) would overwrite the already-current
+    // folder B with A's stale folder, sessions, and drafts.
+    #[gpui::test]
+    fn a_stale_work_folder_scan_finishing_after_a_later_switch_is_ignored(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-scan-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::write(old_root.join("Old.md"), "# Old\n").unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let new_root = draft_test_root("stale-scan-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::write(new_root.join("New.md"), "# New\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        // `old_root`'s scan is modeled as having started at the generation
+        // in effect before any switch happened — the generation this view
+        // starts at.
+        let stale_generation = view.read_with(cx, |view, _| view.work_folder_generation);
+
+        // A switch to `new_root` bumps the generation and starts its own
+        // scan, which is left to run to completion below before the stale
+        // `old_root` result (captured above) is delivered.
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path())
+            );
+        });
+
+        // The stale `old_root` scan now lands, out of completion order,
+        // after `new_root` is already the current folder.
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                stale_generation,
+                (
+                    Ok(old_work_folder),
+                    Ok(RecoveredDrafts::default()),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path()),
+                "a stale scan for a folder switched away from must not overwrite the current one"
+            );
+            assert_eq!(
+                view.editor().document().full_text().trim(),
+                "# New",
+                "the stale scan must not replace the current folder's active document"
+            );
+            assert!(
+                view.work_folder_drafts.is_empty(),
+                "the stale scan must not install drafts for a folder that is no longer current"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
     // Issue #28: Save As on an unnamed note used to fall back to `"."`
     // (resolved against the process's current directory, e.g. the app's own
     // install directory on Windows) whenever the active session had no file
@@ -10945,6 +11047,7 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Err(error),
@@ -10996,6 +11099,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Ok(partial),
@@ -11052,6 +11156,7 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Err(error),
@@ -11129,6 +11234,7 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Err(error),
@@ -14018,6 +14124,7 @@ mod tests {
         };
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Ok(recovered),

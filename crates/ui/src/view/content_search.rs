@@ -695,7 +695,11 @@ impl EditorView {
                 sources.push(SearchSource::Disk(path));
             }
         }
-        let mut drafts: Vec<_> = self.work_folder_drafts.iter().collect();
+        let mut drafts: Vec<_> = self
+            .work_folder_drafts
+            .iter()
+            .filter(|(_, draft)| draft.target_directory.starts_with(folder.root()))
+            .collect();
         drafts.sort_by_key(|(session_id, _)| session_id.0);
         for (&session_id, _draft) in drafts {
             if let Some(session) = self.sessions.get(session_id) {
@@ -2511,6 +2515,82 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Issue #414: `work_folder_drafts` is keyed by `SessionId`, not by which
+    // work folder created it, so a draft left over from a folder that has
+    // since been switched away from (or a draft destined for an unrelated
+    // subtree) must not be searched as if it belonged to the *current*
+    // work folder just because its session id still resolves.
+    #[gpui::test]
+    fn search_sources_exclude_a_draft_targeting_a_different_work_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::OsWorkFolderScanner;
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let fixture = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let current_root = std::env::temp_dir().join(format!(
+            "hane-414-draft-ownership-current-{}-{}",
+            std::process::id(),
+            fixture
+        ));
+        let other_root = std::env::temp_dir().join(format!(
+            "hane-414-draft-ownership-other-{}-{}",
+            std::process::id(),
+            fixture
+        ));
+        std::fs::create_dir_all(&current_root).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        let folder = OsWorkFolderScanner.scan(&current_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("current draft", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let current_draft_session = view.read_with(cx, |view, _| view.sessions.active_id());
+        let other_draft_session = view.update(cx, |view, _| {
+            view.sessions.open_untitled("other folder's draft", "Untitled")
+        });
+
+        let sources = view.update(cx, |view, _| {
+            view.work_folder = Some(folder);
+            view.work_folder_drafts.insert(
+                current_draft_session,
+                WorkFolderDraft {
+                    draft_id: hane_session::DraftId::generate(),
+                    target_directory: current_root.clone(),
+                },
+            );
+            view.work_folder_drafts.insert(
+                other_draft_session,
+                WorkFolderDraft {
+                    draft_id: hane_session::DraftId::generate(),
+                    target_directory: other_root.clone(),
+                },
+            );
+            view.content_search_sources()
+        });
+
+        assert!(
+            sources.iter().any(
+                |source| matches!(source, SearchSource::Draft { session, .. } if *session == current_draft_session)
+            ),
+            "the draft that belongs to the current work folder must be searched"
+        );
+        assert!(
+            !sources.iter().any(
+                |source| matches!(source, SearchSource::Draft { session, .. } if *session == other_draft_session)
+            ),
+            "a draft targeting an unrelated folder must not be searched as a current source"
+        );
+
+        std::fs::remove_dir_all(&current_root).unwrap();
+        std::fs::remove_dir_all(&other_root).unwrap();
     }
 
     #[gpui::test]
