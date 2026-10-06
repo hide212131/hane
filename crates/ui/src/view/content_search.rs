@@ -2280,10 +2280,15 @@ mod tests {
         cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
 
-        // Move focus onto the search results list the way opening a hit list
-        // and pressing tab/down would, without going through a real search.
+        // Open content search through the normal entry point first so the
+        // sidebar's InputState exists before rendering, then move focus onto
+        // the results list the way opening a hit list and pressing tab/down
+        // would, without going through a real search.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
         view.update(cx, |view, cx| {
-            view.content_search.mode = SidebarMode::Content;
             view.content_search.input_focused = false;
             view.content_search.results_focused = true;
             cx.notify();
