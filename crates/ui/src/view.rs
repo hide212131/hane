@@ -3386,6 +3386,7 @@ impl EditorView {
             return;
         }
         self.blur_sidebar_filter(cx);
+        self.blur_content_search_focus(cx);
         self.sidebar_keyboard_focus = false;
     }
 
@@ -3397,6 +3398,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.blur_content_search_focus(cx);
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);

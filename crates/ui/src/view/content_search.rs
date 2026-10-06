@@ -440,6 +440,18 @@ impl EditorView {
         self.content_search.input_focused
     }
 
+    /// Clears both content-search focus flags without changing the search
+    /// mode or results, so a click into the document body stops routing
+    /// Backspace/Delete/Undo/Paste etc. to the content-search no-ops in
+    /// `actions.rs` instead of the editor.
+    pub(crate) fn blur_content_search_focus(&mut self, cx: &mut Context<Self>) {
+        if self.content_search.input_focused || self.content_search.results_focused {
+            self.content_search.input_focused = false;
+            self.content_search.results_focused = false;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn content_search_should_leave_on_escape(&self) -> bool {
         self.content_search
             .should_leave_on_escape(self.editor().ime().is_some())
@@ -2303,6 +2315,87 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
         assert!(view.read_with(cx, |view, _| view.content_search_results_focused()));
+    }
+
+    #[gpui::test]
+    fn clicking_the_editor_body_clears_content_search_focus_so_backspace_reaches_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        // Open content search through the normal entry point and then move
+        // focus onto the results list the way tabbing into a hit list would,
+        // without going through a real search.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.content_search.input_focused = false;
+            view.content_search.results_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.content_search_results_focused()));
+
+        // Click into the document body the way a user does after inspecting
+        // search results, without going through Escape/leave first.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(!view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+        assert!(!view.read_with(cx, |view, _| view.content_search_results_focused()));
+
+        // Backspace must now reach the editor instead of being swallowed by
+        // the lingering content-search focus flags (see `actions.rs`).
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(3)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "ne\n");
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_the_editor_body_clears_content_search_input_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(!view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+        assert!(!view.read_with(cx, |view, _| view.content_search_results_focused()));
     }
 
     #[test]
