@@ -2212,6 +2212,90 @@ mod tests {
         assert!(!state.should_leave_on_escape(true));
     }
 
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_content_search_input_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context, which ctrl-tab is
+        // scoped to, the same way a real click would before opening search.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_content_search_results_are_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        // Move focus onto the search results list the way opening a hit list
+        // and pressing tab/down would, without going through a real search.
+        view.update(cx, |view, cx| {
+            view.content_search.mode = SidebarMode::Content;
+            view.content_search.input_focused = false;
+            view.content_search.results_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.content_search_results_focused()));
+    }
+
     #[test]
     fn dropping_the_search_controller_cancels_current_and_active_workers() {
         let active_cancellation = SearchCancellationToken::new();
