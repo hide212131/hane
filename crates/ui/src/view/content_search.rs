@@ -2095,15 +2095,20 @@ fn search_excerpt(
     hit: hane_document::SourceRange,
 ) -> String {
     let prefix_len = hit.start.0.saturating_sub(context.start.0).min(text.len());
-    let match_len = hit
-        .end
-        .0
-        .saturating_sub(hit.start.0)
-        .min(text.len().saturating_sub(prefix_len));
+    let full_match_len = hit.end.0.saturating_sub(hit.start.0);
+    let match_len = full_match_len.min(text.len().saturating_sub(prefix_len));
+    // `context` covers exactly `text`'s byte span, so if the match extends past
+    // `context.end`, the excerpt only holds a prefix of the match, not the whole hit.
+    let match_truncated = hit.end.0 > context.end.0;
     let start = if context.start.0 > 0 { "…" } else { "" };
-    let end = if context.end.0 > hit.end.0 { "…" } else { "" };
+    let match_ellipsis = if match_truncated { "…" } else { "" };
+    let end = if !match_truncated && context.end.0 > hit.end.0 {
+        "…"
+    } else {
+        ""
+    };
     format!(
-        "{start}{}【{}】{}{end}",
+        "{start}{}【{}{match_ellipsis}】{}{end}",
         &text[..prefix_len],
         &text[prefix_len..prefix_len + match_len],
         &text[prefix_len + match_len..]
@@ -2113,6 +2118,7 @@ fn search_excerpt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hane_session::search::MAX_SEARCH_CONTEXT_BYTES;
 
     fn key(query_epoch: u64) -> SearchKey {
         SearchKey {
@@ -2128,6 +2134,42 @@ mod tests {
             context_range: SourceRange::new(0, context_source.len()),
             context_source: context_source.to_owned(),
         }
+    }
+
+    #[test]
+    fn excerpt_marks_a_match_cut_by_the_context_limit_inside_the_brackets() {
+        // A match over 1 KiB long cannot fit in `context_source`, which the
+        // searcher caps at `MAX_SEARCH_CONTEXT_BYTES`: the excerpt only holds
+        // the match's first bytes, not the whole hit.
+        let full_match_len = MAX_SEARCH_CONTEXT_BYTES + 976;
+        assert!(full_match_len > 1024);
+        let text = "a".repeat(MAX_SEARCH_CONTEXT_BYTES);
+        let context = SourceRange::new(0, MAX_SEARCH_CONTEXT_BYTES);
+        let hit = SourceRange::new(0, full_match_len);
+
+        let excerpt = search_excerpt(&text, context, hit);
+
+        assert_eq!(
+            excerpt,
+            format!("【{}…】", "a".repeat(MAX_SEARCH_CONTEXT_BYTES))
+        );
+    }
+
+    #[test]
+    fn excerpt_keeps_the_trailing_ellipsis_when_only_following_context_is_cut() {
+        // The match itself fits entirely inside the excerpt; only the
+        // context that follows it is truncated. This must still render the
+        // ellipsis after the closing bracket, as before this fix.
+        let text = format!("{}MATCH{}", "x".repeat(10), "y".repeat(10));
+        let context = SourceRange::new(0, text.len());
+        let hit = SourceRange::new(10, 15);
+
+        let excerpt = search_excerpt(&text, context, hit);
+
+        assert_eq!(
+            excerpt,
+            format!("{}【MATCH】{}…", "x".repeat(10), "y".repeat(10))
+        );
     }
 
     #[test]
