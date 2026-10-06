@@ -2367,7 +2367,7 @@ mod tests {
         cx.simulate_keystrokes("backspace");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(view.editor().document().full_text(), "ne\n");
+            assert_eq!(view.editor().document().full_text(), "on\n");
         });
     }
 
