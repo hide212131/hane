@@ -19,7 +19,7 @@
 - branch: `codex/issue-414-p1-search-core`
 - 実装候補SHA: `77b89576fa906f4e562e069906fea245966e8cd0`
 - base同期: `main` SHA `46154b1eff5487ea802a6def5e596b609711edc6` をmerge commit `181e5cedbf2f57ed7a996abce16d6412785d087b` で取り込み済み。
-- Windows: Windows 10 Home、version 2009、build 26200、ARM64
+- Windows: Windows 11 Home、build 26200、ARM64
 - Work folder: `win-ui-test-414-retry-20261002`。指定どおりAlpha.md、Case.md、Other.mdの3ファイルを作成し、Alpha.md本文を読み戻して確認した。フォルダ選択後の画面確認は未実施。
 - ビルド: `CARGO_PROFILE_RELEASE_DEBUG=0`、`CARGO_PROFILE_BUILD_OVERRIDE_DEBUG=0`、`CARGO_INCREMENTAL=0` を指定し、`cargo build --release -p hane --locked -j 1` を実行。成功。
 - バイナリ: `target/release/hane.exe`、SHA-256 `386641FA035A4ACA405EF5A08A79E77E39870C4239DFB81BCF4316482EB81BF2`。このバイナリは上記実装候補SHAのソースからビルドした。
