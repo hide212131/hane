@@ -17,7 +17,6 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const SEARCH_DELIVERY_POLL: Duration = Duration::from_millis(16);
 const SEARCH_SEND_RETRY: Duration = Duration::from_millis(8);
-const MAX_SEARCH_DELIVERIES_PER_FRAME: usize = 4;
 const MAX_SEARCH_CONCURRENT_WORKERS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -830,7 +829,6 @@ impl EditorView {
     }
 
     fn poll_content_search_delivery(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut deliveries = 0;
         let mut rows = 0;
         let mut channel_empty = false;
         while rows < MAX_SEARCH_ROWS_PER_FRAME {
@@ -914,15 +912,11 @@ impl EditorView {
                 }
                 continue;
             }
-            if deliveries >= MAX_SEARCH_DELIVERIES_PER_FRAME {
-                break;
-            }
             let Some(receiver) = self.content_search.receiver.as_ref() else {
                 break;
             };
             match receiver.try_recv() {
                 Ok(event) => {
-                    deliveries += 1;
                     self.content_search
                         .accept_search_event(event, self.work_folder.as_ref());
                 }
@@ -2517,6 +2511,67 @@ mod tests {
 
         assert!(!worker.join().unwrap());
         assert_eq!(receiver.try_recv().unwrap(), queued);
+    }
+
+    // Issue #414/#417: delivery was previously capped at
+    // `MAX_SEARCH_DELIVERIES_PER_FRAME` (4) file results per
+    // `SEARCH_DELIVERY_POLL` (16ms) tick regardless of how many files the
+    // workers had already scanned, capping sustained throughput at ~250
+    // files/sec no matter how fast disk/CPU search itself was. This drives a
+    // real warm, zero-hit search over more files than the old per-tick cap
+    // through the actual worker/channel/poll pipeline and requires it to
+    // finish within a single poll tick instead of needing one tick per 4
+    // files.
+    #[gpui::test]
+    fn content_search_delivers_many_zero_hit_files_within_one_poll_tick(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::OsWorkFolderScanner;
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hane-417-search-throughput-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        const FILE_COUNT: usize = 40;
+        for index in 0..FILE_COUNT {
+            std::fs::write(root.join(format!("Note-{index:02}.md")), "no match here").unwrap();
+        }
+        let folder = OsWorkFolderScanner.scan(&root).unwrap();
+        assert_eq!(folder.entries().len(), FILE_COUNT);
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.initialize_content_search_input(window, cx);
+                view.work_folder = Some(folder);
+                view.content_search.mode = SidebarMode::Content;
+                view.content_search.query_text = "needle".to_owned();
+                view.start_content_search(cx);
+            });
+        });
+
+        // Lets the workers finish scanning and queue their results, then
+        // fires exactly one delivery poll tick.
+        cx.run_until_parked();
+        cx.executor().advance_clock(SEARCH_DELIVERY_POLL);
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.content_search.files_finished, FILE_COUNT);
+            assert_eq!(view.content_search.status, ContentSearchStatus::Complete);
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[gpui::test]

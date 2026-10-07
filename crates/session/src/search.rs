@@ -21,7 +21,12 @@ pub const MAX_SEARCH_CONTEXT_BYTES: usize = 1024;
 pub const MAX_SEARCHER_HEAP_BYTES: usize = 1024 * 1024;
 pub const MAX_SEARCH_READ_BYTES: usize = 64 * 1024;
 pub const MAX_SEARCH_RESULT_TEXT_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_SEARCH_QUEUED_FILES: usize = 4;
+// Bounds buffered-but-undelivered `FileSearchResult`s. The UI drains this
+// channel once per `SEARCH_DELIVERY_POLL` tick (currently 16ms), so sustained
+// delivery throughput is capacity / tick-period. 10,000 warm files in <=3s
+// needs >=~54 files/tick; 128 keeps a bounded channel (not an unbounded
+// queue) while giving headroom over that minimum.
+pub const MAX_SEARCH_QUEUED_FILES: usize = 128;
 pub const MAX_SEARCH_ROWS_PER_FRAME: usize = 128;
 pub const MAX_SEARCH_ERROR_DETAILS: usize = 20;
 const MAX_ERROR_DETAIL_BYTES: usize = 512;
