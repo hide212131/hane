@@ -904,10 +904,13 @@ impl EditorView {
                         // whatever `current_work` happens to be now, so a
                         // query/workspace change in the meantime can never
                         // inflate a different, newer search's budget.
-                        if let Some(work) = self.content_search.current_work.as_ref() {
-                            if work.key == pending.result.key {
-                                release_global_delivery_budget(work, &pending.result);
-                            }
+                        if let Some(work) = self
+                            .content_search
+                            .current_work
+                            .as_ref()
+                            .filter(|work| work.key == pending.result.key)
+                        {
+                            release_global_delivery_budget(work, &pending.result);
                         }
                     }
                     continue;
