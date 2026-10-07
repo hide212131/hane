@@ -1097,6 +1097,7 @@ impl EditorView {
         self.invalidate_content_search(false);
         self.content_search.mode = SidebarMode::Files;
         self.content_search.results_focused = false;
+        self.content_search.input_focused = false;
         self.content_search.status = ContentSearchStatus::Cancelled;
         self.content_search.status_detail = None;
         cx.notify();
@@ -2755,6 +2756,46 @@ mod tests {
 
         // Backspace must now reach the editor instead of being swallowed by
         // the lingering content-search focus flags (see `actions.rs`).
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(3)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "on\n");
+        });
+    }
+
+    #[gpui::test]
+    fn escape_from_content_search_input_clears_input_focus_so_backspace_reaches_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+
+        // Escape while the search input is focused must leave content-search
+        // mode and also clear `input_focused`, not just `results_focused`
+        // (see `leave_content_search`), or Backspace/Paste keep being
+        // swallowed by the lingering flags in `actions.rs`.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        assert!(!view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+        assert!(!view.read_with(cx, |view, _| view.content_search_results_focused()));
+
         view.update(cx, |view, cx| {
             view.editor_mut()
                 .set_selection(Selection::caret(SourceOffset(3)))
