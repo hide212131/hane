@@ -7,7 +7,6 @@ use grep_matcher::{LineTerminator, Matcher};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, MmapChoice, Searcher, SearcherBuilder, Sink, SinkMatch};
 use hane_document::{Revision, RopeSnapshot, SourceRange};
-use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -755,15 +754,19 @@ impl std::error::Error for StreamFailureMarker {}
 
 /// Validates source bytes while preserving every byte offset. Bare CR is
 /// converted to LF one-for-one; CRLF is copied unchanged, even across reads.
+/// Cancellation is only checked around `source` reads; runs of plain bytes
+/// between line terminators are copied to the caller's buffer in one slice
+/// copy, and one `read` call fills as many lines as fit in `output`.
 struct SearchStreamReader<'a> {
     source: &'a mut dyn Read,
     cancellation: &'a SearchCancellationToken,
     raw: &'a mut [u8],
     raw_pos: usize,
     raw_len: usize,
-    pending_raw: Option<u8>,
     pending_cr: bool,
-    normalized: VecDeque<u8>,
+    // The trailing `\n` of a CRLF pair that did not fit in the previous
+    // `output` slice; emitted first on the next call.
+    pending_emit: Option<u8>,
     source_eof: bool,
     eof_validated: bool,
     current_line_bytes: usize,
@@ -783,9 +786,8 @@ impl<'a> SearchStreamReader<'a> {
             raw,
             raw_pos: 0,
             raw_len: 0,
-            pending_raw: None,
             pending_cr: false,
-            normalized: VecDeque::with_capacity(2),
+            pending_emit: None,
             source_eof: false,
             eof_validated: false,
             current_line_bytes: 0,
@@ -806,19 +808,9 @@ impl<'a> SearchStreamReader<'a> {
         Ok(())
     }
 
-    fn next_raw_byte(&mut self) -> io::Result<Option<u8>> {
-        if let Some(byte) = self.pending_raw.take() {
-            return Ok(Some(byte));
-        }
-        if self.raw_pos < self.raw_len {
-            let byte = self.raw[self.raw_pos];
-            self.raw_pos += 1;
-            return Ok(Some(byte));
-        }
-        if self.source_eof {
-            return Ok(None);
-        }
-
+    /// Refills `raw` from `source`, checking cancellation immediately before
+    /// and after the read rather than once per byte.
+    fn fill_raw(&mut self) -> io::Result<()> {
         loop {
             self.check_cancelled()?;
             match self.source.read(self.raw) {
@@ -828,11 +820,8 @@ impl<'a> SearchStreamReader<'a> {
                     self.raw_len = read;
                     if read == 0 {
                         self.source_eof = true;
-                        return Ok(None);
                     }
-                    let byte = self.raw[0];
-                    self.raw_pos = 1;
-                    return Ok(Some(byte));
+                    return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     self.check_cancelled()?;
@@ -865,42 +854,17 @@ impl<'a> SearchStreamReader<'a> {
         Ok(())
     }
 
-    fn enqueue_next(&mut self) -> io::Result<bool> {
-        if self.pending_cr {
-            match self.next_raw_byte()? {
-                Some(b'\n') => {
-                    self.validate_byte(b'\n')?;
-                    self.normalized.push_back(b'\r');
-                    self.normalized.push_back(b'\n');
-                }
-                Some(byte) => {
-                    self.pending_raw = Some(byte);
-                    self.normalized.push_back(b'\n');
-                }
-                None => {
-                    self.validate_eof()?;
-                    self.normalized.push_back(b'\n');
-                }
+    /// Checks the heap-sized line-length bound before letting the caller
+    /// consume another byte of the current line.
+    fn line_room(&mut self, written: usize) -> io::Result<Option<usize>> {
+        let room = MAX_SEARCHER_HEAP_BYTES.saturating_sub(self.current_line_bytes);
+        if room == 0 {
+            if written == 0 {
+                return Err(self.fail(StreamFailure::LineTooLong));
             }
-            self.pending_cr = false;
-            return Ok(true);
+            return Ok(None);
         }
-
-        match self.next_raw_byte()? {
-            Some(byte) => {
-                self.validate_byte(byte)?;
-                if byte == b'\r' {
-                    self.pending_cr = true;
-                } else {
-                    self.normalized.push_back(byte);
-                }
-                Ok(true)
-            }
-            None => {
-                self.validate_eof()?;
-                Ok(false)
-            }
-        }
+        Ok(Some(room))
     }
 }
 
@@ -909,32 +873,91 @@ impl Read for SearchStreamReader<'_> {
         if output.is_empty() {
             return Ok(0);
         }
-        self.check_cancelled()?;
+
         let mut written = 0;
+        if let Some(byte) = self.pending_emit.take() {
+            output[written] = byte;
+            written += 1;
+            self.current_line_bytes = 0;
+        }
+
         loop {
-            self.check_cancelled()?;
-            if let Some(&byte) = self.normalized.front() {
-                if self.current_line_bytes >= MAX_SEARCHER_HEAP_BYTES {
-                    if written == 0 {
-                        return Err(self.fail(StreamFailure::LineTooLong));
+            if written >= output.len() {
+                return Ok(written);
+            }
+
+            if self.raw_pos >= self.raw_len && !self.source_eof {
+                self.fill_raw()?;
+                continue;
+            }
+            let raw_available = self.raw_pos < self.raw_len;
+
+            if self.pending_cr {
+                if self.line_room(written)?.is_none() {
+                    return Ok(written);
+                }
+                self.pending_cr = false;
+                let is_crlf = raw_available && self.raw[self.raw_pos] == b'\n';
+                if is_crlf {
+                    self.raw_pos += 1;
+                    self.validate_byte(b'\n')?;
+                    output[written] = b'\r';
+                    written += 1;
+                    if written < output.len() {
+                        output[written] = b'\n';
+                        written += 1;
+                        self.current_line_bytes = 0;
+                    } else {
+                        self.pending_emit = Some(b'\n');
+                        return Ok(written);
                     }
-                    return Ok(written);
-                }
-                self.normalized.pop_front();
-                output[written] = byte;
-                written += 1;
-                if byte == b'\n' {
+                } else {
+                    output[written] = b'\n';
+                    written += 1;
                     self.current_line_bytes = 0;
-                    return Ok(written);
-                }
-                self.current_line_bytes += 1;
-                if written == output.len() {
-                    return Ok(written);
                 }
                 continue;
             }
-            if !self.enqueue_next()? {
+
+            if !raw_available {
+                self.validate_eof()?;
                 return Ok(written);
+            }
+
+            let Some(line_room) = self.line_room(written)? else {
+                return Ok(written);
+            };
+            let output_room = output.len() - written;
+            let raw_room = self.raw_len - self.raw_pos;
+            let scan_limit = output_room.min(line_room).min(raw_room);
+            let base = self.raw_pos;
+            let terminator = self.raw[base..base + scan_limit]
+                .iter()
+                .position(|&byte| byte == b'\r' || byte == b'\n');
+            let plain_len = terminator.unwrap_or(scan_limit);
+
+            for offset in 0..plain_len {
+                let byte = self.raw[base + offset];
+                self.validate_byte(byte)?;
+            }
+            output[written..written + plain_len].copy_from_slice(&self.raw[base..base + plain_len]);
+            written += plain_len;
+            self.current_line_bytes += plain_len;
+            self.raw_pos += plain_len;
+
+            if terminator.is_some() {
+                let byte = self.raw[self.raw_pos];
+                self.raw_pos += 1;
+                if byte == b'\n' {
+                    self.validate_byte(b'\n')?;
+                    output[written] = b'\n';
+                    written += 1;
+                    self.current_line_bytes = 0;
+                } else {
+                    self.validate_byte(b'\r')?;
+                    self.current_line_bytes += 1;
+                    self.pending_cr = true;
+                }
             }
         }
     }
@@ -1236,6 +1259,36 @@ mod tests {
         };
         assert_eq!(result.hits[0].range, SourceRange::new(5, 6));
         assert_eq!(result.hits[0].line_number, 3);
+    }
+
+    #[test]
+    fn a_single_read_call_returns_multiple_short_lines_at_once() {
+        let cancellation = SearchCancellationToken::new();
+        let mut source = Cursor::new(b"a\nb\nc\n".to_vec());
+        let mut raw = [0u8; MAX_SEARCH_READ_BYTES];
+        let mut reader = SearchStreamReader::new(&mut source, &cancellation, &mut raw[..]);
+        let mut output = [0u8; 64];
+        let read = reader.read(&mut output).unwrap();
+        assert_eq!(&output[..read], b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn a_bare_cr_at_the_exact_end_of_a_chunk_followed_by_lf_is_one_crlf_line() {
+        let service = MemoryFileService::new();
+        service.write_externally("/work/a.md", "ab\r\ncd");
+        service.set_read_behavior(
+            "/work/a.md",
+            MemoryReadBehavior {
+                max_chunk_bytes: Some(3),
+                ..MemoryReadBehavior::default()
+            },
+        );
+        let (mut engine, _) = engine("cd", true);
+        let SearchOutcome::File(result) = engine.search(disk_input(&service, "/work/a.md")) else {
+            panic!("expected a completed file result");
+        };
+        assert_eq!(result.hits[0].range, SourceRange::new(4, 6));
+        assert_eq!(result.hits[0].line_number, 2);
     }
 
     #[test]
