@@ -894,7 +894,22 @@ impl EditorView {
                     self.content_search.has_stale_results = true;
                     self.content_search.status_detail =
                         Some("内容が変わりました。再検索してください".to_owned());
-                    self.content_search.pending_file = None;
+                    if let Some(pending) = self.content_search.pending_file.take() {
+                        // Only the not-yet-displayed hits in `pending.result`
+                        // were ever reserved: earlier poll ticks already
+                        // `drain`ed and counted any displayed hits toward
+                        // `result_hit_count`/`result_text_bytes`, not toward
+                        // `work`'s reservation. Credit this back to the exact
+                        // `SearchWork` that reserved it (matched by key), not
+                        // whatever `current_work` happens to be now, so a
+                        // query/workspace change in the meantime can never
+                        // inflate a different, newer search's budget.
+                        if let Some(work) = self.content_search.current_work.as_ref() {
+                            if work.key == pending.result.key {
+                                release_global_delivery_budget(work, &pending.result);
+                            }
+                        }
+                    }
                     continue;
                 }
                 let remaining_hits =
@@ -2031,6 +2046,20 @@ fn file_result_is_current(result: &FileSearchResult, view: &EditorView) -> bool 
 /// alone let up to `MAX_SEARCH_QUEUED_FILES` queued files each carry up to
 /// `MAX_SEARCH_HITS_PER_DOCUMENT` x `MAX_SEARCH_CONTEXT_BYTES` of context,
 /// far above the intended aggregate ceiling (Issue #414/#417 S10 follow-up).
+///
+/// This reservation only bounds what has been queued or displayed; it says
+/// nothing about what one worker holds transiently while still producing
+/// `result` before this call. The search engine already caps a single
+/// document's result at `MAX_SEARCH_HITS_PER_DOCUMENT` (1,000) hits, each at
+/// most `MAX_SEARCH_CONTEXT_BYTES` (1,024) bytes of context, so one worker's
+/// in-progress, not-yet-reserved result can transiently hold up to
+/// 1,000 x 1,024 bytes (~1,000 KiB), independent of
+/// `MAX_SEARCH_RESULT_TEXT_BYTES`; with `MAX_SEARCH_CONCURRENT_WORKERS` (2)
+/// workers each producing one file result at a time, the worst case across
+/// workers is bounded accordingly (~2,000 KiB). This is a static bound
+/// derived from those existing constants, not a measurement — actual
+/// production UI memory behavior has not been measured and remains
+/// unmeasured here.
 fn reserve_global_delivery_budget(work: &SearchWork, result: &mut FileSearchResult) {
     if result.hits.is_empty() {
         return;
@@ -2074,6 +2103,29 @@ fn reserve_global_delivery_budget(work: &SearchWork, result: &mut FileSearchResu
         }
         break;
     }
+}
+
+/// Returns a discarded, undelivered file result's reserved hit/text budget
+/// to the `SearchWork` that reserved it in `reserve_global_delivery_budget`,
+/// so a later still-current result in the same search can use the capacity
+/// a stale result (one whose `pending_file` was dropped before display,
+/// e.g. because its revision/generation no longer matches) never displays.
+/// Callers must pass the exact `SearchWork` that produced `result` (matched
+/// by `SearchKey`); crediting a different `SearchWork` would let it exceed
+/// its own ceiling.
+fn release_global_delivery_budget(work: &SearchWork, result: &FileSearchResult) {
+    if result.hits.is_empty() {
+        return;
+    }
+    let text_bytes: usize = result
+        .hits
+        .iter()
+        .map(|hit| hit.context_source.len())
+        .sum();
+    work.remaining_hit_budget
+        .fetch_add(result.hits.len(), Ordering::AcqRel);
+    work.remaining_text_budget
+        .fetch_add(text_bytes, Ordering::AcqRel);
 }
 
 fn delivery_hit_count(
@@ -2388,6 +2440,93 @@ mod tests {
                 .map(|hit| hit.context_source.len())
                 .sum::<usize>();
         }
+
+        assert!(total_hits <= MAX_SEARCH_HITS_TOTAL);
+        assert!(total_text <= MAX_SEARCH_RESULT_TEXT_BYTES);
+        assert_eq!(
+            work.remaining_hit_budget.load(Ordering::Relaxed),
+            MAX_SEARCH_HITS_TOTAL - total_hits
+        );
+        assert_eq!(
+            work.remaining_text_budget.load(Ordering::Relaxed),
+            MAX_SEARCH_RESULT_TEXT_BYTES - total_text
+        );
+    }
+
+    fn reserve_hits_in_a_loop(
+        work: &SearchWork,
+        hits_per_reservation: usize,
+        reservations: usize,
+    ) -> (usize, usize) {
+        let big_context = "x".repeat(MAX_SEARCH_CONTEXT_BYTES);
+        let mut total_hits = 0usize;
+        let mut total_text = 0usize;
+        for _ in 0..reservations {
+            let mut result = FileSearchResult {
+                key: key(1),
+                target: SearchTarget::File(PathBuf::from("note.md")),
+                version: SearchVersion::Disk { stamp: None },
+                identity: None,
+                hits: (0..hits_per_reservation)
+                    .map(|_| search_hit(&big_context))
+                    .collect(),
+                completion: SearchFileCompletion::Complete,
+            };
+            reserve_global_delivery_budget(work, &mut result);
+            total_hits += result.hits.len();
+            total_text += result
+                .hits
+                .iter()
+                .map(|hit| hit.context_source.len())
+                .sum::<usize>();
+        }
+        (total_hits, total_text)
+    }
+
+    // Issue #414/#417 S10 follow-up: the test above exercises
+    // `reserve_global_delivery_budget`'s shared ceiling sequentially, from a
+    // single thread, which cannot catch a compare-exchange race between
+    // `MAX_SEARCH_CONCURRENT_WORKERS` (2) real worker threads reserving from
+    // the same `SearchWork` at the same time. This drives the same
+    // over-the-ceiling workload through two OS threads sharing one
+    // `SearchWork`, so any race that let both reservations under-count the
+    // other's concurrent decrement would show up as the totals below
+    // exceeding `MAX_SEARCH_HITS_TOTAL` / `MAX_SEARCH_RESULT_TEXT_BYTES`.
+    #[test]
+    fn concurrent_reservations_from_two_workers_never_exceed_the_shared_budget() {
+        const HITS_PER_RESERVATION: usize = 150;
+        const RESERVATIONS_PER_WORKER: usize = 65;
+        const _: () = assert!(
+            2 * RESERVATIONS_PER_WORKER * HITS_PER_RESERVATION > MAX_SEARCH_HITS_TOTAL,
+            "this scenario must exceed the hit ceiling for the assertions below to be meaningful"
+        );
+
+        let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let work = Arc::new(SearchWork::new(
+            key(1),
+            SearchQuery::new("query", false).unwrap(),
+            SearchCancellationToken::new(),
+            Arc::from([]),
+            sender,
+        ));
+
+        let worker_a = {
+            let work = Arc::clone(&work);
+            std::thread::spawn(move || {
+                reserve_hits_in_a_loop(&work, HITS_PER_RESERVATION, RESERVATIONS_PER_WORKER)
+            })
+        };
+        let worker_b = {
+            let work = Arc::clone(&work);
+            std::thread::spawn(move || {
+                reserve_hits_in_a_loop(&work, HITS_PER_RESERVATION, RESERVATIONS_PER_WORKER)
+            })
+        };
+        let (hits_a, text_a) = worker_a.join().unwrap();
+        let (hits_b, text_b) = worker_b.join().unwrap();
+
+        let total_hits = hits_a + hits_b;
+        let total_text = text_a + text_b;
 
         assert!(total_hits <= MAX_SEARCH_HITS_TOTAL);
         assert!(total_text <= MAX_SEARCH_RESULT_TEXT_BYTES);
@@ -2953,6 +3092,171 @@ mod tests {
             );
             assert_eq!(view.content_search.status, ContentSearchStatus::Searching);
         });
+    }
+
+    // Issue #414/#417 S10 follow-up: `poll_content_search_delivery` discarded
+    // a `pending_file` whose revision/generation no longer matched (detected
+    // via `file_result_is_current`) without returning its
+    // `reserve_global_delivery_budget` reservation, so a stale document's
+    // hits permanently consumed capacity that later still-current documents
+    // in the *same* search could never reuse, even though the stale hits
+    // are never displayed. This drives that exact discard path through
+    // `poll_content_search_delivery` with a shared `SearchWork` budget tight
+    // enough that a later reservation only succeeds if the stale result's
+    // share was returned, and checks the subsequent current result is still
+    // displayed normally (not truncated/partial) with no stale hit left
+    // behind.
+    #[gpui::test]
+    fn a_stale_pending_file_releases_its_budget_for_a_later_current_result(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "日本語🙂 needle の本文";
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled(source, "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (session, generation, revision) = view.read_with(cx, |view, _| {
+            let session = view.sessions.active();
+            (session.id(), session.generation(), session.revision())
+        });
+        let search_key = key(1);
+        let (sender, receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let work = Arc::new(SearchWork::new(
+            search_key,
+            SearchQuery::new("needle", false).unwrap(),
+            SearchCancellationToken::new(),
+            Arc::from([]),
+            sender,
+        ));
+        // Tight enough that the current result's reservation below can only
+        // succeed in full once the stale result's share is returned.
+        work.remaining_hit_budget.store(2, Ordering::Relaxed);
+
+        let mut stale_result = FileSearchResult {
+            key: search_key,
+            target: SearchTarget::Draft(session),
+            version: SearchVersion::Buffer {
+                session,
+                generation,
+                // One revision ahead of the session's current revision, so
+                // `file_result_is_current` treats this as stale once the
+                // delivery loop checks it.
+                revision: Revision(revision.0.wrapping_add(1)),
+            },
+            identity: None,
+            hits: vec![search_hit("stale needle")],
+            completion: SearchFileCompletion::Complete,
+        };
+        reserve_global_delivery_budget(&work, &mut stale_result);
+        assert_eq!(stale_result.hits.len(), 1, "fits under the shared budget");
+
+        let mut current_result = FileSearchResult {
+            key: search_key,
+            target: SearchTarget::Draft(session),
+            version: SearchVersion::Buffer {
+                session,
+                generation,
+                revision,
+            },
+            identity: None,
+            hits: vec![search_hit("current needle")],
+            completion: SearchFileCompletion::Complete,
+        };
+        reserve_global_delivery_budget(&work, &mut current_result);
+        assert_eq!(current_result.hits.len(), 1, "fits under the shared budget");
+        assert_eq!(work.remaining_hit_budget.load(Ordering::Relaxed), 0);
+
+        work.sender
+            .try_send(SearchEvent::File {
+                key: search_key,
+                result: stale_result,
+            })
+            .unwrap();
+        work.sender
+            .try_send(SearchEvent::File {
+                key: search_key,
+                result: current_result,
+            })
+            .unwrap();
+
+        view.update(cx, |view, cx| {
+            view.work_folder_drafts.insert(
+                session,
+                WorkFolderDraft {
+                    draft_id: hane_session::DraftId::generate(),
+                    target_directory: PathBuf::from("/work"),
+                },
+            );
+            view.content_search.workspace_epoch = search_key.workspace_epoch;
+            view.content_search.query_epoch = search_key.query_epoch;
+            view.content_search.current_work = Some(work.clone());
+            view.content_search.receiver = Some(receiver);
+            view.content_search.total_files = 2;
+            view.content_search.status = ContentSearchStatus::Searching;
+
+            view.poll_content_search_delivery(cx);
+
+            assert!(
+                view.content_search.has_stale_results,
+                "the stale document must still be reported as stale"
+            );
+            assert_eq!(
+                view.content_search.result_hit_count, 1,
+                "only the current document's hit should be displayed"
+            );
+            assert_eq!(view.content_search.displayed_files.len(), 2);
+            assert!(
+                view.content_search.displayed_files[0].hits.is_empty(),
+                "the stale document's hit must not remain displayed"
+            );
+            assert_eq!(
+                view.content_search.displayed_files[1]
+                    .hits
+                    .first()
+                    .map(|hit| hit.context_source.as_str()),
+                Some("current needle"),
+                "the current document's hit must still be delivered normally"
+            );
+            assert_eq!(
+                view.content_search.displayed_files[1].completion,
+                SearchFileCompletion::Complete,
+                "the current document must not be wrongly marked partial"
+            );
+        });
+
+        // The stale result's reservation must have been returned: a later
+        // reservation for a third, fresh result now fits in full, which it
+        // could not without the fix (the budget would still read 0 here).
+        assert_eq!(work.remaining_hit_budget.load(Ordering::Relaxed), 1);
+        let mut later_result = FileSearchResult {
+            key: search_key,
+            target: SearchTarget::Draft(session),
+            version: SearchVersion::Buffer {
+                session,
+                generation,
+                revision,
+            },
+            identity: None,
+            hits: vec![search_hit("later needle")],
+            completion: SearchFileCompletion::Complete,
+        };
+        reserve_global_delivery_budget(&work, &mut later_result);
+        assert_eq!(
+            later_result.hits.len(),
+            1,
+            "the later result must not be truncated once the stale \
+             result's budget share was returned"
+        );
+        assert_eq!(
+            later_result.completion,
+            SearchFileCompletion::Complete,
+            "the later result must not be wrongly marked LimitReached"
+        );
+        assert_eq!(work.remaining_hit_budget.load(Ordering::Relaxed), 0);
     }
 
     #[gpui::test]
