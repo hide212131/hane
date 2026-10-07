@@ -550,6 +550,10 @@ impl EditorView {
             self.content_search.input_focused = false;
             self.content_search.status = ContentSearchStatus::Cancelled;
             self.content_search.status_detail = None;
+            // Leaving Content Search via the Files tab hides the search
+            // input the same way Escape does, so GPUI focus must return to
+            // the editor body here too (see `leave_content_search`).
+            window.focus(&self.focus_handle, cx);
         } else {
             self.initialize_content_search_input(window, cx);
             self.content_search.results_focused = false;
@@ -1090,7 +1094,11 @@ impl EditorView {
         true
     }
 
-    pub(crate) fn leave_content_search(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn leave_content_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.content_search.mode != SidebarMode::Content {
             return false;
         }
@@ -1100,6 +1108,12 @@ impl EditorView {
         self.content_search.input_focused = false;
         self.content_search.status = ContentSearchStatus::Cancelled;
         self.content_search.status_detail = None;
+        // Hides the search input (and whatever GPUI focus it or the result
+        // list held), so GPUI focus must be returned to the editor body
+        // here or keyboard input like Backspace keeps targeting the
+        // now-unmounted search input instead of reaching the document
+        // (Issue #417 regression).
+        window.focus(&self.focus_handle, cx);
         cx.notify();
         true
     }
@@ -1330,7 +1344,7 @@ impl EditorView {
                     view.handle_content_search_enter(window, cx);
                     cx.stop_propagation();
                 } else if key == "escape" {
-                    view.leave_content_search(cx);
+                    view.leave_content_search(window, cx);
                     cx.stop_propagation();
                 } else if key == "tab" {
                     view.content_search.results_focused = false;
@@ -2789,7 +2803,11 @@ mod tests {
         // Escape while the search input is focused must leave content-search
         // mode and also clear `input_focused`, not just `results_focused`
         // (see `leave_content_search`), or Backspace/Paste keep being
-        // swallowed by the lingering flags in `actions.rs`.
+        // swallowed by the lingering flags in `actions.rs`. Clearing the
+        // flags alone is not enough either: `leave_content_search` must also
+        // move actual GPUI keyboard focus back to the editor, or Backspace
+        // still reaches nothing because focus stays on the now-unmounted
+        // search input.
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
 
@@ -2808,6 +2826,13 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().document().full_text(), "on\n");
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("X".to_owned()));
+        cx.simulate_keystrokes("secondary-v");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "onX\n");
         });
     }
 

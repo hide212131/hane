@@ -325,9 +325,9 @@ command_actions! {
             }
         }
     },
-    CancelComposition ("escape") => cancel_composition |view, _window, cx| {
+    CancelComposition ("escape") => cancel_composition |view, window, cx| {
         if view.settings_open() {
-            view.handle_settings_escape(_window, cx);
+            view.handle_settings_escape(window, cx);
             return;
         }
         if view.dismiss_file_tab_context_menu(cx) {
@@ -337,7 +337,7 @@ command_actions! {
             return;
         }
         if view.content_search_should_leave_on_escape() {
-            view.leave_content_search(cx);
+            view.leave_content_search(window, cx);
             return;
         }
         if view.sidebar_filter_is_focused() {
