@@ -18,13 +18,18 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const SEARCH_DELIVERY_POLL: Duration = Duration::from_millis(16);
 const SEARCH_SEND_RETRY: Duration = Duration::from_millis(8);
 const MAX_SEARCH_CONCURRENT_WORKERS: usize = 2;
-/// Caps how many channel events one delivery poll tick may examine, separate
-/// from `MAX_SEARCH_ROWS_PER_FRAME`. Zero/low-hit `SearchEvent::File` results
-/// add no delivered rows, so without this bound a single poll tick could
-/// keep draining the channel for as long as workers kept refilling it
-/// instead of yielding back every `SEARCH_DELIVERY_POLL` (Issue #414/#417
-/// S10 follow-up). Set to the same size as the channel itself so one tick
-/// processes at most one buffer's worth of work.
+/// Caps how many `SearchEvent`s one delivery poll tick may receive from the
+/// channel via `try_recv`, separate from `MAX_SEARCH_ROWS_PER_FRAME`.
+/// Zero/low-hit `SearchEvent::File` results add no delivered rows, so
+/// without this bound a single poll tick could keep draining the channel
+/// for as long as workers kept refilling it instead of yielding back every
+/// `SEARCH_DELIVERY_POLL` (Issue #414/#417 S10 follow-up). This only counts
+/// events actually received from the channel, not the separate iterations
+/// that drain a pending file's buffered hits into displayed rows (those are
+/// already bounded by `MAX_SEARCH_ROWS_PER_FRAME`); otherwise a corpus of
+/// one-hit-per-file results would halve the effective per-poll file budget.
+/// Set to the same size as the channel itself so one tick processes at most
+/// one buffer's worth of work.
 const MAX_SEARCH_EVENTS_PER_POLL: usize = MAX_SEARCH_QUEUED_FILES;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -870,7 +875,6 @@ impl EditorView {
         let mut events = 0;
         let mut channel_empty = false;
         while rows < MAX_SEARCH_ROWS_PER_FRAME && events < MAX_SEARCH_EVENTS_PER_POLL {
-            events += 1;
             if let Some(key) = self
                 .content_search
                 .pending_file
@@ -956,6 +960,7 @@ impl EditorView {
             };
             match receiver.try_recv() {
                 Ok(event) => {
+                    events += 1;
                     self.content_search
                         .accept_search_event(event, self.work_folder.as_ref());
                 }
@@ -2343,6 +2348,14 @@ mod tests {
     #[test]
     fn global_delivery_budget_is_shared_so_a_bounded_queue_cannot_exceed_it() {
         const HITS_PER_FILE: usize = 150;
+        // Checked at compile time (rather than via a runtime `assert!` on
+        // constants, which clippy's `assertions_on_constants` flags) so this
+        // scenario is guaranteed to exceed the hit ceiling the assertions
+        // below rely on.
+        const _: () = assert!(
+            (MAX_SEARCH_QUEUED_FILES + 1) * HITS_PER_FILE > MAX_SEARCH_HITS_TOTAL,
+            "this scenario must exceed the hit ceiling for the assertions below to be meaningful"
+        );
         let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
         let work = SearchWork::new(
             key(1),
@@ -2376,10 +2389,6 @@ mod tests {
                 .sum::<usize>();
         }
 
-        assert!(
-            (MAX_SEARCH_QUEUED_FILES + 1) * HITS_PER_FILE > MAX_SEARCH_HITS_TOTAL,
-            "this scenario must exceed the hit ceiling for the assertions below to be meaningful"
-        );
         assert!(total_hits <= MAX_SEARCH_HITS_TOTAL);
         assert!(total_text <= MAX_SEARCH_RESULT_TEXT_BYTES);
         assert_eq!(
@@ -2843,6 +2852,104 @@ mod tests {
             assert_eq!(
                 view.content_search.files_finished, MAX_SEARCH_EVENTS_PER_POLL,
                 "one poll tick drained more than its per-tick event budget"
+            );
+            assert_eq!(view.content_search.status, ContentSearchStatus::Searching);
+        });
+    }
+
+    // Issue #414/#417 S10 follow-up: the per-poll event budget previously
+    // incremented once per `while` pass, including the extra pass that
+    // delivered a pending file's buffered hits into displayed rows. A
+    // corpus of one-hit-per-file results costs two passes per file (one to
+    // receive the `SearchEvent::File`, one to drain its single hit), so the
+    // 128-event budget only let ~64 files through per poll tick instead of
+    // the intended 128. This pre-fills a channel with more one-hit files
+    // than the budget and checks that one poll tick still receives a full
+    // budget's worth of `SearchEvent::File` events, with only the last
+    // received file's hit left pending for the next tick.
+    #[gpui::test]
+    fn content_search_one_hit_per_file_events_are_not_halved_by_delivery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const EVENT_COUNT: usize = MAX_SEARCH_EVENTS_PER_POLL * 3;
+        let (sender, receiver) = mpsc::sync_channel(EVENT_COUNT);
+        let search_key = key(1);
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (session, generation, revision) = view.read_with(cx, |view, _| {
+            let session = view.sessions.active();
+            (session.id(), session.generation(), session.revision())
+        });
+
+        for _ in 0..EVENT_COUNT {
+            sender
+                .try_send(SearchEvent::File {
+                    key: search_key,
+                    result: FileSearchResult {
+                        key: search_key,
+                        target: SearchTarget::Draft(session),
+                        version: SearchVersion::Buffer {
+                            session,
+                            generation,
+                            revision,
+                        },
+                        identity: None,
+                        hits: vec![search_hit("needle")],
+                        completion: SearchFileCompletion::Complete,
+                    },
+                })
+                .unwrap();
+        }
+
+        view.update(cx, |view, cx| {
+            view.work_folder_drafts.insert(
+                session,
+                WorkFolderDraft {
+                    draft_id: hane_session::DraftId::generate(),
+                    target_directory: PathBuf::from("/work"),
+                },
+            );
+            view.content_search.workspace_epoch = search_key.workspace_epoch;
+            view.content_search.query_epoch = search_key.query_epoch;
+            view.content_search.current_work = Some(Arc::new(SearchWork::new(
+                search_key,
+                SearchQuery::new("needle", false).unwrap(),
+                SearchCancellationToken::new(),
+                Arc::from([]),
+                sender,
+            )));
+            view.content_search.receiver = Some(receiver);
+            view.content_search.total_files = EVENT_COUNT;
+            view.content_search.status = ContentSearchStatus::Searching;
+
+            let keep_polling = view.poll_content_search_delivery(cx);
+
+            assert!(
+                keep_polling,
+                "more one-hit files remained queued than a single poll tick may drain"
+            );
+            assert_eq!(
+                view.content_search.files_finished, MAX_SEARCH_EVENTS_PER_POLL,
+                "one poll tick received fewer SearchEvent::File events than its \
+                 per-tick event budget; delivering a file's buffered hits must not \
+                 consume the same budget as receiving its event"
+            );
+            assert_eq!(
+                view.content_search.result_hit_count,
+                MAX_SEARCH_ROWS_PER_FRAME - 1,
+                "every received file except the last-received one (still pending \
+                 for next tick) should have had its single hit delivered this tick"
+            );
+            assert!(
+                view.content_search.pending_file.is_some(),
+                "the last file received this tick should remain pending for the next tick"
             );
             assert_eq!(view.content_search.status, ContentSearchStatus::Searching);
         });
