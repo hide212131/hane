@@ -13932,6 +13932,45 @@ mod tests {
     }
 
     #[gpui::test]
+    fn content_search_toggle_is_rejected_while_inline_rename_is_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_content_search_mode(content_search::SidebarMode::Content, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(view.read_with(cx, |view, _| !view.content_search_sidebar_visible()));
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename.as_ref().unwrap().text.clone()),
+            "Alpha",
+            "the rename text in progress must survive a rejected search-mode toggle"
+        );
+    }
+
+    #[gpui::test]
     fn ctrl_tab_does_not_switch_tabs_during_ime_composition(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));

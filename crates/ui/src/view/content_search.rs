@@ -533,6 +533,9 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.inline_rename_active() {
+            return;
+        }
         if mode == self.content_search.mode {
             if mode == SidebarMode::Content
                 && let Some(input) = self.content_search.input.as_ref()
