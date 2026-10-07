@@ -31,6 +31,11 @@
 - 旧docs-only head `77a07dd`（historical、CodeRabbit full review対象）: CodeRabbit full review [review 5447302402](https://github.com/hide212131/hane/pull/417#pullrequestreview-5447302402) がこのheadに対して実施され、`crates/session/src/search.rs` の `SearchStreamReader` がbytewise processing／line-sized readになっている（1回の `read` 呼び出しで複数行をまとめて返さず、source readの前後でのcancellation確認もbyte単位でしか行われていない）という有効なfinding 1件を検出した。
 - **current code/evidence head: `4aa7d9c6a18d9e6e5671c09b68b9cc22be348c37`。base/main: `b01e4dc421f0399c600733c58c4287dd559b2ea3`。** `4aa7d9c` は、review 5447302402 のfindingに対する修正を適用済みのコードheadである。本記録はこの検証対象コードheadに対する更新であり、本docs-only更新自身のcommit SHAではない。PR headはこのコードhead以降にdocs-only commitを重ねて進んでおり、PR head includes docs-only changes after the code head という関係にある。`4aa7d9c`自体をPR headや「code/docs共通head」「最終docs-updated PR head」とは呼ばない。
 - 旧docs-only head `690255d4689e868ef09c8487fdfe55ae66fac125`（historical）: 本記録の前回更新時点のPR docs-only head。検証対象コードheadは引き続き `4aa7d9c` のままで、このhead自体はコードを変更していなかった。本更新でも新たなdocs-only commitが追加されるため、このhead自体を本文書の「current head」として固定しない。
+- CodeRabbit full review対象head `8141d7a0a77a531bb85bd4495c65167671f07be4`: 有効なfinding 1件（rename中にContent Searchへ切り替えると入力中のrename textが失われうる）を検出した。
+- **current code/evidence head: `f5ed4e4ae26b942dea20c7ed5389ee79923f9abc`。base/main: `b01e4dc421f0399c600733c58c4287dd559b2ea3`。** `f5ed4e4` は、対象head `8141d7a`の有効なfindingに対する修正を適用済みのコードheadである。修正は `toggle_content_search_mode`（`crates/ui/src/view/content_search.rs`）冒頭に `inline_rename_active()` guardを追加し、inline rename実行中はcontent searchモードへの切り替えを拒否して既存のrename入力文字列を保持するようにした。GPUI回帰test `content_search_toggle_is_rejected_while_inline_rename_is_active`（`crates/ui/src/view.rs`）をcommit `f5ed4e4`で追加し、review threadはresolved。この変更はUI切替のguardと回帰testに限定され、既存のsearch reader／worker経路（`crates/session/src/search.rs`等）は変更していない。したがって、S10のcode/evidence head `4aa7d9c`での実測は引き続きcurrent実装の性能実測として正確に扱い、measurement対象のコードheadとcurrent code headを区別する：S10実測対象head（measurement-time code head）は `4aa7d9c6a18d9e6e5671c09b68b9cc22be348c37` のまま、current code head（現在の検証対象コードhead）は `f5ed4e4ae26b942dea20c7ed5389ee79923f9abc` である。
+- 本記録を更新する今回のPR headも引き続きdocs-only commitとして進む。本docs-only commit自身のSHAを「current code head」と呼ばない。code target（`f5ed4e4`）とPR head（本docs-only commit後のhead）を区別して記録する。
+- PR head `f5ed4e4` のCI run [37697494081](https://github.com/hide212131/hane/actions/runs/37697494081) はGitHub上でmaintainer approval待ち（jobs未開始、結論 `action_required`）であり、PASSとして記録しない。
+- current head `f5ed4e4` に対するmanual full reviewは、本docs-only更新の後にCommanderが別途依頼する別gateとして記録する。S10はこれまでに記録済みの実測範囲（上記「S10 詳細」参照）と、OS filesystem cold-cache／runtime queueの実際のpeak occupancyが未測定であることを維持し、全項目PASSとしては記録しない。
 
 ### CodeRabbit finding対応（path replacement、head `1f77e0a`で反映済み）
 
@@ -55,9 +60,19 @@ CodeRabbit full review [review 5447302402](https://github.com/hide212131/hane/pu
 - `a_bare_cr_at_the_exact_end_of_a_chunk_followed_by_lf_is_one_crlf_line`: chunk境界の直前で終わる`CR`の直後に次chunkの`LF`が来た場合も1つのCRLF行として扱われることを確認（既存の`crlf_split_across_reads_is_one_line_and_bare_cr_is_a_line_break`と合わせてCRLF/chunk境界処理の回帰を維持）。
 - `cancellation_after_a_read_is_observed_before_any_hit_is_published`: source readそのものでcancellation tokenが変化した場合、read直後のcancellation確認でread callが1回だけに留まり、結果がCompleteとして公開される前に`Cancelled`になることをスケジューラ依存なしに確認。
 
+### CodeRabbit finding対応（rename中のContent Search切替によるrename text消失、head `f5ed4e4`で反映済み）
+
+CodeRabbit full review（対象head `8141d7a0a77a531bb85bd4495c65167671f07be4`）の有効なfindingは、inline rename実行中に `Cmd/Ctrl+Shift+F` 等でContent Searchモードへ切り替えると、進行中のrename入力テキストが失われうる、という指摘だった。既存の `open_content_search` には `inline_rename_active()` によるguardがあったが、sidebarの既存モード切替経路である `toggle_content_search_mode` にはこのguardがなく、rename中でもContent Searchへの切替が通ってしまっていた。
+
+修正は、`toggle_content_search_mode`（`crates/ui/src/view/content_search.rs:536-538`）の冒頭に `inline_rename_active()` guardを追加し、inline rename実行中はモード切替自体を拒否して進行中のrename状態（`inline_rename`のtext／selection／marked_range等）を変更しないようにした。
+
+回帰テスト（`crates/ui/src/view.rs`、current code head `f5ed4e4`で追加確認）:
+
+- `content_search_toggle_is_rejected_while_inline_rename_is_active`: inline rename実行中に `toggle_content_search_mode(SidebarMode::Content, ...)` を呼んでもcontent search sidebarが表示されず、`inline_rename`が維持され、rename中のtext（`"Alpha"`）が変化しないことを確認。
+
 ## S01〜S10
 
-各行のテスト／観測対象は実装commit `dc6fde26d5154a6d5a86d7dce014cb3f36ca2705`。全10項目に対象SHAを明記した。証拠ログはそのcommitのソースで取得した。S09／S10はその後のheadで更新されており、各行に最新の状態を記載する。S04／S05は、review 5447302402のfinding修正（head `4aa7d9c`）で追加した回帰テストを追記している。
+各行のテスト／観測対象は実装commit `dc6fde26d5154a6d5a86d7dce014cb3f36ca2705`。全10項目に対象SHAを明記した。証拠ログはそのcommitのソースで取得した。S09／S10はその後のheadで更新されており、各行に最新の状態を記載する。S04／S05は、review 5447302402のfinding修正（head `4aa7d9c`）で追加した回帰テストを追記している。current code head `f5ed4e4`で修正したrename中Content Search切替のfinding（`toggle_content_search_mode`のguard、上記「CodeRabbit finding対応」参照）は、既存のsidebar UI操作に対する回帰防止であり、S01〜S08の検索コア・S10の性能実測が対象とする検索reader／worker経路を変更していないため、各行の既存の対象SHA・実測値はこのheadでも変更なしで維持する。
 
 | ID | テスト／観測 | 対象SHA | 結果 | 証拠 |
 |---|---|---|---|---|
@@ -141,6 +156,15 @@ PR headはこのコードhead以降にdocs-only commit（`690255d`含む）を�
 - S10: current code/evidence head `4aa7d9c` から隔離ビルドしたproduction UIで2026-10-08 JSTに実測した（詳細は上記「S10 詳細」）。warm 10,000件0-hitのcomplete表示は4回全てで3秒以内、warm 10,000件few-hitのfirst-result表示は3回中2回が500 ms以内（1回は522 msで超過）。cold-cacheの計測とruntime queueの実occupancyは未測定のため、全項目PASSとしては記録しない。
 - CodeRabbit full review: current code/evidence head `4aa7d9c`に対するmanual full reviewは、current-head CI成功後にCommanderが別途実行する別gateであり、まだ未実施。
 
+### current code head（`f5ed4e4ae26b942dea20c7ed5389ee79923f9abc`）
+
+base/mainは `b01e4dc421f0399c600733c58c4287dd559b2ea3`。PR headはこのコードhead以降もdocs-only commit（本記録の更新）を重ねて進んでおり、PR head includes docs-only changes after the code head という関係は継続している。`f5ed4e4`自体を「最終docs-updated PR head」と呼ばない。
+
+- CodeRabbit full review（対象head `8141d7a0a77a531bb85bd4495c65167671f07be4`）が検出した有効なfinding（rename中にContent Searchへ切り替えると入力中のrename textが失われうる）を、`crates/ui/src/view/content_search.rs`の`toggle_content_search_mode`冒頭への`inline_rename_active()` guard追加のみで修正し、GPUI回帰test `content_search_toggle_is_rejected_while_inline_rename_is_active`（`crates/ui/src/view.rs`）を追加した。review threadはresolved。
+- この変更はUIのモード切替guardと回帰testに限定され、`crates/session/src/search.rs`等の検索reader／worker経路は変更していない。したがって、S01〜S08の検索コアに関する既存の対象SHA・結果と、S10の性能実測（measurement-time code head `4aa7d9c`）はこのheadでも有効な記録として維持する。
+- PR head `f5ed4e4` のCI run [37697494081](https://github.com/hide212131/hane/actions/runs/37697494081): GitHub上でmaintainer approval待ち（jobs未開始、結論 `action_required`）。PASSとして記録しない。
+- CodeRabbit full review: current code head `f5ed4e4`に対するmanual full reviewは未実施。本docs-only更新後にCommanderが別途依頼する別gateとして扱う。
+
 ## Commanderへ渡す残件
 
 - S09はmacOS／Windows双方で利用者の実機確認完了の報告により完了として記録済み。残件なし。
@@ -148,7 +172,11 @@ PR headはこのコードhead以降にdocs-only commit（`690255d`含む）を�
 - CodeRabbit full review [review 5447302402](https://github.com/hide212131/hane/pull/417#pullrequestreview-5447302402)（対象head `77a07dd`）が検出した`SearchStreamReader`のbytewise processing／line-sized readに関する有効なfinding 1件は、current code/evidence head `4aa7d9c`で`crates/session/src/search.rs`のみの変更として修正・回帰テスト追加済み。current code/evidence head `4aa7d9c`に対するmanual full reviewはまだ依頼しておらず未実施であり、PR head側のdocs-only commit追加を含む現在のPR headに対するreviewを、CI成功後にCommanderが明示的に実行・確認する。
 - S10は現行実装の制限値（channel容量128、per-poll SearchEvent budget 128、最大128 displayed rows/frame、最大2 workers、10,000 hits／32 MiB上限）は確認済み。current code/evidence head `4aa7d9c`から隔離ビルドしたproduction UIで2026-10-08 JSTに実測した結果、warm 10,000件0-hitのcomplete表示は4回全てで3秒以内（中央値2.618秒）、warm 10,000件few-hitのfirst-result表示は3回中2回が500 ms以内（1回は522 msで超過）、warm 1,000件0-hitは3回とも651〜668 ms、大きな単一Markdown（1,049,111 bytes）のhitは613 ms以内に表示した。旧head `06f792897` native UI実測（0-hit検索40.121〜41.002秒、historical、[訂正済みPRコメント](https://github.com/hide212131/hane/pull/417#issuecomment-6042203652)）は3秒目標を満たしていなかったが、current code/evidence headの実測はこれを解消している。一方、OS filesystem cold-cacheでの計測（安全なcache purge未実施のため未測定）と、runtime queueの実際のpeak occupancy（容量上限128イベントとは別、instrumentation未対応のため未測定）は依然として欠測であり、これらを含めた全項目PASSとしては記録しない。次action（review・GUI validation・merge等）の判断はCommanderの再観測に委ねる。
 - 初期standalone engine-onlyベンチマーク（0-hit median 598.3 ms等、historical）はproduction UI測定ではなく、UI合格の証拠として採用しない。
+- current code head `f5ed4e4ae26b942dea20c7ed5389ee79923f9abc`は、CodeRabbit full review（対象head `8141d7a0a77a531bb85bd4495c65167671f07be4`）の有効なfinding（rename中にContent Searchへ切り替えると入力中のrename textが失われうる）を`toggle_content_search_mode`冒頭の`inline_rename_active()` guardと回帰test `content_search_toggle_is_rejected_while_inline_rename_is_active`で修正済みで、review threadはresolved。この変更はUI切替guardと回帰testに限定され、検索reader／worker経路は変更していないため、S10のmeasurement-time code head `4aa7d9c`での実測はこのheadでも有効に扱う。
+- PR head `f5ed4e4` のCI run [37697494081](https://github.com/hide212131/hane/actions/runs/37697494081)はGitHub上でmaintainer approval待ち（jobs未開始、結論 `action_required`）であり、PASSとは記録しない。current head `f5ed4e4`に対するmanual full reviewは、本docs-only更新後にCommanderが別途依頼する別gateであり、まだ未実施。
 
-PRは `Refs #414` として [#417](https://github.com/hide212131/hane/pull/417) で共有済み。S09は完了。current code/evidence head `4aa7d9c`のexact worker result verify run、macOS／Windows current-code CI run（tests／Clippy）はいずれもPASS。CodeRabbit full review 5447302402の有効なfinding（`SearchStreamReader`のbytewise processing／line-sized read）はcurrent code/evidence headで修正・回帰テスト追加済み。S10は、current code/evidence head `4aa7d9c`から隔離ビルドしたproduction UIで2026-10-08 JSTに実測した（詳細は「S10 詳細」）。warm 10,000件0-hitのcomplete表示は4回全てで3秒以内、warm 10,000件few-hitのfirst-result表示は3回中2回が500 ms以内（1回は522 msで超過）だが、OS filesystem cold-cacheの計測とruntime queueの実occupancyは未測定であり、この欠測を残件として明記する。current code/evidence head `4aa7d9c`に対するmanual full reviewもまだ未実施であり、PR headはこのコードhead以降にdocs-only commitを重ねて進んでいる（PR head includes docs-only changes after the code head）という関係にある点を踏まえ、Commanderは現在のPR headに対してreviewを依頼する。本workerは本記録更新のみを行い（コード変更不要）、push／merge／Issue closeは行わない。Commanderの再観測に委ねる。
+PRは `Refs #414` として [#417](https://github.com/hide212131/hane/pull/417) で共有済み。S09は完了。current code/evidence head `4aa7d9c`のexact worker result verify run、macOS／Windows current-code CI run（tests／Clippy）はいずれもPASS。CodeRabbit full review 5447302402の有効なfinding（`SearchStreamReader`のbytewise processing／line-sized read）はcurrent code/evidence headで修正・回帰テスト追加済み。S10は、current code/evidence head `4aa7d9c`から隔離ビルドしたproduction UIで2026-10-08 JSTに実測した（詳細は「S10 詳細」）。warm 10,000件0-hitのcomplete表示は4回全てで3秒以内、warm 10,000件few-hitのfirst-result表示は3回中2回が500 ms以内（1回は522 msで超過）だが、OS filesystem cold-cacheの計測とruntime queueの実occupancyは未測定であり、この欠測を残件として明記する。
+
+その後、CodeRabbit full review（対象head `8141d7a`）が検出したrename中Content Search切替によるrename text消失の有効なfindingを、current code head `f5ed4e4`で`toggle_content_search_mode`のguard追加と回帰testのみにより修正し、review threadはresolved。この変更は検索reader／worker経路を変更していないため、S01〜S08・S10の既存の実測値・履歴（measurement-time code head `4aa7d9c`）はこのheadでも有効な記録として維持する。current head `f5ed4e4`のPR CI run [37697494081](https://github.com/hide212131/hane/actions/runs/37697494081)はGitHub上でmaintainer approval待ち（jobs未開始、結論 `action_required`）であり、PASSとして記録しない。current head `f5ed4e4`に対するmanual full reviewは、本docs-only更新後にCommanderが別途依頼する別gateとして未実施のまま記録する。PR headはこのコードhead以降もdocs-only commit（本記録の更新）を重ねて進んでおり、PR head includes docs-only changes after the code head という関係にある。本workerは本記録更新のみを行い（コード変更不要）、push／merge／Issue closeは行わない。Commanderの再観測に委ねる。
 
 PR本文（GitHub上のPull Request description）の同期は、このworkerのローカルファイル編集権限では行えない。本workerはshell／gh／GitHub APIを使用できず、リポジトリ外のGitHubメタデータを変更する手段を持たない。Commanderが本記録の更新内容を踏まえ、PR #417の本文を別途同期する必要がある。
