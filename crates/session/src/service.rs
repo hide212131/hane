@@ -2,9 +2,7 @@ use crate::identity::{FileIdentity, FileStamp};
 use hane_document::RopeBuffer;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::Path;
-#[cfg(any(target_os = "macos", windows, test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -18,8 +16,9 @@ pub struct LoadedFile {
 }
 
 /// A read-only file handle used by streaming features such as content search.
-/// It captures metadata before reading and can query the same open handle again
-/// after reading, without constructing a document session.
+/// It captures metadata before reading and can query both the same open
+/// handle and the originating path again after reading, without
+/// constructing a document session.
 pub struct ReadFile {
     reader: Box<dyn StampedRead>,
     stamp_at_open: Option<FileStamp>,
@@ -46,9 +45,18 @@ impl ReadFile {
         self.stamp_at_open
     }
 
-    /// Metadata from the same open handle after a read has completed.
+    /// Metadata from the same open handle after a read has completed. A
+    /// renamed-over path does not change the inode this handle already has
+    /// open, so this alone cannot see an atomic replacement of `path`.
     pub fn current_stamp(&self) -> io::Result<Option<FileStamp>> {
         self.reader.current_stamp()
+    }
+
+    /// Metadata looked up by the path this handle was opened from, independent
+    /// of the open handle itself. An atomic rename that replaces `path` while
+    /// this handle is open is only visible through this path-based lookup.
+    pub fn path_stamp(&self) -> io::Result<Option<FileStamp>> {
+        self.reader.path_stamp()
     }
 
     /// File identity associated with the path used to open this handle.
@@ -66,21 +74,29 @@ impl Read for ReadFile {
 
 pub(crate) trait StampedRead: Read + Send {
     fn current_stamp(&self) -> io::Result<Option<FileStamp>>;
+    fn path_stamp(&self) -> io::Result<Option<FileStamp>>;
 }
 
-struct OsStampedRead(fs::File);
+struct OsStampedRead {
+    file: fs::File,
+    path: PathBuf,
+}
 
 impl Read for OsStampedRead {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buffer)
+        self.file.read(buffer)
     }
 }
 
 impl StampedRead for OsStampedRead {
     fn current_stamp(&self) -> io::Result<Option<FileStamp>> {
-        self.0
+        self.file
             .metadata()
             .map(|metadata| stamp_from_metadata(Some(metadata)))
+    }
+
+    fn path_stamp(&self) -> io::Result<Option<FileStamp>> {
+        Ok(stamp_from_metadata(fs::metadata(&self.path).ok()))
     }
 }
 
@@ -185,7 +201,14 @@ pub struct OsFileService;
 
 impl FileService for OsFileService {
     fn open_reader(&self, path: &Path) -> io::Result<ReadFile> {
-        ReadFile::from_reader(OsStampedRead(fs::File::open(path)?), identity_for(path))
+        let file = fs::File::open(path)?;
+        ReadFile::from_reader(
+            OsStampedRead {
+                file,
+                path: path.to_path_buf(),
+            },
+            identity_for(path),
+        )
     }
 
     fn load(&self, path: &Path) -> io::Result<LoadedFile> {

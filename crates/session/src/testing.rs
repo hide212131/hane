@@ -17,7 +17,7 @@ type MemoryFile = (Arc<[u8]>, u64);
 /// counter, so external-change detection can be exercised deterministically.
 #[derive(Debug, Default)]
 pub struct MemoryFileService {
-    files: Mutex<HashMap<PathBuf, MemoryFile>>,
+    files: Arc<Mutex<HashMap<PathBuf, MemoryFile>>>,
     directories: Mutex<std::collections::HashSet<PathBuf>>,
     reader_behaviors: Mutex<HashMap<PathBuf, MemoryReadBehavior>>,
     load_calls: AtomicU64,
@@ -43,6 +43,8 @@ struct MemoryStampedRead {
     position: usize,
     stamp: FileStamp,
     behavior: MemoryReadBehavior,
+    files: Arc<Mutex<HashMap<PathBuf, MemoryFile>>>,
+    path: PathBuf,
 }
 
 impl io::Read for MemoryStampedRead {
@@ -94,6 +96,23 @@ impl StampedRead for MemoryStampedRead {
             },
         ))
     }
+
+    /// Looks the stamp up by path in the shared map, independent of the
+    /// snapshot this handle was opened with. This is what lets tests model an
+    /// atomic rename that replaces `path` while a reader opened before the
+    /// replacement is still mid-read.
+    fn path_stamp(&self) -> io::Result<Option<FileStamp>> {
+        Ok(self
+            .files
+            .lock()
+            .expect("files lock")
+            .get(&self.path)
+            .map(|(contents, version)| memory_stamp(contents, *version)))
+    }
+}
+
+fn memory_stamp(contents: &Arc<[u8]>, version: u64) -> FileStamp {
+    FileStamp::new((contents.len() as u64) ^ (version << 32), None)
 }
 
 impl MemoryFileService {
@@ -187,13 +206,15 @@ impl FileService for MemoryFileService {
             .get(&key)
             .cloned()
             .unwrap_or_default();
-        let stamp = FileStamp::new((contents.len() as u64) ^ (version << 32), None);
+        let stamp = memory_stamp(&contents, version);
         ReadFile::from_reader(
             MemoryStampedRead {
                 contents,
                 position: 0,
                 stamp,
                 behavior,
+                files: Arc::clone(&self.files),
+                path: key,
             },
             FileIdentity::lexical(path),
         )

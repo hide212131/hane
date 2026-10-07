@@ -264,6 +264,16 @@ impl SearchInput {
         }
     }
 
+    /// Path-based metadata, looked up independently of the open handle so an
+    /// atomic rename that replaces the path mid-search is not hidden by a
+    /// handle whose own stamp cannot see past its already-open inode.
+    fn disk_path_stamp_after(&self) -> io::Result<Option<FileStamp>> {
+        match &self.content {
+            SearchContent::Disk(reader) => reader.path_stamp(),
+            SearchContent::Buffer(_) => Ok(None),
+        }
+    }
+
     fn is_disk(&self) -> bool {
         matches!(&self.content, SearchContent::Disk(_))
     }
@@ -482,11 +492,21 @@ impl SearchEngine {
                 SearchVersion::Disk { stamp } => stamp,
                 SearchVersion::Buffer { .. } => unreachable!(),
             };
-            let after = match input.disk_stamp_after() {
-                Ok(Some(stamp)) => stamp,
-                Ok(None) => {
-                    return self.warning(input.target, SearchWarningKind::StampUnavailable, None);
+            let handle_after = match input.disk_stamp_after() {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    return self.warning(
+                        input.target,
+                        SearchWarningKind::ReadFailed,
+                        Some(bounded_error_detail(&error)),
+                    );
                 }
+            };
+            // The handle alone cannot see an atomic rename that replaces the
+            // same path: the already-open handle keeps the old inode. A
+            // separate path-based lookup is required to catch that case.
+            let path_after = match input.disk_path_stamp_after() {
+                Ok(stamp) => stamp,
                 Err(error) => {
                     return self.warning(
                         input.target,
@@ -498,7 +518,10 @@ impl SearchEngine {
             let Some(before) = before else {
                 return self.warning(input.target, SearchWarningKind::StampUnavailable, None);
             };
-            if before != after {
+            let (Some(handle_after), Some(path_after)) = (handle_after, path_after) else {
+                return self.warning(input.target, SearchWarningKind::StampUnavailable, None);
+            };
+            if before != handle_after || before != path_after {
                 return self.warning(input.target, SearchWarningKind::StampChanged, None);
             }
         }
@@ -1369,6 +1392,43 @@ mod tests {
     }
 
     #[test]
+    fn an_atomic_path_replacement_is_detected_despite_an_unchanged_handle_stamp() {
+        let service = MemoryFileService::new();
+        service.write_externally("/work/a.md", "needle\n");
+        // Opened before the replacement: the handle keeps reading the old
+        // inode's bytes and reporting the old inode's stamp, exactly like an
+        // atomic rename that replaces `path` while this reader is open.
+        let reader = service.open_reader(Path::new("/work/a.md")).unwrap();
+        service.write_externally("/work/a.md", "replaced\n");
+        let (mut engine, _) = engine("needle", true);
+        let outcome = engine.search(SearchInput::disk("/work/a.md", reader));
+        assert!(matches!(
+            outcome,
+            SearchOutcome::Warning(SearchWarning {
+                kind: SearchWarningKind::StampChanged,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_path_deleted_after_open_is_not_reported_as_complete() {
+        let service = MemoryFileService::new();
+        service.write_externally("/work/a.md", "needle\n");
+        let reader = service.open_reader(Path::new("/work/a.md")).unwrap();
+        service.delete("/work/a.md");
+        let (mut engine, _) = engine("needle", true);
+        let outcome = engine.search(SearchInput::disk("/work/a.md", reader));
+        assert!(matches!(
+            outcome,
+            SearchOutcome::Warning(SearchWarning {
+                kind: SearchWarningKind::StampUnavailable,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn a_line_over_the_searcher_heap_limit_is_not_reported_as_complete() {
         let service = MemoryFileService::new();
         let mut source = "x".repeat(MAX_SEARCHER_HEAP_BYTES + 8);
@@ -1459,6 +1519,10 @@ mod tests {
 
     impl crate::service::StampedRead for CancelOnRead {
         fn current_stamp(&self) -> io::Result<Option<FileStamp>> {
+            Ok(Some(FileStamp::new(8, None)))
+        }
+
+        fn path_stamp(&self) -> io::Result<Option<FileStamp>> {
             Ok(Some(FileStamp::new(8, None)))
         }
     }
