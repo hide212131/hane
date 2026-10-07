@@ -18,6 +18,14 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const SEARCH_DELIVERY_POLL: Duration = Duration::from_millis(16);
 const SEARCH_SEND_RETRY: Duration = Duration::from_millis(8);
 const MAX_SEARCH_CONCURRENT_WORKERS: usize = 2;
+/// Caps how many channel events one delivery poll tick may examine, separate
+/// from `MAX_SEARCH_ROWS_PER_FRAME`. Zero/low-hit `SearchEvent::File` results
+/// add no delivered rows, so without this bound a single poll tick could
+/// keep draining the channel for as long as workers kept refilling it
+/// instead of yielding back every `SEARCH_DELIVERY_POLL` (Issue #414/#417
+/// S10 follow-up). Set to the same size as the channel itself so one tick
+/// processes at most one buffer's worth of work.
+const MAX_SEARCH_EVENTS_PER_POLL: usize = MAX_SEARCH_QUEUED_FILES;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum SidebarMode {
@@ -105,6 +113,36 @@ struct SearchWork {
     sources: Arc<[SearchSource]>,
     next_source: AtomicUsize,
     sender: SyncSender<SearchEvent>,
+    /// Shared, monotonically-decreasing hit/text ceilings that every worker
+    /// must reserve from before queuing a file's hits. Bounds the aggregate
+    /// retained context text across worker-produced, queued, and displayed
+    /// results to `MAX_SEARCH_HITS_TOTAL` / `MAX_SEARCH_RESULT_TEXT_BYTES`,
+    /// instead of relying only on the channel's message-count bound (whose
+    /// entries could otherwise each carry up to `MAX_SEARCH_HITS_PER_DOCUMENT`
+    /// x `MAX_SEARCH_CONTEXT_BYTES`).
+    remaining_hit_budget: AtomicUsize,
+    remaining_text_budget: AtomicUsize,
+}
+
+impl SearchWork {
+    fn new(
+        key: SearchKey,
+        query: SearchQuery,
+        cancellation: SearchCancellationToken,
+        sources: Arc<[SearchSource]>,
+        sender: SyncSender<SearchEvent>,
+    ) -> Self {
+        Self {
+            key,
+            query,
+            cancellation,
+            sources,
+            next_source: AtomicUsize::new(0),
+            sender,
+            remaining_hit_budget: AtomicUsize::new(MAX_SEARCH_HITS_TOTAL),
+            remaining_text_budget: AtomicUsize::new(MAX_SEARCH_RESULT_TEXT_BYTES),
+        }
+    }
 }
 
 struct ActiveSearchWorker {
@@ -661,14 +699,13 @@ impl EditorView {
             return;
         }
         self.content_search.total_files = sources.len();
-        let work = Arc::new(SearchWork {
+        let work = Arc::new(SearchWork::new(
             key,
             query,
-            cancellation: SearchCancellationToken::new(),
+            SearchCancellationToken::new(),
             sources,
-            next_source: AtomicUsize::new(0),
             sender,
-        });
+        ));
         self.content_search.current_work = Some(work);
         self.content_search.receiver = Some(receiver);
         self.content_search.workers_started = 0;
@@ -830,8 +867,10 @@ impl EditorView {
 
     fn poll_content_search_delivery(&mut self, cx: &mut Context<Self>) -> bool {
         let mut rows = 0;
+        let mut events = 0;
         let mut channel_empty = false;
-        while rows < MAX_SEARCH_ROWS_PER_FRAME {
+        while rows < MAX_SEARCH_ROWS_PER_FRAME && events < MAX_SEARCH_EVENTS_PER_POLL {
+            events += 1;
             if let Some(key) = self
                 .content_search
                 .pending_file
@@ -1956,10 +1995,13 @@ fn run_search_worker(work: Arc<SearchWork>, files: Arc<dyn FileService>) -> Resu
             break;
         }
         let event = match outcome {
-            SearchOutcome::File(result) => SearchEvent::File {
-                key: result.key,
-                result,
-            },
+            SearchOutcome::File(mut result) => {
+                reserve_global_delivery_budget(&work, &mut result);
+                SearchEvent::File {
+                    key: result.key,
+                    result,
+                }
+            }
             SearchOutcome::Warning(warning) => SearchEvent::Warning {
                 key: warning.key,
                 warning,
@@ -1975,6 +2017,58 @@ fn run_search_worker(work: Arc<SearchWork>, files: Arc<dyn FileService>) -> Resu
 
 fn file_result_is_current(result: &FileSearchResult, view: &EditorView) -> bool {
     target_version_is_current(&result.target, result.version, view)
+}
+
+/// Reserves this file's share of the search-wide hit/text ceilings before
+/// its result is queued, so the bounded channel can never hold more total
+/// retained context text than the ceiling the delivery loop already
+/// enforces for displayed results. Without this, a count-bounded channel
+/// alone let up to `MAX_SEARCH_QUEUED_FILES` queued files each carry up to
+/// `MAX_SEARCH_HITS_PER_DOCUMENT` x `MAX_SEARCH_CONTEXT_BYTES` of context,
+/// far above the intended aggregate ceiling (Issue #414/#417 S10 follow-up).
+fn reserve_global_delivery_budget(work: &SearchWork, result: &mut FileSearchResult) {
+    if result.hits.is_empty() {
+        return;
+    }
+    loop {
+        let hits_remaining = work.remaining_hit_budget.load(Ordering::Acquire);
+        let text_remaining = work.remaining_text_budget.load(Ordering::Acquire);
+        let take = delivery_hit_count(&result.hits, usize::MAX, hits_remaining, text_remaining);
+        let text_bytes: usize = result.hits[..take]
+            .iter()
+            .map(|hit| hit.context_source.len())
+            .sum();
+        if work
+            .remaining_hit_budget
+            .compare_exchange(
+                hits_remaining,
+                hits_remaining - take,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        if work
+            .remaining_text_budget
+            .compare_exchange(
+                text_remaining,
+                text_remaining - text_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            work.remaining_hit_budget.fetch_add(take, Ordering::AcqRel);
+            continue;
+        }
+        if take < result.hits.len() {
+            result.completion = SearchFileCompletion::LimitReached;
+            result.hits.truncate(take);
+        }
+        break;
+    }
 }
 
 fn delivery_hit_count(
@@ -2183,17 +2277,132 @@ mod tests {
     }
 
     #[test]
+    fn global_delivery_budget_trims_a_single_files_hits_to_the_remaining_ceiling() {
+        let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let work = SearchWork::new(
+            key(1),
+            SearchQuery::new("query", false).unwrap(),
+            SearchCancellationToken::new(),
+            Arc::from([]),
+            sender,
+        );
+        work.remaining_hit_budget.store(3, Ordering::Relaxed);
+        let mut result = FileSearchResult {
+            key: key(1),
+            target: SearchTarget::File(PathBuf::from("note.md")),
+            version: SearchVersion::Disk { stamp: None },
+            identity: None,
+            hits: (0..5).map(|_| search_hit("x")).collect(),
+            completion: SearchFileCompletion::Complete,
+        };
+
+        reserve_global_delivery_budget(&work, &mut result);
+
+        assert_eq!(result.hits.len(), 3);
+        assert_eq!(result.completion, SearchFileCompletion::LimitReached);
+        assert_eq!(work.remaining_hit_budget.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn global_delivery_budget_trims_hits_once_the_text_ceiling_is_reached() {
+        let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let work = SearchWork::new(
+            key(1),
+            SearchQuery::new("query", false).unwrap(),
+            SearchCancellationToken::new(),
+            Arc::from([]),
+            sender,
+        );
+        work.remaining_text_budget.store(1_000, Ordering::Relaxed);
+        let mut result = FileSearchResult {
+            key: key(1),
+            target: SearchTarget::File(PathBuf::from("note.md")),
+            version: SearchVersion::Disk { stamp: None },
+            identity: None,
+            hits: vec![search_hit(&"a".repeat(700)), search_hit(&"b".repeat(700))],
+            completion: SearchFileCompletion::Complete,
+        };
+
+        reserve_global_delivery_budget(&work, &mut result);
+
+        assert_eq!(result.hits.len(), 1, "the second 700-byte hit must stay under the text ceiling");
+        assert_eq!(result.completion, SearchFileCompletion::LimitReached);
+        assert_eq!(work.remaining_text_budget.load(Ordering::Relaxed), 300);
+    }
+
+    // Issue #414/#417 S10 follow-up: a count-bounded channel alone let every
+    // queued file carry up to `MAX_SEARCH_HITS_PER_DOCUMENT` (1,000) x
+    // `MAX_SEARCH_CONTEXT_BYTES` (1 KiB) of context, so `MAX_SEARCH_QUEUED_FILES`
+    // queued files could together retain far more context text than the
+    // aggregate ceiling the delivery loop otherwise enforces for displayed
+    // results. Reserving from the same shared ceiling before a file is ever
+    // queued keeps the worker-produced-plus-queued total bounded regardless
+    // of how many files are in flight; this exercises enough files, each
+    // with a representative per-document hit count, that the unbounded
+    // total would clearly exceed `MAX_SEARCH_HITS_TOTAL` without the fix.
+    #[test]
+    fn global_delivery_budget_is_shared_so_a_bounded_queue_cannot_exceed_it() {
+        const HITS_PER_FILE: usize = 150;
+        let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let work = SearchWork::new(
+            key(1),
+            SearchQuery::new("query", false).unwrap(),
+            SearchCancellationToken::new(),
+            Arc::from([]),
+            sender,
+        );
+        let big_context = "x".repeat(MAX_SEARCH_CONTEXT_BYTES);
+        let make_result = || FileSearchResult {
+            key: key(1),
+            target: SearchTarget::File(PathBuf::from("note.md")),
+            version: SearchVersion::Disk { stamp: None },
+            identity: None,
+            hits: (0..HITS_PER_FILE)
+                .map(|_| search_hit(&big_context))
+                .collect(),
+            completion: SearchFileCompletion::Complete,
+        };
+
+        let mut total_hits = 0usize;
+        let mut total_text = 0usize;
+        for _ in 0..(MAX_SEARCH_QUEUED_FILES + 1) {
+            let mut result = make_result();
+            reserve_global_delivery_budget(&work, &mut result);
+            total_hits += result.hits.len();
+            total_text += result
+                .hits
+                .iter()
+                .map(|hit| hit.context_source.len())
+                .sum::<usize>();
+        }
+
+        assert!(
+            (MAX_SEARCH_QUEUED_FILES + 1) * HITS_PER_FILE > MAX_SEARCH_HITS_TOTAL,
+            "this scenario must exceed the hit ceiling for the assertions below to be meaningful"
+        );
+        assert!(total_hits <= MAX_SEARCH_HITS_TOTAL);
+        assert!(total_text <= MAX_SEARCH_RESULT_TEXT_BYTES);
+        assert_eq!(
+            work.remaining_hit_budget.load(Ordering::Relaxed),
+            MAX_SEARCH_HITS_TOTAL - total_hits
+        );
+        assert_eq!(
+            work.remaining_text_budget.load(Ordering::Relaxed),
+            MAX_SEARCH_RESULT_TEXT_BYTES - total_text
+        );
+    }
+
+    #[test]
     fn reaching_a_global_delivery_limit_is_reported_as_partial() {
         let cancellation = SearchCancellationToken::new();
         let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
-        let work = Arc::new(SearchWork {
-            key: key(1),
-            query: SearchQuery::new("query", false).unwrap(),
-            cancellation: cancellation.clone(),
-            sources: Arc::from([]),
-            next_source: AtomicUsize::new(0),
+        let work = Arc::new(SearchWork::new(
+            key(1),
+            SearchQuery::new("query", false).unwrap(),
+            cancellation.clone(),
+            Arc::from([]),
             sender,
-        });
+        ));
         let mut state = ContentSearchState::default();
         state.current_work = Some(work);
         state.status = ContentSearchStatus::Searching;
@@ -2447,14 +2656,13 @@ mod tests {
                 cancellation: active_cancellation.clone(),
             },
         );
-        state.current_work = Some(Arc::new(SearchWork {
-            key: key(2),
-            query: SearchQuery::new("query", false).unwrap(),
-            cancellation: current_cancellation.clone(),
-            sources: Arc::from([]),
-            next_source: AtomicUsize::new(0),
+        state.current_work = Some(Arc::new(SearchWork::new(
+            key(2),
+            SearchQuery::new("query", false).unwrap(),
+            current_cancellation.clone(),
+            Arc::from([]),
             sender,
-        }));
+        )));
 
         drop(state);
 
@@ -2572,6 +2780,72 @@ mod tests {
         });
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Issue #414/#417 S10 follow-up: zero-hit `SearchEvent::File` results add
+    // no delivered rows, so `MAX_SEARCH_ROWS_PER_FRAME` alone did not bound
+    // how many such events one poll tick could drain; a single tick could
+    // keep draining the channel for as long as workers kept refilling it.
+    // This pre-fills a channel with more zero-hit events than
+    // `MAX_SEARCH_EVENTS_PER_POLL` (without any worker threads, so the
+    // bounded channel can hold all of them at once) and checks that one
+    // poll tick stops at the per-tick event budget and yields back to the
+    // scheduler instead of draining the whole backlog in one call.
+    #[gpui::test]
+    fn content_search_zero_hit_events_are_bounded_per_poll_tick(cx: &mut gpui::TestAppContext) {
+        const EVENT_COUNT: usize = MAX_SEARCH_EVENTS_PER_POLL * 3;
+        let (sender, receiver) = mpsc::sync_channel(EVENT_COUNT);
+        let search_key = key(1);
+        for _ in 0..EVENT_COUNT {
+            sender
+                .try_send(SearchEvent::File {
+                    key: search_key,
+                    result: FileSearchResult {
+                        key: search_key,
+                        target: SearchTarget::File(PathBuf::from("note.md")),
+                        version: SearchVersion::Disk { stamp: None },
+                        identity: None,
+                        hits: Vec::new(),
+                        completion: SearchFileCompletion::Complete,
+                    },
+                })
+                .unwrap();
+        }
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.content_search.workspace_epoch = search_key.workspace_epoch;
+            view.content_search.query_epoch = search_key.query_epoch;
+            view.content_search.current_work = Some(Arc::new(SearchWork::new(
+                search_key,
+                SearchQuery::new("needle", false).unwrap(),
+                SearchCancellationToken::new(),
+                Arc::from([]),
+                sender,
+            )));
+            view.content_search.receiver = Some(receiver);
+            view.content_search.total_files = EVENT_COUNT;
+            view.content_search.status = ContentSearchStatus::Searching;
+
+            let keep_polling = view.poll_content_search_delivery(cx);
+
+            assert!(
+                keep_polling,
+                "more zero-hit events remained queued than a single poll tick may drain"
+            );
+            assert_eq!(
+                view.content_search.files_finished, MAX_SEARCH_EVENTS_PER_POLL,
+                "one poll tick drained more than its per-tick event budget"
+            );
+            assert_eq!(view.content_search.status, ContentSearchStatus::Searching);
+        });
     }
 
     #[gpui::test]
