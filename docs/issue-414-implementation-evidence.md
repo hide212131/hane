@@ -21,12 +21,13 @@
 
 検索のために外部 `rg`、別の列挙器、全件 `FileService::load`、全文String複製、Markdown解析、新規session生成、保存は追加していない。既存WorkFolder一覧を通常検索で使い、「再検索」は既存scannerで更新する。既存のfile bufferとdraft snapshotをdiskより優先する。
 
-## 対象headの更新経緯とcurrent main（2026-10-07更新）
+## 対象headの更新経緯とcurrent main（2026-10-08 JST更新）
 
 - 本記録の初版時点のcurrent main: `5be310c6136e662119e2d208322f832b317e14c4`→rebase後 `145188eef1f1353cfd903b0277458ece71ea8831`（いずれもhistorical）。S10のnative UI実測時点のPR head: `06f79289758d3d7189cb65ab230cc194b93621b2`（historical）。
 - 旧current candidate `628ac0eca1521911d745b3b8e355a9bb7fc8758b`（historical）: このheadのCI run [37664567624](https://github.com/hide212131/hane/actions/runs/37664567624) で、macOS／Windows双方のworkspace testsはPASSしたが、双方のClippyが `crates/ui/src/view/content_search.rs:907` の `clippy::collapsible_if` でFAILした。
 - 旧current source/evidence head `0a2e38a30349cccd97262db776d19170318c05bc`（historical）: `628ac0e`で検出されたClippy指摘を`Option::filter`で一段にまとめて適用した。CodeRabbit full review [review 5446292891](https://github.com/hide212131/hane/pull/417#pullrequestreview-5446292891)（対象head `3eb30f2a58e4afc5cb7a723ce39d63262868cd37`）の記録不整合findingへの応答も含む。
 - **current source/evidence head: `1f77e0addf27a4ed6da03383f409dc34f375a52c`。base/main: `b01e4dc421f0399c600733c58c4287dd559b2ea3`。** `1f77e0a` は、CodeRabbit full review [review 5446840019](https://github.com/hide212131/hane/pull/417#pullrequestreview-5446840019)（対象head `79d91a3b46e9848ed592ffc653625f8139c25e84`）で指摘された有効なpath-replacement finding（[comment](https://github.com/hide212131/hane/pull/417#discussion_r4210694270)）に対する修正を適用済みのコードheadである。本記録はこの検証対象コードheadに対する更新であり、本docs-only更新自身のcommit SHAではない。
+- **本記録を更新する現行PR head（docs-only）: `03b82816d25089957aeaa3669da9207fc5f6799d`。** このheadはdocs-only更新であり、検証対象のコードhead `1f77e0a` 自体は変更しない。コードheadとdocs-only PR headのCI／exact worker result verifyは別runのため、以下で区別して記録する。
 
 ### CodeRabbit finding対応（path replacement、head `1f77e0a`で反映済み）
 
@@ -87,19 +88,27 @@ CodeRabbit full review [review 5446840019](https://github.com/hide212131/hane/pu
 - CodeRabbit full review: [review 5446292891](https://github.com/hide212131/hane/pull/417#pullrequestreview-5446292891)はレビュー対象head `3eb30f2a58e4afc5cb7a723ce39d63262868cd37`に対して実施済み。記録不整合のfinding 1件があり、その時点の更新で応答済み。
 - その後、CodeRabbit full review [review 5446840019](https://github.com/hide212131/hane/pull/417#pullrequestreview-5446840019)（対象head `79d91a3b46e9848ed592ffc653625f8139c25e84`）で有効なpath-replacement finding 1件（[comment](https://github.com/hide212131/hane/pull/417#discussion_r4210694270)）が検出され、現行コード head `1f77e0a` で修正と回帰テストを追加した。
 
-### current head（`1f77e0addf27a4ed6da03383f409dc34f375a52c`）
+### current code head（`1f77e0addf27a4ed6da03383f409dc34f375a52c`）
 
 - macOS／Windows current-code PR CI run [37670971089](https://github.com/hide212131/hane/actions/runs/37670971089): PASS。workspace tests／Clippyとも両OSでPASS。
-- exact worker result verify run [37670104498](https://github.com/hide212131/hane/actions/runs/37670104498): 実行中。完了後の結論に合わせて本記録を更新する。成功が確認されるまでPASSと記載しない。
+- exact worker result verify run [37670104498](https://github.com/hide212131/hane/actions/runs/37670104498): PASS。
 - macOS／Windows実画面（S09）: 利用者から完了報告あり（上表S09、[S09/S10 PR記録](https://github.com/hide212131/hane/pull/417#issuecomment-6041872559)参照）。
-- CodeRabbit full review: current head `1f77e0a`に対するmanual full reviewは、本docs更新後に別途実行する別gateであり、まだ未実施。
+- CodeRabbit full review: current code head `1f77e0a`に対するmanual full reviewは、本docs-only PR headの確定後に別途実行する別gateであり、まだ未実施。
+
+### docs-only PR head（`03b82816d25089957aeaa3669da9207fc5f6799d`）
+
+- このheadは本記録の更新のみで、コード変更は含まない（検証対象コードheadは引き続き `1f77e0a`）。
+- macOS／Windows docs-only PR CI run [37672654246](https://github.com/hide212131/hane/actions/runs/37672654246): PASS。
+- exact worker result verify run [37671825431](https://github.com/hide212131/hane/actions/runs/37671825431): PASS。workspace regression testsとlintを含め成功。
+- CodeRabbit full review: 本docs-only PR head（最終docs-updated PR head）に対するmanual full reviewはまだ依頼しておらず、未実施。
 
 ## Commanderへ渡す残件
 
 - S09はmacOS／Windows双方で利用者の実機確認完了の報告により完了として記録済み。残件なし。
-- current head `1f77e0addf27a4ed6da03383f409dc34f375a52c` の current-code PR CIはmacOS／Windows双方で[run 37670971089](https://github.com/hide212131/hane/actions/runs/37670971089)がPASS。exact worker result verify run [37670104498](https://github.com/hide212131/hane/actions/runs/37670104498)は実行中であり、完了後の結論をCommanderが確認する。
-- CodeRabbit full review（[review 5446840019](https://github.com/hide212131/hane/pull/417#pullrequestreview-5446840019)、対象head `79d91a3b46e9848ed592ffc653625f8139c25e84`）の有効なpath-replacement finding 1件（[comment](https://github.com/hide212131/hane/pull/417#discussion_r4210694270)）は現行コード head `1f77e0a` で修正・回帰テスト追加済み。current head `1f77e0a`に対するmanual full reviewは別gateとして未実施であり、current-head CI成功後にCommanderが明示的に実行・確認する。
+- current code head `1f77e0addf27a4ed6da03383f409dc34f375a52c` の current-code PR CIはmacOS／Windows双方で[run 37670971089](https://github.com/hide212131/hane/actions/runs/37670971089)がPASS。exact worker result verify run [37670104498](https://github.com/hide212131/hane/actions/runs/37670104498)もPASS。
+- docs-only PR head `03b82816d25089957aeaa3669da9207fc5f6799d`（本記録更新）のPR CIは[run 37672654246](https://github.com/hide212131/hane/actions/runs/37672654246)でmacOS／Windows双方PASS。exact worker result verify run [37671825431](https://github.com/hide212131/hane/actions/runs/37671825431)もPASS（workspace regression testsとlintを含め成功）。
+- CodeRabbit full review（[review 5446840019](https://github.com/hide212131/hane/pull/417#pullrequestreview-5446840019)、対象head `79d91a3b46e9848ed592ffc653625f8139c25e84`）の有効なpath-replacement finding 1件（[comment](https://github.com/hide212131/hane/pull/417#discussion_r4210694270)）は現行コード head `1f77e0a` で修正・回帰テスト追加済み。current code head `1f77e0a`、および最終docs-updated PR head `03b82816d25089957aeaa3669da9207fc5f6799d`のいずれに対してもmanual full reviewはまだ依頼しておらず未実施であり、CI成功後にCommanderが明示的に実行・確認する。
 - S10は現行実装の制限値（channel容量128、per-poll SearchEvent budget 128、最大128 displayed rows/frame、最大2 workers、10,000 hits／32 MiB上限）は確認済みだが、current head `1f77e0a`でのproduction UI計時は、利用者のMacがロック中で現在のUIツールから解除できないため未完了（利用者に解除を依頼済み）。旧head `06f792897` native UI実測（0-hit検索40.121〜41.002秒、historical、[訂正済みPRコメント](https://github.com/hide212131/hane/pull/417#issuecomment-6042203652)）は3秒目標を満たしていない。current headでの再測定が可能になるまでS10は未完了のまま記録する。PRとIssueはopen維持、mergeしない。
 - 初期standalone engine-onlyベンチマーク（0-hit median 598.3 ms等、historical）はproduction UI測定ではなく、UI合格の証拠として採用しない。
 
-PRは `Refs #414` として [#417](https://github.com/hide212131/hane/pull/417) で共有済み。S09は完了。current head `1f77e0a`のcurrent-code PR CI（tests／Clippy）は両OSでPASS済み、exact worker result verify runは実行中。CodeRabbit full reviewの有効なfindingは現行コードで修正・回帰テスト追加済みだが、current head `1f77e0a`に対するmanual full reviewとS10のproduction UI計時が残件。本workerは本記録更新のみを行い（コード変更不要）、push／merge／Issue closeは行わない。Commanderの再観測に委ねる。
+PRは `Refs #414` として [#417](https://github.com/hide212131/hane/pull/417) で共有済み。S09は完了。current code head `1f77e0a`のcurrent-code PR CI（tests／Clippy）とexact worker result verify runはいずれもPASS。docs-only PR head `03b82816d25089957aeaa3669da9207fc5f6799d`（本記録更新）のPR CIとexact worker result verifyもいずれもPASS。CodeRabbit full reviewの有効なfindingは現行コードで修正・回帰テスト追加済みだが、current code head `1f77e0a`および最終docs-updated PR head `03b8281`のいずれに対してもmanual full reviewはまだ未実施、S10のproduction UI計時も未完了であり、この2点が残件。本workerは本記録更新のみを行い（コード変更不要）、push／merge／Issue closeは行わない。Commanderの再観測に委ねる。
