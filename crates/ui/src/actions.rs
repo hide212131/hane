@@ -53,6 +53,7 @@ macro_rules! command_actions {
 pub fn register_key_bindings(cx: &mut App) {
     register_core_key_bindings(cx);
     register_secondary_platform_key_bindings(cx);
+    register_document_find_macos_key_bindings(cx);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -69,6 +70,24 @@ fn register_secondary_platform_key_bindings(cx: &mut App) {
 #[cfg(target_os = "macos")]
 fn register_secondary_platform_key_bindings(_cx: &mut App) {}
 
+/// `DocumentFindNext`/`DocumentFindPrevious` already get `f3`/`shift-f3` from
+/// `command_actions!` below, the same on every platform. macOS additionally
+/// accepts the platform-native Cmd+G/Cmd+Shift+G for the same two actions —
+/// bound literally to `cmd` rather than `secondary`, since `secondary-g`
+/// would resolve to Ctrl+G on Windows/Linux and collide with that
+/// platform's own "go to line" convention, which Cmd+G has no equivalent
+/// conflict with on macOS.
+#[cfg(target_os = "macos")]
+fn register_document_find_macos_key_bindings(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-g", DocumentFindNext, Some("HaneEditor")),
+        KeyBinding::new("cmd-shift-g", DocumentFindPrevious, Some("HaneEditor")),
+    ]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_document_find_macos_key_bindings(_cx: &mut App) {}
+
 command_actions! {
     Open ("secondary-o") => open_action |view, _window, cx| {
         if !view.inline_rename_active() { view.prompt_open(cx); }
@@ -81,6 +100,27 @@ command_actions! {
     },
     DocumentFind ("secondary-f") => document_find_action |view, window, cx| {
         view.open_document_find(window, cx);
+    },
+    // Bound once more (to Cmd+G/Cmd+Shift+G on macOS) by
+    // `register_document_find_macos_key_bindings`; this macro only declares
+    // each action's own primary key binding.
+    DocumentFindNext ("f3") => document_find_next_action |view, _window, cx| {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() {
+            return;
+        }
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() {
+            return;
+        }
+        view.document_find_next(cx);
+    },
+    DocumentFindPrevious ("shift-f3") => document_find_previous_action |view, _window, cx| {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() {
+            return;
+        }
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() {
+            return;
+        }
+        view.document_find_previous(cx);
     },
     Save ("secondary-s") => save |view, _window, cx| {
         if !view.inline_rename_active() { view.save_or_prompt(cx); }
@@ -135,7 +175,11 @@ command_actions! {
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() {
+        if view.document_find_input_is_focused() {
+            view.document_find_previous(cx);
+            return;
+        }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() {
             return;
         }
         if view.sidebar_filter_is_focused() {

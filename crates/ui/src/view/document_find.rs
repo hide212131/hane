@@ -1,16 +1,18 @@
-//! Document-find entry bar: open/close, focus isolation, and (as of this
-//! stage) running a literal search against the active session's own
-//! in-memory `RopeBuffer` to show an exact match count, kept current with
-//! the buffer's own revision while the bar is open — including across an
-//! edit, Undo/Redo, or switching to a different open document — without
+//! Document-find entry bar: open/close, focus isolation, running a literal
+//! search against the active session's own in-memory `RopeBuffer`, and
+//! holding the resulting `SourceRange` matches plus a current-match index
+//! for `current / total` display and Next/Previous navigation. Kept current
+//! with the buffer's own revision while the bar is open — including across
+//! an edit, Undo/Redo, or switching to a different open document — without
 //! rescanning on a selection-only change or on every render frame.
-//! Highlighting matches in the document body and previous/next navigation
-//! are later stages (see Issue #413); this bar still never touches the
-//! active document's text, selection, revision, dirty flag, undo history, or
-//! IME composition, and does not move the caret when a search starts,
-//! finishes, or the bar closes. Reuses `hane_editor::find`'s
-//! `FindQuery`/`FindOptions`/`scan` rather than a second search engine or the
-//! Work-folder `content_search`'s disk-backed one.
+//! Highlighting the matches in the document body, and moving the caret or
+//! scrolling to the current one, are later stages (see Issue #413); this bar
+//! still never touches the active document's text, selection, revision,
+//! dirty flag, undo history, or IME composition at any point — opening,
+//! typing a query, scanning, or moving the current match all leave them
+//! alone. Reuses `hane_editor::find`'s
+//! `FindQuery`/`FindOptions`/`scan`/`FindNavigation` rather than a second
+//! search engine or the Work-folder `content_search`'s disk-backed one.
 //!
 //! Kept entirely separate from `content_search` (the Work-folder body search
 //! living in the sidebar, opened with Cmd/Ctrl+Shift+F): different shortcut
@@ -20,7 +22,7 @@
 use super::*;
 use gpui::{AppContext, Entity};
 use gpui_component::input::{Input, InputEvent, InputState};
-use hane_editor::{FindOptions, FindQuery, FindQueryError, FindScan, find_scan};
+use hane_editor::{FindNavigation, FindOptions, FindQuery, FindQueryError, FindScan, find_scan};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const DOCUMENT_FIND_BAR_HEIGHT: f32 = SIDEBAR_FILTER_HEIGHT;
@@ -44,7 +46,9 @@ struct DocumentFindTarget {
 }
 
 /// What the find bar currently has to show, distinguishing every state the
-/// bar's count display must tell apart.
+/// bar's count display must tell apart. The matches themselves (and the
+/// current index into them) live on `DocumentFindState` directly, not here,
+/// since they stay meaningful only while this is `Ready`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) enum DocumentFindResult {
     /// No query entered yet.
@@ -56,7 +60,7 @@ pub(super) enum DocumentFindResult {
     /// A valid query is debouncing or its scan has not completed yet.
     Pending,
     /// A scan for the current query/options/document completed.
-    Ready { count: usize, truncated: bool },
+    Ready,
 }
 
 #[derive(Default)]
@@ -96,6 +100,44 @@ pub(super) struct DocumentFindState {
     /// never bumps the revision — does not.
     synced_target: Option<DocumentFindTarget>,
     result: DocumentFindResult,
+    /// The matches from the most recently applied, non-stale scan. Only
+    /// meaningful while `result` is `Ready`; a new query, option, or
+    /// document target always replaces this wholesale rather than patching
+    /// it, same as `result`.
+    matches: Vec<SourceRange>,
+    truncated: bool,
+    /// 0-based index into `matches` for the current match. `None` when
+    /// `matches` is empty, or when a tab switch just resynced `matches` but
+    /// nothing has explicitly navigated yet (see `reposition_on_next_result`).
+    current: Option<usize>,
+    /// Whether the scan about to land should pick its initial `current` from
+    /// `search_anchor`/`seeded_selection` via `FindNavigation::initial_index`,
+    /// rather than leaving `current` at `None`. `true` for every
+    /// query/option/edit-driven rescan, so re-deciding the current match
+    /// never depends on where an explicit Next/Previous had drifted it to in
+    /// the meantime; set to `false` only for the rescan a tab switch
+    /// triggers (`resync_document_find_for_active_document`), so switching
+    /// tabs never auto-jumps and movement only starts from the first
+    /// explicit Next/Previous afterward.
+    reposition_on_next_result: bool,
+    /// The document-body caret offset (`Selection::active`) to resolve the
+    /// bar's first current match from, captured once when the bar
+    /// transitions from closed to open and reused for every rescan within
+    /// that same open session — including every later query change — so
+    /// re-deciding the initial match always starts from the same search
+    /// anchor rather than from wherever the caret or current index is by
+    /// then.
+    search_anchor: SourceOffset,
+    /// The exact selection the query was seeded from when the bar opened, if
+    /// any. `FindNavigation::initial_index` prefers whichever current match
+    /// equals this verbatim over the first match at or after
+    /// `search_anchor`, so starting from a selected occurrence keeps that
+    /// same occurrence current even if it is not the first in source order.
+    seeded_selection: Option<SourceRange>,
+    /// A short one-shot message to show beside the count right after a
+    /// Next/Previous wrapped around the match list's end. Cleared by the
+    /// next applied scan or by cancelling in-flight find work.
+    wrap_notice: Option<&'static str>,
 }
 
 impl EditorView {
@@ -119,7 +161,11 @@ impl EditorView {
                     let text = input.read(cx).value().to_string();
                     view.document_find_query_changed(text, cx);
                 }
-                InputEvent::PressEnter { .. } => {}
+                // Fired once per committed Enter (not while an IME
+                // composition in this input is still open), matching how
+                // the Work-folder content search already treats this same
+                // event as its own Enter-to-act signal.
+                InputEvent::PressEnter { .. } => view.document_find_next(cx),
             });
         self.document_find.input = Some(input);
         self.document_find.input_subscription = Some(subscription);
@@ -135,8 +181,10 @@ impl EditorView {
 
     /// A non-empty, single-line selection in the active document's body, or
     /// `None` when the selection is empty or spans more than one line. Reads
-    /// the selection only; never mutates it.
-    fn document_find_selection_seed(&self) -> Option<String> {
+    /// the selection only; never mutates it. Returns the selection's own
+    /// `SourceRange` alongside its text so the caller can remember exactly
+    /// which match the query was seeded from.
+    fn document_find_selection_seed(&self) -> Option<(SourceRange, String)> {
         let editor = self.sessions.active().editor();
         let range = editor.selection().range();
         if range.start == range.end {
@@ -146,7 +194,7 @@ impl EditorView {
         if text.is_empty() || text.contains(['\n', '\r']) {
             return None;
         }
-        Some(text)
+        Some((range, text))
     }
 
     /// Opens the bar and focuses its input, seeding the query from the
@@ -168,10 +216,18 @@ impl EditorView {
         let already_open = self.document_find.open;
         if !already_open {
             self.document_find.open = true;
-            if let Some(seed) = self.document_find_selection_seed()
+            // The search anchor and seeded-selection match are decided once,
+            // right here, and reused for every rescan until the bar closes
+            // (see the fields' own docs on `DocumentFindState`); re-pressing
+            // Cmd/Ctrl+F while already open must not redecide them from
+            // wherever the caret has moved to since.
+            self.document_find.search_anchor = self.sessions.active().editor().selection().active;
+            let seed = self.document_find_selection_seed();
+            self.document_find.seeded_selection = seed.as_ref().map(|(range, _)| *range);
+            if let Some((_, text)) = seed
                 && let Some(input) = self.document_find.input.as_ref()
             {
-                input.update(cx, |state, cx| state.set_value(seed, window, cx));
+                input.update(cx, |state, cx| state.set_value(text, window, cx));
             }
         }
         if let Some(input) = self.document_find.input.as_ref() {
@@ -194,7 +250,7 @@ impl EditorView {
             .as_ref()
             .map_or_else(String::new, |input| input.read(cx).value().to_string());
         self.document_find.query_text = text;
-        self.restart_document_find(cx, false);
+        self.restart_document_find(cx, false, true);
     }
 
     /// Hides the bar and returns GPUI focus to the document body. Returns
@@ -216,12 +272,15 @@ impl EditorView {
     /// Re-runs the current query against whatever document is now active,
     /// so a tab switch (or the active tab closing) while the bar is open
     /// never leaves a match count attributed to a document that is no
-    /// longer showing. A no-op while the bar is closed.
+    /// longer showing. Never auto-jumps to a current match for the newly
+    /// active document (`reposition = false`): a tab switch only resets
+    /// what the bar found, leaving `current` unset until the first explicit
+    /// Next/Previous. A no-op while the bar is closed.
     pub(super) fn resync_document_find_for_active_document(&mut self, cx: &mut Context<Self>) {
         if !self.document_find.open {
             return;
         }
-        self.restart_document_find(cx, false);
+        self.restart_document_find(cx, false, false);
     }
 
     /// Called after every edit to the active document (see `after_input`),
@@ -238,17 +297,55 @@ impl EditorView {
         if self.document_find.synced_target == Some(self.document_find_target()) {
             return;
         }
-        self.restart_document_find(cx, true);
+        self.restart_document_find(cx, true, true);
     }
 
     fn document_find_query_changed(&mut self, text: String, cx: &mut Context<Self>) {
         self.document_find.query_text = text;
-        self.restart_document_find(cx, true);
+        self.restart_document_find(cx, true, true);
     }
 
     pub(super) fn toggle_document_find_case(&mut self, cx: &mut Context<Self>) {
         self.document_find.case_sensitive = !self.document_find.case_sensitive;
-        self.restart_document_find(cx, false);
+        self.restart_document_find(cx, false, true);
+    }
+
+    /// Moves to the next (`forward = true`) or previous match, wrapping past
+    /// either end of `matches`. A no-op while the bar is closed, has no
+    /// `Ready` result, or has no matches at all. Never touches the
+    /// document's selection, caret, or scroll position (see the module
+    /// doc); highlighting and visibility of the new current match are later
+    /// stages.
+    fn step_document_find(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.document_find.open || !matches!(self.document_find.result, DocumentFindResult::Ready)
+        {
+            return;
+        }
+        let step = if forward {
+            FindNavigation::next(self.document_find.matches.len(), self.document_find.current)
+        } else {
+            FindNavigation::previous(self.document_find.matches.len(), self.document_find.current)
+        };
+        let Some(step) = step else {
+            return;
+        };
+        self.document_find.current = Some(step.index);
+        self.document_find.wrap_notice = step.wrapped.then(|| {
+            if forward {
+                "先頭に戻りました"
+            } else {
+                "末尾に戻りました"
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn document_find_next(&mut self, cx: &mut Context<Self>) {
+        self.step_document_find(true, cx);
+    }
+
+    pub(crate) fn document_find_previous(&mut self, cx: &mut Context<Self>) {
+        self.step_document_find(false, cx);
     }
 
     /// Cancels whatever scan is in flight or about to start, and bumps
@@ -262,6 +359,7 @@ impl EditorView {
         self.document_find.debounce_task_id = self.document_find.debounce_task_id.wrapping_add(1);
         self.document_find.last_query_change = None;
         self.document_find.restart_pending = false;
+        self.document_find.wrap_notice = None;
         if let Some(cancel) = self.document_find.job_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -271,10 +369,13 @@ impl EditorView {
     /// just changed": classifies the current query text, and either starts
     /// debouncing or scans immediately (`debounce = false` for everything
     /// that is not a keystroke — opening the bar, toggling case, or a tab
-    /// switch — since only typing needs coalescing).
-    fn restart_document_find(&mut self, cx: &mut Context<Self>, debounce: bool) {
+    /// switch — since only typing needs coalescing). `reposition` becomes
+    /// `self.document_find.reposition_on_next_result` for whichever scan
+    /// this (eventually) starts; see that field's doc for what it controls.
+    fn restart_document_find(&mut self, cx: &mut Context<Self>, debounce: bool, reposition: bool) {
         self.document_find.synced_target = Some(self.document_find_target());
         self.cancel_document_find_work();
+        self.document_find.reposition_on_next_result = reposition;
         match FindQuery::parse(&self.document_find.query_text) {
             Ok(_) => {
                 self.document_find.result = DocumentFindResult::Pending;
@@ -287,9 +388,13 @@ impl EditorView {
             }
             Err(FindQueryError::Empty) => {
                 self.document_find.result = DocumentFindResult::Empty;
+                self.document_find.matches.clear();
+                self.document_find.current = None;
             }
             Err(error) => {
                 self.document_find.result = DocumentFindResult::Invalid(error);
+                self.document_find.matches.clear();
+                self.document_find.current = None;
             }
         }
         cx.notify();
@@ -425,10 +530,19 @@ impl EditorView {
             && target == self.document_find_target()
             && let FindScan::Completed(results) = outcome
         {
-            self.document_find.result = DocumentFindResult::Ready {
-                count: results.matches.len(),
-                truncated: results.truncated,
+            self.document_find.current = if self.document_find.reposition_on_next_result {
+                FindNavigation::initial_index(
+                    &results.matches,
+                    self.document_find.search_anchor,
+                    self.document_find.seeded_selection,
+                )
+            } else {
+                None
             };
+            self.document_find.truncated = results.truncated;
+            self.document_find.matches = results.matches;
+            self.document_find.wrap_notice = None;
+            self.document_find.result = DocumentFindResult::Ready;
         }
         if self.document_find.restart_pending {
             self.document_find.restart_pending = false;
@@ -437,6 +551,11 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Shows a 1-based `current / total` (`-` for `current` before the
+    /// first explicit Next/Previous after a tab switch), `+` appended to
+    /// `total` when the scan's own cap truncated it, and a short one-shot
+    /// notice appended after a Next/Previous that just wrapped past either
+    /// end of the match list.
     fn document_find_status_text(&self) -> String {
         match &self.document_find.result {
             DocumentFindResult::Empty | DocumentFindResult::Invalid(FindQueryError::Empty) => {
@@ -449,15 +568,25 @@ impl EditorView {
                 "検索語が長すぎます".to_owned()
             }
             DocumentFindResult::Pending => "検索中…".to_owned(),
-            DocumentFindResult::Ready { count: 0, .. } => "一致なし".to_owned(),
-            DocumentFindResult::Ready {
-                count,
-                truncated: true,
-            } => format!("{count}件以上"),
-            DocumentFindResult::Ready {
-                count,
-                truncated: false,
-            } => format!("{count}件"),
+            DocumentFindResult::Ready => {
+                let state = &self.document_find;
+                if state.matches.is_empty() {
+                    return "一致なし".to_owned();
+                }
+                let total = state.matches.len();
+                let total_text = if state.truncated {
+                    format!("{total}+")
+                } else {
+                    total.to_string()
+                };
+                let current_text = state
+                    .current
+                    .map_or_else(|| "-".to_owned(), |index| (index + 1).to_string());
+                match state.wrap_notice {
+                    Some(notice) => format!("{current_text}/{total_text}（{notice}）"),
+                    None => format!("{current_text}/{total_text}"),
+                }
+            }
         }
     }
 
@@ -497,6 +626,34 @@ impl EditorView {
             .items_center()
             .truncate()
             .child(self.document_find_status_text());
+        let previous = div()
+            .id("document-find-previous")
+            .debug_selector(|| "document-find-previous".to_owned())
+            .h(px(DOCUMENT_FIND_BAR_HEIGHT))
+            .px(px(6.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(rgb(self.theme.code_background))
+            .child("‹")
+            .on_click(cx.listener(|view, _, _, cx| view.document_find_previous(cx)));
+        let next = div()
+            .id("document-find-next")
+            .debug_selector(|| "document-find-next".to_owned())
+            .h(px(DOCUMENT_FIND_BAR_HEIGHT))
+            .px(px(6.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(rgb(self.theme.code_background))
+            .child("›")
+            .on_click(cx.listener(|view, _, _, cx| view.document_find_next(cx)));
         let case_toggle = div()
             .id("document-find-case")
             .debug_selector(|| "document-find-case".to_owned())
@@ -555,6 +712,8 @@ impl EditorView {
                 .text_color(rgb(self.theme.header_foreground))
                 .child(search_box)
                 .child(status)
+                .child(previous)
+                .child(next)
                 .child(case_toggle)
                 .child(close),
         )
@@ -866,7 +1025,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.document_find.query_text = "a\nb".to_owned();
-            view.restart_document_find(cx, false);
+            view.restart_document_find(cx, false, true);
         });
         cx.run_until_parked();
 
@@ -887,7 +1046,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.document_find.query_text = "a".repeat(hane_editor::MAX_QUERY_BYTES + 1);
-            view.restart_document_find(cx, false);
+            view.restart_document_find(cx, false, true);
         });
         cx.run_until_parked();
 
@@ -913,18 +1072,25 @@ mod tests {
         // the live draft buffer, not on disk (there is nothing on disk).
         view.update(cx, |view, cx| {
             view.document_find.query_text = "aa".to_owned();
-            view.restart_document_find(cx, false);
+            view.restart_document_find(cx, false, true);
         });
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert!(!view.document_find.truncated);
+            // The exact `SourceRange`s from the scan are kept, not just a
+            // count, and the default caret at offset 0 resolves the initial
+            // current match to the first one in source order.
             assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 3,
-                    truncated: false,
-                }
+                view.document_find.matches,
+                vec![
+                    SourceRange::new(0, 2),
+                    SourceRange::new(3, 5),
+                    SourceRange::new(6, 8),
+                ]
             );
+            assert_eq!(view.document_find.current, Some(0));
         });
     }
 
@@ -939,30 +1105,22 @@ mod tests {
         view.update(cx, |view, cx| {
             assert!(!view.document_find.case_sensitive);
             view.document_find.query_text = "needle".to_owned();
-            view.restart_document_find(cx, false);
+            view.restart_document_find(cx, false, true);
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 3,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 3);
+            assert!(!view.document_find.truncated);
         });
 
         view.update(cx, |view, cx| view.toggle_document_find_case(cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.document_find.case_sensitive);
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 1,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert!(!view.document_find.truncated);
         });
     }
 
@@ -1013,13 +1171,9 @@ mod tests {
 
         // Only the final, coalesced query ("car") is ever searched.
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 1,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert!(!view.document_find.truncated);
         });
     }
 
@@ -1035,6 +1189,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.document_find.query_text = "ap".to_owned();
+            view.document_find.reposition_on_next_result = true;
             view.start_document_find_scan(cx);
             assert!(view.document_find.job_active);
 
@@ -1055,13 +1210,10 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.document_find.job_active);
             assert!(!view.document_find.restart_pending);
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 1,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert!(!view.document_find.truncated);
+            assert_eq!(view.document_find.current, Some(0));
         });
     }
 
@@ -1074,7 +1226,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.document_find.query_text = "needle".to_owned();
-            view.restart_document_find(cx, false);
+            view.restart_document_find(cx, false, true);
             let real_target = view.document_find_target();
             let other_session = SessionId(real_target.session.0.wrapping_add(1));
             let stale_target = DocumentFindTarget {
@@ -1116,7 +1268,7 @@ mod tests {
             // A newer query supersedes the still-outstanding "needle" job
             // before it has run at all.
             view.document_find.query_text = "other".to_owned();
-            view.restart_document_find(cx, false);
+            view.restart_document_find(cx, false, true);
             assert!(view.document_find.restart_pending);
         });
         cx.run_until_parked();
@@ -1125,13 +1277,10 @@ mod tests {
             // The late "needle" result must not win over a correctly
             // computed, current result for "other" (zero occurrences in
             // this document).
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 0,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert!(view.document_find.matches.is_empty());
+            assert!(!view.document_find.truncated);
+            assert_eq!(view.document_find.current, None);
         });
     }
 
@@ -1153,7 +1302,7 @@ mod tests {
                 // real shortcut initializes it.
                 view.open_document_find(window, cx);
                 view.document_find.query_text = "needle".to_owned();
-                view.restart_document_find(cx, false);
+                view.restart_document_find(cx, false, true);
                 assert!(view.document_find.job_active);
                 assert_eq!(view.document_find.result, DocumentFindResult::Pending);
 
@@ -1191,13 +1340,9 @@ mod tests {
         // no further explicit request, and its count reflects the
         // occurrence the edit introduced.
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 2,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 2);
+            assert!(!view.document_find.truncated);
         });
 
         // Undo moves the revision again while the bar stays open; the
@@ -1212,13 +1357,9 @@ mod tests {
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 1,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert!(!view.document_find.truncated);
         });
     }
 
@@ -1248,18 +1389,17 @@ mod tests {
                 assert_eq!(view.sessions.active_id(), first);
                 view.open_document_find(window, cx);
                 view.document_find.query_text = "needle".to_owned();
-                view.restart_document_find(cx, false);
+                view.restart_document_find(cx, false, true);
             });
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 2,
-                    truncated: false,
-                }
-            );
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 2);
+            assert!(!view.document_find.truncated);
+            // Opening the bar repositions from the default caret at offset
+            // 0, landing on the first match in source order.
+            assert_eq!(view.document_find.current, Some(0));
         });
 
         // Switching to the other open document must not keep showing a
@@ -1271,13 +1411,294 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert_eq!(view.sessions.active_id(), second);
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert!(!view.document_find.truncated);
+            // A tab switch never auto-jumps to a current match for the
+            // newly active document; movement only starts from the first
+            // explicit Next/Previous afterward.
+            assert_eq!(view.document_find.current, None);
+        });
+
+        view.update(cx, |view, cx| view.document_find_next(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.document_find.wrap_notice, None);
+        });
+    }
+
+    #[gpui::test]
+    fn opening_with_a_seeded_selection_on_a_later_occurrence_resolves_current_to_that_occurrence(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx
+            .add_window_view(|_, cx| EditorView::new("needle one needle two\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        // Select the *second* "needle" (offsets 11..17), not the first, so
+        // a correct seeded-selection match is distinguishable from the
+        // anchor-only fallback (anchor 17 has no match at or after it, so
+        // that fallback alone would wrap to the first occurrence instead).
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(11),
+                    active: SourceOffset(17),
+                })
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
             assert_eq!(
-                view.document_find.result,
-                DocumentFindResult::Ready {
-                    count: 1,
-                    truncated: false,
-                }
+                view.document_find.matches,
+                vec![SourceRange::new(0, 6), SourceRange::new(11, 17)]
             );
+            assert_eq!(view.document_find.current, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn a_query_change_discards_the_old_current_index_and_redecides_it_from_the_search_anchor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.matches.len(), 3);
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        // Move explicitly away from the anchor-based initial match.
+        view.update(cx, |view, cx| {
+            view.document_find_next(cx);
+            view.document_find_next(cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(2));
+        });
+
+        // Re-searching the same query (as retyping it would) must not keep
+        // the explicit index from before: it is redecided fresh from the
+        // same search anchor (the caret at open time, offset 0), landing
+        // back on the first match rather than staying at index 2.
+        view.update(cx, |view, cx| {
+            view.document_find_query_changed("needle".to_owned(), cx);
+        });
+        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.executor()
+            .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.matches.len(), 3);
+            assert_eq!(view.document_find.current, Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn next_and_previous_wrap_safely_at_the_ends_and_report_a_short_notice(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.matches.len(), 2);
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.document_find.wrap_notice, None);
+        });
+
+        // Stepping forward past the last match wraps to the first and
+        // reports a short notice.
+        view.update(cx, |view, cx| {
+            view.document_find_next(cx);
+            view.document_find_next(cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.document_find.wrap_notice, Some("先頭に戻りました"));
+        });
+
+        // Stepping backward past the first match wraps to the last and
+        // reports its own short notice, replacing the previous one.
+        view.update(cx, |view, cx| {
+            view.document_find_previous(cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(1));
+            assert_eq!(view.document_find.wrap_notice, Some("末尾に戻りました"));
+        });
+    }
+
+    #[gpui::test]
+    fn navigation_is_a_no_op_with_zero_matches_and_wraps_every_time_with_exactly_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "absent".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.document_find.matches.is_empty());
+            assert_eq!(view.document_find.current, None);
+        });
+        view.update(cx, |view, cx| view.document_find_next(cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, None);
+        });
+
+        view.update(cx, |view, cx| {
+            view.document_find.query_text = "needle".to_owned();
+            view.restart_document_find(cx, false, true);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        for _ in 0..3 {
+            view.update(cx, |view, cx| view.document_find_next(cx));
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.document_find.current, Some(0));
+                assert_eq!(view.document_find.wrap_notice, Some("先頭に戻りました"));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn f3_and_shift_f3_navigate_regardless_of_whether_the_search_field_or_the_editor_has_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        // F3 while the search field still holds focus.
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(1));
+        });
+
+        // Click into the document body (the same gesture the other focus
+        // tests in this module use) so the editor, not the find input,
+        // holds focus, then confirm F3/Shift+F3 still drive navigation and
+        // never leak into the document itself.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.document_find_input_is_focused()));
+
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.document_find.wrap_notice, Some("先頭に戻りました"));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+        });
+
+        cx.simulate_keystrokes("shift-f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(1));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+        });
+    }
+
+    #[gpui::test]
+    fn shift_enter_in_the_search_field_moves_to_the_previous_match_without_editing_the_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.document_find_input_is_focused()));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        cx.simulate_keystrokes("shift-enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(1));
+            assert_eq!(view.document_find.wrap_notice, Some("末尾に戻りました"));
+            // Shift+Enter must stay scoped to find navigation and never
+            // insert a newline into the document underneath the bar.
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
         });
     }
 }
