@@ -1396,6 +1396,12 @@ mod tests {
     use hane_markdown::BlockIndex;
     use hane_presentation::Visibility;
 
+    // A single-Range fixture built via `collect`, not a `Vec`-like sequence
+    // literal (clippy::single_range_in_vec_init).
+    fn single_find_match(range: Range<usize>) -> Vec<Range<usize>> {
+        std::iter::once(range).collect()
+    }
+
     fn code_segment(selected: bool) -> LineSegment {
         LineSegment {
             visual_range: 0..1,
@@ -1476,9 +1482,7 @@ mod tests {
             visual_range: hane_presentation::VisualRange::new(3, 9),
             kind: hane_presentation::StyleKind::InlineCode,
         }];
-        // An explicitly typed single-Range fixture, not a `Vec`-like sequence
-        // literal (clippy::single_range_in_vec_init).
-        let find_matches: [Range<usize>; 1] = [3..6];
+        let find_matches = single_find_match(3..6);
         let segments = line_segments(
             0..9,
             None,
@@ -1831,9 +1835,7 @@ mod tests {
 
     #[test]
     fn find_match_boundaries_split_the_affected_text_and_mark_the_current_one() {
-        // An explicitly typed single-Range fixture, not a `Vec`-like sequence
-        // literal (clippy::single_range_in_vec_init).
-        let find_matches: [Range<usize>; 1] = [3..9];
+        let find_matches = single_find_match(3..9);
         let segments = line_segments(
             0..12,
             None,
@@ -1894,9 +1896,7 @@ mod tests {
         // Both flags are set on the overlap; the renderer (not this function)
         // decides selection wins the paint so the body's own selection state
         // is never hidden underneath a match highlight (Issue #413).
-        // An explicitly typed single-Range fixture, not a `Vec`-like sequence
-        // literal (clippy::single_range_in_vec_init).
-        let find_matches: [Range<usize>; 1] = [0..6];
+        let find_matches = single_find_match(0..6);
         let segments = line_segments(
             0..6,
             None,
