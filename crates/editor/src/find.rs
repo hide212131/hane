@@ -547,7 +547,7 @@ mod tests {
             FindNavigation::previous(3, None),
             Some(NavigationStep {
                 index: 2,
-                wrapped: true
+                wrapped: false
             })
         );
     }
