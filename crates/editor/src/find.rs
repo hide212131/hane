@@ -258,7 +258,9 @@ impl FindNavigation {
         anchor: SourceOffset,
         seeded_selection: Option<SourceRange>,
     ) -> Option<usize> {
-        if let Some(index) = seeded_selection.and_then(|seed| matches.iter().position(|m| *m == seed)) {
+        if let Some(index) =
+            seeded_selection.and_then(|seed| matches.iter().position(|m| *m == seed))
+        {
             return Some(index);
         }
         matches

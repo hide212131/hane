@@ -1028,7 +1028,8 @@ fn table_row_element(
         let cell_selected = clip_visual_range(selected_visual.as_ref(), cell_range.clone());
         let cell_marked = clip_visual_range(marked_visual.as_ref(), cell_range.clone());
         let cell_matches = clip_visual_ranges(&match_visuals, cell_range.clone());
-        let cell_current_match = clip_visual_range(current_match_visual.as_ref(), cell_range.clone());
+        let cell_current_match =
+            clip_visual_range(current_match_visual.as_ref(), cell_range.clone());
         let cell_elements = cell_layout
             .fragments
             .iter()

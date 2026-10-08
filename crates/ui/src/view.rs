@@ -3365,8 +3365,8 @@ impl EditorView {
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
         let row_top = self.content_y_for_row(block_id, row_index)?;
-        let content_y =
-            self.scroll_y + window_y - self.theme.header_height - self.document_find_reserved_height();
+        let content_y = self.scroll_y + window_y - self.theme.header_height
+            - self.document_find_reserved_height();
         let local_y = content_y - row_top;
         let shaper = WindowShaper::new(window, self.zoom);
         let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, &shaper)?;

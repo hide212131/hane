@@ -209,7 +209,8 @@ impl EditorView {
     /// `range_disclosure`) and to paint the current-match highlight distinct
     /// from every other match (Issue #413).
     pub(super) fn document_find_current_match(&self) -> Option<SourceRange> {
-        if !self.document_find.open || !matches!(self.document_find.result, DocumentFindResult::Ready)
+        if !self.document_find.open
+            || !matches!(self.document_find.result, DocumentFindResult::Ready)
         {
             return None;
         }
@@ -225,7 +226,8 @@ impl EditorView {
     /// a linear scan, so painting a frame costs only what is on screen, not
     /// however many matches the whole document has.
     pub(super) fn document_find_matches_in_view(&self, viewport: SourceRange) -> Vec<SourceRange> {
-        if !self.document_find.open || !matches!(self.document_find.result, DocumentFindResult::Ready)
+        if !self.document_find.open
+            || !matches!(self.document_find.result, DocumentFindResult::Ready)
         {
             return Vec::new();
         }
@@ -310,7 +312,11 @@ impl EditorView {
     /// `false` without changing anything when the bar was not open, so
     /// callers (see the `CancelComposition`/Escape handler) can fall through
     /// to other Escape behavior.
-    pub(crate) fn leave_document_find(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn leave_document_find(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.document_find.open {
             return false;
         }
@@ -372,7 +378,8 @@ impl EditorView {
     /// match (see `reveal_current_find_match`), the same way moving the
     /// caret already scrolls without touching anything else.
     fn step_document_find(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if !self.document_find.open || !matches!(self.document_find.result, DocumentFindResult::Ready)
+        if !self.document_find.open
+            || !matches!(self.document_find.result, DocumentFindResult::Ready)
         {
             return;
         }
@@ -662,7 +669,10 @@ impl EditorView {
         }
     }
 
-    pub(super) fn document_find_bar(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+    pub(super) fn document_find_bar(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         if !self.document_find.open {
             return None;
         }
