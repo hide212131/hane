@@ -90,6 +90,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 mod ai_settings;
 mod background_parse;
+mod content_search;
 mod inline_rename;
 mod session_save;
 mod sidebar;
@@ -754,6 +755,9 @@ pub struct EditorView {
     /// any. `None` keeps single-file editing exactly as it was: no sidebar,
     /// no folder concept anywhere else in the view.
     work_folder: Option<WorkFolder>,
+    /// Search UI state is kept with the view so rapid input edits share one
+    /// bounded controller and one long-lived input entity.
+    content_search: content_search::ContentSearchState,
     /// Where a not-yet-named work-folder note's content is journalled, so a
     /// crash before it earns a real filename never loses it. Removed once the
     /// session it belongs to gets a real path or closes.
@@ -1435,6 +1439,7 @@ impl EditorView {
             settings_error: None,
             recent,
             work_folder: None,
+            content_search: content_search::ContentSearchState::default(),
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
@@ -1567,6 +1572,11 @@ impl EditorView {
             self.instrumentation.work_folder_scan_completed_at = None;
         }
         let draft_store = self.draft_store.clone();
+        // Captured before the scan starts so a scan started for an earlier
+        // root (e.g. switched away from before this one finishes) can be
+        // told apart from the current one once both land; see the
+        // `generation` check at the top of `finish_work_folder_scan`.
+        let generation = self.work_folder_generation;
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
             let scanned = cx
@@ -1581,7 +1591,9 @@ impl EditorView {
                     (work_folder, drafts, scan_completed_at)
                 })
                 .await;
-            let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
+            let _ = view.update(cx, |view, cx| {
+                view.finish_work_folder_scan(generation, scanned, cx);
+            });
         })
         .detach();
         cx.notify();
@@ -1589,6 +1601,7 @@ impl EditorView {
 
     fn finish_work_folder_scan(
         &mut self,
+        generation: u64,
         scanned: (
             std::io::Result<WorkFolder>,
             std::io::Result<RecoveredDrafts>,
@@ -1596,6 +1609,15 @@ impl EditorView {
         ),
         cx: &mut Context<Self>,
     ) {
+        if generation != self.work_folder_generation {
+            // A newer `begin_work_folder_scan` (from `switch_to_work_folder`
+            // or another folder open) has already bumped
+            // `work_folder_generation` past what this scan started with.
+            // Installing this result now — regardless of which of the two
+            // scans actually finishes first — would overwrite the current
+            // folder, sessions, and drafts with a stale, unrelated root's.
+            return;
+        }
         let (work_folder, drafts, _scan_completed_at) = scanned;
         match work_folder {
             Err(error) => {
@@ -1657,6 +1679,8 @@ impl EditorView {
                     Err(error) => Some(format!("Could not recover unsaved drafts: {error}")),
                 };
 
+                self.content_search_workspace_changed(cx);
+
                 if let Some(path) = first {
                     // Opening the first entry replaces whichever session is
                     // active through the same background-loading path as any
@@ -1710,6 +1734,7 @@ impl EditorView {
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
+        self.preserve_content_search_navigation_for_action();
         if id == self.sessions.active_id() {
             self.sidebar_focus = SidebarFocus::ActiveSession;
             self.reveal_file_tab(id);
@@ -2277,6 +2302,8 @@ impl EditorView {
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
+        let edited_session = self.sessions.active_id();
+        self.invalidate_content_search_session(edited_session, cx);
         cx.notify();
     }
 
@@ -2329,6 +2356,7 @@ impl EditorView {
                 target_directory,
             },
         );
+        self.content_search_workspace_changed(cx);
         self.on_document_replaced();
         self.schedule_document_parse(cx);
         self.status = None;
@@ -2433,6 +2461,7 @@ impl EditorView {
                     folder.insert_folder(path.clone());
                 }
                 self.expanded_folders.insert(path);
+                self.content_search_workspace_changed(cx);
                 self.status = None;
             }
             Err(error) => {
@@ -2577,6 +2606,7 @@ impl EditorView {
         self.flush_pending_drafts();
         self.sessions = SessionSet::with_untitled("", "Untitled");
         self.work_folder = None;
+        self.content_search_workspace_changed(cx);
         self.work_folder_drafts.clear();
         self.selected_folder = None;
         self.expanded_folders.clear();
@@ -2654,6 +2684,7 @@ impl EditorView {
     }
 
     fn open_with_policy(&mut self, path: &Path, policy: OpenPolicy, cx: &mut Context<Self>) {
+        self.preserve_content_search_navigation_for_action();
         // Whichever path was asked for most recently is what the user wants
         // to see; a load that lands after a newer request must not steal
         // focus back to what it was asked for.
@@ -2721,13 +2752,19 @@ impl EditorView {
             return;
         }
         match loaded {
-            Err(error) => self.status = Some(format!("Open failed: {error}")),
+            Err(error) => {
+                self.cancel_pending_search_navigation_for_path(path);
+                self.status = Some(format!("Open failed: {error}"));
+            }
             Ok(loaded) => {
+                let search_navigation_verification =
+                    self.verify_loaded_search_navigation(path, &loaded);
                 // The read took time, and the target session may have been
                 // edited in the meantime: re-check before replacing it.
                 if into
                     .is_some_and(|id| self.sessions.get(id).is_some_and(DocumentSession::is_dirty))
                 {
+                    self.cancel_pending_search_navigation_for_path(path);
                     self.status =
                         Some("Save current changes before opening another file".to_owned());
                 } else {
@@ -2745,6 +2782,7 @@ impl EditorView {
                     // stale result that targets the current active session is
                     // discarded instead of applied.
                     if !is_latest_request && into == Some(previously_active) {
+                        self.cancel_pending_search_navigation_for_path(path);
                         self.status =
                             Some("A newer document is open; this load was discarded".to_owned());
                     } else {
@@ -2762,6 +2800,15 @@ impl EditorView {
                             self.on_document_replaced();
                             self.status = Some("Opened".to_owned());
                             self.schedule_document_parse(cx);
+                            match search_navigation_verification {
+                                Some(Ok(navigation_id)) => {
+                                    self.finish_pending_search_navigation(navigation_id, true, cx);
+                                }
+                                Some(Err(())) => {
+                                    self.discard_pending_search_navigation_for_path(path, cx);
+                                }
+                                None => {}
+                            }
                         } else {
                             // The session now holds the loaded document and is
                             // ready to be reused instantly next time it is
@@ -3339,6 +3386,7 @@ impl EditorView {
             return;
         }
         self.blur_sidebar_filter(cx);
+        self.blur_content_search_focus(cx);
         self.sidebar_keyboard_focus = false;
     }
 
@@ -3350,6 +3398,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.blur_content_search_focus(cx);
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
@@ -5681,7 +5730,8 @@ impl Render for EditorView {
         // its width out of the same window, so it must be subtracted here too,
         // not just in the element tree, or wrapping would be computed for a
         // column wider than what is actually drawn.
-        let sidebar_width = if self.work_folder.is_some() {
+        let sidebar_visible = self.work_folder.is_some() || self.content_search_sidebar_visible();
+        let sidebar_width = if sidebar_visible {
             self.sidebar_width + SIDEBAR_RESIZER_WIDTH
         } else {
             0.0
@@ -5951,7 +6001,7 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle(cx));
         let sidebar_viewport_height = f32::from(window.viewport_size().height);
         let sidebar = self.work_folder_sidebar(sidebar_viewport_height, cx);
-        let resizer = if self.work_folder.is_some() {
+        let resizer = if sidebar_visible {
             Some(self.sidebar_resizer(cx))
         } else {
             None
@@ -10693,6 +10743,91 @@ mod tests {
         std::fs::remove_dir_all(&new_root).unwrap();
     }
 
+    // Issue #414: `begin_work_folder_scan` starts the scan/recovery pair on a
+    // background thread, and `switch_to_work_folder` can start a second one
+    // before the first lands — switching folder A then B in quick
+    // succession. If A's scan happens to finish *after* B's, a
+    // `finish_work_folder_scan` that only looked at completion order (not
+    // which request it belongs to) would overwrite the already-current
+    // folder B with A's stale folder, sessions, and drafts.
+    #[gpui::test]
+    fn a_stale_work_folder_scan_finishing_after_a_later_switch_is_ignored(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-scan-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::write(old_root.join("Old.md"), "# Old\n").unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let new_root = draft_test_root("stale-scan-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::write(new_root.join("New.md"), "# New\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        // `old_root`'s scan is modeled as having started at the generation
+        // in effect before any switch happened — the generation this view
+        // starts at.
+        let stale_generation = view.read_with(cx, |view, _| view.work_folder_generation);
+
+        // A switch to `new_root` bumps the generation and starts its own
+        // scan, which is left to run to completion below before the stale
+        // `old_root` result (captured above) is delivered.
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path())
+            );
+        });
+
+        // The stale `old_root` scan now lands, out of completion order,
+        // after `new_root` is already the current folder.
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                stale_generation,
+                (
+                    Ok(old_work_folder),
+                    Ok(RecoveredDrafts::default()),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path()),
+                "a stale scan for a folder switched away from must not overwrite the current one"
+            );
+            assert_eq!(
+                view.editor().document().full_text().trim(),
+                "# New",
+                "the stale scan must not replace the current folder's active document"
+            );
+            assert!(
+                view.work_folder_drafts.is_empty(),
+                "the stale scan must not install drafts for a folder that is no longer current"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
     // Issue #28: Save As on an unnamed note used to fall back to `"."`
     // (resolved against the process's current directory, e.g. the app's own
     // install directory on Windows) whenever the active session had no file
@@ -10914,6 +11049,7 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Err(error),
@@ -10965,6 +11101,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Ok(partial),
@@ -11021,6 +11158,7 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Err(error),
@@ -11098,6 +11236,7 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Err(error),
@@ -13793,6 +13932,45 @@ mod tests {
     }
 
     #[gpui::test]
+    fn content_search_toggle_is_rejected_while_inline_rename_is_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_content_search_mode(content_search::SidebarMode::Content, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(view.read_with(cx, |view, _| !view.content_search_sidebar_visible()));
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename.as_ref().unwrap().text.clone()),
+            "Alpha",
+            "the rename text in progress must survive a rejected search-mode toggle"
+        );
+    }
+
+    #[gpui::test]
     fn ctrl_tab_does_not_switch_tabs_during_ime_composition(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
@@ -13987,6 +14165,7 @@ mod tests {
         };
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
+                view.work_folder_generation,
                 (
                     Ok(work_folder),
                     Ok(recovered),
