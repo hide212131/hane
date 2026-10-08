@@ -1756,6 +1756,7 @@ impl EditorView {
         }
         self.reveal_file_tab(id);
         self.on_document_replaced();
+        self.resync_document_find_for_active_document(cx);
         self.schedule_document_parse(cx);
         cx.notify();
         true
@@ -2056,6 +2057,7 @@ impl EditorView {
         }
         if was_active {
             self.on_document_replaced();
+            self.resync_document_find_for_active_document(cx);
             self.schedule_document_parse(cx);
         }
         self.reveal_file_tab(self.sessions.active_id());
