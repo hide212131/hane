@@ -237,13 +237,39 @@ impl EditorView {
         if !self.document_find.open || !self.document_find.input_focused {
             return;
         }
-        let Some(input) = self.document_find.input.clone() else {
-            return;
-        };
+        let Some(input) = self.document_find.input.clone() else { return };
         self.document_find.escape_was_composing = input.update(cx, |state, cx| {
             <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
                 .is_some()
         });
+    }
+
+    /// Whether the find input currently has an active IME marked range.
+    /// `open_document_find` checks this before reselecting/reopening the
+    /// query on a repeated Ctrl/Cmd+F, and `actions.rs`'s
+    /// `DocumentFindNext`/`DocumentFindPrevious` handlers (which also cover
+    /// the macOS Cmd+G/Cmd+Shift+G bindings) check this before moving the
+    /// current match — otherwise either command would interrupt a
+    /// composition still in progress in this field, the same way the body
+    /// editor's own IME composition already blocks both (see
+    /// `step_document_find`). `false` whenever the bar is not open or this
+    /// input does not currently hold focus, since there is then no
+    /// composition here to protect.
+    pub(crate) fn document_find_input_is_composing(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.document_find.open || !self.document_find.input_focused {
+            return false;
+        }
+        let Some(input) = self.document_find.input.clone() else {
+            return false;
+        };
+        input.update(cx, |state, cx| {
+            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
+                .is_some()
+        })
     }
 
     /// The bar's current match, if it is open with a `Ready` result and an
@@ -310,10 +336,13 @@ impl EditorView {
         // While the document body has an active IME composition, opening the
         // bar is a no-op instead: it would otherwise seed the query from (or
         // move focus away from) a selection the composition is still in the
-        // middle of resolving.
+        // middle of resolving. The same holds when re-pressing Cmd/Ctrl+F
+        // while this bar's own input already has an active IME composition:
+        // the `select_all`/`focus` below would otherwise interrupt it.
         if self.inline_rename_active()
             || self.sidebar_filter_focused
             || self.editor().ime().is_some()
+            || self.document_find_input_is_composing(window, cx)
         {
             return;
         }
@@ -562,9 +591,7 @@ impl EditorView {
                         })
                     })
                     .unwrap_or(None);
-                let Some(delay) = delay else {
-                    break;
-                };
+                let Some(delay) = delay else { break };
                 cx.background_executor().timer(delay).await;
                 let keep_waiting = view
                     .update(cx, |view, cx| {
@@ -2139,6 +2166,189 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(!view.document_find.open);
+        });
+    }
+
+    #[gpui::test]
+    fn find_input_composition_blocks_f3_and_shift_f3_navigation(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        let input = view
+            .read_with(cx, |view, _| view.document_find.input.clone())
+            .expect("find input is initialized by open_document_find");
+
+        // Type "needle" through an in-progress IME composition — the same
+        // as a real Japanese/Chinese IME preedit buffer — rather than a
+        // committed `Change`.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "needle", None, window, cx,
+                );
+            });
+        });
+        // See `rapid_query_changes_coalesce_into_a_single_scan_for_the_final_text`
+        // for why both a real sleep and a virtual clock advance are needed
+        // to make the debounce this composing `Change` triggered fire.
+        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.executor()
+            .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 2);
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        // Still composing in the find input itself: F3/Shift+F3 must not
+        // move past this bar's own unfinished composition.
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        cx.simulate_keystrokes("shift-f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::unmark_text(state, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // With the composition committed, F3 navigates normally again.
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn find_input_composition_blocks_reinvoking_the_shortcut_from_reselecting(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        let input = view
+            .read_with(cx, |view, _| view.document_find.input.clone())
+            .expect("find input is initialized by open_document_find");
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "か", None, window, cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let marked_before = cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
+            })
+        });
+        assert!(marked_before.is_some());
+
+        // Re-pressing Ctrl/Cmd+F while this bar's own input is still
+        // composing must not reselect (and so interrupt) that composition.
+        cx.simulate_keystrokes("secondary-f");
+        cx.run_until_parked();
+
+        let marked_after = cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
+            })
+        });
+        assert_eq!(marked_before, marked_after);
+        view.read_with(cx, |view, _| {
+            assert!(view.document_find.open);
+            assert!(view.document_find_input_is_focused());
+        });
+    }
+
+    #[gpui::test]
+    fn find_input_composing_enter_does_not_navigate_but_committed_enter_does(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        let input = view
+            .read_with(cx, |view, _| view.document_find.input.clone())
+            .expect("find input is initialized by open_document_find");
+
+        // Type "needle" through an in-progress IME composition rather than
+        // a committed `Change`.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "needle", None, window, cx,
+                );
+            });
+        });
+        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.executor()
+            .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 2);
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        // Enter while this field's composition is still open must not also
+        // navigate: the pinned `Input` only emits `PressEnter` for a
+        // committed Enter, never one that merely confirms an IME candidate.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::unmark_text(state, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // With the composition committed, a real Enter now navigates
+        // exactly once.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(1));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
         });
     }
 }

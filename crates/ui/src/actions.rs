@@ -111,6 +111,12 @@ command_actions! {
         if view.sidebar_filter_is_focused() || view.inline_rename_active() {
             return;
         }
+        // While the find input itself has an active IME composition, F3 (and
+        // the macOS Cmd+G bound to this same action) must not move the
+        // current match out from under it.
+        if view.document_find_input_is_composing(_window, cx) {
+            return;
+        }
         view.document_find_next(cx);
     },
     DocumentFindPrevious ("shift-f3") => document_find_previous_action |view, _window, cx| {
@@ -118,6 +124,11 @@ command_actions! {
             return;
         }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() {
+            return;
+        }
+        // Same as `DocumentFindNext` above, for Shift+F3 and macOS
+        // Cmd+Shift+G.
+        if view.document_find_input_is_composing(_window, cx) {
             return;
         }
         view.document_find_previous(cx);
