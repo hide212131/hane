@@ -13,8 +13,9 @@ impl EditorView {
 
     /// The item (block, or physical line before a `BlockIndex` exists) and
     /// fractional position under `window_offset` (content-local window y: the
-    /// mouse/gesture position's window y minus the header height), for a zoom
-    /// gesture to anchor to. `None` when there is nothing laid out yet.
+    /// mouse/gesture position's window y minus the header height and the find
+    /// bar's reserved height while it is open), for a zoom gesture to anchor
+    /// to. `None` when there is nothing laid out yet.
     pub(super) fn zoom_anchor_at(&self, window_offset: f32) -> Option<PendingZoomAnchor> {
         if self.heights.is_empty() {
             return None;
@@ -210,7 +211,9 @@ impl EditorView {
             // with the zoom animation (issue #389).
             self.scroll_inertia = None;
             let factor = zoom_factor_for_wheel(event.delta, self.line_height());
-            let window_offset = f32::from(event.position.y) - self.theme.header_height;
+            let window_offset = f32::from(event.position.y)
+                - self.theme.header_height
+                - self.document_find_reserved_height();
             self.queue_wheel_zoom_factor(factor, window_offset, cx);
             return;
         }
@@ -451,7 +454,9 @@ impl EditorView {
         // (issue #389).
         self.scroll_inertia = None;
         let factor = (1.0 + event.delta).max(0.1);
-        let window_offset = f32::from(event.position.y) - self.theme.header_height;
+        let window_offset = f32::from(event.position.y)
+            - self.theme.header_height
+            - self.document_find_reserved_height();
         self.apply_direct_zoom_factor(factor, window_offset, cx);
     }
 }

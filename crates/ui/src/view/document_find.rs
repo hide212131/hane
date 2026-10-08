@@ -344,6 +344,23 @@ impl EditorView {
         .detach();
     }
 
+    /// How much of the body viewport's height the find bar's own row
+    /// currently reserves: zero while closed, or its full row height
+    /// (including the vertical gap on both sides) while open. Subtracted
+    /// from `self.viewport_height` and from every window-to-content y
+    /// conversion that assumes the body viewport starts right below the
+    /// header, so visible range, scroll clamping, the scrollbar, caret
+    /// visibility, IME caret geometry, zoom anchoring, and click/drag
+    /// coordinates all agree with where the body actually starts once this
+    /// bar's row has pushed it down (Issue #413).
+    pub(super) fn document_find_reserved_height(&self) -> f32 {
+        if self.document_find.open {
+            DOCUMENT_FIND_BAR_HEIGHT + SIDEBAR_FILTER_GAP * 2.0
+        } else {
+            0.0
+        }
+    }
+
     fn document_find_target(&self) -> DocumentFindTarget {
         let session = self.sessions.active();
         DocumentFindTarget {
@@ -514,19 +531,20 @@ impl EditorView {
                 view.leave_document_find(window, cx);
             }));
         Some(
-            // Absolutely positioned over the top of the editor viewport
-            // (directly under the tab bar) instead of a flex sibling that
-            // would push it down: `self.viewport_height` and the
-            // mouse-to-row math in `on_editor_mouse_down`/`on_row_mouse_down`
-            // are derived from the header/footer heights alone and must not
-            // shift just because this bar is open (Issue #413).
+            // A fixed-height flex sibling directly under the tab bar, inside
+            // the body area, rather than an absolute overlay: it pushes the
+            // document viewport down instead of covering its first row.
+            // `self.viewport_height` and every window-to-content y
+            // conversion (`document_find_reserved_height`) are kept in sync
+            // with this row's height so scrolling, the scrollbar, caret
+            // visibility, IME caret geometry, zoom anchoring, and click/drag
+            // hit-testing all agree with the body's actual on-screen bounds
+            // while this bar is open (Issue #413).
             div()
                 .id("document-find-bar")
                 .debug_selector(|| "document-find-bar".to_owned())
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .right(px(0.0))
+                .flex_none()
+                .w_full()
                 .h(px(DOCUMENT_FIND_BAR_HEIGHT + SIDEBAR_FILTER_GAP * 2.0))
                 .flex()
                 .items_center()

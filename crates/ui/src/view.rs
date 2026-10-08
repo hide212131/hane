@@ -3358,7 +3358,8 @@ impl EditorView {
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
         let row_top = self.content_y_for_row(block_id, row_index)?;
-        let content_y = self.scroll_y + window_y - self.theme.header_height;
+        let content_y =
+            self.scroll_y + window_y - self.theme.header_height - self.document_find_reserved_height();
         let local_y = content_y - row_top;
         let shaper = WindowShaper::new(window, self.zoom);
         let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, &shaper)?;
@@ -5367,10 +5368,11 @@ impl EditorView {
 
     /// Which edge of the editor viewport `window_y` (window-space, matching
     /// `MouseMoveEvent::position`) sits inside, if any. The viewport begins
-    /// right below the header and is `self.viewport_height` tall, the same
-    /// frame `render` computes it in.
+    /// right below the header (and below the find bar's row while it is
+    /// open) and is `self.viewport_height` tall, the same frame `render`
+    /// computes it in.
     fn text_autoscroll_direction_for(&self, window_y: f32) -> Option<AutoscrollDirection> {
-        let local_y = window_y - self.theme.header_height;
+        let local_y = window_y - self.theme.header_height - self.document_find_reserved_height();
         let near_top = local_y < TEXT_SELECTION_AUTOSCROLL_EDGE;
         let near_bottom = local_y > self.viewport_height - TEXT_SELECTION_AUTOSCROLL_EDGE;
         match (near_top, near_bottom) {
@@ -5542,6 +5544,7 @@ impl EditorView {
         Some(
             div()
                 .id("editor-scrollbar")
+                .debug_selector(|| "editor-scrollbar".to_owned())
                 .absolute()
                 .top(px(0.0))
                 .right(px(0.0))
@@ -5735,7 +5738,8 @@ impl Render for EditorView {
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height
-            - self.theme.footer_height)
+            - self.theme.footer_height
+            - self.document_find_reserved_height())
             .max(self.line_height());
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
@@ -6031,7 +6035,13 @@ impl Render for EditorView {
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .child(self.header_element(cx));
+            .child(self.header_element(cx))
+            // A fixed-height flex sibling directly under the tab bar, inside
+            // the body area, rather than an absolute overlay covering the
+            // document's first row: `self.viewport_height` and every
+            // window-to-content y conversion below account for this row's
+            // height via `document_find_reserved_height` (Issue #413).
+            .children(self.document_find_bar(cx));
         // Relative image destinations resolve against the session's own file,
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
@@ -6120,15 +6130,7 @@ impl Render for EditorView {
                         }))
                         .child(div().h(px(bottom_space))),
                 )
-                .children(editor_scrollbar)
-                // Absolutely positioned over the top of this `.relative()`
-                // viewport (directly under the tab bar), rather than a flex
-                // sibling pushed in above it: `self.viewport_height` and the
-                // mouse-to-content-row math in `on_editor_mouse_down` are
-                // both derived from the header/footer heights alone, so a
-                // flex sibling here would silently shift body bounds and
-                // click targeting whenever the bar is open (Issue #413).
-                .children(self.document_find_bar(cx)),
+                .children(editor_scrollbar),
         );
         let rendered = root.child(main_column.child(self.footer_element(status, cx)));
         let rendered = if let Some(menu) = self.file_tab_context_menu.as_ref() {
@@ -17718,5 +17720,172 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
         });
+    }
+
+    // Issue #413: the find bar used to be an absolute overlay painted on top
+    // of the document's first row, leaving `self.viewport_height` and every
+    // window-to-content y conversion unaware it was open. These regression
+    // tests cover the fixed-row layout instead: rows/scrollbar/caret must
+    // move with the bar's real reserved height, not just visually hide
+    // behind it.
+
+    #[gpui::test]
+    fn opening_the_find_bar_pushes_rows_down_and_shrinks_the_viewport_by_its_reserved_height(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..40)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        let row_top_before = cx.debug_bounds("row-0-0").expect("row painted").origin.y;
+        let viewport_height_before = view.read_with(cx, |view, _| view.viewport_height);
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        let reserved = view.read_with(cx, |view, _| view.document_find_reserved_height());
+        assert!(reserved > 0.0, "the open bar must reserve a real row height");
+
+        let bar_bounds = cx
+            .debug_bounds("document-find-bar")
+            .expect("find bar painted as a fixed row while open");
+        assert_eq!(bar_bounds.size.height, px(reserved));
+        assert_eq!(bar_bounds.origin.y, row_top_before);
+
+        let row_top_after = cx.debug_bounds("row-0-0").expect("row painted").origin.y;
+        let viewport_height_after = view.read_with(cx, |view, _| view.viewport_height);
+
+        // The body's first row moves down by exactly the bar's own height
+        // instead of being covered in place, and the viewport shrinks by the
+        // same amount instead of staying sized for the pre-bar body.
+        assert_eq!(row_top_after - row_top_before, px(reserved));
+        assert_eq!(viewport_height_before - viewport_height_after, reserved);
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.leave_document_find(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let row_top_closed = cx.debug_bounds("row-0-0").expect("row painted").origin.y;
+        let viewport_height_closed = view.read_with(cx, |view, _| view.viewport_height);
+        assert_eq!(
+            row_top_closed, row_top_before,
+            "closing the bar must restore the original row position exactly"
+        );
+        assert_eq!(viewport_height_closed, viewport_height_before);
+    }
+
+    #[gpui::test]
+    fn click_hit_testing_matches_the_shifted_row_position_while_the_find_bar_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        // `row_click` reads the row's real painted bounds this frame, which
+        // now sit below the find bar's row; clicking exactly there must
+        // still resolve to the same source offset the display shows, not an
+        // offset shifted by the bar's reserved height.
+        let (down_point, expected) = row_click(&view, cx, "row-0-0", 0, 0, 3);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(expected));
+        });
+
+        // A drag from that same point to the second paragraph must likewise
+        // land on the row it is visually dragged to, not a row shifted by
+        // the bar's reserved height.
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 3);
+        let (drag_point, drag_expected) = row_click(&view, cx, "row-2-0", 2, 0, 3);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(drag_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(drag_point, MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(anchor, expected);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor: expected,
+                    active: drag_expected,
+                }
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn caret_and_scrollbar_geometry_match_the_shrunken_viewport_while_the_find_bar_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=200)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        let (header_height, footer_height, reserved) = view.read_with(cx, |view, _| {
+            (
+                view.theme.header_height,
+                view.theme.footer_height,
+                view.document_find_reserved_height(),
+            )
+        });
+        assert!(reserved > 0.0);
+        // Computed independently of `self.viewport_height`, from the window
+        // size and the theme's own fixed header/footer, so this cannot pass
+        // merely because the viewport field and the caret/scrollbar code
+        // happen to share the same (possibly wrong) value.
+        let expected_viewport_height = 760.0 - header_height - footer_height - reserved;
+
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
+        });
+        cx.run_until_parked();
+
+        let (caret, viewport_height) =
+            view.read_with(cx, |view, _| (view.caret_geometry(), view.viewport_height));
+        let caret = caret.expect("caret is on screen at the document end");
+
+        assert_eq!(viewport_height, expected_viewport_height);
+        assert!(
+            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT
+                <= viewport_height + CARET_VISIBILITY_TOLERANCE,
+            "caret/IME candidate geometry would sit under the find bar's \
+             reserved row: caret bottom {}, viewport {viewport_height}",
+            caret.y + caret.height
+        );
+
+        // The scrollbar track is painted exactly as tall as the shrunken
+        // viewport, starting right below the find bar's own row.
+        let bar_bottom = cx
+            .debug_bounds("document-find-bar")
+            .expect("bar painted")
+            .bottom();
+        let scrollbar_bounds = cx
+            .debug_bounds("editor-scrollbar")
+            .expect("scrollbar painted for a document this tall");
+        assert_eq!(scrollbar_bounds.origin.y, bar_bottom);
+        assert_eq!(scrollbar_bounds.size.height, px(viewport_height));
     }
 }
