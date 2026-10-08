@@ -354,12 +354,10 @@ impl EditorView {
             return;
         };
         self.document_find.current = Some(step.index);
-        self.document_find.wrap_notice = step.wrapped.then(|| {
-            if forward {
-                "先頭に戻りました"
-            } else {
-                "末尾に戻りました"
-            }
+        self.document_find.wrap_notice = step.wrapped.then_some(if forward {
+            "先頭に戻りました"
+        } else {
+            "末尾に戻りました"
         });
         cx.notify();
     }
