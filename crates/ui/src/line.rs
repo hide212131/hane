@@ -1801,7 +1801,7 @@ mod tests {
                     cursor_before: false,
                     find_match: false,
                     find_current_match: false,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 3..6,
@@ -1810,7 +1810,7 @@ mod tests {
                     cursor_before: true,
                     find_match: false,
                     find_current_match: false,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 6..9,
@@ -1819,7 +1819,7 @@ mod tests {
                     cursor_before: false,
                     find_match: false,
                     find_current_match: false,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 9..12,
@@ -1828,7 +1828,7 @@ mod tests {
                     cursor_before: false,
                     find_match: false,
                     find_current_match: false,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
             ]
         );
@@ -1859,7 +1859,7 @@ mod tests {
                     cursor_before: false,
                     find_match: false,
                     find_current_match: false,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 3..6,
@@ -1868,7 +1868,7 @@ mod tests {
                     cursor_before: false,
                     find_match: true,
                     find_current_match: false,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 6..9,
@@ -1877,7 +1877,7 @@ mod tests {
                     cursor_before: false,
                     find_match: true,
                     find_current_match: true,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 9..12,
@@ -1886,7 +1886,7 @@ mod tests {
                     cursor_before: false,
                     find_match: false,
                     find_current_match: false,
-                    display: InlineDisplay::default()
+                    display: InlineDisplay::default(),
                 },
             ]
         );
