@@ -897,6 +897,10 @@ pub struct EditorView {
     /// `note_document_find_escape_keystroke`) alive for the life of the view;
     /// dropping it would cancel the hook.
     _document_find_escape_interceptor: Subscription,
+    /// Keeps the document-find Enter/composition interceptor (see
+    /// `note_document_find_enter_keystroke`) alive for the life of the view;
+    /// dropping it would cancel the hook.
+    _document_find_enter_interceptor: Subscription,
     /// A draft-recovery failure from the last work-folder scan, if any. Kept
     /// apart from `status`: opening the work folder's first note runs right
     /// after the scan and drives `status` through "Opening…" and "Opened" in
@@ -1441,6 +1445,24 @@ impl EditorView {
                     view.note_document_find_escape_keystroke(window, cx);
                 });
             });
+        // The pinned find-input widget's `InputState::enter` emits
+        // `InputEvent::PressEnter` for every Enter — including one that only
+        // confirms an in-progress IME composition — without checking its own
+        // marked range first. This interceptor runs before that (or any
+        // other) binding for the keystroke is dispatched, so it is the only
+        // point that still observes the find input's marked range as it was
+        // just before this Enter, the same reasoning as the Escape
+        // interceptor above (see `note_document_find_enter_keystroke`).
+        let enter_interceptor_view = cx.entity().downgrade();
+        let document_find_enter_interceptor =
+            cx.intercept_keystrokes(move |event, window, app| {
+                if event.keystroke.key != "enter" {
+                    return;
+                }
+                let _ = enter_interceptor_view.update(app, |view, cx| {
+                    view.note_document_find_enter_keystroke(window, cx);
+                });
+            });
         // Re-observes the local date on a timer so the sidebar's `本日`
         // badge moves on even when the window sits open, focused, and
         // untouched across local midnight; `view.update` failing (the view
@@ -1513,6 +1535,7 @@ impl EditorView {
             _input_mode_subscription: input_mode_subscription,
             _input_mode_focus_subscription: None,
             _document_find_escape_interceptor: document_find_escape_interceptor,
+            _document_find_enter_interceptor: document_find_enter_interceptor,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),

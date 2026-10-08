@@ -154,6 +154,17 @@ pub(super) struct DocumentFindState {
     /// closing the bar. Re-snapshotted on every Escape, so a second, separate
     /// Escape (not composing) closes the bar normally.
     escape_was_composing: bool,
+    /// Whether this input still had an active IME marked range immediately
+    /// before the most recently dispatched Enter keystroke, snapshotted by
+    /// `note_document_find_enter_keystroke`. The pinned find-input widget's
+    /// `InputState::enter` emits `InputEvent::PressEnter` for every Enter —
+    /// including one that only confirms an in-progress composition — without
+    /// checking its own marked range first, so this is what lets the
+    /// `PressEnter` handler tell such a composing Enter apart from a
+    /// committed one that should actually navigate. Re-snapshotted on every
+    /// Enter, so a second, separate Enter (not composing) navigates
+    /// normally.
+    enter_was_composing: bool,
 }
 
 impl EditorView {
@@ -177,10 +188,16 @@ impl EditorView {
                     let text = input.read(cx).value().to_string();
                     view.document_find_query_changed(text, cx);
                 }
-                // Fired once per committed Enter (not while an IME
-                // composition in this input is still open), matching how
-                // the Work-folder content search already treats this same
-                // event as its own Enter-to-act signal. The pinned
+                // Fired for every Enter in this input, including one that
+                // only confirms an in-progress IME composition — the pinned
+                // `InputState::enter` does not check its own marked range
+                // before emitting this, so `enter_was_composing` (snapshotted
+                // just before dispatch by `note_document_find_enter_keystroke`)
+                // is what tells a composing Enter apart from a committed one
+                // that should actually navigate, the same split Escape
+                // already needs (see `escape_was_composing`). Also matches
+                // how the Work-folder content search already treats a
+                // committed Enter as its own Enter-to-act signal. The pinned
                 // single-line `Input` propagates the `shift-enter` action to
                 // the parent first and then emits this event with
                 // `shift: true`, so this is the one and only place that
@@ -189,10 +206,12 @@ impl EditorView {
                 // navigate, or Shift+Enter would move the current match
                 // twice.
                 InputEvent::PressEnter { shift, .. } => {
-                    if *shift {
-                        view.document_find_previous(cx);
-                    } else {
-                        view.document_find_next(cx);
+                    if !view.document_find.enter_was_composing {
+                        if *shift {
+                            view.document_find_previous(cx);
+                        } else {
+                            view.document_find_next(cx);
+                        }
                     }
                 }
             });
@@ -239,6 +258,30 @@ impl EditorView {
         }
         let Some(input) = self.document_find.input.clone() else { return };
         self.document_find.escape_was_composing = input.update(cx, |state, cx| {
+            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
+                .is_some()
+        });
+    }
+
+    /// Snapshots whether the find input currently has an active IME marked
+    /// range, for every Enter keystroke while the bar is open — called by an
+    /// app-level keystroke interceptor that runs before this (or any other)
+    /// binding for the keystroke is dispatched (see its registration in
+    /// `EditorView::new`), so it is the only point that still sees the
+    /// composition before the pinned find-input widget's `InputState::enter`
+    /// emits `InputEvent::PressEnter` for this same keystroke regardless of
+    /// that composition. A no-op when the find input is not the one
+    /// currently focused, so an Enter elsewhere never touches this flag.
+    pub(super) fn note_document_find_enter_keystroke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.document_find.open || !self.document_find.input_focused {
+            return;
+        }
+        let Some(input) = self.document_find.input.clone() else { return };
+        self.document_find.enter_was_composing = input.update(cx, |state, cx| {
             <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
                 .is_some()
         });
@@ -2186,9 +2229,23 @@ mod tests {
             .read_with(cx, |view, _| view.document_find.input.clone())
             .expect("find input is initialized by open_document_find");
 
-        // Type "needle" through an in-progress IME composition — the same
-        // as a real Japanese/Chinese IME preedit buffer — rather than a
-        // committed `Change`.
+        // Establish a committed query with a `Ready` result first, the same
+        // as a normal (non-IME) search.
+        view.update(cx, |view, cx| {
+            view.document_find.query_text = "needle".to_owned();
+            view.restart_document_find(cx, false, true);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 2);
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        // Begin an in-progress IME composition in the find input — the same
+        // as a real Japanese/Chinese IME preedit buffer. Unlike a committed
+        // `Change`, this never restarts the scan, so the `Ready` result
+        // above is retained untouched while composing.
         cx.update(|window, app| {
             input.update(app, |state, cx| {
                 gpui::EntityInputHandler::replace_and_mark_text_in_range(
@@ -2196,12 +2253,6 @@ mod tests {
                 );
             });
         });
-        // See `rapid_query_changes_coalesce_into_a_single_scan_for_the_final_text`
-        // for why both a real sleep and a virtual clock advance are needed
-        // to make the debounce this composing `Change` triggered fire.
-        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
-        cx.executor()
-            .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.document_find.result, DocumentFindResult::Ready);
@@ -2307,8 +2358,22 @@ mod tests {
             .read_with(cx, |view, _| view.document_find.input.clone())
             .expect("find input is initialized by open_document_find");
 
-        // Type "needle" through an in-progress IME composition rather than
-        // a committed `Change`.
+        // Establish a committed query with a `Ready` result first, the same
+        // as a normal (non-IME) search.
+        view.update(cx, |view, cx| {
+            view.document_find.query_text = "needle".to_owned();
+            view.restart_document_find(cx, false, true);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 2);
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        // Begin an in-progress IME composition in the find input. Unlike a
+        // committed `Change`, this never restarts the scan, so the `Ready`
+        // result above is retained untouched while composing.
         cx.update(|window, app| {
             input.update(app, |state, cx| {
                 gpui::EntityInputHandler::replace_and_mark_text_in_range(
@@ -2316,9 +2381,6 @@ mod tests {
                 );
             });
         });
-        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
-        cx.executor()
-            .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.document_find.result, DocumentFindResult::Ready);
@@ -2327,8 +2389,10 @@ mod tests {
         });
 
         // Enter while this field's composition is still open must not also
-        // navigate: the pinned `Input` only emits `PressEnter` for a
-        // committed Enter, never one that merely confirms an IME candidate.
+        // navigate: the pinned `InputState::enter` emits `PressEnter`
+        // regardless of composition, but the find bar's own pre-dispatch
+        // snapshot (`enter_was_composing`) suppresses navigation for this
+        // one.
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
