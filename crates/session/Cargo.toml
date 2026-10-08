@@ -8,6 +8,9 @@ license.workspace = true
 hane-document.workspace = true
 hane-editor.workspace = true
 libc.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
 
 [dev-dependencies]
 hane-markdown.workspace = true

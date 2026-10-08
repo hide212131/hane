@@ -562,18 +562,28 @@ def open_session(
         steps.append(skipped_step("window_discovery", "launch が pass しなかった"))
         steps.append(skipped_step(f"capture_{capture_label}", "launch が pass しなかった"))
         return steps, None
+    if swift_helper is not None:
+        pid = current_pid(process_holder)
+        if pid is None:
+            activation_error = "対象プロセスのPIDを取得できない"
+        else:
+            ok, _output, activation_error = run_helper(
+                swift_helper, ["activate", str(pid)], helper_timeout)
+            if ok:
+                activation_error = None
+        steps.append(make_step(
+            "activate", "pass" if activation_error is None else "blocked",
+            reason=activation_error,
+        ))
+        if activation_error is not None:
+            steps.append(skipped_step("window_discovery", "アプリを前面化できなかった"))
+            steps.append(skipped_step(f"capture_{capture_label}", "アプリを前面化できなかった"))
+            return steps, None
     window_step, window_id = module.do_window_discovery(env, config, process_holder["process"])
     steps.append(window_step)
     if window_step["result"] != "pass":
         steps.append(skipped_step(f"capture_{capture_label}", "window_discovery が pass しなかった"))
         return steps, None
-    if swift_helper is not None:
-        pid = current_pid(process_holder)
-        if pid is None:
-            steps.append(make_step("activate", "blocked", reason="対象プロセスのPIDを取得できない"))
-        else:
-            ok, _output, error = run_helper(swift_helper, ["activate", str(pid)], helper_timeout)
-            steps.append(make_step("activate", "pass" if ok else "blocked", reason=None if ok else error))
     steps.append(capture_named(module, env, config, window_id, config.run_dir, capture_label))
     return steps, window_id
 

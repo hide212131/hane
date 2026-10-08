@@ -33,6 +33,7 @@ mod draft;
 mod identity;
 mod naming;
 mod resource;
+pub mod search;
 mod service;
 mod session;
 mod store;
@@ -51,7 +52,8 @@ pub use naming::{
 };
 pub use resource::ResourceResolver;
 pub use service::{
-    FileService, LoadedFile, OsFileService, OverwriteGuard, SaveFailure, SavedFile, run_save_job,
+    FileService, LoadedFile, OsFileService, OverwriteGuard, ReadFile, SaveFailure, SavedFile,
+    run_save_job,
 };
 pub use session::{
     AutosaveTicket, CloseDecision, DocumentSession, FileEvent, FileEventOutcome, OpenDecision,

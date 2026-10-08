@@ -11,6 +11,7 @@ instrument = ["timing-probe"]
 
 [dependencies]
 hane-document.workspace = true
+hane-ai.workspace = true
 hane-editor.workspace = true
 hane-metrics.workspace = true
 hane-markdown.workspace = true

@@ -10,14 +10,14 @@
 //! explicitly-started generation is already `Ready`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hane_ai::{
-    AiRuntime, OwnerLock, RejectAllServerRequests, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind,
-    RuntimeState,
+    AiRuntime, OwnerLock, RejectAllServerRequests, RuntimeConfig, RuntimeError, RuntimeEvent,
+    RuntimeEventKind, RuntimeState,
 };
 
 fn unique_dir(name: &str) -> PathBuf {
@@ -33,6 +33,13 @@ fn base_config(name: &str) -> RuntimeConfig {
     let dir = unique_dir(name);
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server"));
     let mut config = RuntimeConfig::new(binary, dir.join("runtime.lock"));
+    config.codex_home = Some(dir.join("codex-home"));
+    config.working_directory = Some(
+        dir.join("probe-workspace")
+            .join(format!("runtime-{}-0", std::process::id())),
+    );
+    std::fs::create_dir_all(config.codex_home.as_ref().unwrap()).unwrap();
+    std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
     config.args = Vec::new();
     config.start_timeout = Duration::from_secs(5);
     config.stop_grace_timeout = Duration::from_millis(500);
@@ -49,6 +56,7 @@ fn spawn_runtime(config: RuntimeConfig) -> (AiRuntime, mpsc::Receiver<RuntimeEve
 #[test]
 fn initialize_barrier_reaches_ready_then_calls_and_stops_cleanly() {
     let config = base_config("initialize_barrier");
+    let working_directory = config.working_directory.clone().unwrap();
     let (runtime, _events) = spawn_runtime(config);
 
     let status = runtime.start().expect("start should succeed");
@@ -56,13 +64,21 @@ fn initialize_barrier_reaches_ready_then_calls_and_stops_cleanly() {
     assert!(!status.restart_blocked);
 
     let result = runtime
-        .call("test/echo", Some(serde_json::json!({"x": 1})), Duration::from_secs(5))
+        .call(
+            "test/echo",
+            Some(serde_json::json!({"x": 1})),
+            Duration::from_secs(5),
+        )
         .expect("echo call should succeed");
     assert_eq!(result["x"], 1);
 
     let stopped = runtime.stop().expect("stop should succeed");
     assert_eq!(stopped.state, RuntimeState::Stopped);
     assert!(!stopped.restart_blocked);
+    assert!(
+        !working_directory.exists(),
+        "confirmed runtime stop removes its temporary workspace"
+    );
 }
 
 #[test]
@@ -85,9 +101,10 @@ fn start_times_out_and_transitions_to_failed_when_server_never_responds() {
 #[test]
 fn crash_mid_request_fails_the_call_and_does_not_auto_restart() {
     let mut config = base_config("crash_mid_request");
-    config
-        .extra_env
-        .push(("FAKE_SERVER_MODE".to_string(), "crash_mid_request".to_string()));
+    config.extra_env.push((
+        "FAKE_SERVER_MODE".to_string(),
+        "crash_mid_request".to_string(),
+    ));
     let (runtime, _events) = spawn_runtime(config);
 
     let status = runtime.start().expect("start should succeed");
@@ -117,6 +134,7 @@ fn crash_mid_request_fails_the_call_and_does_not_auto_restart() {
 #[test]
 fn owner_lock_blocks_a_second_owner_and_releases_after_drop() {
     let config = base_config("owner_lock");
+    let working_directory = config.working_directory.clone().unwrap();
     let lock_path = config.owner_lock_path.clone();
     let external_lock = OwnerLock::new(&lock_path);
     let external_guard = external_lock
@@ -128,10 +146,16 @@ fn owner_lock_blocks_a_second_owner_and_releases_after_drop() {
     let result = runtime.start();
     assert!(matches!(result, Err(RuntimeError::OwnerLockUnavailable)));
     assert_eq!(runtime.snapshot().state, RuntimeState::Stopped);
+    assert!(
+        !working_directory.exists(),
+        "a config unused because another process owns the runtime leaves no workspace"
+    );
 
     drop(external_guard);
 
-    let status = runtime.start().expect("start should succeed once the lock is free");
+    let status = runtime
+        .start()
+        .expect("start should succeed once the lock is free");
     assert_eq!(status.state, RuntimeState::Ready);
     let _ = runtime.stop();
 }
@@ -161,7 +185,9 @@ fn stop_escalates_to_a_forced_kill_when_the_server_ignores_graceful_shutdown() {
     let status = runtime.start().expect("start should succeed");
     assert_eq!(status.state, RuntimeState::Ready);
 
-    let stopped = runtime.stop().expect("stop should still succeed via a forced kill");
+    let stopped = runtime
+        .stop()
+        .expect("stop should still succeed via a forced kill");
     assert_eq!(stopped.state, RuntimeState::Stopped);
     assert!(!stopped.restart_blocked);
 }
@@ -187,7 +213,10 @@ fn concurrent_start_calls_spawn_exactly_one_process() {
     }
     let mut generations = Vec::new();
     for handle in handles {
-        let status = handle.join().unwrap().expect("every start call should succeed");
+        let status = handle
+            .join()
+            .unwrap()
+            .expect("every start call should succeed");
         generations.push(status.generation);
     }
     assert!(generations.iter().all(|g| *g == generations[0]));
@@ -257,8 +286,14 @@ fn concurrent_failing_start_calls_share_one_spawn_and_the_same_failure() {
     let retried = runtime.start();
     assert!(matches!(retried, Err(RuntimeError::Handshake(_))));
     let spawned_after_retry = std::fs::read_to_string(&marker).unwrap_or_default();
-    let spawn_count_after_retry = spawned_after_retry.lines().filter(|l| !l.trim().is_empty()).count();
-    assert_eq!(spawn_count_after_retry, 2, "a later explicit retry must still be free to spawn again");
+    let spawn_count_after_retry = spawned_after_retry
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    assert_eq!(
+        spawn_count_after_retry, 2,
+        "a later explicit retry must still be free to spawn again"
+    );
 }
 
 #[test]
@@ -283,7 +318,10 @@ fn concurrent_restart_calls_do_not_respawn_the_child_repeatedly() {
     }
     let mut generations = Vec::new();
     for handle in handles {
-        let status = handle.join().unwrap().expect("every restart call should succeed");
+        let status = handle
+            .join()
+            .unwrap()
+            .expect("every restart call should succeed");
         generations.push(status.generation);
     }
     assert!(
@@ -357,14 +395,20 @@ fn stderr_spam_does_not_block_stdio_communication() {
         .push(("FAKE_SERVER_STDERR_SPAM".to_string(), "1".to_string()));
     let (runtime, _events) = spawn_runtime(config);
 
-    let status = runtime.start().expect("start should succeed even while the child spams stderr");
+    let status = runtime
+        .start()
+        .expect("start should succeed even while the child spams stderr");
     assert_eq!(status.state, RuntimeState::Ready);
 
     // The fake server keeps writing to stderr on its own thread for several
     // seconds; the client must keep draining it and still be able to
     // exchange normal stdio traffic instead of stalling.
     let result = runtime
-        .call("test/echo", Some(serde_json::json!({"x": 1})), Duration::from_secs(5))
+        .call(
+            "test/echo",
+            Some(serde_json::json!({"x": 1})),
+            Duration::from_secs(5),
+        )
         .expect("echo call should succeed while stderr is being spammed");
     assert_eq!(result["x"], 1);
 
@@ -394,7 +438,11 @@ fn a_full_events_queue_drops_events_instead_of_blocking_the_runtime() {
     assert_eq!(status.state, RuntimeState::Ready);
 
     let result = runtime
-        .call("test/echo", Some(serde_json::json!({"x": 1})), Duration::from_secs(5))
+        .call(
+            "test/echo",
+            Some(serde_json::json!({"x": 1})),
+            Duration::from_secs(5),
+        )
         .expect("echo call should succeed while the events queue is full and being dropped from");
     assert_eq!(result["x"], 1);
 
@@ -403,6 +451,44 @@ fn a_full_events_queue_drops_events_instead_of_blocking_the_runtime() {
     assert!(events_rx.recv_timeout(Duration::from_secs(5)).is_ok());
 
     let _ = runtime.stop();
+}
+
+#[test]
+fn a_full_runtime_event_queue_stops_the_child_after_losing_a_critical_notification() {
+    let mut config = base_config("critical_event_overflow");
+    config.extra_env.push((
+        "FAKE_SERVER_CRITICAL_NOTIFICATION_COUNT".to_string(),
+        "2".to_string(),
+    ));
+    let (events_tx, events_rx) = mpsc::sync_channel(1);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn(config, handler, events_tx);
+
+    let status = runtime
+        .start()
+        .expect("initialize should complete before test notifications");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    // Keep the bounded event queue full while the fake server emits both
+    // critical notifications. Draining the first event here races the second
+    // notification and can make this test pass without exercising overflow.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = runtime.snapshot();
+        if status.state == RuntimeState::Failed {
+            assert!(!status.restart_blocked);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "critical notification loss was not handled"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        events_rx.try_recv().is_ok(),
+        "first critical event should remain queued"
+    );
 }
 
 #[test]
@@ -468,7 +554,9 @@ fn stop_releases_pending_calls_immediately_instead_of_waiting_for_the_child_to_e
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    let stopped = runtime.stop().expect("stop should still succeed via a forced kill");
+    let stopped = runtime
+        .stop()
+        .expect("stop should still succeed via a forced kill");
     assert_eq!(stopped.state, RuntimeState::Stopped);
 
     let (elapsed, result) = call_thread.join().unwrap();
@@ -487,7 +575,10 @@ fn owner_lock_fails_immediately_from_a_separate_os_process() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server"));
 
     let lock = OwnerLock::new(&lock_path);
-    let guard = lock.try_acquire().unwrap().expect("first acquire should succeed");
+    let guard = lock
+        .try_acquire()
+        .unwrap()
+        .expect("first acquire should succeed");
 
     let busy_output = std::process::Command::new(&binary)
         .env("FAKE_SERVER_OWNER_LOCK_TRY_PATH", &lock_path)
@@ -517,7 +608,8 @@ fn owner_lock_fails_immediately_from_a_separate_os_process() {
 }
 
 #[test]
-fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer_ready_generation() {
+fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer_ready_generation()
+{
     // `timeout_then_late_response` withholds its `initialize` reply from the
     // *first* spawned process until stdin closes, then sleeps briefly before
     // finally sending that (by then late) response and exiting. Every later
@@ -538,9 +630,10 @@ fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer
     config.stop_force_timeout = Duration::from_secs(2);
     let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
     let marker = dir.join("timeout_once.marker");
-    config
-        .extra_env
-        .push(("FAKE_SERVER_MODE".to_string(), "timeout_then_late_response".to_string()));
+    config.extra_env.push((
+        "FAKE_SERVER_MODE".to_string(),
+        "timeout_then_late_response".to_string(),
+    ));
     config.extra_env.push((
         "FAKE_SERVER_TIMEOUT_ONCE_MARKER".to_string(),
         marker.display().to_string(),
@@ -562,7 +655,9 @@ fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer
     // A second, explicit start spawns a fresh process (the marker file now
     // exists, so this one answers `initialize` immediately) and must reach
     // `Ready` on a newer generation of its own.
-    let second = runtime.start().expect("second explicit start should succeed");
+    let second = runtime
+        .start()
+        .expect("second explicit start should succeed");
     assert_eq!(second.state, RuntimeState::Ready);
     assert!(second.generation > cancelled_status.generation);
 
@@ -607,7 +702,7 @@ fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer
 
 #[test]
 fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_continues_and_blocks_the_next_operation()
-{
+ {
     // `timeout_then_late_response`'s first spawned process withholds its
     // `initialize` reply until stdin closes, then sleeps a fixed delay
     // (`FAKE_SERVER_TIMEOUT_ONCE_DELAY_MS`) before finally sending that (by
@@ -631,9 +726,10 @@ fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_con
     config.stop_force_timeout = Duration::from_secs(5);
     let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
     let marker = dir.join("timeout_once.marker");
-    config
-        .extra_env
-        .push(("FAKE_SERVER_MODE".to_string(), "timeout_then_late_response".to_string()));
+    config.extra_env.push((
+        "FAKE_SERVER_MODE".to_string(),
+        "timeout_then_late_response".to_string(),
+    ));
     config.extra_env.push((
         "FAKE_SERVER_TIMEOUT_ONCE_MARKER".to_string(),
         marker.display().to_string(),
@@ -695,7 +791,9 @@ fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_con
     // that cleanup to actually confirm the old process is gone before the
     // coordinator may spawn a new one.
     let next_started_at = std::time::Instant::now();
-    let next = runtime.start().expect("next explicit start should succeed once cleanup completes");
+    let next = runtime
+        .start()
+        .expect("next explicit start should succeed once cleanup completes");
     let next_elapsed = next_started_at.elapsed();
     assert_eq!(next.state, RuntimeState::Ready);
     assert!(
@@ -709,14 +807,13 @@ fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_con
 }
 
 #[test]
-fn cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart() {
-    // An artificially zero-length grace/force timeout means `stop`'s single
-    // post-kill `try_wait` check has no realistic chance to observe the
-    // exit that `kill()` only just asked the OS to perform, so cleanup is
-    // reported as unconfirmed (`RestartBlocked`) even though the process
-    // itself is not adversarial. `FAKE_SERVER_IGNORE_STOP` guarantees the
-    // grace phase cannot exit voluntarily either, so a forced kill is
-    // always attempted.
+fn stop_result_matches_whether_the_os_confirms_child_exit_immediately() {
+    // Zero-length timeouts force the grace phase to expire and make stop
+    // attempt a kill. Whether the *next* try_wait already observes that
+    // kill is an OS scheduling race: both a confirmed `Stopped` result and
+    // `RestartBlocked` are valid. The deterministic FakeProcess unit test
+    // `reports_restart_blocked_when_process_never_confirms_exit` covers the
+    // latter branch without relying on process scheduling.
     let mut config = base_config("cleanup_unconfirmed");
     config.stop_grace_timeout = Duration::ZERO;
     config.stop_force_timeout = Duration::ZERO;
@@ -727,10 +824,35 @@ fn cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart() {
 
     runtime.start().expect("start should succeed");
 
-    let stop_result = runtime.stop();
-    assert!(matches!(stop_result, Err(RuntimeError::RestartBlocked)));
-    assert!(runtime.snapshot().restart_blocked);
-    assert_eq!(runtime.snapshot().state, RuntimeState::Failed);
+    match runtime.stop() {
+        Ok(status) => {
+            assert_eq!(status.state, RuntimeState::Stopped);
+            assert!(!status.restart_blocked);
+        }
+        Err(RuntimeError::RestartBlocked) => {
+            let status = runtime.snapshot();
+            assert_eq!(status.state, RuntimeState::Failed);
+            assert!(status.restart_blocked);
+        }
+        Err(error) => panic!("stop returned an unexpected error: {error}"),
+    }
+
+    // A new lifecycle operation is an explicit retry. If the prior stop
+    // could not yet confirm exit, it remains blocked until a later retry can
+    // confirm the old child is gone; it must not start a replacement early.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let restarted = loop {
+        match runtime.start() {
+            Ok(status) => break status,
+            Err(RuntimeError::RestartBlocked) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("explicit start retry failed: {error}"),
+        }
+    };
+    assert_eq!(restarted.state, RuntimeState::Ready);
+    assert!(!restarted.restart_blocked);
+    let _ = runtime.stop();
 }
 
 #[test]
@@ -807,27 +929,25 @@ fn crash_cleanup_signals_shutdown_before_waiting_out_the_full_grace_timeout() {
     // handshake reply against closing its stdout and could lose, exactly
     // like the process that just crashed. Removing it first lets the
     // restarted process behave like a normal one.
-    std::fs::remove_file(&close_stdout_trigger).expect("failed to remove close-stdout trigger file");
+    std::fs::remove_file(&close_stdout_trigger)
+        .expect("failed to remove close-stdout trigger file");
 
-    let restarted = runtime.start().expect("a later start should succeed once cleanup is confirmed");
+    let restarted = runtime
+        .start()
+        .expect("a later start should succeed once cleanup is confirmed");
     assert_eq!(restarted.state, RuntimeState::Ready);
     let _ = runtime.stop();
 }
 
 #[test]
-fn shutdown_does_not_release_the_owner_lock_until_the_unconfirmed_child_actually_exits() {
+fn shutdown_releases_the_owner_lock_after_child_exit_is_confirmed() {
     // Same zero-timeout setup as
-    // `cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart`,
-    // but exercised through `shutdown()`, whose coordinator thread exits
-    // right after this cleanup attempt instead of continuing to serve later
-    // lifecycle commands. If the coordinator simply dropped its `current`
-    // `Child` and `owner_guard` on the way out, the owner lock would be
-    // released even though the killed child has not yet been confirmed
-    // gone, letting a new owner start concurrently with it. This test
-    // verifies end-to-end that the lock does eventually get released once
-    // the child is confirmed gone; see the module-level note further down
-    // for why the stronger "not released before confirmation" property is
-    // instead verified by a deterministic unit test rather than here.
+    // `stop_result_matches_whether_the_os_confirms_child_exit_immediately`,
+    // exercised through `shutdown()`. As in the stop test, OS scheduling may
+    // let the final try_wait confirm exit immediately or only in the
+    // background cleanup worker. The stronger "never release before
+    // confirmation" property is checked deterministically by
+    // `wait_for_confirmation_then_release_never_drops_the_resource_before_confirmation`.
     let mut config = base_config("shutdown_unconfirmed");
     config.stop_grace_timeout = Duration::ZERO;
     config.stop_force_timeout = Duration::ZERO;
@@ -840,23 +960,16 @@ fn shutdown_does_not_release_the_owner_lock_until_the_unconfirmed_child_actually
     runtime.start().expect("start should succeed");
 
     let status = runtime.shutdown();
-    assert_eq!(status.state, RuntimeState::Failed);
-    assert!(status.restart_blocked);
+    assert!(
+        (status.state == RuntimeState::Stopped && !status.restart_blocked)
+            || (status.state == RuntimeState::Failed && status.restart_blocked),
+        "shutdown must either confirm the killed child or report restart blocked, got {status:?}"
+    );
 
-    // Whether a fresh acquire attempt made right here would still fail is a
-    // real-process timing race: the killed child's exit and the background
-    // cleanup worker's first `try_wait()` (spawned by `shutdown()` to
-    // confirm it and release the owner lock on its behalf, since this
-    // coordinator thread is exiting) both happen asynchronously with this
-    // test thread, so the worker can legitimately have already confirmed the
-    // exit and released the lock before this point. That the lock is never
-    // released *before* such confirmation is instead covered deterministically
-    // (with no real process or thread involved) by
-    // `wait_for_confirmation_then_release_never_drops_the_resource_before_confirmation`
-    // in `crates/ai/src/runtime.rs`. What this integration test still
-    // verifies end-to-end is that the lock *does* eventually get released
-    // once the already-killed child actually exits, so a later runtime can
-    // start again.
+    // If shutdown reported the child unconfirmed, its background cleanup
+    // worker retains the lock until try_wait confirms exit. If shutdown
+    // returned Stopped, that confirmation already happened synchronously.
+    // In either case, a later owner can eventually acquire the lock.
     let lock = OwnerLock::new(&lock_path);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

@@ -9,6 +9,7 @@
 
 import AppKit
 import Carbon
+import CoreImage
 import CryptoKit
 import Darwin
 import Foundation
@@ -337,7 +338,29 @@ func activateApplication(_ pid: pid_t) {
     }
     _ = application.activate(options: [.activateAllWindows])
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
-    Thread.sleep(forTimeInterval: 0.3)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+    let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    guard application.isActive || frontmostPID == pid else {
+        fail("target application did not become the frontmost app: \(pid)")
+    }
+}
+
+func applicationFocusEvidence(_ pid: pid_t, _ windowID: CGWindowID) ->
+    (frontmostPID: Int?, applicationActive: Bool, targetWindowVisible: Bool) {
+    let frontmostPID = NSWorkspace.shared.frontmostApplication.map {
+        Int($0.processIdentifier)
+    }
+    let applicationActive = NSRunningApplication(processIdentifier: pid)?.isActive ?? false
+    let windows = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+    ) as? [[String: Any]] ?? []
+    let targetWindowVisible = windows.contains { row in
+        guard let ownerPID = row[kCGWindowOwnerPID as String] as? Int,
+              let number = row[kCGWindowNumber as String] as? Int,
+              let layer = row[kCGWindowLayer as String] as? Int else { return false }
+        return ownerPID == Int(pid) && number == Int(windowID) && layer == 0
+    }
+    return (frontmostPID, applicationActive, targetWindowVisible)
 }
 
 func deactivateApplication() {
@@ -464,6 +487,9 @@ func focusEditor(_ pid: pid_t) {
         x: bounds.midX,
         y: bounds.minY + bounds.height * 0.5
     )
+    // `focus(pid)` verifies the app is frontmost before the click. This helper
+    // is a separate short-lived process; the later measurement helpers
+    // reactivate Hane again immediately before each wheel event.
     focus(pid)
     postClick(point)
 }
@@ -553,8 +579,7 @@ func endDocTypeSave(_ pid: pid_t, _ text: String) {
 
 func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
     let bounds = windowBounds(pid)
-    runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
-    Thread.sleep(forTimeInterval: 0.3)
+    activateApplication(pid)
     let point = CGPoint(x: bounds.midX, y: bounds.midY)
     guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left),
@@ -594,16 +619,43 @@ func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32) -> Time
     return postedAt
 }
 
-let machSecondsPerTick: Double = {
+// Separate from `postScroll` above: that function's seconds-based return value
+// is relied on by the existing wheel-capture/wheel-reversal scenarios, so this
+// adds a raw-ticks variant for the measurement-only wheel-measure command
+// instead of changing what postScroll reports (Issue #427).
+@discardableResult
+func postScrollTicks(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32) -> UInt64 {
+    let bounds = windowBounds(pid)
+    guard let event = CGEvent(
+        scrollWheelEvent2Source: nil,
+        units: unit,
+        wheelCount: 1,
+        wheel1: delta,
+        wheel2: 0,
+        wheel3: 0
+    ) else { fail("could not create OS scroll event") }
+    event.location = CGPoint(x: bounds.midX, y: bounds.midY)
+    let postedTicks = monotonicTicks()
+    event.post(tap: .cghidEventTap)
+    return postedTicks
+}
+
+let machTimebaseInfo: mach_timebase_info_data_t = {
     var timebase = mach_timebase_info_data_t()
     guard mach_timebase_info(&timebase) == KERN_SUCCESS, timebase.denom != 0 else {
         fail("could not read mach clock timebase")
     }
-    return Double(timebase.numer) / Double(timebase.denom) / 1_000_000_000
+    return timebase
 }()
+
+let machSecondsPerTick: Double = Double(machTimebaseInfo.numer) / Double(machTimebaseInfo.denom) / 1_000_000_000
 
 func monotonicSeconds() -> TimeInterval {
     Double(mach_absolute_time()) * machSecondsPerTick
+}
+
+func monotonicTicks() -> UInt64 {
+    mach_absolute_time()
 }
 
 final class WindowCapture: @unchecked Sendable {
@@ -710,11 +762,259 @@ func captureImageWithTimes(_ capture: WindowCapture) -> (CapturedWindowFrame?, S
     return (CapturedWindowFrame(image: image, started: started, completed: completed), nil)
 }
 
+struct CapturedWindowFrameTicks {
+    let image: CGImage
+    let startedTicks: UInt64
+    let completedTicks: UInt64
+}
+
+struct CapturedWindowDisplayFrame {
+    let image: CGImage
+    let sampleID: UInt64
+    let displayTicks: UInt64
+    let callbackReceivedTicks: UInt64
+    let imageReadyTicks: UInt64
+}
+
+/// Captures complete ScreenCaptureKit frames displayed after a scroll input.
+/// Each image and WindowServer display timestamp are extracted from the same
+/// CMSampleBuffer; SCScreenshotManager frames remain separate evidence for
+/// the later coast/settling measurements.
+final class WindowServerDisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private let capture: WindowCapture
+    private var stream: SCStream?
+    private let callbackQueue = DispatchQueue(label: "hane.window-server-display-capture", qos: .userInitiated)
+    private let imageContext = CIContext()
+    private let condition = NSCondition()
+    private let responseWindowTicks = UInt64(0.135 / machSecondsPerTick)
+    private let maximumResponseFrames = 64
+    private var streamStarted = false
+    private var eventPostTicks: UInt64?
+    private var nextSampleID: UInt64 = 0
+    private var responseFrames: [CapturedWindowDisplayFrame] = []
+    private var lastResponseDisplayTicks: UInt64?
+    private var responseCollectionValid = true
+    private var lastError: String?
+
+    init(capture: WindowCapture) {
+        self.capture = capture
+        super.init()
+    }
+
+    func start() -> String? {
+        let stream = SCStream(filter: capture.filter, configuration: capture.configuration, delegate: self)
+        self.stream = stream
+        do {
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: callbackQueue)
+        } catch {
+            return String(describing: error)
+        }
+
+        let result = WindowCaptureResult()
+        let completed = DispatchSemaphore(value: 0)
+        stream.startCapture { error in
+            result.finish(error: error.map { String(describing: $0) })
+            completed.signal()
+        }
+        guard completed.wait(timeout: .now() + 10) == .success else {
+            return "timed out while starting ScreenCaptureKit display stream"
+        }
+        let (_, _, error) = result.values()
+        guard error == nil else { return error }
+        return waitUntilStarted(timeout: 10)
+    }
+
+    func markEventPosted(_ ticks: UInt64) {
+        condition.lock()
+        eventPostTicks = ticks
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func waitForDisplayResponses(timeout: TimeInterval) -> ([CapturedWindowDisplayFrame], Bool, String?) {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        while responseFrames.isEmpty && Date() < deadline {
+            if !condition.wait(until: deadline) { break }
+        }
+        let frames = responseFrames
+        let collectionValid = responseCollectionValid
+        let error = lastError
+        condition.unlock()
+        guard !frames.isEmpty else {
+            return ([], collectionValid,
+                    error ?? "no complete ScreenCaptureKit frame with a valid WindowServer display time followed the scroll input")
+        }
+
+        // Do not return a sample as already-presented until the shared mach
+        // clock has reached its attached WindowServer display timestamp.
+        let latestDisplayTicks = frames.last!.displayTicks
+        while true {
+            let nowTicks = monotonicTicks()
+            if nowTicks >= latestDisplayTicks { break }
+            let remaining = Double(latestDisplayTicks - nowTicks) * machSecondsPerTick
+            if remaining > 0 { Thread.sleep(forTimeInterval: min(remaining, 0.01)) }
+        }
+        return (frames, collectionValid, nil)
+    }
+
+    func stop() -> String? {
+        guard let stream else { return nil }
+        let result = WindowCaptureResult()
+        let completed = DispatchSemaphore(value: 0)
+        stream.stopCapture { error in
+            result.finish(error: error.map { String(describing: $0) })
+            completed.signal()
+        }
+        guard completed.wait(timeout: .now() + 10) == .success else {
+            return "timed out while stopping ScreenCaptureKit display stream"
+        }
+        let (_, _, error) = result.values()
+        callbackQueue.sync {}
+        self.stream = nil
+        return error
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+                of outputType: SCStreamOutputType) {
+        let callbackReceivedTicks = monotonicTicks()
+        guard outputType == .screen else {
+            rememberError("ScreenCaptureKit emitted a non-screen sample")
+            return
+        }
+        guard sampleBuffer.isValid else {
+            rememberError("ScreenCaptureKit emitted an invalid CMSampleBuffer")
+            return
+        }
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer, createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]] else {
+            rememberError("ScreenCaptureKit frame attachments could not be read as SCStreamFrameInfo dictionaries")
+            return
+        }
+        guard let attachments = attachmentsArray.first else {
+            rememberError("ScreenCaptureKit sample had no frame attachment dictionary")
+            return
+        }
+        guard let statusValue = attachments[SCStreamFrameInfo.status] else {
+            rememberError("ScreenCaptureKit frame attachments had no status value")
+            return
+        }
+        // Apple exposes this attachment as an integer raw value; casting the
+        // boxed attachment directly to SCFrameStatus rejects valid samples.
+        guard let statusRawValue = statusValue as? Int else {
+            rememberError("ScreenCaptureKit status attachment was not an Int: \(type(of: statusValue))")
+            return
+        }
+        guard let status = SCFrameStatus(rawValue: statusRawValue) else {
+            rememberError("ScreenCaptureKit status attachment had unknown raw value: \(statusRawValue)")
+            return
+        }
+
+        condition.lock()
+        nextSampleID += 1
+        let sampleID = nextSampleID
+        streamStarted = true
+        let inputTicks = eventPostTicks
+        condition.broadcast()
+        condition.unlock()
+
+        guard let inputTicks, status == .complete else { return }
+        guard let displayTicks = attachments[SCStreamFrameInfo.displayTime] as? UInt64,
+              displayTicks > 0 else {
+            rememberError("complete ScreenCaptureKit sample had no valid post-input displayTime")
+            return
+        }
+        // Samples displayed before the event are stale. The measurement
+        // window ends at the existing 135ms inertia boundary; the separate
+        // 80ms observer gate evaluates the actual display timestamps within it.
+        guard callbackReceivedTicks >= inputTicks, displayTicks >= inputTicks else { return }
+        let (latestAllowedTicks, overflow) = inputTicks.addingReportingOverflow(responseWindowTicks)
+        guard !overflow, displayTicks <= latestAllowedTicks else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            rememberError("complete ScreenCaptureKit sample had no image buffer")
+            return
+        }
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let image = imageContext.createCGImage(ciImage, from: ciImage.extent) else {
+            rememberError("could not create an image from the timed ScreenCaptureKit sample")
+            return
+        }
+        let imageReadyTicks = monotonicTicks()
+        condition.lock()
+        if let lastResponseDisplayTicks, displayTicks <= lastResponseDisplayTicks {
+            responseCollectionValid = false
+            lastError = "ScreenCaptureKit display timestamps were not strictly increasing"
+        } else if responseFrames.count >= maximumResponseFrames {
+            responseCollectionValid = false
+            lastError = "ScreenCaptureKit display response exceeded the bounded frame collection"
+        } else {
+            responseFrames.append(CapturedWindowDisplayFrame(
+                image: image,
+                sampleID: sampleID,
+                displayTicks: displayTicks,
+                callbackReceivedTicks: callbackReceivedTicks,
+                imageReadyTicks: imageReadyTicks
+            ))
+            self.lastResponseDisplayTicks = displayTicks
+        }
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        rememberError("ScreenCaptureKit display stream stopped: \(error)")
+    }
+
+    private func waitUntilStarted(timeout: TimeInterval) -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while !streamStarted && Date() < deadline {
+            if !condition.wait(until: deadline) { break }
+        }
+        if streamStarted { return nil }
+        return lastError ?? "timed out waiting for a ScreenCaptureKit frame callback"
+    }
+
+    private func rememberError(_ message: String) {
+        condition.lock()
+        responseCollectionValid = false
+        lastError = message
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+// Raw-ticks counterpart of captureImageWithTimes, used only by wheel-measure
+// so that its frame times are directly comparable (same mach clock, no
+// seconds round-trip) with the product-side ticks it polls for (Issue #427).
+func captureImageWithTimesTicks(_ capture: WindowCapture) -> (CapturedWindowFrameTicks?, String?) {
+    let started = monotonicTicks()
+    let (image, error) = captureWindowImage(capture)
+    let completed = monotonicTicks()
+    guard let image else { return (nil, error ?? "screenshot unavailable") }
+    return (CapturedWindowFrameTicks(image: image, startedTicks: started, completedTicks: completed), nil)
+}
+
 func visibleLineNumbers(_ image: CGImage) -> [Int] {
+    // `.fast` recognition with `["en-US"]` reproduced a Vision crash during
+    // ScreenCaptureKit warm-up on a local macOS 26.6.2 run (Issue #427); a
+    // separate offline probe against that one saved baseline image showed
+    // `.accurate` with `["en-US", "ja-JP"]` does not crash there. That probe
+    // ran outside this hosted GUI path, so it is evidence of a plausible
+    // mitigation, not proof this configuration is crash-free during an
+    // actual run — it is also already the configuration `recognizeText` and
+    // `findTextMatch` use below, so this reuses their proven request instead
+    // of a separately tuned one. If Vision still throws against a live
+    // capture, the `catch` below must keep surfacing the raw error through
+    // `fail` (exit 2) so the Python harness observes this as
+    // measurement-unavailable/blocked, never as a product failure or a
+    // silently empty/synthesized result.
     let request = VNRecognizeTextRequest()
-    request.recognitionLevel = .fast
+    request.recognitionLevel = .accurate
     request.usesLanguageCorrection = false
-    request.recognitionLanguages = ["en-US"]
+    request.recognitionLanguages = ["en-US", "ja-JP"]
     do {
         try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
     } catch {
@@ -749,11 +1049,28 @@ func prepareWindowCaptureContext(_ windowID: CGWindowID) -> WindowCapture {
     return capture
 }
 
+/// Captures the target window after one wheel event, optionally attaching
+/// Hane's matching event-receipt and frame-paint timestamps.
 func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
-                  _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int]) {
+                  _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int],
+                  timingPath: String? = nil, pollTimeoutMs: Int = 0) {
     let capture = prepareWindowCaptureContext(windowID)
+    // This is a short-lived command-line helper. Reassert the app foreground
+    // after the capture warmup and immediately before posting the wheel event.
+    // The activation stays outside the measured input-to-frame interval.
+    focus(pid)
     let commandStarted = monotonicSeconds()
-    let eventPosted = postScroll(pid, unit, delta)
+    let timingOffsetBefore = timingPath.map(fileSizeOrZero) ?? 0
+    let eventPostedTicks: UInt64?
+    let eventPosted: TimeInterval
+    if timingPath != nil {
+        let ticks = postScrollTicks(pid, unit, delta)
+        eventPostedTicks = ticks
+        eventPosted = Double(ticks) * machSecondsPerTick
+    } else {
+        eventPostedTicks = nil
+        eventPosted = postScroll(pid, unit, delta)
+    }
     guard eventPosted >= commandStarted else { fail("scroll event timing was invalid") }
 
     var frames: [(Int, CapturedWindowFrame)] = []
@@ -768,6 +1085,21 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         frames.append((index, frame))
     }
 
+    var productTiming: ProductScrollTiming?
+    if let timingPath {
+        let pollDeadline = Date().addingTimeInterval(Double(max(0, pollTimeoutMs)) / 1000)
+        if let eventPostedTicks {
+            repeat {
+                productTiming = readScrollEventTiming(
+                    timingPath, since: timingOffsetBefore, forEventPostedAt: eventPostedTicks
+                )
+                if productTiming == nil && Date() < pollDeadline {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+            } while productTiming == nil && Date() < pollDeadline
+        }
+    }
+
     try? FileManager.default.createDirectory(
         at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
         withIntermediateDirectories: true
@@ -779,58 +1111,248 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     }
     print("event_route=cghidEventTap")
     print("event_post_elapsed_ms=\(milliseconds(eventPosted - commandStarted))")
+    if let eventPostedTicks {
+        print("event_post_ticks=\(eventPostedTicks)")
+        print("mach_timebase_numer=\(machTimebaseInfo.numer)")
+        print("mach_timebase_denom=\(machTimebaseInfo.denom)")
+        if let productTiming {
+            print("product_scroll_receipt_ticks=\(productTiming.receiptTicks)")
+            print("product_frame_paint_ticks=\(productTiming.paintTicks)")
+            print("product_frame_presented_ticks=unavailable")
+            print("product_mach_timebase_numer=\(productTiming.timebaseNumer)")
+            print("product_mach_timebase_denom=\(productTiming.timebaseDenom)")
+        } else {
+            print("product_scroll_receipt_ticks=unavailable")
+            print("product_frame_paint_ticks=unavailable")
+            print("product_frame_presented_ticks=unavailable")
+            print("product_mach_timebase_numer=unavailable")
+            print("product_mach_timebase_denom=unavailable")
+        }
+    }
     for (index, frame) in frames {
         print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - eventPosted))
         print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - eventPosted))
     }
 }
 
+/// Reads complete timing records appended since `offset` and returns the
+/// first parseable record received at or after the current event post. A late
+/// record for an earlier event, malformed rows, and a final partial line are
+/// ignored; if no matching record is available, the caller reports product
+/// timing as unavailable rather than guessing (Issue #427).
+func readScrollEventTiming(_ path: String, since offset: UInt64,
+                           forEventPostedAt eventPostedTicks: UInt64) -> ProductScrollTiming? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+    do {
+        try handle.seek(toOffset: offset)
+    } catch {
+        return nil
+    }
+    let data = handle.readDataToEndOfFile()
+    guard let lastNewline = data.lastIndex(of: 10) else { return nil }
+    let completeLines = data.prefix(through: lastNewline)
+    for lineData in completeLines.split(separator: 10, omittingEmptySubsequences: true) {
+        guard let line = String(data: lineData, encoding: .utf8),
+              let timing = parseScrollEventTimingLine(line),
+              timing.receiptTicks >= eventPostedTicks else {
+            continue
+        }
+        return timing
+    }
+    return nil
+}
+
+struct ProductScrollTiming {
+    let receiptTicks: UInt64
+    // Hane's own frame paint/submission time (`InputCapture::paint`), not
+    // compositor presentation: the product process has no trustworthy
+    // presentation timestamp on this clock, so it always writes
+    // `scroll_frame_presented_ticks=unavailable` and this helper never reads
+    // that field as a ticks value.
+    let paintTicks: UInt64
+    let timebaseNumer: UInt32
+    let timebaseDenom: UInt32
+}
+
+/// Parses the required fields from one product scroll-timing record.
+func parseScrollEventTimingLine(_ line: String) -> ProductScrollTiming? {
+    var fields: [String: String] = [:]
+    for pair in line.split(separator: " ") {
+        let parts = pair.split(separator: "=", maxSplits: 1)
+        guard parts.count == 2 else { continue }
+        fields[String(parts[0])] = String(parts[1])
+    }
+    guard let receiptTicks = fields["scroll_receipt_ticks"].flatMap(UInt64.init),
+          let paintTicks = fields["scroll_frame_paint_ticks"].flatMap(UInt64.init),
+          let numer = fields["mach_timebase_numer"].flatMap(UInt32.init),
+          let denom = fields["mach_timebase_denom"].flatMap(UInt32.init) else {
+        return nil
+    }
+    return ProductScrollTiming(receiptTicks: receiptTicks, paintTicks: paintTicks,
+                               timebaseNumer: numer, timebaseDenom: denom)
+}
+
+/// Returns the timing file size before an input event, or zero if unavailable.
+func fileSizeOrZero(_ path: String) -> UInt64 {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+          let size = attributes[.size] as? UInt64 else {
+        return 0
+    }
+    return size
+}
+
+/// Captures screen and product timing for diagnosis without evaluating
+/// Issue #389 acceptance thresholds or inferring compositor presentation.
+func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
+                  _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int],
+                  _ timingPath: String, _ pollTimeoutMs: Int) {
+    let capture = prepareWindowCaptureContext(windowID)
+    let displayCapture = WindowServerDisplayCapture(capture: capture)
+    if let error = displayCapture.start() {
+        fail("could not start WindowServer display measurement: \(error)")
+    }
+    // ScreenCaptureKit setup runs in this helper process, so restore Hane as
+    // the foreground app before the timestamped input event.
+    focus(pid)
+    let focusEvidence = applicationFocusEvidence(pid, windowID)
+    let timingOffsetBefore = fileSizeOrZero(timingPath)
+
+    let eventPostedTicks = postScrollTicks(pid, unit, delta)
+    displayCapture.markEventPosted(eventPostedTicks)
+    let eventPostedSeconds = Double(eventPostedTicks) * machSecondsPerTick
+
+    var frames: [(Int, CapturedWindowFrameTicks)] = []
+    for (index, delayMs) in frameDelays.enumerated() {
+        let deadline = eventPostedSeconds + Double(delayMs) / 1000
+        let remaining = deadline - monotonicSeconds()
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+        let (frame, error) = captureImageWithTimesTicks(capture)
+        guard let frame else {
+            fail("could not capture scroll frame \(index): \(error ?? "unknown error")")
+        }
+        frames.append((index, frame))
+    }
+
+    // Polled only after every timed frame capture above, so waiting for the
+    // product's record never itself delays or displaces a capture inside the
+    // inertia window; a slow or missing product record only costs this final
+    // poll budget.
+    let pollDeadline = Date().addingTimeInterval(Double(pollTimeoutMs) / 1000)
+    var productTiming: ProductScrollTiming?
+    repeat {
+        productTiming = readScrollEventTiming(
+            timingPath, since: timingOffsetBefore, forEventPostedAt: eventPostedTicks
+        )
+        if productTiming == nil && Date() < pollDeadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    } while productTiming == nil && Date() < pollDeadline
+
+    if let stopError = displayCapture.stop() {
+        fail("could not stop WindowServer display measurement: \(stopError)")
+    }
+    let (displayResponses, displayCollectionValid, displayError) =
+        displayCapture.waitForDisplayResponses(timeout: 10)
+    guard !displayResponses.isEmpty else {
+        fail("could not capture a timed WindowServer display response: \(displayError ?? "unknown error")")
+    }
+
+    try? FileManager.default.createDirectory(
+        at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    for (index, frame) in frames {
+        let path = URL(fileURLWithPath: frameDirectory, isDirectory: true)
+            .appendingPathComponent(String(format: "frame-%02d.png", index)).path
+        writeWindowImage(frame.image, path: path)
+    }
+    let displayResponsePaths = displayResponses.enumerated().map { index, response in
+        let path = URL(fileURLWithPath: frameDirectory, isDirectory: true)
+            .appendingPathComponent(String(format: "display-response-%02d.png", index)).path
+        writeWindowImage(response.image, path: path)
+        return path
+    }
+    let displayResponseArtifactWrittenTicks = monotonicTicks()
+    let frontmostPIDText = focusEvidence.frontmostPID.map { String($0) } ?? "unavailable"
+    let applicationActiveText = focusEvidence.applicationActive ? "true" : "false"
+    let targetWindowVisibleText = focusEvidence.targetWindowVisible ? "true" : "false"
+
+    print("event_route=cghidEventTap")
+    print("focus_target_pid=\(pid)")
+    print("focus_frontmost_pid=\(frontmostPIDText)")
+    print("focus_application_active=\(applicationActiveText)")
+    print("focus_target_window_visible=\(targetWindowVisibleText)")
+    print("event_post_ticks=\(eventPostedTicks)")
+    print("mach_timebase_numer=\(machTimebaseInfo.numer)")
+    print("mach_timebase_denom=\(machTimebaseInfo.denom)")
+    if let productTiming {
+        print("product_scroll_receipt_ticks=\(productTiming.receiptTicks)")
+        print("product_frame_paint_ticks=\(productTiming.paintTicks)")
+        // Hane never observes true compositor presentation on this clock;
+        // always report it unavailable rather than inferring it from paint.
+        print("product_frame_presented_ticks=unavailable")
+        print("product_mach_timebase_numer=\(productTiming.timebaseNumer)")
+        print("product_mach_timebase_denom=\(productTiming.timebaseDenom)")
+    } else {
+        print("product_scroll_receipt_ticks=unavailable")
+        print("product_frame_paint_ticks=unavailable")
+        print("product_frame_presented_ticks=unavailable")
+        print("product_mach_timebase_numer=unavailable")
+        print("product_mach_timebase_denom=unavailable")
+    }
+    print("display_response_count=\(displayResponses.count)")
+    print("display_response_collection_valid=\(displayCollectionValid ? "true" : "false")")
+    for (index, response) in displayResponses.enumerated() {
+        let prefix = String(format: "display_response_%02d_", index)
+        print(prefix + "sample_id=\(response.sampleID)")
+        print(prefix + "frame_status=complete")
+        print(prefix + "timestamp_source=SCStreamFrameInfo.displayTime")
+        print(prefix + "image_source=same_CMSampleBuffer")
+        print(prefix + "display_time_ticks=\(response.displayTicks)")
+        print(prefix + "callback_received_ticks=\(response.callbackReceivedTicks)")
+        print(prefix + "image_ready_ticks=\(response.imageReadyTicks)")
+        print(prefix + "artifact_written_ticks=\(displayResponseArtifactWrittenTicks)")
+        print(prefix + "image_path=\(displayResponsePaths[index])")
+    }
+    for (index, frame) in frames {
+        print(String(format: "frame_%02d_capture_started_ticks=", index) + String(frame.startedTicks))
+        print(String(format: "frame_%02d_capture_completed_ticks=", index) + String(frame.completedTicks))
+    }
+}
+
 func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
-                   _ reverseDelta: Int32, _ baseline: Int, _ firstProbeMs: Int,
-                   _ probeIntervalMs: Int, _ windowID: CGWindowID,
-                   _ prePath: String, _ frameDirectory: String, _ frameDelays: [Int]) {
-    guard firstProbeMs > 0, probeIntervalMs > 0 else { fail("reversal probe intervals must be positive") }
+                   _ reverseDelta: Int32, _ preProbeDelaysMs: [Int], _ windowID: CGWindowID,
+                   _ preFrameDirectory: String, _ frameDirectory: String, _ frameDelays: [Int]) {
     let capture = prepareWindowCaptureContext(windowID)
 
+    focus(pid)
     let commandStarted = monotonicSeconds()
     // Keep both reversal-probe inputs on the same global Quartz event path as
     // the other GUI scenarios, including normal window-server target routing.
     let firstPosted = postScroll(pid, unit, delta)
-    let firstProbeDeadline = firstPosted + Double(firstProbeMs) / 1000
-    let firstProbeRemaining = firstProbeDeadline - monotonicSeconds()
-    if firstProbeRemaining > 0 { Thread.sleep(forTimeInterval: firstProbeRemaining) }
 
-    // Wait for an old-direction frame before reversing. This makes the
-    // reversal scenario measure response to a visible Lines movement instead
-    // of sending both events before the first one reaches the screen.
-    var preImage: CGImage?
-    var preStarted: TimeInterval = 0
-    var preCompleted: TimeInterval = 0
-    var preLines: [Int] = []
-    var confirmedOldDirection = false
-    let probeDeadline = firstPosted + 0.105
-    while monotonicSeconds() < probeDeadline {
+    // Capture every pre-reversal candidate frame before sending the reverse
+    // input. A single candidate can miss the old-direction motion depending
+    // on exactly when it lands, so multiple candidates are captured and the
+    // reverse input is sent right after the latest one. Vision OCR does not
+    // run in this loop: it can take longer than the remaining Lines coast
+    // and would postpone the reverse input itself.
+    var preFrames: [(Int, CapturedWindowFrame)] = []
+    for (index, delayMs) in preProbeDelaysMs.enumerated() {
+        let deadline = firstPosted + Double(delayMs) / 1000
+        let remaining = deadline - monotonicSeconds()
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
         let (frame, error) = captureImageWithTimes(capture)
         guard let frame else {
-            fail("could not capture pre-reversal window frame: \(error ?? "unknown error")")
+            fail("could not capture pre-reversal window frame \(index): \(error ?? "unknown error")")
         }
-        preImage = frame.image
-        preStarted = frame.started
-        preCompleted = frame.completed
-        preLines = visibleLineNumbers(frame.image)
-        if preLines.min().map({ $0 > baseline }) == true {
-            confirmedOldDirection = true
-            break
+        let startedMs = milliseconds(frame.started - firstPosted)
+        let completedMs = milliseconds(frame.completed - firstPosted)
+        guard frame.completed < firstPosted + 0.135 else {
+            fail("pre-reversal frame \(index) started at \(startedMs)ms and completed at \(completedMs)ms; the Lines inertia deadline is 135ms")
         }
-        let nextProbe = frame.completed + Double(probeIntervalMs) / 1000
-        let remaining = min(nextProbe, probeDeadline) - monotonicSeconds()
-        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
-    }
-    guard confirmedOldDirection, let confirmedPreImage = preImage else {
-        fail("old-direction movement was not visible before reversal")
-    }
-    guard monotonicSeconds() < firstPosted + 0.135 else {
-        fail("old-direction OCR confirmation exceeded the Lines inertia window before reversal")
+        preFrames.append((index, frame))
     }
     let reversePosted = postScroll(pid, unit, reverseDelta)
 
@@ -846,7 +1368,19 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         frames.append((index, frame))
     }
 
-    writeWindowImage(confirmedPreImage, path: prePath)
+    // OCR is intentionally after the reverse event and every timed capture
+    // (pre- and post-reversal); all frames were captured before this point,
+    // so this preserves the evidence ordering without spending the inertia
+    // window on recognition. The caller runs OCR on the written images.
+    try? FileManager.default.createDirectory(
+        at: URL(fileURLWithPath: preFrameDirectory, isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    for (index, frame) in preFrames {
+        let path = URL(fileURLWithPath: preFrameDirectory, isDirectory: true)
+            .appendingPathComponent(String(format: "pre-frame-%02d.png", index)).path
+        writeWindowImage(frame.image, path: path)
+    }
     try? FileManager.default.createDirectory(
         at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
         withIntermediateDirectories: true
@@ -858,11 +1392,12 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     }
 
     print("initial_event_elapsed_ms=\(milliseconds(firstPosted - commandStarted))")
-    print("pre_reverse_capture_started_elapsed_ms=\(milliseconds(preStarted - commandStarted))")
-    print("pre_reverse_capture_completed_elapsed_ms=\(milliseconds(preCompleted - commandStarted))")
-    print("pre_reverse_visible_lines=\(preLines.map(String.init).joined(separator: ","))")
     print("reversal_event_route=cghidEventTap")
     print("reverse_event_elapsed_ms=\(milliseconds(reversePosted - commandStarted))")
+    for (index, frame) in preFrames {
+        print(String(format: "pre_frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - commandStarted))
+        print(String(format: "pre_frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - commandStarted))
+    }
     for (index, frame) in frames {
         print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - reversePosted))
         print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - reversePosted))
@@ -871,7 +1406,7 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|wheel-capture|wheel-reversal|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|wheel-capture|wheel-capture-timed|wheel-measure|wheel-reversal|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -891,6 +1426,7 @@ case "wheel-event":
     guard arguments.count == 4,
           let pid = pid_t(arguments[1]),
           let delta = Int32(arguments[3]) else { fail("wheel-event requires PID, lines|pixels and delta") }
+    activateApplication(pid)
     postScroll(pid, scrollUnit(arguments[2]), delta)
 case "wheel-capture":
     guard arguments.count == 7,
@@ -907,26 +1443,70 @@ case "wheel-capture":
         fail("wheel-capture frame delays must be ascending milliseconds beginning at 0")
     }
     wheelCapture(pid, scrollUnit(arguments[2]), delta, windowID, arguments[5], frameDelays)
+case "wheel-capture-timed":
+    guard arguments.count == 9,
+          let pid = pid_t(arguments[1]),
+          let delta = Int32(arguments[3]),
+          let windowID = UInt32(arguments[4]),
+          let pollTimeoutMs = Int(arguments[8]) else {
+        fail("wheel-capture-timed requires PID, lines|pixels, delta, window ID, frame directory, comma-separated delays, product timing path and poll timeout ms")
+    }
+    let timedFrameDelayTokens = arguments[6].split(separator: ",", omittingEmptySubsequences: false)
+    var timedFrameDelays: [Int] = []
+    for token in timedFrameDelayTokens {
+        guard let delay = Int(token) else {
+            fail("wheel-capture-timed frame delays must be comma-separated integers")
+        }
+        timedFrameDelays.append(delay)
+    }
+    guard !timedFrameDelays.isEmpty,
+          timedFrameDelays.first == 0,
+          timedFrameDelays == timedFrameDelays.sorted(),
+          timedFrameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
+        fail("wheel-capture-timed frame delays must be ascending milliseconds beginning at 0")
+    }
+    wheelCapture(pid, scrollUnit(arguments[2]), delta, windowID, arguments[5], timedFrameDelays,
+                 timingPath: arguments[7], pollTimeoutMs: pollTimeoutMs)
+case "wheel-measure":
+    guard arguments.count == 9,
+          let pid = pid_t(arguments[1]),
+          let delta = Int32(arguments[3]),
+          let windowID = UInt32(arguments[4]),
+          let pollTimeoutMs = Int(arguments[8]) else {
+        fail("wheel-measure requires PID, lines|pixels, delta, window ID, frame directory, comma-separated delays, product timing path and poll timeout ms")
+    }
+    let measureFrameDelays = arguments[6].split(separator: ",").compactMap { Int($0) }
+    guard !measureFrameDelays.isEmpty,
+          measureFrameDelays.first == 0,
+          measureFrameDelays == measureFrameDelays.sorted(),
+          measureFrameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
+        fail("wheel-measure frame delays must be ascending milliseconds beginning at 0")
+    }
+    wheelMeasure(pid, scrollUnit(arguments[2]), delta, windowID, arguments[5], measureFrameDelays,
+                 arguments[7], pollTimeoutMs)
 case "wheel-reversal":
-    guard arguments.count == 12,
+    guard arguments.count == 10,
           let pid = pid_t(arguments[1]),
           let delta = Int32(arguments[3]),
           let reverseDelta = Int32(arguments[4]),
-          let baseline = Int(arguments[5]),
-          let firstProbeMs = Int(arguments[6]), firstProbeMs > 0,
-          let probeIntervalMs = Int(arguments[7]), probeIntervalMs > 0,
-          let windowID = UInt32(arguments[8]) else {
-        fail("wheel-reversal requires PID, lines|pixels, delta, reverse delta, baseline line, first probe ms, probe interval ms, window ID, pre-image path, frame directory and comma-separated delays")
+          let windowID = UInt32(arguments[6]) else {
+        fail("wheel-reversal requires PID, lines|pixels, delta, reverse delta, comma-separated pre-reverse probe delays ms, window ID, pre-frame directory, frame directory and comma-separated delays")
     }
-    let frameDelays = arguments[11].split(separator: ",").compactMap { Int($0) }
+    let preProbeDelays = arguments[5].split(separator: ",").compactMap { Int($0) }
+    guard !preProbeDelays.isEmpty,
+          preProbeDelays == preProbeDelays.sorted(),
+          preProbeDelays.allSatisfy({ $0 > 0 && $0 <= 130 }) else {
+        fail("wheel-reversal pre-reverse probe delays must be ascending milliseconds within the Lines inertia window")
+    }
+    let frameDelays = arguments[9].split(separator: ",").compactMap { Int($0) }
     guard !frameDelays.isEmpty,
           frameDelays.first == 0,
           frameDelays == frameDelays.sorted(),
           frameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
         fail("wheel-reversal frame delays must be ascending milliseconds beginning at 0")
     }
-    wheelReversal(pid, scrollUnit(arguments[2]), delta, reverseDelta, baseline,
-                  firstProbeMs, probeIntervalMs, windowID, arguments[9], arguments[10], frameDelays)
+    wheelReversal(pid, scrollUnit(arguments[2]), delta, reverseDelta, preProbeDelays,
+                  windowID, arguments[7], arguments[8], frameDelays)
 case "current-source":
     print(currentSourceID())
 case "activate":

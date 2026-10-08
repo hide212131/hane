@@ -422,7 +422,11 @@ impl EditorView {
         cx.notify();
     }
 
-    pub(super) fn inline_rename_has_background_conflict(&self, from: &Path, kind: InlineRenameKind) -> bool {
+    pub(super) fn inline_rename_has_background_conflict(
+        &self,
+        from: &Path,
+        kind: InlineRenameKind,
+    ) -> bool {
         let belongs = |path: &Path| match kind {
             InlineRenameKind::File => path == from,
             InlineRenameKind::Folder => rebase_ui_path(path, from, from).is_some(),
@@ -605,6 +609,7 @@ impl EditorView {
                     }
                 }
                 self.follow_inline_rename_paths(&from, &target, kind);
+                self.content_search_workspace_changed(cx);
                 if let Err(error) = self.stores.recent_files().store(&self.recent) {
                     self.status = Some(format!("Recent files failed: {error}"));
                 } else {

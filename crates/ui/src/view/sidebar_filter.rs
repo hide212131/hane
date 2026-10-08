@@ -3,6 +3,8 @@ use super::*;
 impl EditorView {
     pub(crate) fn sidebar_filter_is_focused(&self) -> bool {
         self.sidebar_filter_focused
+            || self.content_search_input_is_focused()
+            || self.content_search_results_focused()
     }
 
     pub(crate) fn sidebar_filter_character_index_for_point(

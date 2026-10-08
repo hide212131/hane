@@ -108,9 +108,7 @@ pub fn parse_incoming(line: &str) -> Result<IncomingMessage, ParseError> {
             };
             Ok(IncomingMessage::Response { id, outcome })
         }
-        (None, None) => Err(ParseError::Malformed(
-            "message has neither id nor method",
-        )),
+        (None, None) => Err(ParseError::Malformed("message has neither id nor method")),
     }
 }
 

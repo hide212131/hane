@@ -42,7 +42,7 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, PathPromptOptions, PinchEvent, Pixels, Render, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored,
-    div, point, prelude::FluentBuilder, px, rgb,
+    div, point, prelude::FluentBuilder, px, rgb, rgba,
 };
 use gpui_component::Disableable;
 use gpui_component::IconName;
@@ -50,7 +50,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::hover_card::HoverCard;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{Sizable, h_flex};
+use gpui_component::{Selectable, Sizable, h_flex};
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
     TextBuffer,
@@ -71,13 +71,14 @@ use hane_presentation::{
     table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use hane_session::{
-    CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
+    CalendarDate, CloseDecision, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
     FileEventOutcome, FileService, LoadedFile, OpenDecision, OpenPolicy, OsDraftStore,
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
-    Settings, StateStores, TitleSyncAction, WorkFolder, WorkFolderNode, WorkFolderScanner,
-    date_badge_range, decide_title_sync, extract_h1_title, format_relative_date_label, local_today,
-    run_save_job, split_file_name_for_badge, unique_folder_name, unique_markdown_filename,
+    Settings, StateStores, TitleSyncAction, UnsavedChanges, WorkFolder, WorkFolderNode,
+    WorkFolderScanner, date_badge_range, decide_title_sync, extract_h1_title,
+    format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
+    unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -87,7 +88,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
+mod ai_settings;
+mod background_parse;
+mod content_search;
 mod inline_rename;
+mod session_save;
 mod sidebar;
 mod sidebar_filter;
 mod viewport;
@@ -143,6 +148,33 @@ const WHEEL_ZOOM_TIME_CONSTANT: Duration = Duration::from_millis(35);
 const WHEEL_ZOOM_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
 /// Stop scheduling frames once the remaining zoom error is below 0.1%.
 const WHEEL_ZOOM_SETTLE_EPSILON: f32 = 0.001;
+/// The time constant for the main panel's short post-wheel scroll inertia
+/// (issue #389): a plain `ScrollDelta::Lines` scroll keeps coasting after the
+/// input stops, decaying exponentially like `eased_wheel_zoom_step` so the
+/// response is independent of display refresh rate. A shorter time constant
+/// also bounds the visible tail after a rapid burst of large Lines deltas:
+/// a small fraction of a large pending distance can still move many pixels.
+/// The measured seven-event physical-wheel burst settles within roughly
+/// 100-150 ms after its last event with this value.
+const SCROLL_INERTIA_TIME_CONSTANT: Duration = Duration::from_millis(20);
+/// Minimum synchronous first step when another Lines event arrives before the
+/// next paint. Already-running animation frames use their actual elapsed time
+/// so the decay is independent of display refresh rate.
+const SCROLL_INERTIA_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
+/// The elapsed time `queue_scroll_inertia_at` assumes for a brand-new coast's
+/// own synchronous first step (issue #389), as opposed to a step that folds a
+/// still-live coast's real, measured gap (see `queue_scroll_inertia_at`'s own
+/// doc comment). A coast armed from an idle view has no
+/// `request_animation_frame` already in flight the way a still-running coast
+/// does, so `SCROLL_INERTIA_MIN_FRAME_TIME`'s 120Hz-optimistic
+/// already-animating gap understates how long `cx.notify()` actually takes to
+/// reach that first real paint. Using it anyway left the first frame actually
+/// painted after a plain Lines scroll still reading as unchanged. This models
+/// a conservative single 60Hz frame instead.
+const SCROLL_INERTIA_COLD_START_FRAME_TIME: Duration = Duration::from_micros(16_667);
+/// Stop scheduling scroll-inertia frames once the remaining coast distance
+/// would move the content by less than a device pixel.
+const SCROLL_INERTIA_SETTLE_EPSILON: f32 = 1.0;
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
@@ -327,6 +359,47 @@ fn eased_wheel_zoom_step(current: f32, target: f32, elapsed: Duration) -> f32 {
     }
 }
 
+/// Converts one `ScrollDelta::Lines` wheel event's `scroll_y` delta (already
+/// negated to content-space, matching how `on_scroll` moves `scroll_y`) into
+/// the initial velocity of the short inertia that continues after the input
+/// stops. Sized so the full coast distance (`velocity *
+/// SCROLL_INERTIA_TIME_CONSTANT`) equals the delta itself: a discrete wheel
+/// step keeps moving a little further rather than stopping dead, without
+/// traveling noticeably past what the user actually scrolled.
+fn scroll_inertia_velocity_for_lines_delta(scroll_delta: f32) -> f32 {
+    scroll_delta / SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32()
+}
+
+/// Advances one frame of exponential-decay scroll inertia. Returns the
+/// distance to add to `scroll_y` this frame and the velocity remaining
+/// afterward, or `None` once the remaining coast distance is imperceptible
+/// and the animation should stop.
+///
+/// The total coast distance still owed at the start of this call is
+/// `velocity * tau` (see `scroll_inertia_velocity_for_lines_delta`'s doc
+/// comment on this telescoping identity). Once decaying `velocity` for one
+/// more frame would leave less than `SCROLL_INERTIA_SETTLE_EPSILON` of that
+/// distance remaining, this step folds the *entire* remaining distance into
+/// its own `distance` instead of only this frame's fractional share,
+/// because the next call would otherwise return `None` and silently drop
+/// whatever fraction was left unapplied (issue #389: this previously left
+/// the coast short of the delta it was supposed to land on).
+fn eased_scroll_inertia_step(velocity: f32, elapsed: Duration) -> Option<(f32, f32)> {
+    let elapsed = elapsed.as_secs_f32();
+    let tau = SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
+    if (velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
+        return None;
+    }
+    let decay = (-elapsed / tau).exp();
+    let next_velocity = velocity * decay;
+    let distance = if (next_velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
+        velocity * tau
+    } else {
+        velocity * tau * (1.0 - decay)
+    };
+    Some((distance, next_velocity))
+}
+
 fn height_snapshot_matches_line_height(current: f32, snapshot: f32) -> bool {
     current.to_bits() == snapshot.to_bits()
 }
@@ -362,6 +435,30 @@ struct PendingZoomAnchor {
 struct WheelZoomAnimation {
     window_offset: f32,
     last_frame: Instant,
+}
+
+/// State for the short post-wheel scroll inertia that continues after a
+/// `ScrollDelta::Lines` input stops (issue #389). `ScrollDelta::Pixels` never
+/// gets one of these: the OS already supplies trackpad momentum for pixel
+/// deltas, so the app must track it directly instead of layering more
+/// inertia on top.
+#[derive(Clone, Copy, Debug)]
+struct ScrollInertia {
+    /// Remaining velocity, in the same units and sign convention as
+    /// `scroll_y`, per second.
+    velocity: f32,
+    last_frame: Instant,
+    /// The `scroll_y` this animation itself produced, as of `last_frame`
+    /// unless `Render::render`'s height-anchor recompute has since resynced
+    /// it (issue #389: that recompute runs after this frame's step and can
+    /// nudge `scroll_y` on its own, which is not a change of ownership). If
+    /// `scroll_y` no longer matches this when the next frame steps, some
+    /// other action (cursor follow, selection autoscroll, a scrollbar drag,
+    /// a document switch, zoom, a pinch, or a render-time clamp against a
+    /// shrunk document/viewport) has taken ownership of the position since,
+    /// and the stale inertia must stop instead of layering a further step on
+    /// top of it.
+    last_applied: f32,
 }
 
 /// Identifies the document a background job was started for. A result that
@@ -421,10 +518,66 @@ struct InlineRenameComposition {
     selection_reversed: bool,
 }
 
+/// Snapshot of which document instance a tab-scoped action (the context
+/// menu, a close confirmation, or a pending "save then close" request) was
+/// taken against: the session's own per-document generation, together with
+/// the work-folder epoch it was opened under. `switch_to_work_folder`
+/// installs a fresh `SessionSet` whose ids restart at the same values the
+/// old one used and whose fresh sessions restart at generation 0 too, so
+/// neither the id nor the per-document generation alone can tell the new
+/// document apart from the one the action was started against; the epoch
+/// is what still can.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DocumentInstance {
+    generation: u64,
+    workspace: u64,
+}
+
 #[derive(Clone, Debug)]
 struct FileTabContextMenu {
     position: gpui::Point<Pixels>,
-    path: Option<PathBuf>,
+    id: SessionId,
+    instance: DocumentInstance,
+}
+
+/// A pending "close this tab" request whose session has unsaved changes, so
+/// the user is asked whether to save before it closes rather than losing the
+/// edits silently.
+///
+/// `PartialEq`/`Eq` let a button closure's render-time snapshot be compared
+/// against the live `tab_close_confirm` by value, not just by `id`: a stale
+/// click dispatched against an old confirmation must not be mistaken for one
+/// against a newer confirmation that happens to reuse the same `id` but
+/// carries a different `instance`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TabCloseConfirm {
+    id: SessionId,
+    instance: DocumentInstance,
+}
+
+/// How the native Save As dialog `prompt_save_as_for_close` opens resolved,
+/// collapsed to one type so `handle_save_as_for_close_response` can check
+/// every case against the same document-instance authority instead of each
+/// one being guarded separately.
+#[derive(Clone, Debug)]
+enum SaveAsForCloseResponse {
+    Chosen(PathBuf),
+    Canceled,
+    /// The dialog's own error, already rendered to text: its concrete
+    /// error type is `anyhow::Error`, which this crate has no direct
+    /// dependency on to name.
+    Failed(String),
+}
+
+/// The same collapsing `prompt_save_as_for_close`'s dialog gets, for the
+/// ordinary Save As dialog `prompt_save_as` opens, so
+/// `handle_save_as_response` can check every case against the same
+/// document-instance authority that handler uses.
+#[derive(Clone, Debug)]
+enum SaveAsResponse {
+    Chosen(PathBuf),
+    Canceled,
+    Failed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -590,6 +743,9 @@ pub struct EditorView {
     stores: StateStores,
     settings: Settings,
     settings_open: bool,
+    settings_ai_page: bool,
+    settings_focus_handle: FocusHandle,
+    ai_settings: ai_settings::AiSettingsPage,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -599,6 +755,9 @@ pub struct EditorView {
     /// any. `None` keeps single-file editing exactly as it was: no sidebar,
     /// no folder concept anywhere else in the view.
     work_folder: Option<WorkFolder>,
+    /// Search UI state is kept with the view so rapid input edits share one
+    /// bounded controller and one long-lived input entity.
+    content_search: content_search::ContentSearchState,
     /// Where a not-yet-named work-folder note's content is journalled, so a
     /// crash before it earns a real filename never loses it. Removed once the
     /// session it belongs to gets a real path or closes.
@@ -647,10 +806,21 @@ pub struct EditorView {
     /// handle lets GPUI reveal a newly activated tab even when the main panel
     /// is narrower than the open session list.
     file_tabs_scroll: ScrollHandle,
-    /// The file tab context menu, if open. Its path is captured from the tab
+    /// The file tab context menu, if open. Its id is captured from the tab
     /// that was clicked so the menu action cannot accidentally fall back to
-    /// the active session.
+    /// the active session; the path it shows is re-read from that session on
+    /// every render instead of being snapshotted, so a rename that lands
+    /// while the menu is open is reflected rather than shown stale.
     file_tab_context_menu: Option<FileTabContextMenu>,
+    /// A tab middle-click-close request that hit unsaved changes and is
+    /// waiting on the user's save-or-cancel answer.
+    tab_close_confirm: Option<TabCloseConfirm>,
+    /// Sessions with a "save, then close" request in flight, keyed to the
+    /// document instance the request was made against. An instance mismatch
+    /// when a write completes means the document was replaced meanwhile —
+    /// in place, or by a work-folder switch — so the close is treated as
+    /// canceled rather than applied to a different document.
+    tab_close_after_save: HashMap<SessionId, DocumentInstance>,
     /// Horizontal scroll state for the footer controls, so recent-file
     /// buttons remain reachable without allowing the footer to cover the
     /// editor viewport on a narrow main panel.
@@ -801,6 +971,9 @@ pub struct EditorView {
     /// `zoom` converges to it once per animation frame. Pinch and reset paths
     /// bypass this state and remain directly coupled to their input.
     wheel_zoom_animation: Option<WheelZoomAnimation>,
+    /// Short post-wheel scroll inertia still coasting after a plain
+    /// `ScrollDelta::Lines` input stopped. See `ScrollInertia`.
+    scroll_inertia: Option<ScrollInertia>,
     /// Set by a zoom-changing gesture, consumed after the visible blocks have
     /// been remeasured for the new zoom. See `PendingZoomAnchor`.
     pending_zoom_anchor: Option<PendingZoomAnchor>,
@@ -1070,12 +1243,11 @@ mod vscode_windows {
     use std::env;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use winreg::HKEY;
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-    use winreg::HKEY;
 
-    const APP_PATHS_SUBKEY: &str =
-        r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
+    const APP_PATHS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
 
     pub(super) fn resolve_executable() -> OsString {
         resolve_from(&candidate_paths())
@@ -1258,12 +1430,16 @@ impl EditorView {
             stores,
             settings,
             settings_open: false,
+            settings_ai_page: false,
+            settings_focus_handle: cx.focus_handle(),
+            ai_settings: ai_settings::AiSettingsPage::default(),
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
             settings_error: None,
             recent,
             work_folder: None,
+            content_search: content_search::ContentSearchState::default(),
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
@@ -1283,6 +1459,8 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             file_tabs_scroll: ScrollHandle::new(),
             file_tab_context_menu: None,
+            tab_close_confirm: None,
+            tab_close_after_save: HashMap::new(),
             footer_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
@@ -1326,6 +1504,7 @@ impl EditorView {
             zoom: 1.0,
             raw_zoom: 1.0,
             wheel_zoom_animation: None,
+            scroll_inertia: None,
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
@@ -1393,6 +1572,11 @@ impl EditorView {
             self.instrumentation.work_folder_scan_completed_at = None;
         }
         let draft_store = self.draft_store.clone();
+        // Captured before the scan starts so a scan started for an earlier
+        // root (e.g. switched away from before this one finishes) can be
+        // told apart from the current one once both land; see the
+        // `generation` check at the top of `finish_work_folder_scan`.
+        let generation = self.work_folder_generation;
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
             let scanned = cx
@@ -1407,7 +1591,9 @@ impl EditorView {
                     (work_folder, drafts, scan_completed_at)
                 })
                 .await;
-            let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
+            let _ = view.update(cx, |view, cx| {
+                view.finish_work_folder_scan(generation, scanned, cx);
+            });
         })
         .detach();
         cx.notify();
@@ -1415,6 +1601,7 @@ impl EditorView {
 
     fn finish_work_folder_scan(
         &mut self,
+        generation: u64,
         scanned: (
             std::io::Result<WorkFolder>,
             std::io::Result<RecoveredDrafts>,
@@ -1422,6 +1609,15 @@ impl EditorView {
         ),
         cx: &mut Context<Self>,
     ) {
+        if generation != self.work_folder_generation {
+            // A newer `begin_work_folder_scan` (from `switch_to_work_folder`
+            // or another folder open) has already bumped
+            // `work_folder_generation` past what this scan started with.
+            // Installing this result now — regardless of which of the two
+            // scans actually finishes first — would overwrite the current
+            // folder, sessions, and drafts with a stale, unrelated root's.
+            return;
+        }
         let (work_folder, drafts, _scan_completed_at) = scanned;
         match work_folder {
             Err(error) => {
@@ -1483,6 +1679,8 @@ impl EditorView {
                     Err(error) => Some(format!("Could not recover unsaved drafts: {error}")),
                 };
 
+                self.content_search_workspace_changed(cx);
+
                 if let Some(path) = first {
                     // Opening the first entry replaces whichever session is
                     // active through the same background-loading path as any
@@ -1536,6 +1734,7 @@ impl EditorView {
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
+        self.preserve_content_search_navigation_for_action();
         if id == self.sessions.active_id() {
             self.sidebar_focus = SidebarFocus::ActiveSession;
             self.reveal_file_tab(id);
@@ -1565,18 +1764,312 @@ impl EditorView {
         self.activate_session(id, cx);
     }
 
+    /// Switches to the next (`delta = 1`) or previous (`delta = -1`) tab in
+    /// display order, wrapping at either end. A no-op with zero or one tab
+    /// open.
+    fn step_file_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.sessions.len();
+        if len <= 1 {
+            return;
+        }
+        let Some(current) = self.file_tab_index(self.sessions.active_id()) else {
+            return;
+        };
+        let next = (current as isize + delta).rem_euclid(len as isize) as usize;
+        let Some(id) = self.sessions().nth(next).map(DocumentSession::id) else {
+            return;
+        };
+        self.activate_file_tab(id, cx);
+    }
+
+    pub(crate) fn next_file_tab(&mut self, cx: &mut Context<Self>) {
+        self.step_file_tab(1, cx);
+    }
+
+    pub(crate) fn prev_file_tab(&mut self, cx: &mut Context<Self>) {
+        self.step_file_tab(-1, cx);
+    }
+
+    /// Entry point for a tab's middle-click: closes it immediately if it has
+    /// nothing to lose, otherwise asks the user whether to save first. The id
+    /// is whatever the caller captured when the tab was rendered, so this
+    /// never substitutes the currently active session for the one actually
+    /// clicked.
+    fn request_tab_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        match session.close_decision() {
+            CloseDecision::Close => self.close_tab_now(id, cx),
+            CloseDecision::Reject(UnsavedChanges) => {
+                let instance = DocumentInstance {
+                    generation: session.generation(),
+                    workspace: self.work_folder_generation,
+                };
+                self.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Unconditionally cancels whatever confirmation is current — the global
+    /// Escape handler's contract, which dismisses whichever prompt the user
+    /// is actually looking at right now rather than one tied to a specific
+    /// render.
+    pub(crate) fn dismiss_tab_close_confirm(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.tab_close_confirm.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancels the confirmation only if it is still exactly the one the
+    /// caller captured at render time. The Cancel button and the overlay's
+    /// backdrop are rendered fresh every frame the confirmation is showing,
+    /// so their closures bind the whole snapshot rather than just an `id`: a
+    /// stale click dispatched against an old confirmation's button must not
+    /// dismiss a newer confirmation that happens to reuse the same `id`.
+    fn dismiss_tab_close_confirm_if(
+        &mut self,
+        confirm: TabCloseConfirm,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.tab_close_confirm != Some(confirm) {
+            return false;
+        }
+        self.tab_close_confirm = None;
+        cx.notify();
+        true
+    }
+
+    /// The "save and close" answer to the confirmation prompt. Saves the
+    /// session by whatever route it needs (its own path, or Save As when it
+    /// has none yet) and arms `tab_close_after_save` so the close actually
+    /// happens once that write lands cleanly; see `resolve_pending_tab_close`.
+    ///
+    /// For a session with no path yet, arming happens only once the user has
+    /// actually picked a Save As target, inside `prompt_save_as_for_close`
+    /// — not here. Arming now, before any write tied to this close request
+    /// even exists, would let an unrelated write for the same untitled
+    /// document (e.g. the H1 title-sync create racing the still-open Save As
+    /// dialog) read as satisfying this request the moment it lands the
+    /// document clean, closing the tab out from under a dialog the user has
+    /// not finished answering yet.
+    ///
+    /// `requested` is the whole confirmation snapshot the button's closure
+    /// captured when it was rendered, not just the `id`: the render-time
+    /// cleanup that discards a confirmation left over for a document
+    /// instance that no longer exists (see the top of the main render pass)
+    /// runs once per frame, not before every click already dispatched
+    /// against an old confirmation's button. A later frame can install a
+    /// *new* confirmation for the very same `id` — reusing it the moment the
+    /// old one closed and another close was requested — so an `id`-only
+    /// check cannot tell a stale click meant for the old confirmation apart
+    /// from one actually meant for the new one. Requiring the live
+    /// confirmation to equal this exact snapshot (not merely match by id or
+    /// by document instance) is what tells them apart; the follow-up
+    /// document-instance check below stays as defense in depth for the case
+    /// where the confirmation itself was never cleared but the document it
+    /// names was replaced in place.
+    fn confirm_save_and_close_tab(&mut self, requested: TabCloseConfirm, cx: &mut Context<Self>) {
+        if self.tab_close_confirm != Some(requested) {
+            return;
+        }
+        let id = requested.id;
+        if self.document_instance(id) != Some(requested.instance) {
+            return;
+        }
+        self.tab_close_confirm = None;
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        if session.path().is_some() {
+            let instance = DocumentInstance {
+                generation: session.generation(),
+                workspace: self.work_folder_generation,
+            };
+            self.tab_close_after_save.insert(id, instance);
+            self.save_session(id, SaveIntent::Current, cx);
+        } else {
+            self.prompt_save_as_for_close(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Save As for a specific session rather than the active one, so a
+    /// background tab's close-and-save does not depend on it being switched
+    /// to first. A canceled or failed dialog drops the close request and
+    /// leaves the document open, the same as canceling Save As normally does.
+    fn prompt_save_as_for_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let directory = session
+            .file()
+            .directory()
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.work_folder
+                    .as_ref()
+                    .map(|folder| folder.root().to_path_buf())
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Captured before the native dialog is even shown — not re-read once
+        // it resolves — so a work-folder switch or an in-place reopen that
+        // replaces this document while the (native, unboundedly long-lived)
+        // dialog is still open is told apart from the document the dialog
+        // was actually opened for, instead of the id's current occupant
+        // being trusted as this request's authority just because the dialog
+        // answered.
+        let instance = DocumentInstance {
+            generation: session.generation(),
+            workspace: self.work_folder_generation,
+        };
+        let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
+        cx.spawn(async move |view, cx| {
+            // Collapsed to one small response type before the single entry
+            // gate in `handle_save_as_for_close_response` runs, so every
+            // way this native, unboundedly long-lived dialog can resolve —
+            // chosen, canceled, failed, or its channel simply dropped — is
+            // checked against the same document-instance authority instead
+            // of each arm re-deriving (and risking drifting from) its own
+            // guard.
+            let response = match receiver.await {
+                Ok(Ok(Some(path))) => SaveAsForCloseResponse::Chosen(path),
+                Ok(Ok(None)) => SaveAsForCloseResponse::Canceled,
+                Ok(Err(error)) => SaveAsForCloseResponse::Failed(error.to_string()),
+                Err(_) => SaveAsForCloseResponse::Canceled,
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.handle_save_as_for_close_response(id, instance, response, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The single entry point every resolution of the Save As dialog
+    /// `prompt_save_as_for_close` opens must pass through. Only this
+    /// dialog's own document instance may act at all: by the time this
+    /// runs, the id may already belong to an unrelated, newer document (a
+    /// work-folder switch, or an in-place `adopt`), and none of them —
+    /// not a path landing on disk, not clearing a close request, not even
+    /// the status message — may be touched on behalf of a dialog that
+    /// document never opened.
+    fn handle_save_as_for_close_response(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        response: SaveAsForCloseResponse,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document_instance(id) != Some(instance) {
+            return;
+        }
+        match response {
+            SaveAsForCloseResponse::Chosen(path) => {
+                // Armed now, against the instance as of this specific
+                // write, so only this user-chosen write's own landing
+                // (checked by `resolve_pending_tab_close`) can close the
+                // tab: nothing landed for this session before the user
+                // chose a target is eligible to satisfy this request.
+                self.tab_close_after_save.insert(id, instance);
+                self.save_session(id, SaveIntent::To(path), cx);
+            }
+            SaveAsForCloseResponse::Failed(error) => {
+                if self.tab_close_after_save.get(&id) == Some(&instance) {
+                    self.tab_close_after_save.remove(&id);
+                }
+                self.status = Some(format!("Save As failed: {error}"));
+                cx.notify();
+            }
+            SaveAsForCloseResponse::Canceled => {
+                if self.tab_close_after_save.get(&id) == Some(&instance) {
+                    self.tab_close_after_save.remove(&id);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Re-checked after any write or rename completes for a session with a
+    /// "save, then close" request pending: closes it only if that same
+    /// document instance is now clean and nothing else is still writing to
+    /// it. A generation mismatch (the document was replaced while the
+    /// request was pending) drops the request instead of closing a document
+    /// the user never asked to close; a save still in flight (an autosave
+    /// queued behind this one, or an H1 rename it triggered) leaves the
+    /// request armed for that write's own completion to re-check.
+    fn resolve_pending_tab_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(&requested_instance) = self.tab_close_after_save.get(&id) else {
+            return;
+        };
+        let Some(session) = self.sessions.get(id) else {
+            self.tab_close_after_save.remove(&id);
+            return;
+        };
+        let current_instance = DocumentInstance {
+            generation: session.generation(),
+            workspace: self.work_folder_generation,
+        };
+        if current_instance != requested_instance {
+            self.tab_close_after_save.remove(&id);
+            return;
+        }
+        if session.save_in_flight() {
+            return;
+        }
+        self.tab_close_after_save.remove(&id);
+        if !session.is_dirty() {
+            self.close_tab_now(id, cx);
+        }
+    }
+
+    /// Closes a tab that is already known to have nothing to lose. The last
+    /// remaining tab is replaced with a blank untitled document by
+    /// `SessionSet::close` rather than leaving the window with none.
+    fn close_tab_now(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let was_active = self.sessions.active_id() == id;
+        if matches!(self.sessions.close(id, "Untitled"), CloseDecision::Reject(_)) {
+            return;
+        }
+        self.tab_close_after_save.remove(&id);
+        if self
+            .tab_close_confirm
+            .is_some_and(|confirm| confirm.id == id)
+        {
+            self.tab_close_confirm = None;
+        }
+        if self
+            .file_tab_context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.id == id)
+        {
+            self.file_tab_context_menu = None;
+        }
+        if was_active {
+            self.on_document_replaced();
+            self.schedule_document_parse(cx);
+        }
+        self.reveal_file_tab(self.sessions.active_id());
+        cx.notify();
+    }
+
     fn open_file_tab_context_menu(
         &mut self,
         id: SessionId,
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let path = self
-            .sessions
-            .get(id)
-            .and_then(DocumentSession::path)
-            .map(Path::to_path_buf);
-        self.file_tab_context_menu = Some(FileTabContextMenu { position, path });
+        let Some(instance) = self.document_instance(id) else {
+            return;
+        };
+        self.file_tab_context_menu = Some(FileTabContextMenu {
+            position,
+            id,
+            instance,
+        });
         cx.notify();
     }
 
@@ -1636,11 +2129,82 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Reveals a file in the platform's file manager, selecting it, without
+    /// launching the file's own default application the way opening the bare
+    /// path would.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn reveal_launch_command(path: &Path) -> Command {
+        #[cfg(target_os = "macos")]
+        {
+            let mut command = Command::new("open");
+            command.arg("-R").arg(path);
+            command
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+
+            let mut command = Command::new("explorer.exe");
+            // Explorer does not use standard argv parsing: it scans its raw
+            // command line for the literal `/select,` switch immediately
+            // followed by a quoted path, e.g. `/select,"C:\a b\file.txt"`.
+            // `Command::arg` would apply Rust's own Windows quoting, which
+            // wraps the whole `/select,<path>` token in quotes whenever the
+            // path contains a space, so Explorer no longer sees the switch.
+            // `raw_arg` appends the text verbatim (no shell, no escaping),
+            // so the path is quoted explicitly here instead, preserving the
+            // original Unicode `OsStr` without a lossy UTF-8 conversion.
+            let mut argument = std::ffi::OsString::from("/select,\"");
+            argument.push(path.as_os_str());
+            argument.push("\"");
+            command.raw_arg(argument);
+            command
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn reveal_file_tab_in_file_manager(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.file_tab_context_menu = None;
+        let Some(path) = path else {
+            self.status = Some("保存場所を開くにはファイルを保存してください".to_owned());
+            cx.notify();
+            return;
+        };
+        match Self::reveal_launch_command(&path).spawn() {
+            Ok(_) => self.status = Some("保存場所を開きました".to_owned()),
+            Err(error) => self.status = Some(format!("保存場所を開けません: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn copy_file_tab_full_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.file_tab_context_menu = None;
+        let Some(path) = path else {
+            self.status = Some("フルパスをコピーするにはファイルを保存してください".to_owned());
+            cx.notify();
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+        self.status = Some("フルパスをコピーしました".to_owned());
+        cx.notify();
+    }
+
     fn document_key(&self) -> DocumentKey {
         DocumentKey {
             session: self.sessions.active_id(),
             generation: self.sessions.active().generation(),
         }
+    }
+
+    /// The document instance `id` currently names, if any. `None` both when
+    /// the id is not open at all and (implicitly, via equality against a
+    /// snapshot taken earlier) when a work-folder switch or an in-place
+    /// reopen replaced whatever the id named before.
+    fn document_instance(&self, id: SessionId) -> Option<DocumentInstance> {
+        self.sessions.get(id).map(|session| DocumentInstance {
+            generation: session.generation(),
+            workspace: self.work_folder_generation,
+        })
     }
 
     /// Cancels a selection drag before the state for another document is
@@ -1656,6 +2220,13 @@ impl EditorView {
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
         self.cancel_text_selection_autoscroll();
+        // A coast belongs to the document it started on. Relying on the
+        // `scroll_y` staleness check in `advance_scroll_inertia` alone is not
+        // enough here: the incoming document can restore a `scroll_y` equal
+        // to the outgoing coast's `last_applied`, in which case that check
+        // would mistake the switch for an ordinary unmoved frame and let the
+        // old document's inertia keep coasting into the new one (issue #389).
+        self.scroll_inertia = None;
         // Whatever the sidebar had highlighted before, the document on
         // screen just changed to a specific file or draft, so that is what
         // should be highlighted now instead.
@@ -1731,356 +2302,8 @@ impl EditorView {
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
-        cx.notify();
-    }
-
-    /// Arms the debounce timer for the active session. Each call invalidates the
-    /// timer armed by the previous keystroke, so a burst of typing produces one
-    /// write at the end rather than one per key.
-    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
-        let autosave = self.settings.autosave;
-        let session = self.sessions.active_mut();
-        session.note_edit();
-        let Some(ticket) = session.autosave_ticket(autosave) else {
-            return;
-        };
-        let id = session.id();
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            let should_save = view
-                .read_with(cx, |view, _| {
-                    view.sessions.active_id() == id
-                        && view
-                            .sessions
-                            .active()
-                            .autosave_is_current(ticket, view.settings.autosave)
-                })
-                .unwrap_or(false);
-            if should_save {
-                let _ = view.update(cx, |view, cx| view.save_current(cx));
-            }
-        })
-        .detach();
-    }
-
-    /// Journals the active session's text into the recovery drafts on the
-    /// same debounce cadence as autosave: a no-op unless the active session
-    /// is an unnamed note in the current work folder. Kept separate from
-    /// `schedule_autosave` because an unnamed note has no path to write to
-    /// yet and must not wait for one to earn crash safety.
-    ///
-    /// The scheduled save targets the session it was armed for by id, not
-    /// whichever session is active when the timer fires: switching to
-    /// another note within the debounce window must not cancel the write, or
-    /// edits made just before switching away are lost on a crash until the
-    /// draft is revisited and edited again.
-    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
-        let id = self.sessions.active_id();
-        let Some(draft_id) = self.work_folder_drafts.get(&id).map(|draft| draft.draft_id) else {
-            return;
-        };
-        let Some(root) = self
-            .work_folder
-            .as_ref()
-            .map(|folder| folder.root().to_path_buf())
-        else {
-            return;
-        };
-        let revision = self.sessions.active().revision();
-        let draft_store = self.draft_store.clone();
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            let text = view
-                .read_with(cx, |view, _| {
-                    let session = view.sessions.get(id)?;
-                    let current =
-                        session.revision() == revision && view.work_folder_drafts.contains_key(&id);
-                    current.then(|| session.editor().document().full_text())
-                })
-                .ok()
-                .flatten();
-            if let Some(text) = text {
-                let _ = cx
-                    .background_executor()
-                    .spawn(async move { draft_store.write(&root, draft_id, &text) })
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    /// Writes every pending unnamed-note draft synchronously, bypassing the
-    /// debounce in `schedule_draft_save`. Called from the app-quit hook
-    /// registered in `from_sessions` and from `switch_to_work_folder`, and
-    /// public so `main.rs` can also call it from a window-close hook: a
-    /// normal quit — or closing the window, which on some platforms does not
-    /// raise an app-quit event at all — gives a `schedule_draft_save` timer
-    /// no chance to fire if it was armed less than 750ms earlier, so without
-    /// this an unnamed note's last few keystrokes would only survive a crash
-    /// (recovered from whatever the debounce last wrote), not a clean exit.
-    pub fn flush_pending_drafts(&self) {
-        if self.work_folder_drafts.is_empty() {
-            return;
-        }
-        let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
-            return;
-        };
-        for (&id, draft) in &self.work_folder_drafts {
-            let Some(session) = self.sessions.get(id) else {
-                continue;
-            };
-            let text = session.editor().document().full_text();
-            let _ = self.draft_store.write(root, draft.draft_id, &text);
-        }
-    }
-
-    /// Issue #6: arms the debounce timer that keeps a work-folder note's
-    /// filename following its first H1. A no-op outside a work folder.
-    fn schedule_title_sync(&mut self, cx: &mut Context<Self>) {
-        if self.work_folder.is_none() {
-            return;
-        }
-        let id = self.sessions.active_id();
-        let generation = self.sessions.active().generation();
-        let revision = self.sessions.active().revision();
-        self.title_sync_scheduled.insert(id, revision);
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                if view.title_sync_scheduled.get(&id).copied() == Some(revision) {
-                    view.title_sync_scheduled.remove(&id);
-                    view.run_title_sync(id, generation, revision, cx);
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Decides, for the session the timer was armed for, whether its H1
-    /// should create, rename, or stop auto-managing its filename — recomputed
-    /// fresh against the document as it stands now, since edits may have
-    /// landed while the timer was pending.
-    fn run_title_sync(
-        &mut self,
-        id: SessionId,
-        generation: u64,
-        revision: Revision,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .inline_rename
-            .as_ref()
-            .is_some_and(|rename| rename.pending)
-        {
-            self.title_sync_deferred.insert(id);
-            return;
-        }
-        if self.title_sync_in_flight.contains(&id) {
-            // Another probe or write for this session is already running; the
-            // next edit re-arms this timer, so nothing is lost by skipping.
-            return;
-        }
-        let Some(work_folder_root) = self
-            .work_folder
-            .as_ref()
-            .map(|folder| folder.root().to_path_buf())
-        else {
-            return;
-        };
-        let Some(session) = self.sessions.get(id) else {
-            return;
-        };
-        if session.generation() != generation || session.revision() != revision {
-            return; // superseded by a later keystroke or a document replacement
-        }
-        let text = session.editor().document().full_text();
-        let extracted = extract_h1_title(&text);
-        let current_stem = session
-            .path()
-            .and_then(Path::file_stem)
-            .and_then(|stem| stem.to_str());
-        let action = decide_title_sync(session.auto_title(), current_stem, extracted.as_deref());
-        match action {
-            TitleSyncAction::None => {}
-            TitleSyncAction::StopTracking => {
-                if let Some(session) = self.sessions.get_mut(id) {
-                    session.stop_auto_naming();
-                }
-            }
-            TitleSyncAction::CreateNamed(title) => {
-                // The folder this note was started in, if it was started
-                // from a selected sidebar folder; otherwise the work folder
-                // root, the same as before folders existed.
-                let target_directory = self
-                    .work_folder_drafts
-                    .get(&id)
-                    .map(|draft| draft.target_directory.clone())
-                    .unwrap_or(work_folder_root);
-                self.begin_title_create(id, target_directory, title, cx);
-            }
-            TitleSyncAction::Rename(title) => self.begin_title_rename(id, title, cx),
-        }
-    }
-
-    /// Picks a collision-free `<title>.md` under `target_directory` in the
-    /// background, then writes the still-untitled session's content there
-    /// for the first time through the same save machinery as any other
-    /// write.
-    fn begin_title_create(
-        &mut self,
-        id: SessionId,
-        target_directory: PathBuf,
-        title: String,
-        cx: &mut Context<Self>,
-    ) {
-        let root = target_directory;
-        self.title_sync_in_flight.insert(id);
-        let files = self.files.clone();
-        let probe_title = title.clone();
-        cx.spawn(async move |view, cx| {
-            let probe_files = files.clone();
-            let probe_root = root.clone();
-            let candidate = cx
-                .background_executor()
-                .spawn(async move {
-                    unique_markdown_filename(&probe_title, |name| {
-                        probe_files.stamp(&probe_root.join(name)).is_some()
-                    })
-                })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                view.title_sync_in_flight.remove(&id);
-                // A session that no longer exists (closed, or replaced while
-                // the probe was running) defers the same as one that reports
-                // `should_defer_h1_create`; `retry_title_sync` picks this
-                // back up once whatever holds the slot finishes.
-                let should_skip = view
-                    .sessions
-                    .get(id)
-                    .is_none_or(DocumentSession::should_defer_h1_create);
-                if should_skip {
-                    return;
-                }
-                view.title_sync_pending.insert(id, title.clone());
-                view.save_session(id, SaveIntent::CreateNew(root.join(&candidate)), cx);
-            });
-        })
-        .detach();
-    }
-
-    /// Picks a collision-free `<title>.md` in the note's own directory in the
-    /// background, then renames the session's current file to it. The
-    /// directory is the file's current parent, not the work folder root, so
-    /// an H1-driven rename never moves a note out of the folder it lives in.
-    /// `DocumentSession`'s own `apply_file_event` is what actually moves the
-    /// session, the same path a filer-originated rename would take, so a
-    /// rename that lands after the file already moved on for some other
-    /// reason is safely ignored.
-    fn begin_title_rename(&mut self, id: SessionId, title: String, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get_mut(id) else {
-            return;
-        };
-        let Some(from) = session.path().map(Path::to_path_buf) else {
-            return;
-        };
-        let Some(root) = from.parent().map(Path::to_path_buf) else {
-            return;
-        };
-        // Reserved synchronously, before any `await`: a concurrent autosave
-        // that fires in the same tick must see the slot already taken and
-        // queue behind it, not race the rename to the filesystem. A `None`
-        // here means a write is already in flight; the rename is skipped for
-        // now rather than racing that write instead, and the next debounce
-        // (armed by any further edit) tries again.
-        let Some(ticket) = session.begin_rename() else {
-            return;
-        };
-        self.title_sync_in_flight.insert(id);
-        let files = self.files.clone();
-        let probe_title = title.clone();
-        let probe_from = from.clone();
-        cx.spawn(async move |view, cx| {
-            let probe_files = files.clone();
-            let probe_root = root.clone();
-            let rename_from = from.clone();
-            let (target, rename_result) = cx
-                .background_executor()
-                .spawn(async move {
-                    let candidate = unique_markdown_filename(&probe_title, |name| {
-                        let candidate = probe_root.join(name);
-                        candidate != probe_from && probe_files.stamp(&candidate).is_some()
-                    });
-                    let target = probe_root.join(candidate);
-                    let result = probe_files.rename(&rename_from, &target);
-                    (target, result)
-                })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                view.title_sync_in_flight.remove(&id);
-                let attempt = TitleRenameAttempt {
-                    id,
-                    ticket,
-                    from,
-                    target,
-                    title,
-                };
-                view.finish_title_rename(attempt, rename_result, cx);
-            });
-        })
-        .detach();
-    }
-
-    fn finish_title_rename(
-        &mut self,
-        attempt: TitleRenameAttempt,
-        result: std::io::Result<()>,
-        cx: &mut Context<Self>,
-    ) {
-        let TitleRenameAttempt {
-            id,
-            ticket,
-            from,
-            target,
-            title,
-        } = attempt;
-        if let Ok(()) = result {
-            let outcomes = self.sessions.apply_file_event(&FileEvent::Renamed {
-                from: from.clone(),
-                to: target.clone(),
-            });
-            let applied = outcomes.iter().any(|(session_id, outcome)| {
-                *session_id == id && *outcome == FileEventOutcome::Renamed
-            });
-            if applied {
-                if let Some(session) = self.sessions.get_mut(id) {
-                    session.note_auto_named(title);
-                }
-                if let Some(folder) = self.work_folder.as_mut() {
-                    folder.rename(&from, &target);
-                }
-                self.recent.rename(&from, &target);
-                if let Err(error) = self.stores.recent_files().store(&self.recent) {
-                    self.status = Some(format!("Recent files failed: {error}"));
-                }
-            }
-        }
-        // The picked name may have been raced away, or the file may have
-        // moved on for some other reason; either way the save slot the
-        // rename reserved must be released so anything it queued behind
-        // itself (an autosave that arrived in the meantime) now runs against
-        // whichever path the session actually ended up at.
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.finish_rename(ticket);
-            if let Some(pending) = session.take_pending_save() {
-                self.save_session(id, pending, cx);
-            }
-        }
+        let edited_session = self.sessions.active_id();
+        self.invalidate_content_search_session(edited_session, cx);
         cx.notify();
     }
 
@@ -2133,6 +2356,7 @@ impl EditorView {
                 target_directory,
             },
         );
+        self.content_search_workspace_changed(cx);
         self.on_document_replaced();
         self.schedule_document_parse(cx);
         self.status = None;
@@ -2237,6 +2461,7 @@ impl EditorView {
                     folder.insert_folder(path.clone());
                 }
                 self.expanded_folders.insert(path);
+                self.content_search_workspace_changed(cx);
                 self.status = None;
             }
             Err(error) => {
@@ -2244,221 +2469,6 @@ impl EditorView {
             }
         }
         cx.notify();
-    }
-
-    /// A note stops being a draft once it earns a real path, whether through
-    /// the (future) H1-derived rename or a manual Save As. The recovery
-    /// journal entry is removed on a background thread; a failure here just
-    /// leaves a harmless leftover file, never lost content.
-    fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(draft) = self.work_folder_drafts.remove(&id) else {
-            return;
-        };
-        let draft_id = draft.draft_id;
-        let Some(root) = self
-            .work_folder
-            .as_ref()
-            .map(|folder| folder.root().to_path_buf())
-        else {
-            return;
-        };
-        let draft_store = self.draft_store.clone();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = draft_store.remove(&root, draft_id);
-            })
-            .detach();
-    }
-
-    /// Marks a session auto-managed once its H1-derived first write has
-    /// actually landed, not merely been requested, and adds the new note to
-    /// the work folder index so it appears in the sidebar without waiting
-    /// for the next full rescan.
-    fn apply_pending_title_sync(&mut self, id: SessionId, path: &Path) {
-        let Some(title) = self.title_sync_pending.remove(&id) else {
-            return;
-        };
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.note_auto_named(title);
-        }
-        if let Some(folder) = self.work_folder.as_mut() {
-            folder.insert(path.to_path_buf());
-        }
-    }
-
-    /// Re-decides title sync for a session right after one of its writes
-    /// lands. `begin_title_rename` defers instead of racing a save that is
-    /// still in flight (see `DocumentSession::begin_rename`), so the rename
-    /// it deferred needs a prompt to try again once that save is done,
-    /// rather than waiting on the next keystroke to re-arm the debounce —
-    /// which may never come, if the H1 edit that wanted the rename was the
-    /// document's last edit before the autosave it lost the race to.
-    fn retry_title_sync(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get(id) else {
-            return;
-        };
-        let generation = session.generation();
-        let revision = session.revision();
-        self.run_title_sync(id, generation, revision, cx);
-    }
-
-    /// Retries title synchronization that was held back by a user-controlled
-    /// filesystem rename. Keeping this at the orchestration boundary means an
-    /// untitled draft is re-evaluated against its rebased directory rather
-    /// than reusing a stale path captured before the folder move.
-    fn retry_deferred_title_sync(&mut self, cx: &mut Context<Self>) {
-        if self.inline_rename.is_some() {
-            return;
-        }
-        let deferred = std::mem::take(&mut self.title_sync_deferred);
-        for id in deferred {
-            self.retry_title_sync(id, cx);
-        }
-    }
-
-    pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
-        self.save_active(SaveIntent::Current, cx);
-    }
-
-    pub(crate) fn save_or_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.sessions.active().path().is_some() {
-            self.save_current(cx);
-        } else {
-            self.prompt_save_as(cx);
-        }
-    }
-
-    fn save_active(&mut self, intent: SaveIntent, cx: &mut Context<Self>) {
-        self.save_session(self.sessions.active_id(), intent, cx);
-    }
-
-    /// Hands one accepted write to the I/O boundary. The session decides whether
-    /// there is a write to do at all; the view only reports what happened.
-    fn save_session(&mut self, id: SessionId, intent: SaveIntent, cx: &mut Context<Self>) {
-        let Some(decision) = self
-            .sessions
-            .get_mut(id)
-            .map(|session| session.request_save(intent))
-        else {
-            return;
-        };
-        match decision {
-            SaveDecision::NeedsPath => {
-                self.status = Some("Use Save As for an untitled document".to_owned());
-            }
-            SaveDecision::Queued => {
-                self.status = Some("Save queued…".to_owned());
-            }
-            SaveDecision::Write(job) => {
-                self.status = Some("Saving…".to_owned());
-                let files = self.files.clone();
-                let path = job.path.clone();
-                let ticket = job.ticket;
-                cx.spawn(async move |view, cx| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            run_save_job(files.as_ref(), &job.path, &job.document, job.guard)
-                        })
-                        .await;
-                    let _ = view.update(cx, |view, cx| {
-                        view.finish_save(id, ticket, &path, result, cx);
-                    });
-                })
-                .detach();
-            }
-        }
-        cx.notify();
-    }
-
-    fn finish_save(
-        &mut self,
-        id: SessionId,
-        ticket: SaveTicket,
-        path: &Path,
-        result: Result<SavedFile, SaveFailure>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(outcome) = self
-            .sessions
-            .get_mut(id)
-            .map(|session| session.finish_save(ticket, result))
-        else {
-            return;
-        };
-        match outcome {
-            SaveOutcome::Saved => {
-                self.status = Some("Saved".to_owned());
-                self.remember_recent(path);
-                cx.add_recent_document(path);
-                self.retire_work_folder_draft(id, cx);
-                self.apply_pending_title_sync(id, path);
-                self.retry_title_sync(id, cx);
-            }
-            SaveOutcome::SavedStale => {
-                self.status = Some("Saved snapshot; newer edits pending".to_owned());
-                self.remember_recent(path);
-                cx.add_recent_document(path);
-                self.schedule_autosave(cx);
-                self.retire_work_folder_draft(id, cx);
-                self.apply_pending_title_sync(id, path);
-                self.retry_title_sync(id, cx);
-            }
-            SaveOutcome::Conflict => {
-                self.status = Some(
-                    "Save refused: the file changed on disk. Save As, or save again to overwrite"
-                        .to_owned(),
-                );
-                // The candidate name this was for was raced away; drop it
-                // rather than let a later, unrelated write consume it.
-                self.title_sync_pending.remove(&id);
-            }
-            SaveOutcome::Failed(error) => {
-                self.status = Some(format!("Save failed: {error}"));
-                self.title_sync_pending.remove(&id);
-            }
-            // The document this write belonged to is gone; nothing to report.
-            SaveOutcome::Superseded => {
-                self.title_sync_pending.remove(&id);
-            }
-        }
-        if let Some(pending) = self
-            .sessions
-            .get_mut(id)
-            .and_then(DocumentSession::take_pending_save)
-        {
-            self.save_session(id, pending, cx);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
-        let directory = self
-            .sessions
-            .active()
-            .file()
-            .directory()
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                self.work_folder
-                    .as_ref()
-                    .map(|folder| folder.root().to_path_buf())
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
-        cx.spawn(async move |view, cx| match receiver.await {
-            Ok(Ok(Some(path))) => {
-                let _ = view.update(cx, |view, cx| view.save_active(SaveIntent::To(path), cx));
-            }
-            Ok(Err(error)) => {
-                let _ = view.update(cx, |view, cx| {
-                    view.status = Some(format!("Save As failed: {error}"));
-                    cx.notify();
-                });
-            }
-            _ => {}
-        })
-        .detach();
     }
 
     pub(crate) fn prompt_open(&mut self, cx: &mut Context<Self>) {
@@ -2596,6 +2606,7 @@ impl EditorView {
         self.flush_pending_drafts();
         self.sessions = SessionSet::with_untitled("", "Untitled");
         self.work_folder = None;
+        self.content_search_workspace_changed(cx);
         self.work_folder_drafts.clear();
         self.selected_folder = None;
         self.expanded_folders.clear();
@@ -2614,10 +2625,26 @@ impl EditorView {
         self.title_sync_deferred.clear();
         self.loading_paths.clear();
         self.latest_open_target = None;
+        // The new `SessionSet` restarts ids (and each fresh session's own
+        // generation) at the same values the old one used, so a tab context
+        // menu, close confirmation, or pending "save then close" request
+        // left over from the old sessions would otherwise keep matching by
+        // id alone and act on whichever unrelated document now holds it.
+        // Dropped outright rather than left for the generation check below
+        // to catch lazily, since a still-open native Save As dialog for the
+        // old document is not reachable from here to cancel; `document_instance`
+        // comparisons elsewhere are what keep that dialog's eventual answer
+        // from acting on the replacement document.
+        self.file_tab_context_menu = None;
+        self.tab_close_confirm = None;
+        self.tab_close_after_save.clear();
         // Any background read still in flight for the old folder (or for
         // single-file state) is now for a session that no longer exists;
         // bumping this makes `finish_open` discard it instead of merging a
-        // stale file into the sessions just installed above.
+        // stale file into the sessions just installed above. It also backs
+        // `DocumentInstance`, which is how the tab-scoped state above tells
+        // a document from before this switch apart from one that reuses the
+        // same session id afterward.
         self.work_folder_generation = self.work_folder_generation.wrapping_add(1);
         self.on_document_replaced();
         self.begin_work_folder_scan(root, cx);
@@ -2625,8 +2652,6 @@ impl EditorView {
 
     /// Handles a path delivered by another Hane process from Explorer.
     pub fn open_external_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.settings_open = false;
-        self.settings_error = None;
         if path.is_dir() {
             self.switch_to_work_folder(path.to_path_buf(), cx);
         } else {
@@ -2659,6 +2684,7 @@ impl EditorView {
     }
 
     fn open_with_policy(&mut self, path: &Path, policy: OpenPolicy, cx: &mut Context<Self>) {
+        self.preserve_content_search_navigation_for_action();
         // Whichever path was asked for most recently is what the user wants
         // to see; a load that lands after a newer request must not steal
         // focus back to what it was asked for.
@@ -2726,13 +2752,19 @@ impl EditorView {
             return;
         }
         match loaded {
-            Err(error) => self.status = Some(format!("Open failed: {error}")),
+            Err(error) => {
+                self.cancel_pending_search_navigation_for_path(path);
+                self.status = Some(format!("Open failed: {error}"));
+            }
             Ok(loaded) => {
+                let search_navigation_verification =
+                    self.verify_loaded_search_navigation(path, &loaded);
                 // The read took time, and the target session may have been
                 // edited in the meantime: re-check before replacing it.
                 if into
                     .is_some_and(|id| self.sessions.get(id).is_some_and(DocumentSession::is_dirty))
                 {
+                    self.cancel_pending_search_navigation_for_path(path);
                     self.status =
                         Some("Save current changes before opening another file".to_owned());
                 } else {
@@ -2750,6 +2782,7 @@ impl EditorView {
                     // stale result that targets the current active session is
                     // discarded instead of applied.
                     if !is_latest_request && into == Some(previously_active) {
+                        self.cancel_pending_search_navigation_for_path(path);
                         self.status =
                             Some("A newer document is open; this load was discarded".to_owned());
                     } else {
@@ -2767,6 +2800,15 @@ impl EditorView {
                             self.on_document_replaced();
                             self.status = Some("Opened".to_owned());
                             self.schedule_document_parse(cx);
+                            match search_navigation_verification {
+                                Some(Ok(navigation_id)) => {
+                                    self.finish_pending_search_navigation(navigation_id, true, cx);
+                                }
+                                Some(Err(())) => {
+                                    self.discard_pending_search_navigation_for_path(path, cx);
+                                }
+                                None => {}
+                            }
                         } else {
                             // The session now holds the loaded document and is
                             // ready to be reused instantly next time it is
@@ -2796,6 +2838,20 @@ impl EditorView {
         self.settings_open
     }
 
+    pub fn settings_is_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Installs a handle to the app-owned AI service. The service itself stays
+    /// in the application composition root and outlives this editor view.
+    pub fn attach_ai_service(
+        &mut self,
+        service: Option<hane_ai::AiServiceHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_settings.attach(service, cx);
+    }
+
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor().ime().is_some() {
             self.status = Some("入力変換を確定または取り消してから設定を開いてください".to_owned());
@@ -2814,6 +2870,8 @@ impl EditorView {
         crate::init_components(cx);
         self.blur_sidebar_filter(cx);
         self.settings_open = true;
+        self.settings_ai_page = false;
+        self.ai_settings.begin_settings_session();
         self.settings_error = None;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         let generation = self.file_context_menu_generation;
@@ -2833,7 +2891,7 @@ impl EditorView {
             });
         })
         .detach();
-        window.focus(&self.focus_handle, cx);
+        window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
 
@@ -2842,10 +2900,50 @@ impl EditorView {
             return;
         }
         self.settings_open = false;
+        self.settings_ai_page = false;
+        self.ai_settings.close_settings();
         self.file_context_menu_busy = false;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    pub(crate) fn handle_settings_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && self.ai_settings.input_has_focus(window, cx) {
+            // A settings input owns Escape, including while an IME composition
+            // is active. The visible navigation remains available to leave.
+            return;
+        }
+        self.request_leave_settings(window, cx);
+    }
+
+    fn select_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if ai && !self.settings_ai_page {
+            self.ai_settings.activate(cx);
+        }
+        self.settings_ai_page = ai;
+        window.focus(&self.settings_focus_handle, cx);
+        cx.notify();
+    }
+
+    fn request_leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && self.ai_settings.is_dirty(cx) {
+            self.ai_settings
+                .confirm_leave(ai_settings::LeaveTarget::Close);
+            cx.notify();
+        } else {
+            self.close_settings(window, cx);
+        }
+    }
+
+    fn request_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && !ai && self.ai_settings.is_dirty(cx) {
+            self.ai_settings
+                .confirm_leave(ai_settings::LeaveTarget::General);
+            cx.notify();
+        } else {
+            self.select_settings_category(ai, window, cx);
+        }
     }
 
     fn set_file_context_menu(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -2903,7 +3001,33 @@ impl EditorView {
         }
     }
 
-    fn settings_screen_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_screen_element(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        if let Some(target) = self.ai_settings.take_ready_route() {
+            match target {
+                ai_settings::LeaveTarget::General => {
+                    self.select_settings_category(false, window, cx)
+                }
+                ai_settings::LeaveTarget::Close => {
+                    self.close_settings(window, cx);
+                }
+            }
+        }
+        let body = if self.settings_ai_page {
+            self.ai_settings_render(window, cx).into_any_element()
+        } else {
+            self.general_settings_content(cx).into_any_element()
+        };
+        self.settings_screen_shell(body, cx)
+    }
+
+    // Build the page before allocating the settings shell's style temporaries.
+    // Both frames must not be live together on Windows' 1 MiB UI thread stack.
+    #[inline(never)]
+    fn settings_screen_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::Div {
         let view = cx.entity();
         let back = Button::new("settings-back")
             .icon(IconName::ArrowLeft)
@@ -2911,9 +3035,73 @@ impl EditorView {
             .ghost()
             .tooltip("アプリに戻る")
             .on_click(move |_, window, app| {
-                view.update(app, |view, cx| view.close_settings(window, cx));
+                view.update(app, |view, cx| view.request_leave_settings(window, cx));
             });
 
+        let view = cx.entity();
+        let general_tab = Button::new("settings-category-general")
+            .label("一般")
+            .ghost()
+            .selected(!self.settings_ai_page)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(false, window, cx)
+                });
+            });
+        let view = cx.entity();
+        let ai_tab = Button::new("settings-category-ai")
+            .label("AI")
+            .ghost()
+            .selected(self.settings_ai_page)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(true, window, cx)
+                });
+            });
+
+        let content = div()
+            .id("settings-content")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full();
+        let content = if self.settings_ai_page {
+            content
+                .flex()
+                .flex_col()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(body)
+        } else {
+            content.overflow_y_scroll().child(body)
+        };
+
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .bg(rgb(self.theme.editor_background))
+            .text_color(rgb(self.theme.foreground))
+            .key_context("HaneEditor")
+            .track_focus(&self.settings_focus_handle);
+        let sidebar = div()
+            .id("settings-sidebar")
+            .debug_selector(|| "settings-sidebar".to_owned())
+            .w(px(self.sidebar_width))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .px(px(16.0))
+            .py(px(16.0))
+            .bg(rgb(self.theme.sidebar_background))
+            .child(back)
+            .child(general_tab)
+            .child(ai_tab);
+        install_action_listeners(root.child(sidebar).child(content), cx)
+    }
+
+    fn general_settings_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let unsupported = matches!(
             self.file_context_menu_state,
             FileContextMenuState::Unsupported
@@ -2934,107 +3122,68 @@ impl EditorView {
                 .text_color(rgb(0xb42318))
                 .child(format!("登録に失敗しました: {error}"))
         });
-        let content = div()
-            .id("settings-content")
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(760.0))
-                    .px(px(32.0))
-                    .py(px(28.0))
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_size(px(22.0))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("一般"),
-                    )
-                    .child(
-                        div()
-                            .pt(px(16.0))
-                            .border_t_1()
-                            .border_color(rgb(self.theme.sidebar_active_background))
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Windowsとの連携"),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-file-context-menu-card")
-                                    .w_full()
-                                    .px(px(16.0))
-                                    .py(px(14.0))
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(self.theme.sidebar_active_background))
-                                    .bg(rgb(self.theme.code_background))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(checkbox)
-                                    .child(
-                                        div()
-                                            .pl(px(28.0))
-                                            .text_color(rgb(self.theme.quote_foreground))
-                                            .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では署名済みのExplorer拡張パッケージが必要です。"),
-                                    )
-                                    .child(
-                                        div()
-                                            .pl(px(28.0))
-                                            .text_color(rgb(self.theme.quote_foreground))
-                                            .child(if busy {
-                                                "反映しています…"
-                                            } else {
-                                                self.file_context_menu_status()
-                                            }),
-                                    )
-                                    .children(error),
-                            ),
-                    ),
-            );
-        let root = div()
-            .size_full()
-            .flex()
-            .flex_row()
-            .bg(rgb(self.theme.editor_background))
-            .text_color(rgb(self.theme.foreground))
-            .key_context("HaneEditor")
-            .track_focus(&self.focus_handle(cx));
-        let sidebar = div()
-            .id("settings-sidebar")
-            .debug_selector(|| "settings-sidebar".to_owned())
-            .w(px(self.sidebar_width))
-            .h_full()
-            .flex_none()
+        div()
+            .id("general-settings-content")
+            .w_full()
+            .max_w(px(760.0))
+            .px(px(32.0))
+            .py(px(28.0))
             .flex()
             .flex_col()
             .gap_4()
-            .px(px(16.0))
-            .py(px(16.0))
-            .bg(rgb(self.theme.sidebar_background))
-            .child(back)
             .child(
                 div()
-                    .id("settings-category-general")
-                    .w_full()
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .rounded_sm()
-                    .bg(rgb(self.theme.sidebar_active_background))
+                    .text_size(px(22.0))
+                    .font_weight(gpui::FontWeight::BOLD)
                     .child("一般"),
-            );
-        install_action_listeners(root.child(sidebar).child(content), cx)
+            )
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .border_t_1()
+                    .border_color(rgb(self.theme.sidebar_active_background))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Windowsとの連携"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-file-context-menu-card")
+                            .w_full()
+                            .px(px(16.0))
+                            .py(px(14.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(self.theme.sidebar_active_background))
+                            .bg(rgb(self.theme.code_background))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(checkbox)
+                            .child(
+                                div()
+                                    .pl(px(28.0))
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では署名済みのExplorer拡張パッケージが必要です。"),
+                            )
+                            .child(
+                                div()
+                                    .pl(px(28.0))
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child(if busy {
+                                        "反映しています…"
+                                    } else {
+                                        self.file_context_menu_status()
+                                    }),
+                            )
+                            .children(error),
+                    ),
+            )
     }
 
     pub(crate) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3046,301 +3195,6 @@ impl EditorView {
         self.heights = HeightIndex::new(self.item_heights());
         self.store_settings();
         cx.notify();
-    }
-
-    /// Coalesced background job producing the formal, document-wide `BlockIndex`.
-    /// One job at a time; a result that no longer matches the document revision
-    /// is rebased or re-scheduled rather than published stale.
-    fn schedule_document_parse(&mut self, cx: &mut Context<Self>) {
-        let document = self.sessions.active().editor().document();
-        let revision = document.revision();
-        let disclosure = self.active_height_disclosure();
-        let force_height_disclosure_snapshot = self.force_height_disclosure_snapshot;
-        let disclosure_refresh = disclosure
-            .filter(|disclosure| !disclosure.is_empty())
-            .is_some_and(|disclosure| {
-                self.last_background_height_disclosure != Some((revision, disclosure))
-            });
-        let disclosure_collapse = disclosure
-            .filter(|disclosure| disclosure.is_empty())
-            .is_some_and(|_| {
-                self.last_background_height_disclosure.is_some_and(
-                    |(background_revision, background)| {
-                        background_revision == revision && !background.is_empty()
-                    },
-                )
-            });
-        if !self.block_index.needs_formal_parse(document)
-            && !disclosure_refresh
-            && !disclosure_collapse
-            && !force_height_disclosure_snapshot
-        {
-            return;
-        }
-        if self.document_parse_job_running {
-            return;
-        }
-        self.force_height_disclosure_snapshot = false;
-        self.document_parse_job_running = true;
-        let key = self.document_key();
-        let line_height = self.line_height();
-        let line_height_bits = line_height.to_bits();
-        let previous_height_disclosure = self
-            .last_applied_height_disclosure
-            .filter(|(previous_revision, _)| *previous_revision == revision)
-            .map(|(_, disclosure)| disclosure);
-        let snapshot_is_collapsing_disclosure = previous_height_disclosure
-            .is_some_and(|previous| !previous.is_empty())
-            && disclosure.is_some_and(|disclosure| disclosure.is_empty());
-        if let Some(disclosure) = disclosure {
-            self.last_background_height_disclosure = Some((revision, disclosure));
-        }
-        let snapshot = self.editor().document().clone();
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(40))
-                .await;
-            let current = view
-                .update(cx, |view, _| {
-                    view.document_key() == key
-                        && block_context_revision_is_current(
-                            view.editor().document().revision(),
-                            revision,
-                        )
-                        && height_snapshot_matches_line_height(
-                            view.line_height(),
-                            f32::from_bits(line_height_bits),
-                        )
-                })
-                .unwrap_or(false);
-            if !current {
-                let _ = view.update(cx, |view, cx| {
-                    view.document_parse_job_running = false;
-                    view.schedule_document_parse(cx);
-                });
-                return;
-            }
-            // Sizing the height index is proportional to the block count, so it
-            // is done here rather than on the main thread: for a 100 MB document
-            // that is tens of milliseconds that would otherwise land in one
-            // frame.
-            let (index, heights) = cx
-                .background_executor()
-                .spawn(async move {
-                    let index = BlockIndex::from_buffer(&snapshot);
-                    let heights = HeightIndex::new(block_heights_with_disclosure(
-                        &snapshot,
-                        &index,
-                        line_height,
-                        disclosure,
-                    ));
-                    (index, heights)
-                })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                view.document_parse_job_running = false;
-                if view.document_key() != key
-                    || !height_snapshot_matches_line_height(
-                        view.line_height(),
-                        f32::from_bits(line_height_bits),
-                    )
-                {
-                    // The index itself may still be current, but these
-                    // heights were measured for an older zoom/theme. Keep the
-                    // stale snapshot out of the visible height tree and rerun
-                    // the job with the current line height.
-                    view.schedule_document_parse(cx);
-                    return;
-                }
-                let document = view.sessions.active().editor().document();
-                let publish_outcome =
-                    view.block_index
-                        .publish(index, IndexSource::Formal, document);
-                let index_was_updated = matches!(
-                    publish_outcome,
-                    PublishOutcome::Published | PublishOutcome::Rebased(_)
-                );
-                if index_was_updated {
-                    view.background_presentation_generation = revision.0 + 1;
-                    // Formal boundaries can disagree with what the bounded
-                    // local parse showed, so every cached presentation is
-                    // re-derived once when the index actually changed.
-                    view.block_cache.clear();
-                    view.joined_parse_cache.clear();
-                }
-                let (granularity, len) = view.desired_layout();
-                let snapshot_disclosure_is_current = view.editor().document().revision()
-                    == revision
-                    && view.active_height_disclosure() == disclosure;
-                if snapshot_disclosure_is_current
-                    && granularity == Granularity::Blocks
-                    && len == heights.len()
-                {
-                    if publish_outcome == PublishOutcome::NotMoreAuthoritative {
-                        // The formal index is already current in this case;
-                        // this job only refreshed disclosure-dependent fence
-                        // heights. Preserve measured wrapping/image heights and
-                        // invalidate presentations lazily through their
-                        // disclosure check instead of throwing their caches
-                        // away for a selection change.
-                        view.install_disclosure_heights_preserving_measurements(
-                            heights,
-                            previous_height_disclosure,
-                        );
-                    } else if index_was_updated {
-                        view.install_heights(granularity, heights);
-                    }
-                    if let Some(disclosure) = disclosure {
-                        view.last_background_height_disclosure = Some((revision, disclosure));
-                    }
-                } else {
-                    // The parse was rebased onto edits, or the caret/IME moved
-                    // while it ran, so the prepared heights no longer describe
-                    // the current disclosure. A changed selection, including
-                    // a non-empty selection collapsing to a caret, is retried
-                    // in another background snapshot; rebuilding all selected
-                    // blocks here would put the same document-sized walk back
-                    // on the input thread at the completion boundary. The
-                    // bounded active-end update keeps the caret addressable
-                    // until that snapshot lands.
-                    let current_disclosure = view.active_height_disclosure();
-                    let selection_snapshot_requires_retry = current_disclosure != disclosure
-                        && (current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
-                            || disclosure.is_some_and(|disclosure| !disclosure.is_empty())
-                            || snapshot_is_collapsing_disclosure);
-                    if selection_snapshot_requires_retry {
-                        if snapshot_is_collapsing_disclosure
-                            && current_disclosure.is_some_and(|disclosure| disclosure.is_empty())
-                        {
-                            // Both snapshots are caret disclosures, so the
-                            // usual non-empty comparison cannot make the
-                            // queued job distinguish the latest caret from
-                            // the one that was captured before it started.
-                            view.force_height_disclosure_snapshot = true;
-                        }
-                        view.schedule_document_parse(cx);
-                        view.ensure_active_disclosure_height();
-                    } else if current_disclosure != disclosure {
-                        // Moving between two caret disclosures only needs the
-                        // bounded endpoint update; a whole-document snapshot
-                        // would make ordinary cursor motion unnecessarily
-                        // expensive.
-                        view.ensure_active_disclosure_height();
-                    } else {
-                        view.resync_heights_for_current_disclosure();
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Coalesced per-block background job producing the whole-span parse of a
-    /// joinable block that exceeds either synchronous line or byte budget — the
-    /// case `presented_block` itself cannot read and reparse synchronously on
-    /// every viewport miss without making a single huge paragraph's render
-    /// cost scale with its length. One job per block, bounded across documents; mirrors
-    /// [`Self::schedule_document_parse`]'s snapshot-and-spawn shape but at
-    /// block granularity, and is what resolves a marker pair arbitrarily far
-    /// apart in such a block without a fixed context window whose result
-    /// would depend on where the viewport happens to sit.
-    fn schedule_joined_parse(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
-        let revision = self.editor().document().revision();
-        for block in blocks {
-            if self.joined_parse_jobs_running >= MAX_JOINED_PARSE_JOBS {
-                // No backlog of obsolete viewport requests. Completion notifies
-                // the view so its current visible blocks can request a free slot.
-                break;
-            }
-            if !block_is_joinable(block.kind) {
-                continue;
-            }
-            // Re-fetched every iteration (cheap: a reference, not a clone) so
-            // its borrow never has to outlive the mutable `self` access below.
-            let document = self.editor().document();
-            let Some(span) = block_line_span(document, block) else {
-                continue;
-            };
-            if block_fits_sync_join_budget(block, &span) {
-                continue;
-            }
-            if self.joined_parse_jobs.contains_key(&block.id)
-                || self
-                    .joined_parse_cache
-                    .get(&block.id)
-                    .is_some_and(|cached| {
-                        cached.revision == revision && cached.source_range == block.source_range
-                    })
-            {
-                continue;
-            }
-            let content = span.start
-                ..span
-                    .end
-                    .saturating_sub(trailing_blank_lines(document, &span));
-            let snapshot = document.clone();
-            let id = block.id;
-            let source_range = block.source_range;
-            let job = JoinedParseJob {
-                document: self.document_key(),
-                revision,
-                source_range,
-            };
-            self.joined_parse_jobs.insert(id, job);
-            self.joined_parse_jobs_running += 1;
-            cx.spawn(async move |view, cx| {
-                let parse =
-                    cx.background_executor()
-                        .spawn(async move {
-                            parse_joined_span(&snapshot, content, source_range, revision)
-                        })
-                        .await;
-                let _ = view.update(cx, |view, cx| {
-                    // Release capacity even for an old document. Dropping a
-                    // Task cannot interrupt synchronous parse already polling;
-                    // capacity remains charged until it really finishes.
-                    view.joined_parse_jobs_running -= 1;
-                    cx.notify();
-                    if view.document_key() != job.document
-                        || view.joined_parse_jobs.get(&id) != Some(&job)
-                    {
-                        return;
-                    }
-                    view.joined_parse_jobs.remove(&id);
-                    // Resolve against the already-published current index;
-                    // never parse source synchronously to validate a result.
-                    // A provisional request can retry once the formal index
-                    // arrives and provides an exact block identity and range.
-                    let current = view
-                        .current_index()
-                        .and_then(|index| index.block_at(source_range.start));
-                    if view.editor().document().revision() != revision
-                        || current.is_none_or(|block| {
-                            block.id != id || block.source_range != source_range
-                        })
-                    {
-                        return;
-                    }
-                    if let Some(parse) = parse {
-                        view.joined_parse_cache.insert(
-                            id,
-                            JoinedBlockCache {
-                                revision,
-                                source_range,
-                                parse,
-                            },
-                        );
-                        // The next viewport miss on this block should read the
-                        // cache instead of the presentation this view already
-                        // built from a bounded, render-window-only parse.
-                        view.block_cache.remove(&id);
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
     }
 
     pub(crate) fn report_error(&mut self, operation: &str, error: BufferError) {
@@ -3440,7 +3294,6 @@ impl EditorView {
         self.after_input(cx);
     }
 
-
     /// Invalidates shaped/layout caches for a new font generation. During an
     /// intermediate wheel-animation frame, keep the existing document-wide
     /// height estimates and let the visible blocks replace only their measured
@@ -3462,7 +3315,6 @@ impl EditorView {
             self.rebuild_height_estimates();
         }
     }
-
 
     /// The presented line under a mouse event, from the mapping the last frame
     /// recorded. Only rendered lines can be clicked, so a miss means the frame
@@ -3534,6 +3386,7 @@ impl EditorView {
             return;
         }
         self.blur_sidebar_filter(cx);
+        self.blur_content_search_focus(cx);
         self.sidebar_keyboard_focus = false;
     }
 
@@ -3545,6 +3398,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.blur_content_search_focus(cx);
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
@@ -5213,6 +5067,28 @@ impl EditorView {
         }
     }
 
+    /// Marks that this view just received a `ScrollWheelEvent`, so the next
+    /// `record_frame_instrumentation` call can pair it with that frame's own
+    /// mach-clock paint/submission time (Issue #427's measurement-only
+    /// correlation tool). Purely an observation hook: it records nothing
+    /// about what the scroll did and never changes scroll behavior.
+    ///
+    /// Only the first receipt in a pending interval is kept: if another
+    /// `ScrollWheelEvent` arrives before `record_frame_instrumentation` has
+    /// consumed the pending tick, that later receipt is dropped rather than
+    /// overwriting the earlier one, so the measured interval always spans
+    /// from the first receipt to the next paint.
+    pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {
+        if self.instrumentation.pending_scroll_receipt_ticks.is_some() {
+            return;
+        }
+        if self.instrumentation.scroll_event_timing.is_some()
+            && let Some(ticks) = hane_metrics::mach_absolute_ticks()
+        {
+            self.instrumentation.pending_scroll_receipt_ticks = Some(ticks);
+        }
+    }
+
     pub(crate) fn record_frame_instrumentation(
         &mut self,
         measurements: &[InputMeasurement],
@@ -5220,6 +5096,18 @@ impl EditorView {
         layout: Option<Duration>,
     ) {
         let instrumentation = &mut self.instrumentation;
+        // `paint_ticks` is when `InputCapture::paint` ran (inside
+        // `Window::draw`), not when the platform renderer actually presented
+        // the frame to the compositor; `ScrollEventTimingOutput::record`
+        // reports that true presentation time as unavailable rather than
+        // treating this as it.
+        if let Some(receipt_ticks) = instrumentation.pending_scroll_receipt_ticks.take()
+            && let Some(paint_ticks) = hane_metrics::mach_absolute_ticks()
+            && let Some(output) = &mut instrumentation.scroll_event_timing
+            && let Err(error) = output.record(receipt_ticks, paint_ticks)
+        {
+            eprintln!("could not write scroll event timing: {error}");
+        }
         if instrumentation.ready_armed && !instrumentation.ready_reported {
             instrumentation.ready_reported = true;
             let startup = instrumentation.process_started.elapsed();
@@ -5334,6 +5222,8 @@ impl EditorView {
 
     fn record_block_index_update(&mut self, _update: &BlockIndexUpdate) {}
 
+    pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {}
+
     pub(crate) fn record_frame_instrumentation(
         &mut self,
         _measurements: &[InputMeasurement],
@@ -5371,6 +5261,12 @@ impl EditorView {
             viewport_height: self.viewport_height,
             content_height,
         });
+        // `advance_scroll_inertia` only detects a lost coast by comparing
+        // `scroll_y` against its own `last_applied` snapshot, which misses a
+        // drag that starts before the coast's next step has moved `scroll_y`
+        // away from that value. Clearing it explicitly here stops the coast
+        // from fighting the drag once it does resume (issue #389).
+        self.scroll_inertia = None;
         cx.stop_propagation();
         cx.notify();
     }
@@ -5789,8 +5685,39 @@ impl Render for EditorView {
             self.install_heights(granularity, heights);
         }
         self.step_wheel_zoom_animation(window);
+        self.step_scroll_inertia(window);
+        // Whether a live coast is still eligible to resync onto the
+        // height-anchor recompute below instead of reading as stale on the
+        // next frame (issue #389). Tracked separately from
+        // `self.scroll_inertia` so the render-entry clamp further down can
+        // disqualify it: if that clamp itself moves `scroll_y`, this is a
+        // genuine external change (e.g. a viewport shrink), not the
+        // height-anchor's own correction, and the coast must still stop.
+        let mut scroll_inertia_tracks_layout = self
+            .scroll_inertia
+            .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         if self.settings_open {
-            return self.settings_screen_element(cx);
+            return self.settings_screen_element(window, cx);
+        }
+        // Discards a context menu or close-confirmation left over for a tab
+        // that closed through some other route while it was still showing,
+        // or whose id now names a different document instance (a
+        // work-folder switch reusing the id, or an in-place reopen), rather
+        // than acting on (or displaying stale information about) a document
+        // the action was never taken against.
+        if self
+            .file_tab_context_menu
+            .as_ref()
+            .is_some_and(|menu| self.document_instance(menu.id) != Some(menu.instance))
+        {
+            self.file_tab_context_menu = None;
+        }
+        if self
+            .tab_close_confirm
+            .as_ref()
+            .is_some_and(|confirm| self.document_instance(confirm.id) != Some(confirm.instance))
+        {
+            self.tab_close_confirm = None;
         }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
@@ -5803,7 +5730,8 @@ impl Render for EditorView {
         // its width out of the same window, so it must be subtracted here too,
         // not just in the element tree, or wrapping would be computed for a
         // column wider than what is actually drawn.
-        let sidebar_width = if self.work_folder.is_some() {
+        let sidebar_visible = self.work_folder.is_some() || self.content_search_sidebar_visible();
+        let sidebar_width = if sidebar_visible {
             self.sidebar_width + SIDEBAR_RESIZER_WIDTH
         } else {
             0.0
@@ -5830,6 +5758,9 @@ impl Render for EditorView {
             self.scrollable_content_height(),
             self.viewport_height,
         );
+        scroll_inertia_tracks_layout &= self
+            .scroll_inertia
+            .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         let visible =
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
@@ -5921,22 +5852,8 @@ impl Render for EditorView {
         // same block and the same position inside it at the top instead of
         // letting those corrections visibly move the document, unless the
         // zoom gesture has a more specific pointer/pinch anchor.
-        if !zoom_anchor_applied && let Some((old_ordinal, intra)) = height_anchor {
-            let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
-            let inside = if ordinal + 1 == self.heights.len() {
-                // At the document's last item, `intra` can already be
-                // carrying the `CARET_MODE_BADGE_HEIGHT` clearance
-                // `scroll_cursor_into_view` reserved past its bottom.
-                // Clamping it to the item's own height would throw that
-                // clearance away before the badge is ever drawn (issue
-                // #240); the clamp below still bounds the result.
-                intra.max(0.0)
-            } else {
-                self.heights
-                    .height(ordinal)
-                    .map_or(0.0, |height| intra.clamp(0.0, height))
-            };
-            self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
+        if !zoom_anchor_applied {
+            self.apply_height_anchor(height_anchor, scroll_inertia_tracks_layout);
         }
         // A newly measured block can shrink at the old bottom. Anchoring
         // preserves its block-relative position, which can now sit below the
@@ -6084,7 +6001,7 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle(cx));
         let sidebar_viewport_height = f32::from(window.viewport_size().height);
         let sidebar = self.work_folder_sidebar(sidebar_viewport_height, cx);
-        let resizer = if self.work_folder.is_some() {
+        let resizer = if sidebar_visible {
             Some(self.sidebar_resizer(cx))
         } else {
             None
@@ -6203,42 +6120,110 @@ impl Render for EditorView {
         } else {
             rendered
         };
+        let rendered = if let Some(confirm) = self.tab_close_confirm.as_ref() {
+            rendered.child(self.tab_close_confirm_element(confirm, cx))
+        } else {
+            rendered
+        };
         self.metrics.record_layout(layout_started.elapsed());
         rendered
     }
 }
 
+#[cfg(target_os = "macos")]
+const REVEAL_IN_FILE_MANAGER_LABEL: &str = "Finderで保存場所を開く";
+#[cfg(target_os = "windows")]
+const REVEAL_IN_FILE_MANAGER_LABEL: &str = "エクスプローラーで保存場所を開く";
+
 impl EditorView {
+    /// One row of the tab context menu. `on_click` is only wired when
+    /// `enabled` is true, so a path-less document (e.g. an untitled buffer)
+    /// does not connect a click action for path-dependent rows at all,
+    /// instead of relying on the handler to refuse the click after the fact.
+    fn file_tab_context_menu_item(
+        &self,
+        key: &'static str,
+        label: &'static str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(key)
+            .debug_selector(move || key.to_owned())
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .when(enabled, move |element| {
+                element
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
+                    .on_click(cx.listener(on_click))
+            })
+            .when(!enabled, |element| {
+                element.text_color(rgb(self.theme.quote_foreground))
+            })
+            .child(label)
+    }
+
     fn file_tab_context_menu_element(
         &self,
         menu: &FileTabContextMenu,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let path = menu.path.clone();
-        let can_open = path.is_some();
-        let item = div()
-            .id("file-tab-context-open-vscode")
-            .debug_selector(|| "file-tab-context-open-vscode".to_owned())
-            .w_full()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .when(can_open, |element| {
-                element
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
-            })
-            .when(!can_open, |element| {
-                element.text_color(rgb(self.theme.quote_foreground))
-            })
-            .child("VSCodeで開く")
-            .on_click(cx.listener(move |view, _, _, cx| {
-                view.open_file_tab_in_vscode(path.clone(), cx);
-            }));
+        // Re-read from the session on every render rather than trusting a
+        // snapshot taken when the menu was opened, so a rename that lands
+        // while it is still open (H1 auto-naming, a filer event) is reflected
+        // instead of acting on a path the file no longer has.
+        let path = self
+            .sessions
+            .get(menu.id)
+            .and_then(DocumentSession::path)
+            .map(Path::to_path_buf);
+        let can_use_path = path.is_some();
 
-        div()
+        let vscode_path = path.clone();
+        let vscode_item = self.file_tab_context_menu_item(
+            "file-tab-context-open-vscode",
+            "VSCodeで開く",
+            can_use_path,
+            cx,
+            move |view, _, _, cx| view.open_file_tab_in_vscode(vscode_path.clone(), cx),
+        );
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let reveal_item = {
+            let reveal_path = path.clone();
+            self.file_tab_context_menu_item(
+                "file-tab-context-reveal",
+                REVEAL_IN_FILE_MANAGER_LABEL,
+                can_use_path,
+                cx,
+                move |view, _, _, cx| view.reveal_file_tab_in_file_manager(reveal_path.clone(), cx),
+            )
+        };
+
+        let copy_path = path;
+        let copy_item = self.file_tab_context_menu_item(
+            "file-tab-context-copy-path",
+            "フルパスをコピー",
+            can_use_path,
+            cx,
+            move |view, _, _, cx| view.copy_file_tab_full_path(copy_path.clone(), cx),
+        );
+
+        let menu_element = div()
             .id("file-tab-context-menu")
             .debug_selector(|| "file-tab-context-menu".to_owned())
+            // The menu floats over the tab bar and document body via
+            // `anchored()`, and can land on top of either depending on
+            // where the triggering tab sits. Without occluding its own
+            // hitbox, a click that lands within the menu's painted bounds
+            // but outside an item (padding, a disabled row, the border)
+            // still reaches whatever row/tab is underneath, moving the
+            // caret or selection in the background document.
+            .occlude()
             .min_w(px(180.0))
             .flex()
             .flex_col()
@@ -6249,7 +6234,81 @@ impl EditorView {
             .bg(rgb(self.theme.code_background))
             .text_color(rgb(self.theme.foreground))
             .on_mouse_down_out(cx.listener(Self::close_file_tab_context_menu))
-            .child(item)
+            .child(vscode_item);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let menu_element = menu_element.child(reveal_item);
+        menu_element.child(copy_item)
+    }
+
+    fn tab_close_confirm_element(
+        &self,
+        confirm: &TabCloseConfirm,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        // Captured as the whole snapshot, not just the `id`: every closure
+        // below, including the backdrop's further down, must act only on
+        // this exact confirmation, not on whatever confirmation happens to
+        // be live by the time a stale click actually fires (see
+        // `confirm_save_and_close_tab`).
+        let snapshot = *confirm;
+        let id = confirm.id;
+        let label = self
+            .sessions
+            .get(id)
+            .map(DocumentSession::label)
+            .unwrap_or_default();
+        let cancel = self.file_tab_context_menu_item(
+            "tab-close-confirm-cancel",
+            "キャンセル",
+            true,
+            cx,
+            move |view, _, _, cx| {
+                view.dismiss_tab_close_confirm_if(snapshot, cx);
+            },
+        );
+        let save_and_close = self.file_tab_context_menu_item(
+            "tab-close-confirm-save",
+            "保存して閉じる",
+            true,
+            cx,
+            move |view, _, _, cx| view.confirm_save_and_close_tab(snapshot, cx),
+        );
+        div()
+            .id("tab-close-confirm-overlay")
+            .debug_selector(|| "tab-close-confirm-overlay".to_owned())
+            .occlude()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_0080))
+            .child(
+                div()
+                    .id("tab-close-confirm")
+                    .debug_selector(|| "tab-close-confirm".to_owned())
+                    .min_w(px(280.0))
+                    .max_w(px(420.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(self.theme.header_foreground))
+                    .bg(rgb(self.theme.code_background))
+                    .text_color(rgb(self.theme.foreground))
+                    .on_mouse_down_out(cx.listener(move |view, _, _, cx| {
+                        view.dismiss_tab_close_confirm_if(snapshot, cx);
+                    }))
+                    .child(div().child(format!("\"{label}\" の変更を保存しますか?")))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(cancel)
+                            .child(save_and_close),
+                    ),
+            )
     }
 
     fn header_element(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -6278,12 +6337,19 @@ impl EditorView {
                 let label_element = div().min_w_0().truncate().child(label.clone());
                 let tab_content = if session.path().is_some() {
                     let full_path = session.label();
-                    HoverCard::new(format!("file-tab-path-{index}"))
-                        .anchor(Anchor::BottomCenter)
+                    // Keyed by the session's own stable `SessionId`, not the
+                    // render `index`: closing or reordering an earlier tab
+                    // shifts later tabs into different indices every frame,
+                    // and an index-keyed `HoverCard` would let a session
+                    // that slides into a freed slot inherit whatever
+                    // hover/open UI state gpui already has cached under
+                    // that same id from the tab that used to live there.
+                    HoverCard::new(format!("file-tab-path-{}", id.0))
+                        .anchor(Anchor::TopCenter)
                         .trigger(label_element)
                         .content(move |_, _, _| {
                             let path_for_copy = full_path.clone();
-                            let copy_button = Button::new(format!("copy-file-path-{index}"))
+                            let copy_button = Button::new(format!("copy-file-path-{}", id.0))
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Copy)
@@ -6327,6 +6393,18 @@ impl EditorView {
                         MouseButton::Right,
                         cx.listener(move |view, event: &MouseDownEvent, _, cx| {
                             view.open_file_tab_context_menu(id, event.position, cx);
+                        }),
+                    )
+                    // Middle-click closes just this tab. `id` is the session
+                    // this specific tab was rendered for, captured fresh each
+                    // frame, so this can never drift onto whichever session
+                    // happens to be active. Wired to mousedown only (like the
+                    // right-click handler above), so a press-and-release pair
+                    // fires this once, not twice.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |view, _event: &MouseDownEvent, _, cx| {
+                            view.request_tab_close(id, cx);
                         }),
                     )
             })
@@ -6671,6 +6749,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn reveal_launch_command_quotes_the_path_for_the_platform_shell() {
+        let path = Path::new("/tmp/日本語 フォルダ/file with spaces.md");
+        let command = EditorView::reveal_launch_command(path);
+        let args: Vec<_> = command.get_args().collect();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("open"));
+            assert_eq!(
+                args,
+                vec![std::ffi::OsStr::new("-R"), path.as_os_str()]
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Explorer parses its raw command line itself: `/select,` must
+            // stay unquoted and directly adjacent to the quoted path, with
+            // no space in between, or the switch is not recognized.
+            let mut expected = std::ffi::OsString::from("/select,\"");
+            expected.push(path.as_os_str());
+            expected.push("\"");
+
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("explorer.exe"));
+            assert_eq!(args, vec![expected.as_os_str()]);
+        }
+    }
+
+    #[test]
     fn layout_cache_key_rejects_each_geometry_input_independently() {
         let entry = LayoutCacheEntry {
             layout: BlockLayout {
@@ -6770,6 +6878,24 @@ mod tests {
             None,
             "test views must not query the host OS input source"
         );
+    }
+
+    // Issue #427's scroll-event measurement harness pairs one receipt with
+    // the next paint; a second `ScrollWheelEvent` arriving first must not
+    // discard the earlier receipt still waiting for that paint.
+    #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+    #[gpui::test]
+    fn scroll_receipt_for_measurement_keeps_the_first_pending_tick(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            view.instrumentation.pending_scroll_receipt_ticks = Some(42);
+            view.record_scroll_receipt_for_measurement();
+            assert_eq!(
+                view.instrumentation.pending_scroll_receipt_ticks,
+                Some(42),
+                "a later scroll receipt must not overwrite the one still pending"
+            );
+        });
     }
 
     #[gpui::test]
@@ -7923,6 +8049,172 @@ mod tests {
 
         let settled = eased_wheel_zoom_step(1.1995, 1.2, Duration::from_millis(16));
         assert_eq!(settled, 1.2);
+    }
+
+    // Issue #389: short post-wheel scroll inertia for the main panel.
+
+    #[test]
+    fn scroll_inertia_velocity_for_lines_delta_matches_the_sign_and_size_of_the_input() {
+        let forward = scroll_inertia_velocity_for_lines_delta(30.0);
+        let backward = scroll_inertia_velocity_for_lines_delta(-30.0);
+        assert!(forward > 0.0, "{forward}");
+        assert!(backward < 0.0, "{backward}");
+        assert_eq!(forward, -backward);
+
+        // The full coast distance (velocity integrated over the exponential
+        // decay) is `velocity * SCROLL_INERTIA_TIME_CONSTANT`, i.e. it must
+        // land back on the delta that produced it.
+        let coast_distance = forward * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
+        assert!((coast_distance - 30.0).abs() < 1e-4, "{coast_distance}");
+    }
+
+    #[test]
+    fn eased_scroll_inertia_step_decays_without_overshooting_the_coast_distance() {
+        let velocity = scroll_inertia_velocity_for_lines_delta(40.0);
+        let coast_distance = velocity * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
+
+        let mut current_velocity = velocity;
+        let mut travelled = 0.0;
+        let mut travelled_by_three_time_constants = None;
+        let mut elapsed_total = Duration::ZERO;
+        for _ in 0..256 {
+            let Some((distance, next_velocity)) =
+                eased_scroll_inertia_step(current_velocity, Duration::from_millis(16))
+            else {
+                break;
+            };
+            assert!(
+                distance.signum() == coast_distance.signum() || distance == 0.0,
+                "inertia must not reverse direction mid-coast: {distance}"
+            );
+            travelled += distance;
+            elapsed_total += Duration::from_millis(16);
+            assert!(
+                travelled <= coast_distance + 1e-3,
+                "inertia overshot its total coast distance: travelled={travelled}, \
+                 coast_distance={coast_distance}"
+            );
+            assert!(
+                next_velocity.abs() <= current_velocity.abs(),
+                "velocity must monotonically decay: {next_velocity} vs {current_velocity}"
+            );
+            if travelled_by_three_time_constants.is_none()
+                && elapsed_total >= SCROLL_INERTIA_TIME_CONSTANT * 3
+            {
+                travelled_by_three_time_constants = Some(travelled);
+            }
+            current_velocity = next_velocity;
+        }
+        assert!(
+            (travelled - coast_distance).abs() < 0.5,
+            "inertia must settle near its full coast distance: travelled={travelled}, \
+             coast_distance={coast_distance}"
+        );
+
+        // Three time constants cover the large majority of a single delta;
+        // the burst test below checks when a large visible tail actually ends.
+        let covered = travelled_by_three_time_constants
+            .expect("the loop must reach three time constants before settling");
+        assert!(
+            covered / coast_distance > 0.9,
+            "expected most of the coast distance to be covered within three time constants: {covered} of \
+             {coast_distance}"
+        );
+
+        // A long-settled duration decays the velocity below the
+        // imperceptible-motion threshold, but the step must still deliver
+        // the full remaining coast distance instead of silently dropping it
+        // (issue #389); a further call then settles with no motion left.
+        let (long_distance, long_next_velocity) =
+            eased_scroll_inertia_step(velocity, Duration::from_secs(1))
+                .expect("a long-elapsed step must still return the remaining coast distance");
+        assert!(
+            (long_distance - coast_distance).abs() < 1e-3,
+            "{long_distance}"
+        );
+        assert!(eased_scroll_inertia_step(long_next_velocity, Duration::from_millis(16)).is_none());
+    }
+
+    #[test]
+    fn physical_wheel_burst_settles_within_150ms_of_its_last_event() {
+        // The observed physical mouse sent seven non-precise Lines events
+        // over 72 ms. A one-pixel settle threshold with a long exponential
+        // tail previously kept this large burst visibly moving for ~296 ms
+        // after the last event. Use a generous 72 px per line so this checks
+        // the visible tail of a large document movement, not just a detent.
+        let burst = [
+            (0, 1.0),
+            (8, 1.0),
+            (19, 4.0),
+            (31, 5.0),
+            (44, 6.0),
+            (58, 7.0),
+            (72, 7.0),
+        ];
+        let mut velocity = 0.0;
+        let mut previous_ms = 0;
+        for (index, (at_ms, lines)) in burst.into_iter().enumerate() {
+            velocity += scroll_inertia_velocity_for_lines_delta(lines * 72.0);
+            let elapsed = if index == 0 {
+                SCROLL_INERTIA_COLD_START_FRAME_TIME
+            } else {
+                Duration::from_millis(at_ms - previous_ms)
+            };
+            let (_, next_velocity) = eased_scroll_inertia_step(velocity, elapsed)
+                .expect("a physical wheel burst must keep the coast armed");
+            velocity = next_velocity;
+            previous_ms = at_ms;
+        }
+
+        let mut last_motion_ms = 0;
+        for after_last_ms in (16..=160).step_by(16) {
+            let Some((distance, next_velocity)) =
+                eased_scroll_inertia_step(velocity, Duration::from_millis(16))
+            else {
+                break;
+            };
+            assert!(distance > 0.0, "coast must not reverse: {distance}");
+            last_motion_ms = after_last_ms;
+            velocity = next_velocity;
+        }
+        assert!(
+            last_motion_ms >= 100,
+            "coast stopped too abruptly: {last_motion_ms} ms"
+        );
+        assert!(
+            last_motion_ms <= 150,
+            "visible coast continued too long: {last_motion_ms} ms"
+        );
+        assert!(
+            eased_scroll_inertia_step(velocity, Duration::from_millis(16)).is_none(),
+            "the burst must be fully settled after its final visible frame"
+        );
+    }
+
+    #[test]
+    fn scroll_inertia_uses_real_time_on_a_240hz_display() {
+        // A frame at 240 Hz arrives in about 4.2 ms. Rounding every frame up
+        // to 8.3 ms would halve the visible coast's real duration.
+        let mut velocity = scroll_inertia_velocity_for_lines_delta(1_000.0);
+        let frame_time = Duration::from_micros(4_167);
+        let mut last_motion = Duration::ZERO;
+        for _ in 0..100 {
+            let Some((distance, next_velocity)) = eased_scroll_inertia_step(velocity, frame_time)
+            else {
+                break;
+            };
+            assert!(distance > 0.0, "coast must not reverse: {distance}");
+            last_motion += frame_time;
+            velocity = next_velocity;
+        }
+        assert!(last_motion >= Duration::from_millis(100), "{last_motion:?}");
+        assert!(last_motion <= Duration::from_millis(150), "{last_motion:?}");
+        assert!(eased_scroll_inertia_step(velocity, frame_time).is_none());
+    }
+
+    #[test]
+    fn eased_scroll_inertia_step_settles_immediately_for_a_negligible_velocity() {
+        assert!(eased_scroll_inertia_step(0.5, Duration::from_millis(16)).is_none());
     }
 
     #[gpui::test]
@@ -10280,6 +10572,103 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // AADW Commander review follow-up on PR #416: `schedule_draft_save`'s
+    // debounce used to check only the session's own revision and whether
+    // `work_folder_drafts` still had *some* entry for the id, neither of
+    // which is scoped to a workspace. A work-folder switch installs a
+    // fresh `SessionSet` whose ids (and each fresh session's own revision
+    // counter) restart at the same values the old one used, so a draft note
+    // in the new workspace that happens to receive exactly as many edits as
+    // the old one had can produce a revision the old timer still reads as
+    // current — and then journal the *new* document's text under the
+    // *old* workspace's draft id and root.
+    #[gpui::test]
+    fn schedule_draft_save_ignores_a_stale_timer_after_a_work_folder_switch_reuses_the_draft_slot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("draft-save-ticket-collision-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let new_root = draft_test_root("draft-save-ticket-collision-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(old_work_folder);
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: old_root.clone(),
+                },
+            );
+            // One edit arms the debounce with a revision value the fresh
+            // replacement document below will coincidentally share, since
+            // a freshly created document's own revision counter restarts
+            // at the same values.
+            view.editor_mut().insert_text("x").unwrap();
+            view.after_input(cx);
+        });
+        // Lets the spawned task reach its `Timer::after` await and register
+        // with the real clock, without letting 750ms of real time pass yet.
+        cx.run_until_parked();
+
+        // `switch_to_work_folder` flushes the old draft synchronously before
+        // dropping it, so the old workspace's journal already holds the
+        // correct "x" at this point — the stale background timer armed
+        // above has not fired yet.
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let new_id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                new_id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: new_root.clone(),
+                },
+            );
+            // Exactly one edit, the same as the old document got, so this
+            // fresh document's revision coincides with the old timer's
+            // captured ticket.
+            view.editor_mut().insert_text("y").unwrap();
+            view.after_input(cx);
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(900));
+        cx.run_until_parked();
+
+        // The stale timer armed for the old workspace's draft must not
+        // have overwritten it with the replacement document's text.
+        let old_recovered = OsDraftStore.recover(&old_root).unwrap();
+        assert_eq!(old_recovered.drafts.len(), 1);
+        assert_eq!(
+            old_recovered.drafts[0].text, "x",
+            "a stale draft-save timer from before a work-folder switch must not overwrite the \
+             old workspace's own draft with the replacement document's text"
+        );
+
+        // The new document's own debounce still works normally.
+        let new_recovered = OsDraftStore.recover(&new_root).unwrap();
+        assert_eq!(new_recovered.drafts.len(), 1);
+        assert_eq!(new_recovered.drafts[0].text, "y");
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
     // Issue #2 follow-up: `prompt_open_work_folder` is the GUI entry point
     // for switching into work-folder mode at runtime (previously only
     // reachable via a startup CLI argument). `switch_to_work_folder` is the
@@ -10349,6 +10738,91 @@ mod tests {
             old_recovered.drafts[0].text,
             format!("{heading}draft in the old folder")
         );
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Issue #414: `begin_work_folder_scan` starts the scan/recovery pair on a
+    // background thread, and `switch_to_work_folder` can start a second one
+    // before the first lands — switching folder A then B in quick
+    // succession. If A's scan happens to finish *after* B's, a
+    // `finish_work_folder_scan` that only looked at completion order (not
+    // which request it belongs to) would overwrite the already-current
+    // folder B with A's stale folder, sessions, and drafts.
+    #[gpui::test]
+    fn a_stale_work_folder_scan_finishing_after_a_later_switch_is_ignored(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-scan-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::write(old_root.join("Old.md"), "# Old\n").unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let new_root = draft_test_root("stale-scan-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::write(new_root.join("New.md"), "# New\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        // `old_root`'s scan is modeled as having started at the generation
+        // in effect before any switch happened — the generation this view
+        // starts at.
+        let stale_generation = view.read_with(cx, |view, _| view.work_folder_generation);
+
+        // A switch to `new_root` bumps the generation and starts its own
+        // scan, which is left to run to completion below before the stale
+        // `old_root` result (captured above) is delivered.
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path())
+            );
+        });
+
+        // The stale `old_root` scan now lands, out of completion order,
+        // after `new_root` is already the current folder.
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                stale_generation,
+                (
+                    Ok(old_work_folder),
+                    Ok(RecoveredDrafts::default()),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path()),
+                "a stale scan for a folder switched away from must not overwrite the current one"
+            );
+            assert_eq!(
+                view.editor().document().full_text().trim(),
+                "# New",
+                "the stale scan must not replace the current folder's active document"
+            );
+            assert!(
+                view.work_folder_drafts.is_empty(),
+                "the stale scan must not install drafts for a folder that is no longer current"
+            );
+        });
 
         std::fs::remove_dir_all(&old_root).unwrap();
         std::fs::remove_dir_all(&new_root).unwrap();
@@ -10575,7 +11049,12 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                view.work_folder_generation,
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -10622,7 +11101,12 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
-                (Ok(work_folder), Ok(partial), work_folder_scan_timestamp_for_test()),
+                view.work_folder_generation,
+                (
+                    Ok(work_folder),
+                    Ok(partial),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -10674,7 +11158,12 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                view.work_folder_generation,
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -10747,7 +11236,12 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                view.work_folder_generation,
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
             // A save failure arriving well after the recovery warning was
@@ -10866,18 +11360,18 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert_eq!(view.sessions.active_id(), SessionId(0));
-            assert_eq!(
-                view.file_tab_context_menu
-                    .as_ref()
-                    .and_then(|menu| menu.path.as_deref()),
-                Some(expected_clicked_path.as_path())
-            );
+            let menu_target_path = view
+                .file_tab_context_menu
+                .as_ref()
+                .and_then(|menu| view.sessions.get(menu.id))
+                .and_then(DocumentSession::path);
+            assert_eq!(menu_target_path, Some(expected_clicked_path.as_path()));
         });
         assert!(cx.debug_bounds("file-tab-context-menu").is_some());
     }
 
     #[gpui::test]
-    fn file_tab_context_menu_handles_an_untitled_session_without_spawning(
+    fn file_tab_context_menu_disables_path_dependent_items_for_an_untitled_session(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
@@ -10890,26 +11384,38 @@ mod tests {
         cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.run_until_parked();
-        let item = cx
+        let vscode_item = cx
             .debug_bounds("file-tab-context-open-vscode")
             .expect("context menu item rendered");
+        let copy_item = cx
+            .debug_bounds("file-tab-context-copy-path")
+            .expect("copy-path item rendered");
         view.read_with(cx, |view, _| {
-            assert!(
-                view.file_tab_context_menu
-                    .as_ref()
-                    .is_some_and(|menu| menu.path.is_none())
-            );
+            let menu_target_path = view
+                .file_tab_context_menu
+                .as_ref()
+                .and_then(|menu| view.sessions.get(menu.id))
+                .and_then(DocumentSession::path);
+            assert!(menu_target_path.is_none());
         });
 
-        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        // Path-dependent rows for an untitled document have no `on_click`
+        // wired at all, so clicking them must not invoke the handler, show
+        // a status message, or close the still-open menu.
+        cx.simulate_click(vscode_item.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(view.file_tab_context_menu.is_none());
-            assert_eq!(
-                view.status.as_deref(),
-                Some("VSCodeで開くにはファイルを保存してください")
-            );
+            assert!(view.file_tab_context_menu.is_some());
+            assert_eq!(view.status, None);
         });
+
+        cx.simulate_click(copy_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_some());
+            assert_eq!(view.status, None);
+        });
+        assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()), None);
     }
 
     #[gpui::test]
@@ -10939,6 +11445,2600 @@ mod tests {
         cx.simulate_click(point(px(620.0), px(220.0)), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_blocks_clicks_to_background_document(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::new("first line\nsecond line\nthird line\n", "Untitled", cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(400.0)));
+        cx.run_until_parked();
+
+        let caret = view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.after_input(cx);
+            view.editor().selection()
+        });
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("first document row rendered");
+        let id = view.read_with(cx, |view, _| view.sessions.active_id());
+
+        // Anchor the menu's own top-left corner exactly at the first row's
+        // top-left corner, the same way a real right-click elsewhere in the
+        // window can land a menu row over the active document body
+        // depending on where the triggering tab sits. The session has no
+        // path, so every item below is a disabled row with no `on_click`
+        // wired, exercising the "disabled row / empty padding" case the fix
+        // must also cover, not just an active item's own click handler.
+        view.update(cx, |view, cx| {
+            view.open_file_tab_context_menu(id, row.origin, cx);
+        });
+        cx.run_until_parked();
+
+        let menu = cx
+            .debug_bounds("file-tab-context-menu")
+            .expect("context menu rendered");
+        let overlap = menu.intersect(&row);
+        assert!(
+            overlap.size.width > px(0.0) && overlap.size.height > px(0.0),
+            "test setup must position the menu over the document body for this probe to be meaningful: \
+             menu={menu:?} row={row:?}"
+        );
+
+        // A click inside the overlap must land on the menu (which occludes
+        // its own hitbox), not fall through to the row underneath.
+        cx.simulate_mouse_down(overlap.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(overlap.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                caret,
+                "a click on the context menu, even over a disabled row, must not move the \
+                 caret in the background document"
+            );
+            assert!(
+                view.file_tab_context_menu.is_some(),
+                "the menu only closes via its own outside-click/escape handling, not by a \
+                 click on itself"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn copying_a_file_tabs_full_path_writes_it_to_the_clipboard(cx: &mut gpui::TestAppContext) {
+        // A directory and file name with both whitespace and Japanese text,
+        // to demonstrate the copied string is exactly `Path::display()`
+        // rather than something reassembled through a shell.
+        let path = PathBuf::from("メモ帳 用フォルダ/日本語 ノート.md");
+        let expected = path.display().to_string();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("body\n"),
+                identity: hane_session::FileIdentity::lexical(path),
+                stamp: None,
+            });
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("file tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let copy_item = cx
+            .debug_bounds("file-tab-context-copy-path")
+            .expect("copy-path item rendered");
+        cx.simulate_click(copy_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(expected)
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_none());
+            assert_eq!(view.status.as_deref(), Some("フルパスをコピーしました"));
+        });
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_is_discarded_when_its_session_closes_through_a_work_folder_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let new_root = draft_test_root("context-menu-stale-switch");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("active\n"),
+                identity: hane_session::FileIdentity::lexical(active_path),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_mouse_down(
+            other_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            other_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        // Switching work folders discards every old session wholesale,
+        // through a route other than the menu's own item handlers or
+        // `close_tab_now`, leaving behind a menu that still targets a
+        // `SessionId` the new `SessionSet` knows nothing about.
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.file_tab_context_menu.is_none(),
+                "a menu left over from the discarded session must not linger"
+            );
+        });
+        assert!(cx.debug_bounds("file-tab-context-menu").is_none());
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Companion to the test above, but for `SessionId(0)` specifically: a
+    // work-folder switch installs a fresh `SessionSet::with_untitled`, whose
+    // one new session reuses id 0 at generation 0 — the exact id and
+    // generation the very first tab of any window starts at. The sibling
+    // test's `SessionId(1)` happens to vanish outright, so it cannot catch a
+    // check that only compares ids; this one exercises the id the old and
+    // new documents actually share.
+    #[gpui::test]
+    fn file_tab_context_menu_for_the_first_tab_is_discarded_when_a_work_folder_switch_reuses_its_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let new_root = draft_test_root("context-menu-stale-switch-id-zero");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "the replacement untitled session reuses the old SessionId(0)"
+            );
+            assert!(
+                view.file_tab_context_menu.is_none(),
+                "a menu opened for the old SessionId(0) document must not linger for the \
+                 unrelated document that now reuses that id"
+            );
+        });
+        assert!(cx.debug_bounds("file-tab-context-menu").is_none());
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Same id-reuse hazard as the test above, for the close-confirmation
+    // overlay rather than the context menu.
+    #[gpui::test]
+    fn tab_close_confirm_for_the_first_tab_is_discarded_when_a_work_folder_switch_reuses_its_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let new_root = draft_test_root("close-confirm-stale-switch-id-zero");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("draft").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.tab_close_confirm.is_some()));
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), SessionId(0));
+            assert!(
+                view.tab_close_confirm.is_none(),
+                "a close confirmation opened for the old SessionId(0) document must not linger \
+                 for the unrelated document that now reuses that id"
+            );
+            assert!(
+                !view.sessions.active().is_dirty(),
+                "the replacement document must be the fresh, clean untitled session \
+                 `switch_to_work_folder` installed, not treated as still having the old \
+                 document's unsaved edits"
+            );
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "no close-then-save request must be armed for the replacement document either"
+            );
+        });
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    #[gpui::test]
+    fn left_clicking_a_path_bearing_file_tab_activates_its_session(cx: &mut gpui::TestAppContext) {
+        // Both sessions have a real path, so both tabs render their label
+        // through the `HoverCard` trigger (`session.path().is_some()`)
+        // instead of the bare label used by path-less sessions. Left-click
+        // selection, driven by `TabBar::on_click`, must still reach the tab
+        // through that trigger.
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("active\n"),
+                    identity: hane_session::FileIdentity::lexical(active_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let other = view.update(cx, |view, cx| {
+            let other = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(SessionId(0)));
+            cx.notify();
+            other
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_click(other_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), other);
+        });
+    }
+
+    #[gpui::test]
+    fn a_file_tabs_identity_follows_its_own_session_after_an_earlier_tab_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Three path-bearing tabs. Closing the first one shifts the other
+        // two tabs' *index* down by one, while the `HoverCard` and its copy
+        // button are keyed by each session's own stable `SessionId` rather
+        // than that index. Left-click, middle-click and right-click on the
+        // tab that slides into the freed slot must all still resolve to the
+        // session actually showing there, with no path left over from the
+        // session that used to occupy that slot.
+        let first_path = PathBuf::from("first.md");
+        let second_path = PathBuf::from("second.md");
+        let third_path = PathBuf::from("third.md");
+        let expected_second_path = second_path.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("first\n"),
+                    identity: hane_session::FileIdentity::lexical(first_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (first, second, third) = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            let second = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("second\n"),
+                    identity: hane_session::FileIdentity::lexical(second_path),
+                    stamp: None,
+                },
+            );
+            let third = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("third\n"),
+                    identity: hane_session::FileIdentity::lexical(third_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(third));
+            cx.notify();
+            (first, second, third)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        // Close the first (non-active) tab by the middle mouse button, the
+        // same way a user would.
+        let first_tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(
+            first_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            first_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(first).is_none(),
+                "the closed tab's session must be gone"
+            );
+            assert_eq!(
+                view.sessions.active_id(),
+                third,
+                "closing a non-active tab must not switch the active session"
+            );
+        });
+
+        // `second` now renders at index 0 (`file-tab-first`), the slot the
+        // closed tab used to own. Left-click there must activate `second`,
+        // not leave the identity pointing at whatever used to live in that
+        // slot.
+        let reused_slot = cx
+            .debug_bounds("file-tab-first")
+            .expect("remaining first tab rendered");
+        cx.simulate_click(reused_slot.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), second);
+        });
+
+        // Right-clicking that same reused slot must open a context menu
+        // targeting `second`'s own path, not a leftover reference to the
+        // closed tab or to `third`.
+        let reused_slot = cx
+            .debug_bounds("file-tab-first")
+            .expect("remaining first tab rendered");
+        cx.simulate_mouse_down(
+            reused_slot.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            reused_slot.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let menu_target_path = view
+                .file_tab_context_menu
+                .as_ref()
+                .and_then(|menu| view.sessions.get(menu.id))
+                .and_then(DocumentSession::path);
+            assert_eq!(menu_target_path, Some(expected_second_path.as_path()));
+        });
+    }
+
+    #[gpui::test]
+    fn a_long_path_file_tab_keeps_its_trigger_within_its_own_tab_bounds_in_a_narrow_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A very long absolute path, in a narrow window, so the
+        // always-visible tab trigger (as opposed to the `HoverCard`'s
+        // floating content, which this worker cannot drive a real hover
+        // into under `TestAppContext`) truncates to its own tab's width
+        // instead of pushing into, or overlapping, its neighbor, and does
+        // not grow the tab strip's fixed row height.
+        let long_path = PathBuf::from(
+            "very/deeply/nested/directory/structure/that/is/intentionally/long/document.md",
+        );
+        let other_path = PathBuf::from("b.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("body\n"),
+                    identity: hane_session::FileIdentity::lexical(long_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("body\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(SessionId(0)));
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+        cx.run_until_parked();
+
+        let header_height = view.read_with(cx, |view, _| view.theme.header_height);
+        let header = cx.debug_bounds("file-tabs").expect("tab strip rendered");
+        let first_tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("long-path tab rendered");
+        let last_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("other tab rendered");
+
+        assert!(
+            first_tab.right() <= last_tab.left(),
+            "the long-path tab's own trigger must not overlap its neighbor: {first_tab:?} vs {last_tab:?}"
+        );
+        assert_eq!(
+            header.size.height,
+            px(header_height),
+            "a long path must not grow the tab strip's fixed row height"
+        );
+    }
+
+    #[gpui::test]
+    fn middle_click_closes_a_clean_non_active_tab_without_switching_active_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("active\n"),
+                identity: hane_session::FileIdentity::lexical(active_path),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path.clone()),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_mouse_down(
+            other_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            other_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "closing a non-active tab must not switch the active session"
+            );
+            assert_eq!(view.sessions.len(), 1);
+            assert!(view.sessions.session_for_path(&other_path).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn middle_click_on_dirty_tab_prompts_and_cancel_leaves_it_open(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("tab-close-cancel");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("before"),
+                    identity: hane_session::FileIdentity::lexical(path.clone()),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let target_id = view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1, "the dirty session must still be open");
+            let confirm_id = view.tab_close_confirm.as_ref().map(|confirm| confirm.id);
+            assert_eq!(
+                confirm_id,
+                Some(view.sessions.active_id()),
+                "the confirm prompt must target the session that was actually clicked"
+            );
+            confirm_id.unwrap()
+        });
+
+        let cancel = cx
+            .debug_bounds("tab-close-confirm-cancel")
+            .expect("cancel button rendered");
+        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert_eq!(view.sessions.len(), 1);
+            assert!(
+                view.sessions
+                    .get(target_id)
+                    .is_some_and(DocumentSession::is_dirty),
+                "canceling must leave the unsaved edits in place"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn middle_click_dirty_tab_save_and_close_writes_then_closes(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("tab-close-save");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        // Loaded through the real service, like `open_with_policy` does, so
+        // the session records the file's actual stamp. Fabricating a `None`
+        // stamp instead would make the save's overwrite guard believe the
+        // path was free when it is not, refusing the write as a conflict.
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let save_button = cx
+            .debug_bounds("tab-close-confirm-save")
+            .expect("save button rendered");
+        cx.simulate_click(save_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before after");
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert_eq!(view.sessions.len(), 1);
+            // The last tab is replaced with a blank untitled document rather
+            // than leaving the window with none, the same rule any other
+            // close already follows.
+            assert!(view.sessions.active().path().is_none());
+            assert!(!view.sessions.active().is_dirty());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn tab_close_confirm_overlay_blocks_clicks_to_background_elements(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-confirm-occlude");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let other_path = PathBuf::from("other.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("before"),
+                identity: hane_session::FileIdentity::lexical(path.clone()),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path.clone()),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let caret = view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.editor().selection()
+        });
+        cx.run_until_parked();
+
+        let first_tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+
+        // Open the confirm overlay by middle-clicking the dirty active tab,
+        // the same trigger the other tests in this group use. The dialog's
+        // own `on_mouse_down_out` dismisses the confirm as soon as a click
+        // lands outside it, so each probe below reopens the confirm for
+        // itself right before checking whether its click reached through
+        // the overlay, instead of sharing one overlay across all probes.
+        let target_id = view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 2, "both sessions must still be open");
+            view.sessions.active_id()
+        });
+        let open_confirm = |cx: &mut gpui::VisualTestContext| {
+            cx.simulate_mouse_down(
+                first_tab.center(),
+                MouseButton::Middle,
+                gpui::Modifiers::none(),
+            );
+            cx.simulate_mouse_up(first_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.tab_close_confirm.as_ref().map(|confirm| confirm.id),
+                    Some(target_id),
+                    "the confirm overlay must be (re)opened and target the dirty session \
+                     for the rest of this probe to be meaningful"
+                );
+            });
+        };
+
+        open_confirm(cx);
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("background tab is still rendered under the overlay");
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("document body is still rendered under the overlay");
+
+        // A click on the background tab must not activate it: without
+        // `.occlude()` on the overlay, the tab underneath is still
+        // considered hovered and receives the click through the modal.
+        cx.simulate_click(other_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                target_id,
+                "a click on the background tab must not reach it through the confirm overlay"
+            );
+        });
+
+        // The click above already dismissed the confirm via the dialog's
+        // outside-click handler, so reopen it before the next, independent
+        // probe.
+        open_confirm(cx);
+
+        // A middle-click on the background tab must not close it either.
+        cx.simulate_mouse_down(other_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(other_tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                2,
+                "a middle-click on the background tab must not close it through the confirm overlay"
+            );
+            assert!(view.sessions.session_for_path(&other_path).is_some());
+        });
+
+        // Reopen the confirm once more before the last, independent probe.
+        open_confirm(cx);
+
+        // A click into the document body must not move the caret.
+        cx.simulate_mouse_down(row.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(row.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                caret,
+                "a click into the document body must not move the caret through the confirm overlay"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn middle_click_dirty_tab_save_and_close_failure_leaves_it_open(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("tab-close-save-fails");
+        // `atomic_write` creates any missing parent directories on its own
+        // (needed so a save can recreate a folder deleted out from under a
+        // dirty session), so a merely-absent parent would not fail here. A
+        // plain file occupying the parent's name instead makes
+        // `fs::create_dir_all` fail for real, on every platform, so the
+        // write fails and the tab must not close.
+        std::fs::create_dir_all(&root).unwrap();
+        let blocking_file = root.join("missing-dir");
+        std::fs::write(&blocking_file, "blocking").unwrap();
+        let missing_path = blocking_file.join("note.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("before"),
+                    identity: hane_session::FileIdentity::lexical(missing_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let save_button = cx
+            .debug_bounds("tab-close-confirm-save")
+            .expect("save button rendered");
+        cx.simulate_click(save_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1, "a failed save must not close the tab");
+            assert!(view.sessions.active().is_dirty());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a failed save must not leave a close request armed for a future, unrelated save"
+            );
+            assert!(view.status.as_deref().unwrap_or_default().contains("Save failed"));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // A keystroke landing while the close-and-save write is already in
+    // flight must not let the tab close on a snapshot that is already
+    // stale: `finish_save` reports `SavedStale` for it, which leaves the
+    // session dirty and must keep `resolve_pending_tab_close` from acting.
+    // `simulate_click`/`simulate_mouse_*` each drain the executor to
+    // completion before returning, so this drives `confirm_save_and_close_tab`
+    // and the interleaved edit directly, both inside one `view.update`, to
+    // land the edit before the write is ever polled.
+    #[gpui::test]
+    fn tab_close_after_save_stays_open_when_an_edit_lands_while_the_write_is_in_flight(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-stale");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_save_and_close_tab(confirm, cx);
+            assert!(view.sessions.active().save_in_flight());
+            // Lands before the executor ever polls the write started above.
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before after");
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "a keystroke landing mid-write must keep the tab open"
+            );
+            assert!(view.sessions.active().is_dirty());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a stale write must drop the close request rather than retry it against a later, unrelated save"
+            );
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Saved snapshot; newer edits pending")
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // The overwrite guard refuses a write once the file changed underneath
+    // it, the same rule any other save follows; a close-and-save request
+    // pending for that write must not close the tab on a refused save.
+    #[gpui::test]
+    fn tab_close_after_save_stays_open_when_the_file_changes_externally_during_the_write(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_save_and_close_tab(confirm, cx);
+            assert!(view.sessions.active().save_in_flight());
+        });
+        // Someone else changes the file on disk before this session's write
+        // is polled, so the overwrite guard's stamp check must fail it.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "a save refused as a conflict must not close the tab"
+            );
+            assert!(view.sessions.active().is_dirty());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a refused save must drop the close request rather than retry it blindly"
+            );
+            assert!(
+                view.status
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("changed on disk")
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "someone else's edit, longer than before",
+            "a refused save must never overwrite the conflicting content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Issue #411: `is_dirty()` alone cannot gate whether the close-and-save
+    // request's *own* write succeeded, because an unrelated earlier save can
+    // already have left the document reading as clean by the time this
+    // write's result comes back. Here the setup save lands and cleans the
+    // document *before* the close-and-close request's write is even
+    // started, so the session is clean for the request's entire lifetime;
+    // that write still refuses as a conflict, and it alone — not the
+    // coincidentally clean document — must decide whether the tab closes.
+    #[gpui::test]
+    fn tab_close_after_save_drops_request_when_its_own_write_conflicts_although_the_document_already_reads_as_clean(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict-after-clean");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            // Opens the confirmation while the document is still genuinely
+            // dirty, exactly as a real middle-click would; the save below
+            // that cleans it lands for this same confirmed instance, the
+            // same as an unrelated autosave racing ahead of the user's own
+            // click would.
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.save_current(cx);
+            (id, confirm)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sessions.active().is_dirty(),
+                "the setup save must land and clean the document before the race begins"
+            );
+        });
+
+        // Someone else changes the file on disk only after the document is
+        // already clean, so nothing in the session's own state (revision,
+        // dirty flag) reflects the conflict the request's write is about to
+        // hit.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+
+        view.update(cx, |view, cx| {
+            view.confirm_save_and_close_tab(confirm, cx);
+            assert!(view.sessions.active().save_in_flight());
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "a conflicting save must not close the tab merely because the document already read as clean"
+            );
+            assert!(!view.sessions.active().is_dirty());
+            assert_eq!(
+                view.sessions.get(id).and_then(|session| session.path()),
+                Some(path.as_path()),
+                "the original file session must still be open, not replaced by a clean Untitled session"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a refused save must drop the close request rather than let a coincidentally clean document close it"
+            );
+            assert!(
+                view.status
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("changed on disk")
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "someone else's edit, longer than before",
+            "a refused save must never overwrite the conflicting content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Issue #411: a save queued behind the close-and-save write (in
+    // `DocumentSession`'s own `pending_save` slot, not a fresh, independent
+    // request) must not inherit a close request its predecessor already
+    // dropped. The predecessor here — the request's own write — refuses as a
+    // conflict; the queued save behind it is a resolved-conflict overwrite
+    // retry, which the requeue in `finish_save` starts immediately and which
+    // goes on to succeed. That success is real and unrelated to whether the
+    // *original* request should close anything, so it must not resurrect a
+    // close request `finish_save` already dropped for the conflict.
+    #[gpui::test]
+    fn a_save_queued_behind_a_conflicting_close_request_does_not_resurrect_the_dropped_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict-then-queued-overwrite-succeeds");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_save_and_close_tab(confirm, cx);
+            assert!(view.sessions.active().save_in_flight());
+            // Queued behind the close request's own write, which is still in
+            // flight: this is the same "save again to overwrite" retry the
+            // conflict status message below points the user at, arriving
+            // before that write's result is even known.
+            view.save_session(id, SaveIntent::Overwrite, cx);
+            id
+        });
+        // Someone else changes the file on disk before the close request's
+        // own write is polled, so its overwrite guard's stamp check fails
+        // it; the queued retry's `Force` guard is unaffected and must still
+        // land once it runs.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "the queued retry succeeding must not close a tab whose own close request conflicted"
+            );
+            assert!(!view.sessions.active().is_dirty(), "the queued retry must still land");
+            assert_eq!(
+                view.sessions.get(id).and_then(|session| session.path()),
+                Some(path.as_path()),
+                "the original file session must still be open, not replaced by a clean Untitled session"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "the conflicting write must drop the close request rather than let a later, unrelated write's success act on it"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before after",
+            "the queued overwrite retry must still land its own content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Canceling the Save As dialog that a close-and-save request opens for
+    // an untitled document must leave the document open, the same as
+    // canceling Save As any other time does; the close request must not
+    // linger to act on a future, unrelated save.
+    #[gpui::test]
+    fn middle_click_close_save_as_cancel_for_an_untitled_note_leaves_it_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("draft").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_save_and_close_tab(confirm, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_new_path_selection(|_| None);
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "canceling Save As must leave the untitled document open"
+            );
+            assert!(view.sessions.active().is_dirty());
+            assert!(view.sessions.active().path().is_none());
+            assert!(
+                !view
+                    .tab_close_after_save
+                    .contains_key(&view.sessions.active_id()),
+                "a canceled Save As must not leave a close request armed for a later, unrelated save"
+            );
+        });
+    }
+
+    // CodeRabbit follow-up on Issue #411: a close-and-save request for an
+    // untitled work-folder note opens a Save As dialog and must wait for the
+    // user's own chosen write, not for whatever other write happens to land
+    // the same untitled document clean in the meantime — such as the H1
+    // title-sync create racing the still-open dialog here. Arming
+    // `tab_close_after_save` before the user has picked a path (i.e. before
+    // any write tied to this request even exists) let that unrelated create
+    // satisfy the request the moment it landed, closing the tab out from
+    // under the open dialog.
+    #[gpui::test]
+    fn save_and_close_on_an_untitled_note_waits_for_its_own_save_as_not_an_unrelated_h1_create(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("close-save-as-vs-h1-create");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let save_as_path = root.join("Chosen.md");
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        let id = view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("LangChain4j").unwrap();
+            view.after_input(cx);
+            let id = view.sessions.active_id();
+            // Opens the Save As dialog: the session is still untitled, so
+            // this is the same "no path yet" branch `new_work_folder_note`
+            // leaves it in, before the H1 title-sync debounce has fired.
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_save_and_close_tab(confirm, cx);
+            id
+        });
+
+        // Lets the H1 title-sync create for this same untitled document run
+        // to completion while the Save As dialog above is still unanswered.
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the H1 title-sync create landing must not close the tab out from under the open Save As dialog"
+            );
+            assert!(
+                view.sessions
+                    .get(id)
+                    .and_then(|session| session.path())
+                    .is_some(),
+                "the unrelated title-sync create should still have landed its own file"
+            );
+            assert!(
+                !view.sessions.get(id).unwrap().is_dirty(),
+                "the title-sync create leaves the document reading as clean, which is exactly what must not be mistaken for the pending Save As landing"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a close request waiting on a Save As path the user has not chosen yet must not be armed"
+            );
+        });
+
+        cx.simulate_new_path_selection(|_| Some(save_as_path.clone()));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_none(),
+                "the tab must close once the user's own chosen Save As write lands"
+            );
+        });
+        assert!(
+            save_as_path.exists(),
+            "the user's chosen Save As target must be written before the tab closes"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression for the "遅延通知" requirement: a close-and-save request
+    // armed for one document instance must not act on a different instance
+    // that later took the same session id (a reload/adopt bumps the
+    // generation the request was made against).
+    #[gpui::test]
+    fn resolve_pending_tab_close_ignores_a_stale_generation(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let requested_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            assert_ne!(
+                view.sessions.active().generation(),
+                requested_instance.generation
+            );
+            view.tab_close_after_save.insert(id, requested_instance);
+            view.resolve_pending_tab_close(id, cx);
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the replaced document must stay open"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "the stale request must be dropped, not retried against the new document"
+            );
+        });
+    }
+
+    // Security-relevant identity regression (PR #416 review): the native
+    // Save As dialog a close-and-save request opens for an untitled
+    // document is not bounded by this process at all — the user can leave
+    // it open indefinitely. If a work-folder switch lands while it is still
+    // open, the dialog's eventual answer must not be mistaken for an answer
+    // about whatever unrelated document now occupies the same `SessionId`:
+    // neither writing the user's old content to their newly chosen path
+    // under the new document's identity, nor closing or otherwise mutating
+    // the new document.
+    #[gpui::test]
+    fn save_as_answered_after_a_work_folder_switch_does_not_act_on_the_replacement_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let new_root = draft_test_root("save-as-across-work-folder-switch");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let chosen_path = new_root.join("Chosen.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("secret draft").unwrap();
+            view.after_input(cx);
+            // Opens the confirmation and then the native Save As dialog for
+            // this untitled, unsaved document, and leaves the dialog
+            // unanswered — exactly the window during which the user could
+            // instead act on the work-folder switch below.
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_save_and_close_tab(confirm, cx);
+            id
+        });
+        cx.run_until_parked();
+        assert_eq!(id, SessionId(0));
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "the replacement untitled session reuses the old SessionId(0)"
+            );
+            assert!(!view.sessions.active().is_dirty());
+            assert!(view.sessions.active().path().is_none());
+        });
+
+        // The user finally answers the dialog that was opened before the
+        // switch, long after the replacement document was installed.
+        cx.simulate_new_path_selection(|_| Some(chosen_path.clone()));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let replacement = view
+                .sessions
+                .get(SessionId(0))
+                .expect("the replacement document must stay open");
+            assert!(
+                replacement.path().is_none(),
+                "the stale Save As answer must not give the replacement document a path"
+            );
+            assert!(
+                !replacement.is_dirty(),
+                "the stale Save As answer must not mark the replacement document dirty"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&SessionId(0)),
+                "the stale request must not arm a close against the replacement document"
+            );
+        });
+        assert!(
+            !chosen_path.exists(),
+            "the stale Save As answer must not write the old document's content to disk \
+             under the replacement document's identity"
+        );
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // PR #416 review follow-up: a work-folder switch installs a fresh
+    // `SessionSet` whose ids — and each fresh `DocumentSession`'s own
+    // generation and `save_sequence` — restart at the same values the old
+    // one used. A write started under the old workspace and a write
+    // started under the replacement document can therefore earn the exact
+    // same `SaveTicket` (same restarted generation, same restarted
+    // sequence, same `Revision` after one edit each), which `finish_save`'s
+    // own ticket check alone cannot tell apart. `save_session` now binds
+    // the workspace epoch the write actually started under, so a stale
+    // completion from before the switch is dropped before it ever reaches
+    // the replacement document's own, colliding in-flight write.
+    #[gpui::test]
+    fn a_stale_save_completion_from_before_a_work_folder_switch_does_not_land_on_a_colliding_new_ticket(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-save-ticket-collision-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_target = old_root.join("Old.md");
+
+        let new_root = draft_test_root("stale-save-ticket-collision-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let new_target = new_root.join("New.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        // Starts the old, untitled document's first write — the same
+        // `SaveIntent::CreateNew` route `begin_title_create` uses for an
+        // H1-derived filename, reachable here directly without the
+        // debounce — and leaves its result unpolled: nothing here calls
+        // `cx.run_until_parked()` before the switch below replaces
+        // `sessions`.
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("first").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(old_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+            id
+        });
+
+        // The switch replaces `sessions` with a fresh `SessionSet`: same
+        // id, generation restarted at 0, `save_sequence` restarted at 0 —
+        // exactly as `switch_to_work_folder` does — without depending on
+        // its own (irrelevant here) background folder scan to do it.
+        view.update(cx, |view, cx| {
+            view.sessions = SessionSet::with_untitled("", "Untitled");
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            view.on_document_replaced();
+            cx.notify();
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), id);
+
+        // The replacement document's own first write earns the exact same
+        // `SaveTicket`: same restarted generation (0), same restarted
+        // sequence (1), and the same `Revision` after one edit.
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("second").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(new_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            old_target.exists(),
+            "the stale write itself must still have landed on disk"
+        );
+        assert!(
+            new_target.exists(),
+            "the replacement document's own write must still have landed on disk"
+        );
+
+        view.read_with(cx, |view, _| {
+            let session = view
+                .sessions
+                .get(id)
+                .expect("the replacement document must still be open");
+            assert_eq!(
+                session.path(),
+                Some(new_target.as_path()),
+                "a stale, colliding completion from before the switch must not give the \
+                 replacement document the old write's file identity"
+            );
+            assert!(
+                !session.is_dirty(),
+                "the replacement document's own write, not the stale one, must be what marks \
+                 it clean"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Companion to the collision test above: even when nothing about the
+    // replacement document's own state could be confused with the stale
+    // write's `SaveTicket` (nothing of its own is in flight at all here),
+    // `finish_save`'s `Superseded` branch and the bookkeeping cleanup at
+    // its tail are keyed only by `SessionId`, not by workspace — so without
+    // binding the stale completion to the workspace it actually started
+    // under, it would still unconditionally clear title-sync and
+    // close-and-save bookkeeping that belongs entirely to the replacement
+    // document.
+    #[gpui::test]
+    fn a_stale_save_completion_from_before_a_work_folder_switch_does_not_clear_the_replacement_documents_bookkeeping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-save-no-clear-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_target = old_root.join("Old.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("first").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(old_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+            id
+        });
+
+        // The switch replaces `sessions` while the old write above is
+        // still unpolled, the same as `switch_to_work_folder` would.
+        view.update(cx, |view, cx| {
+            view.sessions = SessionSet::with_untitled("", "Untitled");
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            view.on_document_replaced();
+            cx.notify();
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), id);
+
+        // Bookkeeping belonging entirely to the replacement document — a
+        // pending title-sync create and a close-and-save request, armed
+        // for writes of its own that have nothing to do with the stale one
+        // above — must survive the stale completion below untouched.
+        let new_instance = view.read_with(cx, |view, _| DocumentInstance {
+            generation: view.sessions.active().generation(),
+            workspace: view.work_folder_generation,
+        });
+        view.update(cx, |view, _cx| {
+            view.title_sync_pending.insert(id, "Kept".to_owned());
+            view.tab_close_after_save.insert(id, new_instance);
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            old_target.exists(),
+            "the stale write itself must still have landed on disk"
+        );
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the replacement document must still be open"
+            );
+            assert_eq!(
+                view.title_sync_pending.get(&id).map(String::as_str),
+                Some("Kept"),
+                "the stale completion must not clear title-sync bookkeeping armed for the \
+                 replacement document"
+            );
+            assert_eq!(
+                view.tab_close_after_save.get(&id),
+                Some(&new_instance),
+                "the stale completion must not clear a close-and-save request armed for the \
+                 replacement document"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+    }
+
+    // PR #416 review follow-up: `confirm_save_and_close_tab` used to trust
+    // a matching `SessionId` alone. The render-time cleanup that discards a
+    // confirmation left over for a document instance that no longer exists
+    // (see the top of the main render pass) runs once per frame, not
+    // necessarily before every click already dispatched against the old
+    // confirmation's button, so a document-instance check belongs in the
+    // handler itself, not only in render.
+    #[gpui::test]
+    fn confirm_save_and_close_tab_ignores_a_stale_click_after_the_document_instance_changed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("confirm-save-close-stale-instance");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            // Captured now, matching what the button closure captures at
+            // render time — before the document instance changes below, so
+            // this snapshot still equals the live confirmation and the
+            // document-instance check inside `confirm_save_and_close_tab`
+            // is what must catch the mismatch.
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            // The document instance changes — a reload/adopt bumps the
+            // generation the confirmation was opened against — without the
+            // confirmation itself being cleared.
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            (id, confirm)
+        });
+
+        view.update(cx, |view, cx| {
+            view.confirm_save_and_close_tab(confirm, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sessions.active().save_in_flight(),
+                "a stale click against an invalidated confirmation must not start a new save"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a stale click must not arm a close-and-save request for the replacement document"
+            );
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the replacement document's own path must be untouched"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // AADW Commander review follow-up on PR #416: the Save-and-close and
+    // Cancel buttons used to wire their click closures to only the `id`
+    // the confirmation was rendered for, re-deriving the instance to check
+    // against from whatever `tab_close_confirm` happens to be live by the
+    // time the click actually fires. That reads as safe only because a
+    // document-instance change also replaces the live confirmation's
+    // `instance` field; it does not by itself tell a stale click from an
+    // old confirmation's render apart from a click actually meant for a
+    // brand new confirmation that later reuses the same `id` with a
+    // different document instance — exactly what the new confirmation's
+    // own instance already encodes here, but which an `id`-only closure
+    // never carries forward to the handler for comparison. Binding the
+    // closure to the whole `TabCloseConfirm` snapshot instead, and
+    // requiring it to equal the live one bit-for-bit, is what makes that
+    // comparison possible at all.
+    #[gpui::test]
+    fn confirm_save_and_close_tab_ignores_a_stale_snapshot_once_a_new_confirmation_reused_the_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("confirm-save-close-reused-id");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (stale_confirm, fresh_confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            // What an old render's button closure would have captured.
+            let stale_confirm = view.tab_close_confirm.expect("confirm armed");
+
+            // The confirmation is answered through some other route
+            // (dismissed, or its own save-and-close already landed) and
+            // the document is replaced in place — bumping the generation
+            // — before the tab is closed again with fresh unsaved changes,
+            // producing a brand new confirmation for the very same `id`
+            // but a different document instance.
+            view.tab_close_confirm = None;
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            view.editor_mut().insert_text("draft").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let fresh_confirm = view.tab_close_confirm.expect("confirm armed");
+            (stale_confirm, fresh_confirm)
+        });
+        assert_ne!(
+            stale_confirm.instance, fresh_confirm.instance,
+            "the replacement document's confirmation must carry a different instance"
+        );
+
+        view.update(cx, |view, cx| {
+            // The stale snapshot from the old render must not be mistaken
+            // for the fresh confirmation just because it names the same id.
+            view.confirm_save_and_close_tab(stale_confirm, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sessions.active().save_in_flight(),
+                "a stale snapshot must not start a save for the replacement document"
+            );
+            assert_eq!(
+                view.tab_close_confirm,
+                Some(fresh_confirm),
+                "the confirmation the user is actually looking at must survive a stale click"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Same AADW Commander review follow-up, for the Cancel button and the
+    // overlay's backdrop: dismissing must be scoped to the exact
+    // confirmation the click closure was rendered for, not to whatever
+    // confirmation happens to be live — otherwise a stale Cancel click
+    // dispatched against an old confirmation's button could dismiss a
+    // brand new one the user has not answered yet. The global Escape
+    // handler keeps the unconditional `dismiss_tab_close_confirm` instead,
+    // since it is meant to cancel whichever confirmation is current.
+    #[gpui::test]
+    fn dismiss_tab_close_confirm_if_ignores_a_stale_snapshot_once_a_new_confirmation_reused_the_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("dismiss-confirm-if-reused-id");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (stale_confirm, fresh_confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let stale_confirm = view.tab_close_confirm.expect("confirm armed");
+
+            view.tab_close_confirm = None;
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            view.editor_mut().insert_text("draft").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let fresh_confirm = view.tab_close_confirm.expect("confirm armed");
+            (stale_confirm, fresh_confirm)
+        });
+        assert_ne!(stale_confirm.instance, fresh_confirm.instance);
+
+        view.update(cx, |view, cx| {
+            let dismissed = view.dismiss_tab_close_confirm_if(stale_confirm, cx);
+            assert!(
+                !dismissed,
+                "a stale snapshot must report nothing was dismissed"
+            );
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tab_close_confirm,
+                Some(fresh_confirm),
+                "a stale Cancel click must not dismiss the confirmation the user is actually \
+                 looking at"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // PR #416 review follow-up: `DocumentSession::adopt` bumps the
+    // generation without touching the workspace at all — an in-place
+    // reopen into the same tab, not a work-folder switch. `finish_save`'s
+    // guard used to compare only the workspace, so a write started before
+    // an in-place `adopt` could still reach the tail of `finish_save` and
+    // clear title-sync and close-and-save bookkeeping that belongs
+    // entirely to the document the `adopt` replaced it with.
+    #[gpui::test]
+    fn a_stale_save_completion_from_before_an_in_place_adopt_does_not_clear_the_replacement_documents_bookkeeping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-save-no-clear-adopt");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_target = old_root.join("Old.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        // Starts the old document's first write and leaves its result
+        // unpolled: nothing here calls `cx.run_until_parked()` before the
+        // `adopt` below replaces the document in place.
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("first").unwrap();
+            view.save_session(id, SaveIntent::CreateNew(old_target.clone()), cx);
+            assert!(view.sessions.active().save_in_flight());
+            id
+        });
+
+        // Replaces the document in place — same `SessionId`, same
+        // workspace, generation bumped — while the write above is still
+        // unpolled.
+        let new_instance = view.update(cx, |view, _cx| {
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            }
+        });
+
+        // Bookkeeping belonging entirely to the replacement document — a
+        // pending title-sync create and a close-and-save request, armed
+        // for writes of its own that have nothing to do with the stale
+        // one above — must survive the stale completion below untouched.
+        view.update(cx, |view, _cx| {
+            view.title_sync_pending.insert(id, "Kept".to_owned());
+            view.tab_close_after_save.insert(id, new_instance);
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            old_target.exists(),
+            "the stale write itself must still have landed on disk"
+        );
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_some(),
+                "the replacement document must still be open"
+            );
+            assert_eq!(
+                view.title_sync_pending.get(&id).map(String::as_str),
+                Some("Kept"),
+                "the stale completion must not clear title-sync bookkeeping armed for the \
+                 replacement document"
+            );
+            assert_eq!(
+                view.tab_close_after_save.get(&id),
+                Some(&new_instance),
+                "the stale completion must not clear a close-and-save request armed for the \
+                 replacement document"
+            );
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the stale completion must not give the replacement document the old write's \
+                 file identity"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+    }
+
+    // PR #416 review follow-up: the native Save As dialog
+    // `prompt_save_as_for_close` opens is not bounded by this process at
+    // all, so every way it can resolve — chosen, canceled, or failed — is
+    // collapsed to one `SaveAsForCloseResponse` before reaching the single
+    // entry gate in `handle_save_as_for_close_response`. A failed dialog
+    // used to skip that gate's status-message guard: this exercises it
+    // directly, since the test platform's own `simulate_new_path_selection`
+    // has no way to produce an error from the dialog itself.
+    #[gpui::test]
+    fn handle_save_as_for_close_response_ignores_a_failure_for_a_stale_document_instance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("save-as-close-response-stale-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, stale_instance, new_instance) = view.update(cx, |view, _cx| {
+            let id = view.sessions.active_id();
+            // The instance the (now long-gone) dialog was opened against.
+            let stale_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            // Bookkeeping belonging entirely to the replacement document —
+            // a close-and-save request of its own, armed after the dialog
+            // above was already opened for the document it replaced.
+            let new_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.tab_close_after_save.insert(id, new_instance);
+            view.status = Some("current document status".to_owned());
+            (id, stale_instance, new_instance)
+        });
+
+        view.update(cx, |view, cx| {
+            view.handle_save_as_for_close_response(
+                id,
+                stale_instance,
+                SaveAsForCloseResponse::Failed("disk full".to_owned()),
+                cx,
+            );
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("current document status"),
+                "a stale dialog's own failure must not overwrite the replacement document's \
+                 status"
+            );
+            assert_eq!(
+                view.tab_close_after_save.get(&id),
+                Some(&new_instance),
+                "a stale dialog's own failure must not clear a close-and-save request armed \
+                 for the replacement document"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Companion to the failure case above, for the chosen-path branch:
+    // before this fix, a mismatched instance here still overwrote the
+    // status with a message about the stale dialog, the one branch of
+    // `prompt_save_as_for_close`'s old three that was not consistent with
+    // the other two's silent drop.
+    #[gpui::test]
+    fn handle_save_as_for_close_response_ignores_a_chosen_path_for_a_stale_document_instance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("save-as-close-response-stale-chosen");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let chosen_path = root.join("Chosen.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, stale_instance) = view.update(cx, |view, _cx| {
+            let id = view.sessions.active_id();
+            let stale_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            view.status = Some("current document status".to_owned());
+            (id, stale_instance)
+        });
+
+        view.update(cx, |view, cx| {
+            view.handle_save_as_for_close_response(
+                id,
+                stale_instance,
+                SaveAsForCloseResponse::Chosen(chosen_path.clone()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("current document status"),
+                "a stale dialog's own chosen path must not overwrite the replacement \
+                 document's status"
+            );
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a stale dialog's own chosen path must not arm a close-and-save request for \
+                 the replacement document"
+            );
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the replacement document's own path must be untouched"
+            );
+        });
+        assert!(
+            !chosen_path.exists(),
+            "the stale dialog's own chosen path must not be written to disk under the \
+             replacement document's identity"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // AADW Commander review follow-up on PR #416: `prompt_save_as` used to
+    // resolve its dialog's answer by saving whatever session happened to be
+    // active (`save_active`), not the session the dialog was actually
+    // opened for. The dialog is native and unboundedly long-lived, so
+    // switching tabs while it is still open is an entirely ordinary thing
+    // for a user to do — and used to save the newly active tab's content
+    // under the originally-dirty tab's chosen path, leaving that original
+    // tab untouched and unsaved.
+    #[gpui::test]
+    fn prompt_save_as_saves_the_original_session_not_whatever_tab_is_active_when_answered(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("prompt-save-as-active-tab-switch");
+        std::fs::create_dir_all(&root).unwrap();
+        let save_as_path = root.join("Chosen.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("original\n", "Untitled", cx));
+        cx.run_until_parked();
+
+        let (original_id, other_id) = view.update(cx, |view, cx| {
+            let original_id = view.sessions.active_id();
+            view.prompt_save_as(cx);
+            // Switches to a second, unrelated tab while the dialog above is
+            // still open and unanswered.
+            let other_id = view.sessions.open_untitled("other\n", "Other");
+            view.on_document_replaced();
+            cx.notify();
+            (original_id, other_id)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                other_id,
+                "the second tab must be the one active while the dialog is still open"
+            );
+        });
+
+        cx.simulate_new_path_selection(|_| Some(save_as_path.clone()));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let original = view
+                .sessions
+                .get(original_id)
+                .expect("the original session must still be open");
+            assert_eq!(
+                original.path(),
+                Some(save_as_path.as_path()),
+                "the dialog's chosen path must save the session it was opened for"
+            );
+            assert!(!original.is_dirty());
+
+            let other = view
+                .sessions
+                .get(other_id)
+                .expect("the tab switched to must still be open");
+            assert!(
+                other.path().is_none(),
+                "the tab that was merely active when the dialog resolved must not be saved \
+                 under the chosen path"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&save_as_path).unwrap(),
+            "original\n",
+            "the written file must hold the original session's content, not the other tab's"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Full integration counterpart to the unit tests below, exercising the
+    // actual dialog round-trip through `prompt_save_as` rather than calling
+    // `handle_save_as_response` directly — the same way
+    // `save_as_answered_after_a_work_folder_switch_does_not_act_on_the_replacement_document`
+    // does for the close variant.
+    #[gpui::test]
+    fn prompt_save_as_answered_after_a_work_folder_switch_does_not_act_on_the_replacement_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let new_root = draft_test_root("save-as-across-work-folder-switch-ordinary");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let chosen_path = new_root.join("Chosen.md");
+
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text("secret draft").unwrap();
+            view.after_input(cx);
+            // Opens the native Save As dialog for this untitled, unsaved
+            // document and leaves it unanswered — exactly the window
+            // during which the user could instead act on the work-folder
+            // switch below.
+            view.prompt_save_as(cx);
+            id
+        });
+        cx.run_until_parked();
+        assert_eq!(id, SessionId(0));
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.active_id(),
+                SessionId(0),
+                "the replacement untitled session reuses the old SessionId(0)"
+            );
+            assert!(!view.sessions.active().is_dirty());
+            assert!(view.sessions.active().path().is_none());
+        });
+
+        // The user finally answers the dialog that was opened before the
+        // switch, long after the replacement document was installed.
+        cx.simulate_new_path_selection(|_| Some(chosen_path.clone()));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let replacement = view
+                .sessions
+                .get(SessionId(0))
+                .expect("the replacement document must stay open");
+            assert!(
+                replacement.path().is_none(),
+                "the stale Save As answer must not give the replacement document a path"
+            );
+            assert!(
+                !replacement.is_dirty(),
+                "the stale Save As answer must not mark the replacement document dirty"
+            );
+        });
+        assert!(
+            !chosen_path.exists(),
+            "the stale Save As answer must not write to the chosen path at all"
+        );
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Companion to the close-dialog's analogous regression test: the
+    // ordinary Save As dialog's own failure must not surface against
+    // whatever document now occupies its id once a work-folder switch or
+    // an in-place `adopt` has replaced it.
+    #[gpui::test]
+    fn handle_save_as_response_ignores_a_failure_for_a_stale_document_instance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("save-as-response-stale-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, stale_instance) = view.update(cx, |view, _cx| {
+            let id = view.sessions.active_id();
+            let stale_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            view.status = Some("current document status".to_owned());
+            (id, stale_instance)
+        });
+
+        view.update(cx, |view, cx| {
+            view.handle_save_as_response(
+                id,
+                Some(stale_instance),
+                SaveAsResponse::Failed("disk full".to_owned()),
+                cx,
+            );
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("current document status"),
+                "a stale dialog's own failure must not overwrite the replacement document's \
+                 status"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Companion to the failure case above, for the chosen-path branch.
+    #[gpui::test]
+    fn handle_save_as_response_ignores_a_chosen_path_for_a_stale_document_instance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("save-as-response-stale-chosen");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let chosen_path = root.join("Chosen.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, stale_instance) = view.update(cx, |view, _cx| {
+            let id = view.sessions.active_id();
+            let stale_instance = DocumentInstance {
+                generation: view.sessions.active().generation(),
+                workspace: view.work_folder_generation,
+            };
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+            });
+            view.status = Some("current document status".to_owned());
+            (id, stale_instance)
+        });
+
+        view.update(cx, |view, cx| {
+            view.handle_save_as_response(
+                id,
+                Some(stale_instance),
+                SaveAsResponse::Chosen(chosen_path.clone()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("current document status"),
+                "a stale dialog's own chosen path must not overwrite the replacement \
+                 document's status"
+            );
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the replacement document's own path must be untouched"
+            );
+        });
+        assert!(
+            !chosen_path.exists(),
+            "the stale dialog's own chosen path must not be written to disk under the \
+             replacement document's identity"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_cycles_file_tabs_in_order_and_wraps(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let ids = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            let second = view.sessions.open_untitled("two\n", "Second");
+            let third = view.sessions.open_untitled("three\n", "Third");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            [first, second, third]
+        });
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context, which ctrl-tab is
+        // scoped to, the same way a real click would before typing.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), ids[1]);
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), ids[2]);
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            ids[0],
+            "must wrap from the last tab back to the first"
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            ids[2],
+            "must wrap backward from the first tab to the last"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_is_a_no_op_with_a_single_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        let id = view.read_with(cx, |view, _| view.sessions.active_id());
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), id);
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context, which ctrl-tab is
+        // scoped to, the same way a real click would before typing, then
+        // move focus onto the sidebar filter the way a real click there
+        // does: setting the flag without changing the shared focus handle.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_is_focused()));
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_inline_rename_is_active(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+    }
+
+    #[gpui::test]
+    fn content_search_toggle_is_rejected_while_inline_rename_is_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_content_search_mode(content_search::SidebarMode::Content, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(view.read_with(cx, |view, _| !view.content_search_sidebar_visible()));
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename.as_ref().unwrap().text.clone()),
+            "Alpha",
+            "the rename text in progress must survive a rejected search-mode toggle"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_during_ime_composition(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "に", Some(1..1))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(
+            view.read_with(cx, |view, _| view.editor().ime().is_some()),
+            "an in-progress IME composition must not be interrupted by the tab switch"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_settings_is_open(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.settings_open));
     }
 
     #[gpui::test]
@@ -11065,7 +14165,12 @@ mod tests {
         };
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
-                (Ok(work_folder), Ok(recovered), work_folder_scan_timestamp_for_test()),
+                view.work_folder_generation,
+                (
+                    Ok(work_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -11977,6 +15082,1110 @@ mod tests {
         cx.run_until_parked();
         let zoomed = view.read_with(cx, |view, _| view.zoom);
         assert!(zoomed > 1.0, "{zoomed}");
+    }
+
+    // Issue #389: short post-wheel scroll inertia for the main panel.
+
+    #[gpui::test]
+    fn plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        let immediate = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            view.scroll_y
+        });
+        // The main-panel scroll responds from the very first update, not
+        // after a delay for the inertia to ramp up.
+        assert!(immediate > 0.0, "{immediate}");
+
+        let coasted = view.update(cx, |view, _cx| {
+            let inertia = view
+                .scroll_inertia
+                .as_mut()
+                .expect("a plain Lines wheel scroll must arm short inertia");
+            inertia.last_frame -= Duration::from_millis(20);
+            // `advance_scroll_inertia` steps the coast state without touching
+            // `window`, so it can be called outside a real render frame (see
+            // issue #389's macOS CI failure: `window.request_animation_frame()`
+            // may only be called during request_layout, prepaint, or paint).
+            view.advance_scroll_inertia();
+            view.scroll_y
+        });
+        assert!(
+            coasted > immediate,
+            "inertia must keep moving briefly after the wheel input stops: \
+             immediate={immediate}, coasted={coasted}"
+        );
+    }
+
+    #[gpui::test]
+    fn plain_wheel_lines_scroll_from_an_idle_view_uses_the_cold_start_frame_time(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: a coast armed from an idle view (no coast already
+        // running `request_animation_frame`) previously sized its own
+        // synchronous first step off `SCROLL_INERTIA_MIN_FRAME_TIME`, the
+        // floor meant for the gap between two frames of an *already-running*
+        // animation loop. That understated how long the state actually takes
+        // to reach the first real paint and left that first frame reading as
+        // unchanged on screen. `queue_scroll_inertia_at` must instead use the
+        // larger `SCROLL_INERTIA_COLD_START_FRAME_TIME` for a brand-new
+        // coast's own first step.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (before, raw_velocity, immediate) = view.update_in(cx, |view, window, cx| {
+            let before = view.scroll_y;
+            let raw_velocity = scroll_inertia_velocity_for_lines_delta(-f32::from(
+                event.delta.pixel_delta(px(view.line_height())).y,
+            ));
+            view.on_scroll(&event, window, cx);
+            (before, raw_velocity, view.scroll_y)
+        });
+
+        let moved = immediate - before;
+        let (min_frame_time_distance, _) =
+            eased_scroll_inertia_step(raw_velocity, SCROLL_INERTIA_MIN_FRAME_TIME)
+                .expect("a full-size delta must still be animating, not settled");
+        let (cold_start_distance, _) =
+            eased_scroll_inertia_step(raw_velocity, SCROLL_INERTIA_COLD_START_FRAME_TIME)
+                .expect("a full-size delta must still be animating, not settled");
+        assert!(
+            (moved - cold_start_distance).abs() < 1e-3,
+            "moved={moved}, cold_start_distance={cold_start_distance}"
+        );
+        assert!(
+            moved > min_frame_time_distance,
+            "a brand-new coast's own first step must move further than the smaller \
+             already-animating frame gap would, or the first painted frame regresses to reading \
+             as unchanged: moved={moved}, min_frame_time_distance={min_frame_time_distance}"
+        );
+    }
+
+    #[gpui::test]
+    fn plain_wheel_lines_scroll_settles_without_doubling_the_input_distance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (before, expected_delta, immediate) = view.update_in(cx, |view, window, cx| {
+            let before = view.scroll_y;
+            let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+            view.on_scroll(&event, window, cx);
+            (before, expected_delta, view.scroll_y)
+        });
+        assert!(expected_delta > 0.0, "{expected_delta}");
+        // The main-panel scroll responds from the very first update, not
+        // after a delay for the inertia to ramp up.
+        assert!(immediate > before, "before={before}, immediate={immediate}");
+
+        // Run the coast to completion, as `step_scroll_inertia` would across
+        // real animation frames, until it settles on its own. Steps via
+        // `advance_scroll_inertia` (see `plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops`)
+        // to avoid calling `window.request_animation_frame()` outside a real frame.
+        let settled = view.update(cx, |view, _cx| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.advance_scroll_inertia();
+            }
+            view.scroll_y
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the coast must settle instead of coasting forever"
+        );
+
+        let total_moved = settled - before;
+        assert!(
+            total_moved <= expected_delta + 1.0,
+            "combined immediate and inertial movement must not exceed a single plain scroll's \
+             pre-clamp distance: total_moved={total_moved}, expected_delta={expected_delta}"
+        );
+        assert!(
+            (total_moved - expected_delta).abs() < 1.0,
+            "the fully settled position must land at the same distance a single plain scroll of \
+             this delta would have, not double it: total_moved={total_moved}, \
+             expected_delta={expected_delta}"
+        );
+    }
+
+    fn assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(
+        cx: &mut gpui::TestAppContext,
+        lines: f32,
+    ) {
+        // Issue #389: a high-precision wheel/trackpad device can send a
+        // `ScrollDelta::Lines` event so small that its pixel-space distance
+        // never clears `eased_scroll_inertia_step`'s settle epsilon.
+        // `queue_scroll_inertia_at` must still apply that distance once instead
+        // of silently dropping it, and must not arm a new coast for it.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, lines)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (expected_delta, before, after, armed_inertia) =
+            view.update_in(cx, |view, window, cx| {
+                let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+                assert!(
+                    (expected_delta * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32()).abs()
+                        <= SCROLL_INERTIA_SETTLE_EPSILON,
+                    "this test only exercises the settle-epsilon path: expected_delta={expected_delta}"
+                );
+                // Start away from both document edges so a small move in
+                // either direction is not itself clamped away, which would
+                // otherwise be indistinguishable from the drop this test
+                // guards against.
+                view.scroll_y = 500.0;
+                let before = view.scroll_y;
+                view.on_scroll(&event, window, cx);
+                (expected_delta, before, view.scroll_y, view.scroll_inertia)
+            });
+
+        let moved = after - before;
+        assert!(
+            (moved - expected_delta).abs() < 0.01,
+            "lines={lines}: a sub-settle-epsilon Lines input must still move scroll_y by its own \
+             delta instead of being dropped: moved={moved}, expected_delta={expected_delta}"
+        );
+        assert!(
+            armed_inertia.is_none(),
+            "lines={lines}: a sub-settle-epsilon input must not arm a new inertia coast"
+        );
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_moves_scroll_y_forward(cx: &mut gpui::TestAppContext) {
+        assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(cx, -0.02);
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_moves_scroll_y_backward(cx: &mut gpui::TestAppContext) {
+        assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(cx, 0.02);
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_clamps_at_the_document_start(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        assert_eq!(view.read_with(cx, |view, _| view.scroll_y), 0.0);
+
+        // A small "scroll up" Lines input while already at the document
+        // start must clamp at 0 rather than going negative.
+        let (after, armed_inertia) = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 0.02)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            (view.scroll_y, view.scroll_inertia)
+        });
+        assert_eq!(
+            after, 0.0,
+            "a sub-settle-epsilon input must clamp at the document start, not go negative"
+        );
+        assert!(armed_inertia.is_none());
+    }
+
+    #[gpui::test]
+    fn repeated_same_direction_wheel_events_keep_refreshing_the_inertia(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        for _ in 0..5 {
+            let velocity = view.update_in(cx, |view, window, cx| {
+                view.on_scroll(
+                    &ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, -3.0)),
+                        modifiers: gpui::Modifiers::none(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    },
+                    window,
+                    cx,
+                );
+                view.scroll_inertia
+                    .expect("continuous scrolling in the same direction must keep inertia armed")
+                    .velocity
+            });
+            assert!(velocity > 0.0, "{velocity}");
+        }
+    }
+
+    #[gpui::test]
+    fn repeated_same_direction_wheel_events_accumulate_the_unmoved_inertia_distance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=600)
+            .map(|n| format!("line {n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        // Move well away from the document's start first (and, with 600
+        // lines, nowhere near its end either), then let that priming
+        // scroll's own inertia fully settle before the burst this test
+        // actually measures.
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..10 {
+                view.on_scroll(&event, window, cx);
+            }
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                // Steps via `advance_scroll_inertia` (see
+                // `plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops`)
+                // to avoid calling `window.request_animation_frame()` outside a
+                // real frame.
+                view.advance_scroll_inertia();
+            }
+        });
+        let (before, max_scroll_y) = view.read_with(cx, |view, _| {
+            (
+                view.scroll_y,
+                (view.scrollable_content_height() - view.viewport_height).max(0.0),
+            )
+        });
+        assert!(
+            before > 0.0 && before < max_scroll_y - 200.0,
+            "before={before}, max_scroll_y={max_scroll_y}"
+        );
+
+        // Two Lines events back to back, before either one's inertia has run
+        // any animation frame, so the second sees the first event's coast
+        // still live (issue #389).
+        let expected_total_delta = view.update_in(cx, |view, window, cx| {
+            let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+            view.on_scroll(&event, window, cx);
+            view.on_scroll(&event, window, cx);
+            expected_delta * 2.0
+        });
+
+        let settled = view.update(cx, |view, _cx| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.advance_scroll_inertia();
+            }
+            view.scroll_y
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the coast must settle instead of coasting forever"
+        );
+
+        let total_moved = settled - before;
+        assert!(
+            (total_moved - expected_total_delta).abs() < 1.0,
+            "settled displacement must reflect the sum of the burst's signed deltas, not drop \
+             an earlier event's unmoved coast distance: total_moved={total_moved}, \
+             expected_total_delta={expected_total_delta}"
+        );
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_replaces_rather_than_accumulates_inertia_velocity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let line_height = view.read_with(cx, |view, _| view.line_height());
+        let reverse_event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let reverse_raw_velocity = scroll_inertia_velocity_for_lines_delta(-f32::from(
+            reverse_event.delta.pixel_delta(px(line_height)).y,
+        ));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        let forward_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("forward scroll must arm inertia")
+            .velocity;
+        assert!(forward_velocity > 0.0, "{forward_velocity}");
+
+        // `queue_scroll_inertia_at`'s immediate step for a *live, already
+        // in-flight* coast is sized off the real time since that coast's own
+        // last frame (issue #389). Pin `last_frame` and the reversal's own
+        // "now" to the exact same `Instant`, read once inside a single
+        // closure, via `on_scroll_at` (see its doc comment), so the elapsed
+        // gap this test exercises is exactly zero — and thus deterministically
+        // floored to `SCROLL_INERTIA_MIN_FRAME_TIME` below — instead of
+        // depending on how long the test harness itself takes between two
+        // separate `Instant::now()` reads (which can exceed
+        // `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI runner). This still
+        // exercises the same replace path a real, promptly-delivered
+        // reversal would take.
+        //
+        // `reversed_velocity` is read inside this same closure, immediately
+        // after `on_scroll_at`, rather than via a later, separate
+        // `read_with`: `cx.notify()` (from `queue_scroll_inertia_at`) can
+        // schedule a render before that later read runs, and `render` calls
+        // `step_scroll_inertia` unconditionally (see its doc comment), which
+        // would advance the coast again by however much real wall-clock time
+        // actually elapsed before that render — nondeterministic, and can
+        // exceed `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI runner,
+        // decaying the value this asserts against without changing any
+        // production real-time behavior.
+        let reversed_velocity = view.update_in(cx, |view, _window, cx| {
+            let now = Instant::now();
+            if let Some(inertia) = view.scroll_inertia.as_mut() {
+                inertia.last_frame = now;
+            }
+            // Scrolling the other way must cancel the old coast immediately
+            // instead of fighting it.
+            view.on_scroll_at(&reverse_event, now, cx);
+            view.scroll_inertia
+                .expect("the reversed scroll must still arm inertia")
+                .velocity
+        });
+        assert!(reversed_velocity < 0.0, "{reversed_velocity}");
+        // Replacing, not accumulating, means the result depends only on the
+        // reversal's own input velocity and the (here, exactly zero, so
+        // floored to `SCROLL_INERTIA_MIN_FRAME_TIME`) gap since the old
+        // coast's last touch, not on `forward_velocity`'s already-decayed
+        // remainder. `forward_velocity` itself now uses the larger, distinct
+        // `SCROLL_INERTIA_COLD_START_FRAME_TIME` (see `queue_scroll_inertia_at`),
+        // so it is deliberately no longer expected to equal
+        // `-reversed_velocity`.
+        let (_, expected_reversed_velocity) =
+            eased_scroll_inertia_step(reverse_raw_velocity, SCROLL_INERTIA_MIN_FRAME_TIME)
+                .expect("a full-size reversal delta must still be animating, not settled");
+        assert_eq!(reversed_velocity, expected_reversed_velocity);
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_after_accumulated_inertia_still_replaces_the_velocity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // Two same-direction events back to back accumulate inertia velocity
+        // instead of one replacing the other's remaining coast (issue #389).
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..2 {
+                view.on_scroll(
+                    &ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                        modifiers: gpui::Modifiers::none(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+        let accumulated_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("accumulated forward scroll must keep inertia armed")
+            .velocity;
+        assert!(accumulated_velocity > 0.0, "{accumulated_velocity}");
+
+        // Reversing direction must still cancel the accumulated coast
+        // outright rather than fighting or partially carrying it.
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        let reversed_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("the reversed scroll must still arm inertia")
+            .velocity;
+        assert!(
+            reversed_velocity < 0.0,
+            "reversing must not drag the accumulated forward velocity along: {reversed_velocity}"
+        );
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_after_a_delayed_event_moves_promptly_instead_of_staying_flat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: a real reversal input does not always land exactly one
+        // nominal animation frame after the old coast's last step; delivery
+        // can lag noticeably (e.g. under system load). `queue_scroll_inertia_at`
+        // must fold that whole real gap into its own synchronous immediate
+        // step instead of only ever advancing by one nominal frame's worth,
+        // or the screen would still read as unchanged in the new direction
+        // for several subsequent frames after a hard reversal.
+        let text = (1..=600)
+            .map(|n| format!("line {n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let forward = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -8.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let reverse = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 12.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let expected_reverse_delta = -f32::from(
+            reverse
+                .delta
+                .pixel_delta(px(view.read_with(cx, |view, _| view.line_height())))
+                .y,
+        );
+        assert!(expected_reverse_delta < 0.0, "{expected_reverse_delta}");
+
+        // Prime well away from the document start (and, with 600 lines,
+        // nowhere near its end either) so the reversal below moves freely
+        // instead of clamping at an edge, which would make the assertions
+        // below indistinguishable from a genuine prompt-movement failure.
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..10 {
+                view.on_scroll(&forward, window, cx);
+            }
+        });
+        view.update(cx, |view, _| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.advance_scroll_inertia();
+            }
+        });
+        assert!(view.read_with(cx, |view, _| view.scroll_inertia.is_none()));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(&forward, window, cx);
+        });
+        let before = view.read_with(cx, |view, _| view.scroll_y);
+
+        // Simulate the reversal event landing well after the old coast's own
+        // last recorded frame, the same gap `step_scroll_inertia` would
+        // otherwise need several real animation frames to close.
+        view.update(cx, |view, _| {
+            let inertia = view
+                .scroll_inertia
+                .as_mut()
+                .expect("forward scroll must arm inertia");
+            inertia.last_frame -= Duration::from_millis(120);
+        });
+
+        let after = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(&reverse, window, cx);
+            view.scroll_y
+        });
+
+        let moved = after - before;
+        assert!(moved < 0.0, "before={before}, after={after}");
+        // A 120ms-old coast is most of the way through its three-time-constant
+        // (~135ms) window, so the reversal's own synchronous catch-up step
+        // must already cover most of its own total distance here, not the
+        // roughly 17% a fixed one-nominal-frame step would apply.
+        assert!(
+            moved.abs() > 0.5 * expected_reverse_delta.abs(),
+            "reversal must move promptly, not stay flat: moved={moved}, \
+             expected_reverse_delta={expected_reverse_delta}"
+        );
+        assert!(
+            moved.abs() <= expected_reverse_delta.abs() + 1.0,
+            "reversal must not overshoot its own total coast distance: moved={moved}, \
+             expected_reverse_delta={expected_reverse_delta}"
+        );
+    }
+
+    #[gpui::test]
+    fn pixel_wheel_scroll_tracks_directly_without_app_added_inertia(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // Arm inertia with a plain Lines scroll first, so this also covers a
+        // device switching mid-gesture: the Pixels event below must still
+        // clear the stale Lines coast rather than adding trackpad momentum
+        // on top of it.
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(view.read_with(cx, |view, _| view.scroll_inertia.is_some()));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "a Pixels wheel event must not carry or add app-side inertia"
+        );
+    }
+
+    #[gpui::test]
+    fn an_external_scroll_position_change_stops_stale_wheel_inertia(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        let armed = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(armed > 0.0, "{armed}");
+
+        // A scrollbar drag (or cursor follow, selection autoscroll, a
+        // document switch, zoom, or a pinch) sets `scroll_y` directly,
+        // without going through the wheel path.
+        let moved = view.update_in(cx, |view, window, _cx| {
+            view.scroll_y = 0.0;
+            view.step_scroll_inertia(window);
+            view.scroll_y
+        });
+        assert_eq!(
+            moved, 0.0,
+            "stale wheel inertia must not overwrite a position another action just set"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the stale inertia must be cancelled once it observes the position moved out from \
+             under it"
+        );
+    }
+
+    #[gpui::test]
+    fn starting_a_scrollbar_drag_cancels_a_live_inertia_coast_that_has_not_moved_yet(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A drag can start on the very frame a coast's next step has not run
+        // yet, so `scroll_y` still equals the coast's own `last_applied` and
+        // the floating-point staleness check `advance_scroll_inertia` relies
+        // on cannot by itself tell the drag apart from an ordinary unmoved
+        // frame (issue #389). `begin_editor_scrollbar_drag` must cancel the
+        // coast explicitly instead of depending on that check.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        view.update(cx, |view, _cx| {
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 50.0,
+            });
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.begin_editor_scrollbar_drag(
+                &MouseDownEvent {
+                    position: point(px(950.0), px(400.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                },
+                600.0,
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "beginning a scrollbar drag must cancel a live coast even when scroll_y has not \
+             moved away from the coast's last_applied yet"
+        );
+    }
+
+    #[gpui::test]
+    fn replacing_the_document_cancels_a_live_inertia_coast_at_the_same_scroll_y(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The incoming document can restore a `scroll_y` equal to the
+        // outgoing coast's `last_applied` (e.g. both start at the top), in
+        // which case the floating-point staleness check `advance_scroll_inertia`
+        // relies on cannot tell the switch apart from an ordinary unmoved
+        // frame (issue #389). `on_document_replaced` must cancel the coast
+        // explicitly instead of depending on that check.
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
+        view.update(cx, |view, _cx| {
+            view.scroll_y = 0.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 0.0,
+            });
+
+            view.on_document_replaced();
+
+            assert!(
+                view.scroll_inertia.is_none(),
+                "replacing the document must cancel a live coast even when the new document's \
+                 scroll_y matches the coast's last_applied"
+            );
+            assert!(
+                !view.advance_scroll_inertia(),
+                "the cancelled coast must not resume advancing after the document switch"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn starting_a_wheel_zoom_cancels_a_live_inertia_coast(cx: &mut gpui::TestAppContext) {
+        // A modifier-wheel event that starts a zoom can arrive while a plain
+        // wheel scroll's inertia is still coasting (issue #389). Without
+        // cancelling that coast explicitly, `step_scroll_inertia` would keep
+        // advancing `scroll_y` every frame in parallel with the zoom
+        // animation instead of the zoom gesture taking over the wheel
+        // stream outright.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_some()),
+            "a plain wheel scroll must arm inertia before the zoom event arrives"
+        );
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 5.0)),
+                    modifiers: secondary_scroll_modifiers(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "switching to a modifier-wheel zoom must cancel the still-live scroll inertia coast"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.wheel_zoom_animation.is_some()),
+            "the zoom request itself must still be queued"
+        );
+    }
+
+    #[gpui::test]
+    fn starting_a_trackpad_pinch_cancels_a_live_inertia_coast(cx: &mut gpui::TestAppContext) {
+        // A neutral first pinch event can establish gesture ownership before
+        // the scale changes. The old Lines-wheel coast must stop at that
+        // point, just as it does when modifier-wheel starts zooming (issue
+        // #389).
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_some()),
+            "a plain wheel scroll must arm inertia before the pinch arrives"
+        );
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_pinch(
+                &gpui::PinchEvent {
+                    position,
+                    delta: 0.0,
+                    modifiers: gpui::Modifiers::none(),
+                    phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "even a neutral pinch-begin event must cancel the old scroll coast"
+        );
+        assert_eq!(view.read_with(cx, |view, _| view.zoom), 1.0);
+        let scroll_y_after_pinch = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            !view.update(cx, |view, _cx| view.advance_scroll_inertia()),
+            "the cancelled coast must not advance after the pinch takes ownership"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.scroll_y),
+            scroll_y_after_pinch
+        );
+    }
+
+    #[gpui::test]
+    fn height_anchor_recompute_resyncs_a_still_tracking_inertia_coast(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: `render` calls `step_scroll_inertia` before laying out
+        // and remeasuring visible blocks. When a block being remeasured (e.g.
+        // mid-resize) has a different height than before, the height-anchor
+        // recompute below moves `scroll_y` again in the same frame. A coast
+        // that still owned `scroll_y` going into that recompute must not then
+        // read as stale on the next frame just because of this frame's own
+        // correction.
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
+        view.update(cx, |view, _cx| {
+            view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 50.0,
+            });
+
+            view.apply_height_anchor(Some((0, 20.0)), true);
+
+            assert_eq!(
+                view.scroll_y, 20.0,
+                "the anchor moves scroll_y to the corrected position"
+            );
+            assert_eq!(
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                Some(20.0),
+                "a still-tracking coast's last_applied must resync onto this frame's own \
+                 height-anchor correction"
+            );
+            assert!(
+                view.advance_scroll_inertia(),
+                "the coast must keep running instead of reading this frame's own correction as \
+                 an unrelated ownership change"
+            );
+            assert!(view.scroll_inertia.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn height_anchor_recompute_does_not_resync_inertia_that_already_lost_scroll_y(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The render-entry clamp (or any other direct assignment) moving
+        // `scroll_y` before layout is a genuine change of ownership; the
+        // height-anchor recompute must not paper over that by resyncing
+        // anyway.
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("one\ntwo\nthree\n", "Untitled", cx)
+        });
+        view.update(cx, |view, _cx| {
+            view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 999.0,
+            });
+
+            view.apply_height_anchor(Some((0, 20.0)), false);
+
+            assert_eq!(view.scroll_y, 20.0);
+            assert_eq!(
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                Some(999.0),
+                "an already-stale coast's last_applied must not be resynced"
+            );
+            assert!(
+                !view.advance_scroll_inertia(),
+                "the coast must still stop once it observes the position moved out from under it"
+            );
+            assert!(view.scroll_inertia.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn scroll_inertia_clamps_each_frame_and_tracks_the_document_end(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+        assert!(max_scroll_y > 1.0, "the test document must scroll");
+
+        let (scroll_y, last_applied, still_coasting) = view.update(cx, |view, _cx| {
+            view.scroll_y = max_scroll_y - 0.25;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 1_000.0,
+                last_frame: Instant::now() - Duration::from_millis(20),
+                last_applied: view.scroll_y,
+            });
+
+            let still_coasting = view.advance_scroll_inertia();
+            (
+                view.scroll_y,
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                still_coasting,
+            )
+        });
+
+        assert!(
+            still_coasting,
+            "the coast must remain live at a document edge"
+        );
+        assert_eq!(
+            scroll_y, max_scroll_y,
+            "an inertia frame must clamp its own position at the document end"
+        );
+        assert_eq!(
+            last_applied,
+            Some(max_scroll_y),
+            "inertia tracking must store the clamped position at the document end"
+        );
+    }
+
+    #[gpui::test]
+    fn scroll_inertia_does_not_carry_scroll_y_past_the_document_end(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // Scroll far past the document end so both the direct delta and any
+        // armed inertia would overshoot it without the existing render-time
+        // clamp.
+        for _ in 0..10 {
+            view.update_in(cx, |view, window, cx| {
+                view.on_scroll(
+                    &ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, -20.0)),
+                        modifiers: gpui::Modifiers::none(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        }
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+
+        cx.run_until_parked();
+
+        let after = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            (after - max_scroll_y).abs() < 1.0,
+            "scroll inertia must not carry scroll_y past the document end: after={after}, \
+             max={max_scroll_y}"
+        );
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_clamps_at_the_document_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+        view.update(cx, |view, _cx| {
+            view.scroll_y = max_scroll_y;
+        });
+
+        // A small "scroll down" Lines input while already at the document
+        // end must clamp at max_scroll_y rather than overshooting it.
+        let (after, armed_inertia) = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -0.02)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            (view.scroll_y, view.scroll_inertia)
+        });
+        assert_eq!(
+            after, max_scroll_y,
+            "a sub-settle-epsilon input must clamp at the document end, not overshoot it"
+        );
+        assert!(armed_inertia.is_none());
     }
 
     #[gpui::test]

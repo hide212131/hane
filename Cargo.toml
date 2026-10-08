@@ -16,7 +16,7 @@ exclude = ["vendor/gpui", "vendor/gpui-pre-macos"]
 
 [workspace.package]
 # Source of truth for release version; Cargo.lock must stay in sync.
-version = "0.20.0"
+version = "0.22.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.98.1"
@@ -36,9 +36,14 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = 
 gpui-component = { version = "=0.6.6", default-features = false }
 gpui-kit-assets = { version = "=0.6.6" }
 libc = "=0.2.189"
+mach2 = "=0.5.0"
 ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
 unicode-segmentation = "=1.12.0"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
+url = "=2.5.8"
+grep-matcher = "=0.1.8"
+grep-regex = "=0.1.14"
+grep-searcher = "=0.1.17"
 
 [profile.release]
 lto = "thin"

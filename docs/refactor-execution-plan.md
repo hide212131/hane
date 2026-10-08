@@ -464,3 +464,81 @@ CodeRabbit full review run `18c5ded6-cac5-4e49-9c21-7fe1813d0430` はhead `4e835
 **残件**
 
 session I/O、background parse、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は #301 の後続として引き続き実行計画で追跡する。#304 には filter/renameの入力先判定の集約、#305 には親に残したUTF-16/grapheme/selection helperの所有権整理、#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置に依存する後続がある場合は逆順に戻す。
+
+### 9.12 RF2-A: EditorView機械的分割 第5PR — save/draft/H1同期分離（#301）
+
+実装はPR [#412](https://github.com/hide212131/hane/pull/412)、starting head `95dfc7e5ac1561404265e8f34a67d1cab4d4694d`（基準main `5be310c6136e662119e2d208322f832b317e14c4` と同一tree）に対して行った。PR本文は `Refs #301` とし、#301全体は閉じない。#396のinline rename分離（9.11節）は受入済みであり再実装していない。#397が変更するopen/settings/renderの領域には触れていない。
+
+**実際の旧→新対応と可視性**
+
+`crates/ui/src/view.rs` の既存 `impl EditorView` ブロックに残っていた保存/draft/title-sync専用の18メソッドを、新規 `crates/ui/src/view/session_save.rs` の新しい `impl EditorView` ブロックへ機械的に移した。移動対象は元のファイル上で連続しておらず、`finish_title_rename` と `retire_work_folder_draft` の間に新規作成専用の7メソッド（`target_directory_for_new_entry`、`new_work_folder_note_heading`、`new_work_folder_note`、`toggle_and_select_work_folder_folder`、`select_work_folder_root`、`new_work_folder_folder`、`finish_new_work_folder_folder`）が挟まっていた。この7件は依頼の対象外（open/scan/session/tab/new-entry/settings/render）として `view.rs` に残し、18件だけを元の相対順のまま移した。署名・引数・戻り値・属性・doc comment・inline commentとbodyは変更していない。
+
+可視性は次の5件だけprivateから `pub(super)` へ変更した。
+
+- `schedule_autosave` — 親 `view.rs` に残る `after_input`（既存の呼び出し）と `toggle_autosave` から呼ぶ。
+- `schedule_draft_save` — 親 `view.rs` に残る `after_input` から呼ぶ。
+- `schedule_title_sync` — 親 `view.rs` に残る `after_input` から呼ぶ。
+- `save_session` — 兄弟 `crates/ui/src/view/inline_rename.rs` の `finish_inline_rename` が `queued_saves` の保存を再開するときに呼ぶ。
+- `retry_deferred_title_sync` — 兄弟 `crates/ui/src/view/inline_rename.rs` の `finish_inline_rename` と `cancel_inline_rename` から呼ぶ。
+
+既存の公開範囲は変更していない。`flush_pending_drafts` は元から `pub fn` で、別crateの `crates/app/src/main.rs` にあるwindow-close callbackと、親 `view.rs` の `from_sessions` が登録するapp-quit hookおよび `switch_to_work_folder` の文書切替前flushから呼ぶため維持した。window-close callbackはapp-quit hookとは別の終了経路である。`save_current` / `save_or_prompt` / `prompt_save_as` は元から `pub(crate) fn` で、`crates/ui/src/actions.rs` と `view.rs` 内の既存 `mod tests` から呼ぶため維持した。残り9件（`run_title_sync`、`begin_title_create`、`begin_title_rename`、`finish_title_rename`、`retire_work_folder_draft`、`apply_pending_title_sync`、`retry_title_sync`、`save_active`、`finish_save`）は移動した18件の内部だけから呼ばれるためprivateのまま維持した。
+
+移動した18件の個別対応は次のとおり。各行で旧定義 `crates/ui/src/view.rs::<method>` を同名の新定義 `crates/ui/src/view/session_save.rs::<method>` へ移した。
+
+1. `schedule_autosave`
+2. `schedule_draft_save`
+3. `flush_pending_drafts`
+4. `schedule_title_sync`
+5. `run_title_sync`
+6. `begin_title_create`
+7. `begin_title_rename`
+8. `finish_title_rename`
+9. `retire_work_folder_draft`
+10. `apply_pending_title_sync`
+11. `retry_title_sync`
+12. `retry_deferred_title_sync`
+13. `save_current`
+14. `save_or_prompt`
+15. `save_active`
+16. `save_session`
+17. `finish_save`
+18. `prompt_save_as`
+
+`view.rs` には `mod session_save;` を既存の `mod inline_rename;` の直後、`mod sidebar;` の直前に追加した。`EditorView` の全field・型・初期化、`WorkFolderDraft` / `TitleRenameAttempt`、title-sync状態（`title_sync_scheduled` / `title_sync_in_flight` / `title_sync_pending` / `title_sync_deferred`）、hook生成、`remember_recent` / `store_settings` / `after_input` / `toggle_autosave`、上記7件の新規作成メソッド、open/scan/session/tab/new-entry/settings/renderと既存 `mod tests` は `view.rs` に残した。新moduleの冒頭は既存の兄弟module（`view/inline_rename.rs` 等）と同じ `use super::*;` を使う。`actions.rs`、`input.rs`、`capture.rs`、`view/sidebar.rs`、`view/sidebar_filter.rs`、`view/inline_rename.rs`、`view/viewport.rs`、session crate、Cargo設定・lockは変更していない。
+
+autosaveのactive-ID/ticket確認とdraftの元session-ID/revision確認の違い、750msデバウンスタイマー、同期flush、capture/clone/spawn/detach/notifyの順序、H1のpending/in-flight/scheduled/deferred状態、保存後の自動命名確定、rename ticket解放とpending save再開、`SaveOutcome::Saved` / `SavedStale` / `Conflict` / `Failed` / `Superseded` の分岐、`prompt_save_as` のclosureが参照するsessionは、bodyをそのまま転記したことでコード上変更していない。
+
+**検証**
+
+このPRの実装工程はshell/test/git/push実行権限を持たないworkerが行い、対象headのコード読解と静的な旧→新対応・可視性理由の確認だけを行った。`cargo test` / `cargo test --all-features` / `cargo clippy` / CI / GUI validationは本working sessionで実行していない。これらの結果はCommanderが別途取得し、本節に追記するのではなくPR #412のコメントに記録する。本節を含むこの文書更新の時点では上記検証は未実施であり、成功・失敗のいずれとも記載しない。
+
+**残件**
+
+session I/O、background parse、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は引き続き #301 の後続として実行計画で追跡する。#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置（`view/session_save.rs` を参照する `view/inline_rename.rs` の呼び出し）に依存する後続がある場合は逆順に戻す。
+
+### 9.13 RF2-A: EditorView機械的分割 第6PR — background parse分離（#301）
+
+実装はPR [#419](https://github.com/hide212131/hane/pull/419)、starting head `178464102f9daeed3bec2fa28adc9fd458f9dbee`（基準main `145188eef1f1353cfd903b0277458ece71ea8831` と同一tree、対象 `view.rs` 基準blob `95a5c02713198a0013ebf969bd4f06dda53da61b`）に対して行った。PR本文は `Refs #301` とし、#301全体は閉じない。保存済み設計はPR #418のcommit `4255fd91357067018d4f213bba61316513f4eb74`、`docs/refactor-rf2a-background-parse-implementation-spec.md`。#418は未マージのためtarget treeに存在しないが、本節の対応表・理由は保存済み設計の転記であり、#418自体は変更していない。#397/#415/#416/#417のcurrent差分（タブclose、open/session/search接続など）は今回移動した2メソッド本体を変更しておらず、未受入branchからのコピーも行っていない。#395は停止中のまま再開・移植していない。
+
+**実際の旧→新対応と可視性**
+
+`crates/ui/src/view.rs` の既存 `impl EditorView` ブロックにあった background parse専用の2メソッドを、新規 `crates/ui/src/view/background_parse.rs` の新しい `impl EditorView` ブロックへ、`schedule_document_parse` → `schedule_joined_parse` の順のまま機械的に移した。署名・引数・戻り値・属性・doc comment（`[Self::schedule_document_parse]` を含む）・inline commentとbodyは変更していない。
+
+| 旧定義（`view.rs`） | 新定義（`view/background_parse.rs`） | 可視性 | 理由 |
+| --- | --- | --- | --- |
+| `schedule_document_parse` | `schedule_document_parse` | private → `pub(super)` | 親 `view.rs` に残る `impl Render for EditorView` など既存callerが呼べるようにする最小可視性 |
+| `schedule_joined_parse` | `schedule_joined_parse` | private → `pub(super)` | 同上。親に残る既存callerが呼べるようにする最小可視性 |
+
+変更した意味上の差はこの2件の可視性だけで、名前・引数・戻り値・関数本体・属性・doc/inline comment・相対順は原文どおり維持した。`view.rs` には `mod background_parse;` を既存の `mod inline_rename;` の直前に追加した。新moduleの冒頭は既存の兄弟module（`view/viewport.rs` 等）と同じ `use super::*;` を使う。
+
+**親 `view.rs` に残した責務**
+
+`EditorView` の全field、`from_sessions` 初期化、`on_document_replaced`、`DocumentKey`、`JoinedParseJob`、`JoinedBlockCache`、`Granularity`、`HeightBlocks`、`MAX_JOINED_PARSE_JOBS`、`document_key`、`block_context_revision_is_current`、`height_snapshot_matches_line_height`、index/height/cache共有helper、`after_input`、`activate_session`、新規note/`finish_open`、render、既存tests/fixtureは親 `view.rs` に残した。新規Manager/trait/Entity/状態所有者の追加や既存fieldのpub化は行っていない。`actions.rs`、`input.rs`、`capture.rs`、既存 `view` 子module、他crate、Cargo設定・lock、workflowは変更していない。
+
+**検証**
+
+このPRの実装工程はshell/test/build/lint/git/commit/push/CI/review/GUI/merge実行権限を持たないworkerが行い、対象headのコード読解と、Read/Edit/Writeによる2件の純粋な移動・可視性確認だけを行った。`cargo test` / `cargo test --all-features` / `cargo clippy` / fmt / CI / GUI validationは本working sessionで実行していない。これらの結果はCommanderが別途取得し、本節に追記するのではなくPR #419のコメントに記録する。本節を含むこの文書更新の時点では上記検証は未実施であり、成功・失敗のいずれとも記載しない。
+
+**残件**
+
+session I/O、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は引き続き #301 の後続として実行計画で追跡する。#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置（`view/background_parse.rs` の2メソッド）に依存する後続がある場合は逆順に戻す。
