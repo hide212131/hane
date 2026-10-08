@@ -33,7 +33,7 @@ mod selection;
 
 pub use find::{
     FindNavigation, FindOptions, FindQuery, FindQueryError, FindResults, FindScan,
-    MAX_MATCHES, MAX_QUERY_BYTES, NavigationStep, scan as find_scan,
+    MAX_MATCHES, MAX_QUERY_BYTES, NavigationStep, matches_in_range, scan as find_scan,
 };
 pub use ime::{ImeCancelOutcome, ImeState, utf16_range_to_byte};
 pub use selection::Selection;

@@ -991,6 +991,12 @@ pub struct EditorView {
     /// changes a row height (for example, an inactive zero-height code fence
     /// becoming editable).
     pending_caret_visibility_after_layout: bool,
+    /// Set after document-find navigation moves the current match. Mirrors
+    /// `pending_caret_visibility_after_layout`: forcing a hidden match's
+    /// block open can change its row height only on the next render, so this
+    /// stays armed until a post-layout pass observes stable geometry for the
+    /// current match (Issue #413).
+    pending_find_visibility_after_layout: bool,
     /// Markdown block boundaries for the current revision. Updated incrementally
     /// on the input path and republished by the background parse; the publish
     /// priority between the two lives in `BlockIndexState`.
@@ -1514,6 +1520,7 @@ impl EditorView {
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
+            pending_find_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
@@ -3618,6 +3625,9 @@ impl EditorView {
             list_projection,
             fence_height_projection,
             table_projection,
+            // Vertical caret navigation onto a neighbor block, unrelated to
+            // the document-find bar's current match.
+            None,
             self.line_height(),
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
@@ -3680,22 +3690,32 @@ impl EditorView {
         self.caret_geometry
     }
 
-    /// Scrolls so the row holding the caret is on screen.
+    /// Scrolls so the row holding the caret is on screen. See
+    /// `scroll_source_offset_into_view` for the shared mechanics.
+    fn scroll_cursor_into_view(&mut self) {
+        let cursor = self.sessions.active().editor().selection().active;
+        self.scroll_source_offset_into_view(cursor);
+    }
+
+    /// Scrolls so the row holding `offset` is on screen — the caret
+    /// (`scroll_cursor_into_view`), or the document-find bar's current match
+    /// (Issue #413).
     ///
-    /// The row is the exact answer and the layout cache holds it whenever the
-    /// caret's block has been drawn at the current revision, which is the case
-    /// while moving around. Right after an edit the layout is a revision behind,
-    /// and the caret's physical line stands in for its row — the same thing
-    /// wherever nothing wraps.
+    /// The row is the exact answer and the layout cache holds it whenever
+    /// `offset`'s block has been drawn at the current revision, which is the
+    /// case while moving around. Right after an edit the layout is a
+    /// revision behind, and `offset`'s physical line stands in for its row —
+    /// the same thing wherever nothing wraps.
     ///
     /// When the row would land flush against the viewport's bottom edge, the
     /// scroll target keeps [`CARET_MODE_BADGE_HEIGHT`] of extra clearance
-    /// below it, so the input-mode badge drawn under the caret is not clipped
-    /// by the viewport's `overflow_hidden` (issue #240).
-    fn scroll_cursor_into_view(&mut self) {
+    /// below it. That clearance only ever actually gets painted for a real
+    /// caret (issue #240); reserving it for a find match too is harmless —
+    /// at most a few extra pixels of margin — and keeps this one shared path
+    /// instead of a second one with its own rounding.
+    fn scroll_source_offset_into_view(&mut self, offset: SourceOffset) {
         let editor = self.sessions.active().editor();
-        let cursor = editor.selection().active;
-        let Ok(line) = editor.document().line_for_offset(cursor) else {
+        let Ok(line) = editor.document().line_for_offset(offset) else {
             return;
         };
         let (top, height) = match self.granularity {
@@ -3716,7 +3736,7 @@ impl EditorView {
                                     )
                                 })
                                 .map(|entry| &entry.layout)?;
-                            let row_index = layout.row_for_source(cursor)?;
+                            let row_index = layout.row_for_source(offset)?;
                             let row = layout.lines.get(row_index)?;
                             if row.line != *visual_line {
                                 return None;
@@ -3733,7 +3753,7 @@ impl EditorView {
             Granularity::Blocks => {
                 let Some(block) = self
                     .current_index()
-                    .and_then(|index| index.block_at(cursor))
+                    .and_then(|index| index.block_at(offset))
                 else {
                     return;
                 };
@@ -3748,7 +3768,7 @@ impl EditorView {
                             editor.document().revision(),
                         )
                     })
-                    .and_then(|entry| entry.layout.row_bounds_for_source(cursor));
+                    .and_then(|entry| entry.layout.row_bounds_for_source(offset));
                 match row {
                     Some((y, height)) => (block_top + y, height),
                     None => {
@@ -3767,6 +3787,64 @@ impl EditorView {
             height + CARET_MODE_BADGE_HEIGHT,
             self.viewport_height,
         );
+    }
+
+    /// The window-local `(x, top, height)` the caret (`offset ==
+    /// editor().selection().active`) or the document-find bar's current
+    /// match would paint at, resolved from `rendered` (this frame's freshly
+    /// laid-out blocks) rather than from `layout_cache`, which may still
+    /// describe the pre-disclosure zero-height row a command just disclosed
+    /// (Issue #413 reuses the same one-frame-stale-cache workaround
+    /// `fresh_caret` already needed).
+    ///
+    /// `BlockLayout::point_for_source` accepts an offset at the end of its
+    /// last line, so two adjacent block layouts can both claim the same
+    /// source boundary. In block granularity the formal index is the
+    /// ownership authority; restrict resolution to the block that owns
+    /// `offset` before asking either layout for a point. Otherwise a
+    /// collapsed closing fence immediately before a paragraph can win the
+    /// search and leave the geometry on the wrong, zero-height block.
+    fn fresh_point_for_offset(
+        &self,
+        rendered: &[(usize, VisualBlock, BlockLayout)],
+        shaper: &dyn LineShaper,
+        offset: SourceOffset,
+    ) -> Option<(f32, f32, f32)> {
+        let line = self.editor().document().line_for_offset(offset).ok();
+        let block_ordinal = (self.granularity == Granularity::Blocks)
+            .then(|| {
+                self.current_index()
+                    .and_then(|index| index.block_at(offset))
+                    .map(|block| block.ordinal)
+            })
+            .flatten();
+        rendered.iter().find_map(|(ordinal, visual, layout)| {
+            if self.granularity == Granularity::Blocks && block_ordinal != Some(*ordinal) {
+                return None;
+            }
+            if offset < visual.source_range.start || visual.source_range.end < offset {
+                return None;
+            }
+            let point = layout.point_for_source(visual, offset, shaper)?;
+            let top = match self.granularity {
+                Granularity::Blocks => self.heights.prefix_sum(*ordinal) + point.y,
+                Granularity::Lines => {
+                    let line = line?;
+                    let line_id = line.0;
+                    let visual_line = visual
+                        .lines
+                        .iter()
+                        .position(|line| line.line_id as usize == line_id)?;
+                    let line_row_top = layout
+                        .lines
+                        .iter()
+                        .find(|row| row.line == visual_line)
+                        .map(|row| row.y)?;
+                    self.heights.prefix_sum(line.0) + point.y - line_row_top
+                }
+            };
+            Some((point.x, top, point.height))
+        })
     }
 
     /// The published index, but only while it describes the current revision.
@@ -4653,6 +4731,7 @@ impl EditorView {
             list_projection,
             fence_height_projection,
             table_projection,
+            self.document_find_current_match(),
             self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());
@@ -4718,6 +4797,7 @@ impl EditorView {
             indexed,
             &render,
             joined.map(|cached| &cached.parse),
+            self.document_find_current_match(),
         ) else {
             return false;
         };
@@ -4820,6 +4900,9 @@ fn target_in_neighbor(
         list_projection,
         None,
         table_projection,
+        // Vertical caret navigation onto a neighbor block, unrelated to the
+        // document-find bar's current match.
+        None,
         line_height,
     )?;
     let layout = layout_block(&visual, width, shaper);
@@ -5887,48 +5970,7 @@ impl Render for EditorView {
         // A fence can become editable one frame after the input event; keep the
         // request armed until that row has a real positive height.
         let caret = self.editor().selection().active;
-        let caret_line = self.editor().document().line_for_offset(caret).ok();
-        // `BlockLayout::point_for_source` accepts a caret at the end of its
-        // last line, so two adjacent block layouts can both claim the same
-        // source boundary. In block granularity the formal index is the
-        // ownership authority; restrict resolution to the block that owns the
-        // caret before asking either layout for a point. Otherwise a collapsed
-        // closing fence immediately before a paragraph can win the search and
-        // leave the IME geometry on the wrong, zero-height block.
-        let caret_block_ordinal = (self.granularity == Granularity::Blocks)
-            .then(|| {
-                self.current_index()
-                    .and_then(|index| index.block_at(caret))
-                    .map(|block| block.ordinal)
-            })
-            .flatten();
-        let fresh_caret = rendered.iter().find_map(|(ordinal, visual, layout)| {
-            if self.granularity == Granularity::Blocks && caret_block_ordinal != Some(*ordinal) {
-                return None;
-            }
-            if caret < visual.source_range.start || visual.source_range.end < caret {
-                return None;
-            }
-            let point = layout.point_for_source(visual, caret, &shaper)?;
-            let top = match self.granularity {
-                Granularity::Blocks => self.heights.prefix_sum(*ordinal) + point.y,
-                Granularity::Lines => {
-                    let line = caret_line?;
-                    let line_id = line.0;
-                    let visual_line = visual
-                        .lines
-                        .iter()
-                        .position(|line| line.line_id as usize == line_id)?;
-                    let line_row_top = layout
-                        .lines
-                        .iter()
-                        .find(|row| row.line == visual_line)
-                        .map(|row| row.y)?;
-                    self.heights.prefix_sum(line.0) + point.y - line_row_top
-                }
-            };
-            Some((point.x, top, point.height))
-        });
+        let fresh_caret = self.fresh_point_for_offset(&rendered, &shaper, caret);
         if self.pending_caret_visibility_after_layout {
             if let Some((_, top, height)) = fresh_caret
                 && height > 0.0
@@ -5970,6 +6012,58 @@ impl Render for EditorView {
                 cx.notify();
             }
         }
+        let find_current_match = self.document_find_current_match();
+        if self.pending_find_visibility_after_layout {
+            match find_current_match
+                .and_then(|range| self.fresh_point_for_offset(&rendered, &shaper, range.start))
+            {
+                Some((_, top, height)) if height > 0.0 => {
+                    let before = self.scroll_y;
+                    self.scroll_y =
+                        scroll_y_for_cursor(self.scroll_y, top, height, self.viewport_height);
+                    self.scroll_y = clamp_scroll_y(
+                        self.scroll_y,
+                        self.scrollable_content_height(),
+                        self.viewport_height,
+                    );
+                    let visible_bottom = top + height - self.scroll_y;
+                    if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
+                        && self.scroll_y == before
+                    {
+                        self.pending_find_visibility_after_layout = false;
+                    } else {
+                        cx.notify();
+                    }
+                    if self.scroll_y != before {
+                        cx.notify();
+                    }
+                }
+                Some(_) => {
+                    // The current match's row has not been laid out with a
+                    // real height yet (its block may still need the forced
+                    // disclosure this frame installs). Keep the request
+                    // alive instead of consuming it early.
+                    cx.notify();
+                }
+                None => {
+                    // No current match (the bar closed, or navigated away
+                    // from): nothing left to scroll to.
+                    self.pending_find_visibility_after_layout = false;
+                }
+            }
+        }
+        let find_matches = self.document_find_matches_in_view(SourceRange {
+            start: rendered
+                .iter()
+                .map(|(_, visual, _)| visual.source_range.start)
+                .min()
+                .unwrap_or(SourceOffset(0)),
+            end: rendered
+                .iter()
+                .map(|(_, visual, _)| visual.source_range.end)
+                .max()
+                .unwrap_or(SourceOffset(0)),
+        });
         // Where the caret was drawn, for the IME candidate window.
         self.caret_geometry = fresh_caret.map(|(x, top, height)| CaretGeometry {
             x: self.theme.line_horizontal_padding + x,
@@ -6089,6 +6183,8 @@ impl Render for EditorView {
                                         self.zoom,
                                         &resolver,
                                         self.caret_input_mode,
+                                        &find_matches,
+                                        find_current_match,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`
@@ -7260,6 +7356,7 @@ mod tests {
             None,
             None,
             Some(projection),
+            None,
             DEFAULT_LINE_HEIGHT,
         )
         .expect("table presentation");
@@ -7954,6 +8051,7 @@ mod tests {
                 None,
                 None,
                 Some(projection),
+                None,
                 view.line_height(),
             )
             .expect("active table presentation");

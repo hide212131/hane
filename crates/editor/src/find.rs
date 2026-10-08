@@ -219,6 +219,18 @@ fn floor_char_boundary(buffer: &RopeBuffer, byte: usize) -> usize {
     candidate
 }
 
+/// The contiguous sub-slice of `matches` (sorted, non-overlapping; see
+/// [`scan`]) that intersects `viewport`, found by binary search rather than a
+/// linear scan — so a render frame that only draws what is on screen pays for
+/// the matches it actually draws, not for however many the whole document
+/// has.
+#[must_use]
+pub fn matches_in_range(matches: &[SourceRange], viewport: SourceRange) -> &[SourceRange] {
+    let start = matches.partition_point(|m| m.end <= viewport.start);
+    let end = start + matches[start..].partition_point(|m| m.start < viewport.end);
+    &matches[start..end]
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NavigationStep {
     pub index: usize,
@@ -508,6 +520,55 @@ mod tests {
             Some(0)
         );
         assert_eq!(FindNavigation::initial_index(&[], SourceOffset(0), None), None);
+    }
+
+    #[test]
+    fn matches_in_range_keeps_only_matches_overlapping_the_viewport() {
+        let matches = vec![
+            SourceRange::new(0, 3),
+            SourceRange::new(10, 13),
+            SourceRange::new(20, 23),
+            SourceRange::new(30, 33),
+        ];
+        assert_eq!(
+            matches_in_range(&matches, SourceRange::new(10, 23)),
+            &matches[1..3]
+        );
+        assert_eq!(
+            matches_in_range(&matches, SourceRange::new(5, 6)),
+            &[] as &[SourceRange]
+        );
+        assert_eq!(matches_in_range(&matches, SourceRange::new(0, 100)), &matches[..]);
+        assert_eq!(matches_in_range(&[], SourceRange::new(0, 100)), &[] as &[SourceRange]);
+    }
+
+    #[test]
+    fn matches_in_range_includes_a_match_that_only_partially_overlaps_the_edges() {
+        let matches = vec![SourceRange::new(5, 15)];
+        // The viewport's own edges fall strictly inside the match.
+        assert_eq!(
+            matches_in_range(&matches, SourceRange::new(8, 12)),
+            &matches[..]
+        );
+        // A viewport that only grazes the match's start or end still overlaps it.
+        assert_eq!(
+            matches_in_range(&matches, SourceRange::new(0, 6)),
+            &matches[..]
+        );
+        assert_eq!(
+            matches_in_range(&matches, SourceRange::new(14, 20)),
+            &matches[..]
+        );
+        // A viewport that touches only the match's boundary (no open interval
+        // overlap) does not count as intersecting.
+        assert_eq!(
+            matches_in_range(&matches, SourceRange::new(0, 5)),
+            &[] as &[SourceRange]
+        );
+        assert_eq!(
+            matches_in_range(&matches, SourceRange::new(15, 20)),
+            &[] as &[SourceRange]
+        );
     }
 
     #[test]

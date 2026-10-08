@@ -18,6 +18,11 @@ pub(crate) struct Theme {
     pub editor_background: u32,
     pub foreground: u32,
     pub selection_background: u32,
+    /// Background of every document-find match other than the current one.
+    /// Kept distinct from `find_current_match_background` so Next/Previous
+    /// visibly singles out the current match (Issue #413).
+    pub find_match_background: u32,
+    pub find_current_match_background: u32,
     pub header_background: u32,
     pub header_foreground: u32,
     pub tab_active_background: u32,
@@ -45,6 +50,8 @@ pub(crate) const DEFAULT_THEME: Theme = Theme {
     editor_background: 0xfaf9f7,
     foreground: 0x262626,
     selection_background: 0xe8eefc,
+    find_match_background: 0xfff1a6,
+    find_current_match_background: 0xffa94d,
     header_background: 0x242424,
     header_foreground: 0xf5f5f5,
     tab_active_background: 0x356d94,
@@ -72,6 +79,8 @@ pub(crate) const DARK_THEME: Theme = Theme {
     editor_background: 0x1f2022,
     foreground: 0xe8e5df,
     selection_background: 0x34435f,
+    find_match_background: 0x5c4b1e,
+    find_current_match_background: 0xcf7f2e,
     header_background: 0x151618,
     header_foreground: 0xf5f5f5,
     tab_active_background: 0x44779e,

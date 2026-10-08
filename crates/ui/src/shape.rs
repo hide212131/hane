@@ -287,6 +287,7 @@ mod tests {
                 None,
                 None,
                 index.table_projection(&block),
+                None,
                 26.0,
             )
             .expect("table block presents");

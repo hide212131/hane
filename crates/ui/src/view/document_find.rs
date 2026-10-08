@@ -203,6 +203,35 @@ impl EditorView {
         self.document_find.open && self.document_find.input_focused
     }
 
+    /// The bar's current match, if it is open with a `Ready` result and an
+    /// explicit current match. Used by the renderer both to force open the
+    /// Markdown disclosure of whichever block the match falls in (see
+    /// `range_disclosure`) and to paint the current-match highlight distinct
+    /// from every other match (Issue #413).
+    pub(super) fn document_find_current_match(&self) -> Option<SourceRange> {
+        if !self.document_find.open || !matches!(self.document_find.result, DocumentFindResult::Ready)
+        {
+            return None;
+        }
+        self.document_find
+            .current
+            .and_then(|index| self.document_find.matches.get(index))
+            .copied()
+    }
+
+    /// This bar's matches that intersect `viewport`, for the renderer to
+    /// highlight — found by binary search (see
+    /// `hane_editor::matches_in_range`) over the full match list rather than
+    /// a linear scan, so painting a frame costs only what is on screen, not
+    /// however many matches the whole document has.
+    pub(super) fn document_find_matches_in_view(&self, viewport: SourceRange) -> Vec<SourceRange> {
+        if !self.document_find.open || !matches!(self.document_find.result, DocumentFindResult::Ready)
+        {
+            return Vec::new();
+        }
+        hane_editor::matches_in_range(&self.document_find.matches, viewport).to_vec()
+    }
+
     /// A non-empty, single-line selection in the active document's body, or
     /// `None` when the selection is empty or spans more than one line. Reads
     /// the selection only; never mutates it. Returns the selection's own
@@ -288,6 +317,7 @@ impl EditorView {
         self.document_find.open = false;
         self.document_find.input_focused = false;
         self.cancel_document_find_work();
+        self.pending_find_visibility_after_layout = false;
         window.focus(&self.focus_handle, cx);
         cx.notify();
         true
@@ -337,9 +367,10 @@ impl EditorView {
     /// Moves to the next (`forward = true`) or previous match, wrapping past
     /// either end of `matches`. A no-op while the bar is closed, has no
     /// `Ready` result, or has no matches at all. Never touches the
-    /// document's selection, caret, or scroll position (see the module
-    /// doc); highlighting and visibility of the new current match are later
-    /// stages.
+    /// document's selection, caret, undo history, or IME composition (see
+    /// the module doc); this only scrolls the viewport to the new current
+    /// match (see `reveal_current_find_match`), the same way moving the
+    /// caret already scrolls without touching anything else.
     fn step_document_find(&mut self, forward: bool, cx: &mut Context<Self>) {
         if !self.document_find.open || !matches!(self.document_find.result, DocumentFindResult::Ready)
         {
@@ -359,7 +390,22 @@ impl EditorView {
         } else {
             "末尾に戻りました"
         });
+        self.reveal_current_find_match();
         cx.notify();
+    }
+
+    /// Scrolls the viewport to the bar's current match (a no-op when there
+    /// is none), and arms `pending_find_visibility_after_layout` so a render
+    /// that forces open the match's block disclosure for the first time
+    /// (changing that block's row height only on the next layout) gets one
+    /// more corrective pass, the same two-step dance
+    /// `pending_caret_visibility_after_layout` already does for the caret.
+    fn reveal_current_find_match(&mut self) {
+        let Some(range) = self.document_find_current_match() else {
+            return;
+        };
+        self.scroll_source_offset_into_view(range.start);
+        self.pending_find_visibility_after_layout = true;
     }
 
     pub(crate) fn document_find_next(&mut self, cx: &mut Context<Self>) {
@@ -565,6 +611,10 @@ impl EditorView {
             self.document_find.matches = results.matches;
             self.document_find.wrap_notice = None;
             self.document_find.result = DocumentFindResult::Ready;
+            // A no-op when `current` landed on `None` above (tab switch):
+            // only a query/option/edit-driven rescan that actually picked a
+            // current match scrolls to it.
+            self.reveal_current_find_match();
         }
         if self.document_find.restart_pending {
             self.document_find.restart_pending = false;
@@ -1721,6 +1771,61 @@ mod tests {
             // Shift+Enter must stay scoped to find navigation and never
             // insert a newline into the document underneath the bar.
             assert_eq!(view.editor().document().full_text(), "needle needle\n");
+        });
+    }
+
+    #[gpui::test]
+    fn a_match_far_below_the_fold_scrolls_into_view_without_touching_the_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        // A single match many paragraphs past what the initial, unscrolled
+        // viewport can show, so resolving the current match exercises the
+        // scroll-into-view path (Issue #413) rather than already being on
+        // screen by coincidence.
+        let mut paragraphs: Vec<String> = (1..=80).map(|n| format!("line {n:02}")).collect();
+        paragraphs[70] = "needle".to_owned();
+        let text = paragraphs.join("\n\n");
+        let needle_start = text.find("needle").expect("needle present");
+        let needle_range = SourceRange::new(needle_start, needle_start + "needle".len());
+
+        let (view, cx) = {
+            let text = text.clone();
+            cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx))
+        };
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| assert_eq!(view.scroll_y, 0.0));
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.document_find.query_text = "needle".to_owned();
+            view.restart_document_find(cx, false, true);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches, vec![needle_range]);
+            assert_eq!(view.document_find.current, Some(0));
+            // Resolving the far-below current match scrolled the viewport to
+            // it, and the post-layout corrective pass found it with a real
+            // height and cleared the pending flag rather than leaving it
+            // armed forever.
+            assert!(
+                view.scroll_y > 0.0,
+                "the far-below match must scroll the viewport"
+            );
+            assert!(!view.pending_find_visibility_after_layout);
+            // Finding and navigating to a match never changes the
+            // document's own text or selection.
+            assert_eq!(view.editor().document().full_text(), text);
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
         });
     }
 }
