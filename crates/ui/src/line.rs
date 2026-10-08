@@ -1835,7 +1835,7 @@ mod tests {
 
     #[test]
     fn find_match_boundaries_split_the_affected_text_and_mark_the_current_one() {
-        let find_matches = single_find_match(3..9);
+        let find_matches = vec![3..6, 6..9];
         let segments = line_segments(
             0..12,
             None,
