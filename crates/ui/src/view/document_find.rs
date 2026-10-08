@@ -175,6 +175,17 @@ impl EditorView {
         self.document_find.input_focused
     }
 
+    /// Clears the document-find input's focus flag without closing the bar,
+    /// so a click into the document body stops routing document-editing
+    /// keys to the (still visible) find input in `actions.rs` instead of
+    /// the editor.
+    pub(crate) fn blur_document_find_focus(&mut self, cx: &mut Context<Self>) {
+        if self.document_find.input_focused {
+            self.document_find.input_focused = false;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn document_find_should_leave_on_escape(&self) -> bool {
         self.document_find.open && self.document_find.input_focused
     }
