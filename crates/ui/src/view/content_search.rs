@@ -503,6 +503,11 @@ impl EditorView {
         if self.settings_open || self.inline_rename_active() {
             return;
         }
+        // Opening Content Search hides the Files filter input, so its
+        // focus flag must be cleared here too, or `sidebar_filter_is_focused`
+        // keeps routing keys like Backspace to the now-hidden filter instead
+        // of the search input or the document after Escape (Issue #417).
+        self.blur_sidebar_filter(cx);
         self.initialize_content_search_input(window, cx);
         self.content_search.mode = SidebarMode::Content;
         self.content_search.results_focused = false;
@@ -555,6 +560,10 @@ impl EditorView {
             // the editor body here too (see `leave_content_search`).
             window.focus(&self.focus_handle, cx);
         } else {
+            // Same as `open_content_search`: switching into Content mode
+            // hides the Files filter input, so its focus flag must be
+            // cleared here too (Issue #417).
+            self.blur_sidebar_filter(cx);
             self.initialize_content_search_input(window, cx);
             self.content_search.results_focused = false;
             self.content_search.input_focused = true;
@@ -2833,6 +2842,68 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().document().full_text(), "onX\n");
+        });
+    }
+
+    #[gpui::test]
+    fn opening_content_search_via_shortcut_clears_the_files_filter_focus_so_escape_backspace_reaches_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context the way a real click
+        // does, then move logical focus onto the Files filter the way
+        // clicking into it does: setting the flag (and some filter text)
+        // without changing the shared GPUI focus handle.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.sidebar_filter = "needle".to_owned();
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_is_focused()));
+
+        // Opening Content Search with the keyboard shortcut while the Files
+        // filter is focused must take over logical focus from the filter,
+        // not just show the search input (Issue #417 regression).
+        cx.simulate_keystrokes("secondary-shift-f");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_focused);
+            assert!(view.content_search_input_is_focused());
+            assert_eq!(view.sidebar_filter, "needle");
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+        assert!(!view.read_with(cx, |view, _| view.sidebar_filter_is_focused()));
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(3)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Backspace must reach the document, not the lingering Files filter
+        // focus flag, and the filter text must stay untouched.
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "on\n");
+            assert_eq!(view.sidebar_filter, "needle");
         });
     }
 
