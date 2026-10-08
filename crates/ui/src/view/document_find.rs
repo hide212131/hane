@@ -17,6 +17,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 
 const DOCUMENT_FIND_BAR_HEIGHT: f32 = SIDEBAR_FILTER_HEIGHT;
 
+#[derive(Default)]
 pub(super) struct DocumentFindState {
     open: bool,
     input: Option<Entity<InputState>>,
@@ -27,17 +28,6 @@ pub(super) struct DocumentFindState {
     /// document-editing keys, so it must be kept in lockstep with the
     /// input's real `Focus`/`Blur` events rather than inferred.
     input_focused: bool,
-}
-
-impl Default for DocumentFindState {
-    fn default() -> Self {
-        Self {
-            open: false,
-            input: None,
-            input_subscription: None,
-            input_focused: false,
-        }
-    }
 }
 
 impl EditorView {
