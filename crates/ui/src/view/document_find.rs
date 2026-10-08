@@ -1127,26 +1127,28 @@ mod tests {
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
         cx.run_until_parked();
 
-        view.update(cx, |view, cx| {
-            // The auto-rescan under test only applies while the bar is
-            // open; opened directly here (rather than through
-            // `open_document_find`) to keep this test focused on the
-            // revision-tracking behavior itself.
-            view.document_find.open = true;
-            view.document_find.query_text = "needle".to_owned();
-            view.restart_document_find(cx, false);
-            assert!(view.document_find.job_active);
-            assert_eq!(view.document_find.result, DocumentFindResult::Pending);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                // The auto-rescan under test only applies while the bar is
+                // open; opened through the normal `open_document_find` entry
+                // point so the find input is initialized the same way the
+                // real shortcut initializes it.
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false);
+                assert!(view.document_find.job_active);
+                assert_eq!(view.document_find.result, DocumentFindResult::Pending);
 
-            // The document itself is edited (through the same view-level
-            // path as real typing, which routes through `after_input`)
-            // while the scan's background task has not run yet, moving the
-            // revision the in-flight scan was started against out from
-            // under it.
-            view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(0)))
-                .unwrap();
-            view.insert_text("needle ", cx);
+                // The document itself is edited (through the same view-level
+                // path as real typing, which routes through `after_input`)
+                // while the scan's background task has not run yet, moving the
+                // revision the in-flight scan was started against out from
+                // under it.
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(0)))
+                    .unwrap();
+                view.insert_text("needle ", cx);
+            });
         });
         cx.run_until_parked();
 
