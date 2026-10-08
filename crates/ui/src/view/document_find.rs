@@ -256,7 +256,9 @@ impl EditorView {
         if !self.document_find.open || !self.document_find.input_focused {
             return;
         }
-        let Some(input) = self.document_find.input.clone() else { return };
+        let Some(input) = self.document_find.input.clone() else {
+            return;
+        };
         self.document_find.escape_was_composing = input.update(cx, |state, cx| {
             <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         });
@@ -279,7 +281,9 @@ impl EditorView {
         if !self.document_find.open || !self.document_find.input_focused {
             return;
         }
-        let Some(input) = self.document_find.input.clone() else { return };
+        let Some(input) = self.document_find.input.clone() else {
+            return;
+        };
         self.document_find.enter_was_composing = input.update(cx, |state, cx| {
             <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         });
@@ -304,7 +308,9 @@ impl EditorView {
         if !self.document_find.open || !self.document_find.input_focused {
             return false;
         }
-        let Some(input) = self.document_find.input.clone() else { return false };
+        let Some(input) = self.document_find.input.clone() else {
+            return false;
+        };
         input.update(cx, |state, cx| {
             <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         })
@@ -623,9 +629,11 @@ impl EditorView {
                     .read_with(cx, |view, _| {
                         let state = &view.document_find;
                         (state.debounce_active && state.debounce_task_id == task_id).then(|| {
-                            state.last_query_change.map_or(DOCUMENT_FIND_DEBOUNCE, |at| {
-                                DOCUMENT_FIND_DEBOUNCE.saturating_sub(at.elapsed())
-                            })
+                            state
+                                .last_query_change
+                                .map_or(DOCUMENT_FIND_DEBOUNCE, |at| {
+                                    DOCUMENT_FIND_DEBOUNCE.saturating_sub(at.elapsed())
+                                })
                         })
                     })
                     .unwrap_or(None);
@@ -2075,7 +2083,10 @@ mod tests {
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(!matches!(view.document_find.result, DocumentFindResult::Ready));
+            assert!(!matches!(
+                view.document_find.result,
+                DocumentFindResult::Ready
+            ));
         });
 
         cx.simulate_keystrokes("escape");

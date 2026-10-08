@@ -1436,14 +1436,15 @@ impl EditorView {
         // point that still observes the find input's marked range as it was
         // just before this Escape.
         let escape_interceptor_view = cx.entity().downgrade();
-        let document_find_escape_interceptor = cx.intercept_keystrokes(move |event, window, app| {
-            if event.keystroke.key != "escape" {
-                return;
-            }
-            let _ = escape_interceptor_view.update(app, |view, cx| {
-                view.note_document_find_escape_keystroke(window, cx);
+        let document_find_escape_interceptor =
+            cx.intercept_keystrokes(move |event, window, app| {
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                let _ = escape_interceptor_view.update(app, |view, cx| {
+                    view.note_document_find_escape_keystroke(window, cx);
+                });
             });
-        });
         // The pinned find-input widget's `InputState::enter` emits
         // `InputEvent::PressEnter` for every Enter — including one that only
         // confirms an in-progress IME composition — without checking its own
@@ -3410,7 +3411,8 @@ impl EditorView {
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
         let row_top = self.content_y_for_row(block_id, row_index)?;
-        let content_y = self.scroll_y + window_y - self.theme.header_height
+        let content_y = self.scroll_y + window_y
+            - self.theme.header_height
             - self.document_find_reserved_height();
         let local_y = content_y - row_top;
         let shaper = WindowShaper::new(window, self.zoom);
@@ -5870,7 +5872,7 @@ impl Render for EditorView {
             - self.theme.header_height
             - self.theme.footer_height
             - self.document_find_reserved_height())
-            .max(self.line_height());
+        .max(self.line_height());
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
         // read once per frame and every layout is keyed by it. A sidebar takes
@@ -17894,7 +17896,10 @@ mod tests {
         cx.run_until_parked();
 
         let reserved = view.read_with(cx, |view, _| view.document_find_reserved_height());
-        assert!(reserved > 0.0, "the open bar must reserve a real row height");
+        assert!(
+            reserved > 0.0,
+            "the open bar must reserve a real row height"
+        );
 
         let bar_bounds = cx
             .debug_bounds("document-find-bar")

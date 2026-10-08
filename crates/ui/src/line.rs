@@ -63,10 +63,12 @@ fn range_disclosure(
         None
     };
     let disclosure = disclosure.or_else(|| {
-        forced.filter(|forced| forced.intersects(range)).map(|forced| SourceRange {
-            start: forced.start.max(range.start),
-            end: forced.end.min(range.end),
-        })
+        forced
+            .filter(|forced| forced.intersects(range))
+            .map(|forced| SourceRange {
+                start: forced.start.max(range.start),
+                end: forced.end.min(range.end),
+            })
     });
     editor
         .ime()
@@ -261,7 +263,15 @@ pub(crate) fn expected_block_disclosures(
 ) -> Option<Vec<(usize, Option<SourceRange>)>> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
-    let ctx = block_context(editor, block, &span, render, joined, None, forced_disclosure)?;
+    let ctx = block_context(
+        editor,
+        block,
+        &span,
+        render,
+        joined,
+        None,
+        forced_disclosure,
+    )?;
     let lines = block_lines(editor, &ctx);
     Some(expected_disclosures(
         block.kind,
@@ -482,7 +492,12 @@ pub(crate) fn disclosure_for_line(
     range: SourceRange,
     forced: Option<SourceRange>,
 ) -> Option<SourceRange> {
-    range_disclosure(editor, range, line + 1 == editor.document().line_count(), forced)
+    range_disclosure(
+        editor,
+        range,
+        line + 1 == editor.document().line_count(),
+        forced,
+    )
 }
 
 /// Row height and body font size at 100% zoom, used by tests and by callers
@@ -878,7 +893,9 @@ pub(crate) fn row_element(
                     // from a selected occurrence): the document's own
                     // selection state must stay visible, not be papered over
                     // by find's highlight (Issue #413).
-                    .when(segment.selected, |element| element.bg(rgb(theme.selection_background)))
+                    .when(segment.selected, |element| {
+                        element.bg(rgb(theme.selection_background))
+                    })
                     .when(!segment.selected && segment.find_current_match, |element| {
                         element.bg(rgb(theme.find_current_match_background))
                     })
@@ -889,9 +906,13 @@ pub(crate) fn row_element(
                     .when(segment.marked || segment.display.underline, |element| {
                         element.underline()
                     })
-                    .when(segment.display.bold, |element| element.font_weight(FontWeight::BOLD))
+                    .when(segment.display.bold, |element| {
+                        element.font_weight(FontWeight::BOLD)
+                    })
                     .when(segment.display.italic, |element| element.italic())
-                    .when(segment.display.strikethrough, |element| element.line_through())
+                    .when(segment.display.strikethrough, |element| {
+                        element.line_through()
+                    })
                     .when(segment.display.monospace, |element| {
                         element.font_family("ui-monospace")
                     })
@@ -1111,12 +1132,16 @@ fn table_row_element(
                             .when(segment.marked || segment.display.underline, |element| {
                                 element.underline()
                             })
-                            .when(table.header, |element| element.font_weight(FontWeight::SEMIBOLD))
+                            .when(table.header, |element| {
+                                element.font_weight(FontWeight::SEMIBOLD)
+                            })
                             .when(segment.display.bold, |element| {
                                 element.font_weight(FontWeight::BOLD)
                             })
                             .when(segment.display.italic, |element| element.italic())
-                            .when(segment.display.strikethrough, |element| element.line_through())
+                            .when(segment.display.strikethrough, |element| {
+                                element.line_through()
+                            })
                             .when(segment.display.monospace, |element| {
                                 element.font_family("ui-monospace")
                             })
