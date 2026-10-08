@@ -221,7 +221,7 @@ impl EditorView {
 
     pub(super) fn toggle_document_find_case(&mut self, cx: &mut Context<Self>) {
         self.document_find.case_sensitive = !self.document_find.case_sensitive;
-        self.restart_document_find(cx, true);
+        self.restart_document_find(cx, false);
     }
 
     /// Cancels whatever scan is in flight or about to start, and bumps
