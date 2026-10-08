@@ -854,8 +854,10 @@ pub(crate) fn row_element(
         visual_cursor.map(|offset| offset.0),
         selected_visual,
         marked_visual,
-        &match_visuals,
-        current_match_visual,
+        FindHighlight {
+            matches: &match_visuals,
+            current: current_match_visual,
+        },
         &line.style_runs,
         row.body_visual_start,
     );
@@ -1076,8 +1078,10 @@ fn table_row_element(
                         None,
                         fragment_selected,
                         fragment_marked,
-                        &fragment_matches,
-                        fragment_current_match,
+                        FindHighlight {
+                            matches: &fragment_matches,
+                            current: fragment_current_match,
+                        },
                         &line.style_runs,
                         None,
                     )
@@ -1255,17 +1259,21 @@ fn clip_visual_ranges(sources: &[Range<usize>], bounds: Range<usize>) -> Vec<Ran
         .collect()
 }
 
-/// `find_matches` are this row's document-find match visual ranges (already
-/// clipped to the row, and in source order; see
-/// `BlockLayout::visual_range_on_row`), and `find_current_match` is whichever
-/// one of them is the bar's current match, if any is on this row.
+/// A row's (or a table fragment's) share of the document-find highlight:
+/// `matches` are the match visual ranges (already clipped to the row, and in
+/// source order; see `BlockLayout::visual_range_on_row`), and `current` is
+/// whichever one of them is the bar's current match, if any is on this row.
+struct FindHighlight<'a> {
+    matches: &'a [Range<usize>],
+    current: Option<Range<usize>>,
+}
+
 fn line_segments(
     bounds: Range<usize>,
     cursor: Option<usize>,
     selected: Option<Range<usize>>,
     marked: Option<Range<usize>>,
-    find_matches: &[Range<usize>],
-    find_current_match: Option<Range<usize>>,
+    find: FindHighlight<'_>,
     style_runs: &[hane_presentation::StyleRun],
     body_visual_start: Option<usize>,
 ) -> Vec<LineSegment> {
@@ -1276,7 +1284,7 @@ fn line_segments(
         boundaries.push(range.start);
         boundaries.push(range.end);
     }
-    for range in find_matches {
+    for range in find.matches {
         boundaries.push(range.start);
         boundaries.push(range.end);
     }
@@ -1294,10 +1302,12 @@ fn line_segments(
                 .as_ref()
                 .is_some_and(|marked| range.start >= marked.start && range.end <= marked.end),
             cursor_before: cursor == Some(range.start),
-            find_match: find_matches
+            find_match: find
+                .matches
                 .iter()
                 .any(|m| range.start >= m.start && range.end <= m.end),
-            find_current_match: find_current_match
+            find_current_match: find
+                .current
                 .as_ref()
                 .is_some_and(|m| range.start >= m.start && range.end <= m.end),
             display: inline_display_for(&range, style_runs),
@@ -1435,7 +1445,18 @@ mod tests {
             visual_range: hane_presentation::VisualRange::new(3, 9),
             kind: hane_presentation::StyleKind::InlineCode,
         }];
-        let segments = line_segments(0..9, None, Some(0..6), None, &[], None, &style_runs, None);
+        let segments = line_segments(
+            0..9,
+            None,
+            Some(0..6),
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &style_runs,
+            None,
+        );
         let overlap = segments
             .iter()
             .find(|segment| segment.visual_range == (3..6))
@@ -1455,7 +1476,21 @@ mod tests {
             visual_range: hane_presentation::VisualRange::new(3, 9),
             kind: hane_presentation::StyleKind::InlineCode,
         }];
-        let segments = line_segments(0..9, None, None, None, &[3..6], None, &style_runs, None);
+        // An explicitly typed single-Range fixture, not a `Vec`-like sequence
+        // literal (clippy::single_range_in_vec_init).
+        let find_matches: [Range<usize>; 1] = [3..6];
+        let segments = line_segments(
+            0..9,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &find_matches,
+                current: None,
+            },
+            &style_runs,
+            None,
+        );
         let overlap = segments
             .iter()
             .find(|segment| segment.visual_range == (3..6))
@@ -1711,7 +1746,18 @@ mod tests {
         // Selection and IME ranges that reach past the row are clipped to it, so
         // a construct spanning a soft wrap is painted on both rows and neither
         // row draws outside its own text.
-        let segments = line_segments(6..12, Some(3), Some(0..9), None, &[], None, &[], None);
+        let segments = line_segments(
+            6..12,
+            Some(3),
+            Some(0..9),
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            None,
+        );
         assert_eq!(
             segments.first().map(|segment| segment.visual_range.start),
             Some(6)
@@ -1730,7 +1776,18 @@ mod tests {
     #[test]
     fn selection_and_ime_boundaries_split_only_the_affected_text() {
         assert_eq!(
-            line_segments(0..12, Some(3), Some(3..9), Some(6..12), &[], None, &[], None),
+            line_segments(
+                0..12,
+                Some(3),
+                Some(3..9),
+                Some(6..12),
+                FindHighlight {
+                    matches: &[],
+                    current: None,
+                },
+                &[],
+                None,
+            ),
             vec![
                 LineSegment {
                     visual_range: 0..3,
@@ -1774,7 +1831,21 @@ mod tests {
 
     #[test]
     fn find_match_boundaries_split_the_affected_text_and_mark_the_current_one() {
-        let segments = line_segments(0..12, None, None, None, &[3..9], Some(6..9), &[], None);
+        // An explicitly typed single-Range fixture, not a `Vec`-like sequence
+        // literal (clippy::single_range_in_vec_init).
+        let find_matches: [Range<usize>; 1] = [3..9];
+        let segments = line_segments(
+            0..12,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &find_matches,
+                current: Some(6..9),
+            },
+            &[],
+            None,
+        );
         assert_eq!(
             segments,
             vec![
@@ -1823,7 +1894,21 @@ mod tests {
         // Both flags are set on the overlap; the renderer (not this function)
         // decides selection wins the paint so the body's own selection state
         // is never hidden underneath a match highlight (Issue #413).
-        let segments = line_segments(0..6, None, Some(0..6), None, &[0..6], Some(0..6), &[], None);
+        // An explicitly typed single-Range fixture, not a `Vec`-like sequence
+        // literal (clippy::single_range_in_vec_init).
+        let find_matches: [Range<usize>; 1] = [0..6];
+        let segments = line_segments(
+            0..6,
+            None,
+            Some(0..6),
+            None,
+            FindHighlight {
+                matches: &find_matches,
+                current: Some(0..6),
+            },
+            &[],
+            None,
+        );
         assert_eq!(segments.len(), 1);
         assert!(segments[0].selected);
         assert!(segments[0].find_match);
@@ -1841,8 +1926,10 @@ mod tests {
             None,
             Some(5..9),
             Some(7..11),
-            &[],
-            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
             &[],
             row.body_visual_start,
         );
@@ -1862,7 +1949,18 @@ mod tests {
         row.body_visual_start = Some(4);
         row.marker_body_gap = 8.0;
         row.body_gap = 8.0;
-        let segments = line_segments(0..4, None, None, None, &[], None, &[], row.body_visual_start);
+        let segments = line_segments(
+            0..4,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            row.body_visual_start,
+        );
 
         assert_eq!(
             segments
@@ -1876,7 +1974,18 @@ mod tests {
 
     #[test]
     fn list_body_boundary_splits_paint_segments_without_adding_text() {
-        let segments = line_segments(0..8, None, None, None, &[], None, &[], Some(3));
+        let segments = line_segments(
+            0..8,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            Some(3),
+        );
         assert_eq!(
             segments
                 .iter()
