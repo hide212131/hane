@@ -164,8 +164,21 @@ impl EditorView {
                 // Fired once per committed Enter (not while an IME
                 // composition in this input is still open), matching how
                 // the Work-folder content search already treats this same
-                // event as its own Enter-to-act signal.
-                InputEvent::PressEnter { .. } => view.document_find_next(cx),
+                // event as its own Enter-to-act signal. The pinned
+                // single-line `Input` propagates the `shift-enter` action to
+                // the parent first and then emits this event with
+                // `shift: true`, so this is the one and only place that
+                // dispatches find navigation for Enter/Shift+Enter in this
+                // field; `actions.rs`'s `ShiftNewline` handler must not also
+                // navigate, or Shift+Enter would move the current match
+                // twice.
+                InputEvent::PressEnter { shift } => {
+                    if shift {
+                        view.document_find_previous(cx);
+                    } else {
+                        view.document_find_next(cx);
+                    }
+                }
             });
         self.document_find.input = Some(input);
         self.document_find.input_subscription = Some(subscription);

@@ -175,8 +175,11 @@ command_actions! {
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
+        // The find input's own `InputEvent::PressEnter { shift: true }`
+        // subscription (see `document_find.rs`) already drives Previous for
+        // Shift+Enter in this field after this action propagates to it;
+        // navigating again here would move the current match twice.
         if view.document_find_input_is_focused() {
-            view.document_find_previous(cx);
             return;
         }
         if view.content_search_input_is_focused() || view.content_search_results_focused() {
