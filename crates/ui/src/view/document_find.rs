@@ -947,6 +947,20 @@ mod tests {
         // view (e.g. `settle_debounce` in `view.rs`), runs on GPUI's real
         // timer rather than the deterministic test dispatcher, so it needs
         // `advance_clock` rather than just `run_until_parked` to fire.
+        //
+        // Firing the timer is not enough on its own, though:
+        // `schedule_document_find_debounce`'s post-wake check re-reads
+        // `last_query_change.elapsed()` against `std::time::Instant::now()`,
+        // which `advance_clock` (a virtual clock private to the test
+        // dispatcher) never moves. Without real wall-clock time also having
+        // passed, that check still reads as "not enough time yet", so the
+        // loop just re-arms another `DOCUMENT_FIND_DEBOUNCE`-long virtual
+        // timer — one `advance_clock` call past the one above's reach — and
+        // the scan never runs. A real sleep for at least the debounce
+        // window, taken before the virtual clock is advanced, makes that
+        // `elapsed()` check see genuine elapsed time by the time the
+        // now-due virtual timer wakes the task inside `advance_clock`.
+        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
         cx.executor()
             .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
         cx.run_until_parked();
