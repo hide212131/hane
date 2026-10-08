@@ -91,6 +91,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod ai_settings;
 mod background_parse;
 mod content_search;
+mod document_find;
 mod inline_rename;
 mod session_save;
 mod sidebar;
@@ -758,6 +759,10 @@ pub struct EditorView {
     /// Search UI state is kept with the view so rapid input edits share one
     /// bounded controller and one long-lived input entity.
     content_search: content_search::ContentSearchState,
+    /// The per-document find bar's own open/focus state, entirely separate
+    /// from `content_search` (the Work-folder body search in the sidebar):
+    /// different shortcut, different field, different focus flag.
+    document_find: document_find::DocumentFindState,
     /// Where a not-yet-named work-folder note's content is journalled, so a
     /// crash before it earns a real filename never loses it. Removed once the
     /// session it belongs to gets a real path or closes.
@@ -1440,6 +1445,7 @@ impl EditorView {
             recent,
             work_folder: None,
             content_search: content_search::ContentSearchState::default(),
+            document_find: document_find::DocumentFindState::default(),
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
@@ -6107,7 +6113,15 @@ impl Render for EditorView {
                         }))
                         .child(div().h(px(bottom_space))),
                 )
-                .children(editor_scrollbar),
+                .children(editor_scrollbar)
+                // Absolutely positioned over the top of this `.relative()`
+                // viewport (directly under the tab bar), rather than a flex
+                // sibling pushed in above it: `self.viewport_height` and the
+                // mouse-to-content-row math in `on_editor_mouse_down` are
+                // both derived from the header/footer heights alone, so a
+                // flex sibling here would silently shift body bounds and
+                // click targeting whenever the bar is open (Issue #413).
+                .children(self.document_find_bar(cx)),
         );
         let rendered = root.child(main_column.child(self.footer_element(status, cx)));
         let rendered = if let Some(menu) = self.file_tab_context_menu.as_ref() {
