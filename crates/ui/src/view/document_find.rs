@@ -172,8 +172,8 @@ impl EditorView {
                 // field; `actions.rs`'s `ShiftNewline` handler must not also
                 // navigate, or Shift+Enter would move the current match
                 // twice.
-                InputEvent::PressEnter { shift } => {
-                    if shift {
+                InputEvent::PressEnter { shift, .. } => {
+                    if *shift {
                         view.document_find_previous(cx);
                     } else {
                         view.document_find_next(cx);
