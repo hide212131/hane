@@ -443,10 +443,7 @@ mod tests {
         text.push_str("needle");
         text.push_str(&"b".repeat(1024));
         let result = matches(&text, "needle", true);
-        assert_eq!(
-            result.matches,
-            vec![SourceRange::new(boundary, boundary + "needle".len())]
-        );
+        assert_eq!(result.matches, vec![SourceRange::new(boundary, boundary + "needle".len())]);
     }
 
     #[test]
@@ -511,14 +508,8 @@ mod tests {
     #[test]
     fn initial_index_falls_back_to_first_match_at_or_after_anchor() {
         let ranges = vec![SourceRange::new(0, 3), SourceRange::new(10, 13)];
-        assert_eq!(
-            FindNavigation::initial_index(&ranges, SourceOffset(5), None),
-            Some(1)
-        );
-        assert_eq!(
-            FindNavigation::initial_index(&ranges, SourceOffset(50), None),
-            Some(0)
-        );
+        assert_eq!(FindNavigation::initial_index(&ranges, SourceOffset(5), None), Some(1));
+        assert_eq!(FindNavigation::initial_index(&ranges, SourceOffset(50), None), Some(0));
         assert_eq!(FindNavigation::initial_index(&[], SourceOffset(0), None), None);
     }
 
@@ -534,10 +525,7 @@ mod tests {
             matches_in_range(&matches, SourceRange::new(10, 23)),
             &matches[1..3]
         );
-        assert_eq!(
-            matches_in_range(&matches, SourceRange::new(5, 6)),
-            &[] as &[SourceRange]
-        );
+        assert_eq!(matches_in_range(&matches, SourceRange::new(5, 6)), &[] as &[SourceRange]);
         assert_eq!(matches_in_range(&matches, SourceRange::new(0, 100)), &matches[..]);
         assert_eq!(matches_in_range(&[], SourceRange::new(0, 100)), &[] as &[SourceRange]);
     }

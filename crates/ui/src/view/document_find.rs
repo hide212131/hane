@@ -258,8 +258,7 @@ impl EditorView {
         }
         let Some(input) = self.document_find.input.clone() else { return };
         self.document_find.escape_was_composing = input.update(cx, |state, cx| {
-            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
-                .is_some()
+            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         });
     }
 
@@ -282,8 +281,7 @@ impl EditorView {
         }
         let Some(input) = self.document_find.input.clone() else { return };
         self.document_find.enter_was_composing = input.update(cx, |state, cx| {
-            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
-                .is_some()
+            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         });
     }
 
@@ -306,12 +304,9 @@ impl EditorView {
         if !self.document_find.open || !self.document_find.input_focused {
             return false;
         }
-        let Some(input) = self.document_find.input.clone() else {
-            return false;
-        };
+        let Some(input) = self.document_find.input.clone() else { return false };
         input.update(cx, |state, cx| {
-            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
-                .is_some()
+            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         })
     }
 

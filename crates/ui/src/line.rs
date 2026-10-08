@@ -878,13 +878,10 @@ pub(crate) fn row_element(
                     // from a selected occurrence): the document's own
                     // selection state must stay visible, not be papered over
                     // by find's highlight (Issue #413).
-                    .when(segment.selected, |element| {
-                        element.bg(rgb(theme.selection_background))
+                    .when(segment.selected, |element| element.bg(rgb(theme.selection_background)))
+                    .when(!segment.selected && segment.find_current_match, |element| {
+                        element.bg(rgb(theme.find_current_match_background))
                     })
-                    .when(
-                        !segment.selected && segment.find_current_match,
-                        |element| element.bg(rgb(theme.find_current_match_background)),
-                    )
                     .when(
                         !segment.selected && !segment.find_current_match && segment.find_match,
                         |element| element.bg(rgb(theme.find_match_background)),
@@ -892,13 +889,9 @@ pub(crate) fn row_element(
                     .when(segment.marked || segment.display.underline, |element| {
                         element.underline()
                     })
-                    .when(segment.display.bold, |element| {
-                        element.font_weight(FontWeight::BOLD)
-                    })
+                    .when(segment.display.bold, |element| element.font_weight(FontWeight::BOLD))
                     .when(segment.display.italic, |element| element.italic())
-                    .when(segment.display.strikethrough, |element| {
-                        element.line_through()
-                    })
+                    .when(segment.display.strikethrough, |element| element.line_through())
                     .when(segment.display.monospace, |element| {
                         element.font_family("ui-monospace")
                     })
@@ -1106,10 +1099,9 @@ fn table_row_element(
                             .when(segment.selected, |element| {
                                 element.bg(rgb(theme.selection_background))
                             })
-                            .when(
-                                !segment.selected && segment.find_current_match,
-                                |element| element.bg(rgb(theme.find_current_match_background)),
-                            )
+                            .when(!segment.selected && segment.find_current_match, |element| {
+                                element.bg(rgb(theme.find_current_match_background))
+                            })
                             .when(
                                 !segment.selected
                                     && !segment.find_current_match
@@ -1119,16 +1111,12 @@ fn table_row_element(
                             .when(segment.marked || segment.display.underline, |element| {
                                 element.underline()
                             })
-                            .when(table.header, |element| {
-                                element.font_weight(FontWeight::SEMIBOLD)
-                            })
+                            .when(table.header, |element| element.font_weight(FontWeight::SEMIBOLD))
                             .when(segment.display.bold, |element| {
                                 element.font_weight(FontWeight::BOLD)
                             })
                             .when(segment.display.italic, |element| element.italic())
-                            .when(segment.display.strikethrough, |element| {
-                                element.line_through()
-                            })
+                            .when(segment.display.strikethrough, |element| element.line_through())
                             .when(segment.display.monospace, |element| {
                                 element.font_family("ui-monospace")
                             })

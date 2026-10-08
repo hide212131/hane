@@ -1436,15 +1436,14 @@ impl EditorView {
         // point that still observes the find input's marked range as it was
         // just before this Escape.
         let escape_interceptor_view = cx.entity().downgrade();
-        let document_find_escape_interceptor =
-            cx.intercept_keystrokes(move |event, window, app| {
-                if event.keystroke.key != "escape" {
-                    return;
-                }
-                let _ = escape_interceptor_view.update(app, |view, cx| {
-                    view.note_document_find_escape_keystroke(window, cx);
-                });
+        let document_find_escape_interceptor = cx.intercept_keystrokes(move |event, window, app| {
+            if event.keystroke.key != "escape" {
+                return;
+            }
+            let _ = escape_interceptor_view.update(app, |view, cx| {
+                view.note_document_find_escape_keystroke(window, cx);
             });
+        });
         // The pinned find-input widget's `InputState::enter` emits
         // `InputEvent::PressEnter` for every Enter — including one that only
         // confirms an in-progress IME composition — without checking its own
@@ -1454,15 +1453,14 @@ impl EditorView {
         // just before this Enter, the same reasoning as the Escape
         // interceptor above (see `note_document_find_enter_keystroke`).
         let enter_interceptor_view = cx.entity().downgrade();
-        let document_find_enter_interceptor =
-            cx.intercept_keystrokes(move |event, window, app| {
-                if event.keystroke.key != "enter" {
-                    return;
-                }
-                let _ = enter_interceptor_view.update(app, |view, cx| {
-                    view.note_document_find_enter_keystroke(window, cx);
-                });
+        let document_find_enter_interceptor = cx.intercept_keystrokes(move |event, window, app| {
+            if event.keystroke.key != "enter" {
+                return;
+            }
+            let _ = enter_interceptor_view.update(app, |view, cx| {
+                view.note_document_find_enter_keystroke(window, cx);
             });
+        });
         // Re-observes the local date on a timer so the sidebar's `本日`
         // badge moves on even when the window sits open, focused, and
         // untouched across local midnight; `view.update` failing (the view
