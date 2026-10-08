@@ -5,12 +5,18 @@
 //! with the buffer's own revision while the bar is open — including across
 //! an edit, Undo/Redo, or switching to a different open document — without
 //! rescanning on a selection-only change or on every render frame.
-//! Highlighting the matches in the document body, and moving the caret or
-//! scrolling to the current one, are later stages (see Issue #413); this bar
-//! still never touches the active document's text, selection, revision,
-//! dirty flag, undo history, or IME composition at any point — opening,
-//! typing a query, scanning, or moving the current match all leave them
-//! alone. Reuses `hane_editor::find`'s
+//! Highlighting the matches in the document body (see
+//! `document_find_matches_in_view`/`document_find_current_match`) and
+//! scrolling to the current one (see `reveal_current_find_match`) on every
+//! rescan or explicit Next/Previous are both implemented (Issue #413). This
+//! bar never touches the active document's text, revision, dirty flag, undo
+//! history, or IME composition at any point — opening, typing a query,
+//! scanning, or moving the current match all leave them alone; the one
+//! exception is the body's selection, which closing the bar (Escape or the
+//! close button) replaces with the current match's own range, but only when
+//! that match is still `Ready` for the active session/generation/revision
+//! (see `leave_document_find`) — otherwise the selection from before closing
+//! is left exactly as it was. Reuses `hane_editor::find`'s
 //! `FindQuery`/`FindOptions`/`scan`/`FindNavigation` rather than a second
 //! search engine or the Work-folder `content_search`'s disk-backed one.
 //!
@@ -138,6 +144,16 @@ pub(super) struct DocumentFindState {
     /// Next/Previous wrapped around the match list's end. Cleared by the
     /// next applied scan or by cancelling in-flight find work.
     wrap_notice: Option<&'static str>,
+    /// Whether this input still had an active IME marked range immediately
+    /// before the most recently dispatched Escape keystroke, snapshotted by
+    /// `note_document_find_escape_keystroke`. The pinned find-input widget
+    /// unmarks its own composition on Escape and lets the key keep bubbling,
+    /// so by the time `document_find_should_leave_on_escape` runs the
+    /// composition is already gone; this field is what still lets that one
+    /// Escape be treated as "cancel the composition only" instead of also
+    /// closing the bar. Re-snapshotted on every Escape, so a second, separate
+    /// Escape (not composing) closes the bar normally.
+    escape_was_composing: bool,
 }
 
 impl EditorView {
@@ -200,7 +216,34 @@ impl EditorView {
     }
 
     pub(crate) fn document_find_should_leave_on_escape(&self) -> bool {
-        self.document_find.open && self.document_find.input_focused
+        self.document_find.open
+            && self.document_find.input_focused
+            && !self.document_find.escape_was_composing
+    }
+
+    /// Snapshots whether the find input currently has an active IME marked
+    /// range, for every Escape keystroke while the bar is open — called by an
+    /// app-level keystroke interceptor that runs before this (or any other)
+    /// binding for the keystroke is dispatched (see its registration in
+    /// `EditorView::new`), so it is the only point that still sees the
+    /// composition the pinned find-input widget's own Escape handling is
+    /// about to unmark. A no-op when the find input is not the one currently
+    /// focused, so an Escape elsewhere never touches this flag.
+    pub(super) fn note_document_find_escape_keystroke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.document_find.open || !self.document_find.input_focused {
+            return;
+        }
+        let Some(input) = self.document_find.input.clone() else {
+            return;
+        };
+        self.document_find.escape_was_composing = input.update(cx, |state, cx| {
+            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx)
+                .is_some()
+        });
     }
 
     /// The bar's current match, if it is open with a `Ready` result and an
@@ -264,7 +307,14 @@ impl EditorView {
         // Work-folder content search's own input/results, but Cmd/Ctrl+F
         // from content search must be able to hand focus over to this bar
         // (see `blur_content_search_focus` below), not be swallowed here.
-        if self.inline_rename_active() || self.sidebar_filter_focused {
+        // While the document body has an active IME composition, opening the
+        // bar is a no-op instead: it would otherwise seed the query from (or
+        // move focus away from) a selection the composition is still in the
+        // middle of resolving.
+        if self.inline_rename_active()
+            || self.sidebar_filter_focused
+            || self.editor().ime().is_some()
+        {
             return;
         }
         self.initialize_document_find_input(window, cx);
@@ -308,10 +358,15 @@ impl EditorView {
         self.restart_document_find(cx, false, true);
     }
 
-    /// Hides the bar and returns GPUI focus to the document body. Returns
-    /// `false` without changing anything when the bar was not open, so
-    /// callers (see the `CancelComposition`/Escape handler) can fall through
-    /// to other Escape behavior.
+    /// Hides the bar and returns GPUI focus to the document body. If the
+    /// bar's current match is still `Ready` and belongs to the active
+    /// session/generation/revision, selects that match's original
+    /// `SourceRange` in the body; otherwise leaves the selection exactly as
+    /// it was before closing (an empty/zero-result/invalid/pending/stale
+    /// current match never moves the caret). Returns `false` without
+    /// changing anything when the bar was not open, so callers (see the
+    /// `CancelComposition`/Escape handler) can fall through to other Escape
+    /// behavior.
     pub(crate) fn leave_document_find(
         &mut self,
         window: &mut Window,
@@ -319,6 +374,14 @@ impl EditorView {
     ) -> bool {
         if !self.document_find.open {
             return false;
+        }
+        if self.document_find.synced_target == Some(self.document_find_target())
+            && let Some(range) = self.document_find_current_match()
+        {
+            let _ = self.editor_mut().set_selection(Selection {
+                anchor: range.start,
+                active: range.end,
+            });
         }
         self.document_find.open = false;
         self.document_find.input_focused = false;
@@ -380,6 +443,11 @@ impl EditorView {
     fn step_document_find(&mut self, forward: bool, cx: &mut Context<Self>) {
         if !self.document_find.open
             || !matches!(self.document_find.result, DocumentFindResult::Ready)
+            // While the document body has an active IME composition, moving
+            // the current match is a no-op: it must never scroll the
+            // viewport or touch `pending_find_visibility_after_layout` out
+            // from under the composition in progress.
+            || self.editor().ime().is_some()
         {
             return;
         }
@@ -708,7 +776,7 @@ impl EditorView {
             .items_center()
             .truncate()
             .child(self.document_find_status_text());
-        let previous = div()
+        let previous_button = div()
             .id("document-find-previous")
             .debug_selector(|| "document-find-previous".to_owned())
             .h(px(DOCUMENT_FIND_BAR_HEIGHT))
@@ -722,7 +790,12 @@ impl EditorView {
             .bg(rgb(self.theme.code_background))
             .child("‹")
             .on_click(cx.listener(|view, _, _, cx| view.document_find_previous(cx)));
-        let next = div()
+        let previous = HoverCard::new("document-find-previous-tooltip")
+            .anchor(Anchor::TopCenter)
+            .trigger(previous_button)
+            .content(|_, _, _| div().px_2().py_1().child("前の一致 (Shift+F3)"))
+            .into_any_element();
+        let next_button = div()
             .id("document-find-next")
             .debug_selector(|| "document-find-next".to_owned())
             .h(px(DOCUMENT_FIND_BAR_HEIGHT))
@@ -736,7 +809,12 @@ impl EditorView {
             .bg(rgb(self.theme.code_background))
             .child("›")
             .on_click(cx.listener(|view, _, _, cx| view.document_find_next(cx)));
-        let case_toggle = div()
+        let next = HoverCard::new("document-find-next-tooltip")
+            .anchor(Anchor::TopCenter)
+            .trigger(next_button)
+            .content(|_, _, _| div().px_2().py_1().child("次の一致 (F3)"))
+            .into_any_element();
+        let case_toggle_button = div()
             .id("document-find-case")
             .debug_selector(|| "document-find-case".to_owned())
             .h(px(DOCUMENT_FIND_BAR_HEIGHT))
@@ -754,7 +832,12 @@ impl EditorView {
                 "Aa"
             })
             .on_click(cx.listener(|view, _, _, cx| view.toggle_document_find_case(cx)));
-        let close = div()
+        let case_toggle = HoverCard::new("document-find-case-tooltip")
+            .anchor(Anchor::TopCenter)
+            .trigger(case_toggle_button)
+            .content(|_, _, _| div().px_2().py_1().child("大文字と小文字を区別"))
+            .into_any_element();
+        let close_button = div()
             .id("document-find-close")
             .h(px(DOCUMENT_FIND_BAR_HEIGHT))
             .px(px(6.0))
@@ -769,6 +852,11 @@ impl EditorView {
             .on_click(cx.listener(|view, _, window, cx| {
                 view.leave_document_find(window, cx);
             }));
+        let close = HoverCard::new("document-find-close-tooltip")
+            .anchor(Anchor::TopCenter)
+            .trigger(close_button)
+            .content(|_, _, _| div().px_2().py_1().child("検索を閉じる (Esc)"))
+            .into_any_element();
         Some(
             // A fixed-height flex sibling directly under the tab bar, inside
             // the body area, rather than an absolute overlay: it pushes the
@@ -1849,6 +1937,208 @@ mod tests {
             // document's own text or selection.
             assert_eq!(view.editor().document().full_text(), text);
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+        });
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_bar_and_selects_the_current_matchs_range_when_ready(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "needle and thread\n";
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "thread".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        let thread_start = text.find("thread").expect("thread present");
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
+            assert!(!view.document_find_input_is_focused());
+            // Closing with a `Ready` current match selects that match's own
+            // range in the body, instead of leaving the caret at its old
+            // position from before the bar opened.
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor: SourceOffset(thread_start),
+                    active: SourceOffset(thread_start + "thread".len()),
+                }
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn escape_preserves_the_prior_selection_when_there_is_no_ready_current_match(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("aa bb cc\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(3)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                // A multi-line query is `Invalid`, never `Ready`, so there is
+                // no current match for Escape to select.
+                view.document_find.query_text = "a\nb".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!matches!(view.document_find.result, DocumentFindResult::Ready));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(3)));
+        });
+    }
+
+    #[gpui::test]
+    fn body_ime_composition_blocks_opening_the_find_bar(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "か", None)
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
+            // The in-progress composition must be left exactly as it was.
+            assert!(view.editor().ime().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn body_ime_composition_blocks_find_navigation(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "か", None)
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| view.document_find_next(cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            // Still composing in the body: moving the current match is a
+            // no-op rather than scrolling the viewport or advancing `current`
+            // out from under the composition in progress.
+            assert_eq!(view.document_find.current, Some(0));
+            assert!(view.editor().ime().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn escape_during_find_input_composition_only_cancels_the_composition(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.document_find_input_is_focused()));
+
+        let input = view
+            .read_with(cx, |view, _| view.document_find.input.clone())
+            .expect("find input is initialized by open_document_find");
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "か", None, window, cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        // A composition is active in the find input: this Escape must only
+        // cancel that composition, never also close the bar on the same
+        // keystroke.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.document_find.open);
+        });
+
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::unmark_text(state, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // With no composition left, a second, separate Escape closes the bar
+        // normally.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
         });
     }
 }
