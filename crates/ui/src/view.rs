@@ -1698,6 +1698,7 @@ impl EditorView {
                 } else if let Some(last_recovered) = last_recovered {
                     self.reveal_file_tab(last_recovered);
                     self.on_document_replaced();
+                    self.resync_document_find_for_active_document(cx);
                     self.schedule_document_parse(cx);
                 }
             }
@@ -2312,6 +2313,7 @@ impl EditorView {
         self.schedule_title_sync(cx);
         let edited_session = self.sessions.active_id();
         self.invalidate_content_search_session(edited_session, cx);
+        self.resync_document_find_after_edit(cx);
         cx.notify();
     }
 
@@ -2366,6 +2368,7 @@ impl EditorView {
         );
         self.content_search_workspace_changed(cx);
         self.on_document_replaced();
+        self.resync_document_find_for_active_document(cx);
         self.schedule_document_parse(cx);
         self.status = None;
         cx.notify();
@@ -2655,6 +2658,7 @@ impl EditorView {
         // same session id afterward.
         self.work_folder_generation = self.work_folder_generation.wrapping_add(1);
         self.on_document_replaced();
+        self.resync_document_find_for_active_document(cx);
         self.begin_work_folder_scan(root, cx);
     }
 
@@ -2806,6 +2810,7 @@ impl EditorView {
                         if is_latest_request {
                             self.reveal_file_tab(opened_id);
                             self.on_document_replaced();
+                            self.resync_document_find_for_active_document(cx);
                             self.status = Some("Opened".to_owned());
                             self.schedule_document_parse(cx);
                             match search_navigation_verification {

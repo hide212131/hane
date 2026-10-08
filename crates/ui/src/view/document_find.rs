@@ -1,13 +1,16 @@
 //! Document-find entry bar: open/close, focus isolation, and (as of this
 //! stage) running a literal search against the active session's own
-//! in-memory `RopeBuffer` to show an exact match count. Highlighting matches
-//! in the document body and previous/next navigation are later stages (see
-//! Issue #413); this bar still never touches the active document's text,
-//! selection, revision, dirty flag, undo history, or IME composition, and
-//! does not move the caret when a search starts, finishes, or the bar
-//! closes. Reuses `hane_editor::find`'s `FindQuery`/`FindOptions`/`scan`
-//! rather than a second search engine or the Work-folder `content_search`'s
-//! disk-backed one.
+//! in-memory `RopeBuffer` to show an exact match count, kept current with
+//! the buffer's own revision while the bar is open — including across an
+//! edit, Undo/Redo, or switching to a different open document — without
+//! rescanning on a selection-only change or on every render frame.
+//! Highlighting matches in the document body and previous/next navigation
+//! are later stages (see Issue #413); this bar still never touches the
+//! active document's text, selection, revision, dirty flag, undo history, or
+//! IME composition, and does not move the caret when a search starts,
+//! finishes, or the bar closes. Reuses `hane_editor::find`'s
+//! `FindQuery`/`FindOptions`/`scan` rather than a second search engine or the
+//! Work-folder `content_search`'s disk-backed one.
 //!
 //! Kept entirely separate from `content_search` (the Work-folder body search
 //! living in the sidebar, opened with Cmd/Ctrl+Shift+F): different shortcut
@@ -85,6 +88,13 @@ pub(super) struct DocumentFindState {
     /// that job's task returns, the latest query/options/document at that
     /// time (not whatever was current when this was set) is scanned next.
     restart_pending: bool,
+    /// The target `restart_document_find` last (re)computed `result` for.
+    /// Compared against the active document's current target after every
+    /// edit (see `resync_document_find_after_edit`) so an edit that actually
+    /// moved the revision triggers a fresh scan, while a selection-only
+    /// change — which also runs through the same `after_input` hook but
+    /// never bumps the revision — does not.
+    synced_target: Option<DocumentFindTarget>,
     result: DocumentFindResult,
 }
 
@@ -214,6 +224,23 @@ impl EditorView {
         self.restart_document_find(cx, false);
     }
 
+    /// Called after every edit to the active document (see `after_input`),
+    /// which also fires for selection-only changes (a mouse click or caret
+    /// move) that never move the revision. Only an edit that actually
+    /// advances `document_find_target()` past what `result` was last
+    /// computed for restarts the scan — and does so debounced, the same as
+    /// a keystroke in the query field, so a run of edits coalesces into one
+    /// rescan instead of one per edit. A no-op while the bar is closed.
+    pub(super) fn resync_document_find_after_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.document_find.open {
+            return;
+        }
+        if self.document_find.synced_target == Some(self.document_find_target()) {
+            return;
+        }
+        self.restart_document_find(cx, true);
+    }
+
     fn document_find_query_changed(&mut self, text: String, cx: &mut Context<Self>) {
         self.document_find.query_text = text;
         self.restart_document_find(cx, true);
@@ -246,6 +273,7 @@ impl EditorView {
     /// that is not a keystroke — opening the bar, toggling case, or a tab
     /// switch — since only typing needs coalescing).
     fn restart_document_find(&mut self, cx: &mut Context<Self>, debounce: bool) {
+        self.document_find.synced_target = Some(self.document_find_target());
         self.cancel_document_find_work();
         match FindQuery::parse(&self.document_find.query_text) {
             Ok(_) => {
@@ -1100,24 +1128,77 @@ mod tests {
         cx.run_until_parked();
 
         view.update(cx, |view, cx| {
+            // The auto-rescan under test only applies while the bar is
+            // open; opened directly here (rather than through
+            // `open_document_find`) to keep this test focused on the
+            // revision-tracking behavior itself.
+            view.document_find.open = true;
             view.document_find.query_text = "needle".to_owned();
             view.restart_document_find(cx, false);
             assert!(view.document_find.job_active);
             assert_eq!(view.document_find.result, DocumentFindResult::Pending);
 
-            // The document itself is edited while the scan's background
-            // task has not run yet, moving the revision the in-flight scan
-            // was started against out from under it. This stage does not
-            // auto-restart on document edits, so the find bar's own state
-            // stays `Pending` until the next explicit request; what matters
-            // here is that the now-stale job never overwrites it.
-            view.editor_mut().insert_text("x").unwrap();
+            // The document itself is edited (through the same view-level
+            // path as real typing, which routes through `after_input`)
+            // while the scan's background task has not run yet, moving the
+            // revision the in-flight scan was started against out from
+            // under it.
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.insert_text("needle ", cx);
         });
         cx.run_until_parked();
 
+        // The now-stale job is rejected rather than overwriting `result`
+        // with a count computed against the pre-edit text; the edit itself
+        // debounces a fresh scan the same way a keystroke in the query
+        // field would, so the bar is still `Pending` right after the edit.
         view.read_with(cx, |view, _| {
             assert!(!view.document_find.job_active);
             assert_eq!(view.document_find.result, DocumentFindResult::Pending);
+        });
+
+        // See `rapid_query_changes_coalesce_into_a_single_scan_for_the_final_text`
+        // for why both a real sleep and a virtual clock advance are needed
+        // to make the debounce fire.
+        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.executor()
+            .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+
+        // The bar rescans the current (post-edit) buffer on its own, with
+        // no further explicit request, and its count reflects the
+        // occurrence the edit introduced.
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.document_find.result,
+                DocumentFindResult::Ready {
+                    count: 2,
+                    truncated: false,
+                }
+            );
+        });
+
+        // Undo moves the revision again while the bar stays open; the
+        // count must track it back down, not keep showing the edited
+        // document's count.
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::Undo, cx);
+        });
+        std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.executor()
+            .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.document_find.result,
+                DocumentFindResult::Ready {
+                    count: 1,
+                    truncated: false,
+                }
+            );
         });
     }
 
