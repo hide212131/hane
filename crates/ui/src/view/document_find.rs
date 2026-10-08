@@ -948,7 +948,14 @@ mod tests {
         });
         cx.run_until_parked();
         view.read_with(cx, |view, app| {
-            let value = view.document_find.input.as_ref().unwrap().read(app).value().to_string();
+            let value = view
+                .document_find
+                .input
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .value()
+                .to_string();
             assert_eq!(value, "needle");
         });
 
@@ -971,7 +978,14 @@ mod tests {
         cx.run_until_parked();
 
         view.read_with(cx, |view, app| {
-            let value = view.document_find.input.as_ref().unwrap().read(app).value().to_string();
+            let value = view
+                .document_find
+                .input
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .value()
+                .to_string();
             assert_eq!(value, "needle");
         });
     }
@@ -1145,8 +1159,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(crate::actions::register_key_bindings);
-        let (view, cx) =
-            cx.add_window_view(|_, cx| EditorView::new("aa aa aa\n", "Untitled", cx));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("aa aa aa\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
         cx.run_until_parked();
 
@@ -1515,8 +1528,8 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(crate::actions::register_key_bindings);
-        let (view, cx) = cx
-            .add_window_view(|_, cx| EditorView::new("needle one needle two\n", "Untitled", cx));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle one needle two\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
         cx.run_until_parked();
 

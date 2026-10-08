@@ -121,10 +121,8 @@ pub fn scan(
         }
         let window_search_end =
             floor_char_boundary(buffer, (window_search_start + WINDOW_CORE_BYTES).min(total));
-        let fetch_end = floor_char_boundary(
-            buffer,
-            (window_search_end + WINDOW_SLACK_BYTES).min(total),
-        );
+        let fetch_end =
+            floor_char_boundary(buffer, (window_search_end + WINDOW_SLACK_BYTES).min(total));
         let text = buffer
             .text(SourceRange::new(window_search_start, fetch_end))
             .expect("window bounds are validated char boundaries within the buffer");
