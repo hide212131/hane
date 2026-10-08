@@ -93,7 +93,12 @@ impl EditorView {
     /// of reseeding it, matching the platform convention for re-pressing
     /// Cmd/Ctrl+F.
     pub(crate) fn open_document_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.inline_rename_active() || self.sidebar_filter_is_focused() {
+        // Only the filename filter (and inline rename) should block opening
+        // this bar. `sidebar_filter_is_focused()` also reports focus for the
+        // Work-folder content search's own input/results, but Cmd/Ctrl+F
+        // from content search must be able to hand focus over to this bar
+        // (see `blur_content_search_focus` below), not be swallowed here.
+        if self.inline_rename_active() || self.sidebar_filter_focused {
             return;
         }
         self.initialize_document_find_input(window, cx);
