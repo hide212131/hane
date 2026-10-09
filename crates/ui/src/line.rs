@@ -31,12 +31,26 @@ fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: boo
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
 
-/// Disclosure (caret, selection or IME range) that touches `range`, which may
-/// be a single physical line's range or a whole block's span. `is_final`
-/// mirrors [`line_owns_cursor`]'s own end-of-range tweak: true when `range`
-/// reaches the document's end, so a caret resting right after the last
-/// character is still owned by it rather than by nothing.
-fn range_disclosure(editor: &Editor, range: SourceRange, is_final: bool) -> Option<SourceRange> {
+/// Disclosure (caret, selection, IME range, or `forced`) that touches
+/// `range`, which may be a single physical line's range or a whole block's
+/// span. `is_final` mirrors [`line_owns_cursor`]'s own end-of-range tweak:
+/// true when `range` reaches the document's end, so a caret resting right
+/// after the last character is still owned by it rather than by nothing.
+///
+/// `forced` is the document-find bar's current match, when its `SourceRange`
+/// falls on Markdown markers that are otherwise hidden: forcing the block
+/// that owns it open the same way a caret or selection would, rather than
+/// adding a second disclosure mechanism, is what lets Next/Previous reveal a
+/// match hidden inside a construct like a link destination (Issue #413). It
+/// never wins over a real caret/selection/IME disclosure, and never applies
+/// to anything but the one forced range, so finding matches never discloses
+/// Markdown markers document-wide.
+fn range_disclosure(
+    editor: &Editor,
+    range: SourceRange,
+    is_final: bool,
+    forced: Option<SourceRange>,
+) -> Option<SourceRange> {
     let selection = editor.selection().range();
     let disclosure = if selection.is_empty() {
         line_owns_cursor(range, selection.start, is_final).then_some(selection)
@@ -48,6 +62,14 @@ fn range_disclosure(editor: &Editor, range: SourceRange, is_final: bool) -> Opti
     } else {
         None
     };
+    let disclosure = disclosure.or_else(|| {
+        forced
+            .filter(|forced| forced.intersects(range))
+            .map(|forced| SourceRange {
+                start: forced.start.max(range.start),
+                end: forced.end.min(range.end),
+            })
+    });
     editor
         .ime()
         .and_then(|ime| {
@@ -160,10 +182,14 @@ pub(crate) fn presented_block_with_projections(
         list_projection,
         fence_height_projection,
         None,
+        None,
         line_height,
     )
 }
 
+/// `forced_disclosure`, when given, is the document-find bar's current
+/// match: see [`range_disclosure`] for why this is threaded alongside the
+/// caret/selection/IME disclosures instead of as a second mechanism.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn presented_block_with_table_projection(
     editor: &Editor,
@@ -173,6 +199,7 @@ pub(crate) fn presented_block_with_table_projection(
     list_projection: Option<&ListProjection>,
     fence_height_projection: Option<&FenceHeightProjection>,
     table_projection: Option<&TableProjection>,
+    forced_disclosure: Option<SourceRange>,
     line_height: f32,
 ) -> Option<VisualBlock> {
     let document = editor.document();
@@ -185,6 +212,7 @@ pub(crate) fn presented_block_with_table_projection(
         &render,
         joined,
         fence_height_projection,
+        forced_disclosure,
     )?;
     let lines = block_lines(editor, &ctx);
     let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
@@ -216,22 +244,34 @@ pub(crate) fn presented_block_with_table_projection(
 /// Disclosure `presented_block` would currently assign to each line of
 /// `render` in this block, without presenting it.
 ///
-/// Cheap enough to call every frame the caret, selection or IME sits inside
-/// the block: it groups `render`'s lines the same way `present_block` itself
-/// does (see `hane_presentation::disclosure_runs`) and reads no more source
-/// than `presented_block` would for the same `render`/`joined` pair, so a
+/// Cheap enough to call every frame the caret, selection, IME, or the
+/// document-find bar's current match sits inside the block: it groups
+/// `render`'s lines the same way `present_block` itself does (see
+/// `hane_presentation::disclosure_runs`) and reads no more source than
+/// `presented_block` would for the same `render`/`joined` pair, so a
 /// cache-currentness check compares like for like instead of drifting from
 /// what a fresh presentation would produce for a run joined across physical
-/// lines.
+/// lines. `forced_disclosure` must be the exact same value the caller fed
+/// (or will feed) to `presented_block_with_table_projection` for this block,
+/// or this comparison drifts from what was actually cached.
 pub(crate) fn expected_block_disclosures(
     editor: &Editor,
     block: &IndexedBlock,
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
+    forced_disclosure: Option<SourceRange>,
 ) -> Option<Vec<(usize, Option<SourceRange>)>> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
-    let ctx = block_context(editor, block, &span, render, joined, None)?;
+    let ctx = block_context(
+        editor,
+        block,
+        &span,
+        render,
+        joined,
+        None,
+        forced_disclosure,
+    )?;
     let lines = block_lines(editor, &ctx);
     Some(expected_disclosures(
         block.kind,
@@ -261,6 +301,12 @@ struct BlockContext {
     ranges: Vec<SourceRange>,
     texts: Vec<String>,
     block_disclosure: Option<SourceRange>,
+    /// The document-find bar's current-match range, if any, forwarded to
+    /// each line's own [`disclosure_for_line`] call (Issue #413). Threaded
+    /// alongside `block_disclosure` rather than folded into it, because this
+    /// is also needed per-line, not just for the whole-block value fed to
+    /// the fence-height projection below.
+    forced_disclosure: Option<SourceRange>,
     /// A fenced code block's own true opening physical line, its range and
     /// text — read even when `context`/`render` do not reach it — so a
     /// closing-fence candidate anywhere in a large block can be validated
@@ -284,6 +330,7 @@ fn block_context(
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
     fence_height_projection: Option<&FenceHeightProjection>,
+    forced_disclosure: Option<SourceRange>,
 ) -> Option<BlockContext> {
     let document = editor.document();
     let joinable = block_is_joinable(block.kind);
@@ -321,6 +368,7 @@ fn block_context(
         editor,
         block.source_range,
         span.end == document.line_count(),
+        forced_disclosure,
     );
     let trailing_blank_lines = trailing_blank_lines(document, span);
     let fenced = block_line_context(block.kind) == LineContext::FencedCode;
@@ -391,6 +439,7 @@ fn block_context(
         ranges,
         texts,
         block_disclosure,
+        forced_disclosure,
         opening_fence_line,
         clipped_fence_lines,
         zero_height_fence_rows_before,
@@ -406,7 +455,7 @@ fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>>
             line: *line,
             range: *range,
             text,
-            disclosure: disclosure_for_line(editor, *line, *range),
+            disclosure: disclosure_for_line(editor, *line, *range, ctx.forced_disclosure),
         });
     }
     lines.extend(ctx.context.clone().zip(&ctx.ranges).zip(&ctx.texts).map(
@@ -414,7 +463,7 @@ fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>>
             line,
             range: *range,
             text,
-            disclosure: disclosure_for_line(editor, line, *range),
+            disclosure: disclosure_for_line(editor, line, *range, ctx.forced_disclosure),
         },
     ));
     lines.sort_by_key(|line| line.line);
@@ -428,20 +477,27 @@ fn clipped_fence_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockL
             line: *line,
             range: *range,
             text,
-            disclosure: disclosure_for_line(editor, *line, *range),
+            disclosure: disclosure_for_line(editor, *line, *range, ctx.forced_disclosure),
         })
         .collect()
 }
 
 /// Source range whose Markdown markers this line discloses: the caret's own
-/// position, the part of the selection that falls on the line, or the IME's
-/// marked range, which wins because composing text must stay visible.
+/// position, the part of the selection that falls on the line, the document
+/// find bar's forced current-match range, or the IME's marked range, which
+/// wins because composing text must stay visible.
 pub(crate) fn disclosure_for_line(
     editor: &Editor,
     line: usize,
     range: SourceRange,
+    forced: Option<SourceRange>,
 ) -> Option<SourceRange> {
-    range_disclosure(editor, range, line + 1 == editor.document().line_count())
+    range_disclosure(
+        editor,
+        range,
+        line + 1 == editor.document().line_count(),
+        forced,
+    )
 }
 
 /// Row height and body font size at 100% zoom, used by tests and by callers
@@ -574,6 +630,36 @@ fn quote_bar(
     )
 }
 
+/// This row's share of `find_matches` (already filtered to intersect the
+/// viewport by the caller — see `hane_editor::matches_in_range` — so this
+/// only ever walks a handful of candidates, never the whole document's match
+/// list) in visual coordinates, plus whichever one is `find_current_match`,
+/// if either is on this row at all. Matches that fall entirely on hidden
+/// Markdown markup (e.g. a literal search for `**`) have no visual range on
+/// any row and are silently dropped here, same as selection/IME; only the
+/// current match forces its own row's block disclosure open to try to avoid
+/// this (see `range_disclosure`).
+fn row_find_match_visuals(
+    block: &VisualBlock,
+    layout: &BlockLayout,
+    row_index: usize,
+    find_matches: &[SourceRange],
+    find_current_match: Option<SourceRange>,
+) -> (Vec<Range<usize>>, Option<Range<usize>>) {
+    let mut visuals = Vec::new();
+    let mut current_visual = None;
+    for m in find_matches {
+        let Some(visual_range) = layout.visual_range_on_row(block, row_index, *m) else {
+            continue;
+        };
+        if find_current_match == Some(*m) {
+            current_visual = Some(visual_range.clone());
+        }
+        visuals.push(visual_range);
+    }
+    (visuals, current_visual)
+}
+
 /// One row of a block: the text that fits on it, with the caret, selection and
 /// IME underline that fall inside it.
 ///
@@ -591,6 +677,8 @@ pub(crate) fn row_element(
     zoom: f32,
     resolver: &ResourceResolver,
     caret_input_mode: Option<KeyboardInputMode>,
+    find_matches: &[SourceRange],
+    find_current_match: Option<SourceRange>,
 ) -> Div {
     let row = &layout.lines[row_index];
     let line = &block.lines[row.line];
@@ -701,6 +789,8 @@ pub(crate) fn row_element(
             theme,
             zoom,
             caret_input_mode,
+            find_matches,
+            find_current_match,
         );
     }
 
@@ -752,6 +842,8 @@ pub(crate) fn row_element(
             theme,
             zoom,
             caret_input_mode,
+            find_matches,
+            find_current_match,
         );
     }
 
@@ -770,11 +862,17 @@ pub(crate) fn row_element(
     let marked_visual = editor
         .ime()
         .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
+    let (match_visuals, current_match_visual) =
+        row_find_match_visuals(block, layout, row_index, find_matches, find_current_match);
     let segments = line_segments(
         row.line_visual_range.clone(),
         visual_cursor.map(|offset| offset.0),
         selected_visual,
         marked_visual,
+        FindHighlight {
+            matches: &match_visuals,
+            current: current_match_visual,
+        },
         &line.style_runs,
         row.body_visual_start,
     );
@@ -790,9 +888,21 @@ pub(crate) fn row_element(
         if !segment.visual_range.is_empty() {
             elements.push(
                 div()
+                    // Selection wins outright over a match highlight when
+                    // both cover the same stretch (e.g. the query was seeded
+                    // from a selected occurrence): the document's own
+                    // selection state must stay visible, not be papered over
+                    // by find's highlight (Issue #413).
                     .when(segment.selected, |element| {
                         element.bg(rgb(theme.selection_background))
                     })
+                    .when(!segment.selected && segment.find_current_match, |element| {
+                        element.bg(rgb(theme.find_current_match_background))
+                    })
+                    .when(
+                        !segment.selected && !segment.find_current_match && segment.find_match,
+                        |element| element.bg(rgb(theme.find_match_background)),
+                    )
                     .when(segment.marked || segment.display.underline, |element| {
                         element.underline()
                     })
@@ -865,12 +975,16 @@ fn table_row_element(
     theme: Theme,
     zoom: f32,
     caret_input_mode: Option<KeyboardInputMode>,
+    find_matches: &[SourceRange],
+    find_current_match: Option<SourceRange>,
 ) -> Div {
     let selection = editor.selection().range();
     let selected_visual = layout.visual_range_on_row(block, row_index, selection);
     let marked_visual = editor
         .ime()
         .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
+    let (match_visuals, current_match_visual) =
+        row_find_match_visuals(block, layout, row_index, find_matches, find_current_match);
     let cursor_geometry = layout
         .point_for_source(block, editor.selection().active, shaper)
         .filter(|point| point.row == row_index)
@@ -927,6 +1041,9 @@ fn table_row_element(
         let cell_range = cell_layout.visual_range.clone();
         let cell_selected = clip_visual_range(selected_visual.as_ref(), cell_range.clone());
         let cell_marked = clip_visual_range(marked_visual.as_ref(), cell_range.clone());
+        let cell_matches = clip_visual_ranges(&match_visuals, cell_range.clone());
+        let cell_current_match =
+            clip_visual_range(current_match_visual.as_ref(), cell_range.clone());
         let cell_elements = cell_layout
             .fragments
             .iter()
@@ -937,7 +1054,13 @@ fn table_row_element(
                     clip_visual_range(cell_selected.as_ref(), fragment_range.clone());
                 let fragment_marked =
                     clip_visual_range(cell_marked.as_ref(), fragment_range.clone());
-                if fragment_selected.is_none() && fragment_marked.is_none() {
+                let fragment_matches = clip_visual_ranges(&cell_matches, fragment_range.clone());
+                let fragment_current_match =
+                    clip_visual_range(cell_current_match.as_ref(), fragment_range.clone());
+                if fragment_selected.is_none()
+                    && fragment_marked.is_none()
+                    && fragment_matches.is_empty()
+                {
                     let text = line.visual_text[fragment_range].to_owned();
                     let text_element = div()
                         .absolute()
@@ -970,6 +1093,10 @@ fn table_row_element(
                         None,
                         fragment_selected,
                         fragment_marked,
+                        FindHighlight {
+                            matches: &fragment_matches,
+                            current: fragment_current_match,
+                        },
                         &line.style_runs,
                         None,
                     )
@@ -993,6 +1120,15 @@ fn table_row_element(
                             .when(segment.selected, |element| {
                                 element.bg(rgb(theme.selection_background))
                             })
+                            .when(!segment.selected && segment.find_current_match, |element| {
+                                element.bg(rgb(theme.find_current_match_background))
+                            })
+                            .when(
+                                !segment.selected
+                                    && !segment.find_current_match
+                                    && segment.find_match,
+                                |element| element.bg(rgb(theme.find_match_background)),
+                            )
                             .when(segment.marked || segment.display.underline, |element| {
                                 element.underline()
                             })
@@ -1086,6 +1222,10 @@ struct LineSegment {
     selected: bool,
     marked: bool,
     cursor_before: bool,
+    /// Inside a document-find match other than the current one.
+    find_match: bool,
+    /// Inside the document-find bar's current match. Implies `find_match`.
+    find_current_match: bool,
     /// Inline render policy for this stretch, supplied by presentation.
     display: InlineDisplay,
 }
@@ -1096,10 +1236,12 @@ struct LineSegment {
 /// as part of the glyph run, above the box's own `StyleRefinement::background`
 /// (set by `bg`) regardless of which method was chained first or last on the
 /// element — the two live in unrelated fields painted by unrelated passes. A
-/// segment inside a selected code span sets both, so leaving this unguarded
-/// hides the selection highlight entirely underneath the code background.
+/// segment inside a selected code span, or a document-find match, sets both,
+/// so leaving this unguarded would hide the selection or match highlight
+/// entirely underneath the code background (Issue #413 extends the Issue
+/// #117 fix this guarded originally to matches).
 fn segment_shows_code_background(segment: &LineSegment) -> bool {
-    segment.display.code_background && !segment.selected
+    segment.display.code_background && !segment.selected && !segment.find_match
 }
 
 /// Combined inline policy for every style run that fully covers `range`.
@@ -1122,11 +1264,30 @@ fn clip_visual_range(source: Option<&Range<usize>>, bounds: Range<usize>) -> Opt
     (!clipped.is_empty()).then_some(clipped)
 }
 
+/// [`clip_visual_range`] applied to every one of a table cell/fragment's
+/// share of the row's document-find matches.
+fn clip_visual_ranges(sources: &[Range<usize>], bounds: Range<usize>) -> Vec<Range<usize>> {
+    sources
+        .iter()
+        .filter_map(|source| clip_visual_range(Some(source), bounds.clone()))
+        .collect()
+}
+
+/// A row's (or a table fragment's) share of the document-find highlight:
+/// `matches` are the match visual ranges (already clipped to the row, and in
+/// source order; see `BlockLayout::visual_range_on_row`), and `current` is
+/// whichever one of them is the bar's current match, if any is on this row.
+struct FindHighlight<'a> {
+    matches: &'a [Range<usize>],
+    current: Option<Range<usize>>,
+}
+
 fn line_segments(
     bounds: Range<usize>,
     cursor: Option<usize>,
     selected: Option<Range<usize>>,
     marked: Option<Range<usize>>,
+    find: FindHighlight<'_>,
     style_runs: &[hane_presentation::StyleRun],
     body_visual_start: Option<usize>,
 ) -> Vec<LineSegment> {
@@ -1134,6 +1295,10 @@ fn line_segments(
     boundaries.extend(cursor);
     boundaries.extend(body_visual_start);
     for range in [selected.as_ref(), marked.as_ref()].into_iter().flatten() {
+        boundaries.push(range.start);
+        boundaries.push(range.end);
+    }
+    for range in find.matches {
         boundaries.push(range.start);
         boundaries.push(range.end);
     }
@@ -1151,6 +1316,14 @@ fn line_segments(
                 .as_ref()
                 .is_some_and(|marked| range.start >= marked.start && range.end <= marked.end),
             cursor_before: cursor == Some(range.start),
+            find_match: find
+                .matches
+                .iter()
+                .any(|m| range.start >= m.start && range.end <= m.end),
+            find_current_match: find
+                .current
+                .as_ref()
+                .is_some_and(|m| range.start >= m.start && range.end <= m.end),
             display: inline_display_for(&range, style_runs),
             visual_range: range.clone(),
         })
@@ -1237,12 +1410,20 @@ mod tests {
     use hane_markdown::BlockIndex;
     use hane_presentation::Visibility;
 
+    // A single-Range fixture built via `collect`, not a `Vec`-like sequence
+    // literal (clippy::single_range_in_vec_init).
+    fn single_find_match(range: Range<usize>) -> Vec<Range<usize>> {
+        std::iter::once(range).collect()
+    }
+
     fn code_segment(selected: bool) -> LineSegment {
         LineSegment {
             visual_range: 0..1,
             selected,
             marked: false,
             cursor_before: false,
+            find_match: false,
+            find_current_match: false,
             display: InlineDisplay {
                 code_background: true,
                 ..InlineDisplay::default()
@@ -1284,12 +1465,55 @@ mod tests {
             visual_range: hane_presentation::VisualRange::new(3, 9),
             kind: hane_presentation::StyleKind::InlineCode,
         }];
-        let segments = line_segments(0..9, None, Some(0..6), None, &style_runs, None);
+        let segments = line_segments(
+            0..9,
+            None,
+            Some(0..6),
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &style_runs,
+            None,
+        );
         let overlap = segments
             .iter()
             .find(|segment| segment.visual_range == (3..6))
             .expect("the selected half of the code run is its own segment");
         assert!(overlap.selected);
+        assert!(overlap.display.code_background);
+        assert!(!segment_shows_code_background(overlap));
+    }
+
+    #[test]
+    fn a_find_match_inside_a_code_span_shows_the_match_not_the_code_background() {
+        // Issue #413 extends the Issue #117 guard above to document-find
+        // matches: a match highlight is a `bg`, the code background is a
+        // `text_bg`, and GPUI paints the latter above the former, so without
+        // this guard a match inside a code span would be invisible.
+        let style_runs = [hane_presentation::StyleRun {
+            visual_range: hane_presentation::VisualRange::new(3, 9),
+            kind: hane_presentation::StyleKind::InlineCode,
+        }];
+        let find_matches = single_find_match(3..6);
+        let segments = line_segments(
+            0..9,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &find_matches,
+                current: None,
+            },
+            &style_runs,
+            None,
+        );
+        let overlap = segments
+            .iter()
+            .find(|segment| segment.visual_range == (3..6))
+            .expect("the matched half of the code run is its own segment");
+        assert!(overlap.find_match);
         assert!(overlap.display.code_background);
         assert!(!segment_shows_code_background(overlap));
     }
@@ -1540,7 +1764,18 @@ mod tests {
         // Selection and IME ranges that reach past the row are clipped to it, so
         // a construct spanning a soft wrap is painted on both rows and neither
         // row draws outside its own text.
-        let segments = line_segments(6..12, Some(3), Some(0..9), None, &[], None);
+        let segments = line_segments(
+            6..12,
+            Some(3),
+            Some(0..9),
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            None,
+        );
         assert_eq!(
             segments.first().map(|segment| segment.visual_range.start),
             Some(6)
@@ -1559,38 +1794,139 @@ mod tests {
     #[test]
     fn selection_and_ime_boundaries_split_only_the_affected_text() {
         assert_eq!(
-            line_segments(0..12, Some(3), Some(3..9), Some(6..12), &[], None),
+            line_segments(
+                0..12,
+                Some(3),
+                Some(3..9),
+                Some(6..12),
+                FindHighlight {
+                    matches: &[],
+                    current: None,
+                },
+                &[],
+                None,
+            ),
             vec![
                 LineSegment {
                     visual_range: 0..3,
                     selected: false,
                     marked: false,
                     cursor_before: false,
-                    display: InlineDisplay::default()
+                    find_match: false,
+                    find_current_match: false,
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 3..6,
                     selected: true,
                     marked: false,
                     cursor_before: true,
-                    display: InlineDisplay::default()
+                    find_match: false,
+                    find_current_match: false,
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 6..9,
                     selected: true,
                     marked: true,
                     cursor_before: false,
-                    display: InlineDisplay::default()
+                    find_match: false,
+                    find_current_match: false,
+                    display: InlineDisplay::default(),
                 },
                 LineSegment {
                     visual_range: 9..12,
                     selected: false,
                     marked: true,
                     cursor_before: false,
-                    display: InlineDisplay::default()
+                    find_match: false,
+                    find_current_match: false,
+                    display: InlineDisplay::default(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn find_match_boundaries_split_the_affected_text_and_mark_the_current_one() {
+        let find_matches = vec![3..6, 6..9];
+        let segments = line_segments(
+            0..12,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &find_matches,
+                current: Some(6..9),
+            },
+            &[],
+            None,
+        );
+        assert_eq!(
+            segments,
+            vec![
+                LineSegment {
+                    visual_range: 0..3,
+                    selected: false,
+                    marked: false,
+                    cursor_before: false,
+                    find_match: false,
+                    find_current_match: false,
+                    display: InlineDisplay::default(),
+                },
+                LineSegment {
+                    visual_range: 3..6,
+                    selected: false,
+                    marked: false,
+                    cursor_before: false,
+                    find_match: true,
+                    find_current_match: false,
+                    display: InlineDisplay::default(),
+                },
+                LineSegment {
+                    visual_range: 6..9,
+                    selected: false,
+                    marked: false,
+                    cursor_before: false,
+                    find_match: true,
+                    find_current_match: true,
+                    display: InlineDisplay::default(),
+                },
+                LineSegment {
+                    visual_range: 9..12,
+                    selected: false,
+                    marked: false,
+                    cursor_before: false,
+                    find_match: false,
+                    find_current_match: false,
+                    display: InlineDisplay::default(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_selected_find_match_still_shows_selected_rather_than_only_the_match_flag() {
+        // Both flags are set on the overlap; the renderer (not this function)
+        // decides selection wins the paint so the body's own selection state
+        // is never hidden underneath a match highlight (Issue #413).
+        let find_matches = single_find_match(0..6);
+        let segments = line_segments(
+            0..6,
+            None,
+            Some(0..6),
+            None,
+            FindHighlight {
+                matches: &find_matches,
+                current: Some(0..6),
+            },
+            &[],
+            None,
+        );
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].selected);
+        assert!(segments[0].find_match);
+        assert!(segments[0].find_current_match);
     }
 
     #[test]
@@ -1604,6 +1940,10 @@ mod tests {
             None,
             Some(5..9),
             Some(7..11),
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
             &[],
             row.body_visual_start,
         );
@@ -1623,7 +1963,18 @@ mod tests {
         row.body_visual_start = Some(4);
         row.marker_body_gap = 8.0;
         row.body_gap = 8.0;
-        let segments = line_segments(0..4, None, None, None, &[], row.body_visual_start);
+        let segments = line_segments(
+            0..4,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            row.body_visual_start,
+        );
 
         assert_eq!(
             segments
@@ -1637,7 +1988,18 @@ mod tests {
 
     #[test]
     fn list_body_boundary_splits_paint_segments_without_adding_text() {
-        let segments = line_segments(0..8, None, None, None, &[], Some(3));
+        let segments = line_segments(
+            0..8,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            Some(3),
+        );
         assert_eq!(
             segments
                 .iter()

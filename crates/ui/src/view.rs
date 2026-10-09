@@ -91,6 +91,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod ai_settings;
 mod background_parse;
 mod content_search;
+mod document_find;
 mod inline_rename;
 mod session_save;
 mod sidebar;
@@ -758,6 +759,10 @@ pub struct EditorView {
     /// Search UI state is kept with the view so rapid input edits share one
     /// bounded controller and one long-lived input entity.
     content_search: content_search::ContentSearchState,
+    /// The per-document find bar's own open/focus state, entirely separate
+    /// from `content_search` (the Work-folder body search in the sidebar):
+    /// different shortcut, different field, different focus flag.
+    document_find: document_find::DocumentFindState,
     /// Where a not-yet-named work-folder note's content is journalled, so a
     /// crash before it earns a real filename never loses it. Removed once the
     /// session it belongs to gets a real path or closes.
@@ -888,6 +893,14 @@ pub struct EditorView {
     /// Refreshes the input mode when the editor receives focus, covering a
     /// pre-existing IME state before any mode-change notification arrives.
     _input_mode_focus_subscription: Option<Subscription>,
+    /// Keeps the document-find Escape/composition interceptor (see
+    /// `note_document_find_escape_keystroke`) alive for the life of the view;
+    /// dropping it would cancel the hook.
+    _document_find_escape_interceptor: Subscription,
+    /// Keeps the document-find Enter/composition interceptor (see
+    /// `note_document_find_enter_keystroke`) alive for the life of the view;
+    /// dropping it would cancel the hook.
+    _document_find_enter_interceptor: Subscription,
     /// A draft-recovery failure from the last work-folder scan, if any. Kept
     /// apart from `status`: opening the work folder's first note runs right
     /// after the scan and drives `status` through "Opening…" and "Opened" in
@@ -986,6 +999,12 @@ pub struct EditorView {
     /// changes a row height (for example, an inactive zero-height code fence
     /// becoming editable).
     pending_caret_visibility_after_layout: bool,
+    /// Set after document-find navigation moves the current match. Mirrors
+    /// `pending_caret_visibility_after_layout`: forcing a hidden match's
+    /// block open can change its row height only on the next render, so this
+    /// stays armed until a post-layout pass observes stable geometry for the
+    /// current match (Issue #413).
+    pending_find_visibility_after_layout: bool,
     /// Markdown block boundaries for the current revision. Updated incrementally
     /// on the input path and republished by the background parse; the publish
     /// priority between the two lives in `BlockIndexState`.
@@ -1407,6 +1426,42 @@ impl EditorView {
                 cx.notify();
             });
         });
+        // The pinned find-input widget unmarks its own active IME composition
+        // on Escape and then still lets the keystroke bubble out to this
+        // view's own `CancelComposition` handler (see
+        // `note_document_find_escape_keystroke`), so by the time that handler
+        // runs, the composition it needs to distinguish is already gone. An
+        // interceptor runs before any binding for the keystroke is dispatched
+        // (unlike a normal action or key-down listener), so it is the only
+        // point that still observes the find input's marked range as it was
+        // just before this Escape.
+        let escape_interceptor_view = cx.entity().downgrade();
+        let document_find_escape_interceptor =
+            cx.intercept_keystrokes(move |event, window, app| {
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                let _ = escape_interceptor_view.update(app, |view, cx| {
+                    view.note_document_find_escape_keystroke(window, cx);
+                });
+            });
+        // The pinned find-input widget's `InputState::enter` emits
+        // `InputEvent::PressEnter` for every Enter — including one that only
+        // confirms an in-progress IME composition — without checking its own
+        // marked range first. This interceptor runs before that (or any
+        // other) binding for the keystroke is dispatched, so it is the only
+        // point that still observes the find input's marked range as it was
+        // just before this Enter, the same reasoning as the Escape
+        // interceptor above (see `note_document_find_enter_keystroke`).
+        let enter_interceptor_view = cx.entity().downgrade();
+        let document_find_enter_interceptor = cx.intercept_keystrokes(move |event, window, app| {
+            if event.keystroke.key != "enter" {
+                return;
+            }
+            let _ = enter_interceptor_view.update(app, |view, cx| {
+                view.note_document_find_enter_keystroke(window, cx);
+            });
+        });
         // Re-observes the local date on a timer so the sidebar's `本日`
         // badge moves on even when the window sits open, focused, and
         // untouched across local midnight; `view.update` failing (the view
@@ -1440,6 +1495,7 @@ impl EditorView {
             recent,
             work_folder: None,
             content_search: content_search::ContentSearchState::default(),
+            document_find: document_find::DocumentFindState::default(),
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
@@ -1477,6 +1533,8 @@ impl EditorView {
             caret_input_mode: active_keyboard_input_mode(),
             _input_mode_subscription: input_mode_subscription,
             _input_mode_focus_subscription: None,
+            _document_find_escape_interceptor: document_find_escape_interceptor,
+            _document_find_enter_interceptor: document_find_enter_interceptor,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),
@@ -1508,6 +1566,7 @@ impl EditorView {
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
+            pending_find_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
@@ -1692,6 +1751,7 @@ impl EditorView {
                 } else if let Some(last_recovered) = last_recovered {
                     self.reveal_file_tab(last_recovered);
                     self.on_document_replaced();
+                    self.resync_document_find_for_active_document(cx);
                     self.schedule_document_parse(cx);
                 }
             }
@@ -1750,6 +1810,7 @@ impl EditorView {
         }
         self.reveal_file_tab(id);
         self.on_document_replaced();
+        self.resync_document_find_for_active_document(cx);
         self.schedule_document_parse(cx);
         cx.notify();
         true
@@ -2050,6 +2111,7 @@ impl EditorView {
         }
         if was_active {
             self.on_document_replaced();
+            self.resync_document_find_for_active_document(cx);
             self.schedule_document_parse(cx);
         }
         self.reveal_file_tab(self.sessions.active_id());
@@ -2304,6 +2366,7 @@ impl EditorView {
         self.schedule_title_sync(cx);
         let edited_session = self.sessions.active_id();
         self.invalidate_content_search_session(edited_session, cx);
+        self.resync_document_find_after_edit(cx);
         cx.notify();
     }
 
@@ -2358,6 +2421,7 @@ impl EditorView {
         );
         self.content_search_workspace_changed(cx);
         self.on_document_replaced();
+        self.resync_document_find_for_active_document(cx);
         self.schedule_document_parse(cx);
         self.status = None;
         cx.notify();
@@ -2647,6 +2711,7 @@ impl EditorView {
         // same session id afterward.
         self.work_folder_generation = self.work_folder_generation.wrapping_add(1);
         self.on_document_replaced();
+        self.resync_document_find_for_active_document(cx);
         self.begin_work_folder_scan(root, cx);
     }
 
@@ -2798,6 +2863,7 @@ impl EditorView {
                         if is_latest_request {
                             self.reveal_file_tab(opened_id);
                             self.on_document_replaced();
+                            self.resync_document_find_for_active_document(cx);
                             self.status = Some("Opened".to_owned());
                             self.schedule_document_parse(cx);
                             match search_navigation_verification {
@@ -3345,7 +3411,9 @@ impl EditorView {
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
         let row_top = self.content_y_for_row(block_id, row_index)?;
-        let content_y = self.scroll_y + window_y - self.theme.header_height;
+        let content_y = self.scroll_y + window_y
+            - self.theme.header_height
+            - self.document_find_reserved_height();
         let local_y = content_y - row_top;
         let shaper = WindowShaper::new(window, self.zoom);
         let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, &shaper)?;
@@ -3387,6 +3455,7 @@ impl EditorView {
         }
         self.blur_sidebar_filter(cx);
         self.blur_content_search_focus(cx);
+        self.blur_document_find_focus(cx);
         self.sidebar_keyboard_focus = false;
     }
 
@@ -3399,6 +3468,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.blur_content_search_focus(cx);
+        self.blur_document_find_focus(cx);
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
@@ -3602,6 +3672,9 @@ impl EditorView {
             list_projection,
             fence_height_projection,
             table_projection,
+            // Vertical caret navigation onto a neighbor block, unrelated to
+            // the document-find bar's current match.
+            None,
             self.line_height(),
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
@@ -3664,22 +3737,32 @@ impl EditorView {
         self.caret_geometry
     }
 
-    /// Scrolls so the row holding the caret is on screen.
+    /// Scrolls so the row holding the caret is on screen. See
+    /// `scroll_source_offset_into_view` for the shared mechanics.
+    fn scroll_cursor_into_view(&mut self) {
+        let cursor = self.sessions.active().editor().selection().active;
+        self.scroll_source_offset_into_view(cursor);
+    }
+
+    /// Scrolls so the row holding `offset` is on screen — the caret
+    /// (`scroll_cursor_into_view`), or the document-find bar's current match
+    /// (Issue #413).
     ///
-    /// The row is the exact answer and the layout cache holds it whenever the
-    /// caret's block has been drawn at the current revision, which is the case
-    /// while moving around. Right after an edit the layout is a revision behind,
-    /// and the caret's physical line stands in for its row — the same thing
-    /// wherever nothing wraps.
+    /// The row is the exact answer and the layout cache holds it whenever
+    /// `offset`'s block has been drawn at the current revision, which is the
+    /// case while moving around. Right after an edit the layout is a
+    /// revision behind, and `offset`'s physical line stands in for its row —
+    /// the same thing wherever nothing wraps.
     ///
     /// When the row would land flush against the viewport's bottom edge, the
     /// scroll target keeps [`CARET_MODE_BADGE_HEIGHT`] of extra clearance
-    /// below it, so the input-mode badge drawn under the caret is not clipped
-    /// by the viewport's `overflow_hidden` (issue #240).
-    fn scroll_cursor_into_view(&mut self) {
+    /// below it. That clearance only ever actually gets painted for a real
+    /// caret (issue #240); reserving it for a find match too is harmless —
+    /// at most a few extra pixels of margin — and keeps this one shared path
+    /// instead of a second one with its own rounding.
+    fn scroll_source_offset_into_view(&mut self, offset: SourceOffset) {
         let editor = self.sessions.active().editor();
-        let cursor = editor.selection().active;
-        let Ok(line) = editor.document().line_for_offset(cursor) else {
+        let Ok(line) = editor.document().line_for_offset(offset) else {
             return;
         };
         let (top, height) = match self.granularity {
@@ -3700,7 +3783,7 @@ impl EditorView {
                                     )
                                 })
                                 .map(|entry| &entry.layout)?;
-                            let row_index = layout.row_for_source(cursor)?;
+                            let row_index = layout.row_for_source(offset)?;
                             let row = layout.lines.get(row_index)?;
                             if row.line != *visual_line {
                                 return None;
@@ -3717,7 +3800,7 @@ impl EditorView {
             Granularity::Blocks => {
                 let Some(block) = self
                     .current_index()
-                    .and_then(|index| index.block_at(cursor))
+                    .and_then(|index| index.block_at(offset))
                 else {
                     return;
                 };
@@ -3732,7 +3815,7 @@ impl EditorView {
                             editor.document().revision(),
                         )
                     })
-                    .and_then(|entry| entry.layout.row_bounds_for_source(cursor));
+                    .and_then(|entry| entry.layout.row_bounds_for_source(offset));
                 match row {
                     Some((y, height)) => (block_top + y, height),
                     None => {
@@ -3751,6 +3834,64 @@ impl EditorView {
             height + CARET_MODE_BADGE_HEIGHT,
             self.viewport_height,
         );
+    }
+
+    /// The window-local `(x, top, height)` the caret (`offset ==
+    /// editor().selection().active`) or the document-find bar's current
+    /// match would paint at, resolved from `rendered` (this frame's freshly
+    /// laid-out blocks) rather than from `layout_cache`, which may still
+    /// describe the pre-disclosure zero-height row a command just disclosed
+    /// (Issue #413 reuses the same one-frame-stale-cache workaround
+    /// `fresh_caret` already needed).
+    ///
+    /// `BlockLayout::point_for_source` accepts an offset at the end of its
+    /// last line, so two adjacent block layouts can both claim the same
+    /// source boundary. In block granularity the formal index is the
+    /// ownership authority; restrict resolution to the block that owns
+    /// `offset` before asking either layout for a point. Otherwise a
+    /// collapsed closing fence immediately before a paragraph can win the
+    /// search and leave the geometry on the wrong, zero-height block.
+    fn fresh_point_for_offset(
+        &self,
+        rendered: &[(usize, VisualBlock, BlockLayout)],
+        shaper: &dyn LineShaper,
+        offset: SourceOffset,
+    ) -> Option<(f32, f32, f32)> {
+        let line = self.editor().document().line_for_offset(offset).ok();
+        let block_ordinal = (self.granularity == Granularity::Blocks)
+            .then(|| {
+                self.current_index()
+                    .and_then(|index| index.block_at(offset))
+                    .map(|block| block.ordinal)
+            })
+            .flatten();
+        rendered.iter().find_map(|(ordinal, visual, layout)| {
+            if self.granularity == Granularity::Blocks && block_ordinal != Some(*ordinal) {
+                return None;
+            }
+            if offset < visual.source_range.start || visual.source_range.end < offset {
+                return None;
+            }
+            let point = layout.point_for_source(visual, offset, shaper)?;
+            let top = match self.granularity {
+                Granularity::Blocks => self.heights.prefix_sum(*ordinal) + point.y,
+                Granularity::Lines => {
+                    let line = line?;
+                    let line_id = line.0;
+                    let visual_line = visual
+                        .lines
+                        .iter()
+                        .position(|line| line.line_id as usize == line_id)?;
+                    let line_row_top = layout
+                        .lines
+                        .iter()
+                        .find(|row| row.line == visual_line)
+                        .map(|row| row.y)?;
+                    self.heights.prefix_sum(line.0) + point.y - line_row_top
+                }
+            };
+            Some((point.x, top, point.height))
+        })
     }
 
     /// The published index, but only while it describes the current revision.
@@ -4637,6 +4778,7 @@ impl EditorView {
             list_projection,
             fence_height_projection,
             table_projection,
+            self.document_find_current_match(),
             self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());
@@ -4702,6 +4844,7 @@ impl EditorView {
             indexed,
             &render,
             joined.map(|cached| &cached.parse),
+            self.document_find_current_match(),
         ) else {
             return false;
         };
@@ -4804,6 +4947,9 @@ fn target_in_neighbor(
         list_projection,
         None,
         table_projection,
+        // Vertical caret navigation onto a neighbor block, unrelated to the
+        // document-find bar's current match.
+        None,
         line_height,
     )?;
     let layout = layout_block(&visual, width, shaper);
@@ -5354,10 +5500,11 @@ impl EditorView {
 
     /// Which edge of the editor viewport `window_y` (window-space, matching
     /// `MouseMoveEvent::position`) sits inside, if any. The viewport begins
-    /// right below the header and is `self.viewport_height` tall, the same
-    /// frame `render` computes it in.
+    /// right below the header (and below the find bar's row while it is
+    /// open) and is `self.viewport_height` tall, the same frame `render`
+    /// computes it in.
     fn text_autoscroll_direction_for(&self, window_y: f32) -> Option<AutoscrollDirection> {
-        let local_y = window_y - self.theme.header_height;
+        let local_y = window_y - self.theme.header_height - self.document_find_reserved_height();
         let near_top = local_y < TEXT_SELECTION_AUTOSCROLL_EDGE;
         let near_bottom = local_y > self.viewport_height - TEXT_SELECTION_AUTOSCROLL_EDGE;
         match (near_top, near_bottom) {
@@ -5529,6 +5676,7 @@ impl EditorView {
         Some(
             div()
                 .id("editor-scrollbar")
+                .debug_selector(|| "editor-scrollbar".to_owned())
                 .absolute()
                 .top(px(0.0))
                 .right(px(0.0))
@@ -5722,8 +5870,9 @@ impl Render for EditorView {
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height
-            - self.theme.footer_height)
-            .max(self.line_height());
+            - self.theme.footer_height
+            - self.document_find_reserved_height())
+        .max(self.line_height());
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
         // read once per frame and every layout is keyed by it. A sidebar takes
@@ -5868,48 +6017,7 @@ impl Render for EditorView {
         // A fence can become editable one frame after the input event; keep the
         // request armed until that row has a real positive height.
         let caret = self.editor().selection().active;
-        let caret_line = self.editor().document().line_for_offset(caret).ok();
-        // `BlockLayout::point_for_source` accepts a caret at the end of its
-        // last line, so two adjacent block layouts can both claim the same
-        // source boundary. In block granularity the formal index is the
-        // ownership authority; restrict resolution to the block that owns the
-        // caret before asking either layout for a point. Otherwise a collapsed
-        // closing fence immediately before a paragraph can win the search and
-        // leave the IME geometry on the wrong, zero-height block.
-        let caret_block_ordinal = (self.granularity == Granularity::Blocks)
-            .then(|| {
-                self.current_index()
-                    .and_then(|index| index.block_at(caret))
-                    .map(|block| block.ordinal)
-            })
-            .flatten();
-        let fresh_caret = rendered.iter().find_map(|(ordinal, visual, layout)| {
-            if self.granularity == Granularity::Blocks && caret_block_ordinal != Some(*ordinal) {
-                return None;
-            }
-            if caret < visual.source_range.start || visual.source_range.end < caret {
-                return None;
-            }
-            let point = layout.point_for_source(visual, caret, &shaper)?;
-            let top = match self.granularity {
-                Granularity::Blocks => self.heights.prefix_sum(*ordinal) + point.y,
-                Granularity::Lines => {
-                    let line = caret_line?;
-                    let line_id = line.0;
-                    let visual_line = visual
-                        .lines
-                        .iter()
-                        .position(|line| line.line_id as usize == line_id)?;
-                    let line_row_top = layout
-                        .lines
-                        .iter()
-                        .find(|row| row.line == visual_line)
-                        .map(|row| row.y)?;
-                    self.heights.prefix_sum(line.0) + point.y - line_row_top
-                }
-            };
-            Some((point.x, top, point.height))
-        });
+        let fresh_caret = self.fresh_point_for_offset(&rendered, &shaper, caret);
         if self.pending_caret_visibility_after_layout {
             if let Some((_, top, height)) = fresh_caret
                 && height > 0.0
@@ -5951,6 +6059,58 @@ impl Render for EditorView {
                 cx.notify();
             }
         }
+        let find_current_match = self.document_find_current_match();
+        if self.pending_find_visibility_after_layout {
+            match find_current_match
+                .and_then(|range| self.fresh_point_for_offset(&rendered, &shaper, range.start))
+            {
+                Some((_, top, height)) if height > 0.0 => {
+                    let before = self.scroll_y;
+                    self.scroll_y =
+                        scroll_y_for_cursor(self.scroll_y, top, height, self.viewport_height);
+                    self.scroll_y = clamp_scroll_y(
+                        self.scroll_y,
+                        self.scrollable_content_height(),
+                        self.viewport_height,
+                    );
+                    let visible_bottom = top + height - self.scroll_y;
+                    if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
+                        && self.scroll_y == before
+                    {
+                        self.pending_find_visibility_after_layout = false;
+                    } else {
+                        cx.notify();
+                    }
+                    if self.scroll_y != before {
+                        cx.notify();
+                    }
+                }
+                Some(_) => {
+                    // The current match's row has not been laid out with a
+                    // real height yet (its block may still need the forced
+                    // disclosure this frame installs). Keep the request
+                    // alive instead of consuming it early.
+                    cx.notify();
+                }
+                None => {
+                    // No current match (the bar closed, or navigated away
+                    // from): nothing left to scroll to.
+                    self.pending_find_visibility_after_layout = false;
+                }
+            }
+        }
+        let find_matches = self.document_find_matches_in_view(SourceRange {
+            start: rendered
+                .iter()
+                .map(|(_, visual, _)| visual.source_range.start)
+                .min()
+                .unwrap_or(SourceOffset(0)),
+            end: rendered
+                .iter()
+                .map(|(_, visual, _)| visual.source_range.end)
+                .max()
+                .unwrap_or(SourceOffset(0)),
+        });
         // Where the caret was drawn, for the IME candidate window.
         self.caret_geometry = fresh_caret.map(|(x, top, height)| CaretGeometry {
             x: self.theme.line_horizontal_padding + x,
@@ -6018,7 +6178,13 @@ impl Render for EditorView {
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .child(self.header_element(cx));
+            .child(self.header_element(cx))
+            // A fixed-height flex sibling directly under the tab bar, inside
+            // the body area, rather than an absolute overlay covering the
+            // document's first row: `self.viewport_height` and every
+            // window-to-content y conversion below account for this row's
+            // height via `document_find_reserved_height` (Issue #413).
+            .children(self.document_find_bar(cx));
         // Relative image destinations resolve against the session's own file,
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
@@ -6064,6 +6230,8 @@ impl Render for EditorView {
                                         self.zoom,
                                         &resolver,
                                         self.caret_input_mode,
+                                        &find_matches,
+                                        find_current_match,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`
@@ -7235,6 +7403,7 @@ mod tests {
             None,
             None,
             Some(projection),
+            None,
             DEFAULT_LINE_HEIGHT,
         )
         .expect("table presentation");
@@ -7929,6 +8098,7 @@ mod tests {
                 None,
                 None,
                 Some(projection),
+                None,
                 view.line_height(),
             )
             .expect("active table presentation");
@@ -17697,5 +17867,175 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
         });
+    }
+
+    // Issue #413: the find bar used to be an absolute overlay painted on top
+    // of the document's first row, leaving `self.viewport_height` and every
+    // window-to-content y conversion unaware it was open. These regression
+    // tests cover the fixed-row layout instead: rows/scrollbar/caret must
+    // move with the bar's real reserved height, not just visually hide
+    // behind it.
+
+    #[gpui::test]
+    fn opening_the_find_bar_pushes_rows_down_and_shrinks_the_viewport_by_its_reserved_height(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..40)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        let row_top_before = cx.debug_bounds("row-0-0").expect("row painted").origin.y;
+        let viewport_height_before = view.read_with(cx, |view, _| view.viewport_height);
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        let reserved = view.read_with(cx, |view, _| view.document_find_reserved_height());
+        assert!(
+            reserved > 0.0,
+            "the open bar must reserve a real row height"
+        );
+
+        let bar_bounds = cx
+            .debug_bounds("document-find-bar")
+            .expect("find bar painted as a fixed row while open");
+        assert_eq!(bar_bounds.size.height, px(reserved));
+        assert_eq!(bar_bounds.origin.y, row_top_before);
+
+        let row_top_after = cx.debug_bounds("row-0-0").expect("row painted").origin.y;
+        let viewport_height_after = view.read_with(cx, |view, _| view.viewport_height);
+
+        // The body's first row moves down by exactly the bar's own height
+        // instead of being covered in place, and the viewport shrinks by the
+        // same amount instead of staying sized for the pre-bar body.
+        assert_eq!(row_top_after - row_top_before, px(reserved));
+        assert_eq!(viewport_height_before - viewport_height_after, reserved);
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.leave_document_find(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let row_top_closed = cx.debug_bounds("row-0-0").expect("row painted").origin.y;
+        let viewport_height_closed = view.read_with(cx, |view, _| view.viewport_height);
+        assert_eq!(
+            row_top_closed, row_top_before,
+            "closing the bar must restore the original row position exactly"
+        );
+        assert_eq!(viewport_height_closed, viewport_height_before);
+    }
+
+    #[gpui::test]
+    fn click_hit_testing_matches_the_shifted_row_position_while_the_find_bar_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        // `row_click` reads the row's real painted bounds this frame, which
+        // now sit below the find bar's row; clicking exactly there must
+        // still resolve to the same source offset the display shows, not an
+        // offset shifted by the bar's reserved height.
+        let (down_point, expected) = row_click(&view, cx, "row-0-0", 0, 0, 3);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(expected));
+        });
+
+        // A drag from that same point to the second paragraph must likewise
+        // land on the row it is visually dragged to, not a row shifted by
+        // the bar's reserved height.
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 3);
+        let (drag_point, drag_expected) = row_click(&view, cx, "row-2-0", 2, 0, 3);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(drag_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(drag_point, MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(anchor, expected);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor: expected,
+                    active: drag_expected,
+                }
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn caret_and_scrollbar_geometry_match_the_shrunken_viewport_while_the_find_bar_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=200)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        let (header_height, footer_height, reserved) = view.read_with(cx, |view, _| {
+            (
+                view.theme.header_height,
+                view.theme.footer_height,
+                view.document_find_reserved_height(),
+            )
+        });
+        assert!(reserved > 0.0);
+        // Computed independently of `self.viewport_height`, from the window
+        // size and the theme's own fixed header/footer, so this cannot pass
+        // merely because the viewport field and the caret/scrollbar code
+        // happen to share the same (possibly wrong) value.
+        let expected_viewport_height = 760.0 - header_height - footer_height - reserved;
+
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
+        });
+        cx.run_until_parked();
+
+        let (caret, viewport_height) =
+            view.read_with(cx, |view, _| (view.caret_geometry(), view.viewport_height));
+        let caret = caret.expect("caret is on screen at the document end");
+
+        assert_eq!(viewport_height, expected_viewport_height);
+        assert!(
+            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT
+                <= viewport_height + CARET_VISIBILITY_TOLERANCE,
+            "caret/IME candidate geometry would sit under the find bar's \
+             reserved row: caret bottom {}, viewport {viewport_height}",
+            caret.y + caret.height
+        );
+
+        // The scrollbar track is painted exactly as tall as the shrunken
+        // viewport, starting right below the find bar's own row.
+        let bar_bottom = cx
+            .debug_bounds("document-find-bar")
+            .expect("bar painted")
+            .bottom();
+        let scrollbar_bounds = cx
+            .debug_bounds("editor-scrollbar")
+            .expect("scrollbar painted for a document this tall");
+        assert_eq!(scrollbar_bounds.origin.y, bar_bottom);
+        assert_eq!(scrollbar_bounds.size.height, px(viewport_height));
     }
 }

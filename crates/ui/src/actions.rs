@@ -53,6 +53,7 @@ macro_rules! command_actions {
 pub fn register_key_bindings(cx: &mut App) {
     register_core_key_bindings(cx);
     register_secondary_platform_key_bindings(cx);
+    register_document_find_macos_key_bindings(cx);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -69,6 +70,24 @@ fn register_secondary_platform_key_bindings(cx: &mut App) {
 #[cfg(target_os = "macos")]
 fn register_secondary_platform_key_bindings(_cx: &mut App) {}
 
+/// `DocumentFindNext`/`DocumentFindPrevious` already get `f3`/`shift-f3` from
+/// `command_actions!` below, the same on every platform. macOS additionally
+/// accepts the platform-native Cmd+G/Cmd+Shift+G for the same two actions —
+/// bound literally to `cmd` rather than `secondary`, since `secondary-g`
+/// would resolve to Ctrl+G on Windows/Linux and collide with that
+/// platform's own "go to line" convention, which Cmd+G has no equivalent
+/// conflict with on macOS.
+#[cfg(target_os = "macos")]
+fn register_document_find_macos_key_bindings(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-g", DocumentFindNext, Some("HaneEditor")),
+        KeyBinding::new("cmd-shift-g", DocumentFindPrevious, Some("HaneEditor")),
+    ]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_document_find_macos_key_bindings(_cx: &mut App) {}
+
 command_actions! {
     Open ("secondary-o") => open_action |view, _window, cx| {
         if !view.inline_rename_active() { view.prompt_open(cx); }
@@ -79,6 +98,41 @@ command_actions! {
     ContentSearch ("secondary-shift-f") => content_search_action |view, window, cx| {
         view.open_content_search(window, cx);
     },
+    DocumentFind ("secondary-f") => document_find_action |view, window, cx| {
+        view.open_document_find(window, cx);
+    },
+    // Bound once more (to Cmd+G/Cmd+Shift+G on macOS) by
+    // `register_document_find_macos_key_bindings`; this macro only declares
+    // each action's own primary key binding.
+    DocumentFindNext ("f3") => document_find_next_action |view, _window, cx| {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() {
+            return;
+        }
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() {
+            return;
+        }
+        // While the find input itself has an active IME composition, F3 (and
+        // the macOS Cmd+G bound to this same action) must not move the
+        // current match out from under it.
+        if view.document_find_input_is_composing(_window, cx) {
+            return;
+        }
+        view.document_find_next(cx);
+    },
+    DocumentFindPrevious ("shift-f3") => document_find_previous_action |view, _window, cx| {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() {
+            return;
+        }
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() {
+            return;
+        }
+        // Same as `DocumentFindNext` above, for Shift+F3 and macOS
+        // Cmd+Shift+G.
+        if view.document_find_input_is_composing(_window, cx) {
+            return;
+        }
+        view.document_find_previous(cx);
+    },
     Save ("secondary-s") => save |view, _window, cx| {
         if !view.inline_rename_active() { view.save_or_prompt(cx); }
     },
@@ -87,7 +141,7 @@ command_actions! {
     },
     ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
     NextFileTab ("ctrl-tab") => next_file_tab_action |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() {
             return;
         }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() || view.editor().ime().is_some() {
@@ -96,7 +150,7 @@ command_actions! {
         view.next_file_tab(cx);
     },
     PrevFileTab ("ctrl-shift-tab") => prev_file_tab_action |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() {
             return;
         }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() || view.editor().ime().is_some() {
@@ -111,7 +165,7 @@ command_actions! {
             view.handle_content_search_enter(window, cx);
             return;
         }
-        if view.content_search_input_is_focused() {
+        if view.content_search_input_is_focused() || view.document_find_input_is_focused() {
             return;
         }
         if view.sidebar_filter_is_focused() {
@@ -132,6 +186,13 @@ command_actions! {
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
+        // The find input's own `InputEvent::PressEnter { shift: true }`
+        // subscription (see `document_find.rs`) already drives Previous for
+        // Shift+Enter in this field after this action propagates to it;
+        // navigating again here would move the current match twice.
+        if view.document_find_input_is_focused() {
+            return;
+        }
         if view.content_search_input_is_focused() || view.content_search_results_focused() {
             return;
         }
@@ -153,10 +214,13 @@ command_actions! {
         }
     },
     Backspace ("backspace") => backspace |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.backspace_sidebar_filter(cx); } else if view.inline_rename_active() { view.backspace_inline_rename(cx); } else if !view.apply_list_edit_intent(ListEditIntent::Backspace, cx) { view.dispatch(EditorCommand::Backspace, cx); }
     },
     Indent ("tab") => indent |view, window, cx| {
+        if view.document_find_input_is_focused() {
+            return;
+        }
         if view.content_search_input_is_focused() {
             view.focus_content_search_results(window, cx);
             return;
@@ -170,6 +234,9 @@ command_actions! {
         }
     },
     Outdent ("shift-tab") => outdent |view, window, cx| {
+        if view.document_find_input_is_focused() {
+            return;
+        }
         if view.content_search_input_is_focused() || view.content_search_results_focused() {
             view.focus_content_search_input(window, cx);
             return;
@@ -179,19 +246,21 @@ command_actions! {
         }
     },
     Delete ("delete") => delete |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.delete_sidebar_filter(cx); } else if view.inline_rename_active() { view.delete_inline_rename(cx); } else { view.dispatch(EditorCommand::Delete, cx); }
     },
     Left ("left") => left |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_left(false, cx); } else if view.inline_rename_active() { view.move_inline_rename_left(false, cx); } else { view.dispatch(EditorCommand::MoveLeft { extend: false }, cx); }
     },
     Right ("right") => right |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_right(false, cx); } else if view.inline_rename_active() { view.move_inline_rename_right(false, cx); } else { view.dispatch(EditorCommand::MoveRight { extend: false }, cx); }
     },
     Up ("up") => up |view, window, cx| {
-        if view.content_search_results_focused() {
+        if view.document_find_input_is_focused() {
+            return;
+        } else if view.content_search_results_focused() {
             view.move_content_search_selection(false, cx);
         } else if view.content_search_input_is_focused() {
             return;
@@ -200,7 +269,9 @@ command_actions! {
         }
     },
     Down ("down") => down |view, window, cx| {
-        if view.content_search_results_focused() {
+        if view.document_find_input_is_focused() {
+            return;
+        } else if view.content_search_results_focused() {
             view.move_content_search_selection(true, cx);
         } else if view.content_search_input_is_focused() {
             view.focus_content_search_results(window, cx);
@@ -209,79 +280,79 @@ command_actions! {
         }
     },
     SelectLeft ("shift-left") => select_left |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_left(cx); } else if view.inline_rename_active() { view.select_inline_rename_left(cx); } else { view.dispatch(EditorCommand::MoveLeft { extend: true }, cx); }
     },
     SelectRight ("shift-right") => select_right |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_right(cx); } else if view.inline_rename_active() { view.select_inline_rename_right(cx); } else { view.dispatch(EditorCommand::MoveRight { extend: true }, cx); }
     },
     SelectUp ("shift-up") => select_up |view, window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.move_vertical(false, true, window, cx);
     },
     SelectDown ("shift-down") => select_down |view, window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.move_vertical(true, true, window, cx);
     },
     SelectAll ("secondary-a") => select_all |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_all_sidebar_filter(cx); } else if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::SelectAll, cx); }
     },
     Home ("home") => home |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_home(cx); } else if view.inline_rename_active() { view.move_inline_rename_home(cx); } else { view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx); }
     },
     End ("end") => end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_end(cx); } else if view.inline_rename_active() { view.move_inline_rename_end(cx); } else { view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx); }
     },
     SelectHome ("shift-home") => select_home |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_home(cx); return; }
         if view.inline_rename_active() { view.select_inline_rename_home(cx); return; }
         view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx);
     },
     SelectEnd ("shift-end") => select_end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_end(cx); return; }
         if view.inline_rename_active() { view.select_inline_rename_end(cx); return; }
         view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx);
     },
     DocumentStart ("secondary-up") => document_start |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
     },
     DocumentEnd ("secondary-down") => document_end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
     },
     SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToStart { extend: true }, cx);
     },
     SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx);
     },
     Undo ("secondary-z") => undo |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::Undo, cx);
     },
     Redo ("secondary-shift-z") => redo |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::Redo, cx);
     },
     Copy ("secondary-c") => copy |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         let text = if view.sidebar_filter_is_focused() {
             view.selected_sidebar_filter_text()
         } else if view.inline_rename_active() {
@@ -294,7 +365,7 @@ command_actions! {
         }
     },
     Cut ("secondary-x") => cut |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         let text = if view.sidebar_filter_is_focused() {
             view.selected_sidebar_filter_text()
         } else if view.inline_rename_active() {
@@ -314,7 +385,7 @@ command_actions! {
         }
     },
     Paste ("secondary-v") => paste |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             if view.sidebar_filter_is_focused() {
                 view.replace_sidebar_filter_text(None, &text, cx);
@@ -338,6 +409,10 @@ command_actions! {
         }
         if view.content_search_should_leave_on_escape() {
             view.leave_content_search(window, cx);
+            return;
+        }
+        if view.document_find_should_leave_on_escape() {
+            view.leave_document_find(window, cx);
             return;
         }
         if view.sidebar_filter_is_focused() {
