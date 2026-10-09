@@ -13,10 +13,13 @@
 //! history, or IME composition at any point — opening, typing a query,
 //! scanning, or moving the current match all leave them alone; the one
 //! exception is the body's selection, which closing the bar (Escape or the
-//! close button) replaces with the current match's own range, but only when
-//! that match is still `Ready` for the active session/generation/revision
-//! (see `leave_document_find`) — otherwise the selection from before closing
-//! is left exactly as it was. Reuses `hane_editor::find`'s
+//! close button) while the bar's own input still holds focus replaces with
+//! the current match's own range, but only when that match is still `Ready`
+//! for the active session/generation/revision (see `leave_document_find`) —
+//! otherwise, including when a click into the body already blurred the
+//! input and moved the selection before this same bar is closed, the
+//! selection from before closing is left exactly as it was. Reuses
+//! `hane_editor::find`'s
 //! `FindQuery`/`FindOptions`/`scan`/`FindNavigation` rather than a second
 //! search engine or the Work-folder `content_search`'s disk-backed one.
 //!
@@ -234,10 +237,24 @@ impl EditorView {
         }
     }
 
+    /// Whether an Escape should close this bar and return focus to the body,
+    /// true both while the bar's own input holds focus (unless that Escape
+    /// only cancelled the input's own IME composition — see
+    /// `escape_was_composing`) and after a click into the document body left
+    /// the bar open but unfocused (Issue #413's "search ends, editing
+    /// resumes" flow) — except when the body itself has an active IME
+    /// composition, since that Escape must cancel the composition first (see
+    /// the `CancelComposition` handler's fallback to
+    /// `perform_cancel_composition`) rather than also closing the bar.
     pub(crate) fn document_find_should_leave_on_escape(&self) -> bool {
-        self.document_find.open
-            && self.document_find.input_focused
-            && !self.document_find.escape_was_composing
+        if !self.document_find.open {
+            return false;
+        }
+        if self.document_find.input_focused {
+            !self.document_find.escape_was_composing
+        } else {
+            self.editor().ime().is_none()
+        }
     }
 
     /// Snapshots whether the find input currently has an active IME marked
@@ -432,14 +449,20 @@ impl EditorView {
     }
 
     /// Hides the bar and returns GPUI focus to the document body. If the
-    /// bar's current match is still `Ready` and belongs to the active
+    /// bar's own input still holds focus (an Escape or the close button
+    /// pressed while the bar, not the body, had focus) and the bar's current
+    /// match is still `Ready` and belongs to the active
     /// session/generation/revision, selects that match's original
     /// `SourceRange` in the body; otherwise leaves the selection exactly as
-    /// it was before closing (an empty/zero-result/invalid/pending/stale
-    /// current match never moves the caret). Returns `false` without
-    /// changing anything when the bar was not open, so callers (see the
-    /// `CancelComposition`/Escape handler) can fall through to other Escape
-    /// behavior.
+    /// it was before closing. This also covers a click into the document
+    /// body (which already moved the selection to the click and blurred the
+    /// input via `blur_document_find_focus`, without closing the bar) — a
+    /// later Escape here must leave that click's own selection untouched
+    /// rather than snapping it back to a possibly unrelated match (an
+    /// empty/zero-result/invalid/pending/stale current match likewise never
+    /// moves the caret). Returns `false` without changing anything when the
+    /// bar was not open, so callers (see the `CancelComposition`/Escape
+    /// handler) can fall through to other Escape behavior.
     pub(crate) fn leave_document_find(
         &mut self,
         window: &mut Window,
@@ -448,7 +471,8 @@ impl EditorView {
         if !self.document_find.open {
             return false;
         }
-        if self.document_find.synced_target == Some(self.document_find_target())
+        if self.document_find.input_focused
+            && self.document_find.synced_target == Some(self.document_find_target())
             && let Some(range) = self.document_find_current_match()
         {
             let _ = self.editor_mut().set_selection(Selection {
@@ -2095,6 +2119,119 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.document_find.open);
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(3)));
+        });
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_bar_after_a_click_into_the_body_without_moving_its_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "needle and thread\n";
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "thread".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        // Click into the document body while the bar is still open, the same
+        // way a user resuming editing mid-search would, instead of pressing
+        // Escape with the find input itself still focused.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let clicked_selection = view.read_with(cx, |view, _| {
+            // The click blurs the bar's own input without closing the bar.
+            assert!(view.document_find.open);
+            assert!(!view.document_find_input_is_focused());
+            view.editor().selection()
+        });
+
+        // This is the regression: before the fix, Escape here required
+        // `input_focused`, so it fell through to the generic composition
+        // handler and never closed the bar.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
+            assert!(!view.document_find_input_is_focused());
+            // Closing here must leave the click's own caret position alone,
+            // not snap the selection back to the still-`Ready` "thread"
+            // match, and must never touch the document's text or revision.
+            assert_eq!(view.editor().selection(), clicked_selection);
+            assert_eq!(view.editor().document().full_text(), text);
+        });
+    }
+
+    #[gpui::test]
+    fn escape_cancels_body_composition_before_closing_the_bar_after_a_click(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        // Click into the body: blurs the find input without closing the bar.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.document_find.open);
+            assert!(!view.document_find_input_is_focused());
+        });
+
+        // Start an IME composition in the body itself, the same as a real
+        // Japanese input conversion in progress there.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "か", None)
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+
+        // The first Escape must cancel the body's own composition first,
+        // never also close the still-open find bar on the same keystroke.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.document_find.open);
+            assert!(view.editor().ime().is_none());
+        });
+
+        // With no composition left, a second, separate Escape closes the
+        // bar normally.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
         });
     }
 
