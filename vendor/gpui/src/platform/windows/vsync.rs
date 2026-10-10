@@ -61,21 +61,58 @@ fn get_dwm_interval() -> Result<Duration> {
         ..Default::default()
     };
     unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing_info) }?;
-    let interval = retrieve_duration(timing_info.qpcRefreshPeriod, *QPC_TICKS_PER_SECOND);
-    // Check for interval values that are impossibly low. A 29 microsecond
-    // interval was seen (from a qpcRefreshPeriod of 60).
-    if interval < VSYNC_INTERVAL_THRESHOLD {
-        Ok(retrieve_duration(
+    retrieve_duration(timing_info.qpcRefreshPeriod, *QPC_TICKS_PER_SECOND).or_else(|_| {
+        // Check for interval values that are impossibly low. A 29 microsecond
+        // interval was seen (from a qpcRefreshPeriod of 60).
+        retrieve_duration(
             timing_info.rateRefresh.uiDenominator as u64,
             timing_info.rateRefresh.uiNumerator as u64,
-        ))
-    } else {
-        Ok(interval)
-    }
+        )
+    })
 }
 
 #[inline]
-fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Duration {
-    let ticks_per_microsecond = ticks_per_second / 1_000_000;
-    Duration::from_micros(counts / ticks_per_microsecond)
+fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Result<Duration> {
+    if ticks_per_second == 0 {
+        anyhow::bail!("ticks per second must be non-zero");
+    }
+
+    let micros = (u128::from(counts) * 1_000_000) / u128::from(ticks_per_second);
+    if micros < VSYNC_INTERVAL_THRESHOLD.as_micros() {
+        anyhow::bail!("vsync interval is shorter than 1ms");
+    }
+
+    let micros = u64::try_from(micros).context("vsync interval exceeds supported range")?;
+    Ok(Duration::from_micros(micros))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieve_duration_preserves_subsecond_precision() {
+        assert_eq!(
+            retrieve_duration(1, 60).unwrap(),
+            Duration::from_micros(16_666)
+        );
+    }
+
+    #[test]
+    fn retrieve_duration_rejects_zero_denominator() {
+        assert!(retrieve_duration(1, 0).is_err());
+    }
+
+    #[test]
+    fn retrieve_duration_rejects_intervals_shorter_than_threshold() {
+        assert!(retrieve_duration(1, 2_000).is_err());
+    }
+
+    #[test]
+    fn retrieve_duration_accepts_one_millisecond() {
+        assert_eq!(
+            retrieve_duration(1, 1_000).unwrap(),
+            VSYNC_INTERVAL_THRESHOLD
+        );
+    }
 }
