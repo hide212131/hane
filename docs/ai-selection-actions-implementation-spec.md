@@ -237,6 +237,16 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 最終候補ではcurrent mainへの影響を確認し、required CI、CodeRabbitのcurrent-head full review、必要な両OSの実画面と実接続の証拠を揃える。機能Issueの成立を妨げる不具合、データ損失、安全性、未知の必要証拠は残したままmergeしない。関係のない改善の全件解消を求めてscopeを広げない。mergeとIssue closeは実装workerに任せない。
 
+### 9.1 現在の実装状況（このworker実行時点、exact-head CI実行前）
+
+保存モデル（`prompts.rs`）とサービス（`text_transform.rs`/`service.rs`のAiServiceHandle::try_submit_text_transform経路）、設定ページ（`ai_prompts.rs`）は、本PRのcheckpoint復元時点で実装・単体テストとも揃っていた。今回の作業は`crates/ui/src/view/ai_selection.rs`を新規追加し、選択対象の捕捉（文書インスタンス・revision・UTF-8 byte range・元文字列）、Windows Alt+I／macOS Control+Lの呼出し、一度で開く小さな画面（自由入力＋保存済み指示一覧）、送信直前・適用直前の再照合、`replace_range_recorded`による1回Undoの置換、再生成、破棄、旧世代・取消後の応答の無視、文書編集時の即時無効化を実装し、`view.rs`/`actions.rs`に配線した。
+
+T05〜T08に対応する回帰テスト（複数byte文字の byte-accurate置換と単一Undo/Redo、結果が元文と同一の場合のno-op、捕捉後の編集による無効化、旧generation／close後の応答破棄）をユニット・統合テストとして追加したが、範囲は絞っており、二重クリック・取消中タブ切替・通知欠落など`T08`/`T09`の全ケース、一覧の矢印キー操作やTabによる4要素間の完全な移動（Tab/Shift-Tabは本文側への誤動作を防ぐguardのみ実装し、一覧内フォーカス移動自体は今回実装していない）は対象外。
+
+ポップアップの画面上の位置は、選択範囲の終端（caret）の既存レイアウト情報（`caret_geometry`/`main_column_left`）から算出し、`snap_to_window()`で画面内に収めている。選択範囲そのものの矩形（複数行・逆方向選択時の正確な端）やエディタ表示領域ちょうどへのクランプ（ウィンドウ全体ではなく）は簡略化しており、実画面での見た目の確認はできていない。
+
+このworkerはRead/Edit/Write/Glob/Grepのみに制限されており、`cargo build`/`cargo test`/`cargo clippy`やGUIを一切実行していない。T11〜T13（Windows/macOS実画面、実ChatGPT/Codex/Custom接続）は本PRで未実施のまま。exact-head CIでの最初の検証、CodeRabbitのreview、GUI validationは、この後のCommanderの観測対象。
+
 ## 10. 参考資料
 
 - [Wordのスクリーンリーダー／キーボード操作](https://support.microsoft.com/en-us/accessibility/copilot/use-copilot-in-word-with-a-screen-reader): Windows RewriteのAlt+I、macOS RewriteのControl+L、選択→結果確認→Replace。2026-10-10確認。

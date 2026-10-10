@@ -54,6 +54,7 @@ pub fn register_key_bindings(cx: &mut App) {
     register_core_key_bindings(cx);
     register_secondary_platform_key_bindings(cx);
     register_document_find_macos_key_bindings(cx);
+    register_ai_selection_key_binding(cx);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -87,6 +88,35 @@ fn register_document_find_macos_key_bindings(cx: &mut App) {
 
 #[cfg(not(target_os = "macos"))]
 fn register_document_find_macos_key_bindings(_cx: &mut App) {}
+
+actions!(hane_editor, [OpenAiSelection]);
+
+/// Windows Rewrite uses Alt+I; macOS Rewrite uses Control+L (not Command),
+/// per Word's own keyboard/screen-reader docs (see
+/// `docs/ai-selection-actions-implementation-spec.md` section 3.1/10). Bound
+/// only to "HaneEditor", like every other body-editing action, so the
+/// shortcut never fires while a settings field, the sidebar filter, or an
+/// inline rename has focus.
+#[cfg(target_os = "macos")]
+fn register_ai_selection_key_binding(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("ctrl-l", OpenAiSelection, Some("HaneEditor"))]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_ai_selection_key_binding(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("alt-i", OpenAiSelection, Some("HaneEditor"))]);
+}
+
+impl EditorView {
+    pub(crate) fn open_ai_selection_action(
+        &mut self,
+        _: &OpenAiSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_ai_selection(window, cx);
+    }
+}
 
 command_actions! {
     Open ("secondary-o") => open_action |view, _window, cx| {
@@ -141,7 +171,7 @@ command_actions! {
     },
     ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
     NextFileTab ("ctrl-tab") => next_file_tab_action |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() || view.editor().ime().is_some() {
@@ -150,7 +180,7 @@ command_actions! {
         view.next_file_tab(cx);
     },
     PrevFileTab ("ctrl-shift-tab") => prev_file_tab_action |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() {
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() || view.editor().ime().is_some() {
@@ -165,7 +195,7 @@ command_actions! {
             view.handle_content_search_enter(window, cx);
             return;
         }
-        if view.content_search_input_is_focused() || view.document_find_input_is_focused() {
+        if view.content_search_input_is_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         }
         if view.sidebar_filter_is_focused() {
@@ -190,7 +220,7 @@ command_actions! {
         // subscription (see `document_find.rs`) already drives Previous for
         // Shift+Enter in this field after this action propagates to it;
         // navigating again here would move the current match twice.
-        if view.document_find_input_is_focused() {
+        if view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         }
         if view.content_search_input_is_focused() || view.content_search_results_focused() {
@@ -214,11 +244,11 @@ command_actions! {
         }
     },
     Backspace ("backspace") => backspace |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.backspace_sidebar_filter(cx); } else if view.inline_rename_active() { view.backspace_inline_rename(cx); } else if !view.apply_list_edit_intent(ListEditIntent::Backspace, cx) { view.dispatch(EditorCommand::Backspace, cx); }
     },
     Indent ("tab") => indent |view, window, cx| {
-        if view.document_find_input_is_focused() {
+        if view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         }
         if view.content_search_input_is_focused() {
@@ -234,7 +264,7 @@ command_actions! {
         }
     },
     Outdent ("shift-tab") => outdent |view, window, cx| {
-        if view.document_find_input_is_focused() {
+        if view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         }
         if view.content_search_input_is_focused() || view.content_search_results_focused() {
@@ -246,19 +276,19 @@ command_actions! {
         }
     },
     Delete ("delete") => delete |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.delete_sidebar_filter(cx); } else if view.inline_rename_active() { view.delete_inline_rename(cx); } else { view.dispatch(EditorCommand::Delete, cx); }
     },
     Left ("left") => left |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_left(false, cx); } else if view.inline_rename_active() { view.move_inline_rename_left(false, cx); } else { view.dispatch(EditorCommand::MoveLeft { extend: false }, cx); }
     },
     Right ("right") => right |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_right(false, cx); } else if view.inline_rename_active() { view.move_inline_rename_right(false, cx); } else { view.dispatch(EditorCommand::MoveRight { extend: false }, cx); }
     },
     Up ("up") => up |view, window, cx| {
-        if view.document_find_input_is_focused() {
+        if view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         } else if view.content_search_results_focused() {
             view.move_content_search_selection(false, cx);
@@ -269,7 +299,7 @@ command_actions! {
         }
     },
     Down ("down") => down |view, window, cx| {
-        if view.document_find_input_is_focused() {
+        if view.document_find_input_is_focused() || view.ai_selection_input_is_focused() {
             return;
         } else if view.content_search_results_focused() {
             view.move_content_search_selection(true, cx);
@@ -280,79 +310,79 @@ command_actions! {
         }
     },
     SelectLeft ("shift-left") => select_left |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_left(cx); } else if view.inline_rename_active() { view.select_inline_rename_left(cx); } else { view.dispatch(EditorCommand::MoveLeft { extend: true }, cx); }
     },
     SelectRight ("shift-right") => select_right |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_right(cx); } else if view.inline_rename_active() { view.select_inline_rename_right(cx); } else { view.dispatch(EditorCommand::MoveRight { extend: true }, cx); }
     },
     SelectUp ("shift-up") => select_up |view, window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.move_vertical(false, true, window, cx);
     },
     SelectDown ("shift-down") => select_down |view, window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.move_vertical(true, true, window, cx);
     },
     SelectAll ("secondary-a") => select_all |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_all_sidebar_filter(cx); } else if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::SelectAll, cx); }
     },
     Home ("home") => home |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_home(cx); } else if view.inline_rename_active() { view.move_inline_rename_home(cx); } else { view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx); }
     },
     End ("end") => end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_end(cx); } else if view.inline_rename_active() { view.move_inline_rename_end(cx); } else { view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx); }
     },
     SelectHome ("shift-home") => select_home |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_home(cx); return; }
         if view.inline_rename_active() { view.select_inline_rename_home(cx); return; }
         view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx);
     },
     SelectEnd ("shift-end") => select_end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() { view.select_sidebar_filter_end(cx); return; }
         if view.inline_rename_active() { view.select_inline_rename_end(cx); return; }
         view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx);
     },
     DocumentStart ("secondary-up") => document_start |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
     },
     DocumentEnd ("secondary-down") => document_end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
     },
     SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToStart { extend: true }, cx);
     },
     SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx);
     },
     Undo ("secondary-z") => undo |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::Undo, cx);
     },
     Redo ("secondary-shift-z") => redo |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::Redo, cx);
     },
     Copy ("secondary-c") => copy |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         let text = if view.sidebar_filter_is_focused() {
             view.selected_sidebar_filter_text()
         } else if view.inline_rename_active() {
@@ -365,7 +395,7 @@ command_actions! {
         }
     },
     Cut ("secondary-x") => cut |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         let text = if view.sidebar_filter_is_focused() {
             view.selected_sidebar_filter_text()
         } else if view.inline_rename_active() {
@@ -385,7 +415,7 @@ command_actions! {
         }
     },
     Paste ("secondary-v") => paste |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() { return; }
+        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_input_is_focused() { return; }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             if view.sidebar_filter_is_focused() {
                 view.replace_sidebar_filter_text(None, &text, cx);
@@ -399,6 +429,10 @@ command_actions! {
     CancelComposition ("escape") => cancel_composition |view, window, cx| {
         if view.settings_open() {
             view.handle_settings_escape(window, cx);
+            return;
+        }
+        if view.ai_selection_should_leave_on_escape() {
+            view.leave_ai_selection(window, cx);
             return;
         }
         if view.dismiss_file_tab_context_menu(cx) {
