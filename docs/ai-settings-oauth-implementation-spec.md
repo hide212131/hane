@@ -276,7 +276,7 @@ thread/start
   baseInstructions/developerInstructions: 接続確認専用（文書を含めない）
 turn/start
   threadId: 上記のthread
-  input: text「Reply with exactly HANE_AI_OK.」のみ
+  input: [{"type": "text", "text": "Reply with exactly HANE_AI_OK."}]
 item/completed（当該thread/turnのagentMessageを収集）
 turn/completed（status/errorを検査）
 結果確定、共有lock解放
