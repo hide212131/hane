@@ -14,7 +14,7 @@ use hane_markdown::BlockIndexUpdate;
 use hane_metrics::{DurationDistribution, FrameMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// A single interpretation of the `HANE_*` measurement environment variables.
@@ -45,6 +45,10 @@ pub struct InstrumentationConfig {
     /// (Issue #427). `None` outside that tool's own GUI runs, matching
     /// every other `HANE_*` instrumentation switch here.
     pub scroll_event_timing_path: Option<PathBuf>,
+    /// Destination for completed Work folder search queue occupancy samples.
+    /// This measurement is only available in `instrument` builds.
+    #[cfg(feature = "instrument")]
+    pub search_queue_metrics_path: Option<PathBuf>,
 }
 
 impl InstrumentationConfig {
@@ -122,6 +126,9 @@ impl InstrumentationConfig {
             measurement_cycles: usize_var("HANE_MEASUREMENT_CYCLES").unwrap_or_default(),
             scroll_event_timing_path: std::env::var_os("HANE_SCROLL_EVENT_TIMING_PATH")
                 .map(PathBuf::from),
+            #[cfg(feature = "instrument")]
+            search_queue_metrics_path: std::env::var_os("HANE_SEARCH_QUEUE_METRICS_PATH")
+                .map(PathBuf::from),
         }
     }
 }
@@ -144,6 +151,10 @@ pub(crate) struct Instrumentation {
     /// Measurement-only correlation output for Issue #427; `None` unless
     /// `HANE_SCROLL_EVENT_TIMING_PATH` is set.
     pub(crate) scroll_event_timing: Option<ScrollEventTimingOutput>,
+    /// Completed Work folder search queue occupancy, only when explicitly
+    /// requested by the measurement environment.
+    #[cfg(feature = "instrument")]
+    pub(crate) search_queue_metrics_output: Option<SearchQueueMetricsOutput>,
     /// Set when `on_scroll` observes a `ScrollWheelEvent` and cleared by the
     /// next `record_frame_instrumentation` call, which pairs it with that
     /// frame's own mach-clock paint/submission time (not compositor
@@ -162,9 +173,17 @@ impl Instrumentation {
             eprintln!("could not open HANE_SCROLL_EVENT_TIMING_PATH: {error}");
             None
         });
+        #[cfg(feature = "instrument")]
+        let search_queue_metrics_output =
+            SearchQueueMetricsOutput::new(&config).unwrap_or_else(|error| {
+                eprintln!("could not open HANE_SEARCH_QUEUE_METRICS_PATH: {error}");
+                None
+            });
         Self {
             metrics_output,
             scroll_event_timing,
+            #[cfg(feature = "instrument")]
+            search_queue_metrics_output,
             pending_scroll_receipt_ticks: None,
             process_started: Instant::now(),
             #[cfg(feature = "instrument")]
@@ -177,6 +196,69 @@ impl Instrumentation {
             layout_cache_hits: 0,
             layout_cache_misses: 0,
         }
+    }
+}
+
+/// Numeric, query-independent results from the bounded search result channel.
+/// The scenario name is supplied by the measurement runner (for example
+/// `s10-zero-hit`) so repeated 0-hit / few-hit / many-hit runs can be compared.
+#[cfg(feature = "instrument")]
+pub(crate) struct SearchQueueMetricsOutput {
+    file: File,
+    scenario: String,
+}
+
+#[cfg(feature = "instrument")]
+impl SearchQueueMetricsOutput {
+    fn new(config: &InstrumentationConfig) -> io::Result<Option<Self>> {
+        let Some(path) = config.search_queue_metrics_path.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(Self::create(path, config.scenario.clone())?))
+    }
+
+    pub(crate) fn create(path: &Path, scenario: impl Into<String>) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        writeln!(
+            file,
+            "scenario,workspace_epoch,query_epoch,source_count,events_enqueued,events_dequeued,peak_queued_events,queue_capacity"
+        )?;
+        Ok(Self {
+            file,
+            scenario: scenario.into(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_search_queue(
+        &mut self,
+        key: hane_session::search::SearchKey,
+        source_count: usize,
+        events_enqueued: usize,
+        events_dequeued: usize,
+        peak_queued_events: usize,
+        queue_capacity: usize,
+    ) -> io::Result<()> {
+        writeln!(
+            self.file,
+            "{},{},{},{},{},{},{},{}",
+            csv(&self.scenario),
+            key.workspace_epoch,
+            key.query_epoch,
+            source_count,
+            events_enqueued,
+            events_dequeued,
+            peak_queued_events,
+            queue_capacity,
+        )?;
+        self.file.flush()
     }
 }
 
