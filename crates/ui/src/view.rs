@@ -76,7 +76,7 @@ use hane_session::{
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, TitleSyncAction, UnsavedChanges, WorkFolder, WorkFolderNode,
-    WorkFolderScanner, date_badge_range, decide_title_sync, extract_h1_title,
+    WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
     format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
     unique_folder_name, unique_markdown_filename,
 };
@@ -85,7 +85,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod ai_settings;
@@ -1682,7 +1682,13 @@ impl EditorView {
             Err(error) => {
                 self.status = Some(format!("Could not open work folder: {error}"));
             }
-            Ok(work_folder) => {
+            Ok(mut work_folder) => {
+                // A scan always builds a fresh, `Name`-ordered tree (see
+                // `WorkFolder::from_tree`); apply the persisted sidebar sort
+                // order here rather than threading it through
+                // `WorkFolderScanner`, which test doubles and other callers
+                // do not need to know about.
+                work_folder.set_sort_order(self.settings.sidebar_sort);
                 #[cfg(feature = "instrument")]
                 {
                     self.instrumentation.work_folder_scan_completed_at = Some(_scan_completed_at);
@@ -2501,12 +2507,20 @@ impl EditorView {
         let files = self.files.clone();
         let probe_path = path.clone();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let outcome = cx
                 .background_executor()
-                .spawn(async move { files.create_dir(&probe_path) })
+                .spawn(async move {
+                    let result = files.create_dir(&probe_path);
+                    // Acquired here, off the main thread, so `touch` below
+                    // can retain the new folder's modified time the same
+                    // no-rescan way a save does, instead of leaving it
+                    // unknown (and sorting as oldest) until the next scan.
+                    let modified = files.stamp(&probe_path).and_then(|stamp| stamp.modified);
+                    (result, modified)
+                })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.finish_new_work_folder_folder(path, result, cx);
+                view.finish_new_work_folder_folder(path, outcome, cx);
             });
         })
         .detach();
@@ -2515,14 +2529,16 @@ impl EditorView {
     fn finish_new_work_folder_folder(
         &mut self,
         path: PathBuf,
-        result: std::io::Result<()>,
+        outcome: (std::io::Result<()>, Option<SystemTime>),
         cx: &mut Context<Self>,
     ) {
+        let (result, modified) = outcome;
         self.pending_new_folders.remove(&path);
         match result {
             Ok(()) => {
                 if let Some(folder) = self.work_folder.as_mut() {
                     folder.insert_folder(path.clone());
+                    folder.touch(&path, modified);
                 }
                 self.expanded_folders.insert(path);
                 self.content_search_workspace_changed(cx);
@@ -3168,6 +3184,27 @@ impl EditorView {
     }
 
     fn general_settings_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar_sort = self.settings.sidebar_sort;
+        let view = cx.entity();
+        let sidebar_sort_name_button = Button::new("settings-sidebar-sort-name")
+            .label("名前")
+            .ghost()
+            .selected(sidebar_sort == WorkFolderSortOrder::Name)
+            .on_click(move |_, _window, app| {
+                view.update(app, |view, cx| {
+                    view.set_sidebar_sort(WorkFolderSortOrder::Name, cx);
+                });
+            });
+        let view = cx.entity();
+        let sidebar_sort_updated_button = Button::new("settings-sidebar-sort-updated")
+            .label("更新日時")
+            .ghost()
+            .selected(sidebar_sort == WorkFolderSortOrder::Updated)
+            .on_click(move |_, _window, app| {
+                view.update(app, |view, cx| {
+                    view.set_sidebar_sort(WorkFolderSortOrder::Updated, cx);
+                });
+            });
         let unsupported = matches!(
             self.file_context_menu_state,
             FileContextMenuState::Unsupported
@@ -3250,6 +3287,48 @@ impl EditorView {
                             .children(error),
                     ),
             )
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .border_t_1()
+                    .border_color(rgb(self.theme.sidebar_active_background))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("サイドバー"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-sidebar-sort-card")
+                            .w_full()
+                            .px(px(16.0))
+                            .py(px(14.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(self.theme.sidebar_active_background))
+                            .bg(rgb(self.theme.code_background))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("ファイル・フォルダーの並び順"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(sidebar_sort_name_button)
+                                    .child(sidebar_sort_updated_button),
+                            ),
+                    ),
+            )
     }
 
     pub(crate) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3259,6 +3338,25 @@ impl EditorView {
         self.block_cache.clear();
         self.layout_cache.clear();
         self.heights = HeightIndex::new(self.item_heights());
+        self.store_settings();
+        cx.notify();
+    }
+
+    /// Changes how the work-folder sidebar orders files and folders,
+    /// re-sorting the already-scanned tree in place (no rescan) so the
+    /// change is visible immediately, and persists the choice the same way
+    /// `cycle_theme`/`toggle_autosave` do. Selection, the active session,
+    /// expanded folders, and any unsaved content are all addressed by path
+    /// rather than by position in the sidebar list, so re-sorting the tree
+    /// here never disturbs any of them.
+    pub(crate) fn set_sidebar_sort(&mut self, order: WorkFolderSortOrder, cx: &mut Context<Self>) {
+        if self.settings.sidebar_sort == order {
+            return;
+        }
+        self.settings.sidebar_sort = order;
+        if let Some(folder) = self.work_folder.as_mut() {
+            folder.set_sort_order(order);
+        }
         self.store_settings();
         cx.notify();
     }

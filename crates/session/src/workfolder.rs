@@ -7,10 +7,12 @@
 //! `DocumentSession`; callers open a `WorkFolderEntry::path()` through
 //! `FileService::load` only once a note is actually selected.
 
+use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// One Markdown file discovered under a work folder, not yet loaded.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +20,13 @@ pub struct WorkFolderEntry {
     path: PathBuf,
     name: String,
     file_name: String,
+    /// The file's last-modified time, retained from whichever of a scan, a
+    /// save, or a rename most recently acquired it, rather than re-read from
+    /// disk every time the sidebar sorts. `None` until something has
+    /// acquired one (a synthetic entry built without touching the real
+    /// filesystem, or a platform that does not report `modified`); such an
+    /// entry sorts as the oldest under `WorkFolderSortOrder::Updated`.
+    modified: Option<SystemTime>,
 }
 
 impl WorkFolderEntry {
@@ -34,6 +43,7 @@ impl WorkFolderEntry {
             path,
             name,
             file_name,
+            modified: None,
         }
     }
 
@@ -52,6 +62,11 @@ impl WorkFolderEntry {
     /// Display name for a tree entry, including the `.md` extension.
     pub fn file_name(&self) -> &str {
         &self.file_name
+    }
+
+    /// The retained last-modified time; see the field doc comment.
+    pub fn modified(&self) -> Option<SystemTime> {
+        self.modified
     }
 }
 
@@ -77,6 +92,15 @@ impl WorkFolderNode {
             Self::Folder(folder) => folder.name(),
         }
     }
+
+    /// The retained last-modified time of whichever node this is; see
+    /// `WorkFolderEntry`'s field doc comment.
+    pub fn modified(&self) -> Option<SystemTime> {
+        match self {
+            Self::File(entry) => entry.modified(),
+            Self::Folder(folder) => folder.modified(),
+        }
+    }
 }
 
 /// A folder under a work folder, holding its own children (files and, in
@@ -87,10 +111,14 @@ pub struct WorkFolderFolder {
     path: PathBuf,
     name: String,
     children: Vec<WorkFolderNode>,
+    /// See `WorkFolderEntry::modified`'s field doc comment; a folder's own
+    /// last-modified time (not any child's), the same filesystem entry a
+    /// directory listing would report it for.
+    modified: Option<SystemTime>,
 }
 
 impl WorkFolderFolder {
-    fn new(path: PathBuf, children: Vec<WorkFolderNode>) -> Self {
+    fn new(path: PathBuf, children: Vec<WorkFolderNode>, modified: Option<SystemTime>) -> Self {
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
@@ -99,6 +127,7 @@ impl WorkFolderFolder {
             path,
             name,
             children,
+            modified,
         }
     }
 
@@ -110,10 +139,58 @@ impl WorkFolderFolder {
         &self.name
     }
 
-    /// This folder's direct children, folders and files mixed and sorted by
-    /// display name.
+    /// The retained last-modified time; see the field doc comment.
+    pub fn modified(&self) -> Option<SystemTime> {
+        self.modified
+    }
+
+    /// This folder's direct children, folders and files mixed and sorted
+    /// according to the work folder's current `WorkFolderSortOrder`.
     pub fn children(&self) -> &[WorkFolderNode] {
         &self.children
+    }
+}
+
+/// How the sidebar orders a work folder's children, applied independently at
+/// every level of the hierarchy (a folder's children never compare against
+/// another folder's). Persisted as part of `Settings` (`sidebar_sort`), with
+/// `Name` as the default so a settings file written before this existed, or
+/// one simply missing the key, keeps the original alphabetical order
+/// unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkFolderSortOrder {
+    /// Alphabetical by display name (`WorkFolderNode::sort_key`), the
+    /// original and only order before this setting existed.
+    #[default]
+    Name,
+    /// Most recently modified first, using each node's retained
+    /// `modified()`; a node with no retained time sorts as the oldest.
+    Updated,
+}
+
+impl WorkFolderSortOrder {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Updated => "updated",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "updated" => Self::Updated,
+            _ => Self::Name,
+        }
+    }
+
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Updated,
+            Self::Updated => Self::Name,
+        }
     }
 }
 
@@ -125,6 +202,7 @@ impl WorkFolderFolder {
 pub struct WorkFolder {
     root: PathBuf,
     children: Vec<WorkFolderNode>,
+    sort_order: WorkFolderSortOrder,
 }
 
 impl WorkFolder {
@@ -136,6 +214,7 @@ impl WorkFolder {
         let mut folder = Self {
             root,
             children: Vec::new(),
+            sort_order: WorkFolderSortOrder::default(),
         };
         for entry in entries {
             folder.insert(entry.path().to_path_buf());
@@ -144,10 +223,45 @@ impl WorkFolder {
     }
 
     /// Builds a work folder from an already-assembled tree, e.g. the result
-    /// of a real filesystem walk that also knows about empty folders.
+    /// of a real filesystem walk that also knows about empty folders. Always
+    /// sorted by `Name` on construction; a caller applying a different
+    /// persisted `WorkFolderSortOrder` does so afterward through
+    /// `set_sort_order`, so a scan's own sort order does not need threading
+    /// through `WorkFolderScanner`.
     pub(crate) fn from_tree(root: PathBuf, mut children: Vec<WorkFolderNode>) -> Self {
-        sort_nodes(&mut children);
-        Self { root, children }
+        let sort_order = WorkFolderSortOrder::default();
+        sort_nodes(&mut children, sort_order);
+        Self {
+            root,
+            children,
+            sort_order,
+        }
+    }
+
+    /// Re-sorts every level of the tree in place for a newly chosen
+    /// `WorkFolderSortOrder`, and remembers it for subsequent `insert`,
+    /// `insert_folder`, `rename`, and `rename_folder` calls. A no-op when
+    /// `order` already matches, so switching the setting back and forth does
+    /// not needlessly re-sort an unchanged tree.
+    pub fn set_sort_order(&mut self, order: WorkFolderSortOrder) {
+        if self.sort_order == order {
+            return;
+        }
+        self.sort_order = order;
+        resort_tree(&mut self.children, order);
+    }
+
+    pub fn sort_order(&self) -> WorkFolderSortOrder {
+        self.sort_order
+    }
+
+    /// Updates the retained modified time for a node this app's own write
+    /// just produced — a save, an autosave, or a newly created file or
+    /// folder — without a rescan, and re-sorts the level it lives at so an
+    /// `Updated` sort order reflects the change immediately. A `path` the
+    /// tree was not scanned, inserted, or created with is a no-op.
+    pub fn touch(&mut self, path: &Path, modified: Option<SystemTime>) {
+        set_modified(&mut self.children, path, modified, self.sort_order);
     }
 
     /// Adds a note this app itself just created to the index, so it appears
@@ -166,7 +280,13 @@ impl WorkFolder {
         if components.is_empty() {
             return;
         }
-        insert_file(&mut self.children, &self.root, &components, path);
+        insert_file(
+            &mut self.children,
+            &self.root,
+            &components,
+            path,
+            self.sort_order,
+        );
     }
 
     /// Adds a folder this app itself just created to the index, so it
@@ -181,7 +301,7 @@ impl WorkFolder {
         if components.is_empty() {
             return;
         }
-        insert_folder_at(&mut self.children, &self.root, &components);
+        insert_folder_at(&mut self.children, &self.root, &components, self.sort_order);
     }
 
     /// Follows a rename this app itself just performed, keeping the index in
@@ -189,9 +309,15 @@ impl WorkFolder {
     /// A `from` the folder was not scanned with (already renamed, or never
     /// present) is a no-op.
     pub fn rename(&mut self, from: &Path, to: &Path) {
-        if remove_file(&mut self.children, from) {
-            self.insert(to.to_path_buf());
-        }
+        let Some(entry) = remove_file(&mut self.children, from) else {
+            return;
+        };
+        self.insert(to.to_path_buf());
+        // `insert` always builds the fresh entry with no retained modified
+        // time, since a plain rename (unlike a save) never changes a file's
+        // content or its mtime; carry over what was already known instead
+        // of letting it fall back to "oldest" under an `Updated` sort.
+        set_modified(&mut self.children, to, entry.modified, self.sort_order);
     }
 
     /// Follows a folder rename this app itself just performed: `from` moves to
@@ -209,10 +335,10 @@ impl WorkFolder {
         };
         if parent == self.root {
             self.children.push(WorkFolderNode::Folder(renamed));
-            sort_nodes(&mut self.children);
+            sort_nodes(&mut self.children, self.sort_order);
         } else if let Some(parent_folder) = find_folder_mut(&mut self.children, parent) {
             parent_folder.children.push(WorkFolderNode::Folder(renamed));
-            sort_nodes(&mut parent_folder.children);
+            sort_nodes(&mut parent_folder.children, self.sort_order);
         }
         // A `to` whose parent is not itself in the tree drops the folder
         // rather than reinserting it at the wrong place; a real rename never
@@ -223,8 +349,8 @@ impl WorkFolder {
         &self.root
     }
 
-    /// The root's direct children, folders and files mixed and sorted by
-    /// display name.
+    /// The root's direct children, folders and files mixed and sorted
+    /// according to the work folder's current `WorkFolderSortOrder`.
     pub fn children(&self) -> &[WorkFolderNode] {
         &self.children
     }
@@ -318,21 +444,27 @@ fn remove_folder(nodes: &mut Vec<WorkFolderNode>, path: &Path) -> Option<WorkFol
 
 /// Rebuilds `folder` and every node beneath it with paths moved from under
 /// `from` to under `to`, preserving each node's position relative to the
-/// folder root that moved.
+/// folder root that moved, and each node's own retained modified time (a
+/// rename changes neither a file's content nor a folder's own identity, so
+/// neither should fall back to "oldest" under an `Updated` sort just because
+/// it moved).
 fn rebase_folder(folder: WorkFolderFolder, from: &Path, to: &Path) -> WorkFolderFolder {
     let path = rebase_path(folder.path(), from, to);
+    let modified = folder.modified;
     let children = folder
         .children
         .into_iter()
         .map(|child| rebase_node(child, from, to))
         .collect();
-    WorkFolderFolder::new(path, children)
+    WorkFolderFolder::new(path, children, modified)
 }
 
 fn rebase_node(node: WorkFolderNode, from: &Path, to: &Path) -> WorkFolderNode {
     match node {
         WorkFolderNode::File(entry) => {
-            WorkFolderNode::File(WorkFolderEntry::new(rebase_path(entry.path(), from, to)))
+            let mut rebased = WorkFolderEntry::new(rebase_path(entry.path(), from, to));
+            rebased.modified = entry.modified;
+            WorkFolderNode::File(rebased)
         }
         WorkFolderNode::Folder(folder) => WorkFolderNode::Folder(rebase_folder(folder, from, to)),
     }
@@ -351,12 +483,70 @@ fn rebase_path(path: &Path, from: &Path, to: &Path) -> PathBuf {
     }
 }
 
-fn sort_nodes(nodes: &mut [WorkFolderNode]) {
-    nodes.sort_by(|a, b| {
-        a.sort_key()
-            .cmp(b.sort_key())
-            .then_with(|| a.path().cmp(b.path()))
-    });
+fn sort_nodes(nodes: &mut [WorkFolderNode], order: WorkFolderSortOrder) {
+    nodes.sort_by(|a, b| compare_nodes(a, b, order));
+}
+
+/// The ordering for two siblings at one hierarchy level: `Name` compares the
+/// display name and falls back to the path so two nodes never tie; `Updated`
+/// sorts the more recently modified node first and falls back to the exact
+/// same name/path rule whenever both retained modified times tie (including
+/// two unknown times). Applying this one rule at every level, independently
+/// per folder, is the "same-rank rule per hierarchy level" this sort order
+/// needs; the filter view inherits it for free since it only ever reads
+/// already-sorted `children()`, never re-sorting its own matches.
+fn compare_nodes(a: &WorkFolderNode, b: &WorkFolderNode, order: WorkFolderSortOrder) -> Ordering {
+    let name_then_path = |a: &WorkFolderNode, b: &WorkFolderNode| {
+        a.sort_key().cmp(b.sort_key()).then_with(|| a.path().cmp(b.path()))
+    };
+    match order {
+        WorkFolderSortOrder::Name => name_then_path(a, b),
+        WorkFolderSortOrder::Updated => b
+            .modified()
+            .cmp(&a.modified())
+            .then_with(|| name_then_path(a, b)),
+    }
+}
+
+/// Re-sorts `nodes` and, recursively, every folder's own children beneath
+/// it, for a `WorkFolderSortOrder` switch applied to an already-built tree.
+fn resort_tree(nodes: &mut [WorkFolderNode], order: WorkFolderSortOrder) {
+    sort_nodes(nodes, order);
+    for node in nodes {
+        if let WorkFolderNode::Folder(folder) = node {
+            resort_tree(&mut folder.children, order);
+        }
+    }
+}
+
+/// Sets the retained modified time of the node at `path`, wherever in the
+/// tree it lives, and re-sorts the level it lives at. Returns whether a node
+/// was found; a `path` the tree was never scanned, inserted, or created with
+/// is a no-op (`WorkFolder::touch` and `WorkFolder::rename` both rely on
+/// this, the latter after the node has already been reinserted at its new
+/// path).
+fn set_modified(
+    nodes: &mut Vec<WorkFolderNode>,
+    path: &Path,
+    modified: Option<SystemTime>,
+    order: WorkFolderSortOrder,
+) -> bool {
+    if let Some(index) = nodes.iter().position(|node| node.path() == path) {
+        match &mut nodes[index] {
+            WorkFolderNode::File(entry) => entry.modified = modified,
+            WorkFolderNode::Folder(folder) => folder.modified = modified,
+        }
+        sort_nodes(nodes, order);
+        return true;
+    }
+    for node in nodes.iter_mut() {
+        if let WorkFolderNode::Folder(folder) = node
+            && set_modified(&mut folder.children, path, modified, order)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn insert_file(
@@ -364,13 +554,14 @@ fn insert_file(
     current_dir: &Path,
     components: &[&OsStr],
     file_path: PathBuf,
+    order: WorkFolderSortOrder,
 ) {
     if components.len() == 1 {
         nodes.push(WorkFolderNode::File(WorkFolderEntry::new(file_path)));
-        sort_nodes(nodes);
+        sort_nodes(nodes, order);
         return;
     }
-    let index = folder_index(nodes, current_dir, components[0]);
+    let index = folder_index(nodes, current_dir, components[0], order);
     if let WorkFolderNode::Folder(folder) = &mut nodes[index] {
         let folder_path = folder.path().to_path_buf();
         insert_file(
@@ -378,25 +569,36 @@ fn insert_file(
             &folder_path,
             &components[1..],
             file_path,
+            order,
         );
     }
 }
 
-fn insert_folder_at(nodes: &mut Vec<WorkFolderNode>, current_dir: &Path, components: &[&OsStr]) {
-    let index = folder_index(nodes, current_dir, components[0]);
+fn insert_folder_at(
+    nodes: &mut Vec<WorkFolderNode>,
+    current_dir: &Path,
+    components: &[&OsStr],
+    order: WorkFolderSortOrder,
+) {
+    let index = folder_index(nodes, current_dir, components[0], order);
     if components.len() == 1 {
         return;
     }
     if let WorkFolderNode::Folder(folder) = &mut nodes[index] {
         let folder_path = folder.path().to_path_buf();
-        insert_folder_at(&mut folder.children, &folder_path, &components[1..]);
+        insert_folder_at(&mut folder.children, &folder_path, &components[1..], order);
     }
 }
 
 /// The index in `nodes` of the folder named `name` directly under
 /// `current_dir`, creating it (with no children yet) if it is not already
 /// there.
-fn folder_index(nodes: &mut Vec<WorkFolderNode>, current_dir: &Path, name: &OsStr) -> usize {
+fn folder_index(
+    nodes: &mut Vec<WorkFolderNode>,
+    current_dir: &Path,
+    name: &OsStr,
+    order: WorkFolderSortOrder,
+) -> usize {
     let folder_path = current_dir.join(name);
     if let Some(index) = nodes.iter().position(
         |node| matches!(node, WorkFolderNode::Folder(folder) if folder.path() == folder_path),
@@ -406,8 +608,9 @@ fn folder_index(nodes: &mut Vec<WorkFolderNode>, current_dir: &Path, name: &OsSt
     nodes.push(WorkFolderNode::Folder(WorkFolderFolder::new(
         folder_path.clone(),
         Vec::new(),
+        None,
     )));
-    sort_nodes(nodes);
+    sort_nodes(nodes, order);
     nodes
         .iter()
         .position(
@@ -416,22 +619,26 @@ fn folder_index(nodes: &mut Vec<WorkFolderNode>, current_dir: &Path, name: &OsSt
         .expect("folder just inserted")
 }
 
-fn remove_file(nodes: &mut Vec<WorkFolderNode>, path: &Path) -> bool {
+/// Removes and returns the file node at `path`, searching the whole tree,
+/// the file-shaped counterpart to `remove_folder`. Returning the removed
+/// entry (rather than just whether one was found) is what lets `rename`
+/// carry its retained modified time over to the reinserted node.
+fn remove_file(nodes: &mut Vec<WorkFolderNode>, path: &Path) -> Option<WorkFolderEntry> {
     if let Some(index) = nodes
         .iter()
         .position(|node| matches!(node, WorkFolderNode::File(entry) if entry.path() == path))
+        && let WorkFolderNode::File(entry) = nodes.remove(index)
     {
-        nodes.remove(index);
-        return true;
+        return Some(entry);
     }
     for node in nodes.iter_mut() {
         if let WorkFolderNode::Folder(folder) = node
-            && remove_file(&mut folder.children, path)
+            && let Some(entry) = remove_file(&mut folder.children, path)
         {
-            return true;
+            return Some(entry);
         }
     }
-    false
+    None
 }
 
 fn find_file<'a>(nodes: &'a [WorkFolderNode], path: &Path) -> Option<&'a WorkFolderEntry> {
@@ -508,6 +715,17 @@ fn walk(root: &Path, dir: &Path) -> io::Result<Vec<WorkFolderNode>> {
         let item = item?;
         let path = item.path();
         let file_type = item.file_type()?;
+        // Acquired here, once per scan, and retained on the node from then
+        // on (see `WorkFolderEntry::modified`'s doc comment) rather than
+        // re-read from disk every time the sidebar sorts or a persisted
+        // `WorkFolderSortOrder` is switched to `Updated`. A transient
+        // failure (permission, or an entry removed mid-walk) degrades to
+        // `None` instead of failing the whole scan, since this is purely an
+        // enrichment of the listing `file_type` above already succeeded at.
+        let modified = item
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
         if file_type.is_dir() {
             // `.hane` directly under the work folder root is where Hane
             // keeps its own state for this work folder (the unnamed-note
@@ -521,13 +739,19 @@ fn walk(root: &Path, dir: &Path) -> io::Result<Vec<WorkFolderNode>> {
             }
             let children = walk(root, &path)?;
             nodes.push(WorkFolderNode::Folder(WorkFolderFolder::new(
-                path, children,
+                path, children, modified,
             )));
         } else if file_type.is_file() && is_markdown(&path) {
-            nodes.push(WorkFolderNode::File(WorkFolderEntry::new(path)));
+            let mut entry = WorkFolderEntry::new(path);
+            entry.modified = modified;
+            nodes.push(WorkFolderNode::File(entry));
         }
     }
-    sort_nodes(&mut nodes);
+    // Always `Name`: a scan builds a fresh tree from scratch, and
+    // `OsWorkFolderScanner::scan` hands it to `WorkFolder::from_tree`, which
+    // sorts it the same way; a caller wanting a different persisted
+    // `WorkFolderSortOrder` applies it afterward through `set_sort_order`.
+    sort_nodes(&mut nodes, WorkFolderSortOrder::Name);
     Ok(nodes)
 }
 
@@ -874,5 +1098,203 @@ mod tests {
                 .iter()
                 .any(|node| matches!(node, WorkFolderNode::Folder(f) if f.name() == "archive"))
         );
+    }
+
+    fn system_time_at(seconds: u64) -> SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+    }
+
+    fn file_node(path: &str, modified: Option<SystemTime>) -> WorkFolderNode {
+        let mut entry = WorkFolderEntry::new(PathBuf::from(path));
+        entry.modified = modified;
+        WorkFolderNode::File(entry)
+    }
+
+    #[test]
+    fn work_folder_sort_order_defaults_to_name_and_round_trips_through_as_str() {
+        assert_eq!(WorkFolderSortOrder::default(), WorkFolderSortOrder::Name);
+        assert_eq!(
+            WorkFolderSortOrder::parse("updated"),
+            WorkFolderSortOrder::Updated
+        );
+        assert_eq!(
+            WorkFolderSortOrder::parse("name"),
+            WorkFolderSortOrder::Name
+        );
+        assert_eq!(
+            WorkFolderSortOrder::parse("unrecognized"),
+            WorkFolderSortOrder::Name,
+            "an unrecognized or missing value must fall back to the pre-existing order"
+        );
+        assert_eq!(WorkFolderSortOrder::Name.as_str(), "name");
+        assert_eq!(WorkFolderSortOrder::Updated.as_str(), "updated");
+        assert_eq!(WorkFolderSortOrder::Name.next(), WorkFolderSortOrder::Updated);
+        assert_eq!(WorkFolderSortOrder::Updated.next(), WorkFolderSortOrder::Name);
+    }
+
+    #[test]
+    fn updated_sort_order_lists_the_most_recently_modified_node_first_with_a_name_tie_break() {
+        let children = vec![
+            file_node("/notes/Older.md", Some(system_time_at(100))),
+            file_node("/notes/Newer.md", Some(system_time_at(300))),
+            file_node("/notes/SameTime_B.md", Some(system_time_at(200))),
+            file_node("/notes/SameTime_A.md", Some(system_time_at(200))),
+        ];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+        folder.set_sort_order(WorkFolderSortOrder::Updated);
+
+        let names: Vec<String> = folder
+            .children()
+            .iter()
+            .map(|node| match node {
+                WorkFolderNode::File(entry) => entry.file_name().to_owned(),
+                WorkFolderNode::Folder(_) => unreachable!("only files were inserted"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["Newer.md", "SameTime_A.md", "SameTime_B.md", "Older.md"],
+            "newest first, with same-time siblings broken by name ascending"
+        );
+    }
+
+    #[test]
+    fn an_unknown_modified_time_sorts_last_under_updated_order() {
+        let children = vec![
+            file_node("/notes/Known.md", Some(system_time_at(100))),
+            file_node("/notes/Unknown.md", None),
+        ];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+        folder.set_sort_order(WorkFolderSortOrder::Updated);
+
+        let names: Vec<&str> = folder
+            .children()
+            .iter()
+            .map(|node| node.path().file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Known.md", "Unknown.md"]);
+    }
+
+    #[test]
+    fn set_sort_order_resorts_every_level_of_the_tree() {
+        let nested = vec![
+            file_node("/notes/dev/Older.md", Some(system_time_at(10))),
+            file_node("/notes/dev/Newer.md", Some(system_time_at(20))),
+        ];
+        let children = vec![WorkFolderNode::Folder(WorkFolderFolder::new(
+            PathBuf::from("/notes/dev"),
+            nested,
+            None,
+        ))];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+        folder.set_sort_order(WorkFolderSortOrder::Updated);
+
+        let WorkFolderNode::Folder(dev) = &folder.children()[0] else {
+            panic!("dev folder expected");
+        };
+        let names: Vec<&str> = dev
+            .children()
+            .iter()
+            .map(|node| match node {
+                WorkFolderNode::File(entry) => entry.file_name(),
+                WorkFolderNode::Folder(_) => unreachable!("only files were nested under dev"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["Newer.md", "Older.md"],
+            "a sort-order switch must resort a nested folder's own children too, not just the root"
+        );
+    }
+
+    #[test]
+    fn touching_an_entry_moves_it_without_a_rescan_under_updated_order() {
+        let children = vec![
+            file_node("/notes/A.md", Some(system_time_at(100))),
+            file_node("/notes/B.md", Some(system_time_at(200))),
+        ];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+        folder.set_sort_order(WorkFolderSortOrder::Updated);
+        assert_eq!(folder.children()[0].path(), Path::new("/notes/B.md"));
+
+        // Simulates the modified time a save or autosave just produced,
+        // without touching the filesystem from this test.
+        folder.touch(Path::new("/notes/A.md"), Some(system_time_at(300)));
+
+        assert_eq!(folder.children()[0].path(), Path::new("/notes/A.md"));
+    }
+
+    #[test]
+    fn renaming_a_file_preserves_its_retained_modified_time_for_updated_order() {
+        let children = vec![
+            file_node("/notes/Alpha.md", Some(system_time_at(100))),
+            file_node("/notes/Zeta.md", Some(system_time_at(200))),
+        ];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+        folder.set_sort_order(WorkFolderSortOrder::Updated);
+
+        folder.rename(Path::new("/notes/Alpha.md"), Path::new("/notes/Omega.md"));
+
+        let omega = folder
+            .children()
+            .iter()
+            .find_map(|node| match node {
+                WorkFolderNode::File(entry) if entry.file_name() == "Omega.md" => Some(entry),
+                _ => None,
+            })
+            .expect("renamed entry still indexed");
+        assert_eq!(
+            omega.modified(),
+            Some(system_time_at(100)),
+            "a rename must not reset the retained modified time to unknown"
+        );
+        assert_eq!(
+            folder.children()[0].path(),
+            Path::new("/notes/Zeta.md"),
+            "Zeta.md (modified at 200) must still sort before the renamed Omega.md (100)"
+        );
+    }
+
+    #[test]
+    fn renaming_a_folder_preserves_descendant_modified_times_for_updated_order() {
+        let nested = vec![file_node("/notes/dev/Child.md", Some(system_time_at(50)))];
+        let children = vec![WorkFolderNode::Folder(WorkFolderFolder::new(
+            PathBuf::from("/notes/dev"),
+            nested,
+            Some(system_time_at(60)),
+        ))];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+        folder.set_sort_order(WorkFolderSortOrder::Updated);
+
+        folder.rename_folder(Path::new("/notes/dev"), Path::new("/notes/Projects"));
+
+        let WorkFolderNode::Folder(renamed) = &folder.children()[0] else {
+            panic!("renamed folder expected");
+        };
+        assert_eq!(renamed.modified(), Some(system_time_at(60)));
+        let child = renamed
+            .children()
+            .first()
+            .expect("child moved with the renamed folder");
+        assert_eq!(child.modified(), Some(system_time_at(50)));
+    }
+
+    #[test]
+    fn the_real_filesystem_scanner_retains_each_entrys_modified_time() {
+        let root = temporary_directory("workfolder-modified-time");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Meeting.md"), "# Meeting\n").unwrap();
+
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let entry = work_folder
+            .entries()
+            .into_iter()
+            .next()
+            .expect("the written note is scanned");
+        assert!(
+            entry.modified().is_some(),
+            "a real scan must acquire a modified time for later Updated sorting"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
