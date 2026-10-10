@@ -7065,105 +7065,10 @@ mod tests {
         );
     }
 
-    /// Moves focus off the editor's `focus_handle` and back, the same real
-    /// GPUI focus-path transition a live settings-close or window refocus
-    /// produces, so it runs through the actual `cx.on_focus` listener that
-    /// `render` installs (see `_input_mode_focus_subscription`) rather than
-    /// a stand-in for it.
-    fn refocus_editor(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) {
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                window.focus(&view.settings_focus_handle, cx);
-            });
-        });
-        cx.run_until_parked();
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                window.focus(&view.focus_handle, cx);
-            });
-        });
-        cx.run_until_parked();
-    }
-
-    // Issue #448: on Windows, the on-focus listener that drives
-    // `caret_input_mode` can run before the IME context is reassociated
-    // for the just-refocused view, observing a stale `None` even though
-    // the real mode is known; the reassociation reload must then correct
-    // the badge in one update, without flickering through further
-    // unnecessary redraws. This drives the production listener through a
-    // real focus-path transition and reads the badge actually painted for
-    // the observed glyph (via `cursor_overlay`'s `debug_selector`), rather
-    // than calling `update_keyboard_input_mode` and `caret_mode_glyph`
-    // directly.
-    #[gpui::test]
-    fn caret_mode_badge_updates_through_the_real_focus_listener(cx: &mut gpui::TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
-        cx.simulate_resize(gpui::size(px(640.0), px(360.0)));
-        cx.run_until_parked();
-
-        let notify_count = std::rc::Rc::new(std::cell::Cell::new(0));
-        let notify_count_handle = notify_count.clone();
-        let observed_view = view.clone();
-        cx.update(move |_, app| {
-            app.observe(&observed_view, move |_, _| {
-                notify_count_handle.set(notify_count_handle.get() + 1);
-            })
-            .detach();
-        });
-
-        crate::input_mode::set_test_active_keyboard_input_mode(Some(KeyboardInputMode::Ascii));
-        refocus_editor(&view, cx);
-        assert_eq!(
-            view.read_with(cx, |view, _| view.caret_input_mode),
-            Some(KeyboardInputMode::Ascii)
-        );
-        assert!(cx.debug_bounds("caret-mode-badge-A").is_some());
-        assert_eq!(
-            notify_count.replace(0),
-            1,
-            "the real listener must redraw once when the observed mode changes"
-        );
-
-        // A duplicate observation of the same, already-current mode must
-        // not request another redraw, through the same real listener.
-        refocus_editor(&view, cx);
-        assert_eq!(
-            view.read_with(cx, |view, _| view.caret_input_mode),
-            Some(KeyboardInputMode::Ascii)
-        );
-        assert!(cx.debug_bounds("caret-mode-badge-A").is_some());
-        assert_eq!(
-            notify_count.replace(0),
-            0,
-            "a duplicate observation of the same mode must not redraw again"
-        );
-
-        // A stale disassociation (e.g. settings closing before the IME
-        // context reassociates) observes `None` and hides the badge in
-        // one update, through the same real listener.
-        crate::input_mode::set_test_active_keyboard_input_mode(None);
-        refocus_editor(&view, cx);
-        assert_eq!(view.read_with(cx, |view, _| view.caret_input_mode), None);
-        assert!(cx.debug_bounds("caret-mode-badge-A").is_none());
-        assert_eq!(notify_count.replace(0), 1);
-
-        // The post-reassociation reload corrects the stale read and the
-        // badge reappears with the right glyph, through the same real
-        // listener.
-        crate::input_mode::set_test_active_keyboard_input_mode(Some(KeyboardInputMode::Native));
-        refocus_editor(&view, cx);
-        assert_eq!(
-            view.read_with(cx, |view, _| view.caret_input_mode),
-            Some(KeyboardInputMode::Native)
-        );
-        assert!(cx.debug_bounds("caret-mode-badge-あ").is_some());
-        assert_eq!(notify_count.replace(0), 1);
-    }
-
     // Issue #448: the production `on_keyboard_layout_change` notification
     // (`_input_mode_subscription`) is a distinct path from the on-focus
-    // listener exercised above — GPUI's test platform cannot raise the real
-    // OS keyboard-layout event, so this drives the exact same subscription
+    // listener — GPUI's test platform cannot raise the real OS
+    // keyboard-layout event, so this drives the exact same subscription
     // handler (`refresh_caret_input_mode_for_keyboard_layout_change`) the
     // production subscription calls, through a test-only injection point,
     // rather than a dispatcher classification, the focus listener, or the

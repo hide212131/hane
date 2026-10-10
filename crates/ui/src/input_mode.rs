@@ -21,12 +21,12 @@ pub(crate) fn update_keyboard_input_mode(
 }
 
 // Unit tests use GPUI's test platform, not the host's actual input source.
-// Regression tests that need to drive the real on-focus/keyboard-layout
-// listeners end-to-end (see `view.rs`'s
-// `caret_mode_badge_updates_through_the_real_focus_listener`) read this
-// test-only cell through `set_test_active_keyboard_input_mode` instead of
-// calling the platform, which the test harness cannot make report anything
-// but a fixed value.
+// Regression tests that need to drive the real keyboard-layout listener
+// end-to-end (see `view.rs`'s
+// `caret_mode_badge_updates_through_the_real_keyboard_layout_listener`) read
+// this test-only cell through `set_test_active_keyboard_input_mode` instead
+// of calling the platform, which the test harness cannot make report
+// anything but a fixed value.
 #[cfg(test)]
 std::thread_local! {
     static TEST_ACTIVE_KEYBOARD_INPUT_MODE: std::cell::Cell<Option<KeyboardInputMode>> =
