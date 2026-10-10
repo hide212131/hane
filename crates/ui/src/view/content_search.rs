@@ -13,6 +13,8 @@ use hane_session::search::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+#[cfg(feature = "instrument")]
+use std::sync::{Mutex, MutexGuard};
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const SEARCH_DELIVERY_POLL: Duration = Duration::from_millis(16);
@@ -118,6 +120,10 @@ struct SearchWork {
     sources: Arc<[SearchSource]>,
     next_source: AtomicUsize,
     sender: SyncSender<SearchEvent>,
+    /// Measurement-only queue accounting. It is enabled only when the
+    /// instrumented app was given a search-queue metrics output path.
+    #[cfg(feature = "instrument")]
+    queue_occupancy: Option<Arc<SearchQueueOccupancy>>,
     /// Shared, monotonically-decreasing hit/text ceilings that every worker
     /// must reserve from before queuing a file's hits. Bounds the aggregate
     /// retained context text across worker-produced, queued, and displayed
@@ -144,10 +150,97 @@ impl SearchWork {
             sources,
             next_source: AtomicUsize::new(0),
             sender,
+            #[cfg(feature = "instrument")]
+            queue_occupancy: None,
             remaining_hit_budget: AtomicUsize::new(MAX_SEARCH_HITS_TOTAL),
             remaining_text_budget: AtomicUsize::new(MAX_SEARCH_RESULT_TEXT_BYTES),
         }
     }
+
+    #[cfg(feature = "instrument")]
+    fn with_queue_occupancy(mut self, queue_occupancy: Option<Arc<SearchQueueOccupancy>>) -> Self {
+        self.queue_occupancy = queue_occupancy;
+        self
+    }
+}
+
+#[cfg(feature = "instrument")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SearchQueueOccupancySnapshot {
+    events_enqueued: usize,
+    events_dequeued: usize,
+    peak_queued_events: usize,
+}
+
+#[cfg(feature = "instrument")]
+#[derive(Default)]
+struct SearchQueueOccupancyState {
+    queued_events: usize,
+    snapshot: SearchQueueOccupancySnapshot,
+}
+
+/// Counts successful operations against the real bounded channel. The mutex
+/// makes each channel operation and its counter update one linearized step,
+/// so a fast receiver cannot observe a send before its increment is recorded.
+#[cfg(feature = "instrument")]
+#[derive(Default)]
+struct SearchQueueOccupancy {
+    state: Mutex<SearchQueueOccupancyState>,
+}
+
+#[cfg(feature = "instrument")]
+impl SearchQueueOccupancy {
+    fn lock_state(&self) -> MutexGuard<'_, SearchQueueOccupancyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the standard channel returns the original event on Full so the producer can retry it"
+    )]
+    fn try_send(
+        &self,
+        sender: &SyncSender<SearchEvent>,
+        event: SearchEvent,
+    ) -> Result<(), TrySendError<SearchEvent>> {
+        let mut state = self.lock_state();
+        match sender.try_send(event) {
+            Ok(()) => {
+                state.queued_events += 1;
+                state.snapshot.events_enqueued = state.snapshot.events_enqueued.saturating_add(1);
+                state.snapshot.peak_queued_events =
+                    state.snapshot.peak_queued_events.max(state.queued_events);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_recv(&self, receiver: &Receiver<SearchEvent>) -> Result<SearchEvent, TryRecvError> {
+        let mut state = self.lock_state();
+        match receiver.try_recv() {
+            Ok(event) => {
+                debug_assert!(state.queued_events > 0);
+                state.queued_events = state.queued_events.saturating_sub(1);
+                state.snapshot.events_dequeued = state.snapshot.events_dequeued.saturating_add(1);
+                Ok(event)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn snapshot(&self) -> SearchQueueOccupancySnapshot {
+        self.lock_state().snapshot
+    }
+}
+
+#[cfg(feature = "instrument")]
+struct CompletedSearchQueueMeasurement {
+    key: SearchKey,
+    source_count: usize,
+    snapshot: SearchQueueOccupancySnapshot,
 }
 
 struct ActiveSearchWorker {
@@ -201,6 +294,10 @@ pub(super) struct ContentSearchState {
     status_detail: Option<String>,
     current_work: Option<Arc<SearchWork>>,
     receiver: Option<Receiver<SearchEvent>>,
+    #[cfg(feature = "instrument")]
+    queue_occupancy: Option<Arc<SearchQueueOccupancy>>,
+    #[cfg(feature = "instrument")]
+    completed_queue_measurement: Option<CompletedSearchQueueMeasurement>,
     active_workers: HashMap<u64, ActiveSearchWorker>,
     next_worker_id: u64,
     next_navigation_id: u64,
@@ -243,6 +340,10 @@ impl Default for ContentSearchState {
             status_detail: None,
             current_work: None,
             receiver: None,
+            #[cfg(feature = "instrument")]
+            queue_occupancy: None,
+            #[cfg(feature = "instrument")]
+            completed_queue_measurement: None,
             active_workers: HashMap::new(),
             next_worker_id: 1,
             next_navigation_id: 1,
@@ -316,6 +417,11 @@ impl ContentSearchState {
             work.cancellation.cancel();
         }
         self.receiver = None;
+        #[cfg(feature = "instrument")]
+        {
+            self.queue_occupancy = None;
+            self.completed_queue_measurement = None;
+        }
         self.pending_file = None;
         self.terminal_key = None;
         self.terminal_reason = None;
@@ -720,13 +826,21 @@ impl EditorView {
             return;
         }
         self.content_search.total_files = sources.len();
-        let work = Arc::new(SearchWork::new(
-            key,
-            query,
-            SearchCancellationToken::new(),
-            sources,
-            sender,
-        ));
+        #[cfg(feature = "instrument")]
+        let queue_occupancy = self
+            .instrumentation
+            .search_queue_metrics_output
+            .as_ref()
+            .map(|_| Arc::new(SearchQueueOccupancy::default()));
+        #[cfg(feature = "instrument")]
+        {
+            self.content_search.queue_occupancy = queue_occupancy.clone();
+            self.content_search.completed_queue_measurement = None;
+        }
+        let work = SearchWork::new(key, query, SearchCancellationToken::new(), sources, sender);
+        #[cfg(feature = "instrument")]
+        let work = work.with_queue_occupancy(queue_occupancy);
+        let work = Arc::new(work);
         self.content_search.current_work = Some(work);
         self.content_search.receiver = Some(receiver);
         self.content_search.workers_started = 0;
@@ -992,7 +1106,15 @@ impl EditorView {
             let Some(receiver) = self.content_search.receiver.as_ref() else {
                 break;
             };
-            match receiver.try_recv() {
+            #[cfg(feature = "instrument")]
+            let received = self
+                .content_search
+                .queue_occupancy
+                .as_ref()
+                .map_or_else(|| receiver.try_recv(), |queue| queue.try_recv(receiver));
+            #[cfg(not(feature = "instrument"))]
+            let received = receiver.try_recv();
+            match received {
                 Ok(event) => {
                     events += 1;
                     self.content_search
@@ -1009,6 +1131,20 @@ impl EditorView {
         }
         self.content_search
             .finish_search_if_drained(channel_empty && self.content_search.pending_file.is_none());
+        #[cfg(feature = "instrument")]
+        if let Some(measurement) = self.content_search.completed_queue_measurement.take()
+            && let Some(output) = self.instrumentation.search_queue_metrics_output.as_mut()
+            && let Err(error) = output.record_search_queue(
+                measurement.key,
+                measurement.source_count,
+                measurement.snapshot.events_enqueued,
+                measurement.snapshot.events_dequeued,
+                measurement.snapshot.peak_queued_events,
+                MAX_SEARCH_QUEUED_FILES,
+            )
+        {
+            eprintln!("could not record HANE_SEARCH_QUEUE_METRICS_PATH: {error}");
+        }
         let keep_polling = self.content_search.has_search_work();
         if !keep_polling {
             self.content_search.delivery_poll_active = false;
@@ -1026,6 +1162,10 @@ impl EditorView {
         self.content_search.last_query_change = None;
         work.cancellation.cancel();
         self.content_search.receiver = None;
+        #[cfg(feature = "instrument")]
+        {
+            self.content_search.queue_occupancy = None;
+        }
         self.content_search.pending_file = None;
         self.content_search.status = ContentSearchStatus::Stopping;
         self.content_search.status_detail = None;
@@ -1980,6 +2120,8 @@ impl ContentSearchState {
             return;
         };
         let key = work.key;
+        #[cfg(feature = "instrument")]
+        let source_count = work.sources.len();
         let no_active = self.active_workers_for(key) == 0;
         let all_sources_claimed = work.next_source.load(Ordering::Acquire) >= work.sources.len();
         if no_active && all_sources_claimed && channel_empty && self.pending_file.is_none() {
@@ -1992,6 +2134,17 @@ impl ContentSearchState {
                 || self.terminal_reason == Some(SearchCompletion::Partial);
             self.current_work = None;
             self.receiver = None;
+            #[cfg(feature = "instrument")]
+            {
+                self.completed_queue_measurement =
+                    self.queue_occupancy
+                        .take()
+                        .map(|queue| CompletedSearchQueueMeasurement {
+                            key,
+                            source_count,
+                            snapshot: queue.snapshot(),
+                        });
+            }
             self.status = if partial {
                 ContentSearchStatus::Partial
             } else {
@@ -2058,7 +2211,7 @@ fn run_search_worker(work: Arc<SearchWork>, files: Arc<dyn FileService>) -> Resu
             },
             SearchOutcome::Cancelled { .. } => break,
         };
-        if !send_search_event(&work.sender, event, &work.cancellation) {
+        if !send_search_event_for_work(&work, event) {
             break;
         }
     }
@@ -2147,11 +2300,7 @@ fn release_global_delivery_budget(work: &SearchWork, result: &FileSearchResult) 
     if result.hits.is_empty() {
         return;
     }
-    let text_bytes: usize = result
-        .hits
-        .iter()
-        .map(|hit| hit.context_source.len())
-        .sum();
+    let text_bytes: usize = result.hits.iter().map(|hit| hit.context_source.len()).sum();
     work.remaining_hit_budget
         .fetch_add(result.hits.len(), Ordering::AcqRel);
     work.remaining_text_budget
@@ -2222,14 +2371,55 @@ fn target_version_is_current(
 
 fn send_search_event(
     sender: &SyncSender<SearchEvent>,
-    mut event: SearchEvent,
+    event: SearchEvent,
     cancellation: &SearchCancellationToken,
 ) -> bool {
+    send_search_event_with(sender, event, cancellation, SyncSender::try_send)
+}
+
+#[cfg(feature = "instrument")]
+#[allow(
+    clippy::result_large_err,
+    reason = "the standard channel returns the original event on Full so the producer can retry it"
+)]
+fn send_search_event_with_queue(
+    sender: &SyncSender<SearchEvent>,
+    event: SearchEvent,
+    cancellation: &SearchCancellationToken,
+    queue_occupancy: &SearchQueueOccupancy,
+) -> bool {
+    send_search_event_with(sender, event, cancellation, |sender, event| {
+        queue_occupancy.try_send(sender, event)
+    })
+}
+
+fn send_search_event_for_work(work: &SearchWork, event: SearchEvent) -> bool {
+    #[cfg(feature = "instrument")]
+    if let Some(queue_occupancy) = work.queue_occupancy.as_deref() {
+        return send_search_event_with_queue(
+            &work.sender,
+            event,
+            &work.cancellation,
+            queue_occupancy,
+        );
+    }
+    send_search_event(&work.sender, event, &work.cancellation)
+}
+
+fn send_search_event_with<F>(
+    sender: &SyncSender<SearchEvent>,
+    mut event: SearchEvent,
+    cancellation: &SearchCancellationToken,
+    mut try_send: F,
+) -> bool
+where
+    F: FnMut(&SyncSender<SearchEvent>, SearchEvent) -> Result<(), TrySendError<SearchEvent>>,
+{
     loop {
         if cancellation.is_cancelled() {
             return false;
         }
-        match sender.try_send(event) {
+        match try_send(sender, event) {
             Ok(()) => return true,
             Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
@@ -2412,7 +2602,11 @@ mod tests {
 
         reserve_global_delivery_budget(&work, &mut result);
 
-        assert_eq!(result.hits.len(), 1, "the second 700-byte hit must stay under the text ceiling");
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "the second 700-byte hit must stay under the text ceiling"
+        );
         assert_eq!(result.completion, SearchFileCompletion::LimitReached);
         assert_eq!(work.remaining_text_budget.load(Ordering::Relaxed), 300);
     }
@@ -2688,7 +2882,10 @@ mod tests {
 
         cx.simulate_keystrokes("ctrl-tab");
         cx.run_until_parked();
-        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            first
+        );
         assert!(view.read_with(cx, |view, _| view.content_search_input_is_focused()));
     }
 
@@ -2736,7 +2933,10 @@ mod tests {
 
         cx.simulate_keystrokes("ctrl-tab");
         cx.run_until_parked();
-        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            first
+        );
         assert!(view.read_with(cx, |view, _| view.content_search_results_focused()));
     }
 
@@ -2908,9 +3108,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn clicking_the_editor_body_clears_content_search_input_focus(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn clicking_the_editor_body_clears_content_search_input_focus(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
@@ -3010,6 +3208,98 @@ mod tests {
 
         assert!(!worker.join().unwrap());
         assert_eq!(receiver.try_recv().unwrap(), queued);
+    }
+
+    #[cfg(feature = "instrument")]
+    #[test]
+    fn queue_occupancy_records_successful_runtime_operations_and_peak() {
+        let (sender, receiver) = mpsc::sync_channel(3);
+        let occupancy = SearchQueueOccupancy::default();
+        let search_key = key(1);
+        let progress_event = || SearchEvent::Progress {
+            key: search_key,
+            files_scanned: 1,
+            files_total: 3,
+            hits_found: 0,
+        };
+
+        for _ in 0..3 {
+            occupancy.try_send(&sender, progress_event()).unwrap();
+        }
+        assert!(matches!(
+            occupancy.try_send(&sender, progress_event()),
+            Err(TrySendError::Full(_))
+        ));
+        assert_eq!(
+            occupancy.snapshot(),
+            SearchQueueOccupancySnapshot {
+                events_enqueued: 3,
+                events_dequeued: 0,
+                peak_queued_events: 3,
+            }
+        );
+
+        occupancy.try_recv(&receiver).unwrap();
+        occupancy.try_recv(&receiver).unwrap();
+        occupancy.try_send(&sender, progress_event()).unwrap();
+        while occupancy.try_recv(&receiver).is_ok() {}
+
+        assert_eq!(
+            occupancy.snapshot(),
+            SearchQueueOccupancySnapshot {
+                events_enqueued: 4,
+                events_dequeued: 4,
+                peak_queued_events: 3,
+            },
+            "a failed full-channel send must not count, and dequeue/reuse must not lower the high-water mark"
+        );
+    }
+
+    #[cfg(feature = "instrument")]
+    #[test]
+    fn queue_occupancy_stays_consistent_with_concurrent_producer_and_receiver() {
+        const EVENT_COUNT: usize = 2_000;
+        const QUEUE_CAPACITY: usize = 8;
+        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let occupancy = Arc::new(SearchQueueOccupancy::default());
+        let producer_occupancy = occupancy.clone();
+        let search_key = key(1);
+        let producer = std::thread::spawn(move || {
+            let cancellation = SearchCancellationToken::new();
+            for index in 0..EVENT_COUNT {
+                let event = SearchEvent::Progress {
+                    key: search_key,
+                    files_scanned: index as u64,
+                    files_total: EVENT_COUNT as u64,
+                    hits_found: 0,
+                };
+                assert!(send_search_event_with_queue(
+                    &sender,
+                    event,
+                    &cancellation,
+                    &producer_occupancy,
+                ));
+            }
+        });
+
+        for _ in 0..EVENT_COUNT {
+            loop {
+                match occupancy.try_recv(&receiver) {
+                    Ok(_) => break,
+                    Err(TryRecvError::Empty) => std::thread::yield_now(),
+                    Err(TryRecvError::Disconnected) => {
+                        panic!("producer disconnected before sending all events")
+                    }
+                }
+            }
+        }
+        producer.join().unwrap();
+
+        let snapshot = occupancy.snapshot();
+        assert_eq!(snapshot.events_enqueued, EVENT_COUNT);
+        assert_eq!(snapshot.events_dequeued, EVENT_COUNT);
+        assert!(snapshot.peak_queued_events > 0);
+        assert!(snapshot.peak_queued_events <= QUEUE_CAPACITY);
     }
 
     // Issue #414/#417: delivery was previously capped at
@@ -3572,7 +3862,8 @@ mod tests {
         });
         let current_draft_session = view.read_with(cx, |view, _| view.sessions.active_id());
         let other_draft_session = view.update(cx, |view, _| {
-            view.sessions.open_untitled("other folder's draft", "Untitled")
+            view.sessions
+                .open_untitled("other folder's draft", "Untitled")
         });
 
         let sources = view.update(cx, |view, _| {
