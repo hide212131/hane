@@ -1274,7 +1274,7 @@ impl WindowsWindowInner {
 
     fn handle_ime_notify(&self, wparam: WPARAM) -> Option<isize> {
         dispatch_input_mode_ime_notification(wparam.0 as u32, || {
-            self.handle_input_language_changed()
+            let _ = self.handle_input_language_changed();
         })
     }
 
@@ -1797,13 +1797,12 @@ fn get_frame_thicknessy(dpi: u32) -> i32 {
 
 fn dispatch_input_mode_ime_notification(
     notification: u32,
-    refresh_keyboard_layout: impl FnOnce() -> Option<isize>,
+    refresh_keyboard_layout: impl FnOnce(),
 ) -> Option<isize> {
     if matches!(notification, IMN_SETOPENSTATUS | IMN_SETCONVERSIONMODE) {
-        refresh_keyboard_layout()
-    } else {
-        None
+        refresh_keyboard_layout();
     }
+    None
 }
 
 fn notify_frame_changed(handle: HWND) {
@@ -1841,10 +1840,9 @@ mod hane_input_mode_notification_tests {
             let mut refresh_count = 0;
             let result = dispatch_input_mode_ime_notification(notification, || {
                 refresh_count += 1;
-                Some(0)
             });
 
-            assert_eq!(result, Some(0));
+            assert_eq!(result, None);
             assert_eq!(refresh_count, 1);
         }
     }
@@ -1854,7 +1852,6 @@ mod hane_input_mode_notification_tests {
         let mut refresh_count = 0;
         let result = dispatch_input_mode_ime_notification(0, || {
             refresh_count += 1;
-            Some(0)
         });
 
         assert_eq!(result, None);
