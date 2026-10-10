@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hane_ai::{
-    AccountState, ActiveConnection, AdmissionError, AiCommand, AiService, AiServiceConfig,
+    AccountState, AdmissionError, AiCommand, AiService, AiServiceConfig,
     AiSettingsLock, BrowserOpenError, BrowserOpener, FakeCredentialStore, ModelListState,
     OperationId, SafeOperationResult, ServiceBusyReason, ShellEnvironmentPolicyFormat,
     TextTransformErrorCode, TextTransformOutcome,
@@ -201,14 +201,14 @@ fn text_transform_rejects_invalid_input_before_touching_busy_state() {
     let (service, data_root) = prepare_connected_service("probe_success");
     let handle = service.handle();
 
-    assert_eq!(
+    assert!(matches!(
         handle.try_submit_text_transform(String::new(), "text".to_owned()),
         Err(AdmissionError::InvalidInput)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         handle.try_submit_text_transform("instruction".to_owned(), String::new()),
         Err(AdmissionError::InvalidInput)
-    );
+    ));
     assert!(handle.snapshot().busy.is_none());
 
     drop(service);
@@ -231,9 +231,11 @@ fn text_transform_keeps_other_ai_operations_busy_until_terminal_and_rejects_a_se
         handle.try_submit(AiCommand::Logout),
         Err(AdmissionError::Busy)
     );
-    assert_eq!(
-        handle.try_submit_text_transform("another".to_owned(), "本文2".to_owned()),
-        Err(AdmissionError::Busy),
+    assert!(
+        matches!(
+            handle.try_submit_text_transform("another".to_owned(), "本文2".to_owned()),
+            Err(AdmissionError::Busy),
+        ),
         "a second text transform must not run concurrently with the first"
     );
     let settings_lock = AiSettingsLock::new(data_root.join("ai/ai-settings.lock"));
@@ -312,10 +314,10 @@ fn a_fixed_probe_and_a_text_transform_never_run_concurrently_and_probe_input_nev
     let handle = service.handle();
     let probe_id = handle.try_submit(AiCommand::Probe).unwrap();
     wait_for_probe_record(&data_root, "TURN_START:");
-    assert_eq!(
+    assert!(matches!(
         handle.try_submit_text_transform("校正する".to_owned(), "本文".to_owned()),
         Err(AdmissionError::Busy)
-    );
+    ));
     handle.cancel(probe_id).unwrap();
     assert_eq!(wait_for_result(&service, probe_id), SafeOperationResult::Canceled);
 

@@ -3014,6 +3014,10 @@ impl AiSettingsPage {
                     "応答を確認中です",
                     "保存済みの接続へ短いテストメッセージを送信しています。",
                 ),
+                ServiceBusyReason::TextTransform => (
+                    "選択範囲をAIで処理中です",
+                    "結果を確認できるまで、ほかのAI操作は実行できません。",
+                ),
             }
         } else if self.snapshot.persistence == PersistenceState::NotCommitted {
             (
@@ -3240,6 +3244,7 @@ fn admission_message(error: AdmissionError) -> String {
             "AI runtimeを利用できません。設定と実行環境を確認してください。".to_owned()
         }
         AdmissionError::WrongOperation => "この操作は現在のAI処理に適用できません。".to_owned(),
+        AdmissionError::InvalidInput => "指示または選択範囲を確認してください。".to_owned(),
     }
 }
 

@@ -11,9 +11,9 @@ use gpui::{
     App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
-use gpui_component::Disableable;
+use gpui_component::{Disableable, Sizable};
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use hane_ai::{AiPaths, UserPromptDraft, UserPrompts, UserPromptsLoadError, UserPromptsSaveError};
 use hane_session::FileStateStore;
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ pub(super) struct AiPromptsPage {
     draft: Vec<UserPromptDraft>,
     selected: usize,
     title_input: Option<Entity<InputState>>,
-    body_input: Option<Entity<InputState>>,
+    body_input: Option<Entity<TextareaState>>,
     message: Option<String>,
     busy: bool,
     leave_prompt: Option<LeaveTarget>,
@@ -170,7 +170,7 @@ impl AiPromptsPage {
     fn flush_selected_from_inputs(&mut self, cx: &App) {
         if let (Some(title_input), Some(body_input)) = (&self.title_input, &self.body_input) {
             let title = value(title_input, cx);
-            let prompt = value(body_input, cx);
+            let prompt = textarea_value(body_input, cx);
             if let Some(entry) = self.draft.get_mut(self.selected) {
                 entry.title = title;
                 entry.prompt = prompt;
@@ -184,7 +184,7 @@ impl AiPromptsPage {
             && let Some(entry) = draft.get_mut(self.selected)
         {
             entry.title = value(title_input, cx);
-            entry.prompt = value(body_input, cx);
+            entry.prompt = textarea_value(body_input, cx);
         }
         draft
     }
@@ -203,7 +203,7 @@ impl AiPromptsPage {
         match (&self.title_input, &self.body_input) {
             (Some(title_input), Some(body_input)) => {
                 set_value(title_input, &title, window, cx);
-                set_value(body_input, &prompt, window, cx);
+                set_textarea_value(body_input, &prompt, window, cx);
             }
             _ => {
                 self.title_input = Some(cx.new(|cx| {
@@ -212,9 +212,8 @@ impl AiPromptsPage {
                         .placeholder("タイトル")
                 }));
                 self.body_input = Some(cx.new(|cx| {
-                    InputState::new(window, cx)
+                    TextareaState::new(window, cx)
                         .default_value(&prompt)
-                        .multi_line()
                         .placeholder("保存した指示として、選択範囲のAIメニューから実行する内容")
                 }));
             }
@@ -625,7 +624,7 @@ impl AiPromptsPage {
                 .child("タイトル")
                 .children(title_input.map(|input| Input::new(&input).aria_label("prompt title")))
                 .child("プロンプト")
-                .children(body_input.map(|input| Input::new(&input).aria_label("prompt body")))
+                .children(body_input.map(|input| Textarea::new(&input).aria_label("prompt body")))
                 .into_any_element()
         };
         div().w_full().flex().gap_4().child(list_column).child(detail)
@@ -716,6 +715,19 @@ fn value(input: &Entity<InputState>, cx: &App) -> String {
 }
 
 fn set_value(input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut Context<EditorView>) {
+    input.update(cx, |state, cx| state.set_value(value, window, cx));
+}
+
+fn textarea_value(input: &Entity<TextareaState>, cx: &App) -> String {
+    input.read(cx).value().to_string()
+}
+
+fn set_textarea_value(
+    input: &Entity<TextareaState>,
+    value: &str,
+    window: &mut Window,
+    cx: &mut Context<EditorView>,
+) {
     input.update(cx, |state, cx| state.set_value(value, window, cx));
 }
 
