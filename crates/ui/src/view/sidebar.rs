@@ -189,6 +189,40 @@ impl EditorView {
                 .bg(rgb(self.theme.code_background))
                 .child(row_icon(icon_path, self.theme.foreground))
         };
+        let sidebar_sort = self.settings.sidebar_sort;
+        let sort_menu_view = cx.entity();
+        let sort_button = Button::new("work-folder-sort-menu")
+            .label(format!("並べ替え: {}", sidebar_sort.label()))
+            .small()
+            .ghost()
+            .dropdown_menu(move |mut menu, _, _| {
+                for order in WorkFolderSortOrder::all() {
+                    let view = sort_menu_view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .id(order.as_str())
+                                .debug_selector(move || {
+                                    format!("sidebar-sort-item-{}", order.as_str())
+                                })
+                                .px(px(5.0))
+                                .py(px(3.0))
+                                .child(order.label())
+                        })
+                        .checked(order == sidebar_sort)
+                        .on_click(move |_, _window, app| {
+                            view.update(app, |view, cx| {
+                                view.set_sidebar_sort(order, cx);
+                            });
+                        }),
+                    );
+                }
+                menu
+            });
+        let sort_button = div()
+            .id("work-folder-sort-menu-wrapper")
+            .debug_selector(|| "sidebar-sort-menu".to_owned())
+            .child(sort_button);
         let toolbar = div()
             .id("work-folder-toolbar")
             .debug_selector(|| "sidebar-toolbar".to_owned())
@@ -226,7 +260,8 @@ impl EditorView {
                             cx,
                         );
                     })),
-            );
+            )
+            .child(sort_button);
         let mut filter_input = div().relative().flex_1().min_w(px(0.0)).h_full();
         if self.sidebar_filter.is_empty() {
             filter_input = filter_input.child(

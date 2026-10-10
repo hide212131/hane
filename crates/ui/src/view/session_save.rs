@@ -477,6 +477,27 @@ impl EditorView {
         }
     }
 
+    /// Carries the modified time a just-landed save or autosave produced
+    /// into the retained work-folder tree — the same no-rescan update
+    /// `rename` and `insert`/`insert_folder` already give a move or
+    /// creation — so an `Updated` sidebar sort reflects this write
+    /// immediately rather than only after the next full rescan. Runs after
+    /// `apply_pending_title_sync` so a note's first write (which both
+    /// indexes it and produces its first stamp) picks up the time too, not
+    /// just an ordinary save of an already-indexed note. A session with no
+    /// on-disk stamp, or a `path` the tree was never indexed with, is a
+    /// no-op.
+    fn touch_saved_work_folder_entry(&mut self, id: SessionId, path: &Path) {
+        let modified = self
+            .sessions
+            .get(id)
+            .and_then(|session| session.file().stamp())
+            .and_then(|stamp| stamp.modified);
+        if let Some(folder) = self.work_folder.as_mut() {
+            folder.touch(path, modified);
+        }
+    }
+
     /// Re-decides title sync for a session right after one of its writes
     /// lands. `begin_title_rename` defers instead of racing a save that is
     /// still in flight (see `DocumentSession::begin_rename`), so the rename
@@ -626,6 +647,7 @@ impl EditorView {
                 cx.add_recent_document(path);
                 self.retire_work_folder_draft(id, cx);
                 self.apply_pending_title_sync(id, path);
+                self.touch_saved_work_folder_entry(id, path);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::SavedStale => {
@@ -635,6 +657,7 @@ impl EditorView {
                 self.schedule_autosave(cx);
                 self.retire_work_folder_draft(id, cx);
                 self.apply_pending_title_sync(id, path);
+                self.touch_saved_work_folder_entry(id, path);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::Conflict => {

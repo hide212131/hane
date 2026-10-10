@@ -1,4 +1,5 @@
 use crate::service::atomic_write_bytes;
+use crate::workfolder::WorkFolderSortOrder;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -52,6 +53,11 @@ pub struct Settings {
     /// stays a one-off open rather than changing what "ordinary launch"
     /// means.
     pub default_folder: Option<PathBuf>,
+    /// How the work-folder sidebar orders files and folders. Defaults to
+    /// `Name`, the order used before this setting existed, so a settings
+    /// file predating it — or simply missing the `sidebar_sort` line —
+    /// keeps that same alphabetical order rather than silently switching.
+    pub sidebar_sort: WorkFolderSortOrder,
 }
 
 impl Default for Settings {
@@ -60,6 +66,7 @@ impl Default for Settings {
             autosave: true,
             theme: ThemePreference::System,
             default_folder: None,
+            sidebar_sort: WorkFolderSortOrder::default(),
         }
     }
 }
@@ -222,6 +229,8 @@ impl SettingsRepository for FileStateStore {
                     settings.theme = ThemePreference::parse(value);
                 } else if let Some(value) = line.strip_prefix("default_folder=") {
                     settings.default_folder = Some(PathBuf::from(unescape_line(value)));
+                } else if let Some(value) = line.strip_prefix("sidebar_sort=") {
+                    settings.sidebar_sort = WorkFolderSortOrder::parse(value);
                 }
             }
         }
@@ -231,9 +240,10 @@ impl SettingsRepository for FileStateStore {
     fn store(&self, settings: &Settings) -> io::Result<()> {
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\n",
             settings.autosave,
-            settings.theme.as_str()
+            settings.theme.as_str(),
+            settings.sidebar_sort.as_str()
         );
         if let Some(folder) = &settings.default_folder {
             contents.push_str("default_folder=");
@@ -422,6 +432,7 @@ mod tests {
             autosave: false,
             theme: ThemePreference::Dark,
             default_folder: Some(PathBuf::from("C:\\notes")),
+            sidebar_sort: WorkFolderSortOrder::UpdatedOldest,
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -431,12 +442,72 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Every one of the four `WorkFolderSortOrder` values round-trips
+    /// through a real store/reload cycle, not just the one value the
+    /// adjacent `settings_survive_a_store_reload` test happens to pick.
+    #[test]
+    fn every_sidebar_sort_order_round_trips_through_a_store_reload() {
+        for order in WorkFolderSortOrder::all() {
+            let root = temporary_directory("state-sidebar-sort-round-trip");
+            let store = FileStateStore::at(&root);
+            let settings = Settings {
+                sidebar_sort: order,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            assert_eq!(
+                SettingsRepository::load(&FileStateStore::at(&root)).sidebar_sort,
+                order,
+                "order {order:?} did not round-trip"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn default_folder_is_absent_until_set() {
         let root = temporary_directory("state");
         let store = FileStateStore::at(&root);
         SettingsRepository::store(&store, &Settings::default()).unwrap();
         assert_eq!(SettingsRepository::load(&store).default_folder, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A settings file written before `sidebar_sort` existed has no such
+    // line at all; it must load as the current default order rather than
+    // fail to parse or silently switch the user's sidebar to some other
+    // value.
+    #[test]
+    fn a_settings_file_predating_sidebar_sort_loads_the_default_order() {
+        let root = temporary_directory("state");
+        let store = FileStateStore::at(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("settings.conf"), "autosave=true\ntheme=dark\n").unwrap();
+        assert_eq!(
+            SettingsRepository::load(&store).sidebar_sort,
+            WorkFolderSortOrder::default()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // A value written by an older or newer version that this version does
+    // not recognize must reset only `sidebar_sort` to the default, leaving
+    // every other persisted setting intact.
+    #[test]
+    fn an_unrecognized_sidebar_sort_value_resets_only_that_setting() {
+        let root = temporary_directory("state");
+        let store = FileStateStore::at(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("settings.conf"),
+            "autosave=false\ntheme=dark\nsidebar_sort=unknown_future_value\ndefault_folder=/notes\n",
+        )
+        .unwrap();
+        let loaded = SettingsRepository::load(&store);
+        assert_eq!(loaded.sidebar_sort, WorkFolderSortOrder::default());
+        assert!(!loaded.autosave);
+        assert_eq!(loaded.theme, ThemePreference::Dark);
+        assert_eq!(loaded.default_folder, Some(PathBuf::from("/notes")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -451,6 +522,7 @@ mod tests {
                     autosave: false,
                     theme: ThemePreference::Light,
                     default_folder: None,
+                    sidebar_sort: WorkFolderSortOrder::NameAscending,
                 })
                 .unwrap();
         }

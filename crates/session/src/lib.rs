@@ -66,5 +66,5 @@ pub use store::{
 };
 pub use workfolder::{
     OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderFolder, WorkFolderNode,
-    WorkFolderScanner,
+    WorkFolderScanner, WorkFolderSortOrder,
 };
