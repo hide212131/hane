@@ -20,7 +20,9 @@ use crate::capture::InputCapture;
 use crate::context_menu::{self, FileContextMenuState};
 use crate::icons;
 use crate::input::{InlineRenameInput, shape_inline_rename_line};
-use crate::input_mode::{KeyboardInputMode, active_keyboard_input_mode};
+use crate::input_mode::{
+    KeyboardInputMode, active_keyboard_input_mode, update_keyboard_input_mode,
+};
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
@@ -1422,8 +1424,12 @@ impl EditorView {
         let input_mode_view = cx.entity().downgrade();
         let input_mode_subscription = cx.on_keyboard_layout_change(move |app| {
             let _ = input_mode_view.update(app, |view, cx| {
-                view.caret_input_mode = active_keyboard_input_mode();
-                cx.notify();
+                if update_keyboard_input_mode(
+                    &mut view.caret_input_mode,
+                    active_keyboard_input_mode(),
+                ) {
+                    cx.notify();
+                }
             });
         });
         // The pinned find-input widget unmarks its own active IME composition
@@ -5818,8 +5824,12 @@ impl Render for EditorView {
             let focus_handle = self.focus_handle.clone();
             self._input_mode_focus_subscription =
                 Some(cx.on_focus(&focus_handle, window, |view, _, cx| {
-                    view.caret_input_mode = active_keyboard_input_mode();
-                    cx.notify();
+                    if update_keyboard_input_mode(
+                        &mut view.caret_input_mode,
+                        active_keyboard_input_mode(),
+                    ) {
+                        cx.notify();
+                    }
                 }));
         }
         let resolved_theme = resolve_theme(self.settings.theme, window.appearance());
