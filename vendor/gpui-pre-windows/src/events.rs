@@ -1831,7 +1831,9 @@ fn notify_frame_changed(handle: HWND) {
 
 #[cfg(test)]
 mod hane_input_mode_notification_tests {
-    use super::*;
+    use super::{
+        dispatch_input_mode_ime_notification, IMN_SETCONVERSIONMODE, IMN_SETOPENSTATUS,
+    };
 
     #[test]
     fn ime_mode_notifications_dispatch_a_keyboard_layout_refresh() {
