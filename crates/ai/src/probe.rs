@@ -524,6 +524,14 @@ fn cancellation_requested(
 
 /// Collects only completed agent messages belonging to the exact runtime,
 /// thread, and turn. Item IDs and output size are bounded.
+///
+/// `crate::text_transform` reuses this same collector (via
+/// [`ProbeCollector::with_max_text_bytes`]) for the identical
+/// generation/thread/turn-matching, duplicate-item, and tool-activity
+/// detection a selection text transform turn also needs, just with its own
+/// (much larger) result size cap. The fixed connectivity Probe's own public
+/// [`ProbeCollector::new`] constructor and its [`MAX_PROBE_TEXT_BYTES`] cap
+/// are unchanged by this.
 pub struct ProbeCollector {
     runtime_generation: u64,
     thread_id: String,
@@ -531,12 +539,22 @@ pub struct ProbeCollector {
     item_ids: HashSet<String>,
     text: String,
     text_bytes: usize,
+    max_text_bytes: usize,
     terminal: Option<ProbeTerminal>,
     unsafe_tool_activity: bool,
 }
 
 impl ProbeCollector {
     pub fn new(runtime_generation: u64, thread_id: String, turn_id: String) -> Self {
+        Self::with_max_text_bytes(runtime_generation, thread_id, turn_id, MAX_PROBE_TEXT_BYTES)
+    }
+
+    pub(crate) fn with_max_text_bytes(
+        runtime_generation: u64,
+        thread_id: String,
+        turn_id: String,
+        max_text_bytes: usize,
+    ) -> Self {
         Self {
             runtime_generation,
             thread_id,
@@ -544,6 +562,7 @@ impl ProbeCollector {
             item_ids: HashSet::new(),
             text: String::new(),
             text_bytes: 0,
+            max_text_bytes,
             terminal: None,
             unsafe_tool_activity: false,
         }
@@ -629,7 +648,7 @@ impl ProbeCollector {
     }
 
     fn append_bounded(&mut self, value: &str) {
-        let remaining = MAX_PROBE_TEXT_BYTES.saturating_sub(self.text_bytes);
+        let remaining = self.max_text_bytes.saturating_sub(self.text_bytes);
         if remaining == 0 {
             return;
         }
@@ -647,7 +666,11 @@ impl ProbeCollector {
     }
 }
 
-fn is_tool_activity(item_type: &str) -> bool {
+/// Shared with `crate::text_transform`, which runs under the same tool-use
+/// safety profile: both must treat the same set of App Server item kinds as
+/// unsafe tool activity, so a safety-relevant item type added to one is never
+/// silently missed by the other.
+pub(crate) fn is_tool_activity(item_type: &str) -> bool {
     matches!(
         item_type,
         "commandExecution"
@@ -661,7 +684,12 @@ fn is_tool_activity(item_type: &str) -> bool {
     ) || item_type.to_ascii_lowercase().contains("tool")
 }
 
-fn classify_provider_error(error: &Value) -> ProbeErrorCode {
+/// Maps a raw provider error payload to a stable classification without ever
+/// copying its free-text message into a snapshot or log. `crate::text_transform`
+/// reuses this same mapping against `ProbeErrorCode`'s equivalent variants,
+/// so the two capabilities never classify the same provider status
+/// differently.
+pub(crate) fn classify_provider_error(error: &Value) -> ProbeErrorCode {
     fn scan(value: &Value) -> Option<u16> {
         match value {
             Value::Object(fields) => {

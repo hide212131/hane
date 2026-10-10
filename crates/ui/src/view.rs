@@ -88,6 +88,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
+mod ai_prompts;
+mod ai_selection;
 mod ai_settings;
 mod background_parse;
 mod content_search;
@@ -497,6 +499,17 @@ enum InlineRenameKind {
     Folder,
 }
 
+/// Which settings sidebar category is currently shown. `ai_settings`
+/// ("AI") edits connection/credential settings; `ai_prompts`
+/// ("AIプロンプト") edits saved selection-action prompts independently of
+/// it (Issue #449) and never touches connection/credential state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsCategory {
+    General,
+    Connection,
+    Prompts,
+}
+
 /// State for the one sidebar row currently being edited. The editable text is
 /// kept separate from the fixed Markdown extension so input and filesystem
 /// validation cannot accidentally turn a note into another file type.
@@ -744,9 +757,11 @@ pub struct EditorView {
     stores: StateStores,
     settings: Settings,
     settings_open: bool,
-    settings_ai_page: bool,
+    settings_category: SettingsCategory,
     settings_focus_handle: FocusHandle,
     ai_settings: ai_settings::AiSettingsPage,
+    ai_prompts: ai_prompts::AiPromptsPage,
+    ai_selection: ai_selection::AiSelectionState,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -1443,6 +1458,7 @@ impl EditorView {
                 }
                 let _ = escape_interceptor_view.update(app, |view, cx| {
                     view.note_document_find_escape_keystroke(window, cx);
+                    view.note_ai_selection_escape_keystroke(window, cx);
                 });
             });
         // The pinned find-input widget's `InputState::enter` emits
@@ -1460,6 +1476,7 @@ impl EditorView {
             }
             let _ = enter_interceptor_view.update(app, |view, cx| {
                 view.note_document_find_enter_keystroke(window, cx);
+                view.note_ai_selection_enter_keystroke(window, cx);
             });
         });
         // Re-observes the local date on a timer so the sidebar's `本日`
@@ -1485,9 +1502,11 @@ impl EditorView {
             stores,
             settings,
             settings_open: false,
-            settings_ai_page: false,
+            settings_category: SettingsCategory::General,
             settings_focus_handle: cx.focus_handle(),
             ai_settings: ai_settings::AiSettingsPage::default(),
+            ai_prompts: ai_prompts::AiPromptsPage::default(),
+            ai_selection: ai_selection::AiSelectionState::default(),
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
@@ -2281,6 +2300,13 @@ impl EditorView {
 
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        // The selection AI popup's captured range/revision/instance belong to
+        // the document that was active when it opened; switching tabs, a
+        // work-folder reopen, or an in-place reload all replace that document
+        // instance, so the popup (and any in-flight text-transform request it
+        // owns) must not survive into whatever replaced it (Issue #449
+        // section 3.3/4).
+        self.ai_selection.reset();
         self.cancel_text_selection_autoscroll();
         // A coast belongs to the document it started on. Relying on the
         // `scroll_y` staleness check in `advance_scroll_inertia` alone is not
@@ -2367,6 +2393,15 @@ impl EditorView {
         let edited_session = self.sessions.active_id();
         self.invalidate_content_search_session(edited_session, cx);
         self.resync_document_find_after_edit(cx);
+        // Per the implementation spec section 4, any edit while the selection
+        // AI popup is open invalidates its captured result, even one outside
+        // the originally selected range, in this initial version. The AI
+        // replace/regenerate paths themselves reset the popup *before*
+        // calling `after_input` for their own edit, so this never fires for
+        // the edit that applies their own result.
+        if self.ai_selection.invalidate_for_edit() {
+            self.status = Some(ai_selection::AI_SELECTION_STALE_MESSAGE.to_owned());
+        }
         cx.notify();
     }
 
@@ -2915,6 +2950,7 @@ impl EditorView {
         service: Option<hane_ai::AiServiceHandle>,
         cx: &mut Context<Self>,
     ) {
+        self.ai_selection.attach(service.clone());
         self.ai_settings.attach(service, cx);
     }
 
@@ -2934,10 +2970,12 @@ impl EditorView {
             return;
         }
         crate::init_components(cx);
+        self.ai_selection.reset();
         self.blur_sidebar_filter(cx);
         self.settings_open = true;
-        self.settings_ai_page = false;
+        self.settings_category = SettingsCategory::General;
         self.ai_settings.begin_settings_session();
+        self.ai_prompts.begin_settings_session(cx);
         self.settings_error = None;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         let generation = self.file_context_menu_generation;
@@ -2966,8 +3004,9 @@ impl EditorView {
             return;
         }
         self.settings_open = false;
-        self.settings_ai_page = false;
+        self.settings_category = SettingsCategory::General;
         self.ai_settings.close_settings();
+        self.ai_prompts.close_settings();
         self.file_context_menu_busy = false;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle, cx);
@@ -2975,41 +3014,71 @@ impl EditorView {
     }
 
     pub(crate) fn handle_settings_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_ai_page && self.ai_settings.input_has_focus(window, cx) {
-            // A settings input owns Escape, including while an IME composition
-            // is active. The visible navigation remains available to leave.
-            return;
+        match self.settings_category {
+            SettingsCategory::Connection if self.ai_settings.input_has_focus(window, cx) => {
+                // A settings input owns Escape, including while an IME
+                // composition is active. The visible navigation remains
+                // available to leave.
+                return;
+            }
+            SettingsCategory::Prompts if self.ai_prompts.input_has_focus(window, cx) => return,
+            _ => {}
         }
         self.request_leave_settings(window, cx);
     }
 
-    fn select_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if ai && !self.settings_ai_page {
+    pub(crate) fn select_settings_category(
+        &mut self,
+        category: SettingsCategory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if category == SettingsCategory::Connection && self.settings_category != category {
             self.ai_settings.activate(cx);
         }
-        self.settings_ai_page = ai;
+        self.settings_category = category;
         window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
 
     fn request_leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_ai_page && self.ai_settings.is_dirty(cx) {
-            self.ai_settings
-                .confirm_leave(ai_settings::LeaveTarget::Close);
-            cx.notify();
-        } else {
-            self.close_settings(window, cx);
+        match self.settings_category {
+            SettingsCategory::Connection if self.ai_settings.is_dirty(cx) => {
+                self.ai_settings
+                    .confirm_leave(ai_settings::LeaveTarget::Close);
+                cx.notify();
+            }
+            SettingsCategory::Prompts if self.ai_prompts.is_dirty(cx) => {
+                self.ai_prompts.confirm_leave(ai_prompts::LeaveTarget::Close);
+                cx.notify();
+            }
+            _ => self.close_settings(window, cx),
         }
     }
 
-    fn request_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_ai_page && !ai && self.ai_settings.is_dirty(cx) {
-            self.ai_settings
-                .confirm_leave(ai_settings::LeaveTarget::General);
-            cx.notify();
-        } else {
-            self.select_settings_category(ai, window, cx);
+    fn request_settings_category(
+        &mut self,
+        category: SettingsCategory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_category != category {
+            match self.settings_category {
+                SettingsCategory::Connection if self.ai_settings.is_dirty(cx) => {
+                    self.ai_settings
+                        .confirm_leave(ai_settings::LeaveTarget::General);
+                    cx.notify();
+                    return;
+                }
+                SettingsCategory::Prompts if self.ai_prompts.is_dirty(cx) => {
+                    self.ai_prompts.confirm_leave(ai_prompts::LeaveTarget::General);
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
         }
+        self.select_settings_category(category, window, cx);
     }
 
     fn set_file_context_menu(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -3075,17 +3144,27 @@ impl EditorView {
         if let Some(target) = self.ai_settings.take_ready_route() {
             match target {
                 ai_settings::LeaveTarget::General => {
-                    self.select_settings_category(false, window, cx)
+                    self.select_settings_category(SettingsCategory::General, window, cx)
                 }
                 ai_settings::LeaveTarget::Close => {
                     self.close_settings(window, cx);
                 }
             }
         }
-        let body = if self.settings_ai_page {
-            self.ai_settings_render(window, cx).into_any_element()
-        } else {
-            self.general_settings_content(cx).into_any_element()
+        if let Some(target) = self.ai_prompts.take_ready_route() {
+            match target {
+                ai_prompts::LeaveTarget::General => {
+                    self.select_settings_category(SettingsCategory::General, window, cx)
+                }
+                ai_prompts::LeaveTarget::Close => {
+                    self.close_settings(window, cx);
+                }
+            }
+        }
+        let body = match self.settings_category {
+            SettingsCategory::General => self.general_settings_content(cx).into_any_element(),
+            SettingsCategory::Connection => self.ai_settings_render(window, cx).into_any_element(),
+            SettingsCategory::Prompts => self.ai_prompts_render(window, cx).into_any_element(),
         };
         self.settings_screen_shell(body, cx)
     }
@@ -3108,20 +3187,30 @@ impl EditorView {
         let general_tab = Button::new("settings-category-general")
             .label("一般")
             .ghost()
-            .selected(!self.settings_ai_page)
+            .selected(self.settings_category == SettingsCategory::General)
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| {
-                    view.request_settings_category(false, window, cx)
+                    view.request_settings_category(SettingsCategory::General, window, cx)
                 });
             });
         let view = cx.entity();
         let ai_tab = Button::new("settings-category-ai")
             .label("AI")
             .ghost()
-            .selected(self.settings_ai_page)
+            .selected(self.settings_category == SettingsCategory::Connection)
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| {
-                    view.request_settings_category(true, window, cx)
+                    view.request_settings_category(SettingsCategory::Connection, window, cx)
+                });
+            });
+        let view = cx.entity();
+        let ai_prompts_tab = Button::new("settings-category-ai-prompts")
+            .label("AIプロンプト")
+            .ghost()
+            .selected(self.settings_category == SettingsCategory::Prompts)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(SettingsCategory::Prompts, window, cx)
                 });
             });
 
@@ -3130,15 +3219,15 @@ impl EditorView {
             .flex_1()
             .min_w(px(0.0))
             .h_full();
-        let content = if self.settings_ai_page {
+        let content = if self.settings_category == SettingsCategory::General {
+            content.overflow_y_scroll().child(body)
+        } else {
             content
                 .flex()
                 .flex_col()
                 .min_h(px(0.0))
                 .overflow_hidden()
                 .child(body)
-        } else {
-            content.overflow_y_scroll().child(body)
         };
 
         let root = div()
@@ -3163,7 +3252,8 @@ impl EditorView {
             .bg(rgb(self.theme.sidebar_background))
             .child(back)
             .child(general_tab)
-            .child(ai_tab);
+            .child(ai_tab)
+            .child(ai_prompts_tab);
         install_action_listeners(root.child(sidebar).child(content), cx)
     }
 
@@ -6167,6 +6257,7 @@ impl Render for EditorView {
             None
         };
         let root = install_action_listeners(root, cx)
+            .on_action(cx.listener(EditorView::open_ai_selection_action))
             .children(sidebar)
             .children(resizer)
             .on_mouse_move(cx.listener(Self::on_panel_mouse_move))
@@ -6290,6 +6381,11 @@ impl Render for EditorView {
         };
         let rendered = if let Some(confirm) = self.tab_close_confirm.as_ref() {
             rendered.child(self.tab_close_confirm_element(confirm, cx))
+        } else {
+            rendered
+        };
+        let rendered = if let Some(overlay) = self.ai_selection_overlay(window, cx) {
+            rendered.child(overlay)
         } else {
             rendered
         };
