@@ -96,6 +96,17 @@ impl WindowsDispatcher {
         runnable.run();
         gpui::profiler::save_task_timing();
     }
+
+    // Mirrors the `wake_posted` handling in `WindowsPlatformState::run_foreground_task`
+    // (platform.rs). `try_post` only runs when we are the thread that flips the flag
+    // from false to true, so if it fails we must roll the flag back; otherwise the
+    // runnable just enqueued in `main_sender` is left with no one posting the wake
+    // message, since every later dispatch would see `wake_posted == true` and skip it.
+    fn notify_main_thread(wake_posted: &AtomicBool, try_post: impl FnOnce() -> bool) {
+        if !wake_posted.swap(true, Ordering::AcqRel) && !try_post() {
+            wake_posted.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl PlatformDispatcher for WindowsDispatcher {
@@ -118,17 +129,16 @@ impl PlatformDispatcher for WindowsDispatcher {
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
         match self.main_sender.send(priority, runnable) {
             Ok(_) => {
-                if !self.wake_posted.swap(true, Ordering::AcqRel) {
-                    unsafe {
-                        PostMessageW(
-                            Some(self.platform_window_handle.as_raw()),
-                            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
-                            WPARAM(self.validation_number),
-                            LPARAM(0),
-                        )
-                        .log_err();
-                    }
-                }
+                Self::notify_main_thread(&self.wake_posted, || unsafe {
+                    PostMessageW(
+                        Some(self.platform_window_handle.as_raw()),
+                        WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
+                        WPARAM(self.validation_number),
+                        LPARAM(0),
+                    )
+                    .log_err()
+                    .is_some()
+                });
             }
             Err(runnable) => {
                 // NOTE: Runnable may wrap a Future that is !Send.
@@ -188,4 +198,51 @@ unsafe extern "system" fn run_timer_callback(
     let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
     WindowsDispatcher::execute_runnable(runnable);
     unsafe { CloseThreadpoolTimer(timer) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hane_main_thread_wake_retry_resets_flag_when_post_fails() {
+        let wake_posted = AtomicBool::new(false);
+
+        WindowsDispatcher::notify_main_thread(&wake_posted, || false);
+
+        assert!(
+            !wake_posted.load(Ordering::Acquire),
+            "a failed notification must not leave wake_posted stuck true, \
+             otherwise a later dispatch_on_main_thread call would skip posting \
+             and the queued runnable would never be woken up"
+        );
+    }
+
+    #[test]
+    fn hane_main_thread_wake_retry_retries_after_a_previous_failure() {
+        let wake_posted = AtomicBool::new(false);
+
+        WindowsDispatcher::notify_main_thread(&wake_posted, || false);
+        assert!(!wake_posted.load(Ordering::Acquire));
+
+        let mut posted = false;
+        WindowsDispatcher::notify_main_thread(&wake_posted, || {
+            posted = true;
+            true
+        });
+
+        assert!(posted, "the next dispatch must retry posting the wake message");
+        assert!(wake_posted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hane_main_thread_wake_retry_skips_post_when_already_pending() {
+        let wake_posted = AtomicBool::new(true);
+
+        WindowsDispatcher::notify_main_thread(&wake_posted, || {
+            panic!("must not post again while a wake message is already pending")
+        });
+
+        assert!(wake_posted.load(Ordering::Acquire));
+    }
 }
