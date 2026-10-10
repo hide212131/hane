@@ -820,6 +820,12 @@ impl EditorView {
         let key = self.content_search.key();
         if sources.is_empty() {
             self.content_search.total_files = 0;
+            #[cfg(feature = "instrument")]
+            self.record_search_queue_metrics(CompletedSearchQueueMeasurement {
+                key,
+                source_count: 0,
+                snapshot: SearchQueueOccupancySnapshot::default(),
+            });
             self.content_search.status = ContentSearchStatus::Complete;
             self.content_search.status_detail = None;
             cx.notify();
@@ -851,6 +857,22 @@ impl EditorView {
         self.start_available_content_search_workers(cx);
         self.ensure_content_search_delivery_poll(cx);
         cx.notify();
+    }
+
+    #[cfg(feature = "instrument")]
+    fn record_search_queue_metrics(&mut self, measurement: CompletedSearchQueueMeasurement) {
+        if let Some(output) = self.instrumentation.search_queue_metrics_output.as_mut()
+            && let Err(error) = output.record_search_queue(
+                measurement.key,
+                measurement.source_count,
+                measurement.snapshot.events_enqueued,
+                measurement.snapshot.events_dequeued,
+                measurement.snapshot.peak_queued_events,
+                MAX_SEARCH_QUEUED_FILES,
+            )
+        {
+            eprintln!("could not record HANE_SEARCH_QUEUE_METRICS_PATH: {error}");
+        }
     }
 
     fn content_search_sources(&self) -> Vec<SearchSource> {
@@ -1132,18 +1154,8 @@ impl EditorView {
         self.content_search
             .finish_search_if_drained(channel_empty && self.content_search.pending_file.is_none());
         #[cfg(feature = "instrument")]
-        if let Some(measurement) = self.content_search.completed_queue_measurement.take()
-            && let Some(output) = self.instrumentation.search_queue_metrics_output.as_mut()
-            && let Err(error) = output.record_search_queue(
-                measurement.key,
-                measurement.source_count,
-                measurement.snapshot.events_enqueued,
-                measurement.snapshot.events_dequeued,
-                measurement.snapshot.peak_queued_events,
-                MAX_SEARCH_QUEUED_FILES,
-            )
-        {
-            eprintln!("could not record HANE_SEARCH_QUEUE_METRICS_PATH: {error}");
+        if let Some(measurement) = self.content_search.completed_queue_measurement.take() {
+            self.record_search_queue_metrics(measurement);
         }
         let keep_polling = self.content_search.has_search_work();
         if !keep_polling {
@@ -3361,6 +3373,75 @@ mod tests {
         });
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "instrument")]
+    #[gpui::test]
+    fn content_search_empty_work_folder_records_zero_queue_occupancy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::OsWorkFolderScanner;
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let fixture_id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "hane-414-empty-work-folder-{}-{fixture_id}",
+            std::process::id()
+        ));
+        let metrics_path = std::env::temp_dir().join(format!(
+            "hane-414-empty-queue-metrics-{}-{fixture_id}.csv",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let folder = OsWorkFolderScanner.scan(&root).unwrap();
+        assert!(folder.entries().is_empty());
+        let metrics_output =
+            crate::instrument::SearchQueueMetricsOutput::create(&metrics_path, "empty-work-folder")
+                .unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.initialize_content_search_input(window, cx);
+                view.instrumentation.search_queue_metrics_output = Some(metrics_output);
+                view.work_folder = Some(folder);
+                view.content_search.mode = SidebarMode::Content;
+                view.content_search.query_text = "needle".to_owned();
+                view.start_content_search(cx);
+            });
+        });
+
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.content_search.total_files, 0);
+            assert_eq!(view.content_search.status, ContentSearchStatus::Complete);
+        });
+
+        let csv = std::fs::read_to_string(&metrics_path).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "scenario,workspace_epoch,query_epoch,source_count,events_enqueued,events_dequeued,peak_queued_events,queue_capacity"
+            )
+        );
+        let row = lines.next().expect("empty-folder search must be recorded");
+        assert!(row.starts_with("\"empty-work-folder\","));
+        assert_eq!(
+            row.split(',').skip(3).collect::<Vec<_>>(),
+            ["0", "0", "0", "0", "128"]
+        );
+        assert!(lines.next().is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(metrics_path).unwrap();
     }
 
     // Issue #414/#417 S10 follow-up: zero-hit `SearchEvent::File` results add

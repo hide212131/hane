@@ -14,7 +14,7 @@ use hane_markdown::BlockIndexUpdate;
 use hane_metrics::{DurationDistribution, FrameMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// A single interpretation of the `HANE_*` measurement environment variables.
@@ -214,6 +214,10 @@ impl SearchQueueMetricsOutput {
         let Some(path) = config.search_queue_metrics_path.as_deref() else {
             return Ok(None);
         };
+        Ok(Some(Self::create(path, config.scenario.clone())?))
+    }
+
+    pub(crate) fn create(path: &Path, scenario: impl Into<String>) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -226,10 +230,10 @@ impl SearchQueueMetricsOutput {
             file,
             "scenario,workspace_epoch,query_epoch,source_count,events_enqueued,events_dequeued,peak_queued_events,queue_capacity"
         )?;
-        Ok(Some(Self {
+        Ok(Self {
             file,
-            scenario: config.scenario.clone(),
-        }))
+            scenario: scenario.into(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
