@@ -4,7 +4,7 @@ This directory vendors the crates.io package `gpui-pre-windows 0.3.6`, a
 snapshot of Zed `bcf6582ce3500df93a8a39366640173e6786cea6`. The downloaded crate
 SHA-256 is `27662e65bfcf4445d2cccfad91f1570ec07f4b1b5de98400a9f207fd19c464cf`.
 The Apache-2.0 license is retained in `LICENSE-APACHE`. Hane changes only
-`src/events.rs`.
+`src/events.rs` and `src/vsync.rs`.
 
 ## Refresh the caret's input-mode badge
 
@@ -22,6 +22,12 @@ the refresh and unrelated notifications do not:
 ```powershell
 cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_input_mode_notification
 ```
+
+The same Windows CI test command also selects the `src/vsync.rs` regression
+tests. They verify that DWM timing conversion preserves sub-millisecond
+precision, rejects a zero denominator and intervals shorter than 1 ms, and
+accepts the 1 ms boundary. Invalid timing values return an error so
+`VSyncProvider::new` uses `DEFAULT_VSYNC_INTERVAL`.
 
 The Hane UI tests for mode changes, repeated values, and unknown state run with
 the normal workspace test command. These tests do not replace the required
