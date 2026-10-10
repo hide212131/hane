@@ -401,10 +401,11 @@ impl AiPromptsPage {
     }
 
     pub(super) fn input_has_focus(&self, window: &Window, cx: &App) -> bool {
-        [&self.title_input, &self.body_input]
-            .into_iter()
-            .flatten()
-            .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+        self.title_input.as_ref().is_some_and(|input| {
+            input.read(cx).focus_handle(cx).is_focused(window)
+        }) || self.body_input.as_ref().is_some_and(|input| {
+            input.read(cx).focus_handle(cx).is_focused(window)
+        })
     }
 
     pub(super) fn render(
