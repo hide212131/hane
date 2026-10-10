@@ -3282,6 +3282,7 @@ fn models_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::SettingsCategory;
     use gpui::{Focusable, px};
     use hane_ai::{
         AiService, AiServiceConfig, FakeCredentialStore, ShellEnvironmentPolicyFormat,
@@ -3322,7 +3323,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.persistence = PersistenceState::Clean;
             view.ai_settings.snapshot.settings.custom = Some(CustomConnectionSettings {
@@ -3396,7 +3397,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.persistence = PersistenceState::Clean;
             view.ai_settings.snapshot.settings.active_connection = ActiveConnection::Custom;
@@ -3459,7 +3460,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.service = Some(handle.clone());
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.persistence = PersistenceState::Clean;
@@ -3516,7 +3517,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.persistence = PersistenceState::Clean;
             view.ai_settings.snapshot.account = AccountState::SignedIn {
@@ -3631,7 +3632,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.settings.active_connection = ActiveConnection::Custom;
             view.ai_settings.credential_edit = CredentialEdit::Replace;
@@ -3715,7 +3716,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             cx.notify();
         });
 
@@ -3747,7 +3748,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.persistence = PersistenceState::Clean;
             cx.notify();
@@ -3778,7 +3779,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.recovery_required = true;
             view.ai_settings.snapshot.persistence = PersistenceState::DurabilityUnconfirmed;
@@ -3820,7 +3821,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
         view.update(cx, |view, cx| {
             view.settings_open = true;
-            view.settings_category = super::SettingsCategory::Connection;
+            view.settings_category = SettingsCategory::Connection;
             view.ai_settings.snapshot.ownership = OwnershipState::OwnedElsewhere;
             cx.notify();
         });
