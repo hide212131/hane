@@ -1386,7 +1386,13 @@ fn cursor_overlay(theme: Theme, caret_input_mode: Option<KeyboardInputMode>) -> 
                 .text_color(rgb(theme.quote_foreground))
                 .text_size(px(9.))
                 .line_height(px(CARET_MODE_BADGE_HEIGHT))
-                .child(glyph),
+                .child(glyph)
+                // Lets regression tests address the badge actually painted
+                // for a given glyph (see `view.rs`'s
+                // `caret_mode_badge_updates_through_the_real_focus_listener`)
+                // instead of calling `caret_mode_glyph` directly. A no-op
+                // outside test builds.
+                .debug_selector(move || format!("caret-mode-badge-{glyph}")),
         );
     }
     overlay
