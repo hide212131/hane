@@ -6,10 +6,75 @@ pub(crate) enum KeyboardInputMode {
     Native,
 }
 
+/// Updates the mode shown beside the caret and reports whether the view needs
+/// to redraw. An unknown mode remains unknown instead of being shown as ASCII.
+pub(crate) fn update_keyboard_input_mode(
+    current: &mut Option<KeyboardInputMode>,
+    observed: Option<KeyboardInputMode>,
+) -> bool {
+    if *current == observed {
+        return false;
+    }
+
+    *current = observed;
+    true
+}
+
 // Unit tests use GPUI's test platform, not the host's actual input source.
+// Regression tests that need to drive the real keyboard-layout listener
+// end-to-end (see `view.rs`'s
+// `caret_mode_badge_updates_through_the_real_keyboard_layout_listener`) read
+// this test-only cell through `set_test_active_keyboard_input_mode` instead
+// of calling the platform, which the test harness cannot make report
+// anything but a fixed value.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ACTIVE_KEYBOARD_INPUT_MODE: std::cell::Cell<Option<KeyboardInputMode>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_active_keyboard_input_mode(mode: Option<KeyboardInputMode>) {
+    TEST_ACTIVE_KEYBOARD_INPUT_MODE.with(|cell| cell.set(mode));
+}
+
 #[cfg(test)]
 pub(crate) fn active_keyboard_input_mode() -> Option<KeyboardInputMode> {
-    None
+    TEST_ACTIVE_KEYBOARD_INPUT_MODE.with(|cell| cell.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn updates_only_when_the_observed_mode_changes() {
+        let mut current = Some(KeyboardInputMode::Ascii);
+
+        assert!(update_keyboard_input_mode(
+            &mut current,
+            Some(KeyboardInputMode::Native)
+        ));
+        assert_eq!(current, Some(KeyboardInputMode::Native));
+        assert!(!update_keyboard_input_mode(
+            &mut current,
+            Some(KeyboardInputMode::Native)
+        ));
+    }
+
+    #[test]
+    fn unknown_mode_hides_the_badge_and_can_be_recovered() {
+        let mut current = Some(KeyboardInputMode::Native);
+
+        assert!(update_keyboard_input_mode(&mut current, None));
+        assert_eq!(current, None);
+        assert!(!update_keyboard_input_mode(&mut current, None));
+        assert!(update_keyboard_input_mode(
+            &mut current,
+            Some(KeyboardInputMode::Ascii)
+        ));
+        assert_eq!(current, Some(KeyboardInputMode::Ascii));
+    }
 }
 
 #[cfg(all(not(test), target_os = "macos"))]

@@ -142,5 +142,8 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Test Windows IME notification dispatch
+        run: cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_input_mode_notification
+
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
