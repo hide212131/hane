@@ -725,6 +725,15 @@ impl WindowsWindowInner {
                     .log_err();
             }
         }
+        // `draw_window` calls this after `request_frame`, whose synchronous
+        // `on_focus` listeners (e.g. the caret mode badge) may have already
+        // read `active_keyboard_input_mode()` against the *previous*
+        // association, before `ImmAssociateContextEx` above repointed this
+        // window at its real IME context (or detached it). Reuse the
+        // existing keyboard-layout-change path so the mode is re-read
+        // against the now-current association and the badge is corrected
+        // rather than left on a stale snapshot.
+        let _ = self.handle_input_language_changed();
     }
 
     fn handle_ime_composition(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
