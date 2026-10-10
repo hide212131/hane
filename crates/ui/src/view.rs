@@ -7101,6 +7101,17 @@ mod tests {
             cx.run_until_parked();
         };
 
+        // Restores the thread-local test input mode to `None` on every exit
+        // path (including an assertion panic), so a later test on the same
+        // thread cannot inherit this test's last mode.
+        struct ResetTestInputModeOnDrop;
+        impl Drop for ResetTestInputModeOnDrop {
+            fn drop(&mut self) {
+                crate::input_mode::set_test_active_keyboard_input_mode(None);
+            }
+        }
+        let _reset_test_input_mode = ResetTestInputModeOnDrop;
+
         crate::input_mode::set_test_active_keyboard_input_mode(Some(KeyboardInputMode::Ascii));
         dispatch_keyboard_layout_change(&view, cx);
         assert_eq!(
