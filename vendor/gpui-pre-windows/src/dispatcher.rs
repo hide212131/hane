@@ -97,15 +97,37 @@ impl WindowsDispatcher {
         gpui::profiler::save_task_timing();
     }
 
+    // The number of `PostMessageW` attempts `notify_main_thread` makes before giving up.
+    // Bounded so a persistently failing `PostMessageW` (e.g. the window already being torn
+    // down) cannot turn this into an unbounded retry loop on the calling thread.
+    const MAX_WAKE_POST_ATTEMPTS: u8 = 3;
+
     // Mirrors the `wake_posted` handling in `WindowsPlatformState::run_foreground_task`
     // (platform.rs). `try_post` only runs when we are the thread that flips the flag
-    // from false to true, so if it fails we must roll the flag back; otherwise the
-    // runnable just enqueued in `main_sender` is left with no one posting the wake
-    // message, since every later dispatch would see `wake_posted == true` and skip it.
-    fn notify_main_thread(wake_posted: &AtomicBool, try_post: impl FnOnce() -> bool) {
-        if !wake_posted.swap(true, Ordering::AcqRel) && !try_post() {
-            wake_posted.store(false, Ordering::Release);
+    // from false to true; every other concurrent caller sees `wake_posted == true` and
+    // returns immediately, trusting that this caller will get a wake message posted.
+    //
+    // That trust is why a single failed `PostMessageW` cannot simply roll the flag back:
+    // by the time it fails, another thread may already have enqueued a runnable and
+    // skipped its own post because it observed `wake_posted == true` first. Rolling back
+    // immediately would strand both that runnable and our own with no pending wake
+    // message until some unrelated later dispatch happens to retry. So we retry the post
+    // ourselves first, synchronously and a bounded number of times, before giving up the
+    // claim.
+    fn notify_main_thread(wake_posted: &AtomicBool, mut try_post: impl FnMut() -> bool) {
+        if wake_posted.swap(true, Ordering::AcqRel) {
+            return;
         }
+
+        for _ in 0..Self::MAX_WAKE_POST_ATTEMPTS {
+            if try_post() {
+                return;
+            }
+        }
+
+        // Every attempt failed; give up our claim so a later dispatch can retry instead of
+        // leaving the flag stuck at true forever.
+        wake_posted.store(false, Ordering::Release);
     }
 }
 
@@ -244,5 +266,66 @@ mod tests {
         });
 
         assert!(wake_posted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hane_main_thread_wake_retry_recovers_lost_wake_from_interleaved_dispatch() {
+        // Reproduces the exact-head race: dispatch A claims `wake_posted` (false -> true)
+        // and starts its `PostMessageW` call. While that call is in flight, dispatch B
+        // enqueues its own runnable, observes `wake_posted == true`, and skips posting,
+        // trusting A to wake the main thread. A's first `PostMessageW` attempt then fails.
+        // Without a retry, both A's and B's runnables would be stuck with no pending wake.
+        let wake_posted = AtomicBool::new(false);
+        let attempts = std::cell::Cell::new(0);
+
+        WindowsDispatcher::notify_main_thread(&wake_posted, || {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+
+            if attempt == 0 {
+                assert!(
+                    wake_posted.swap(true, Ordering::AcqRel),
+                    "dispatch B must observe wake_posted already true and skip its own post"
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        assert!(
+            wake_posted.load(Ordering::Acquire),
+            "a retried post must still end up pending so the runnables queued by both \
+             dispatch A and dispatch B are woken up"
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "the retry must happen inside notify_main_thread itself, not depend on a \
+             later unrelated dispatch"
+        );
+    }
+
+    #[test]
+    fn hane_main_thread_wake_retry_gives_up_after_bounded_attempts() {
+        let wake_posted = AtomicBool::new(false);
+        let attempts = std::cell::Cell::new(0u8);
+
+        WindowsDispatcher::notify_main_thread(&wake_posted, || {
+            attempts.set(attempts.get() + 1);
+            false
+        });
+
+        assert_eq!(
+            attempts.get(),
+            WindowsDispatcher::MAX_WAKE_POST_ATTEMPTS,
+            "a persistently failing PostMessageW must be retried a bounded number of \
+             times, not spun on indefinitely"
+        );
+        assert!(
+            !wake_posted.load(Ordering::Acquire),
+            "once retries are exhausted the flag must be released so a later dispatch \
+             can still retry"
+        );
     }
 }

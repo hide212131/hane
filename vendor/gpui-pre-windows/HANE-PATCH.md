@@ -48,16 +48,27 @@ already resets this same flag to false when its own `PostMessageW` fails;
 `WindowsDispatcher::notify_main_thread` helper, so the next dispatch on any
 thread retries the notification instead of leaving the queue silently stuck.
 
-This still relies on some later `dispatch_on_main_thread` call to retry the
-post; if the flag is reset and no main-thread work is ever dispatched again,
-the backlog stays queued until that happens. `run_foreground_task` drains all
-pending runnables on every wake, so in practice any later dispatch (not
-necessarily related to the stuck runnables) clears the backlog. We accepted
-this as consistent with the already-accepted `run_foreground_task` design
-rather than adding a blocking retry loop on the calling thread.
+Relying solely on some later `dispatch_on_main_thread` call to retry the post
+left a lost-wake interleaving: dispatch A claims `wake_posted` (false -> true)
+and starts its `PostMessageW` call; dispatch B enqueues its own runnable while
+A's post is in flight, observes `wake_posted == true`, and skips posting,
+trusting A to wake the main thread; A's `PostMessageW` then fails and reset
+the flag to false. Both runnables were left queued with no pending wake
+message, and nothing guaranteed a later unrelated dispatch would ever arrive
+to retry.
 
-A focused regression test exercises the flag-reset/retry/skip logic directly
-(it does not call the real `PostMessageW`, since forcing that specific Win32
+`notify_main_thread` now retries its own `PostMessageW` call synchronously,
+up to `WindowsDispatcher::MAX_WAKE_POST_ATTEMPTS` (3) times, before giving up
+the claim. This recovers the interleaving above without depending on a later
+dispatch, while staying bounded so a persistently failing `PostMessageW`
+(e.g. the window already being torn down) cannot turn into an unbounded
+retry loop on the calling thread. If every attempt fails, the flag is still
+released so a later dispatch can retry, matching the previous fallback
+behavior.
+
+Focused regression tests exercise the flag-reset/retry/skip logic, the
+interleaved lost-wake scenario above, and the bounded give-up directly (they
+do not call the real `PostMessageW`, since forcing that specific Win32
 failure deterministically in a unit test is impractical):
 
 ```powershell
