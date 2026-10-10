@@ -862,6 +862,7 @@ impl EditorView {
             .border_1()
             .border_color(rgb(self.theme.sidebar_foreground))
             .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
             .child(search_input);
         let status = div()
             .id("document-find-status")
@@ -885,6 +886,7 @@ impl EditorView {
             .rounded_sm()
             .cursor_pointer()
             .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
             .child("‹")
             .on_click(cx.listener(|view, _, _, cx| view.document_find_previous(cx)));
         let previous = HoverCard::new("document-find-previous-tooltip")
@@ -904,6 +906,7 @@ impl EditorView {
             .rounded_sm()
             .cursor_pointer()
             .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
             .child("›")
             .on_click(cx.listener(|view, _, _, cx| view.document_find_next(cx)));
         let next = HoverCard::new("document-find-next-tooltip")
@@ -923,6 +926,7 @@ impl EditorView {
             .rounded_sm()
             .cursor_pointer()
             .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
             .child(if self.document_find.case_sensitive {
                 "Aa✓"
             } else {
@@ -945,6 +949,7 @@ impl EditorView {
             .rounded_sm()
             .cursor_pointer()
             .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
             .child("閉じる")
             .on_click(cx.listener(|view, _, window, cx| {
                 view.leave_document_find(window, cx);
