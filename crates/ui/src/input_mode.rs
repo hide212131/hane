@@ -30,7 +30,7 @@ pub(crate) fn update_keyboard_input_mode(
 #[cfg(test)]
 std::thread_local! {
     static TEST_ACTIVE_KEYBOARD_INPUT_MODE: std::cell::Cell<Option<KeyboardInputMode>> =
-        std::cell::Cell::new(None);
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]

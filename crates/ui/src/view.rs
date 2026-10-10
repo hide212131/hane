@@ -1424,12 +1424,7 @@ impl EditorView {
         let input_mode_view = cx.entity().downgrade();
         let input_mode_subscription = cx.on_keyboard_layout_change(move |app| {
             let _ = input_mode_view.update(app, |view, cx| {
-                if update_keyboard_input_mode(
-                    &mut view.caret_input_mode,
-                    active_keyboard_input_mode(),
-                ) {
-                    cx.notify();
-                }
+                view.refresh_caret_input_mode_for_keyboard_layout_change(cx);
             });
         });
         // The pinned find-input widget unmarks its own active IME composition
@@ -5653,6 +5648,18 @@ impl EditorView {
         cx.notify();
     }
 
+    /// The keyboard-layout-change handler registered as `_input_mode_subscription`.
+    /// Kept as its own method (rather than inlined in the subscription closure)
+    /// so regression tests can drive this exact handler through a test-only
+    /// injection point instead of reimplementing it or only exercising the
+    /// unrelated on-focus listener (see
+    /// `caret_mode_badge_updates_through_the_real_keyboard_layout_listener`).
+    fn refresh_caret_input_mode_for_keyboard_layout_change(&mut self, cx: &mut Context<Self>) {
+        if update_keyboard_input_mode(&mut self.caret_input_mode, active_keyboard_input_mode()) {
+            cx.notify();
+        }
+    }
+
     fn sidebar_resizer(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
             .id("work-folder-resizer")
@@ -7145,6 +7152,88 @@ mod tests {
         // listener.
         crate::input_mode::set_test_active_keyboard_input_mode(Some(KeyboardInputMode::Native));
         refocus_editor(&view, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.caret_input_mode),
+            Some(KeyboardInputMode::Native)
+        );
+        assert!(cx.debug_bounds("caret-mode-badge-あ").is_some());
+        assert_eq!(notify_count.replace(0), 1);
+    }
+
+    // Issue #448: the production `on_keyboard_layout_change` notification
+    // (`_input_mode_subscription`) is a distinct path from the on-focus
+    // listener exercised above — GPUI's test platform cannot raise the real
+    // OS keyboard-layout event, so this drives the exact same subscription
+    // handler (`refresh_caret_input_mode_for_keyboard_layout_change`) the
+    // production subscription calls, through a test-only injection point,
+    // rather than a dispatcher classification, the focus listener, or the
+    // low-level `update_keyboard_input_mode` state helper directly. It
+    // checks both `caret_input_mode` and the badge actually painted (via
+    // `cursor_overlay`'s `debug_selector`).
+    #[gpui::test]
+    fn caret_mode_badge_updates_through_the_real_keyboard_layout_listener(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(360.0)));
+        cx.run_until_parked();
+
+        let notify_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let notify_count_handle = notify_count.clone();
+        let observed_view = view.clone();
+        cx.update(move |_, app| {
+            app.observe(&observed_view, move |_, _| {
+                notify_count_handle.set(notify_count_handle.get() + 1);
+            })
+            .detach();
+        });
+
+        let dispatch_keyboard_layout_change = |view: &gpui::Entity<EditorView>,
+                                                cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| {
+                view.refresh_caret_input_mode_for_keyboard_layout_change(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        crate::input_mode::set_test_active_keyboard_input_mode(Some(KeyboardInputMode::Ascii));
+        dispatch_keyboard_layout_change(&view, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.caret_input_mode),
+            Some(KeyboardInputMode::Ascii)
+        );
+        assert!(cx.debug_bounds("caret-mode-badge-A").is_some());
+        assert_eq!(
+            notify_count.replace(0),
+            1,
+            "the keyboard-layout listener must redraw once when the observed mode changes"
+        );
+
+        // A duplicate notification of the same, already-current mode must
+        // not request another redraw, through the same subscription handler.
+        dispatch_keyboard_layout_change(&view, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.caret_input_mode),
+            Some(KeyboardInputMode::Ascii)
+        );
+        assert!(cx.debug_bounds("caret-mode-badge-A").is_some());
+        assert_eq!(
+            notify_count.replace(0),
+            0,
+            "a duplicate notification of the same mode must not redraw again"
+        );
+
+        // An unknown mode notification hides the badge, through the same
+        // subscription handler.
+        crate::input_mode::set_test_active_keyboard_input_mode(None);
+        dispatch_keyboard_layout_change(&view, cx);
+        assert_eq!(view.read_with(cx, |view, _| view.caret_input_mode), None);
+        assert!(cx.debug_bounds("caret-mode-badge-A").is_none());
+        assert_eq!(notify_count.replace(0), 1);
+
+        // Recovering a known mode shows the badge again with the right glyph.
+        crate::input_mode::set_test_active_keyboard_input_mode(Some(KeyboardInputMode::Native));
+        dispatch_keyboard_layout_change(&view, cx);
         assert_eq!(
             view.read_with(cx, |view, _| view.caret_input_mode),
             Some(KeyboardInputMode::Native)
