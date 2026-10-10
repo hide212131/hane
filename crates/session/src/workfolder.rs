@@ -984,11 +984,12 @@ mod tests {
 
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
 
-        let names: Vec<String> = work_folder
+        let mut names: Vec<String> = work_folder
             .entries()
             .into_iter()
             .map(|entry| entry.name().to_owned())
             .collect();
+        names.sort_unstable();
         assert_eq!(names, ["LangChain4j", "Meeting", "TODO"]);
         assert!(
             work_folder
@@ -1069,11 +1070,12 @@ mod tests {
         symlink(&external, root.join("linked")).unwrap();
 
         let folder = OsWorkFolderScanner.scan(&root).unwrap();
-        let paths: Vec<_> = folder
+        let mut paths: Vec<_> = folder
             .entries()
             .into_iter()
             .map(|entry| entry.path().to_path_buf())
             .collect();
+        paths.sort_unstable();
 
         assert_eq!(
             paths,
@@ -1296,8 +1298,8 @@ mod tests {
     #[test]
     fn set_sort_order_resorts_every_level_of_the_tree() {
         let nested = vec![
-            file_node("/notes/dev/Older.md", Some(system_time_at(10))),
             file_node("/notes/dev/Newer.md", Some(system_time_at(20))),
+            file_node("/notes/dev/Older.md", Some(system_time_at(10))),
         ];
         let children = vec![WorkFolderNode::Folder(WorkFolderFolder::new(
             PathBuf::from("/notes/dev"),
@@ -1305,21 +1307,27 @@ mod tests {
             None,
         ))];
         let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+        let nested_names = |folder: &WorkFolder| {
+            let WorkFolderNode::Folder(dev) = &folder.children()[0] else {
+                panic!("dev folder expected");
+            };
+            dev.children()
+                .iter()
+                .map(|node| match node {
+                    WorkFolderNode::File(entry) => entry.file_name(),
+                    WorkFolderNode::Folder(_) => {
+                        unreachable!("only files were nested under dev")
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        folder.set_sort_order(WorkFolderSortOrder::NameDescending);
+        assert_eq!(nested_names(&folder), ["Older.md", "Newer.md"]);
         folder.set_sort_order(WorkFolderSortOrder::UpdatedNewest);
 
-        let WorkFolderNode::Folder(dev) = &folder.children()[0] else {
-            panic!("dev folder expected");
-        };
-        let names: Vec<&str> = dev
-            .children()
-            .iter()
-            .map(|node| match node {
-                WorkFolderNode::File(entry) => entry.file_name(),
-                WorkFolderNode::Folder(_) => unreachable!("only files were nested under dev"),
-            })
-            .collect();
         assert_eq!(
-            names,
+            nested_names(&folder),
             ["Newer.md", "Older.md"],
             "a sort-order switch must resort a nested folder's own children too, not just the root"
         );
