@@ -961,6 +961,8 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.content_search.active_workers.remove(&worker_id);
+        #[cfg(feature = "instrument")]
+        let mut failed_queue_measurement = None;
         if self
             .content_search
             .current_work
@@ -970,11 +972,31 @@ impl EditorView {
             if let Err(detail) = result {
                 self.content_search.status = ContentSearchStatus::Failed;
                 self.content_search.status_detail = Some(detail);
+                #[cfg(feature = "instrument")]
+                let failed_source_count = self
+                    .content_search
+                    .current_work
+                    .as_ref()
+                    .map(|work| work.sources.len());
                 if let Some(work) = self.content_search.current_work.as_ref() {
                     work.cancellation.cancel();
                 }
                 self.content_search.current_work = None;
                 self.content_search.receiver = None;
+                #[cfg(feature = "instrument")]
+                {
+                    failed_queue_measurement = self
+                        .content_search
+                        .queue_occupancy
+                        .take()
+                        .zip(failed_source_count)
+                        .map(|(queue, source_count)| CompletedSearchQueueMeasurement {
+                            key,
+                            source_count,
+                            snapshot: queue.snapshot(),
+                        });
+                    self.content_search.completed_queue_measurement = None;
+                }
             } else {
                 self.start_available_content_search_workers(cx);
             }
@@ -998,6 +1020,13 @@ impl EditorView {
             );
             self.content_search.terminal_key = None;
             self.content_search.terminal_reason = None;
+        }
+        #[cfg(feature = "instrument")]
+        if let Some(measurement) = failed_queue_measurement {
+            // A worker error drops the receiver and ends delivery polling, so
+            // write its final queue snapshot directly from this completion
+            // path instead of waiting for a poll that can no longer run.
+            self.record_search_queue_metrics(measurement);
         }
         self.ensure_content_search_delivery_poll(cx);
         cx.notify();
@@ -2113,9 +2142,22 @@ impl ContentSearchState {
             return;
         };
         let key = work.key;
+        #[cfg(feature = "instrument")]
+        let source_count = work.sources.len();
         work.cancellation.cancel();
         self.receiver = None;
         self.pending_file = None;
+        #[cfg(feature = "instrument")]
+        {
+            self.completed_queue_measurement =
+                self.queue_occupancy
+                    .take()
+                    .map(|queue| CompletedSearchQueueMeasurement {
+                        key,
+                        source_count,
+                        snapshot: queue.snapshot(),
+                    });
+        }
         self.status = ContentSearchStatus::Stopping;
         self.status_detail = Some("検索上限に達しました。表示中は検出済みの一致です".to_owned());
         self.terminal_key = Some(key);
@@ -2779,16 +2821,38 @@ mod tests {
     #[test]
     fn reaching_a_global_delivery_limit_is_reported_as_partial() {
         let cancellation = SearchCancellationToken::new();
-        let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
-        let work = Arc::new(SearchWork::new(
+        let (sender, receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        #[cfg(feature = "instrument")]
+        let queue_occupancy = Arc::new(SearchQueueOccupancy::default());
+        #[cfg(feature = "instrument")]
+        queue_occupancy
+            .try_send(
+                &sender,
+                SearchEvent::Progress {
+                    key: key(1),
+                    files_scanned: 0,
+                    files_total: 1,
+                    hits_found: 0,
+                },
+            )
+            .unwrap();
+        let work = SearchWork::new(
             key(1),
             SearchQuery::new("query", false).unwrap(),
             cancellation.clone(),
-            Arc::from([]),
+            Arc::from([SearchSource::Disk(PathBuf::from("note.md"))]),
             sender,
-        ));
+        );
+        #[cfg(feature = "instrument")]
+        let work = work.with_queue_occupancy(Some(queue_occupancy.clone()));
+        let work = Arc::new(work);
         let mut state = ContentSearchState::default();
         state.current_work = Some(work);
+        state.receiver = Some(receiver);
+        #[cfg(feature = "instrument")]
+        {
+            state.queue_occupancy = Some(queue_occupancy);
+        }
         state.status = ContentSearchStatus::Searching;
 
         state.stop_at_global_limit();
@@ -2802,6 +2866,24 @@ mod tests {
                 .as_deref()
                 .is_some_and(|text| text.contains("上限"))
         );
+        #[cfg(feature = "instrument")]
+        {
+            assert!(state.queue_occupancy.is_none());
+            let measurement = state
+                .completed_queue_measurement
+                .take()
+                .expect("global stop must retain its final queue measurement");
+            assert_eq!(measurement.key, key(1));
+            assert_eq!(measurement.source_count, 1);
+            assert_eq!(
+                measurement.snapshot,
+                SearchQueueOccupancySnapshot {
+                    events_enqueued: 1,
+                    events_dequeued: 0,
+                    peak_queued_events: 1,
+                }
+            );
+        }
     }
 
     #[test]
@@ -3441,6 +3523,171 @@ mod tests {
         assert!(lines.next().is_none());
 
         std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(metrics_path).unwrap();
+    }
+
+    #[cfg(feature = "instrument")]
+    #[gpui::test]
+    fn content_search_worker_error_records_final_queue_occupancy(cx: &mut gpui::TestAppContext) {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let fixture_id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let metrics_path = std::env::temp_dir().join(format!(
+            "hane-414-worker-error-queue-metrics-{}-{fixture_id}.csv",
+            std::process::id()
+        ));
+        let metrics_output =
+            crate::instrument::SearchQueueMetricsOutput::create(&metrics_path, "worker-error")
+                .unwrap();
+        let search_key = key(1);
+        let (sender, receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let queue_occupancy = Arc::new(SearchQueueOccupancy::default());
+        queue_occupancy
+            .try_send(
+                &sender,
+                SearchEvent::Progress {
+                    key: search_key,
+                    files_scanned: 0,
+                    files_total: 1,
+                    hits_found: 0,
+                },
+            )
+            .unwrap();
+        let work = Arc::new(
+            SearchWork::new(
+                search_key,
+                SearchQuery::new("query", false).unwrap(),
+                SearchCancellationToken::new(),
+                Arc::from([SearchSource::Disk(PathBuf::from("note.md"))]),
+                sender,
+            )
+            .with_queue_occupancy(Some(queue_occupancy.clone())),
+        );
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.instrumentation.search_queue_metrics_output = Some(metrics_output);
+                view.content_search.status = ContentSearchStatus::Searching;
+                view.content_search.current_work = Some(work);
+                view.content_search.receiver = Some(receiver);
+                view.content_search.queue_occupancy = Some(queue_occupancy);
+                view.finish_content_search_worker(
+                    1,
+                    search_key,
+                    Err("synthetic worker error".to_owned()),
+                    cx,
+                );
+            });
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.content_search.status, ContentSearchStatus::Failed);
+            assert!(view.content_search.current_work.is_none());
+            assert!(view.content_search.receiver.is_none());
+            assert!(view.content_search.queue_occupancy.is_none());
+        });
+
+        let csv = std::fs::read_to_string(&metrics_path).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "scenario,workspace_epoch,query_epoch,source_count,events_enqueued,events_dequeued,peak_queued_events,queue_capacity"
+            )
+        );
+        let row = lines.next().expect("worker error must be recorded");
+        assert!(row.starts_with("\"worker-error\","));
+        assert_eq!(
+            row.split(',').skip(3).collect::<Vec<_>>(),
+            ["1", "1", "0", "1", "128"]
+        );
+        assert!(lines.next().is_none());
+
+        std::fs::remove_file(metrics_path).unwrap();
+    }
+
+    #[cfg(feature = "instrument")]
+    #[gpui::test]
+    fn content_search_global_limit_records_final_queue_occupancy(cx: &mut gpui::TestAppContext) {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let fixture_id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let metrics_path = std::env::temp_dir().join(format!(
+            "hane-414-global-limit-queue-metrics-{}-{fixture_id}.csv",
+            std::process::id()
+        ));
+        let metrics_output =
+            crate::instrument::SearchQueueMetricsOutput::create(&metrics_path, "global-limit")
+                .unwrap();
+        let search_key = key(1);
+        let (sender, receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let queue_occupancy = Arc::new(SearchQueueOccupancy::default());
+        queue_occupancy
+            .try_send(
+                &sender,
+                SearchEvent::Progress {
+                    key: search_key,
+                    files_scanned: 0,
+                    files_total: 1,
+                    hits_found: 0,
+                },
+            )
+            .unwrap();
+        let work = Arc::new(
+            SearchWork::new(
+                search_key,
+                SearchQuery::new("query", false).unwrap(),
+                SearchCancellationToken::new(),
+                Arc::from([SearchSource::Disk(PathBuf::from("note.md"))]),
+                sender,
+            )
+            .with_queue_occupancy(Some(queue_occupancy.clone())),
+        );
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.instrumentation.search_queue_metrics_output = Some(metrics_output);
+                view.content_search.status = ContentSearchStatus::Searching;
+                view.content_search.current_work = Some(work);
+                view.content_search.receiver = Some(receiver);
+                view.content_search.queue_occupancy = Some(queue_occupancy);
+                view.content_search.stop_at_global_limit();
+                assert!(view.content_search.queue_occupancy.is_none());
+                assert_eq!(view.content_search.status, ContentSearchStatus::Partial);
+                view.poll_content_search_delivery(cx);
+            });
+        });
+
+        let csv = std::fs::read_to_string(&metrics_path).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "scenario,workspace_epoch,query_epoch,source_count,events_enqueued,events_dequeued,peak_queued_events,queue_capacity"
+            )
+        );
+        let row = lines.next().expect("global-limit stop must be recorded");
+        assert!(row.starts_with("\"global-limit\","));
+        assert_eq!(
+            row.split(',').skip(3).collect::<Vec<_>>(),
+            ["1", "1", "0", "1", "128"]
+        );
+        assert!(lines.next().is_none());
+
         std::fs::remove_file(metrics_path).unwrap();
     }
 
