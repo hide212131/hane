@@ -69,8 +69,13 @@ behavior.
 Focused regression tests exercise the flag-reset/retry/skip logic, the
 interleaved lost-wake scenario above, and the bounded give-up directly (they
 do not call the real `PostMessageW`, since forcing that specific Win32
-failure deterministically in a unit test is impractical):
+failure deterministically in a unit test is impractical). They are named
+`hane_input_mode_notification_wake_retry_*` so the existing Windows CI test
+command above (the one that selects the IME mode-notification and vsync
+tests) also selects these dispatcher wake-retry tests: a lost main-thread
+wake would stall delivery of the IME open/conversion-mode update just as
+surely as a missing dispatch would.
 
 ```powershell
-cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_main_thread_wake_retry
+cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_input_mode_notification
 ```

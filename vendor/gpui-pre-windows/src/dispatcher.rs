@@ -226,8 +226,13 @@ unsafe extern "system" fn run_timer_callback(
 mod tests {
     use super::*;
 
+    // These dispatcher wake-retry tests share the `hane_input_mode_notification` filter
+    // so the existing Windows CI step also runs them: a lost main-thread wake would stall
+    // delivery of the IME open/conversion-mode update to the window just as surely as a
+    // missing dispatch would.
+
     #[test]
-    fn hane_main_thread_wake_retry_resets_flag_when_post_fails() {
+    fn hane_input_mode_notification_wake_retry_resets_flag_when_post_fails() {
         let wake_posted = AtomicBool::new(false);
 
         WindowsDispatcher::notify_main_thread(&wake_posted, || false);
@@ -241,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn hane_main_thread_wake_retry_retries_after_a_previous_failure() {
+    fn hane_input_mode_notification_wake_retry_retries_after_a_previous_failure() {
         let wake_posted = AtomicBool::new(false);
 
         WindowsDispatcher::notify_main_thread(&wake_posted, || false);
@@ -258,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn hane_main_thread_wake_retry_skips_post_when_already_pending() {
+    fn hane_input_mode_notification_wake_retry_skips_post_when_already_pending() {
         let wake_posted = AtomicBool::new(true);
 
         WindowsDispatcher::notify_main_thread(&wake_posted, || {
@@ -269,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn hane_main_thread_wake_retry_recovers_lost_wake_from_interleaved_dispatch() {
+    fn hane_input_mode_notification_wake_retry_recovers_lost_wake_from_interleaved_dispatch() {
         // Reproduces the exact-head race: dispatch A claims `wake_posted` (false -> true)
         // and starts its `PostMessageW` call. While that call is in flight, dispatch B
         // enqueues its own runnable, observes `wake_posted == true`, and skips posting,
@@ -307,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn hane_main_thread_wake_retry_gives_up_after_bounded_attempts() {
+    fn hane_input_mode_notification_wake_retry_gives_up_after_bounded_attempts() {
         let wake_posted = AtomicBool::new(false);
         let attempts = std::cell::Cell::new(0u8);
 
