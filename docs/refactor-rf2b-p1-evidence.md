@@ -1,9 +1,8 @@
-# RF2-B P1 実装記録
-
 ## 状態
 
-第5.1節の8型とunit test 1件のファイル移動を、実装workerがファイル編集のみで適用した段階。この実装workerはshell/test/build/git実行権限を持たず、`cargo test`等は一切実行していない（下記はこの適用直後の記録であり、変更していない）。その後、対象head `7ec7b7f7751e3ffc811e23f1177ae364c655e2cb` に対して変更後の検証を実施し、結果を「変更後の検証」節に追記した。current-headに対するCodeRabbitのfull reviewと最終mergeは本docs更新時点でも未実施であり、この記録だけでP1を受入済みとは扱わない。実際に実行していない検証を成功とは書かない。
+P1実装PR [#456](https://github.com/hide212131/hane/pull/456) はmerge済み。対象head `0a9d214b25b94012bfbd063028da86ccff7e698c`、merge commit `a6c093499e3d3d49d6fad3f477da456a72ff314a`。設計PR #454もmerge済み（`90f51e1a965588b1796f05a6744c150ac5ba4a9f`）。P1のレビュー・検証・受入結果は末尾の「受入結果」に記録する。
 
+この文書の実装・変更後検証の各節には当時の観測時点を保持した記述が含まれる。後から行った最終レビュー・merge・Issue/実行計画更新の状態は、末尾の受入結果を参照する。実行していない検証を成功とは書かない。
 ## 対象
 
 - Issue: [#302](https://github.com/hide212131/hane/issues/302)（openを維持）
@@ -89,6 +88,16 @@ crate rootの公開名は移動前後で変化していない。`BoundarySide`�
 
 full review run `528c7787-b67e-43ab-a431-68ed26d8cb67` は、上記検証結果が反映される前の本docsの「状態」節・未実施記載と実際の検証状況の食い違いを指摘した。本節の追記はその食い違いを解消するdocs-only更新であり、新しいheadに対する最終full reviewとmergeはこの時点でも未実施である。
 
-## 受入まで未実施
+## 受入結果（2026-10-12）
 
-変更後のコンパイル確認、テスト名・属性・入力・期待値の前後比較、`cargo test`/`--all-features`/workspace全体、exact-head CIでのClippy、macOS・Windows CI、GUI検証要否の確認は上記「変更後の検証」節に記録済みである。一方、`cargo doc`の変更後再実行、CodeRabbitの新しいheadに対するcurrent-head full review、最終merge、実行計画とIssue本文への完了記録は本docs更新時点でも未実施であり、今回のdocs-only修正の範囲外として独立した検証job・Commanderの再観測に委ねる。
+- PR #456: merged。PR head `0a9d214b25b94012bfbd063028da86ccff7e698c`、base `90f51e1a965588b1796f05a6744c150ac5ba4a9f`、merge commit `a6c093499e3d3d49d6fad3f477da456a72ff314a`。
+- GitHub Code Review: review [5483760984](https://github.com/hide212131/hane/pull/456#pullrequestreview-5483760984) はhead `0a9d214...`を対象とし、blocking findingなし。review主体は `hide212131`（PR authorと同じ）で、独立reviewではない。ユーザー指示によりCodeRabbit full reviewではなくGitHub reviewへ切り替えた。旧headに対するCodeRabbit指摘は証拠文書の状態不整合で、head `0a9d214...`までに解消。
+- exact-head PR CI [run 38145043557](https://github.com/hide212131/hane/actions/runs/38145043557): macOS/Windows双方のworkspace tests、OS固有tests、Clippy成功。
+- exact-head trusted verification [run 38144884154](https://github.com/hide212131/hane/actions/runs/38144884154): workspace all-features regression testsとClippy成功。
+- 製品コード検証head `7ec7b7f...`でpresentation通常/all-features各140 passed、workspace通常1,060 passed。exact PR head `0a9d214...`で `cargo doc --locked -p hane-presentation --no-deps` exit 0（既存warning 9件）、`git diff --check` exit 0。
+- 型と全impl、移動testのbyte-identical比較とcrate root公開8名維持は「変更後の検証」節の記録どおり。
+- `cargo fmt --all -- --check` はローカルrustfmt 1.99.0対repo指定1.98.1により、未変更の `crates/ui/src/view.rs:14674` で既存差分を検出（変更前も同じ）。成功とは扱わず、P1差分外のため未修正。
+- 実画面検証は設計書第9.4節に基づき不要と判断。UI配線・layout・描画実装は変更していない。実字形・paint・inputを検証済みとは扱わない。
+- Issue #302はP1のみの完了を記録してopen維持。他の受入条件は未完了。P2以降は未着手。
+
+詳細な移動表・公開範囲・前後検証は [実行計画 §9.14](refactor-execution-plan.md) およびPR #456を参照。
