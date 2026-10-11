@@ -24,7 +24,7 @@ jobs:
       pull-requests: write
     outputs:
       release_tag: ${{ steps.create.outputs.release_tag }}
-      branch: ${{ steps.create.outputs.branch }}
+      branch: ${{ steps.validate.outputs.branch }}
       pr_number: ${{ steps.create.outputs.pr_number }}
       pr_url: ${{ steps.create.outputs.pr_url }}
       head_sha: ${{ steps.create.outputs.head_sha }}

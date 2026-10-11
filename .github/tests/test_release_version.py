@@ -82,6 +82,8 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn("RELEASE_AUTOMATION_TOKEN", workflow)
         self.assertIn("gh pr create", workflow)
         self.assertIn("gh run watch", workflow)
+        self.assertIn("branch: ${{ steps.validate.outputs.branch }}", workflow)
+        self.assertNotIn("branch: ${{ steps.create.outputs.branch }}", workflow)
 
     def test_release_ci_does_not_prefix_the_release_tag_twice(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
