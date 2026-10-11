@@ -403,6 +403,9 @@ fn text_transform_error_message(code: TextTransformErrorCode) -> String {
         TextTransformErrorCode::ResultTooLarge => {
             "AIの結果が大きすぎるため適用できません。".to_owned()
         }
+        TextTransformErrorCode::IsolationBoundaryUnverified => {
+            "安全な実行境界を確認できないため、この操作は現在利用できません。".to_owned()
+        }
     }
 }
 

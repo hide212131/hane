@@ -249,6 +249,14 @@ T05〜T08に対応する回帰テスト（複数byte文字の byte-accurate置�
 
 このworkerはRead/Edit/Write/Glob/Grepのみに制限されており、`cargo build`/`cargo test`/`cargo clippy`やGUIを一切実行していない。T11〜T13（Windows/macOS実画面、実ChatGPT/Codex/Custom接続）は本PRで未実施のまま。exact-head CIでの最初の検証、CodeRabbitのreview、GUI validationは、この後のCommanderの観測対象。
 
+#### 9.1.1 tool・ファイル隔離の未解決と、送信をfail-closedにした対応（後続worker実行）
+
+GitHub Copilotのcurrent-head full review finding（[PR #450のdiscussion](https://github.com/hide212131/hane/pull/450#discussion_r4242355110)）とADR-0032 §10の指摘を受け、`thread_start_params`の`sandbox: "read-only"`・`approvalPolicy: "never"`だけでは、専用workspace外の読み取りやshell/tool実行を禁止した根拠にならず、承認拒否は先行した読み取り・送信を取り消せないことを確認した。同梱App Serverの実バイナリに対する`--strict-config`検証やOS/プロセスレベルの隔離の実効性確認には、このworkerには無いcargo build/test/実バイナリ実行権限が必要であり、今回のworker実行では公式にサポートされた検証済みの隔離境界を確立できなかった。
+
+この根本原因だけについて、`crates/ai/src/text_transform.rs`の`execute_text_transform`を、設定共有ロックの取得や`thread/start`呼び出しより前の最初の分岐で無条件にfail-closedさせ、新しい`TextTransformErrorCode::IsolationBoundaryUnverified`を返すようにした（`text_transform_isolation_boundary_verified()`が`false`を返す間、合成文を含むすべての要求が対象）。これにより選択文・指示は（テスト用の合成文であっても）App Serverへ一切送信されない。回帰テストとして、`text_transform.rs`内のユニットテストで実際の`AiRuntime`/`AiSettingsStore`を使い、ロック取得やruntime呼び出しが一度も発生しないことを確認し、`crates/ai/tests/text_transform_service.rs`の統合テストでfakeApp Serverに対して選択文を含むturn/startが一切記録されないことを確認している。従来この統合テストにあった成功経路・interrupt-ack・tool-item検出のシナリオ別検証は、text transform経由では到達不能になったため削除したが、これらが使う`ProbeCollector`/interrupt確認の共有ロジック自体は`account_service.rs`側の固定Probe向けテスト（`probe_tool_item_start_is_not_reported_as_success`、`interrupt_ack_alone_does_not_release_probe_guard_before_child_stops`）で引き続き検証されている。
+
+この結果、選択文へのAI指示機能はIssueの受入条件（AC3「安全なサーバー要求拒否」を含む）を安全側で満たすが、実際にAIへ送信して結果を得る経路はfail-closedにより現在使用できない。公式にサポートされた検証可能な隔離境界（例: 同梱App Serverバイナリに対する`--strict-config`で確認済みの設定、またはHane自身がspawn時に適用するOS/プロセスレベルの隔離）を設計・実装し、`text_transform_isolation_boundary_verified()`をその検証済み条件に置き換える別設計が必要であり、これは本PRのscope外の後続作業として報告する。
+
 ## 10. 参考資料
 
 - [Wordのスクリーンリーダー／キーボード操作](https://support.microsoft.com/en-us/accessibility/copilot/use-copilot-in-word-with-a-screen-reader): Windows RewriteのAlt+I、macOS RewriteのControl+L、選択→結果確認→Replace。2026-10-10確認。
