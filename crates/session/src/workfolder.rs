@@ -12,7 +12,26 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::SystemTime;
+
+/// Process-wide monotonic counter stamped onto a node's modified time at the
+/// moment that time is actually read off the filesystem — not when the read
+/// later reaches the UI thread through a background task's completion.
+/// `WorkFolder::touch` and `WorkFolder::rename` compare these sequence
+/// numbers, never the modified time values themselves, to tell a read that
+/// lands on the UI thread out of order with another read of the same path
+/// apart from one that is genuinely newer; see `set_modified` for why the
+/// time value alone cannot do this safely.
+static NEXT_MODIFIED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Allocates the next value from `NEXT_MODIFIED_SEQUENCE`. Callers acquire
+/// this at the same point they read a node's real modified time through
+/// `FileService::stamp`, off the UI thread, pairing the two before either
+/// crosses back onto the UI thread through `WorkFolder::touch`.
+pub fn next_modified_sequence() -> u64 {
+    NEXT_MODIFIED_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+}
 
 /// One Markdown file discovered under a work folder, not yet loaded.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +47,13 @@ pub struct WorkFolderEntry {
     /// entry sorts last under `WorkFolderSortOrder::UpdatedNewest` or
     /// `WorkFolderSortOrder::UpdatedOldest`.
     modified: Option<SystemTime>,
+    /// The `next_modified_sequence` value paired with `modified` when it was
+    /// last set through `set_modified`, or `None` if `modified` has never
+    /// been set that way (built fresh, or only ever carried over by
+    /// `WorkFolder::rename` from an entry that itself had none). See
+    /// `set_modified` for how this, not `modified` itself, decides whether a
+    /// later call may overwrite what is retained here.
+    modified_seq: Option<u64>,
 }
 
 impl WorkFolderEntry {
@@ -45,6 +71,7 @@ impl WorkFolderEntry {
             name,
             file_name,
             modified: None,
+            modified_seq: None,
         }
     }
 
@@ -116,6 +143,8 @@ pub struct WorkFolderFolder {
     /// last-modified time (not any child's), the same filesystem entry a
     /// directory listing would report it for.
     modified: Option<SystemTime>,
+    /// See `WorkFolderEntry::modified_seq`'s field doc comment.
+    modified_seq: Option<u64>,
 }
 
 impl WorkFolderFolder {
@@ -129,6 +158,7 @@ impl WorkFolderFolder {
             name,
             children,
             modified,
+            modified_seq: None,
         }
     }
 
@@ -293,11 +323,15 @@ impl WorkFolder {
     /// just produced — a save, an autosave, or a newly created file or
     /// folder — without a rescan, and re-sorts the level it lives at so an
     /// `Updated` sort order reflects the change immediately. A `path` the
-    /// tree was not scanned, inserted, or created with is a no-op. See
-    /// `set_modified` for why an out-of-order, chronologically older
-    /// `modified` cannot regress what is already retained.
-    pub fn touch(&mut self, path: &Path, modified: Option<SystemTime>) {
-        set_modified(&mut self.children, path, modified, self.sort_order);
+    /// tree was not scanned, inserted, or created with is a no-op.
+    ///
+    /// `sequence` must be the `next_modified_sequence` value the caller
+    /// acquired alongside `modified` itself, off the UI thread, at the point
+    /// it actually read the filesystem; see `set_modified` for why this,
+    /// not `modified`, is what decides whether this call may overwrite what
+    /// is already retained.
+    pub fn touch(&mut self, path: &Path, modified: Option<SystemTime>, sequence: u64) {
+        set_modified(&mut self.children, path, modified, Some(sequence), self.sort_order);
     }
 
     /// Adds a note this app itself just created to the index, so it appears
@@ -352,8 +386,12 @@ impl WorkFolder {
         // `insert` always builds the fresh entry with no retained modified
         // time, since a plain rename (unlike a save) never changes a file's
         // content or its mtime; carry over what was already known instead
-        // of letting it fall back to "oldest" under an `Updated` sort.
-        set_modified(&mut self.children, to, entry.modified, self.sort_order);
+        // of letting it fall back to "oldest" under an `Updated` sort. The
+        // sequence travels with it unchanged too, rather than minting a new
+        // one here: nothing was actually re-read from disk, so the fresh
+        // entry `insert` just built (itself not yet sequenced) only needs
+        // whatever freshness `entry` already carried.
+        set_modified(&mut self.children, to, entry.modified, entry.modified_seq, self.sort_order);
     }
 
     /// Follows a folder rename this app itself just performed: `from` moves to
@@ -508,12 +546,15 @@ fn remove_folder(nodes: &mut Vec<WorkFolderNode>, path: &Path) -> Option<WorkFol
 fn rebase_folder(folder: WorkFolderFolder, from: &Path, to: &Path) -> WorkFolderFolder {
     let path = rebase_path(folder.path(), from, to);
     let modified = folder.modified;
+    let modified_seq = folder.modified_seq;
     let children = folder
         .children
         .into_iter()
         .map(|child| rebase_node(child, from, to))
         .collect();
-    WorkFolderFolder::new(path, children, modified)
+    let mut rebased = WorkFolderFolder::new(path, children, modified);
+    rebased.modified_seq = modified_seq;
+    rebased
 }
 
 fn rebase_node(node: WorkFolderNode, from: &Path, to: &Path) -> WorkFolderNode {
@@ -521,6 +562,7 @@ fn rebase_node(node: WorkFolderNode, from: &Path, to: &Path) -> WorkFolderNode {
         WorkFolderNode::File(entry) => {
             let mut rebased = WorkFolderEntry::new(rebase_path(entry.path(), from, to));
             rebased.modified = entry.modified;
+            rebased.modified_seq = entry.modified_seq;
             WorkFolderNode::File(rebased)
         }
         WorkFolderNode::Folder(folder) => WorkFolderNode::Folder(rebase_folder(folder, from, to)),
@@ -610,44 +652,62 @@ fn resort_tree(nodes: &mut [WorkFolderNode], order: WorkFolderSortOrder) {
 /// this, the latter after the node has already been reinserted at its new
 /// path).
 ///
-/// A `Some` `modified` older than what the node already retains is dropped
-/// instead of applied. `touch`'s callers acquire `modified` off the UI
-/// thread and apply it once their background work completes, so two
-/// completions for the same node — most commonly two sibling saves whose
-/// `ancestor_folder_paths` both name the same parent folder — can reach the
-/// UI thread in an order that does not match the order their writes landed
-/// in on disk. Without this guard, whichever completion happens to apply
-/// last would win regardless of which write it actually reflects, letting a
-/// chronologically earlier snapshot silently regress a newer one already
-/// retained. A `None` result (acquisition failed, or the node never had one)
-/// still always applies, the same degrade-on-failure contract
-/// `stamp_ancestor_folders` already documents.
+/// An out-of-order call is dropped instead of applied, decided by `sequence`
+/// — a `next_modified_sequence` value, not `modified` itself. `touch`'s
+/// callers acquire `modified` off the UI thread and apply it once their
+/// background work completes, so two completions for the same node — most
+/// commonly two sibling saves whose `ancestor_folder_paths` both name the
+/// same parent folder — can reach the UI thread in an order that does not
+/// match the order their reads actually happened in. Comparing `modified`
+/// values themselves cannot tell these apart: a freshly re-read real
+/// directory entry can legitimately report an *older* time than what is
+/// retained (a folder whose mtime was briefly set into the future, say, by
+/// another process, catching back up on its next real change), which a
+/// time-based guard would wrongly reject forever, and a stale `None` can
+/// otherwise always slip through and erase an already-applied newer `Some`,
+/// since a value-based guard cannot compare against "nothing" at all.
+/// `sequence`, captured synchronously at the point of the read itself rather
+/// than at the point its result reaches the UI thread, is monotonic in real
+/// read order regardless of what either read actually observed, including
+/// a `None` (acquisition failed, or the node never had one) — which still
+/// applies whenever its `sequence` is newer, the same degrade-on-failure
+/// contract `stamp_ancestor_folders` already documents. A node with no
+/// retained `sequence` yet (built fresh, or only ever carried over by
+/// `WorkFolder::rename`) accepts any call unconditionally, the same as
+/// before this guard existed.
 fn set_modified(
     nodes: &mut [WorkFolderNode],
     path: &Path,
     modified: Option<SystemTime>,
+    sequence: Option<u64>,
     order: WorkFolderSortOrder,
 ) -> bool {
     if let Some(index) = nodes.iter().position(|node| node.path() == path) {
-        let retained = match &nodes[index] {
-            WorkFolderNode::File(entry) => entry.modified,
-            WorkFolderNode::Folder(folder) => folder.modified,
+        let retained_seq = match &nodes[index] {
+            WorkFolderNode::File(entry) => entry.modified_seq,
+            WorkFolderNode::Folder(folder) => folder.modified_seq,
         };
-        if let (Some(retained), Some(incoming)) = (retained, modified)
-            && incoming < retained
+        if let (Some(retained_seq), Some(incoming_seq)) = (retained_seq, sequence)
+            && incoming_seq <= retained_seq
         {
             return true;
         }
         match &mut nodes[index] {
-            WorkFolderNode::File(entry) => entry.modified = modified,
-            WorkFolderNode::Folder(folder) => folder.modified = modified,
+            WorkFolderNode::File(entry) => {
+                entry.modified = modified;
+                entry.modified_seq = sequence;
+            }
+            WorkFolderNode::Folder(folder) => {
+                folder.modified = modified;
+                folder.modified_seq = sequence;
+            }
         }
         sort_nodes(nodes, order);
         return true;
     }
     for node in nodes.iter_mut() {
         if let WorkFolderNode::Folder(folder) = node
-            && set_modified(&mut folder.children, path, modified, order)
+            && set_modified(&mut folder.children, path, modified, sequence, order)
         {
             return true;
         }
@@ -1437,21 +1497,29 @@ mod tests {
 
         // Simulates the modified time a save or autosave just produced,
         // without touching the filesystem from this test.
-        folder.touch(Path::new("/notes/A.md"), Some(system_time_at(300)));
+        folder.touch(
+            Path::new("/notes/A.md"),
+            Some(system_time_at(300)),
+            next_modified_sequence(),
+        );
 
         assert_eq!(folder.children()[0].path(), Path::new("/notes/A.md"));
     }
 
     #[test]
-    fn a_stale_out_of_order_touch_does_not_regress_a_newer_retained_modified_time() {
+    fn a_reverse_delivered_touch_does_not_regress_a_newer_retained_modified_time() {
         // Two sibling saves under the same parent folder each acquire that
         // folder's own modified time off the UI thread once their write
         // lands, then feed it back through `touch` once their completion
         // reaches the UI thread — see `WorkFolder::ancestor_folder_paths`.
-        // Here the save that landed on disk later (400) is simulated as
-        // completing first, and the save that landed earlier (200)
-        // completes after it, the reversed order `set_modified` must guard
-        // against.
+        // The read that actually happened later (`later_seq`, reporting 400)
+        // is simulated as reaching the UI thread first, and the read that
+        // happened earlier (`earlier_seq`, reporting 200) reaches it after —
+        // the reversed delivery order `set_modified` must guard against,
+        // using the acquisition-order `sequence`, not the two `SystemTime`
+        // values, to tell which is actually newer.
+        let earlier_seq = next_modified_sequence();
+        let later_seq = next_modified_sequence();
         let children = vec![WorkFolderNode::Folder(WorkFolderFolder::new(
             PathBuf::from("/notes/dev"),
             vec![file_node("/notes/dev/Child.md", Some(system_time_at(100)))],
@@ -1459,8 +1527,12 @@ mod tests {
         ))];
         let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
 
-        folder.touch(Path::new("/notes/dev"), Some(system_time_at(400)));
-        folder.touch(Path::new("/notes/dev"), Some(system_time_at(200)));
+        folder.touch(Path::new("/notes/dev"), Some(system_time_at(400)), later_seq);
+        folder.touch(
+            Path::new("/notes/dev"),
+            Some(system_time_at(200)),
+            earlier_seq,
+        );
 
         let WorkFolderNode::Folder(dev) = &folder.children()[0] else {
             panic!("dev folder expected");
@@ -1468,7 +1540,94 @@ mod tests {
         assert_eq!(
             dev.modified(),
             Some(system_time_at(400)),
-            "the later-arriving but chronologically older touch must not overwrite the newer one"
+            "the later-arriving but earlier-acquired touch must not overwrite the newer one"
+        );
+    }
+
+    #[test]
+    fn a_stale_none_arriving_after_a_newer_some_does_not_erase_it() {
+        // The ancestor-fetch read that failed (reporting `None`, e.g. a
+        // transient race) happened before the read that succeeded, but its
+        // completion reaches the UI thread after the successful one's. A
+        // guard comparing `modified` values directly cannot reject this —
+        // there is nothing to compare a `None` against — so only comparing
+        // `sequence` protects the already-applied `Some` here.
+        let earlier_seq = next_modified_sequence();
+        let later_seq = next_modified_sequence();
+        let children = vec![file_node("/notes/A.md", None)];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+
+        folder.touch(Path::new("/notes/A.md"), Some(system_time_at(400)), later_seq);
+        folder.touch(Path::new("/notes/A.md"), None, earlier_seq);
+
+        let WorkFolderNode::File(entry) = &folder.children()[0] else {
+            panic!("file entry expected");
+        };
+        assert_eq!(
+            entry.modified(),
+            Some(system_time_at(400)),
+            "a stale None must not erase an already-applied newer Some"
+        );
+    }
+
+    #[test]
+    fn a_newer_read_still_applies_a_none_per_the_degrade_on_failure_contract() {
+        // The opposite of the previous case: the newer read is the one that
+        // failed. `sequence` alone decides this, so the `None` still
+        // overwrites the older `Some`, exactly like a value-based guard
+        // would already do for two `Some`s in the correct order.
+        let earlier_seq = next_modified_sequence();
+        let later_seq = next_modified_sequence();
+        let children = vec![file_node("/notes/A.md", None)];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+
+        folder.touch(
+            Path::new("/notes/A.md"),
+            Some(system_time_at(100)),
+            earlier_seq,
+        );
+        folder.touch(Path::new("/notes/A.md"), None, later_seq);
+
+        let WorkFolderNode::File(entry) = &folder.children()[0] else {
+            panic!("file entry expected");
+        };
+        assert_eq!(
+            entry.modified(),
+            None,
+            "a genuinely newer read must apply even when it degrades to None"
+        );
+    }
+
+    #[test]
+    fn a_newer_read_applies_even_when_its_system_time_is_smaller() {
+        // A real directory entry can legitimately report an earlier
+        // `SystemTime` than what is already retained — e.g. a folder whose
+        // mtime briefly ran ahead into the future catching back up on its
+        // next real change. Comparing `SystemTime` values would wrongly
+        // reject this forever; only `sequence` decides freshness here.
+        let earlier_seq = next_modified_sequence();
+        let later_seq = next_modified_sequence();
+        let children = vec![file_node("/notes/A.md", None)];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+
+        folder.touch(
+            Path::new("/notes/A.md"),
+            Some(system_time_at(900)),
+            earlier_seq,
+        );
+        folder.touch(
+            Path::new("/notes/A.md"),
+            Some(system_time_at(100)),
+            later_seq,
+        );
+
+        let WorkFolderNode::File(entry) = &folder.children()[0] else {
+            panic!("file entry expected");
+        };
+        assert_eq!(
+            entry.modified(),
+            Some(system_time_at(100)),
+            "a genuinely newer read must apply even though its own SystemTime is smaller"
         );
     }
 

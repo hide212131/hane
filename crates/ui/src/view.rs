@@ -80,8 +80,8 @@ use hane_session::{
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, TitleSyncAction, UnsavedChanges, WorkFolder, WorkFolderNode,
     WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
-    format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
-    unique_folder_name, unique_markdown_filename,
+    format_relative_date_label, local_today, next_modified_sequence, run_save_job,
+    split_file_name_for_badge, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -492,7 +492,7 @@ struct TitleRenameAttempt {
     from: PathBuf,
     target: PathBuf,
     title: String,
-    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,7 +508,7 @@ struct InlineRenameAttempt {
     target: PathBuf,
     kind: InlineRenameKind,
     tickets: Vec<(SessionId, SaveTicket)>,
-    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
 /// One document save attempt's outcome-handling context, bundled so
@@ -518,7 +518,7 @@ struct SaveAttempt {
     ticket: SaveTicket,
     instance: Option<DocumentInstance>,
     path: PathBuf,
-    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
 /// A `new_work_folder_folder` background creation's result, bundled into one
@@ -526,7 +526,8 @@ struct SaveAttempt {
 struct NewFolderOutcome {
     result: std::io::Result<()>,
     modified: Option<SystemTime>,
-    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
+    modified_seq: u64,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
 /// State for the one sidebar row currently being edited. The editable text is
@@ -667,13 +668,23 @@ fn rebase_ui_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
 /// rather than keeping whatever this call does not actually know, the same
 /// degrade-on-failure contract `OsWorkFolderScanner::scan` already uses for
 /// `WorkFolderEntry::modified`.
+///
+/// Each result is paired with a `next_modified_sequence` value, allocated
+/// right here at the point the read actually happens. Two of these calls can
+/// run for the same ancestor path from different saves and reach the UI
+/// thread in either order; `WorkFolder::touch` uses this sequence, not the
+/// `SystemTime` itself, to tell which read was genuinely the later one — see
+/// `set_modified` for why the time value alone cannot do that safely.
 fn stamp_ancestor_folders(
     files: &dyn FileService,
     ancestors: &[PathBuf],
-) -> Vec<(PathBuf, Option<SystemTime>)> {
+) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
     ancestors
         .iter()
-        .map(|path| (path.clone(), files.stamp(path).and_then(|stamp| stamp.modified)))
+        .map(|path| {
+            let modified = files.stamp(path).and_then(|stamp| stamp.modified);
+            (path.clone(), modified, next_modified_sequence())
+        })
         .collect()
 }
 
@@ -2376,12 +2387,12 @@ impl EditorView {
     /// for why a parent folder's own retained time needs the same refresh.
     /// A workspace switched away in the meantime simply has no ancestors
     /// left to touch, since `self.work_folder` itself changed.
-    fn touch_work_folder_ancestors(&mut self, ancestors: &[(PathBuf, Option<SystemTime>)]) {
+    fn touch_work_folder_ancestors(&mut self, ancestors: &[(PathBuf, Option<SystemTime>, u64)]) {
         let Some(folder) = self.work_folder.as_mut() else {
             return;
         };
-        for (path, modified) in ancestors {
-            folder.touch(path, *modified);
+        for (path, modified, sequence) in ancestors {
+            folder.touch(path, *modified, *sequence);
         }
     }
 
@@ -2586,6 +2597,7 @@ impl EditorView {
                     // no-rescan way a save does, instead of leaving it
                     // unknown (and sorting as oldest) until the next scan.
                     let modified = files.stamp(&probe_path).and_then(|stamp| stamp.modified);
+                    let modified_seq = next_modified_sequence();
                     // The parent directory's own entry just gained this new
                     // folder, so its real modified time changed too; failing
                     // this new folder's own creation leaves the tree
@@ -2599,6 +2611,7 @@ impl EditorView {
                     NewFolderOutcome {
                         result,
                         modified,
+                        modified_seq,
                         ancestors,
                     }
                 })
@@ -2619,6 +2632,7 @@ impl EditorView {
         let NewFolderOutcome {
             result,
             modified,
+            modified_seq,
             ancestors,
         } = outcome;
         self.pending_new_folders.remove(&path);
@@ -2626,7 +2640,7 @@ impl EditorView {
             Ok(()) => {
                 if let Some(folder) = self.work_folder.as_mut() {
                     folder.insert_folder(path.clone());
-                    folder.touch(&path, modified);
+                    folder.touch(&path, modified, modified_seq);
                 }
                 self.touch_work_folder_ancestors(&ancestors);
                 self.expanded_folders.insert(path);

@@ -515,7 +515,7 @@ impl EditorView {
         &mut self,
         id: SessionId,
         path: &Path,
-        ancestors: &[(PathBuf, Option<SystemTime>)],
+        ancestors: &[(PathBuf, Option<SystemTime>, u64)],
     ) {
         let modified = self
             .sessions
@@ -523,7 +523,7 @@ impl EditorView {
             .and_then(|session| session.file().stamp())
             .and_then(|stamp| stamp.modified);
         if let Some(folder) = self.work_folder.as_mut() {
-            folder.touch(path, modified);
+            folder.touch(path, modified, next_modified_sequence());
         }
         self.touch_work_folder_ancestors(ancestors);
     }
