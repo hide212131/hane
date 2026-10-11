@@ -2,7 +2,7 @@
 
 ## 状態
 
-P1 の変更前証拠を記録した段階。実装・変更後検証・独立レビューは未完了であり、この記録だけでP1を受入済みとは扱わない。
+第5.1節の8型とunit test 1件のファイル移動を、実装workerがファイル編集のみで適用した段階。この実装workerはshell/test/build/git実行権限を持たず、`cargo test`等は一切実行していない。変更後のコンパイル・テスト・Clippy・CI・独立レビュー・GUI要否確認は未実施であり、この記録だけでP1を受入済みとは扱わない。実際に実行していない検証を成功とは書かない。
 
 ## 対象
 
@@ -43,6 +43,34 @@ P1 の変更前証拠を記録した段階。実装・変更後検証・独立�
 
 テスト一覧と実行ログは作業環境の `work/p1-base-test-list.log`、`work/p1-base-*` に保存済み。変更後は現在のPR headに対して同じ検証を再実行し、テスト名・属性・入力・期待値の差分と、公開API全項目を比較して追記する。CIのmacOS/Windows結果は各runの対象headとbaseを確認して別途記録する。
 
+## 実装：移動表（ファイル編集のみ、コンパイル未確認）
+
+編集対象のPR head（開始時点）: `13114321122ba70096e8c63a9492125e1f77d5fd`（[PR #456](https://github.com/hide212131/hane/pull/456)）。
+
+| # | シンボル／項目 | 旧配置 | 新配置 | 扱い |
+| --- | --- | --- | --- | --- |
+| 1 | `VisualOffset` | `lib.rs` | `source_map.rs` | derive・フィールドそのまま移動。 |
+| 2 | `VisualRange`（`VisualRange::new`を含む） | `lib.rs` | `source_map.rs` | derive・フィールド・implそのまま移動。 |
+| 3 | `Visibility` | `lib.rs` | `source_map.rs` | 全variant・deriveそのまま移動。 |
+| 4 | `BoundarySide` | `lib.rs` | `source_map.rs` | 全variant・deriveそのまま移動。 |
+| 5 | `MarkerEdge` | `lib.rs` | `source_map.rs` | 全variant・derive・直結doc commentそのまま移動。 |
+| 6 | `MappingSegment` | `lib.rs` | `source_map.rs` | 公開フィールド・derive・フィールドdoc commentそのまま移動。 |
+| 7 | `PositionCandidate` | `lib.rs` | `source_map.rs` | 公開フィールド・deriveそのまま移動。 |
+| 8 | `SourceMap`（`visual_to_source`、`source_to_visual`、`normalize_source`、`normalize_visual`を含む全impl） | `lib.rs` | `source_map.rs` | メソッド本体・処理順・doc commentそのまま移動。`segments`フィールドの公開も維持。 |
+| 9 | crate root module宣言 | （なし） | `lib.rs` | `mod source_map;`を`mod layout;`の次に追加。moduleは非公開のまま。 |
+| 10 | crate root再export | `lib.rs`（各型を直接定義） | `lib.rs`（`pub use source_map::{...}`） | 従来の8公開名（`BoundarySide`、`MappingSegment`、`MarkerEdge`、`PositionCandidate`、`SourceMap`、`Visibility`、`VisualOffset`、`VisualRange`）を変更せず再export。新しい別名・wrapperは追加していない。 |
+| 11 | `hidden_unicode_boundaries_normalize_with_affinity`（unit test） | `lib.rs`の`mod tests`（他の全unit testと同じ単一module） | `source_map.rs`の新規`#[cfg(test)] mod tests` | テスト名・属性・入力・期待値・本体は変更していない。配置理由は下記。 |
+
+### テスト配置の理由（項目11）
+
+このテストは`present_markdown`で`VisualLine`を組み立てた上で、隠れたUnicode境界に対する`SourceMap::normalize_source`／`normalize_visual`の正規化契約（丸め先の候補選択、UTF-8境界の保持）を直接検証している。アサーション対象はすべて`source_map`の契約であり、`present_markdown`はP1でまだ移動しない`projection`責務の既存入口を使ったセットアップに過ぎない。設計書第9.1節は「別責務をまたぐテストは既存呼出関係に沿って配置を選び、理由を記録する」としており、本テストの検証責務を基準に`source_map.rs`側へ配置した。`present_markdown`はP1では`lib.rs`に残るcrate root関数のままなので、新module側から`crate::present_markdown`で呼び出している。
+
+### 公開API比較（名前のみ、コンパイル未確認）
+
+crate rootの公開名は移動前後で変化していない。`BoundarySide`、`MappingSegment`、`MarkerEdge`、`PositionCandidate`、`SourceMap`、`Visibility`、`VisualOffset`、`VisualRange`の8名は、定義元が`lib.rs`直下から`source_map`moduleの`pub use`経由に変わっただけで、signature・公開フィールド・variant・derive・trait実装・cfgは変更していない。`append_segment`、`segments_tile_range`、`display`・`height_index`・`projection`・`layout`・`testing`・integration tests・UI接続・Cargo設定は未変更。
+
+このworkerはshell実行権限を持たないため、上記の比較は差分適用後のファイル内容を読み直した上での目視確認であり、`cargo test`／`cargo doc`／`cargo fmt`／Clippyによる機械確認ではない。
+
 ## 受入まで未実施
 
-P1実装、変更後のテスト/API比較、macOS・Windows CI、CodeRabbitのcurrent-head full review、実画面検証の要否確認、最終merge、実行計画とIssue本文への完了記録。配置変更のみで関数本体・型契約・layout・UI接続を変えないと確認できた場合に限り、設計書第9.4節とRF0-04を根拠に追加GUI検証不要と記録する。
+変更後のコンパイル確認、`cargo test --locked -p hane-presentation -- --list`等によるテスト名・属性・入力・期待値の前後比較、`cargo test`/`--all-features`/workspace全体、`cargo clippy -- -D warnings`、`cargo doc`、`cargo fmt --all -- --check`、macOS・Windows CI、CodeRabbitのcurrent-head full review、実画面検証の要否確認、最終merge、実行計画とIssue本文への完了記録。これらは今回の実装workerの範囲外であり、独立した検証job・Commanderの再観測に委ねる。配置変更のみで関数本体・型契約・layout・UI接続を変えないと確認できた場合に限り、設計書第9.4節とRF0-04を根拠に追加GUI検証不要と記録できるが、その確認自体も今回は未実施である。
