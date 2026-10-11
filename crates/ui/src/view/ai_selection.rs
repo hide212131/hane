@@ -232,7 +232,12 @@ impl AiSelectionState {
                 // logical focus there up front so Tab/Enter reach it without
                 // requiring a Tab first (`ai_selection_handle_tab`/
                 // `ai_selection_handle_enter`), the same way `Reviewing`
-                // below lands on its own first stop.
+                // below lands on its own first stop. Real keyboard focus is
+                // synchronized off the (about to be unmounted) `Input`
+                // widget separately, by `ai_selection_overlay_element` on
+                // the very next render (PR #450 review) — this inner state
+                // stays window/cx-agnostic so it keeps being usable from the
+                // plain `#[test]`s below.
                 self.focus_region = AiSelectionFocusRegion::Stop;
                 self.list_focus_index = None;
                 let view = cx.entity().downgrade();
@@ -285,7 +290,9 @@ impl AiSelectionState {
                 // Lands on the reviewing screen's own first stop up front —
                 // `Replace` when offered, otherwise `Regenerate` — so Tab/
                 // Enter reach it without requiring a Tab first, same as
-                // `Submitting` above.
+                // `Submitting` above. Real keyboard focus is synchronized
+                // off `Input` separately — see the comment in
+                // `start_request`.
                 self.focus_region = if unchanged {
                     AiSelectionFocusRegion::Regenerate
                 } else {
@@ -1139,6 +1146,20 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         self.ensure_ai_selection_input(window, cx);
+        // Every focus stop other than `Input` parks real GPUI keyboard focus
+        // on the shared `focus_handle` instead (see
+        // `ai_selection_set_focus_region`). Re-asserting that on every frame
+        // this popup is open — rather than only at the moment `focus_region`
+        // changes — is what keeps real focus from staying parked on the
+        // pinned `Input` widget once a phase transition (`start_request`
+        // landing on `Stop`, `apply_outcome` landing on `Replace`/
+        // `Regenerate`) stops rendering `Input` at all: with real focus left
+        // on a now-unmounted widget, Tab/Enter stop reaching this popup's
+        // own actions entirely (PR #450 review).
+        if self.ai_selection.focus_region != AiSelectionFocusRegion::Input {
+            window.focus(&self.focus_handle, cx);
+            self.ai_selection.input_focused = false;
+        }
         let phase = self.ai_selection.phase.clone();
         let content = match phase {
             AiSelectionPhase::Composing => self.ai_selection_compose_element(cx).into_any_element(),
