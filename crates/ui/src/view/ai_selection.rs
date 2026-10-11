@@ -502,6 +502,16 @@ impl EditorView {
             self.ai_selection.input_focused = true;
         } else {
             window.focus(&self.focus_handle, cx);
+            // Same reasoning as the `Input` branch above, symmetrically
+            // applied: clear this synchronously rather than waiting for the
+            // pinned input's own async `InputEvent::Blur`, whose effect-queue
+            // delivery is not guaranteed to have been observed before the
+            // very next keystroke (e.g. `note_ai_selection_escape_keystroke`
+            // reading `input_focused` right after a Tab moved focus to
+            // `Send`/`List`/`Close`). Leaving a stale `true` here would make
+            // that Escape keep treating the input as focused and never close
+            // the popup.
+            self.ai_selection.input_focused = false;
         }
         cx.notify();
     }
