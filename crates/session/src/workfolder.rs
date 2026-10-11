@@ -421,6 +421,27 @@ impl WorkFolder {
         }
         find_folder(&self.children, path).map(WorkFolderFolder::children)
     }
+
+    /// `path`'s own containing folder, if any, as a single-element list (or
+    /// empty when `path` sits directly under this work folder's root, which
+    /// is never a tracked `WorkFolderNode`): the one folder whose own real
+    /// modified time changes alongside `path`'s whenever a save, create, or
+    /// rename actually writes to the filesystem. An atomic save replaces the
+    /// target via a temp-file rename, and a plain rename changes a directory
+    /// entry outright; either way only the directory that entry lives in is
+    /// touched on disk — a grandparent's own entry (naming that directory
+    /// itself) is untouched, so it is deliberately left out rather than
+    /// walked up as a chain. Pure path arithmetic — it does not touch the
+    /// filesystem or search the tree, so callers acquire the parent's real
+    /// modified time off the UI thread (the same `FileService::stamp`
+    /// boundary a save already uses) before feeding it back through
+    /// `touch`.
+    pub fn ancestor_folder_paths(&self, path: &Path) -> Vec<PathBuf> {
+        match path.parent() {
+            Some(parent) if parent != self.root => vec![parent.to_path_buf()],
+            _ => Vec::new(),
+        }
+    }
 }
 
 fn find_folder<'a>(nodes: &'a [WorkFolderNode], path: &Path) -> Option<&'a WorkFolderFolder> {
@@ -1450,6 +1471,28 @@ mod tests {
             .first()
             .expect("child moved with the renamed folder");
         assert_eq!(child.modified(), Some(system_time_at(50)));
+    }
+
+    #[test]
+    fn ancestor_folder_paths_is_only_the_immediate_parent_not_the_whole_chain_to_root() {
+        // Only the directory a write's directory entry actually lives in
+        // changes on disk; `Archive` (the grandparent here) keeps its own
+        // real modified time untouched, so it must not appear.
+        let folder = WorkFolder::new(PathBuf::from("/notes"), Vec::new());
+        assert_eq!(
+            folder.ancestor_folder_paths(Path::new("/notes/Archive/Sub/Nested.md")),
+            [PathBuf::from("/notes/Archive/Sub")]
+        );
+    }
+
+    #[test]
+    fn ancestor_folder_paths_is_empty_for_a_top_level_path() {
+        let folder = WorkFolder::new(PathBuf::from("/notes"), Vec::new());
+        assert!(
+            folder
+                .ancestor_folder_paths(Path::new("/notes/Meeting.md"))
+                .is_empty()
+        );
     }
 
     #[test]

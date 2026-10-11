@@ -344,11 +344,20 @@ impl EditorView {
         let files = self.files.clone();
         let probe_title = title.clone();
         let probe_from = from.clone();
+        // The rename never moves the file to a different directory (`target`
+        // below is always `root.join(candidate)`), so the containing folder
+        // is the same before and after it lands; computed now, off the tree
+        // the rename was requested against.
+        let ancestor_folders = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.ancestor_folder_paths(&from))
+            .unwrap_or_default();
         cx.spawn(async move |view, cx| {
             let probe_files = files.clone();
             let probe_root = root.clone();
             let rename_from = from.clone();
-            let (target, rename_result) = cx
+            let (target, rename_result, ancestors) = cx
                 .background_executor()
                 .spawn(async move {
                     let candidate = unique_markdown_filename(&probe_title, |name| {
@@ -357,7 +366,17 @@ impl EditorView {
                     });
                     let target = probe_root.join(candidate);
                     let result = probe_files.rename(&rename_from, &target);
-                    (target, result)
+                    // The containing directory's own entry changed with the
+                    // rename (an entry removed under the old name, added
+                    // under the new one), so its real modified time is
+                    // acquired here too. A failed rename never touched the
+                    // filesystem, so nothing here changed either.
+                    let ancestors = if result.is_ok() {
+                        stamp_ancestor_folders(probe_files.as_ref(), &ancestor_folders)
+                    } else {
+                        Vec::new()
+                    };
+                    (target, result, ancestors)
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
@@ -380,6 +399,7 @@ impl EditorView {
                     from,
                     target,
                     title,
+                    ancestors,
                 };
                 view.finish_title_rename(attempt, rename_result, cx);
             });
@@ -399,6 +419,7 @@ impl EditorView {
             from,
             target,
             title,
+            ancestors,
         } = attempt;
         if let Ok(()) = result {
             let outcomes = self.sessions.apply_file_event(&FileEvent::Renamed {
@@ -415,6 +436,7 @@ impl EditorView {
                 if let Some(folder) = self.work_folder.as_mut() {
                     folder.rename(&from, &target);
                 }
+                self.touch_work_folder_ancestors(&ancestors);
                 self.recent.rename(&from, &target);
                 if let Err(error) = self.stores.recent_files().store(&self.recent) {
                     self.status = Some(format!("Recent files failed: {error}"));
@@ -486,8 +508,15 @@ impl EditorView {
     /// indexes it and produces its first stamp) picks up the time too, not
     /// just an ordinary save of an already-indexed note. A session with no
     /// on-disk stamp, or a `path` the tree was never indexed with, is a
-    /// no-op.
-    fn touch_saved_work_folder_entry(&mut self, id: SessionId, path: &Path) {
+    /// no-op. `ancestors` (acquired off the UI thread alongside the save
+    /// itself) carries the same update to the containing folder whose own
+    /// directory entry changed too — see `WorkFolder::ancestor_folder_paths`.
+    fn touch_saved_work_folder_entry(
+        &mut self,
+        id: SessionId,
+        path: &Path,
+        ancestors: &[(PathBuf, Option<SystemTime>)],
+    ) {
         let modified = self
             .sessions
             .get(id)
@@ -496,6 +525,7 @@ impl EditorView {
         if let Some(folder) = self.work_folder.as_mut() {
             folder.touch(path, modified);
         }
+        self.touch_work_folder_ancestors(ancestors);
     }
 
     /// Re-decides title sync for a session right after one of its writes
@@ -584,15 +614,39 @@ impl EditorView {
                 // tells the two apart instead of letting the ticket alone
                 // decide.
                 let instance = self.document_instance(id);
+                // Computed now, off the tree the save was requested against,
+                // rather than re-borrowing `self.work_folder` once the write
+                // lands: a workspace switch in the meantime simply leaves
+                // these paths absent from whatever tree `finish_save` then
+                // finds, a no-op for `touch_work_folder_ancestors`.
+                let ancestor_folders = self
+                    .work_folder
+                    .as_ref()
+                    .map(|folder| folder.ancestor_folder_paths(&path))
+                    .unwrap_or_default();
                 cx.spawn(async move |view, cx| {
-                    let result = cx
+                    let (result, ancestors) = cx
                         .background_executor()
                         .spawn(async move {
-                            run_save_job(files.as_ref(), &job.path, &job.document, job.guard)
+                            let result =
+                                run_save_job(files.as_ref(), &job.path, &job.document, job.guard);
+                            // The containing directory's own entry changed
+                            // alongside the leaf's write (an atomic save
+                            // replaces the target via a temp-file rename),
+                            // so its real modified time is acquired here too
+                            // rather than left to the next full rescan. A
+                            // failed write never touched the filesystem, so
+                            // nothing here changed either.
+                            let ancestors = if result.is_ok() {
+                                stamp_ancestor_folders(files.as_ref(), &ancestor_folders)
+                            } else {
+                                Vec::new()
+                            };
+                            (result, ancestors)
                         })
                         .await;
                     let _ = view.update(cx, |view, cx| {
-                        view.finish_save(id, ticket, instance, &path, result, cx);
+                        view.finish_save(id, ticket, instance, &path, result, ancestors, cx);
                     });
                 })
                 .detach();
@@ -608,6 +662,7 @@ impl EditorView {
         instance: Option<DocumentInstance>,
         path: &Path,
         result: Result<SavedFile, SaveFailure>,
+        ancestors: Vec<(PathBuf, Option<SystemTime>)>,
         cx: &mut Context<Self>,
     ) {
         if self.document_instance(id) != instance {
@@ -647,7 +702,7 @@ impl EditorView {
                 cx.add_recent_document(path);
                 self.retire_work_folder_draft(id, cx);
                 self.apply_pending_title_sync(id, path);
-                self.touch_saved_work_folder_entry(id, path);
+                self.touch_saved_work_folder_entry(id, path, &ancestors);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::SavedStale => {
@@ -657,7 +712,7 @@ impl EditorView {
                 self.schedule_autosave(cx);
                 self.retire_work_folder_draft(id, cx);
                 self.apply_pending_title_sync(id, path);
-                self.touch_saved_work_folder_entry(id, path);
+                self.touch_saved_work_folder_entry(id, path, &ancestors);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::Conflict => {

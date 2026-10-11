@@ -492,6 +492,7 @@ struct TitleRenameAttempt {
     from: PathBuf,
     target: PathBuf,
     title: String,
+    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -629,6 +630,23 @@ fn rebase_ui_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
     } else {
         to.join(relative)
     })
+}
+
+/// Looks up each ancestor folder's current real modified time through the
+/// same `FileService::stamp` boundary a save already uses for its own leaf
+/// path, off the UI thread. A folder whose metadata cannot be read right now
+/// (a transient race, or a platform that reports none) comes back `None`
+/// rather than keeping whatever this call does not actually know, the same
+/// degrade-on-failure contract `OsWorkFolderScanner::scan` already uses for
+/// `WorkFolderEntry::modified`.
+fn stamp_ancestor_folders(
+    files: &dyn FileService,
+    ancestors: &[PathBuf],
+) -> Vec<(PathBuf, Option<SystemTime>)> {
+    ancestors
+        .iter()
+        .map(|path| (path.clone(), files.stamp(path).and_then(|stamp| stamp.modified)))
+        .collect()
 }
 
 fn byte_offset_from_utf16(text: &str, offset: usize) -> usize {
@@ -2323,6 +2341,22 @@ impl EditorView {
         self.joined_parse_jobs.clear();
     }
 
+    /// Carries each ancestor folder's just-fetched real modified time into
+    /// the retained work-folder tree, the ancestor-folder counterpart to the
+    /// no-rescan `WorkFolder::touch` a save, create, or rename already gives
+    /// the node it directly changed. See `WorkFolder::ancestor_folder_paths`
+    /// for why a parent folder's own retained time needs the same refresh.
+    /// A workspace switched away in the meantime simply has no ancestors
+    /// left to touch, since `self.work_folder` itself changed.
+    fn touch_work_folder_ancestors(&mut self, ancestors: &[(PathBuf, Option<SystemTime>)]) {
+        let Some(folder) = self.work_folder.as_mut() else {
+            return;
+        };
+        for (path, modified) in ancestors {
+            folder.touch(path, *modified);
+        }
+    }
+
     fn remember_recent(&mut self, path: &Path) {
         self.recent.remember(path);
         if let Err(error) = self.stores.recent_files().store(&self.recent) {
@@ -2499,6 +2533,12 @@ impl EditorView {
             }) || pending.contains(&target_directory.join(candidate))
         });
         let path = target_directory.join(&name);
+        // Computed here, while `work_folder` is still borrowed, rather than
+        // walking the tree again once the create lands: `WorkFolder` would
+        // otherwise have to be re-borrowed from `self` after the background
+        // op, which `finish_new_work_folder_folder` already does for the
+        // mutation itself.
+        let ancestor_folders = work_folder.ancestor_folder_paths(&path);
         // Reserved synchronously, before any `await`: the tree is not
         // updated until `create_dir` finishes in the background, so a second
         // "new folder" click landing before this one completes would
@@ -2518,7 +2558,17 @@ impl EditorView {
                     // no-rescan way a save does, instead of leaving it
                     // unknown (and sorting as oldest) until the next scan.
                     let modified = files.stamp(&probe_path).and_then(|stamp| stamp.modified);
-                    (result, modified)
+                    // The parent directory's own entry just gained this new
+                    // folder, so its real modified time changed too; failing
+                    // this new folder's own creation leaves the tree
+                    // untouched instead of acting on paths the create never
+                    // actually affected.
+                    let ancestors = if result.is_ok() {
+                        stamp_ancestor_folders(files.as_ref(), &ancestor_folders)
+                    } else {
+                        Vec::new()
+                    };
+                    (result, modified, ancestors)
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
@@ -2531,10 +2581,14 @@ impl EditorView {
     fn finish_new_work_folder_folder(
         &mut self,
         path: PathBuf,
-        outcome: (std::io::Result<()>, Option<SystemTime>),
+        outcome: (
+            std::io::Result<()>,
+            Option<SystemTime>,
+            Vec<(PathBuf, Option<SystemTime>)>,
+        ),
         cx: &mut Context<Self>,
     ) {
-        let (result, modified) = outcome;
+        let (result, modified, ancestors) = outcome;
         self.pending_new_folders.remove(&path);
         match result {
             Ok(()) => {
@@ -2542,6 +2596,7 @@ impl EditorView {
                     folder.insert_folder(path.clone());
                     folder.touch(&path, modified);
                 }
+                self.touch_work_folder_ancestors(&ancestors);
                 self.expanded_folders.insert(path);
                 self.content_search_workspace_changed(cx);
                 self.status = None;
@@ -7571,6 +7626,68 @@ mod tests {
                 names,
                 ["Zeta.md", "Mid.md", "Alpha.md"],
                 "the already-scanned tree must resort immediately, without a rescan"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn saving_a_nested_note_resorts_its_real_parent_folder_by_updated_newest(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #447: a save only ever lands inside the note's own
+        // directory (an atomic write replaces the target via a temp-file
+        // rename), which also bumps that directory's own real modified
+        // time — so the sidebar's `UpdatedNewest` order must move the
+        // parent folder itself, not just the saved note, once the write
+        // lands.
+        let root = draft_test_root("save-resorts-parent-folder");
+        let archive = root.join("Archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let nested = archive.join("Nested.md");
+        std::fs::write(&nested, "before").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(root.join("Later.md"), "# Later\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let top_level_names = |view: &EditorView| -> Vec<String> {
+            view.work_folder
+                .as_ref()
+                .expect("work folder is scanned")
+                .children()
+                .iter()
+                .map(|node| node.path().file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                top_level_names(view),
+                ["Later.md", "Archive"],
+                "Later.md was written after Archive's own last change, so it starts out newest"
+            );
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        view.update(cx, |view, cx| view.open_work_folder_entry(&nested, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                top_level_names(view),
+                ["Archive", "Later.md"],
+                "Archive's own directory entry changed when the save landed inside it, \
+                 so it must now sort ahead of Later.md without a rescan"
             );
         });
 

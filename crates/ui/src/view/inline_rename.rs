@@ -542,20 +542,39 @@ impl EditorView {
         let files = self.files.clone();
         let operation_from = from.clone();
         let operation_target = target.clone();
+        // The rename only ever changes the final path component (`target`
+        // above is always `parent.join(file_name)`), so the containing
+        // folder is the same before and after it lands; computed now, off
+        // the tree the rename was requested against.
+        let ancestor_folders = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.ancestor_folder_paths(&from))
+            .unwrap_or_default();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let (result, ancestors) = cx
                 .background_executor()
                 .spawn(async move {
-                    match kind {
+                    let result = match kind {
                         InlineRenameKind::File => files.rename(&operation_from, &operation_target),
                         InlineRenameKind::Folder => {
                             files.rename_folder(&operation_from, &operation_target)
                         }
-                    }
+                    };
+                    // The containing directory's own entry changed with the
+                    // rename, so its real modified time is acquired here
+                    // too. A failed rename never touched the filesystem, so
+                    // nothing here changed either.
+                    let ancestors = if result.is_ok() {
+                        stamp_ancestor_folders(files.as_ref(), &ancestor_folders)
+                    } else {
+                        Vec::new()
+                    };
+                    (result, ancestors)
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.finish_inline_rename(from, target, kind, tickets, result, cx);
+                view.finish_inline_rename(from, target, kind, tickets, result, ancestors, cx);
             });
         })
         .detach();
@@ -569,6 +588,7 @@ impl EditorView {
         kind: InlineRenameKind,
         tickets: Vec<(SessionId, SaveTicket)>,
         result: std::io::Result<()>,
+        ancestors: Vec<(PathBuf, Option<SystemTime>)>,
         cx: &mut Context<Self>,
     ) {
         let mut queued_saves = Vec::new();
@@ -608,6 +628,7 @@ impl EditorView {
                         self.recent.rename_folder(&from, &target);
                     }
                 }
+                self.touch_work_folder_ancestors(&ancestors);
                 self.follow_inline_rename_paths(&from, &target, kind);
                 self.content_search_workspace_changed(cx);
                 if let Err(error) = self.stores.recent_files().store(&self.recent) {
