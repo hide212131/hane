@@ -1314,7 +1314,7 @@ mod tests {
             dev.children()
                 .iter()
                 .map(|node| match node {
-                    WorkFolderNode::File(entry) => entry.file_name(),
+                    WorkFolderNode::File(entry) => entry.file_name().to_owned(),
                     WorkFolderNode::Folder(_) => {
                         unreachable!("only files were nested under dev")
                     }
