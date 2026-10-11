@@ -54,9 +54,9 @@ pub struct Settings {
     /// means.
     pub default_folder: Option<PathBuf>,
     /// How the work-folder sidebar orders files and folders. Defaults to
-    /// `Name`, the order used before this setting existed, so a settings
-    /// file predating it — or simply missing the `sidebar_sort` line —
-    /// keeps that same alphabetical order rather than silently switching.
+    /// `UpdatedNewest`, so a settings file predating this setting — or
+    /// simply missing the `sidebar_sort` line — gets that same order rather
+    /// than an unspecified one.
     pub sidebar_sort: WorkFolderSortOrder,
 }
 

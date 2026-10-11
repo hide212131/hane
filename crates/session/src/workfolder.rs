@@ -293,7 +293,9 @@ impl WorkFolder {
     /// just produced — a save, an autosave, or a newly created file or
     /// folder — without a rescan, and re-sorts the level it lives at so an
     /// `Updated` sort order reflects the change immediately. A `path` the
-    /// tree was not scanned, inserted, or created with is a no-op.
+    /// tree was not scanned, inserted, or created with is a no-op. See
+    /// `set_modified` for why an out-of-order, chronologically older
+    /// `modified` cannot regress what is already retained.
     pub fn touch(&mut self, path: &Path, modified: Option<SystemTime>) {
         set_modified(&mut self.children, path, modified, self.sort_order);
     }
@@ -607,6 +609,19 @@ fn resort_tree(nodes: &mut [WorkFolderNode], order: WorkFolderSortOrder) {
 /// is a no-op (`WorkFolder::touch` and `WorkFolder::rename` both rely on
 /// this, the latter after the node has already been reinserted at its new
 /// path).
+///
+/// A `Some` `modified` older than what the node already retains is dropped
+/// instead of applied. `touch`'s callers acquire `modified` off the UI
+/// thread and apply it once their background work completes, so two
+/// completions for the same node — most commonly two sibling saves whose
+/// `ancestor_folder_paths` both name the same parent folder — can reach the
+/// UI thread in an order that does not match the order their writes landed
+/// in on disk. Without this guard, whichever completion happens to apply
+/// last would win regardless of which write it actually reflects, letting a
+/// chronologically earlier snapshot silently regress a newer one already
+/// retained. A `None` result (acquisition failed, or the node never had one)
+/// still always applies, the same degrade-on-failure contract
+/// `stamp_ancestor_folders` already documents.
 fn set_modified(
     nodes: &mut [WorkFolderNode],
     path: &Path,
@@ -614,6 +629,15 @@ fn set_modified(
     order: WorkFolderSortOrder,
 ) -> bool {
     if let Some(index) = nodes.iter().position(|node| node.path() == path) {
+        let retained = match &nodes[index] {
+            WorkFolderNode::File(entry) => entry.modified,
+            WorkFolderNode::Folder(folder) => folder.modified,
+        };
+        if let (Some(retained), Some(incoming)) = (retained, modified)
+            && incoming < retained
+        {
+            return true;
+        }
         match &mut nodes[index] {
             WorkFolderNode::File(entry) => entry.modified = modified,
             WorkFolderNode::Folder(folder) => folder.modified = modified,
@@ -1416,6 +1440,36 @@ mod tests {
         folder.touch(Path::new("/notes/A.md"), Some(system_time_at(300)));
 
         assert_eq!(folder.children()[0].path(), Path::new("/notes/A.md"));
+    }
+
+    #[test]
+    fn a_stale_out_of_order_touch_does_not_regress_a_newer_retained_modified_time() {
+        // Two sibling saves under the same parent folder each acquire that
+        // folder's own modified time off the UI thread once their write
+        // lands, then feed it back through `touch` once their completion
+        // reaches the UI thread — see `WorkFolder::ancestor_folder_paths`.
+        // Here the save that landed on disk later (400) is simulated as
+        // completing first, and the save that landed earlier (200)
+        // completes after it, the reversed order `set_modified` must guard
+        // against.
+        let children = vec![WorkFolderNode::Folder(WorkFolderFolder::new(
+            PathBuf::from("/notes/dev"),
+            vec![file_node("/notes/dev/Child.md", Some(system_time_at(100)))],
+            Some(system_time_at(100)),
+        ))];
+        let mut folder = WorkFolder::from_tree(PathBuf::from("/notes"), children);
+
+        folder.touch(Path::new("/notes/dev"), Some(system_time_at(400)));
+        folder.touch(Path::new("/notes/dev"), Some(system_time_at(200)));
+
+        let WorkFolderNode::Folder(dev) = &folder.children()[0] else {
+            panic!("dev folder expected");
+        };
+        assert_eq!(
+            dev.modified(),
+            Some(system_time_at(400)),
+            "the later-arriving but chronologically older touch must not overwrite the newer one"
+        );
     }
 
     #[test]
