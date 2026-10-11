@@ -41,6 +41,10 @@ const AI_SELECTION_NO_SELECTION_MESSAGE: &str = "AIで処理する文章を選�
 /// `text_transform::TEXT_TRANSFORM_TIMEOUT`, purely so this background thread
 /// cannot block forever if the service were ever to stop replying at all.
 const AI_SELECTION_RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The popup content area's own height cap, shared between
+/// `ai_selection_overlay_element`'s `max_h` and the below/above fit check in
+/// `ai_selection_overlay_position` so the two stay in sync.
+const AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT: f32 = 320.0;
 
 /// One popup invocation's fixed target, captured once when it opens (section
 /// 4). `instance`+`revision` together detect both "a different document
@@ -934,31 +938,43 @@ impl EditorView {
         .detach();
     }
 
-    /// The popup's current window-space anchor: the active end of the
-    /// captured selection's own screen position (`caret_geometry`, already
-    /// content-area-relative), placed below it with room for an estimated
-    /// popup height, or above it when that would not fit. `snap_to_window()`
-    /// at the call site then keeps the popup horizontally on-screen. Falls
-    /// back to a position near the top-left of the content area on the rare
+    /// Upper bound on the popup's own rendered height (its `max_h` in
+    /// `ai_selection_overlay_element`, plus the 1px top/bottom border), used
+    /// only to decide whether it fits *below* the selection without
+    /// clipping. The final on-screen position never uses this bound: it
+    /// comes from `Corner::TopLeft`/`Corner::BottomLeft` anchoring at the
+    /// selection's own edge, which GPUI resolves against the popup's real
+    /// measured size (see `ai_selection_overlay`). A short panel (e.g. an
+    /// empty saved-prompt list) therefore never leaves an oversized gap
+    /// above the selection, and a tall one is never placed where it would
+    /// overflow the editor area.
+    const AI_SELECTION_POPUP_MAX_HEIGHT: f32 = AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT + 2.0;
+
+    /// The popup's anchor point and the corner of the popup that should sit
+    /// at that point: the active end of the captured selection's own screen
+    /// position (`caret_geometry`, already content-area-relative), below the
+    /// selection when `AI_SELECTION_POPUP_MAX_HEIGHT` fits there, or above it
+    /// otherwise. `ai_selection_overlay` lets GPUI resolve the opposite edge
+    /// from the popup's real measured size, so the gap next to the selection
+    /// always matches the actually rendered content. Falls back to
+    /// `Corner::TopLeft` near the top-left of the content area on the rare
     /// frame where no caret geometry has been resolved yet.
-    fn ai_selection_overlay_position(&self) -> gpui::Point<Pixels> {
-        const POPUP_HEIGHT_ESTIMATE: f32 = 280.0;
+    fn ai_selection_overlay_position(&self) -> (gpui::Point<Pixels>, Corner) {
         const GAP: f32 = 6.0;
         let base_x = self.main_column_left + self.theme.line_horizontal_padding;
         let base_y = self.theme.header_height + self.document_find_reserved_height();
         let Some(geometry) = self.caret_geometry() else {
-            return point(px(base_x), px(base_y));
+            return (point(px(base_x), px(base_y)), Corner::TopLeft);
         };
         let x = self.main_column_left + geometry.x;
         let caret_top = base_y + geometry.y;
         let caret_bottom = caret_top + geometry.height;
         let window_bottom = base_y + self.viewport_height;
-        let y = if caret_bottom + GAP + POPUP_HEIGHT_ESTIMATE <= window_bottom {
-            caret_bottom + GAP
+        if caret_bottom + GAP + Self::AI_SELECTION_POPUP_MAX_HEIGHT <= window_bottom {
+            (point(px(x), px(caret_bottom + GAP)), Corner::TopLeft)
         } else {
-            (caret_top - GAP - POPUP_HEIGHT_ESTIMATE).max(self.theme.header_height)
-        };
-        point(px(x), px(y))
+            (point(px(x), px(caret_top - GAP)), Corner::BottomLeft)
+        }
     }
 
     /// The popup's full overlay element, or `None` while it is closed. Called
@@ -972,11 +988,23 @@ impl EditorView {
         if !self.ai_selection.open {
             return None;
         }
-        let position = self.ai_selection_overlay_position();
+        let (position, corner) = self.ai_selection_overlay_position();
+        // Keeps the popup within the editor's own display area (below the
+        // header/find bar, above the footer) rather than the whole window,
+        // per the implementation spec's "左右と高さをエディタ表示領域内に
+        // 収める"; horizontal margins stay 0, matching the pre-existing
+        // left/right clamp against the window edges.
+        let editor_area_margin = Edges {
+            top: px(self.theme.header_height + self.document_find_reserved_height()),
+            right: px(0.0),
+            bottom: px(self.theme.footer_height),
+            left: px(0.0),
+        };
         Some(
             anchored()
+                .anchor(corner)
                 .position(position)
-                .snap_to_window()
+                .snap_to_window_with_margin(editor_area_margin)
                 .child(self.ai_selection_overlay_element(window, cx))
                 .into_any_element(),
         )
@@ -1003,7 +1031,7 @@ impl EditorView {
             .debug_selector(|| "ai-selection-popup".to_owned())
             .occlude()
             .w(px(360.0))
-            .max_h(px(320.0))
+            .max_h(px(AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT))
             .flex()
             .flex_col()
             .rounded_sm()
@@ -1475,6 +1503,78 @@ mod tests {
             assert!(view.ai_selection.open);
             assert_eq!(view.ai_selection.original_text, "日本語");
             assert_eq!(view.editor().document().full_text(), "日本語の文章です\n");
+        });
+    }
+
+    // Issue #449 AC2 follow-up: the popup must stay close to the selection
+    // on both the below and the flipped-above path, using the selection's
+    // own edge rather than a fixed height guess (`POPUP_HEIGHT_ESTIMATE`)
+    // that could overshoot the popup's real rendered height and leave a
+    // large gap above the selection.
+    #[gpui::test]
+    fn overlay_position_sits_just_below_the_selection_when_the_editor_area_has_room(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one two\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, _cx| {
+            view.main_column_left = 0.0;
+            view.viewport_height = 600.0;
+            view.caret_geometry = Some(CaretGeometry {
+                x: 100.0,
+                y: 50.0,
+                height: 20.0,
+            });
+        });
+
+        view.read_with(cx, |view, _| {
+            let (position, corner) = view.ai_selection_overlay_position();
+            assert_eq!(corner, Corner::TopLeft);
+            let base_y = view.theme.header_height + view.document_find_reserved_height();
+            // caret_bottom + GAP, independent of the popup's actual content.
+            let expected_y = base_y + 50.0 + 20.0 + 6.0;
+            assert!((f32::from(position.y) - expected_y).abs() < 0.01);
+        });
+    }
+
+    #[gpui::test]
+    fn overlay_position_flips_to_sit_just_above_the_selection_when_below_would_clip(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one two\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        view.update(cx, |view, _cx| {
+            view.main_column_left = 0.0;
+            // Only ~60px of editor area left below the selection: far less
+            // than the popup's own height cap, so this must flip above
+            // instead of reusing a fixed height guess that overshoots
+            // whatever the popup actually renders at (the reported bug: an
+            // oversized, selection-distant gap for a short panel).
+            view.viewport_height = 100.0;
+            view.caret_geometry = Some(CaretGeometry {
+                x: 100.0,
+                y: 40.0,
+                height: 20.0,
+            });
+        });
+
+        view.read_with(cx, |view, _| {
+            let (position, corner) = view.ai_selection_overlay_position();
+            assert_eq!(corner, Corner::BottomLeft);
+            let base_y = view.theme.header_height + view.document_find_reserved_height();
+            let caret_top = base_y + 40.0;
+            // caret_top - GAP: GPUI resolves the popup's top edge from this
+            // anchor using its real measured height (`Corner::BottomLeft`),
+            // so this position never needs — and never bakes in — any
+            // estimate of that height.
+            let expected_y = caret_top - 6.0;
+            assert!((f32::from(position.y) - expected_y).abs() < 0.01);
         });
     }
 

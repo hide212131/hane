@@ -40,11 +40,11 @@ use crate::line::{
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme, sync_component_theme};
 use gpui::{
-    Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, PathPromptOptions, PinchEvent, Pixels, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored,
-    div, point, prelude::FluentBuilder, px, rgb, rgba,
+    Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, Corner, CursorStyle, Edges,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, PinchEvent, Pixels, Render,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
+    Task, Window, anchored, div, point, prelude::FluentBuilder, px, rgb, rgba,
 };
 use gpui_component::Disableable;
 use gpui_component::IconName;
