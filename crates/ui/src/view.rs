@@ -17303,7 +17303,8 @@ mod tests {
         std::fs::write(root.join("Loose.md"), "# Loose\n").unwrap();
         let (view, cx) = open_inline_rename_test_view(cx, &root);
 
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
+            view.set_sidebar_sort(WorkFolderSortOrder::NameAscending, cx);
             view.expanded_folders.insert(archive.clone());
             view.sidebar_scroll.set_offset(point(px(0.0), px(-120.0)));
         });
