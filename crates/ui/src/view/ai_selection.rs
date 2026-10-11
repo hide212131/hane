@@ -495,6 +495,11 @@ impl EditorView {
             if let Some(input) = self.ai_selection.input.clone() {
                 input.update(cx, |state, cx| state.focus(window, cx));
             }
+            // Set synchronously rather than waiting for the pinned input's
+            // own `InputEvent::Focus` — see the same reasoning in
+            // `open_ai_selection`, which applies equally to cycling Tab/
+            // Shift+Tab back onto `Input` (e.g. wrapping past `Close`).
+            self.ai_selection.input_focused = true;
         } else {
             window.focus(&self.focus_handle, cx);
         }
@@ -780,6 +785,15 @@ impl EditorView {
                 state.focus(window, cx);
             });
         }
+        // Set synchronously rather than waiting for the pinned input's own
+        // `InputEvent::Focus` (see the `cx.subscribe` in
+        // `ensure_ai_selection_input`): `note_ai_selection_escape_keystroke`
+        // reads `input_focused` for the very next keystroke, and a Focus
+        // event dispatched through GPUI's own effect queue is not guaranteed
+        // to have been observed by then. `document_find`'s `open_document_find`
+        // and `content_search`'s `open_content_search` set their own
+        // `input_focused` the same way for the same reason.
+        self.ai_selection.input_focused = true;
         self.reload_ai_selection_saved_prompts(cx);
         cx.notify();
     }
@@ -2344,6 +2358,9 @@ mod tests {
             });
         });
         cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.input_focused);
+        });
 
         let input = view
             .read_with(cx, |view, _| view.ai_selection.input.clone())
@@ -2357,12 +2374,25 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // The input still holds focus, and the composition just started is
+        // still active, going into the first Escape below.
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.input_focused);
+        });
+        let marked_before_escape = cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::marked_text_range(state, window, cx)
+            })
+        });
+        assert!(marked_before_escape.is_some());
+
         // While the input holds focus with an in-progress composition, Escape
         // must only cancel the composition, not close the popup.
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.ai_selection.open);
+            assert!(view.ai_selection.input_focused);
         });
 
         // Tab away from the input (blurring it) without ever snapshotting a
