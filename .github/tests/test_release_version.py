@@ -65,6 +65,9 @@ class ReleaseVersionTests(unittest.TestCase):
             "should_release",
             "if ! gh api --paginate",
             "Failed to read repository tags; refusing to release.",
+            "expected_sha:",
+            'EXPECTED_SHA: ${{ inputs.expected_sha }}',
+            'if [ "$GITHUB_SHA" != "$EXPECTED_SHA" ]; then',
         ):
             self.assertIn(expected, workflow)
 
@@ -72,6 +75,16 @@ class ReleaseVersionTests(unittest.TestCase):
             'gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag"',
             workflow,
         )
+
+    def test_automated_release_dispatch_is_bound_to_the_merge_commit(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("      - name: Merge with the tested head SHA\n        id: merge", workflow)
+        self.assertIn('merge_sha="$(jq -er \'.sha\' <<< "$result")"', workflow)
+        self.assertIn('RELEASE_SOURCE_SHA: ${{ steps.merge.outputs.merge_sha }}', workflow)
+        self.assertIn('--field "expected_sha=$RELEASE_SOURCE_SHA"', workflow)
 
     def test_release_request_uses_a_token_that_triggers_pull_request_ci(self):
         workflow = (

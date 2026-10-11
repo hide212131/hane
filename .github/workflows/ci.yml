@@ -337,6 +337,7 @@ jobs:
           gh pr checks "$PR_NUMBER" --required --repo "$GITHUB_REPOSITORY"
 
       - name: Merge with the tested head SHA
+        id: merge
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -349,12 +350,16 @@ jobs:
           result="$(gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/merge" \
             -f sha="$EXPECTED_HEAD_SHA" -f merge_method=squash)"
           jq -e '.merged == true' <<< "$result" >/dev/null
+          merge_sha="$(jq -er '.sha' <<< "$result")"
+          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
 
       - name: Start the existing Release builds workflow
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.release_checks.outputs.release_version }}
+          RELEASE_SOURCE_SHA: ${{ steps.merge.outputs.merge_sha }}
         run: |
           gh workflow run windows-release.yml --repo "$GITHUB_REPOSITORY" \
-            --ref main --field "version=$RELEASE_TAG"
+            --ref main --field "version=$RELEASE_TAG" \
+            --field "expected_sha=$RELEASE_SOURCE_SHA"
 
