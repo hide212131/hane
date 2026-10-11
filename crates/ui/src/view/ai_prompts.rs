@@ -377,7 +377,7 @@ impl AiPromptsPage {
                     })
                     .collect();
                 self.draft = self.baseline.clone();
-                self.selected = 0;
+                self.selected = self.selected.min(self.draft.len().saturating_sub(1));
                 self.title_input = None;
                 self.body_input = None;
                 self.message = None;
@@ -784,5 +784,153 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.ai_prompts.render(window, cx, self.theme)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::SettingsCategory;
+    use gpui::px;
+
+    // Regression for a saved draft resetting `selected` to the first prompt
+    // and losing track of the one actually being edited.
+    #[gpui::test]
+    fn saving_a_non_first_prompt_keeps_it_selected(cx: &mut gpui::TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-ai-prompts-save-selection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Prompts;
+            view.ai_prompts.root = Some(root.clone());
+            view.ai_prompts.loaded = true;
+            view.ai_prompts.load_error = None;
+            view.ai_prompts.revision = 0;
+            view.ai_prompts.baseline = vec![
+                UserPromptDraft {
+                    id: None,
+                    title: "一番目".to_owned(),
+                    prompt: "最初の指示".to_owned(),
+                },
+                UserPromptDraft {
+                    id: None,
+                    title: "二番目".to_owned(),
+                    prompt: "二番目の指示".to_owned(),
+                },
+                UserPromptDraft {
+                    id: None,
+                    title: "三番目".to_owned(),
+                    prompt: "三番目の指示".to_owned(),
+                },
+            ];
+            view.ai_prompts.draft = view.ai_prompts.baseline.clone();
+            view.ai_prompts.selected = 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let selected_title_before = view.read_with(cx, |view, app| {
+            value(view.ai_prompts.title_input.as_ref().unwrap(), app)
+        });
+        assert_eq!(selected_title_before, "二番目");
+
+        view.update(cx, |view, cx| {
+            view.ai_prompts.save(cx, None);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, app| {
+            assert_eq!(view.ai_prompts.message, None, "save must not fail");
+            assert_eq!(
+                view.ai_prompts.selected, 1,
+                "selected must stay on the edited prompt, not reset to the first one"
+            );
+            assert_eq!(view.ai_prompts.draft.len(), 3);
+            assert_eq!(
+                value(
+                    view.ai_prompts
+                        .title_input
+                        .as_ref()
+                        .expect("inputs resync after save"),
+                    app
+                ),
+                "二番目",
+                "the input fields must stay in sync with the still-selected prompt"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Saving an emptied list (e.g. after deleting the only prompt) must leave
+    // `selected` in a valid state instead of an out-of-range index.
+    #[gpui::test]
+    fn saving_an_emptied_draft_list_keeps_selected_valid(cx: &mut gpui::TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-ai-prompts-save-selection-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Prompts;
+            view.ai_prompts.root = Some(root.clone());
+            view.ai_prompts.loaded = true;
+            view.ai_prompts.load_error = None;
+            view.ai_prompts.revision = 0;
+            view.ai_prompts.baseline = vec![UserPromptDraft {
+                id: None,
+                title: "唯一の指示".to_owned(),
+                prompt: "唯一の指示の内容".to_owned(),
+            }];
+            view.ai_prompts.draft = view.ai_prompts.baseline.clone();
+            view.ai_prompts.selected = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts.request_delete(0);
+                view.ai_prompts.confirm_delete(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_prompts.draft.is_empty());
+            assert_eq!(view.ai_prompts.selected, 0);
+        });
+
+        view.update(cx, |view, cx| {
+            view.ai_prompts.save(cx, None);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.ai_prompts.message, None,
+                "saving an emptied list must not fail"
+            );
+            assert!(view.ai_prompts.draft.is_empty());
+            assert_eq!(view.ai_prompts.selected, 0);
+            assert!(view.ai_prompts.title_input.is_none());
+            assert!(view.ai_prompts.body_input.is_none());
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
