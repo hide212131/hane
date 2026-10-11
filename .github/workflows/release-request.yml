@@ -152,7 +152,7 @@ jobs:
           Release PR の自動化: Issue #453
           EOF
           pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$RELEASE_BRANCH" \
-            --title "[skip review] chore: $RELEASE_TAG release" \
+            --title "[skip review] chore: $RELEASE_TAG のリリース準備" \
             --body-file "$body_file" --label release)"
           pr_json="$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" \
             --json number,url,headRefOid,baseRefOid)"

@@ -98,6 +98,16 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn("branch: ${{ steps.validate.outputs.branch }}", workflow)
         self.assertNotIn("branch: ${{ steps.create.outputs.branch }}", workflow)
 
+    def test_generated_release_pr_title_uses_japanese_description(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "release-request.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            '--title "[skip review] chore: $RELEASE_TAG のリリース準備"',
+            workflow,
+        )
+
     def test_release_ci_does_not_prefix_the_release_tag_twice(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
