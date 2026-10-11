@@ -7684,6 +7684,55 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // Regression test for CodeRabbit review 5482775725 / inline comment
+    // 4241076881 on PR #451: at `SIDEBAR_MIN_WIDTH` the toolbar's sort
+    // control used to be pushed past the sidebar panel's right edge and
+    // clipped by its `overflow_hidden`, making it invisible and unclickable.
+    #[gpui::test]
+    fn sidebar_sort_menu_stays_visible_and_clickable_at_minimum_sidebar_width(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("sidebar-sort-menu-min-width");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        std::fs::write(root.join("Mid.md"), "# Mid\n").unwrap();
+        std::fs::write(root.join("Zeta.md"), "# Zeta\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, cx| {
+            view.sidebar_width = SIDEBAR_MIN_WIDTH;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let sort_menu = cx
+            .debug_bounds("sidebar-sort-menu")
+            .expect("the sort menu entry is rendered in the sidebar toolbar area");
+        assert!(
+            sort_menu.right() <= px(SIDEBAR_MIN_WIDTH),
+            "the sort control must stay within the sidebar panel's right edge \
+             at SIDEBAR_MIN_WIDTH, not be clipped by it: {sort_menu:?}"
+        );
+
+        cx.simulate_click(sort_menu.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let name_descending_item = cx
+            .debug_bounds("sidebar-sort-item-name_descending")
+            .expect("the open sort menu's items must still be reachable at the minimum width");
+        cx.simulate_click(name_descending_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings.sidebar_sort,
+                WorkFolderSortOrder::NameDescending,
+                "the sort control must stay clickable at SIDEBAR_MIN_WIDTH"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[gpui::test]
     fn saving_a_nested_note_resorts_its_real_parent_folder_by_updated_newest(
         cx: &mut gpui::TestAppContext,

@@ -63,6 +63,21 @@ pub(super) fn flatten_filtered_work_folder_tree<'a>(
     found
 }
 
+/// A short label for the sidebar toolbar's sort button. The full
+/// `WorkFolderSortOrder::label()` text (shown in the dropdown menu and on
+/// the settings screen, which both have room to spare) does not fit next to
+/// the toolbar's other controls at `SIDEBAR_MIN_WIDTH`, so the toolbar shows
+/// this shorter form and carries the full text via the button's tooltip and
+/// accessibility label instead.
+fn sidebar_sort_toolbar_label(order: WorkFolderSortOrder) -> &'static str {
+    match order {
+        WorkFolderSortOrder::UpdatedNewest => "新しい順",
+        WorkFolderSortOrder::UpdatedOldest => "古い順",
+        WorkFolderSortOrder::NameAscending => "名前（昇順）",
+        WorkFolderSortOrder::NameDescending => "名前（降順）",
+    }
+}
+
 impl EditorView {
     /// Re-observes the local calendar date for the sidebar's file-name
     /// badges and redraws the view when it has moved on. Driven by
@@ -192,7 +207,9 @@ impl EditorView {
         let sidebar_sort = self.settings.sidebar_sort;
         let sort_menu_view = cx.entity();
         let sort_button = Button::new("work-folder-sort-menu")
-            .label(format!("並べ替え: {}", sidebar_sort.label()))
+            .label(sidebar_sort_toolbar_label(sidebar_sort))
+            .tooltip(format!("並べ替え: {}", sidebar_sort.label()))
+            .accessibility_label(format!("並べ替え: {}", sidebar_sort.label()))
             .small()
             .ghost()
             .dropdown_menu(move |mut menu, _, _| {
@@ -260,7 +277,20 @@ impl EditorView {
                             cx,
                         );
                     })),
-            )
+            );
+        // A row of its own: at `SIDEBAR_MIN_WIDTH` there is not enough room
+        // left in `toolbar` for the sort control to stay fully visible and
+        // clickable alongside the other toolbar buttons (CodeRabbit review
+        // 5482775725 / inline comment 4241076881 on PR #451).
+        let sort_row = div()
+            .id("work-folder-sort-row")
+            .debug_selector(|| "sidebar-sort-row".to_owned())
+            .h(px(SIDEBAR_TOOLBAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .mb(px(SIDEBAR_TOOLBAR_GAP))
             .child(sort_button);
         let mut filter_input = div().relative().flex_1().min_w(px(0.0)).h_full();
         if self.sidebar_filter.is_empty() {
@@ -550,6 +580,8 @@ impl EditorView {
         let list_top = SIDEBAR_PADDING
             + SIDEBAR_TOOLBAR_HEIGHT
             + SIDEBAR_TOOLBAR_GAP
+            + SIDEBAR_TOOLBAR_HEIGHT
+            + SIDEBAR_TOOLBAR_GAP
             + if show_filter {
                 SIDEBAR_FILTER_HEIGHT + SIDEBAR_FILTER_GAP
             } else {
@@ -627,6 +659,7 @@ impl EditorView {
                         .text_color(rgb(self.theme.sidebar_foreground))
                         .text_size(px(BODY_FONT_SIZE))
                         .child(toolbar)
+                        .child(sort_row)
                         .children(filter)
                         .child(list)
                         .child(settings_footer),
