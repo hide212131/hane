@@ -542,3 +542,33 @@ session I/O、background parse、height/cache、viewportの残りのpointer/pane
 **残件**
 
 session I/O、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は引き続き #301 の後続として実行計画で追跡する。#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置（`view/background_parse.rs` の2メソッド）に依存する後続がある場合は逆順に戻す。
+
+
+### 9.14 RF2-B: presentationの機械的分割 第1PR — 位置対応 (#302)
+
+設計PR [#454](https://github.com/hide212131/hane/pull/454) はmerge済み。設計の受入commit・P1の変更前mainは `90f51e1a965588b1796f05a6744c150ac5ba4a9f`。設計は保存済み文書の第5.1節・第8.1節を使い、再設計せずcurrent codeとの差分を確認して実装した。
+
+P1実装はPR [#456](https://github.com/hide212131/hane/pull/456)。製品コード検証headは `7ec7b7f7751e3ffc811e23f1177ae364c655e2cb`、証拠文書更新後のPR headは `0a9d214b25b94012bfbd063028da86ccff7e698c`。PR #456 はこのheadを期待headとしてmergeし、merge commitは `a6c093499e3d3d49d6fad3f477da456a72ff314a`。Issue #302はopenのままとする。
+
+**移動表**
+
+| 旧配置 | 新配置 | 内容 |
+| --- | --- | --- |
+| `crates/presentation/src/lib.rs` | `crates/presentation/src/source_map.rs` | `VisualOffset`、`VisualRange`、`Visibility`、`BoundarySide`、`MarkerEdge`、`MappingSegment`、`PositionCandidate`、`SourceMap`と全impl |
+| crate root | crate root | private `mod source_map;` と同じ8公開名の明示的re-export |
+| `lib.rs::tests` | `source_map.rs::tests` | `hidden_unicode_boundaries_normalize_with_affinity`を、名前・属性・入力・期待値・本体を維持して移動 |
+
+テストmoduleで既存の `present_markdown` を使うため `use crate::present_markdown;` を追加した。既存テスト一覧はpresentation 140件のまま。8型+全implおよび移動test本体のbyte-identical比較、crate rootの公開名8件の維持を記録した。新alias/wrapper/public moduleはない。
+
+**受入検証**
+
+- PR CI [run 38145043557](https://github.com/hide212131/hane/actions/runs/38145043557): PR head `0a9d214...` のmacOS/Windows workspace tests、OS固有テスト、Clippyがsuccess。
+- trusted verification [run 38144884154](https://github.com/hide212131/hane/actions/runs/38144884154): 同headのworkspace all-features regression testsとClippyがsuccess。
+- ローカル `cargo test --locked -p hane-presentation` および `--all-features`: 各140 passed。ローカル `cargo test --workspace --locked`: 1,060 passed。製品コード検証head `7ec7b7f...`で実行。
+- exact PR head `0a9d214...` の `cargo doc --locked -p hane-presentation --no-deps`: exit 0、既存warning 9件。
+- `git diff --check`: exit 0。公開範囲・移動コード・テスト比較の詳細は [P1証拠記録](refactor-rf2b-p1-evidence.md)。
+- `cargo fmt --all -- --check`: ローカルrustfmt 1.99.0とrepository指定1.98.1の不一致により、未変更 `crates/ui/src/view.rs:14674` で差を検出。変更前も同じ結果で、P1差分外の既存問題として未修正、成功扱いにしない。
+- 設計書第9.4節に照らし追加の実画面検証は不要と判断した。UI配線・layout・描画処理は変更していない。実字形・paint・inputをunit testで確認済みとは扱わない。
+- current-headのCodeRabbit full reviewは実施していない。ユーザーの指示によりGitHub Code Reviewへ切替え、review [5483760984](https://github.com/hide212131/hane/pull/456#pullrequestreview-5483760984) をPR head `0a9d214...` に記録した。findingなし・blocking issueなし。review主体はこのtaskのGitHub認証 `hide212131` で、PR authorと同じであり、独立reviewとは扱わない。旧headに対するCodeRabbit指摘は証拠文書の記載不整合で、head `0a9d214...` までに修正済み。
+
+P1のみ受入済み。P2以降は未着手であり、本節から自動的に継続しない。Issue #302の他の受入条件は未完了のため、Issueは閉じない。
