@@ -243,9 +243,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 T05〜T08に対応する回帰テスト（複数byte文字の byte-accurate置換と単一Undo/Redo、結果が元文と同一の場合のno-op、捕捉後の編集による無効化、旧generation／close後の応答破棄）をユニット・統合テストとして追加したが、範囲は絞っており、二重クリック・取消中タブ切替・通知欠落など`T08`/`T09`の全ケースは対象外。
 
-一覧の矢印キー操作とTabによる4要素間の移動（AC2）は後続のworker実行で追加実装した。入力欄・送信ボタン・保存済み項目一覧・閉じるボタンの間をTab/Shift+Tabで巡回し（保存項目が0件のときは一覧を巡回対象から外す）、矢印キーによる一覧内項目の移動は一覧自体にフォーカスがある場合だけ行う。本文へのTab/矢印/Backspace/Delete/Undo等の漏れ防止は、ポップアップが開いている間は常時（論理フォーカスが入力欄以外にある間も含む）有効にした。一覧項目のキーボードフォーカスが指す行を、保存項目の再読込・0件化が追い越した場合に無効な項目を指し続けないことも回帰テストで確認している。Send/Closeボタン自体の視覚的なフォーカス表示、およびEnterキーによるSend/List/Closeの決定（マウスクリックでの即時実行は維持）は、このfocused fixの対象外とした。
+一覧の矢印キー操作とTabによる4要素間の移動（AC2）は後続のworker実行で追加実装した。入力欄・送信ボタン・保存済み項目一覧・閉じるボタンの間をTab/Shift+Tabで巡回し（保存項目が0件のときは一覧を巡回対象から外す）、矢印キーによる一覧内項目の移動は一覧自体にフォーカスがある場合だけ行う。本文へのTab/矢印/Backspace/Delete/Undo等の漏れ防止は、ポップアップが開いている間は常時（論理フォーカスが入力欄以外にある間も含む）有効にした。一覧項目のキーボードフォーカスが指す行を、保存項目の再読込・0件化が追い越した場合に無効な項目を指し続けないことも回帰テストで確認している。Send/Closeボタン自体の視覚的なフォーカス表示（`send_focused`/`close_focused`）と、Enterキーによる現在のfocus_regionに応じたSend/List/Closeの決定（`ai_selection_handle_enter`、マウスクリックでの即時実行は維持）も実装・回帰テスト済み。
 
-ポップアップの画面上の位置は、選択範囲の終端（caret）の既存レイアウト情報（`caret_geometry`/`main_column_left`）から算出し、`snap_to_window()`で画面内に収めている。選択範囲そのものの矩形（複数行・逆方向選択時の正確な端）やエディタ表示領域ちょうどへのクランプ（ウィンドウ全体ではなく）は簡略化しており、実画面での見た目の確認はできていない。
+ポップアップの画面上の位置は、選択範囲の終端（caret）の既存レイアウト情報（`caret_geometry`/`main_column_left`）から算出し、`snap_to_window_with_margin()`でウィンドウ全体ではなくヘッダー・検索バー・フッターを除くエディタ表示領域内に収めている（左右の margin は既存のウィンドウ端クランプと同じ0のまま）。選択範囲そのものの矩形（複数行・逆方向選択時の正確な端）は簡略化しており、実画面での見た目の確認はできていない。
 
 このworkerはRead/Edit/Write/Glob/Grepのみに制限されており、`cargo build`/`cargo test`/`cargo clippy`やGUIを一切実行していない。T11〜T13（Windows/macOS実画面、実ChatGPT/Codex/Custom接続）は本PRで未実施のまま。exact-head CIでの最初の検証、CodeRabbitのreview、GUI validationは、この後のCommanderの観測対象。
 
