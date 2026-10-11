@@ -675,13 +675,22 @@ impl EditorView {
         });
     }
 
-    /// Same reasoning as `note_ai_selection_escape_keystroke`, for Enter.
+    /// Same reasoning as `note_ai_selection_escape_keystroke`, for Enter —
+    /// except this one does not also require `input_focused`. The pinned
+    /// input's own `InputEvent::Focus`/`Blur` can still be mid-flight (not
+    /// yet observed by this view) immediately after `open_ai_selection`
+    /// hands it real focus, and reading a stale `false` here would let a
+    /// composing Enter fall through to `InputEvent::PressEnter` as if it
+    /// were a committed one, submitting the marked text as the instruction.
+    /// Reading `marked_text_range` straight from the input is cheap and
+    /// always current, and is harmlessly `None` whenever this input holds no
+    /// composition (including while it does not have real focus at all).
     pub(super) fn note_ai_selection_enter_keystroke(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.ai_selection.open || !self.ai_selection.input_focused {
+        if !self.ai_selection.open {
             return;
         }
         let Some(input) = self.ai_selection.input.clone() else {
