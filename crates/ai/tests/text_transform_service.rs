@@ -75,6 +75,37 @@ fn wait_for_probe_record(root: &std::path::Path, needle: &str) -> String {
     }
 }
 
+fn find_turn_start_with_selected_text(
+    record: &str,
+    selected_text: &str,
+) -> Option<serde_json::Value> {
+    record
+        .lines()
+        .filter_map(|line| line.strip_prefix("TURN_START:"))
+        .find_map(|params| {
+            let turn_start: serde_json::Value = serde_json::from_str(params).ok()?;
+            let input_text = turn_start["input"].get(0)?.get("text")?.as_str()?;
+            let payload: serde_json::Value = serde_json::from_str(input_text).ok()?;
+            (payload["selected_text"].as_str() == Some(selected_text)).then_some(turn_start)
+        })
+}
+
+fn wait_for_text_transform_record(root: &std::path::Path, selected_text: &str) -> String {
+    let path = root.join("ai/codex-chatgpt/.hane-fake-app-server-probe-record");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let record = std::fs::read_to_string(&path).unwrap_or_default();
+        if find_turn_start_with_selected_text(&record, selected_text).is_some() {
+            return record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not record a text transform turn with selected_text={selected_text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn spawn_service(root: PathBuf, browser_opener: Arc<dyn BrowserOpener>) -> AiService {
     AiService::spawn(AiServiceConfig {
         app_data_root: root,
@@ -324,10 +355,11 @@ fn a_fixed_probe_and_a_text_transform_never_run_concurrently_and_probe_input_nev
     // Once the Probe has released the guard, a text transform is admitted
     // and sends its own structured instruction/selected_text (never the
     // fixed Probe's own fixed request text).
+    let selected_text = "選択テキスト";
     let (id, reply_rx) = handle
-        .try_submit_text_transform("校正する".to_owned(), "選択テキスト".to_owned())
+        .try_submit_text_transform("校正する".to_owned(), selected_text.to_owned())
         .unwrap();
-    wait_for_probe_record(&data_root, "TURN_START:");
+    wait_for_text_transform_record(&data_root, selected_text);
     handle.cancel(id).unwrap();
     assert_eq!(wait_for_result(&service, id), SafeOperationResult::Canceled);
     let outcome = reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -336,11 +368,7 @@ fn a_fixed_probe_and_a_text_transform_never_run_concurrently_and_probe_input_nev
         data_root.join("ai/codex-chatgpt/.hane-fake-app-server-probe-record"),
     )
     .unwrap();
-    let text_transform_turn_start: serde_json::Value = record
-        .lines()
-        .filter_map(|line| line.strip_prefix("TURN_START:"))
-        .last()
-        .and_then(|params| serde_json::from_str(params).ok())
+    let text_transform_turn_start = find_turn_start_with_selected_text(&record, selected_text)
         .expect("the text transform's own TURN_START was recorded");
     let input_text = text_transform_turn_start["input"][0]["text"]
         .as_str()
@@ -350,7 +378,8 @@ fn a_fixed_probe_and_a_text_transform_never_run_concurrently_and_probe_input_nev
         "the fixed Probe's own fixed input must never be the text transform's input: {input_text}"
     );
     let payload: serde_json::Value = serde_json::from_str(input_text).unwrap();
-    assert_eq!(payload["selected_text"], "選択テキスト");
+    assert_eq!(payload["instruction"], "校正する");
+    assert_eq!(payload["selected_text"], selected_text);
 
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);
