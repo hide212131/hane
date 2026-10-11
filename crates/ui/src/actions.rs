@@ -445,6 +445,20 @@ command_actions! {
             view.leave_ai_selection(window, cx);
             return;
         }
+        if view.ai_selection_blocks_editor_keys() {
+            // Reaching here means the popup is open but this Escape was not
+            // meant to leave it (`ai_selection_should_leave_on_escape` above
+            // was false) — i.e. it only cancelled the popup's own pinned
+            // input's in-progress IME composition, which already happened
+            // through the normal key-dispatch path above this action. Never
+            // fall through to `perform_cancel_composition` below: that is
+            // the main document body's own composition-cancel, and its
+            // `after_input` unconditionally invalidates a still-open popup
+            // via `AiSelectionState::invalidate_for_edit`, which would close
+            // this popup on the very Escape that was only supposed to
+            // cancel its composition.
+            return;
+        }
         if view.dismiss_file_tab_context_menu(cx) {
             return;
         }
