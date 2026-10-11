@@ -83,6 +83,38 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn("gh pr create", workflow)
         self.assertIn("gh run watch", workflow)
 
+    def test_release_ci_does_not_prefix_the_release_tag_twice(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "RELEASE_TAG: ${{ needs.release_checks.outputs.release_version }}",
+            workflow,
+        )
+        self.assertNotIn(
+            "RELEASE_TAG: v${{ needs.release_checks.outputs.release_version }}",
+            workflow,
+        )
+
+    def test_release_merge_job_can_read_required_checks_and_statuses(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        merge_job = workflow.split("  merge_release_pr:", 1)[1]
+
+        self.assertIn("checks: read", merge_job)
+        self.assertIn("statuses: read", merge_job)
+
+    def test_release_automation_documents_main_ruleset_requirements(self):
+        guide = (ROOT / ".github" / "RELEASE_AUTOMATION.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("cargo test / clippy (macos-latest)", guide)
+        self.assertIn("cargo test / clippy (windows-latest)", guide)
+        self.assertIn("required approval review", guide)
+
     def test_release_notes_exclude_release_only_pulls(self):
         config = (ROOT / ".github" / "release.yml").read_text(encoding="utf-8")
         self.assertRegex(

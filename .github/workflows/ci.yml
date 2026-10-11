@@ -294,8 +294,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
+      checks: read
       contents: write
       pull-requests: write
+      statuses: read
     steps:
       - name: Verify current head, base, checks, and mergeability
         id: current
@@ -310,8 +312,21 @@ jobs:
           set -euo pipefail
           current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
           test "$current_main" = "$EXPECTED_BASE_SHA"
-          pr="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json state,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels)"
+          for attempt in $(seq 1 6); do
+            pr="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json state,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels)"
+            mergeable="$(jq -r '.mergeable // "UNKNOWN"' <<< "$pr")"
+            if [ "$mergeable" != "UNKNOWN" ]; then
+              break
+            fi
+            if [ "$attempt" -lt 6 ]; then
+              sleep 5
+            fi
+          done
+          if [ "$mergeable" = "UNKNOWN" ]; then
+            echo "GitHub did not finish calculating release PR mergeability." >&2
+            exit 1
+          fi
           jq -e \
             --arg head "$EXPECTED_HEAD_SHA" \
             --arg head_ref "$EXPECTED_HEAD_REF" \
@@ -338,7 +353,7 @@ jobs:
       - name: Start the existing Release builds workflow
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: v${{ needs.release_checks.outputs.release_version }}
+          RELEASE_TAG: ${{ needs.release_checks.outputs.release_version }}
         run: |
           gh workflow run windows-release.yml --repo "$GITHUB_REPOSITORY" \
             --ref main --field "version=$RELEASE_TAG"
