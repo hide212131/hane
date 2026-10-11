@@ -216,6 +216,7 @@ impl SourceMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::present_markdown;
     use hane_document::Revision;
 
     // The surrounding markdown parse/visual-text construction is exercised
@@ -225,7 +226,7 @@ mod tests {
     #[test]
     fn hidden_unicode_boundaries_normalize_with_affinity() {
         let source = "**日本🙂**";
-        let block = crate::present_markdown(
+        let block = present_markdown(
             0,
             Revision(1),
             SourceRange::new(100, 100 + source.len()),

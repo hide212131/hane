@@ -63,7 +63,7 @@
 
 ### テスト配置の理由（項目11）
 
-このテストは`present_markdown`で`VisualLine`を組み立てた上で、隠れたUnicode境界に対する`SourceMap::normalize_source`／`normalize_visual`の正規化契約（丸め先の候補選択、UTF-8境界の保持）を直接検証している。アサーション対象はすべて`source_map`の契約であり、`present_markdown`はP1でまだ移動しない`projection`責務の既存入口を使ったセットアップに過ぎない。設計書第9.1節は「別責務をまたぐテストは既存呼出関係に沿って配置を選び、理由を記録する」としており、本テストの検証責務を基準に`source_map.rs`側へ配置した。`present_markdown`はP1では`lib.rs`に残るcrate root関数のままなので、新module側から`crate::present_markdown`で呼び出している。
+このテストは`present_markdown`で`VisualLine`を組み立てた上で、隠れたUnicode境界に対する`SourceMap::normalize_source`／`normalize_visual`の正規化契約（丸め先の候補選択、UTF-8境界の保持）を直接検証している。アサーション対象はすべて`source_map`の契約であり、`present_markdown`はP1でまだ移動しない`projection`責務の既存入口を使ったセットアップに過ぎない。設計書第9.1節は「別責務をまたぐテストは既存呼出関係に沿って配置を選び、理由を記録する」としており、本テストの検証責務を基準に`source_map.rs`側へ配置した。`present_markdown`はP1では`lib.rs`に残るcrate root関数のままなので、新module側に`use crate::present_markdown;`を追加し、本体の呼出しは旧`lib.rs`時点と同じ`present_markdown(...)`のまま変更していない。
 
 ### 公開API比較（名前のみ、コンパイル未確認）
 
