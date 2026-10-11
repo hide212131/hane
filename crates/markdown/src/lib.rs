@@ -49,6 +49,7 @@ pub use list_projection::{
     ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
     ListProjectionRow, QuoteProjection,
 };
+pub(crate) use markers::markdown_lines;
 pub use markers::{
     FenceDelimiter, FenceMarkerEdge, fence_closes, fence_closing_delimiter, fence_delimiter,
     has_delimiter_markers, is_table_delimiter,
@@ -56,7 +57,6 @@ pub use markers::{
 pub use syntax::{
     MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment, TableParse,
 };
-pub(crate) use markers::markdown_lines;
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use markers::{

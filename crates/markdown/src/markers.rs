@@ -493,7 +493,11 @@ pub(super) struct DerivedMarkers {
 /// pulldown-cmark already attributed to each node. The event ranges stay
 /// authoritative; this only recovers open/close delimiter positions that the
 /// event stream does not expose. Returned ranges are sorted and merged.
-pub(super) fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> DerivedMarkers {
+pub(super) fn derive_markers(
+    tree: &MarkdownTree,
+    range: SourceRange,
+    source: &str,
+) -> DerivedMarkers {
     let mut markers = Vec::new();
     let mut fence_markers = Vec::new();
     let mut fence_marker_edges = Vec::new();
