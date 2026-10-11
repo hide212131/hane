@@ -94,6 +94,11 @@ pub enum UserPromptsSaveError {
     /// and retry rather than overwriting a concurrent change.
     RevisionConflict { current: Box<UserPrompts> },
     TooManyPrompts { max: usize },
+    /// `id` is `0`, or is `>=` the persisted `next_id` at the start of this
+    /// save: it was never actually issued by this store.
+    InvalidId { id: u64 },
+    /// Two drafts in the same save carry the same existing id.
+    DuplicateId { id: u64 },
     TitleEmpty,
     TitleContainsNewline,
     TitleTooLong { max_chars: usize },
@@ -119,6 +124,12 @@ impl std::fmt::Display for UserPromptsSaveError {
             }
             UserPromptsSaveError::TooManyPrompts { max } => {
                 write!(f, "a maximum of {max} saved prompts is supported")
+            }
+            UserPromptsSaveError::InvalidId { id } => {
+                write!(f, "prompt id {id} was never issued by this store")
+            }
+            UserPromptsSaveError::DuplicateId { id } => {
+                write!(f, "prompt id {id} is used by more than one entry in the same save")
             }
             UserPromptsSaveError::TitleEmpty => write!(f, "a prompt title cannot be empty"),
             UserPromptsSaveError::TitleContainsNewline => {
@@ -233,6 +244,23 @@ impl UserPromptsStore {
             return Err(UserPromptsSaveError::TooManyPrompts {
                 max: MAX_PROMPT_COUNT,
             });
+        }
+
+        // Every explicit id must have been actually issued by a prior save
+        // (non-zero and below the pre-save `next_id`), and no two drafts may
+        // carry the same id. Checked up front, against the pre-save
+        // `next_id`, so a newly minted id below can never collide with one
+        // of these: minted ids only ever start at `next_id` and increase.
+        let mut seen_ids = std::collections::HashSet::with_capacity(drafts.len());
+        for draft in &drafts {
+            if let Some(id) = draft.id {
+                if id == 0 || id >= next_id {
+                    return Err(UserPromptsSaveError::InvalidId { id });
+                }
+                if !seen_ids.insert(id) {
+                    return Err(UserPromptsSaveError::DuplicateId { id });
+                }
+            }
         }
 
         let mut prompts = Vec::with_capacity(drafts.len());
@@ -503,6 +531,37 @@ mod tests {
         // The on-disk file is untouched.
         let raw = std::fs::read_to_string(store.path()).unwrap();
         assert!(raw.contains(&(USER_PROMPTS_SCHEMA_VERSION + 1).to_string()));
+    }
+
+    /// Regression for the id-invariant bug: a save that reuses an existing
+    /// id on two drafts, or supplies an id of `0`, or supplies an id that
+    /// was never issued (`>= next_id`), must be rejected and must not touch
+    /// the file.
+    #[test]
+    fn duplicate_or_unissued_ids_are_rejected_without_persisting() {
+        let store = store("id_invariants");
+        let first = store
+            .save(0, vec![draft(None, "校正する", "本文A")])
+            .unwrap();
+        let id = first.prompts[0].id;
+
+        assert!(matches!(
+            store.save(
+                first.revision,
+                vec![draft(Some(id), "A", "本文A"), draft(Some(id), "B", "本文B")]
+            ),
+            Err(UserPromptsSaveError::DuplicateId { id: dup }) if dup == id
+        ));
+        assert!(matches!(
+            store.save(first.revision, vec![draft(Some(0), "A", "本文A")]),
+            Err(UserPromptsSaveError::InvalidId { id: 0 })
+        ));
+        assert!(matches!(
+            store.save(first.revision, vec![draft(Some(first.next_id), "A", "本文A")]),
+            Err(UserPromptsSaveError::InvalidId { id }) if id == first.next_id
+        ));
+        // None of the rejected saves touched the persisted file.
+        assert_eq!(store.load().unwrap().unwrap(), first);
     }
 
     #[test]

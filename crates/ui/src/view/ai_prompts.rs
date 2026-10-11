@@ -758,6 +758,10 @@ fn save_error_message(error: &UserPromptsSaveError) -> String {
         UserPromptsSaveError::TooManyPrompts { max } => {
             format!("保存できる指示は最大{max}件です。")
         }
+        UserPromptsSaveError::InvalidId { .. } | UserPromptsSaveError::DuplicateId { .. } => {
+            "内部状態が不整合です。「元に戻す」で最新の内容を読み込んでから編集し直してください。"
+                .to_owned()
+        }
         UserPromptsSaveError::TitleEmpty => "タイトルを入力してください。".to_owned(),
         UserPromptsSaveError::TitleContainsNewline => "タイトルに改行は使えません。".to_owned(),
         UserPromptsSaveError::TitleTooLong { max_chars } => {
