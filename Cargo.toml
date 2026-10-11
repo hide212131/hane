@@ -12,7 +12,7 @@ members = [
     "crates/ui",
 ]
 resolver = "2"
-exclude = ["vendor/gpui", "vendor/gpui-pre-macos"]
+exclude = ["vendor/gpui", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows"]
 
 [workspace.package]
 # Source of truth for release version; Cargo.lock must stay in sync.
@@ -53,3 +53,4 @@ codegen-units = 1
 [patch.crates-io]
 pulldown-cmark = { path = "vendor/pulldown-cmark" }
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }

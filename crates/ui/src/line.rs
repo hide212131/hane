@@ -1386,7 +1386,13 @@ fn cursor_overlay(theme: Theme, caret_input_mode: Option<KeyboardInputMode>) -> 
                 .text_color(rgb(theme.quote_foreground))
                 .text_size(px(9.))
                 .line_height(px(CARET_MODE_BADGE_HEIGHT))
-                .child(glyph),
+                .child(glyph)
+                // Lets regression tests address the badge actually painted
+                // for a given glyph (see `view.rs`'s
+                // `caret_mode_badge_updates_through_the_real_keyboard_layout_listener`)
+                // instead of calling `caret_mode_glyph` directly. A no-op
+                // outside test builds.
+                .debug_selector(move || format!("caret-mode-badge-{glyph}")),
         );
     }
     overlay
@@ -1408,6 +1414,7 @@ mod tests {
     use super::*;
     use hane_editor::Selection;
     use hane_markdown::BlockIndex;
+    use crate::input_mode::update_keyboard_input_mode;
     use hane_presentation::Visibility;
 
     // A single-Range fixture built via `collect`, not a `Vec`-like sequence
@@ -1453,6 +1460,45 @@ mod tests {
             Some("あ")
         );
         assert_eq!(caret_mode_glyph(None), None);
+    }
+
+    #[test]
+    fn caret_mode_badge_recovers_from_a_stale_unknown_reassociation_race() {
+        // Issue #448: on Windows, the on_focus listener that drives
+        // `caret_input_mode` can run synchronously (inside `draw_window`'s
+        // `request_frame`) before the IME context is reassociated for the
+        // just-refocused view, observing `None` even though the real mode
+        // is known. The reassociation reload that `update_ime_enabled`
+        // then triggers must correct the badge in one update, without
+        // flickering through further unnecessary redraws.
+        let mut caret_input_mode = Some(KeyboardInputMode::Ascii);
+
+        // Settings page closes and returns focus to the editor while its
+        // IME context is still disassociated: the stale read hides the
+        // badge.
+        assert!(update_keyboard_input_mode(&mut caret_input_mode, None));
+        assert_eq!(caret_mode_glyph(caret_input_mode), None);
+
+        // The post-reassociation reload observes the corrected mode and
+        // the badge reappears with the right glyph.
+        assert!(update_keyboard_input_mode(
+            &mut caret_input_mode,
+            Some(KeyboardInputMode::Native)
+        ));
+        assert_eq!(caret_mode_glyph(caret_input_mode), Some("あ"));
+
+        // A duplicate reload observing the same, already-current mode
+        // must not request another redraw.
+        assert!(!update_keyboard_input_mode(
+            &mut caret_input_mode,
+            Some(KeyboardInputMode::Native)
+        ));
+        assert_eq!(caret_mode_glyph(caret_input_mode), Some("あ"));
+
+        // A genuinely unknown mode (e.g. another app's window briefly
+        // holds focus) still hides the badge instead of guessing ASCII.
+        assert!(update_keyboard_input_mode(&mut caret_input_mode, None));
+        assert_eq!(caret_mode_glyph(caret_input_mode), None);
     }
 
     #[test]
