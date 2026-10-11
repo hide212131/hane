@@ -201,5 +201,29 @@ class ReleaseClassificationTests(unittest.TestCase):
         self.assertEqual(version, "0.24.0")
 
 
+class ReleaseValidationTests(unittest.TestCase):
+    @mock.patch.object(
+        release_pr,
+        "classify",
+        return_value=(True, "Cargo.toml と workspace package の版だけが更新されています", "0.24.0"),
+    )
+    def test_accepts_the_requested_version_branch(self, _classify):
+        version = release_pr.validate(
+            ROOT, "base", "head", "v0.23.0", "release/v0.24.0"
+        )
+        self.assertEqual(version, "0.24.0")
+
+    @mock.patch.object(
+        release_pr,
+        "classify",
+        return_value=(True, "Cargo.toml と workspace package の版だけが更新されています", "0.24.0"),
+    )
+    def test_rejects_a_branch_for_a_different_requested_version(self, _classify):
+        with self.assertRaisesRegex(ValueError, "does not match requested version"):
+            release_pr.validate(
+                ROOT, "base", "head", "v0.23.0", "release/v0.25.0"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
