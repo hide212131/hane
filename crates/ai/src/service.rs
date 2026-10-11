@@ -1376,6 +1376,7 @@ fn map_probe_error_code_for_text_transform(
         ProbeErrorCode::ProviderFailed => T::ProviderFailed,
         ProbeErrorCode::Canceled => T::Canceled,
         ProbeErrorCode::Isolated => T::Isolated,
+        ProbeErrorCode::ContextLengthExceeded => T::ContextLengthExceeded,
     }
 }
 

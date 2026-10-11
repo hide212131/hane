@@ -508,6 +508,7 @@ fn map_probe_error_code(code: crate::probe::ProbeErrorCode) -> TextTransformErro
         P::ProviderFailed => TextTransformErrorCode::ProviderFailed,
         P::Canceled => TextTransformErrorCode::Canceled,
         P::Isolated => TextTransformErrorCode::Isolated,
+        P::ContextLengthExceeded => TextTransformErrorCode::ContextLengthExceeded,
     }
 }
 
@@ -601,6 +602,14 @@ fn cancellation_requested(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_exceeded_probe_error_maps_to_context_length_exceeded() {
+        assert_eq!(
+            map_probe_error_code(crate::probe::ProbeErrorCode::ContextLengthExceeded),
+            TextTransformErrorCode::ContextLengthExceeded
+        );
+    }
 
     #[test]
     fn validate_request_rejects_empty_or_oversized_fields() {

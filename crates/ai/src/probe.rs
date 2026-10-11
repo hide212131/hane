@@ -52,6 +52,7 @@ pub enum ProbeErrorCode {
     ProviderFailed,
     Canceled,
     Isolated,
+    ContextLengthExceeded,
 }
 
 impl ProbeErrorCode {
@@ -76,6 +77,7 @@ impl ProbeErrorCode {
             Self::ProviderFailed => "provider_failed",
             Self::Canceled => "canceled",
             Self::Isolated => "runtime_isolated",
+            Self::ContextLengthExceeded => "context_length_exceeded",
         }
     }
 }
@@ -727,6 +729,7 @@ pub(crate) fn classify_provider_error(error: &Value) -> ProbeErrorCode {
     match info.and_then(Value::as_str) {
         Some("unauthorized") => return ProbeErrorCode::Unauthorized,
         Some("rateLimitExceeded") => return ProbeErrorCode::RateLimited,
+        Some("contextWindowExceeded") => return ProbeErrorCode::ContextLengthExceeded,
         _ => {}
     }
     match scan(error) {
@@ -860,6 +863,17 @@ mod tests {
                 "threadId":"thread-1", "turn":{"id":"turn-1","status":"failed","error":{"message":"secret diagnostic","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":status}}}}
             }))), Some(ProbeTerminal::Failed(expected)));
         }
+    }
+
+    #[test]
+    fn context_window_exceeded_is_classified_distinctly_from_provider_failed() {
+        let mut collector = new_collector();
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"partial"}
+        })));
+        assert_eq!(collector.observe(event(7, "turn/completed", json!({
+            "threadId":"thread-1", "turn":{"id":"turn-1","status":"failed","error":{"message":"secret diagnostic","codexErrorInfo":"contextWindowExceeded"}}
+        }))), Some(ProbeTerminal::Failed(ProbeErrorCode::ContextLengthExceeded)));
     }
 
     #[test]

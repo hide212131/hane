@@ -3228,6 +3228,9 @@ fn probe_error_message(error: ProbeErrorCode) -> &'static str {
         }
         ProbeErrorCode::Canceled => "応答確認を取り消しました。",
         ProbeErrorCode::Isolated => "子プロセスの停止を確認できず、AI操作を停止しています。",
+        ProbeErrorCode::ContextLengthExceeded => {
+            "入力が長すぎて処理できませんでした。入力を短くして再試行してください。"
+        }
     }
 }
 
