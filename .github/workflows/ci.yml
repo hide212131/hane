@@ -9,10 +9,49 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  release_only_detector:
+    name: Classify release-only Pull Request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      release_only: ${{ steps.classify.outputs.release_only }}
+    steps:
+      - name: Check out Pull Request
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch exact Pull Request head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags origin "$HEAD_SHA"
+
+      - name: Classify the exact base-to-head diff
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ -f .github/scripts/release_pr.py ]]; then
+            python3 .github/scripts/release_pr.py classify \
+              --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+          else
+            echo "release_only=false" >> "$GITHUB_OUTPUT"
+            echo "Trusted release classifier is not present in the base revision; using normal CI."
+          fi
+
   rust_ci_changes:
     name: Determine whether Rust CI is required
+    needs: release_only_detector
+    if: ${{ needs.release_only_detector.result == 'success' && needs.release_only_detector.outputs.release_only != 'true' }}
     runs-on: ubuntu-latest
     outputs:
       required: ${{ steps.filter.outputs.required }}
@@ -63,6 +102,9 @@ jobs:
       - name: Test release version policy
         run: python3 .github/tests/test_release_version.py
 
+      - name: Test release PR policy
+        run: python3 .github/tests/test_release_pr.py
+
       - name: Detect Rust CI inputs
         id: filter
         shell: bash
@@ -77,14 +119,102 @@ jobs:
           )"
           echo "required=$required" >> "$GITHUB_OUTPUT"
 
+  release_checks:
+    name: Lightweight release checks
+    needs: release_only_detector
+    if: ${{ needs.release_only_detector.result == 'success' && needs.release_only_detector.outputs.release_only == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    outputs:
+      release_version: ${{ steps.validate.outputs.release_version }}
+    steps:
+      - name: Check out trusted base revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch exact Pull Request head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags origin "$HEAD_SHA"
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Find latest semantic-version tag
+        id: latest_tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_names_file="$(mktemp)"
+          trap 'rm -f "$tag_names_file"' EXIT
+          gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
+            --jq '.[].name' > "$tag_names_file"
+          latest_tag="$(grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' "$tag_names_file" | sort -V | tail -n 1 || true)"
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check diff whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff --check "$BASE_SHA...$HEAD_SHA"
+
+      - name: Validate release scope and version
+        id: validate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LATEST_TAG: ${{ steps.latest_tag.outputs.latest_tag }}
+        run: |
+          python3 .github/scripts/release_pr.py validate \
+            --base "$BASE_SHA" --head "$HEAD_SHA" --latest-tag "$LATEST_TAG" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Run release policy tests
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git show "$HEAD_SHA:Cargo.toml" > Cargo.toml
+          git show "$HEAD_SHA:Cargo.lock" > Cargo.lock
+          python3 .github/tests/test_release_version.py
+          python3 .github/tests/test_release_pr.py
+
+      - name: Verify Cargo workspace and lock file
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
+      - name: Add release label and skip-review marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh label create release --description "自動リリース用の版番号更新PR" \
+            --color "0E8A16" --force --repo "$GITHUB_REPOSITORY"
+          gh pr edit "$PR_NUMBER" --add-label release --repo "$GITHUB_REPOSITORY"
+          title="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq '.title')"
+          case "$title" in
+            "[skip review]"*) ;;
+            *) gh pr edit "$PR_NUMBER" --title "[skip review] $title" --repo "$GITHUB_REPOSITORY" ;;
+          esac
+
   test_macos:
     name: cargo test / clippy (macos-latest)
-    needs: rust_ci_changes
-    if: ${{ always() && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true') }}
+    needs: [release_only_detector, rust_ci_changes]
+    if: ${{ github.event_name == 'pull_request' && always() && (needs.release_only_detector.result != 'success' || (needs.release_only_detector.outputs.release_only != 'true' && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true'))) }}
     runs-on: macos-latest
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
+      - name: Fail when release-only detection failed
+        if: ${{ needs.release_only_detector.result != 'success' }}
+        run: exit 1
+
       - name: Fail when Rust CI path detection failed
         if: ${{ needs.rust_ci_changes.result != 'success' }}
         run: exit 1
@@ -116,12 +246,16 @@ jobs:
 
   test_windows:
     name: cargo test / clippy (windows-latest)
-    needs: rust_ci_changes
-    if: ${{ always() && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true') }}
+    needs: [release_only_detector, rust_ci_changes]
+    if: ${{ github.event_name == 'pull_request' && always() && (needs.release_only_detector.result != 'success' || (needs.release_only_detector.outputs.release_only != 'true' && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true'))) }}
     runs-on: windows-latest
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
+      - name: Fail when release-only detection failed
+        if: ${{ needs.release_only_detector.result != 'success' }}
+        run: exit 1
+
       - name: Fail when Rust CI path detection failed
         if: ${{ needs.rust_ci_changes.result != 'success' }}
         run: exit 1
@@ -147,3 +281,59 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  merge_release_pr:
+    name: Merge release PR and start Release builds
+    needs: [release_only_detector, release_checks, test_macos, test_windows]
+    if: ${{ always() && needs.release_only_detector.result == 'success' && needs.release_only_detector.outputs.release_only == 'true' && needs.release_checks.result == 'success' && needs.test_macos.result == 'skipped' && needs.test_windows.result == 'skipped' }}
+    concurrency:
+      group: release-pr-merge-main
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Verify current head, base, checks, and mergeability
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$current_main" = "$EXPECTED_BASE_SHA"
+          pr="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json state,headRefOid,baseRefName,baseRefOid,mergeable,labels)"
+          jq -e \
+            --arg head "$EXPECTED_HEAD_SHA" \
+            --arg base "$EXPECTED_BASE_SHA" \
+            '.state == "OPEN" and .headRefOid == $head and .baseRefName == "main" and .baseRefOid == $base and .mergeable == "MERGEABLE" and any(.labels[]; .name == "release")' \
+            <<< "$pr" >/dev/null
+          gh pr checks "$PR_NUMBER" --required --repo "$GITHUB_REPOSITORY"
+
+      - name: Merge with the tested head SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$current_main" = "$EXPECTED_BASE_SHA"
+          result="$(gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/merge" \
+            -f sha="$EXPECTED_HEAD_SHA" -f merge_method=squash)"
+          jq -e '.merged == true' <<< "$result" >/dev/null
+
+      - name: Start the existing Release builds workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ needs.release_checks.outputs.release_version }}
+        run: |
+          gh workflow run windows-release.yml --repo "$GITHUB_REPOSITORY" \
+            --ref main --field "version=$RELEASE_TAG"
+
