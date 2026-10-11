@@ -1,3 +1,5 @@
+# RF2-B P1 実装記録
+
 ## 状態
 
 P1実装PR [#456](https://github.com/hide212131/hane/pull/456) はmerge済み。対象head `0a9d214b25b94012bfbd063028da86ccff7e698c`、merge commit `a6c093499e3d3d49d6fad3f477da456a72ff314a`。設計PR #454もmerge済み（`90f51e1a965588b1796f05a6744c150ac5ba4a9f`）。P1のレビュー・検証・受入結果は末尾の「受入結果」に記録する。
