@@ -51,6 +51,7 @@ use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::hover_card::HoverCard;
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{Selectable, Sizable, h_flex};
 use hane_document::{
@@ -78,16 +79,16 @@ use hane_session::{
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, TitleSyncAction, UnsavedChanges, WorkFolder, WorkFolderNode,
-    WorkFolderScanner, date_badge_range, decide_title_sync, extract_h1_title,
-    format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
-    unique_folder_name, unique_markdown_filename,
+    WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
+    format_relative_date_label, local_today, next_modified_sequence, run_save_job,
+    split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod ai_settings;
@@ -491,12 +492,42 @@ struct TitleRenameAttempt {
     from: PathBuf,
     target: PathBuf,
     title: String,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InlineRenameKind {
     File,
     Folder,
+}
+
+/// One sidebar inline-rename attempt's outcome-handling context, bundled so
+/// `finish_inline_rename` takes one argument instead of five.
+struct InlineRenameAttempt {
+    from: PathBuf,
+    target: PathBuf,
+    kind: InlineRenameKind,
+    tickets: Vec<(SessionId, SaveTicket)>,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
+}
+
+/// One document save attempt's outcome-handling context, bundled so
+/// `finish_save` takes one argument instead of five.
+struct SaveAttempt {
+    id: SessionId,
+    ticket: SaveTicket,
+    instance: Option<DocumentInstance>,
+    path: PathBuf,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
+}
+
+/// A `new_work_folder_folder` background creation's result, bundled into one
+/// named type rather than a tuple so the type itself stays simple.
+struct NewFolderOutcome {
+    result: std::io::Result<()>,
+    modified: Option<SystemTime>,
+    modified_seq: u64,
+    ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
 /// State for the one sidebar row currently being edited. The editable text is
@@ -628,6 +659,39 @@ fn rebase_ui_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
     } else {
         to.join(relative)
     })
+}
+
+/// Looks up each ancestor folder's current real modified time through the
+/// same `FileService::stamp` boundary a save already uses for its own leaf
+/// path, off the UI thread. A folder whose metadata cannot be read right now
+/// (a transient race, or a platform that reports none) comes back `None`
+/// rather than keeping whatever this call does not actually know, the same
+/// degrade-on-failure contract `OsWorkFolderScanner::scan` already uses for
+/// `WorkFolderEntry::modified`.
+///
+/// Each result is paired with a `next_modified_sequence` value through
+/// `stamp_with_sequence`, which allocates it behind a lock for that specific
+/// path rather than as a separate step after the read. Two of these calls
+/// can run for the same ancestor path from different saves — most commonly
+/// two sibling saves whose `ancestor_folder_paths` both name the same parent
+/// folder — and reach the UI thread in either order; `WorkFolder::touch`
+/// uses the sequence, not the `SystemTime` itself, to tell which read was
+/// genuinely the later one, which only works if the sequence numbering
+/// itself still matches real read order. See `stamp_with_sequence` for why
+/// the read and the `fetch_add` must be paired atomically, not just
+/// performed one after the other, and `set_modified` for why the time value
+/// alone cannot stand in for the sequence.
+fn stamp_ancestor_folders(
+    files: &dyn FileService,
+    ancestors: &[PathBuf],
+) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
+    ancestors
+        .iter()
+        .map(|path| {
+            let (modified, sequence) = stamp_with_sequence(files, path);
+            (path.clone(), modified, sequence)
+        })
+        .collect()
 }
 
 fn byte_offset_from_utf16(text: &str, offset: usize) -> usize {
@@ -1683,7 +1747,13 @@ impl EditorView {
             Err(error) => {
                 self.status = Some(format!("Could not open work folder: {error}"));
             }
-            Ok(work_folder) => {
+            Ok(mut work_folder) => {
+                // A scan always builds a fresh, `Name`-ordered tree (see
+                // `WorkFolder::from_tree`); apply the persisted sidebar sort
+                // order here rather than threading it through
+                // `WorkFolderScanner`, which test doubles and other callers
+                // do not need to know about.
+                work_folder.set_sort_order(self.settings.sidebar_sort);
                 #[cfg(feature = "instrument")]
                 {
                     self.instrumentation.work_folder_scan_completed_at = Some(_scan_completed_at);
@@ -2316,6 +2386,22 @@ impl EditorView {
         self.joined_parse_jobs.clear();
     }
 
+    /// Carries each ancestor folder's just-fetched real modified time into
+    /// the retained work-folder tree, the ancestor-folder counterpart to the
+    /// no-rescan `WorkFolder::touch` a save, create, or rename already gives
+    /// the node it directly changed. See `WorkFolder::ancestor_folder_paths`
+    /// for why a parent folder's own retained time needs the same refresh.
+    /// A workspace switched away in the meantime simply has no ancestors
+    /// left to touch, since `self.work_folder` itself changed.
+    fn touch_work_folder_ancestors(&mut self, ancestors: &[(PathBuf, Option<SystemTime>, u64)]) {
+        let Some(folder) = self.work_folder.as_mut() else {
+            return;
+        };
+        for (path, modified, sequence) in ancestors {
+            folder.touch(path, *modified, *sequence);
+        }
+    }
+
     fn remember_recent(&mut self, path: &Path) {
         self.recent.remember(path);
         if let Err(error) = self.stores.recent_files().store(&self.recent) {
@@ -2492,6 +2578,12 @@ impl EditorView {
             }) || pending.contains(&target_directory.join(candidate))
         });
         let path = target_directory.join(&name);
+        // Computed here, while `work_folder` is still borrowed, rather than
+        // walking the tree again once the create lands: `WorkFolder` would
+        // otherwise have to be re-borrowed from `self` after the background
+        // op, which `finish_new_work_folder_folder` already does for the
+        // mutation itself.
+        let ancestor_folders = work_folder.ancestor_folder_paths(&path);
         // Reserved synchronously, before any `await`: the tree is not
         // updated until `create_dir` finishes in the background, so a second
         // "new folder" click landing before this one completes would
@@ -2502,12 +2594,36 @@ impl EditorView {
         let files = self.files.clone();
         let probe_path = path.clone();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let outcome = cx
                 .background_executor()
-                .spawn(async move { files.create_dir(&probe_path) })
+                .spawn(async move {
+                    let result = files.create_dir(&probe_path);
+                    // Acquired here, off the main thread, so `touch` below
+                    // can retain the new folder's modified time the same
+                    // no-rescan way a save does, instead of leaving it
+                    // unknown (and sorting as oldest) until the next scan.
+                    let modified = files.stamp(&probe_path).and_then(|stamp| stamp.modified);
+                    let modified_seq = next_modified_sequence();
+                    // The parent directory's own entry just gained this new
+                    // folder, so its real modified time changed too; failing
+                    // this new folder's own creation leaves the tree
+                    // untouched instead of acting on paths the create never
+                    // actually affected.
+                    let ancestors = if result.is_ok() {
+                        stamp_ancestor_folders(files.as_ref(), &ancestor_folders)
+                    } else {
+                        Vec::new()
+                    };
+                    NewFolderOutcome {
+                        result,
+                        modified,
+                        modified_seq,
+                        ancestors,
+                    }
+                })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.finish_new_work_folder_folder(path, result, cx);
+                view.finish_new_work_folder_folder(path, outcome, cx);
             });
         })
         .detach();
@@ -2516,15 +2632,23 @@ impl EditorView {
     fn finish_new_work_folder_folder(
         &mut self,
         path: PathBuf,
-        result: std::io::Result<()>,
+        outcome: NewFolderOutcome,
         cx: &mut Context<Self>,
     ) {
+        let NewFolderOutcome {
+            result,
+            modified,
+            modified_seq,
+            ancestors,
+        } = outcome;
         self.pending_new_folders.remove(&path);
         match result {
             Ok(()) => {
                 if let Some(folder) = self.work_folder.as_mut() {
                     folder.insert_folder(path.clone());
+                    folder.touch(&path, modified, modified_seq);
                 }
+                self.touch_work_folder_ancestors(&ancestors);
                 self.expanded_folders.insert(path);
                 self.content_search_workspace_changed(cx);
                 self.status = None;
@@ -3169,6 +3293,20 @@ impl EditorView {
     }
 
     fn general_settings_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar_sort = self.settings.sidebar_sort;
+        let sidebar_sort_view = cx.entity();
+        let sidebar_sort_buttons = WorkFolderSortOrder::all().map(|order| {
+            let view = sidebar_sort_view.clone();
+            Button::new(format!("settings-sidebar-sort-{}", order.as_str()))
+                .label(order.label())
+                .ghost()
+                .selected(sidebar_sort == order)
+                .on_click(move |_, _window, app| {
+                    view.update(app, |view, cx| {
+                        view.set_sidebar_sort(order, cx);
+                    });
+                })
+        });
         let unsupported = matches!(
             self.file_context_menu_state,
             FileContextMenuState::Unsupported
@@ -3251,6 +3389,48 @@ impl EditorView {
                             .children(error),
                     ),
             )
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .border_t_1()
+                    .border_color(rgb(self.theme.sidebar_active_background))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("サイドバー"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-sidebar-sort-card")
+                            .w_full()
+                            .px(px(16.0))
+                            .py(px(14.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(self.theme.sidebar_active_background))
+                            .bg(rgb(self.theme.code_background))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("ファイル・フォルダーの並び順"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .children(sidebar_sort_buttons),
+                            ),
+                    ),
+            )
     }
 
     pub(crate) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3260,6 +3440,25 @@ impl EditorView {
         self.block_cache.clear();
         self.layout_cache.clear();
         self.heights = HeightIndex::new(self.item_heights());
+        self.store_settings();
+        cx.notify();
+    }
+
+    /// Changes how the work-folder sidebar orders files and folders,
+    /// re-sorting the already-scanned tree in place (no rescan) so the
+    /// change is visible immediately, and persists the choice the same way
+    /// `cycle_theme`/`toggle_autosave` do. Selection, the active session,
+    /// expanded folders, and any unsaved content are all addressed by path
+    /// rather than by position in the sidebar list, so re-sorting the tree
+    /// here never disturbs any of them.
+    pub(crate) fn set_sidebar_sort(&mut self, order: WorkFolderSortOrder, cx: &mut Context<Self>) {
+        if self.settings.sidebar_sort == order {
+            return;
+        }
+        self.settings.sidebar_sort = order;
+        if let Some(folder) = self.work_folder.as_mut() {
+            folder.set_sort_order(order);
+        }
         self.store_settings();
         cx.notify();
     }
@@ -7433,6 +7632,164 @@ mod tests {
         assert!(cx.debug_bounds("sidebar-root").unwrap().top() < root_before.top());
         view.read_with(cx, |view, _| {
             assert!(view.sidebar_scroll.offset().y < px(0.0));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_sort_menu_updates_order_and_resorts_without_a_rescan(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("sidebar-sort-menu");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        std::fs::write(root.join("Mid.md"), "# Mid\n").unwrap();
+        std::fs::write(root.join("Zeta.md"), "# Zeta\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let sort_menu = cx
+            .debug_bounds("sidebar-sort-menu")
+            .expect("the sort menu entry is rendered in the sidebar toolbar");
+        cx.simulate_click(sort_menu.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let name_descending_item = cx
+            .debug_bounds("sidebar-sort-item-name_descending")
+            .expect("the name-descending option is rendered in the open sort menu");
+        cx.simulate_click(name_descending_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings.sidebar_sort,
+                WorkFolderSortOrder::NameDescending,
+                "selecting a menu item must persist the chosen order"
+            );
+            let names: Vec<String> = view
+                .work_folder
+                .as_ref()
+                .expect("work folder is scanned")
+                .children()
+                .iter()
+                .map(|node| match node {
+                    WorkFolderNode::File(entry) => entry.file_name().to_owned(),
+                    WorkFolderNode::Folder(_) => unreachable!("only files were written"),
+                })
+                .collect();
+            assert_eq!(
+                names,
+                ["Zeta.md", "Mid.md", "Alpha.md"],
+                "the already-scanned tree must resort immediately, without a rescan"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Regression test for CodeRabbit review 5482775725 / inline comment
+    // 4241076881 on PR #451: at `SIDEBAR_MIN_WIDTH` the toolbar's sort
+    // control used to be pushed past the sidebar panel's right edge and
+    // clipped by its `overflow_hidden`, making it invisible and unclickable.
+    #[gpui::test]
+    fn sidebar_sort_menu_stays_visible_and_clickable_at_minimum_sidebar_width(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("sidebar-sort-menu-min-width");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        std::fs::write(root.join("Mid.md"), "# Mid\n").unwrap();
+        std::fs::write(root.join("Zeta.md"), "# Zeta\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, cx| {
+            view.sidebar_width = SIDEBAR_MIN_WIDTH;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let sort_menu = cx
+            .debug_bounds("sidebar-sort-menu")
+            .expect("the sort menu entry is rendered in the sidebar toolbar area");
+        assert!(
+            sort_menu.right() <= px(SIDEBAR_MIN_WIDTH),
+            "the sort control must stay within the sidebar panel's right edge \
+             at SIDEBAR_MIN_WIDTH, not be clipped by it: {sort_menu:?}"
+        );
+
+        cx.simulate_click(sort_menu.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let name_descending_item = cx
+            .debug_bounds("sidebar-sort-item-name_descending")
+            .expect("the open sort menu's items must still be reachable at the minimum width");
+        cx.simulate_click(name_descending_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings.sidebar_sort,
+                WorkFolderSortOrder::NameDescending,
+                "the sort control must stay clickable at SIDEBAR_MIN_WIDTH"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn saving_a_nested_note_resorts_its_real_parent_folder_by_updated_newest(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #447: a save only ever lands inside the note's own
+        // directory (an atomic write replaces the target via a temp-file
+        // rename), which also bumps that directory's own real modified
+        // time — so the sidebar's `UpdatedNewest` order must move the
+        // parent folder itself, not just the saved note, once the write
+        // lands.
+        let root = draft_test_root("save-resorts-parent-folder");
+        let archive = root.join("Archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let nested = archive.join("Nested.md");
+        std::fs::write(&nested, "before").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(root.join("Later.md"), "# Later\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let top_level_names = |view: &EditorView| -> Vec<String> {
+            view.work_folder
+                .as_ref()
+                .expect("work folder is scanned")
+                .children()
+                .iter()
+                .map(|node| node.path().file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                top_level_names(view),
+                ["Later.md", "Archive"],
+                "Later.md was written after Archive's own last change, so it starts out newest"
+            );
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        view.update(cx, |view, cx| view.open_work_folder_entry(&nested, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                top_level_names(view),
+                ["Archive", "Later.md"],
+                "Archive's own directory entry changed when the save landed inside it, \
+                 so it must now sort ahead of Later.md without a rescan"
+            );
         });
 
         std::fs::remove_dir_all(root).unwrap();
@@ -17164,7 +17521,8 @@ mod tests {
         std::fs::write(root.join("Loose.md"), "# Loose\n").unwrap();
         let (view, cx) = open_inline_rename_test_view(cx, &root);
 
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
+            view.set_sidebar_sort(WorkFolderSortOrder::NameAscending, cx);
             view.expanded_folders.insert(archive.clone());
             view.sidebar_scroll.set_offset(point(px(0.0), px(-120.0)));
         });
