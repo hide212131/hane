@@ -25,6 +25,15 @@ class ReleasePrepareTests(unittest.TestCase):
         self.assertEqual(release_pr.manifest_version(updated), "0.24.0")
         self.assertIn('serde = "1"', updated)
 
+    def test_manifest_update_preserves_version_line_spacing(self):
+        base = BASE_MANIFEST.replace(
+            'version = "0.23.0"', 'version   =   "0.23.0"'
+        )
+
+        updated = release_pr.replace_workspace_version(base, "0.23.0", "0.24.0")
+
+        self.assertIn('version   =   "0.24.0"', updated)
+
     def test_lock_update_changes_every_workspace_package_only(self):
         updated = release_pr.update_lock_versions(
             BASE_LOCK, {"hane", "hane-ai"}, "0.23.0", "0.24.0"
@@ -97,6 +106,24 @@ class ReleaseClassificationTests(unittest.TestCase):
             "[workspace.package]", "# extra comment\n[workspace.package]"
         )
         valid, _, _ = self.validate(head_manifest=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_normalizing_spacing_on_the_version_line(self):
+        base = BASE_MANIFEST.replace(
+            'version = "0.23.0"', 'version   =   "0.23.0"'
+        )
+        formatted_head = base.replace(
+            'version   =   "0.23.0"', 'version   =   "0.24.0"'
+        )
+        normalized_head = formatted_head.replace(
+            'version   =   "0.24.0"', 'version = "0.24.0"'
+        )
+
+        valid, _, _ = self.validate(
+            base_manifest=base,
+            head_manifest=normalized_head,
+        )
+
         self.assertFalse(valid)
 
     def test_rejects_external_checksum_or_dependency_changes(self):

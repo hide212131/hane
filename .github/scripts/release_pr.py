@@ -71,8 +71,8 @@ def replace_workspace_version(text: str, current: str, target: str) -> str:
     if section is None:
         raise ValueError("Cargo.toml に [workspace.package] がありません")
     updated, count = re.subn(
-        rf'(?m)^version\s*=\s*"{re.escape(current)}"\s*$',
-        f'version = "{target}"',
+        rf'(?m)^([ \t]*version[ \t]*=[ \t]*)"{re.escape(current)}"([ \t]*\r?)$',
+        lambda match: f'{match.group(1)}"{target}"{match.group(2)}',
         section.group(1),
     )
     if count != 1:
