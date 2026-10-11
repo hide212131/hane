@@ -662,13 +662,23 @@ impl EditorView {
     /// `note_document_find_escape_keystroke`'s reasoning: the interceptor
     /// that calls this runs before any binding for the keystroke dispatches,
     /// so it is the only point that still observes the composition the
-    /// pinned input widget is about to unmark on its own.
+    /// pinned input widget is about to unmark on its own. Once the input has
+    /// been blurred (e.g. by Tab moving focus to Send/List/Close), there is
+    /// no composition left to observe on it, so this resets
+    /// `escape_was_composing` to `false` instead of leaving behind a stale
+    /// `true` from the Escape that ended the composition — otherwise a later
+    /// Escape, dispatched after the blur, would keep reading that stale
+    /// flag and never close the popup.
     pub(super) fn note_ai_selection_escape_keystroke(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.ai_selection.open || !self.ai_selection.input_focused {
+        if !self.ai_selection.open {
+            return;
+        }
+        if !self.ai_selection.input_focused {
+            self.ai_selection.escape_was_composing = false;
             return;
         }
         let Some(input) = self.ai_selection.input.clone() else {
@@ -2310,6 +2320,65 @@ mod tests {
             assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
             assert!(view.ai_selection.confirmed_instruction.is_empty());
             assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn escape_still_closes_the_popup_after_a_composing_escape_blurs_the_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let input = view
+            .read_with(cx, |view, _| view.ai_selection.input.clone())
+            .expect("input is initialized by open_ai_selection");
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "か", None, window, cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        // While the input holds focus with an in-progress composition, Escape
+        // must only cancel the composition, not close the popup.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
+        });
+
+        // Tab away from the input (blurring it) without ever snapshotting a
+        // fresh, non-composing Escape on it. The stale `escape_was_composing
+        // == true` from above must not survive the blur.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+            assert!(!view.ai_selection.input_focused);
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.ai_selection.open);
         });
     }
 }
