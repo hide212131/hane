@@ -24,7 +24,7 @@ const T00_PROBE_GATE_PASSED: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeaveTarget {
-    General,
+    Category(super::SettingsCategory),
     Close,
 }
 
@@ -3105,14 +3105,13 @@ impl AiSettingsPage {
                 view.update(app, |view, cx| {
                     view.ai_settings.reset_draft(window, cx);
                     view.ai_settings.leave_prompt = None;
-                    if target == LeaveTarget::General {
-                        view.select_settings_category(
-                            super::SettingsCategory::General,
-                            window,
-                            cx,
-                        );
-                    } else {
-                        view.close_settings(window, cx);
+                    match target {
+                        LeaveTarget::Category(category) => {
+                            view.select_settings_category(category, window, cx);
+                        }
+                        LeaveTarget::Close => {
+                            view.close_settings(window, cx);
+                        }
                     }
                 })
             });
@@ -3769,6 +3768,49 @@ mod tests {
         assert_eq!(
             view.read_with(cx, |view, _| view.ai_settings.leave_prompt),
             Some(LeaveTarget::Close)
+        );
+    }
+
+    // Regression for #450: picking another category while the connection
+    // draft is dirty must route to the clicked category after the leave is
+    // confirmed, not unconditionally back to "一般".
+    #[gpui::test]
+    fn switching_category_from_a_dirty_ai_settings_draft_targets_the_clicked_category(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Connection;
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_settings.active_connection = ActiveConnection::Custom;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, app| view.ai_settings.is_dirty(app)));
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.request_settings_category(SettingsCategory::Prompts, window, cx)
+            });
+        });
+
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.settings_category),
+            SettingsCategory::Connection,
+            "the category must not switch until the leave is confirmed"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.ai_settings.leave_prompt),
+            Some(LeaveTarget::Category(SettingsCategory::Prompts))
         );
     }
 

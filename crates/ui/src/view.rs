@@ -3191,12 +3191,13 @@ impl EditorView {
             match self.settings_category {
                 SettingsCategory::Connection if self.ai_settings.is_dirty(cx) => {
                     self.ai_settings
-                        .confirm_leave(ai_settings::LeaveTarget::General);
+                        .confirm_leave(ai_settings::LeaveTarget::Category(category));
                     cx.notify();
                     return;
                 }
                 SettingsCategory::Prompts if self.ai_prompts.is_dirty(cx) => {
-                    self.ai_prompts.confirm_leave(ai_prompts::LeaveTarget::General);
+                    self.ai_prompts
+                        .confirm_leave(ai_prompts::LeaveTarget::Category(category));
                     cx.notify();
                     return;
                 }
@@ -3268,8 +3269,8 @@ impl EditorView {
     ) -> gpui::Div {
         if let Some(target) = self.ai_settings.take_ready_route() {
             match target {
-                ai_settings::LeaveTarget::General => {
-                    self.select_settings_category(SettingsCategory::General, window, cx)
+                ai_settings::LeaveTarget::Category(category) => {
+                    self.select_settings_category(category, window, cx)
                 }
                 ai_settings::LeaveTarget::Close => {
                     self.close_settings(window, cx);
@@ -3278,8 +3279,8 @@ impl EditorView {
         }
         if let Some(target) = self.ai_prompts.take_ready_route() {
             match target {
-                ai_prompts::LeaveTarget::General => {
-                    self.select_settings_category(SettingsCategory::General, window, cx)
+                ai_prompts::LeaveTarget::Category(category) => {
+                    self.select_settings_category(category, window, cx)
                 }
                 ai_prompts::LeaveTarget::Close => {
                     self.close_settings(window, cx);

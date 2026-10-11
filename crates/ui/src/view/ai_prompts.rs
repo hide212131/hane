@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeaveTarget {
-    General,
+    Category(super::SettingsCategory),
     Close,
 }
 
@@ -653,11 +653,9 @@ impl AiPromptsPage {
                     view.ai_prompts.title_input = None;
                     view.ai_prompts.body_input = None;
                     match target {
-                        LeaveTarget::General => view.select_settings_category(
-                            super::SettingsCategory::General,
-                            window,
-                            cx,
-                        ),
+                        LeaveTarget::Category(category) => {
+                            view.select_settings_category(category, window, cx)
+                        }
                         LeaveTarget::Close => view.close_settings(window, cx),
                     }
                 })
@@ -934,6 +932,65 @@ mod tests {
             assert!(view.ai_prompts.title_input.is_none());
             assert!(view.ai_prompts.body_input.is_none());
         });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Regression for #450: picking another category while the prompts
+    // draft is dirty must route to the clicked category after the leave is
+    // confirmed, not unconditionally back to "一般".
+    #[gpui::test]
+    fn switching_category_from_a_dirty_ai_prompts_draft_targets_the_clicked_category(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-ai-prompts-switch-category-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Prompts;
+            view.ai_prompts.root = Some(root.clone());
+            view.ai_prompts.loaded = true;
+            view.ai_prompts.load_error = None;
+            view.ai_prompts.revision = 0;
+            view.ai_prompts.baseline = vec![UserPromptDraft {
+                id: None,
+                title: "指示".to_owned(),
+                prompt: "指示の内容".to_owned(),
+            }];
+            view.ai_prompts.draft = vec![UserPromptDraft {
+                id: None,
+                title: "編集中の指示".to_owned(),
+                prompt: "指示の内容".to_owned(),
+            }];
+            view.ai_prompts.selected = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, app| view.ai_prompts.is_dirty(app)));
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.request_settings_category(SettingsCategory::Connection, window, cx)
+            });
+        });
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.settings_category),
+            SettingsCategory::Prompts,
+            "the category must not switch until the leave is confirmed"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.ai_prompts.leave_prompt),
+            Some(LeaveTarget::Category(SettingsCategory::Connection))
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
