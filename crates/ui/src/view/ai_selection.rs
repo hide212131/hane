@@ -72,6 +72,23 @@ enum AiSelectionPhase {
     },
 }
 
+/// The compose screen's own Tab/Shift+Tab stops (implementation spec section
+/// 3.2): the free-text input, the send button, the saved-prompt list, and
+/// the close button — in that order. Independent of `input_focused`, which
+/// only tracks whether the pinned `InputState` widget currently holds real
+/// GPUI keyboard focus; `Send`/`List`/`Close` instead park real focus on the
+/// shared `EditorView::focus_handle` (see `ai_selection_set_focus_region`),
+/// the same technique `focus_content_search_results` already uses for its
+/// own keyboard-navigable list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AiSelectionFocusRegion {
+    #[default]
+    Input,
+    Send,
+    List,
+    Close,
+}
+
 #[derive(Default)]
 pub(super) struct AiSelectionState {
     service: Option<AiServiceHandle>,
@@ -82,6 +99,17 @@ pub(super) struct AiSelectionState {
     input: Option<Entity<InputState>>,
     input_subscription: Option<Subscription>,
     input_focused: bool,
+    /// Which of `ai_selection_focus_stops`'s stops currently has logical
+    /// keyboard focus on the compose screen. Meaningful only while `phase`
+    /// is `Composing`; the submitting/reviewing screens have no such stops
+    /// yet.
+    focus_region: AiSelectionFocusRegion,
+    /// The saved-prompt list's own keyboard-focused row, meaningful only
+    /// while `focus_region` is `List`. Always kept within
+    /// `saved_prompts`'s current bounds (or cleared if it becomes empty) —
+    /// see `apply_saved_prompts` — so a reload or an item disappearing never
+    /// leaves this pointed at an item that no longer exists.
+    list_focus_index: Option<usize>,
     saved_prompts: Vec<UserPrompt>,
     prompts_load_generation: u64,
     phase: AiSelectionPhase,
@@ -109,6 +137,8 @@ impl AiSelectionState {
         self.input = None;
         self.input_subscription = None;
         self.input_focused = false;
+        self.focus_region = AiSelectionFocusRegion::default();
+        self.list_focus_index = None;
         self.phase = AiSelectionPhase::Composing;
         self.message = None;
         self.saved_prompts = Vec::new();
@@ -151,6 +181,19 @@ impl AiSelectionState {
             // is the honest answer for this read-only menu.
             Ok(None) | Err(_) => Vec::new(),
         };
+        // A reload can shrink or empty the list out from under a keyboard
+        // focus that was pointed into it; never leave `list_focus_index`
+        // referencing an item that no longer exists, and fall back to the
+        // next stop still guaranteed to exist (`Send`) if the list itself
+        // disappeared while it held focus.
+        if self.saved_prompts.is_empty() {
+            self.list_focus_index = None;
+            if self.focus_region == AiSelectionFocusRegion::List {
+                self.focus_region = AiSelectionFocusRegion::Send;
+            }
+        } else if let Some(index) = self.list_focus_index {
+            self.list_focus_index = Some(index.min(self.saved_prompts.len() - 1));
+        }
     }
 
     /// Admits one text-transform request through the shared service and
@@ -376,17 +419,140 @@ fn text_transform_admission_message(error: AdmissionError) -> String {
 }
 
 impl EditorView {
-    /// Whether the popup's own free-text input currently holds keyboard
-    /// focus. `actions.rs` checks this before every body-editing key
-    /// (Backspace, arrows, Undo/Redo, Copy/Cut/Paste, Tab, Enter, …) the same
-    /// way it already checks `document_find_input_is_focused()`, so typing in
-    /// this field never leaks into the document underneath it.
-    pub(crate) fn ai_selection_input_is_focused(&self) -> bool {
-        self.ai_selection.open && self.ai_selection.input_focused
+    /// Whether this popup currently owns keyboard input, for every one of
+    /// its own focus stops (the free-text input, the send button, the
+    /// saved-prompt list, and the close button — see
+    /// `AiSelectionFocusRegion`), not only while its pinned input widget
+    /// holds real GPUI focus. `actions.rs` checks this before every
+    /// body-editing key (Backspace, arrows, Undo/Redo, Copy/Cut/Paste, Tab,
+    /// Enter, …) the same way it already checks
+    /// `document_find_input_is_focused()`, and `InputCapture::paint` checks
+    /// it before registering the document body as the active text-input
+    /// target — together, this is what keeps every one of those keys (not
+    /// only ones typed while the free-text input specifically has focus)
+    /// from leaking into the document underneath the popup, including while
+    /// `Send`/`List`/`Close` has parked real focus on the shared
+    /// `focus_handle` instead (see `ai_selection_set_focus_region`).
+    pub(crate) fn ai_selection_blocks_editor_keys(&self) -> bool {
+        self.ai_selection.open
     }
 
     pub(crate) fn ai_selection_should_leave_on_escape(&self) -> bool {
         self.ai_selection.open && !self.ai_selection.escape_was_composing
+    }
+
+    /// The compose screen's Tab/Shift+Tab stops, in order (implementation
+    /// spec section 3.2) — skipping `List` when there is nothing in it for
+    /// arrow keys to move among.
+    fn ai_selection_focus_stops(&self) -> Vec<AiSelectionFocusRegion> {
+        let mut stops = vec![AiSelectionFocusRegion::Input, AiSelectionFocusRegion::Send];
+        if !self.ai_selection.saved_prompts.is_empty() {
+            stops.push(AiSelectionFocusRegion::List);
+        }
+        stops.push(AiSelectionFocusRegion::Close);
+        stops
+    }
+
+    /// Moves logical focus to the next (`forward`) or previous stop in
+    /// `ai_selection_focus_stops`, wrapping past either end.
+    fn ai_selection_move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let stops = self.ai_selection_focus_stops();
+        let current = stops
+            .iter()
+            .position(|region| *region == self.ai_selection.focus_region)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % stops.len()
+        } else {
+            (current + stops.len() - 1) % stops.len()
+        };
+        self.ai_selection_set_focus_region(stops[next], window, cx);
+    }
+
+    /// Applies one focus stop: `Input` returns real GPUI focus to the pinned
+    /// free-text input (the only stop with a native focus target of its
+    /// own), while `Send`/`List`/`Close` park it on the shared
+    /// `focus_handle` instead — the same technique
+    /// `focus_content_search_results` already uses for its own
+    /// keyboard-navigable list, so Tab/arrow keystrokes keep reaching the
+    /// root-level `actions.rs` handlers that interpret them against
+    /// `focus_region` rather than the (now unfocused) input's own key
+    /// bindings.
+    fn ai_selection_set_focus_region(
+        &mut self,
+        region: AiSelectionFocusRegion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_selection.focus_region = region;
+        self.ai_selection.list_focus_index =
+            (region == AiSelectionFocusRegion::List).then_some(0);
+        if region == AiSelectionFocusRegion::Input {
+            if let Some(input) = self.ai_selection.input.clone() {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+        } else {
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Moves the saved-prompt list's own keyboard-focused row, wrapping past
+    /// either end. A no-op when the list is empty.
+    fn ai_selection_move_list_focus(&mut self, down: bool, cx: &mut Context<Self>) {
+        let len = self.ai_selection.saved_prompts.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.ai_selection.list_focus_index.unwrap_or(0);
+        let next = if down {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        self.ai_selection.list_focus_index = Some(next);
+        cx.notify();
+    }
+
+    /// Tab/Shift+Tab while this popup is open (implementation spec section
+    /// 3.2): cycles the compose screen's focus stops and reports `true` so
+    /// `actions.rs` never falls through to the document's own
+    /// Indent/Outdent. Swallows the key without cycling anything outside the
+    /// compose phase, since the submitting/reviewing screens have no such
+    /// stops.
+    pub(crate) fn ai_selection_handle_tab(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.ai_selection.open {
+            return false;
+        }
+        if matches!(self.ai_selection.phase, AiSelectionPhase::Composing) {
+            self.ai_selection_move_focus(forward, window, cx);
+        }
+        true
+    }
+
+    /// Up/Down while this popup is open: moves the saved-prompt list's own
+    /// keyboard-focused row only while that list itself currently holds
+    /// logical focus (implementation spec section 3.2); otherwise swallows
+    /// the key without moving anything, same as `ai_selection_handle_tab`.
+    pub(crate) fn ai_selection_handle_vertical_arrow(
+        &mut self,
+        down: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.ai_selection.open {
+            return false;
+        }
+        if matches!(self.ai_selection.phase, AiSelectionPhase::Composing)
+            && self.ai_selection.focus_region == AiSelectionFocusRegion::List
+        {
+            self.ai_selection_move_list_focus(down, cx);
+        }
+        true
     }
 
     pub(crate) fn leave_ai_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -550,6 +716,8 @@ impl EditorView {
         self.ai_selection.confirmed_instruction.clear();
         self.ai_selection.message = None;
         self.ai_selection.phase = AiSelectionPhase::Composing;
+        self.ai_selection.focus_region = AiSelectionFocusRegion::Input;
+        self.ai_selection.list_focus_index = None;
         self.ai_selection.open = true;
         self.status = None;
         self.ensure_ai_selection_input(window, cx);
@@ -924,6 +1092,8 @@ impl EditorView {
                     saved.title.clone()
                 };
                 let prompt = saved.prompt.clone();
+                let keyboard_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::List
+                    && self.ai_selection.list_focus_index == Some(index);
                 let view = cx.entity();
                 let row = div()
                     .id(("ai-selection-saved-prompt", index))
@@ -931,6 +1101,9 @@ impl EditorView {
                     .py_1()
                     .rounded_sm()
                     .cursor_pointer()
+                    .when(keyboard_focused, |el| {
+                        el.bg(rgb(theme.sidebar_active_background))
+                    })
                     .hover(|style| style.bg(rgb(theme.sidebar_active_background)))
                     .child(title)
                     .on_click(move |_, _, app| {
@@ -1430,6 +1603,305 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert!(!view.ai_selection.open);
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+            assert!(!view.editor().can_undo());
+        });
+    }
+
+    fn saved_prompt(id: u64, prompt: &str) -> UserPrompt {
+        UserPrompt {
+            id,
+            title: format!("prompt-{id}"),
+            prompt: prompt.to_owned(),
+        }
+    }
+
+    #[gpui::test]
+    fn tab_cycles_focus_through_input_send_list_and_close_and_shift_tab_reverses(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_selection.saved_prompts = vec![saved_prompt(1, "直す")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Input);
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::List);
+            assert_eq!(view.ai_selection.list_focus_index, Some(0));
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Close);
+            // Leaving the list clears its own keyboard-focused row.
+            assert_eq!(view.ai_selection.list_focus_index, None);
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Input);
+        });
+
+        // Shift+Tab walks the exact same stops backward.
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Close);
+        });
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::List);
+        });
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Input);
+        });
+    }
+
+    #[gpui::test]
+    fn tab_skips_the_saved_prompt_list_stop_while_it_is_empty(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        // No saved prompts: `reload_ai_selection_saved_prompts` is still
+        // in flight/empty here, same as a freshly opened popup with none
+        // saved yet.
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.saved_prompts.is_empty());
+        });
+
+        for expected in [
+            AiSelectionFocusRegion::Send,
+            AiSelectionFocusRegion::Close,
+            AiSelectionFocusRegion::Input,
+        ] {
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.ai_selection.focus_region, expected);
+                assert_eq!(view.ai_selection.list_focus_index, None);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn up_down_move_the_saved_prompt_list_focus_only_while_the_list_itself_has_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_selection.saved_prompts =
+                vec![saved_prompt(1, "直す"), saved_prompt(2, "要約する")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // While the input (not the list) has focus, Up/Down must not move
+        // anything in the list.
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.list_focus_index, None);
+        });
+
+        // Tab twice: Input -> Send -> List.
+        cx.simulate_keystrokes("tab");
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::List);
+            assert_eq!(view.ai_selection.list_focus_index, Some(0));
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.list_focus_index, Some(1));
+        });
+
+        // Wraps past the end.
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.list_focus_index, Some(0));
+        });
+
+        // And past the start going the other way.
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.list_focus_index, Some(1));
+        });
+
+        // Moving on to Close leaves the list's own index cleared, and
+        // Up/Down there must not touch it again.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Close);
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.list_focus_index, None);
+        });
+    }
+
+    #[gpui::test]
+    fn dynamically_emptying_the_saved_prompt_list_moves_focus_off_of_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_selection.saved_prompts = vec![saved_prompt(1, "直す")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::List);
+            assert_eq!(view.ai_selection.list_focus_index, Some(0));
+        });
+
+        // A reload landing while the list holds focus (e.g. the prompts were
+        // deleted from the settings page in another window) must not leave
+        // this pointed at an item that no longer exists.
+        view.update(cx, |view, cx| {
+            let generation = view.ai_selection.prompts_load_generation;
+            view.ai_selection.apply_saved_prompts(generation, Ok(None));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.saved_prompts.is_empty());
+            assert_eq!(view.ai_selection.list_focus_index, None);
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+    }
+
+    #[gpui::test]
+    fn tab_and_arrow_keys_never_leak_into_the_document_while_the_popup_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_selection.saved_prompts = vec![saved_prompt(1, "直す")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for keystroke in ["tab", "up", "down", "tab", "up", "down", "shift-tab", "tab"] {
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+        }
+
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
             assert_eq!(view.editor().document().full_text(), "abcdef\n");
             assert!(!view.editor().can_undo());
         });

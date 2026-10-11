@@ -241,7 +241,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 保存モデル（`prompts.rs`）とサービス（`text_transform.rs`/`service.rs`のAiServiceHandle::try_submit_text_transform経路）、設定ページ（`ai_prompts.rs`）は、本PRのcheckpoint復元時点で実装・単体テストとも揃っていた。今回の作業は`crates/ui/src/view/ai_selection.rs`を新規追加し、選択対象の捕捉（文書インスタンス・revision・UTF-8 byte range・元文字列）、Windows Alt+I／macOS Control+Lの呼出し、一度で開く小さな画面（自由入力＋保存済み指示一覧）、送信直前・適用直前の再照合、`replace_range_recorded`による1回Undoの置換、再生成、破棄、旧世代・取消後の応答の無視、文書編集時の即時無効化を実装し、`view.rs`/`actions.rs`に配線した。
 
-T05〜T08に対応する回帰テスト（複数byte文字の byte-accurate置換と単一Undo/Redo、結果が元文と同一の場合のno-op、捕捉後の編集による無効化、旧generation／close後の応答破棄）をユニット・統合テストとして追加したが、範囲は絞っており、二重クリック・取消中タブ切替・通知欠落など`T08`/`T09`の全ケース、一覧の矢印キー操作やTabによる4要素間の完全な移動（Tab/Shift-Tabは本文側への誤動作を防ぐguardのみ実装し、一覧内フォーカス移動自体は今回実装していない）は対象外。
+T05〜T08に対応する回帰テスト（複数byte文字の byte-accurate置換と単一Undo/Redo、結果が元文と同一の場合のno-op、捕捉後の編集による無効化、旧generation／close後の応答破棄）をユニット・統合テストとして追加したが、範囲は絞っており、二重クリック・取消中タブ切替・通知欠落など`T08`/`T09`の全ケースは対象外。
+
+一覧の矢印キー操作とTabによる4要素間の移動（AC2）は後続のworker実行で追加実装した。入力欄・送信ボタン・保存済み項目一覧・閉じるボタンの間をTab/Shift+Tabで巡回し（保存項目が0件のときは一覧を巡回対象から外す）、矢印キーによる一覧内項目の移動は一覧自体にフォーカスがある場合だけ行う。本文へのTab/矢印/Backspace/Delete/Undo等の漏れ防止は、ポップアップが開いている間は常時（論理フォーカスが入力欄以外にある間も含む）有効にした。一覧項目のキーボードフォーカスが指す行を、保存項目の再読込・0件化が追い越した場合に無効な項目を指し続けないことも回帰テストで確認している。Send/Closeボタン自体の視覚的なフォーカス表示、およびEnterキーによるSend/List/Closeの決定（マウスクリックでの即時実行は維持）は、このfocused fixの対象外とした。
 
 ポップアップの画面上の位置は、選択範囲の終端（caret）の既存レイアウト情報（`caret_geometry`/`main_column_left`）から算出し、`snap_to_window()`で画面内に収めている。選択範囲そのものの矩形（複数行・逆方向選択時の正確な端）やエディタ表示領域ちょうどへのクランプ（ウィンドウ全体ではなく）は簡略化しており、実画面での見た目の確認はできていない。
 
