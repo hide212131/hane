@@ -501,6 +501,34 @@ enum InlineRenameKind {
     Folder,
 }
 
+/// One sidebar inline-rename attempt's outcome-handling context, bundled so
+/// `finish_inline_rename` takes one argument instead of five.
+struct InlineRenameAttempt {
+    from: PathBuf,
+    target: PathBuf,
+    kind: InlineRenameKind,
+    tickets: Vec<(SessionId, SaveTicket)>,
+    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
+}
+
+/// One document save attempt's outcome-handling context, bundled so
+/// `finish_save` takes one argument instead of five.
+struct SaveAttempt {
+    id: SessionId,
+    ticket: SaveTicket,
+    instance: Option<DocumentInstance>,
+    path: PathBuf,
+    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
+}
+
+/// A `new_work_folder_folder` background creation's result, bundled into one
+/// named type rather than a tuple so the type itself stays simple.
+struct NewFolderOutcome {
+    result: std::io::Result<()>,
+    modified: Option<SystemTime>,
+    ancestors: Vec<(PathBuf, Option<SystemTime>)>,
+}
+
 /// State for the one sidebar row currently being edited. The editable text is
 /// kept separate from the fixed Markdown extension so input and filesystem
 /// validation cannot accidentally turn a note into another file type.
@@ -2568,7 +2596,11 @@ impl EditorView {
                     } else {
                         Vec::new()
                     };
-                    (result, modified, ancestors)
+                    NewFolderOutcome {
+                        result,
+                        modified,
+                        ancestors,
+                    }
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
@@ -2581,14 +2613,14 @@ impl EditorView {
     fn finish_new_work_folder_folder(
         &mut self,
         path: PathBuf,
-        outcome: (
-            std::io::Result<()>,
-            Option<SystemTime>,
-            Vec<(PathBuf, Option<SystemTime>)>,
-        ),
+        outcome: NewFolderOutcome,
         cx: &mut Context<Self>,
     ) {
-        let (result, modified, ancestors) = outcome;
+        let NewFolderOutcome {
+            result,
+            modified,
+            ancestors,
+        } = outcome;
         self.pending_new_folders.remove(&path);
         match result {
             Ok(()) => {

@@ -574,7 +574,14 @@ impl EditorView {
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.finish_inline_rename(from, target, kind, tickets, result, ancestors, cx);
+                let attempt = InlineRenameAttempt {
+                    from,
+                    target,
+                    kind,
+                    tickets,
+                    ancestors,
+                };
+                view.finish_inline_rename(attempt, result, cx);
             });
         })
         .detach();
@@ -583,14 +590,17 @@ impl EditorView {
 
     fn finish_inline_rename(
         &mut self,
-        from: PathBuf,
-        target: PathBuf,
-        kind: InlineRenameKind,
-        tickets: Vec<(SessionId, SaveTicket)>,
+        attempt: InlineRenameAttempt,
         result: std::io::Result<()>,
-        ancestors: Vec<(PathBuf, Option<SystemTime>)>,
         cx: &mut Context<Self>,
     ) {
+        let InlineRenameAttempt {
+            from,
+            target,
+            kind,
+            tickets,
+            ancestors,
+        } = attempt;
         let mut queued_saves = Vec::new();
         for (id, ticket) in tickets {
             if let Some(session) = self.sessions.get_mut(id) {

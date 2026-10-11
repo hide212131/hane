@@ -646,7 +646,14 @@ impl EditorView {
                         })
                         .await;
                     let _ = view.update(cx, |view, cx| {
-                        view.finish_save(id, ticket, instance, &path, result, ancestors, cx);
+                        let attempt = SaveAttempt {
+                            id,
+                            ticket,
+                            instance,
+                            path,
+                            ancestors,
+                        };
+                        view.finish_save(attempt, result, cx);
                     });
                 })
                 .detach();
@@ -657,14 +664,18 @@ impl EditorView {
 
     fn finish_save(
         &mut self,
-        id: SessionId,
-        ticket: SaveTicket,
-        instance: Option<DocumentInstance>,
-        path: &Path,
+        attempt: SaveAttempt,
         result: Result<SavedFile, SaveFailure>,
-        ancestors: Vec<(PathBuf, Option<SystemTime>)>,
         cx: &mut Context<Self>,
     ) {
+        let SaveAttempt {
+            id,
+            ticket,
+            instance,
+            path,
+            ancestors,
+        } = attempt;
+        let path = path.as_path();
         if self.document_instance(id) != instance {
             // The document this write was for is gone, or this id now
             // names a different instance of it — a work-folder switch that
