@@ -7,12 +7,15 @@
 //! `DocumentSession`; callers open a `WorkFolderEntry::path()` through
 //! `FileService::load` only once a note is actually selected.
 
+use crate::service::FileService;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::SystemTime;
 
 /// Process-wide monotonic counter stamped onto a node's modified time at the
@@ -31,6 +34,45 @@ static NEXT_MODIFIED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// crosses back onto the UI thread through `WorkFolder::touch`.
 pub fn next_modified_sequence() -> u64 {
     NEXT_MODIFIED_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// One lock per path ever stamped through `stamp_with_sequence`, kept for the
+/// life of the process. Entries are never removed: the set of distinct paths
+/// a running process stamps is bounded by the folders and files the user's
+/// work folder actually has, the same bound `WorkFolder`'s own tree already
+/// keeps.
+static PATH_STAMP_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn path_stamp_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = PATH_STAMP_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Reads `path`'s current modified time through `FileService::stamp` and
+/// allocates its paired `next_modified_sequence` value as one step, held
+/// behind a lock specific to `path`, rather than as two separate steps a
+/// thread switch can land in between.
+///
+/// Pairing the read and the sequence this way — not merely reading, then
+/// allocating a sequence afterward — is what keeps two calls for the *same*
+/// path in real read order: without the lock, one call's read can land first
+/// while a second, independent call for the same path (most commonly two
+/// sibling saves whose `ancestor_folder_paths` both name the same parent
+/// folder) reads afterward yet reaches `fetch_add` first, handing the
+/// genuinely later read the *smaller* sequence number. `WorkFolder::touch`
+/// and `rename` only have the sequence to tell the two apart (see
+/// `set_modified`), so once that numbering itself is wrong, no comparison on
+/// the receiving side can recover the real order.
+pub fn stamp_with_sequence(files: &dyn FileService, path: &Path) -> (Option<SystemTime>, u64) {
+    let lock = path_stamp_lock(path);
+    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let modified = files.stamp(path).and_then(|stamp| stamp.modified);
+    let sequence = next_modified_sequence();
+    (modified, sequence)
 }
 
 /// One Markdown file discovered under a work folder, not yet loaded.
@@ -1628,6 +1670,128 @@ mod tests {
             entry.modified(),
             Some(system_time_at(100)),
             "a genuinely newer read must apply even though its own SystemTime is smaller"
+        );
+    }
+
+    #[test]
+    fn stamp_with_sequence_serializes_concurrent_reads_of_the_same_path() {
+        // Reproduces the race `stamp_ancestor_folders` used to be exposed to
+        // before it was rewritten on top of `stamp_with_sequence`: two
+        // sibling saves whose `ancestor_folder_paths` both name the same
+        // parent folder, each acquiring that folder's modified time off the
+        // UI thread. Without per-path serialization, a first call's read can
+        // land before a second, independent call's read for the same path,
+        // yet still receive a *later* `next_modified_sequence` value if a
+        // thread switch lands in the gap between "read the real modified
+        // time" and "allocate the sequence" — exactly the gap
+        // `stamp_with_sequence` closes by holding that path's lock across
+        // both steps. A barrier inside this `FileService` double holds the
+        // first call inside `stamp` so the test can assert, from the
+        // outside, that a second call for the same path cannot even start
+        // its own read (let alone finish and allocate a sequence) until the
+        // first call has released the lock.
+        use crate::identity::FileStamp;
+        use crate::service::{LoadedFile, ReadFile, SavedFile};
+        use hane_document::RopeBuffer;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        struct GatedFileService {
+            entered_tx: Mutex<Option<mpsc::Sender<()>>>,
+            release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+            modified: SystemTime,
+        }
+
+        impl FileService for GatedFileService {
+            fn load(&self, _path: &Path) -> io::Result<LoadedFile> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn open_reader(&self, _path: &Path) -> io::Result<ReadFile> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn save(&self, _path: &Path, _document: &RopeBuffer) -> io::Result<SavedFile> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn stamp(&self, _path: &Path) -> Option<FileStamp> {
+                if let Some(entered) = self.entered_tx.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = self.release_rx.lock().unwrap().take() {
+                    release.recv().expect("test releases the first call");
+                }
+                Some(FileStamp::new(0, Some(self.modified)))
+            }
+
+            fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn rename_folder(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn create_dir(&self, _path: &Path) -> io::Result<()> {
+                unreachable!("not exercised by this test")
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let files = Arc::new(GatedFileService {
+            entered_tx: Mutex::new(Some(entered_tx)),
+            release_rx: Mutex::new(Some(release_rx)),
+            modified: system_time_at(100),
+        });
+        let path = PathBuf::from("/notes/dev");
+
+        let first = {
+            let files = Arc::clone(&files);
+            let path = path.clone();
+            thread::spawn(move || stamp_with_sequence(files.as_ref(), &path))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first call enters FileService::stamp while holding the path lock");
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let second = {
+            let files = Arc::clone(&files);
+            let path = path.clone();
+            thread::spawn(move || {
+                let _ = second_started_tx.send(());
+                stamp_with_sequence(files.as_ref(), &path)
+            })
+        };
+        second_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second call's own thread starts running");
+
+        // The second call must still be blocked acquiring the first call's
+        // path lock: with no serialization it would reach `stamp` (which
+        // this double only gates once) and return almost immediately.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !second.is_finished(),
+            "a second stamp_with_sequence call for the same path must not complete \
+             while the first call still holds that path's lock"
+        );
+
+        release_tx
+            .send(())
+            .expect("first call is still waiting on the release channel");
+        let (first_modified, first_sequence) = first.join().expect("first call completes");
+        let (second_modified, second_sequence) = second.join().expect("second call completes");
+
+        assert_eq!(first_modified, Some(system_time_at(100)));
+        assert_eq!(second_modified, Some(system_time_at(100)));
+        assert!(
+            first_sequence < second_sequence,
+            "the call whose read completed first must also receive the smaller sequence, \
+             since serialization never lets the second call's read start earlier"
         );
     }
 

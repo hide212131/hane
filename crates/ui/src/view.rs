@@ -81,7 +81,7 @@ use hane_session::{
     Settings, StateStores, TitleSyncAction, UnsavedChanges, WorkFolder, WorkFolderNode,
     WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
     format_relative_date_label, local_today, next_modified_sequence, run_save_job,
-    split_file_name_for_badge, unique_folder_name, unique_markdown_filename,
+    split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -669,12 +669,18 @@ fn rebase_ui_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
 /// degrade-on-failure contract `OsWorkFolderScanner::scan` already uses for
 /// `WorkFolderEntry::modified`.
 ///
-/// Each result is paired with a `next_modified_sequence` value, allocated
-/// right here at the point the read actually happens. Two of these calls can
-/// run for the same ancestor path from different saves and reach the UI
-/// thread in either order; `WorkFolder::touch` uses this sequence, not the
-/// `SystemTime` itself, to tell which read was genuinely the later one — see
-/// `set_modified` for why the time value alone cannot do that safely.
+/// Each result is paired with a `next_modified_sequence` value through
+/// `stamp_with_sequence`, which allocates it behind a lock for that specific
+/// path rather than as a separate step after the read. Two of these calls
+/// can run for the same ancestor path from different saves — most commonly
+/// two sibling saves whose `ancestor_folder_paths` both name the same parent
+/// folder — and reach the UI thread in either order; `WorkFolder::touch`
+/// uses the sequence, not the `SystemTime` itself, to tell which read was
+/// genuinely the later one, which only works if the sequence numbering
+/// itself still matches real read order. See `stamp_with_sequence` for why
+/// the read and the `fetch_add` must be paired atomically, not just
+/// performed one after the other, and `set_modified` for why the time value
+/// alone cannot stand in for the sequence.
 fn stamp_ancestor_folders(
     files: &dyn FileService,
     ancestors: &[PathBuf],
@@ -682,8 +688,8 @@ fn stamp_ancestor_folders(
     ancestors
         .iter()
         .map(|path| {
-            let modified = files.stamp(path).and_then(|stamp| stamp.modified);
-            (path.clone(), modified, next_modified_sequence())
+            let (modified, sequence) = stamp_with_sequence(files, path);
+            (path.clone(), modified, sequence)
         })
         .collect()
 }
