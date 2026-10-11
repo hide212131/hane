@@ -12,6 +12,10 @@ on:
         description: "Release version (例: v0.8.0)"
         required: true
         type: string
+      expected_sha:
+        description: "Expected commit SHA for an automated release dispatch"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -32,6 +36,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
           set -euo pipefail
 
@@ -42,6 +47,16 @@ jobs:
             if [ "${{ github.ref }}" != "refs/heads/main" ]; then
               echo "Manual releases must be run from the main branch." >&2
               exit 1
+            fi
+            if [ -n "$EXPECTED_SHA" ]; then
+              if ! [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "Expected release commit must be a full lowercase SHA-1." >&2
+                exit 1
+              fi
+              if [ "$GITHUB_SHA" != "$EXPECTED_SHA" ]; then
+                echo "Release workflow resolved $GITHUB_SHA, expected merged release commit $EXPECTED_SHA." >&2
+                exit 1
+              fi
             fi
             release_tag="$INPUT_VERSION"
           elif [ "${{ github.ref_type }}" = "tag" ]; then
