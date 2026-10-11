@@ -249,8 +249,12 @@ impl UserPromptsStore {
         // Every explicit id must have been actually issued by a prior save
         // (non-zero and below the pre-save `next_id`), and no two drafts may
         // carry the same id. Checked up front, against the pre-save
-        // `next_id`, so a newly minted id below can never collide with one
-        // of these: minted ids only ever start at `next_id` and increase.
+        // `next_id`, so under normal operation a newly minted id below can
+        // never collide with one of these: minted ids only ever start at
+        // `next_id` and increase. Still registered into the same `seen_ids`
+        // set below (and rejected if `0`) as a defense against a corrupted
+        // on-disk `next_id`, which would otherwise let a mint collide with,
+        // or equal, an id that must never be issued.
         let mut seen_ids = std::collections::HashSet::with_capacity(drafts.len());
         for draft in &drafts {
             if let Some(id) = draft.id {
@@ -289,6 +293,12 @@ impl UserPromptsStore {
                 Some(id) => id,
                 None => {
                     let assigned = next_id;
+                    if assigned == 0 {
+                        return Err(UserPromptsSaveError::InvalidId { id: 0 });
+                    }
+                    if !seen_ids.insert(assigned) {
+                        return Err(UserPromptsSaveError::DuplicateId { id: assigned });
+                    }
                     next_id = next_id
                         .checked_add(1)
                         .ok_or(UserPromptsSaveError::IdCounterOverflow)?;
@@ -562,6 +572,38 @@ mod tests {
         ));
         // None of the rejected saves touched the persisted file.
         assert_eq!(store.load().unwrap().unwrap(), first);
+    }
+
+    /// Regression for the id-invariant bug: a corrupted on-disk file whose
+    /// `next_id` is already `0` must not let a newly minted id come out as
+    /// `0` either. The save is rejected and the file is left untouched.
+    #[test]
+    fn minting_a_new_id_from_a_corrupted_zero_next_id_is_rejected_without_persisting() {
+        let store = store("zero_next_id_fixture");
+        let corrupted = serde_json::json!({
+            "schema_version": USER_PROMPTS_SCHEMA_VERSION,
+            "revision": 1,
+            "next_id": 0,
+            "prompts": [],
+        });
+        std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        std::fs::write(store.path(), serde_json::to_vec_pretty(&corrupted).unwrap()).unwrap();
+
+        assert!(matches!(
+            store.save(1, vec![draft(None, "校正する", "本文")]),
+            Err(UserPromptsSaveError::InvalidId { id: 0 })
+        ));
+        // The on-disk file is untouched.
+        let raw = std::fs::read_to_string(store.path()).unwrap();
+        let reloaded: UserPrompts = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reloaded.next_id, 0);
+        assert!(reloaded.prompts.is_empty());
+
+        // A save that mints no new id (e.g. an empty list) is unaffected by
+        // the corrupted counter and still succeeds normally.
+        let saved = store.save(1, Vec::new()).unwrap();
+        assert_eq!(saved.revision, 2);
+        assert!(saved.prompts.is_empty());
     }
 
     #[test]
