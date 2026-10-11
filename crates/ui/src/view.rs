@@ -501,17 +501,6 @@ enum InlineRenameKind {
     Folder,
 }
 
-/// Which settings sidebar category is currently shown. `ai_settings`
-/// ("AI") edits connection/credential settings; `ai_prompts`
-/// ("AIプロンプト") edits saved selection-action prompts independently of
-/// it (Issue #449) and never touches connection/credential state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SettingsCategory {
-    General,
-    Connection,
-    Prompts,
-}
-
 /// State for the one sidebar row currently being edited. The editable text is
 /// kept separate from the fixed Markdown extension so input and filesystem
 /// validation cannot accidentally turn a note into another file type.
@@ -747,6 +736,17 @@ enum SidebarFocus {
     ActiveSession,
     /// A folder or root row is highlighted, driven by `selected_folder`.
     Folder,
+}
+
+/// Which settings sidebar category is currently shown. `ai_settings`
+/// ("AI") edits connection/credential settings; `ai_prompts`
+/// ("AIプロンプト") edits saved selection-action prompts independently of
+/// it (Issue #449) and never touches connection/credential state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsCategory {
+    General,
+    Connection,
+    Prompts,
 }
 
 pub struct EditorView {
