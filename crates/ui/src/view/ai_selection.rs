@@ -76,14 +76,18 @@ enum AiSelectionPhase {
     },
 }
 
-/// The compose screen's own Tab/Shift+Tab stops (implementation spec section
-/// 3.2): the free-text input, the send button, the saved-prompt list, and
-/// the close button — in that order. Independent of `input_focused`, which
-/// only tracks whether the pinned `InputState` widget currently holds real
-/// GPUI keyboard focus; `Send`/`List`/`Close` instead park real focus on the
-/// shared `EditorView::focus_handle` (see `ai_selection_set_focus_region`),
-/// the same technique `focus_content_search_results` already uses for its
-/// own keyboard-navigable list.
+/// One popup screen's own Tab/Shift+Tab stop. `Input`/`Send`/`List`/`Close`
+/// belong to the compose screen (implementation spec section 3.2): the
+/// free-text input, the send button, the saved-prompt list, and the close
+/// button — in that order. `Stop` belongs to the submitting screen, and
+/// `Replace`/`Regenerate`/`Discard` belong to the reviewing screen (`Close`
+/// is shared with it too, for its own "×"). Independent of `input_focused`,
+/// which only tracks whether the pinned `InputState` widget currently holds
+/// real GPUI keyboard focus; every stop other than `Input` instead parks
+/// real focus on the shared `EditorView::focus_handle` (see
+/// `ai_selection_set_focus_region`), the same technique
+/// `focus_content_search_results` already uses for its own
+/// keyboard-navigable list.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum AiSelectionFocusRegion {
     #[default]
@@ -91,6 +95,10 @@ enum AiSelectionFocusRegion {
     Send,
     List,
     Close,
+    Stop,
+    Replace,
+    Regenerate,
+    Discard,
 }
 
 #[derive(Default)]
@@ -103,10 +111,10 @@ pub(super) struct AiSelectionState {
     input: Option<Entity<InputState>>,
     input_subscription: Option<Subscription>,
     input_focused: bool,
-    /// Which of `ai_selection_focus_stops`'s stops currently has logical
-    /// keyboard focus on the compose screen. Meaningful only while `phase`
-    /// is `Composing`; the submitting/reviewing screens have no such stops
-    /// yet.
+    /// Which stop of the current phase's own
+    /// `ai_selection_current_focus_stops` currently has logical keyboard
+    /// focus — the compose, submitting, or reviewing screen's own stops,
+    /// depending on `phase`.
     focus_region: AiSelectionFocusRegion,
     /// The saved-prompt list's own keyboard-focused row, meaningful only
     /// while `focus_region` is `List`. Always kept within
@@ -220,6 +228,13 @@ impl AiSelectionState {
                     generation,
                 });
                 self.phase = AiSelectionPhase::Submitting;
+                // The submitting screen has exactly one stop (`Stop`); land
+                // logical focus there up front so Tab/Enter reach it without
+                // requiring a Tab first (`ai_selection_handle_tab`/
+                // `ai_selection_handle_enter`), the same way `Reviewing`
+                // below lands on its own first stop.
+                self.focus_region = AiSelectionFocusRegion::Stop;
+                self.list_focus_index = None;
                 let view = cx.entity().downgrade();
                 cx.spawn(async move |_, cx| {
                     let outcome = cx
@@ -267,6 +282,16 @@ impl AiSelectionState {
                     result: text,
                     unchanged,
                 };
+                // Lands on the reviewing screen's own first stop up front —
+                // `Replace` when offered, otherwise `Regenerate` — so Tab/
+                // Enter reach it without requiring a Tab first, same as
+                // `Submitting` above.
+                self.focus_region = if unchanged {
+                    AiSelectionFocusRegion::Regenerate
+                } else {
+                    AiSelectionFocusRegion::Replace
+                };
+                self.list_focus_index = None;
             }
             Ok(TextTransformOutcome::Canceled) => {
                 self.phase = AiSelectionPhase::Composing;
@@ -448,7 +473,7 @@ impl EditorView {
     /// The compose screen's Tab/Shift+Tab stops, in order (implementation
     /// spec section 3.2) — skipping `List` when there is nothing in it for
     /// arrow keys to move among.
-    fn ai_selection_focus_stops(&self) -> Vec<AiSelectionFocusRegion> {
+    fn ai_selection_composing_focus_stops(&self) -> Vec<AiSelectionFocusRegion> {
         let mut stops = vec![AiSelectionFocusRegion::Input, AiSelectionFocusRegion::Send];
         if !self.ai_selection.saved_prompts.is_empty() {
             stops.push(AiSelectionFocusRegion::List);
@@ -457,10 +482,39 @@ impl EditorView {
         stops
     }
 
+    /// The reviewing screen's Tab/Shift+Tab stops, in the same
+    /// primary-action/secondary-actions/dismiss order as the compose
+    /// screen's own stops above: 置き換える (skipped once the result is
+    /// `unchanged`, since there is then nothing for it to apply — see
+    /// `ai_selection_replace`), 再生成, 破棄, then × last.
+    fn ai_selection_reviewing_focus_stops(&self, unchanged: bool) -> Vec<AiSelectionFocusRegion> {
+        let mut stops = Vec::new();
+        if !unchanged {
+            stops.push(AiSelectionFocusRegion::Replace);
+        }
+        stops.push(AiSelectionFocusRegion::Regenerate);
+        stops.push(AiSelectionFocusRegion::Discard);
+        stops.push(AiSelectionFocusRegion::Close);
+        stops
+    }
+
+    /// The current phase's own Tab/Shift+Tab stops: the compose screen's
+    /// `Input`/`Send`/`List`/`Close`, the submitting screen's single `Stop`,
+    /// or the reviewing screen's own stops above.
+    fn ai_selection_current_focus_stops(&self) -> Vec<AiSelectionFocusRegion> {
+        match &self.ai_selection.phase {
+            AiSelectionPhase::Composing => self.ai_selection_composing_focus_stops(),
+            AiSelectionPhase::Submitting => vec![AiSelectionFocusRegion::Stop],
+            AiSelectionPhase::Reviewing { unchanged, .. } => {
+                self.ai_selection_reviewing_focus_stops(*unchanged)
+            }
+        }
+    }
+
     /// Moves logical focus to the next (`forward`) or previous stop in
-    /// `ai_selection_focus_stops`, wrapping past either end.
+    /// `ai_selection_current_focus_stops`, wrapping past either end.
     fn ai_selection_move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let stops = self.ai_selection_focus_stops();
+        let stops = self.ai_selection_current_focus_stops();
         let current = stops
             .iter()
             .position(|region| *region == self.ai_selection.focus_region)
@@ -534,11 +588,13 @@ impl EditorView {
     }
 
     /// Tab/Shift+Tab while this popup is open (implementation spec section
-    /// 3.2): cycles the compose screen's focus stops and reports `true` so
-    /// `actions.rs` never falls through to the document's own
-    /// Indent/Outdent. Swallows the key without cycling anything outside the
-    /// compose phase, since the submitting/reviewing screens have no such
-    /// stops.
+    /// 3.2, extended to the submitting/reviewing screens): cycles the
+    /// current phase's own focus stops (`ai_selection_current_focus_stops`)
+    /// and reports `true` so `actions.rs` never falls through to the
+    /// document's own Indent/Outdent — including while submitting or
+    /// reviewing, where there is no document-editing meaning for Tab to
+    /// fall through to anyway, and the key must still never leak into the
+    /// document underneath.
     pub(crate) fn ai_selection_handle_tab(
         &mut self,
         forward: bool,
@@ -548,9 +604,7 @@ impl EditorView {
         if !self.ai_selection.open {
             return false;
         }
-        if matches!(self.ai_selection.phase, AiSelectionPhase::Composing) {
-            self.ai_selection_move_focus(forward, window, cx);
-        }
+        self.ai_selection_move_focus(forward, window, cx);
         true
     }
 
@@ -574,33 +628,68 @@ impl EditorView {
         true
     }
 
-    /// Enter while this popup is open, for every focus stop except `Input`
-    /// (implementation spec section 3.2). `Input` is deliberately a no-op
+    /// Enter while this popup is open, dispatched against whichever stop of
+    /// the current phase's own focus stops
+    /// (`ai_selection_current_focus_stops`) currently holds logical focus.
+    ///
+    /// On the compose screen (implementation spec section 3.2), every stop
+    /// except `Input` decides something; `Input` is deliberately a no-op
     /// here: while that stop holds real GPUI focus, the pinned `InputState`
     /// widget's own `InputEvent::PressEnter` subscription (wired in
     /// `ensure_ai_selection_input`) already submits the free-text
     /// instruction and already guards Shift+Enter and an in-progress IME
-    /// composition — handling it again here would submit twice. Swallows
-    /// the key without deciding anything outside the `Composing` phase,
-    /// since the submitting/reviewing screens have no such stops.
+    /// composition — handling it again here would submit twice.
+    ///
+    /// On the submitting screen, Enter at its own `Stop` stop cancels the
+    /// in-flight request the same as clicking "停止" (`ai_selection_stop`).
+    /// On the reviewing screen, Enter decides the same action as clicking
+    /// the correspondingly focused button: `Replace` → "置き換える"
+    /// (`ai_selection_replace`, unreachable once the result is `unchanged`
+    /// — see `ai_selection_reviewing_focus_stops`), `Regenerate` → "再生成"
+    /// (`ai_selection_regenerate`), `Discard`/`Close` → close the popup the
+    /// same as "破棄"/"×" (`close_ai_selection`).
+    ///
+    /// Every branch not matching the current phase's own stops (e.g. a
+    /// leftover `focus_region` from a previous phase, see `ai_selection_stop`
+    /// and `apply_outcome`'s Composing-returning branches) swallows the key
+    /// without deciding anything, rather than falling back to some other
+    /// phase's meaning for the same stop value.
     pub(crate) fn ai_selection_handle_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.ai_selection.phase, AiSelectionPhase::Composing) {
-            return;
-        }
-        match self.ai_selection.focus_region {
-            AiSelectionFocusRegion::Input => {}
-            AiSelectionFocusRegion::Send => self.ai_selection_submit_free_text(cx),
-            AiSelectionFocusRegion::List => {
-                if let Some(prompt) = self
-                    .ai_selection
-                    .list_focus_index
-                    .and_then(|index| self.ai_selection.saved_prompts.get(index))
-                    .map(|saved| saved.prompt.clone())
-                {
-                    self.ai_selection_run_saved_prompt(prompt, cx);
+        match self.ai_selection.phase.clone() {
+            AiSelectionPhase::Composing => match self.ai_selection.focus_region {
+                AiSelectionFocusRegion::Input => {}
+                AiSelectionFocusRegion::Send => self.ai_selection_submit_free_text(cx),
+                AiSelectionFocusRegion::List => {
+                    if let Some(prompt) = self
+                        .ai_selection
+                        .list_focus_index
+                        .and_then(|index| self.ai_selection.saved_prompts.get(index))
+                        .map(|saved| saved.prompt.clone())
+                    {
+                        self.ai_selection_run_saved_prompt(prompt, cx);
+                    }
+                }
+                AiSelectionFocusRegion::Close => self.close_ai_selection(window, cx),
+                AiSelectionFocusRegion::Stop
+                | AiSelectionFocusRegion::Replace
+                | AiSelectionFocusRegion::Regenerate
+                | AiSelectionFocusRegion::Discard => {}
+            },
+            AiSelectionPhase::Submitting => {
+                if self.ai_selection.focus_region == AiSelectionFocusRegion::Stop {
+                    self.ai_selection_stop(cx);
                 }
             }
-            AiSelectionFocusRegion::Close => self.close_ai_selection(window, cx),
+            AiSelectionPhase::Reviewing { unchanged, .. } => match self.ai_selection.focus_region {
+                AiSelectionFocusRegion::Replace if !unchanged => {
+                    self.ai_selection_replace(window, cx);
+                }
+                AiSelectionFocusRegion::Regenerate => self.ai_selection_regenerate(window, cx),
+                AiSelectionFocusRegion::Discard | AiSelectionFocusRegion::Close => {
+                    self.close_ai_selection(window, cx);
+                }
+                _ => {}
+            },
         }
     }
 
@@ -1250,6 +1339,20 @@ impl EditorView {
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| view.ai_selection_stop(cx));
             });
+        // `Stop` has no native focus target of its own while it holds this
+        // screen's logical keyboard focus (real GPUI focus instead parks on
+        // the shared `focus_handle`, see `ai_selection_set_focus_region`),
+        // so this border is its only on-screen focus indicator — the same
+        // role the compose screen's `send_focused`/`close_focused` borders
+        // play for its own stops.
+        let stop_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::Stop;
+        let stop = div()
+            .id("ai-selection-stop-focus-ring")
+            .rounded_sm()
+            .when(stop_focused, |el| {
+                el.border_1().border_color(rgb(theme.link_foreground))
+            })
+            .child(stop);
         div()
             .flex()
             .flex_col()
@@ -1279,6 +1382,16 @@ impl EditorView {
     ) -> impl IntoElement {
         let theme = self.theme;
         let original = self.ai_selection.original_text.clone();
+        // Each button below has no native focus target of its own while it
+        // holds this screen's logical keyboard focus (real GPUI focus
+        // instead parks on the shared `focus_handle`, see
+        // `ai_selection_set_focus_region`), so its own border is its only
+        // on-screen focus indicator — the same role the compose screen's
+        // `send_focused`/`close_focused` borders play for its own stops.
+        let close_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::Close;
+        let replace_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::Replace;
+        let regenerate_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::Regenerate;
+        let discard_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::Discard;
         let view = cx.entity();
         let close = Button::new("ai-selection-close-review")
             .label("×")
@@ -1287,6 +1400,13 @@ impl EditorView {
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.close_ai_selection(window, cx));
             });
+        let close = div()
+            .id("ai-selection-close-review-focus-ring")
+            .rounded_sm()
+            .when(close_focused, |el| {
+                el.border_1().border_color(rgb(theme.link_foreground))
+            })
+            .child(close);
         let header = div()
             .flex()
             .items_center()
@@ -1342,6 +1462,13 @@ impl EditorView {
                 .on_click(move |_, window, app| {
                     view.update(app, |view, cx| view.ai_selection_replace(window, cx));
                 });
+            let replace = div()
+                .id("ai-selection-replace-focus-ring")
+                .rounded_sm()
+                .when(replace_focused, |el| {
+                    el.border_1().border_color(rgb(theme.link_foreground))
+                })
+                .child(replace);
             footer = footer.child(replace);
         }
         let view = cx.entity();
@@ -1351,6 +1478,13 @@ impl EditorView {
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.ai_selection_regenerate(window, cx));
             });
+        let regenerate = div()
+            .id("ai-selection-regenerate-focus-ring")
+            .rounded_sm()
+            .when(regenerate_focused, |el| {
+                el.border_1().border_color(rgb(theme.link_foreground))
+            })
+            .child(regenerate);
         let view = cx.entity();
         let discard = Button::new("ai-selection-discard")
             .label("破棄")
@@ -1359,6 +1493,13 @@ impl EditorView {
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.close_ai_selection(window, cx));
             });
+        let discard = div()
+            .id("ai-selection-discard-focus-ring")
+            .rounded_sm()
+            .when(discard_focused, |el| {
+                el.border_1().border_color(rgb(theme.link_foreground))
+            })
+            .child(discard);
         footer = footer.child(regenerate).child(discard);
         let mut body = div().flex().flex_col().child(header).child(compare);
         if let Some(message) = &self.ai_selection.message {
@@ -2253,7 +2394,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn enter_is_swallowed_without_deciding_anything_outside_the_composing_phase(
+    fn enter_does_not_fall_back_to_a_leftover_focus_region_from_a_different_phase(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(crate::actions::register_key_bindings);
@@ -2280,9 +2421,11 @@ mod tests {
             assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
         });
 
-        // The submitting/reviewing screens have no focus stops of their own;
-        // Enter there must not fall back to the compose screen's decisions
-        // for whatever `focus_region` is still left over.
+        // `Send` is a compose-only stop, not one of the submitting screen's
+        // own (`Stop`). Forcing the phase to `Submitting` without going
+        // through `start_request` (which would have landed `focus_region`
+        // on `Stop` itself) leaves this stale `Send` behind; Enter must not
+        // fall back to the compose screen's decision for it.
         view.update(cx, |view, cx| {
             view.ai_selection.phase = AiSelectionPhase::Submitting;
             cx.notify();
@@ -2419,6 +2562,233 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(!view.ai_selection.open);
+        });
+    }
+
+    fn open_popup_for_keyboard_tests(
+        cx: &mut gpui::TestAppContext,
+    ) -> gpui::WindowHandle<EditorView> {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view
+    }
+
+    // PR #450 review: the reviewing screen previously had no focus stops of
+    // its own, so Tab/Shift+Tab only cycled the compose screen's stops and
+    // Enter never decided anything there — leaving the result screen
+    // keyboard-unreachable. These stops follow the same
+    // primary-action/secondary-actions/dismiss order as the compose screen's
+    // own (`ai_selection_composing_focus_stops`): 置き換える, 再生成, 破棄,
+    // then × last.
+    #[gpui::test]
+    fn tab_cycles_focus_through_the_reviewing_screens_own_stops(cx: &mut gpui::TestAppContext) {
+        let view = open_popup_for_keyboard_tests(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                result: "XYZ".to_owned(),
+                unchanged: false,
+            };
+            view.ai_selection.focus_region = AiSelectionFocusRegion::Replace;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for expected in [
+            AiSelectionFocusRegion::Regenerate,
+            AiSelectionFocusRegion::Discard,
+            AiSelectionFocusRegion::Close,
+            AiSelectionFocusRegion::Replace,
+        ] {
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.ai_selection.focus_region, expected);
+            });
+        }
+
+        // Shift+Tab walks the exact same stops backward.
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Close);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+            assert!(!view.editor().can_undo());
+        });
+    }
+
+    #[gpui::test]
+    fn tab_skips_the_replace_stop_in_the_reviewing_screen_once_the_result_is_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = open_popup_for_keyboard_tests(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                result: "abc".to_owned(),
+                unchanged: true,
+            };
+            view.ai_selection.focus_region = AiSelectionFocusRegion::Regenerate;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for expected in [
+            AiSelectionFocusRegion::Discard,
+            AiSelectionFocusRegion::Close,
+            // Wraps straight back to `Regenerate`, never landing on
+            // `Replace` — there is nothing for it to apply.
+            AiSelectionFocusRegion::Regenerate,
+        ] {
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.ai_selection.focus_region, expected);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn enter_at_the_reviewing_replace_stop_applies_the_result(cx: &mut gpui::TestAppContext) {
+        let view = open_popup_for_keyboard_tests(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                result: "XYZ".to_owned(),
+                unchanged: false,
+            };
+            view.ai_selection.focus_region = AiSelectionFocusRegion::Replace;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.ai_selection.open);
+            assert_eq!(view.editor().document().full_text(), "XYZdef\n");
+            assert!(view.editor().can_undo());
+        });
+    }
+
+    #[gpui::test]
+    fn enter_at_the_reviewing_regenerate_stop_starts_a_fresh_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = open_popup_for_keyboard_tests(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.confirmed_instruction = "直す".to_owned();
+            view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                result: "XYZ".to_owned(),
+                unchanged: false,
+            };
+            view.ai_selection.focus_region = AiSelectionFocusRegion::Regenerate;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            // No AI service is attached in this test, so the request is
+            // rejected at admission — but the rejection message (rather
+            // than, say, a replace/discard) confirms Enter at `Regenerate`
+            // reached `ai_selection_regenerate` and not some other stop's
+            // decision.
+            assert!(view.ai_selection.open);
+            assert_eq!(
+                view.ai_selection.message.as_deref(),
+                Some("AIサービスを利用できません。")
+            );
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn enter_at_the_reviewing_discard_or_close_stop_closes_without_touching_the_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for focus in [AiSelectionFocusRegion::Discard, AiSelectionFocusRegion::Close] {
+            let view = open_popup_for_keyboard_tests(cx);
+            view.update(cx, |view, cx| {
+                view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                    result: "XYZ".to_owned(),
+                    unchanged: false,
+                };
+                view.ai_selection.focus_region = focus;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(!view.ai_selection.open);
+                assert_eq!(view.editor().document().full_text(), "abcdef\n");
+                assert!(!view.editor().can_undo());
+            });
+
+            // Keyboard focus must have actually returned to the document
+            // body, not just dropped the popup's own state — typing now
+            // replaces the still-selected "abc" rather than being swallowed.
+            cx.simulate_input("X");
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.editor().document().full_text(), "Xdef\n");
+            });
+        }
+    }
+
+    // PR #450 review: the submitting screen also had no focus stop of its
+    // own, so Tab/Enter there only swallowed the key without ever reaching
+    // the existing "停止" control.
+    #[gpui::test]
+    fn tab_reaches_and_enter_activates_the_submitting_screens_stop_control(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = open_popup_for_keyboard_tests(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.pending = Some(pending(1, 1));
+            view.ai_selection.phase = AiSelectionPhase::Submitting;
+            view.ai_selection.focus_region = AiSelectionFocusRegion::Stop;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // A single-stop screen: Tab/Shift+Tab never leaks into the document
+        // and leaves the one stop still focused.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Stop);
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+            assert!(!view.editor().can_undo());
         });
     }
 }
