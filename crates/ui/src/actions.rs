@@ -195,7 +195,11 @@ command_actions! {
             view.handle_content_search_enter(window, cx);
             return;
         }
-        if view.content_search_input_is_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() {
+        if view.content_search_input_is_focused() || view.document_find_input_is_focused() {
+            return;
+        }
+        if view.ai_selection_blocks_editor_keys() {
+            view.ai_selection_handle_enter(window, cx);
             return;
         }
         if view.sidebar_filter_is_focused() {
@@ -294,9 +298,7 @@ command_actions! {
         if view.sidebar_filter_is_focused() { view.move_sidebar_filter_right(false, cx); } else if view.inline_rename_active() { view.move_inline_rename_right(false, cx); } else { view.dispatch(EditorCommand::MoveRight { extend: false }, cx); }
     },
     Up ("up") => up |view, window, cx| {
-        if view.ai_selection_handle_vertical_arrow(false, cx) {
-            return;
-        } else if view.document_find_input_is_focused() {
+        if view.ai_selection_handle_vertical_arrow(false, cx) || view.document_find_input_is_focused() {
             return;
         } else if view.content_search_results_focused() {
             view.move_content_search_selection(false, cx);
@@ -307,9 +309,7 @@ command_actions! {
         }
     },
     Down ("down") => down |view, window, cx| {
-        if view.ai_selection_handle_vertical_arrow(true, cx) {
-            return;
-        } else if view.document_find_input_is_focused() {
+        if view.ai_selection_handle_vertical_arrow(true, cx) || view.document_find_input_is_focused() {
             return;
         } else if view.content_search_results_focused() {
             view.move_content_search_selection(true, cx);

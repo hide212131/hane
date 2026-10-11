@@ -555,6 +555,36 @@ impl EditorView {
         true
     }
 
+    /// Enter while this popup is open, for every focus stop except `Input`
+    /// (implementation spec section 3.2). `Input` is deliberately a no-op
+    /// here: while that stop holds real GPUI focus, the pinned `InputState`
+    /// widget's own `InputEvent::PressEnter` subscription (wired in
+    /// `ensure_ai_selection_input`) already submits the free-text
+    /// instruction and already guards Shift+Enter and an in-progress IME
+    /// composition — handling it again here would submit twice. Swallows
+    /// the key without deciding anything outside the `Composing` phase,
+    /// since the submitting/reviewing screens have no such stops.
+    pub(crate) fn ai_selection_handle_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.ai_selection.phase, AiSelectionPhase::Composing) {
+            return;
+        }
+        match self.ai_selection.focus_region {
+            AiSelectionFocusRegion::Input => {}
+            AiSelectionFocusRegion::Send => self.ai_selection_submit_free_text(cx),
+            AiSelectionFocusRegion::List => {
+                if let Some(prompt) = self
+                    .ai_selection
+                    .list_focus_index
+                    .and_then(|index| self.ai_selection.saved_prompts.get(index))
+                    .map(|saved| saved.prompt.clone())
+                {
+                    self.ai_selection_run_saved_prompt(prompt, cx);
+                }
+            }
+            AiSelectionFocusRegion::Close => self.close_ai_selection(window, cx),
+        }
+    }
+
     pub(crate) fn leave_ai_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_ai_selection(window, cx);
     }
@@ -988,6 +1018,14 @@ impl EditorView {
         let ready = snapshot.as_ref().is_some_and(text_transform_connection_ready);
         let status_line = text_transform_status_line(snapshot.as_ref());
         let input = self.ai_selection.input.clone();
+        // Send/Close have no native focus target of their own while they
+        // hold the compose screen's logical keyboard focus (real GPUI focus
+        // instead parks on the shared `focus_handle`, see
+        // `ai_selection_set_focus_region`), so this border is their only
+        // on-screen focus indicator — the same role `keyboard_focused`'s
+        // background fill plays for the saved-prompt list's rows below.
+        let close_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::Close;
+        let send_focused = self.ai_selection.focus_region == AiSelectionFocusRegion::Send;
         let view = cx.entity();
         let close = Button::new("ai-selection-close")
             .label("×")
@@ -996,6 +1034,13 @@ impl EditorView {
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.close_ai_selection(window, cx));
             });
+        let close = div()
+            .id("ai-selection-close-focus-ring")
+            .rounded_sm()
+            .when(close_focused, |el| {
+                el.border_1().border_color(rgb(theme.link_foreground))
+            })
+            .child(close);
         let header = div()
             .flex()
             .items_center()
@@ -1015,6 +1060,13 @@ impl EditorView {
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| view.ai_selection_submit_free_text(cx));
             });
+        let send = div()
+            .id("ai-selection-send-focus-ring")
+            .rounded_sm()
+            .when(send_focused, |el| {
+                el.border_1().border_color(rgb(theme.link_foreground))
+            })
+            .child(send);
         let input_row = div()
             .flex()
             .items_center()
@@ -1904,6 +1956,251 @@ mod tests {
             assert!(view.ai_selection.open);
             assert_eq!(view.editor().document().full_text(), "abcdef\n");
             assert!(!view.editor().can_undo());
+        });
+    }
+
+    #[gpui::test]
+    fn enter_at_send_focus_submits_the_free_text_instruction(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // The free-text input holds real focus right after opening.
+        cx.simulate_input("直す");
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            // No AI service is attached in this test, so the request is
+            // rejected at admission rather than actually sent — but reaching
+            // that rejection (and not, say, inserting a newline) confirms
+            // Enter at `Send` submitted the free-text field's own value.
+            assert_eq!(view.ai_selection.confirmed_instruction, "直す");
+            assert_eq!(
+                view.ai_selection.message.as_deref(),
+                Some("AIサービスを利用できません。")
+            );
+            assert!(view.ai_selection.open);
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn enter_at_list_focus_sends_the_highlighted_saved_prompt_immediately(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_selection.saved_prompts =
+                vec![saved_prompt(1, "直す"), saved_prompt(2, "要約する")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Leaves text in the free-text field that must not be combined with
+        // the saved prompt's own body below.
+        cx.simulate_input("別の指示");
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::List);
+            assert_eq!(view.ai_selection.list_focus_index, Some(0));
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.confirmed_instruction, "直す");
+            assert_eq!(
+                view.ai_selection.message.as_deref(),
+                Some("AIサービスを利用できません。")
+            );
+            assert!(view.ai_selection.open);
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn enter_at_close_focus_closes_the_popup_and_returns_focus_to_the_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // No saved prompts: Input -> Send -> Close.
+        cx.simulate_keystrokes("tab");
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Close);
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.ai_selection.open);
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+
+        // Keyboard focus must have actually returned to the document body,
+        // not just dropped the popup's own state.
+        cx.simulate_input("X");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "Xdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn enter_is_swallowed_without_deciding_anything_outside_the_composing_phase(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+
+        // The submitting/reviewing screens have no focus stops of their own;
+        // Enter there must not fall back to the compose screen's decisions
+        // for whatever `focus_region` is still left over.
+        view.update(cx, |view, cx| {
+            view.ai_selection.phase = AiSelectionPhase::Submitting;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Submitting));
+            assert!(view.ai_selection.confirmed_instruction.is_empty());
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn enter_while_composing_in_the_free_text_input_does_not_submit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let input = view
+            .read_with(cx, |view, _| view.ai_selection.input.clone())
+            .expect("input is initialized by open_ai_selection");
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "か", None, window, cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        // This Enter only confirms the in-progress IME composition; it must
+        // not also submit the free-text field as an instruction.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.confirmed_instruction.is_empty());
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
         });
     }
 }
