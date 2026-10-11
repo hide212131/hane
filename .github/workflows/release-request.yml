@@ -182,11 +182,19 @@ jobs:
           set -euo pipefail
           run_id=""
           for attempt in $(seq 1 60); do
+            pr="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json state,headRefName,headRefOid,baseRefName)"
+            jq -e --arg branch "$BRANCH" --arg sha "$HEAD_SHA" \
+              '.headRefName == $branch and .headRefOid == $sha and .baseRefName == "main" and (.state == "OPEN" or .state == "MERGED")' \
+              <<< "$pr" >/dev/null || {
+                echo "Release PR no longer matches the requested branch and head SHA: $PR_URL" >&2
+                exit 1
+              }
             runs="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
               --branch "$BRANCH" --event pull_request --limit 20 \
               --json databaseId,headBranch,headSha,createdAt,status,conclusion)"
-            run_id="$(jq -r --arg branch "$BRANCH" \
-              '[.[] | select(.headBranch == $branch)] | sort_by(.createdAt) | last | .databaseId // empty' \
+            run_id="$(jq -r --arg branch "$BRANCH" --arg sha "$HEAD_SHA" \
+              '[.[] | select(.headBranch == $branch and .headSha == $sha)] | sort_by(.createdAt) | last | .databaseId // empty' \
               <<< "$runs")"
             if [ -n "$run_id" ]; then
               break
@@ -199,14 +207,20 @@ jobs:
           fi
           gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status --compact
 
-          jobs="$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json jobs --jq '.jobs | map({name, conclusion})')"
+          run="$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json event,headBranch,headSha,jobs)"
+          jq -e --arg branch "$BRANCH" --arg sha "$HEAD_SHA" \
+            '.event == "pull_request" and .headBranch == $branch and .headSha == $sha' \
+            <<< "$run" >/dev/null
+          jobs="$(jq '.jobs | map({name, conclusion})' <<< "$run")"
           jq -e 'any(.[]; .name == "Lightweight release checks" and .conclusion == "success")' <<< "$jobs" >/dev/null
           jq -e 'any(.[]; .name == "cargo test / clippy (macos-latest)" and .conclusion == "skipped")' <<< "$jobs" >/dev/null
           jq -e 'any(.[]; .name == "cargo test / clippy (windows-latest)" and .conclusion == "skipped")' <<< "$jobs" >/dev/null
           jq -e 'any(.[]; .name == "Merge release PR and start Release builds" and .conclusion == "success")' <<< "$jobs" >/dev/null
 
-          pr="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,mergeCommit)"
-          jq -e '.state == "MERGED" and .mergeCommit.oid != null' <<< "$pr" >/dev/null
+          pr="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,headRefName,headRefOid,mergeCommit)"
+          jq -e --arg branch "$BRANCH" --arg sha "$HEAD_SHA" \
+            '.state == "MERGED" and .headRefName == $branch and .headRefOid == $sha and .mergeCommit.oid != null' \
+            <<< "$pr" >/dev/null
           merge_sha="$(jq -r '.mergeCommit.oid' <<< "$pr")"
           echo "Merged release PR $PR_URL at $merge_sha"
 

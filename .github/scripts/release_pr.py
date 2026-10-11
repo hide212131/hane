@@ -277,10 +277,22 @@ def classify(root: Path, base: str, head: str) -> tuple[bool, str, str | None]:
         return False, f"release-only 判定ができません: {error}", None
 
 
-def validate(root: Path, base: str, head: str, latest_tag: str) -> str:
+def validate_release_branch(head_ref: str, release_version: str) -> None:
+    expected = f"release/v{release_version}"
+    if head_ref != expected:
+        raise ValueError(
+            f"release branch {head_ref!r} does not match requested version {expected!r}"
+        )
+
+
+def validate(root: Path, base: str, head: str, latest_tag: str, head_ref: str) -> str:
     is_release, reason, version = classify(root, base, head)
     if not is_release or version is None:
         raise ValueError(reason)
+    # The branch name binds the validated Cargo diff to workflow_dispatch's requested
+    # version. It is only a consistency check; release-only classification still uses
+    # the exact base-to-head file contents above.
+    validate_release_branch(head_ref, version)
     if latest_tag:
         if not latest_tag.startswith("v"):
             raise ValueError(f"最新 tag の形式が不正です: {latest_tag}")
@@ -304,6 +316,7 @@ def main() -> int:
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--base", required=True)
     validate_parser.add_argument("--head", required=True)
+    validate_parser.add_argument("--head-ref", required=True)
     validate_parser.add_argument("--latest-tag", default="")
     validate_parser.add_argument("--github-output")
 
@@ -321,7 +334,7 @@ def main() -> int:
                 with open(args.github_output, "a", encoding="utf-8") as output:
                     output.write(f"release_only={str(is_release).lower()}\n")
             return 0
-        version = validate(ROOT, args.base, args.head, args.latest_tag)
+        version = validate(ROOT, args.base, args.head, args.latest_tag, args.head_ref)
         print(f"release v{version} の軽量チェックに合格しました")
         if args.github_output:
             with open(args.github_output, "a", encoding="utf-8") as output:

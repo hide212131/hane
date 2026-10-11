@@ -68,8 +68,27 @@ class ReleaseClassificationTests(unittest.TestCase):
         valid, _, _ = self.validate(changed_paths={"Cargo.toml", "Cargo.lock", "README.md"})
         self.assertFalse(valid)
 
+    def test_rejects_rust_source_contamination(self):
+        valid, _, _ = self.validate(
+            changed_paths={"Cargo.toml", "Cargo.lock", "crates/ai/src/lib.rs"}
+        )
+        self.assertFalse(valid)
+
     def test_rejects_manifest_changes_other_than_workspace_version(self):
         changed = HEAD_MANIFEST.replace('serde = "1"', 'serde = "2"')
+        valid, _, _ = self.validate(head_manifest=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_a_workspace_package_added_to_manifest(self):
+        changed = HEAD_MANIFEST.replace(
+            'members = ["crates/ai"]',
+            'members = ["crates/ai", "crates/new"]',
+        )
+        valid, _, _ = self.validate(head_manifest=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_a_workspace_package_removed_from_manifest(self):
+        changed = HEAD_MANIFEST.replace('members = ["crates/ai"]', 'members = []')
         valid, _, _ = self.validate(head_manifest=changed)
         self.assertFalse(valid)
 
@@ -82,6 +101,39 @@ class ReleaseClassificationTests(unittest.TestCase):
 
     def test_rejects_external_checksum_or_dependency_changes(self):
         changed = HEAD_LOCK.replace('checksum = "unchanged"', 'checksum = "changed"')
+        valid, _, _ = self.validate(head_lock=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_external_dependency_version_changes(self):
+        changed = HEAD_LOCK.replace('version = "1.0.0"', 'version = "1.1.0"')
+        valid, _, _ = self.validate(head_lock=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_external_dependency_source_changes(self):
+        changed = HEAD_LOCK.replace(
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "registry+https://example.invalid/index",
+        )
+        valid, _, _ = self.validate(head_lock=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_external_dependency_list_changes(self):
+        changed = HEAD_LOCK.replace(
+            'name = "serde"\nversion = "1.0.0"',
+            'name = "serde"\nversion = "1.0.0"\ndependencies = ["other 1.0.0"]',
+        )
+        valid, _, _ = self.validate(head_lock=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_workspace_package_added_to_head_lock(self):
+        changed = HEAD_LOCK + '\n[[package]]\nname = "hane-new"\nversion = "0.24.0"\n'
+        valid, _, _ = self.validate(head_lock=changed)
+        self.assertFalse(valid)
+
+    def test_rejects_workspace_package_removed_from_head_lock(self):
+        changed = HEAD_LOCK.replace(
+            '\n[[package]]\nname = "hane-ai"\nversion = "0.24.0"\n', "\n"
+        )
         valid, _, _ = self.validate(head_lock=changed)
         self.assertFalse(valid)
 
@@ -103,6 +155,17 @@ class ReleaseClassificationTests(unittest.TestCase):
         lock = HEAD_LOCK.replace('0.24.0', '0.23.0')
         valid, _, _ = self.validate(head_manifest=manifest, head_lock=lock)
         self.assertFalse(valid)
+
+    def test_rejects_an_older_version(self):
+        manifest = HEAD_MANIFEST.replace('0.24.0', '0.22.0')
+        lock = HEAD_LOCK.replace('0.24.0', '0.22.0')
+        valid, _, _ = self.validate(head_manifest=manifest, head_lock=lock)
+        self.assertFalse(valid)
+
+    def test_release_branch_must_match_detected_version(self):
+        release_pr.validate_release_branch("release/v0.24.0", "0.24.0")
+        with self.assertRaises(ValueError):
+            release_pr.validate_release_branch("release/v0.25.0", "0.24.0")
 
     def test_classifies_candidate_against_base_workspace_metadata(self):
         with tempfile.TemporaryDirectory() as directory:

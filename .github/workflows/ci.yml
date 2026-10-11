@@ -170,10 +170,12 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
           LATEST_TAG: ${{ steps.latest_tag.outputs.latest_tag }}
         run: |
           python3 .github/scripts/release_pr.py validate \
             --base "$BASE_SHA" --head "$HEAD_SHA" --latest-tag "$LATEST_TAG" \
+            --head-ref "$HEAD_REF" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Run release policy tests
@@ -301,17 +303,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          RELEASE_VERSION: ${{ needs.release_checks.outputs.release_version }}
         run: |
           set -euo pipefail
           current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
           test "$current_main" = "$EXPECTED_BASE_SHA"
           pr="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json state,headRefOid,baseRefName,baseRefOid,mergeable,labels)"
+            --json state,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels)"
           jq -e \
             --arg head "$EXPECTED_HEAD_SHA" \
+            --arg head_ref "$EXPECTED_HEAD_REF" \
+            --arg release_branch "release/$RELEASE_VERSION" \
             --arg base "$EXPECTED_BASE_SHA" \
-            '.state == "OPEN" and .headRefOid == $head and .baseRefName == "main" and .baseRefOid == $base and .mergeable == "MERGEABLE" and any(.labels[]; .name == "release")' \
+            '.state == "OPEN" and .headRefOid == $head and .headRefName == $head_ref and .headRefName == $release_branch and .baseRefName == "main" and .baseRefOid == $base and .mergeable == "MERGEABLE" and any(.labels[]; .name == "release")' \
             <<< "$pr" >/dev/null
           gh pr checks "$PR_NUMBER" --required --repo "$GITHUB_REPOSITORY"
 
