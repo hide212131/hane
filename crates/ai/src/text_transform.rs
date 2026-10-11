@@ -319,7 +319,7 @@ fn run_locked(
 
     loop {
         if let Some(terminal) = drain_events(events_rx, &mut collector, deferred_events) {
-            return settle_terminal(terminal);
+            return settle_terminal(terminal, collector.text_overflowed());
         }
         if collector.has_unsafe_tool_activity() {
             return interrupt_or_stop(
@@ -367,7 +367,7 @@ fn run_locked(
         match events_rx.recv_timeout(EVENT_POLL) {
             Ok(event) => {
                 if let Some(terminal) = observe_or_defer(event, &mut collector, deferred_events) {
-                    return settle_terminal(terminal);
+                    return settle_terminal(terminal, collector.text_overflowed());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -444,9 +444,9 @@ fn outcome_for_error(code: TextTransformErrorCode) -> TextTransformOutcome {
     }
 }
 
-fn settle_terminal(terminal: ProbeTerminal) -> (TextTransformOutcome, bool) {
+fn settle_terminal(terminal: ProbeTerminal, overflowed: bool) -> (TextTransformOutcome, bool) {
     match terminal {
-        ProbeTerminal::Completed(text) => (validate_result_text(text), false),
+        ProbeTerminal::Completed(text) => (validate_result_text(text, overflowed), false),
         ProbeTerminal::Failed(code) => (
             TextTransformOutcome::Failed(map_probe_error_code(code)),
             false,
@@ -456,13 +456,16 @@ fn settle_terminal(terminal: ProbeTerminal) -> (TextTransformOutcome, bool) {
 }
 
 /// Section 6: the result is kept exactly as returned — no trimming, no
-/// fence stripping — but an empty/whitespace-only or over-limit result must
-/// never become applicable as a replacement.
-fn validate_result_text(text: String) -> TextTransformOutcome {
-    if text.trim().is_empty() {
-        TextTransformOutcome::Failed(TextTransformErrorCode::ResultEmpty)
-    } else if text.len() > MAX_RESULT_BYTES {
+/// fence stripping. `overflowed` comes from the shared
+/// [`ProbeCollector::text_overflowed`]: unlike the fixed Probe, a text
+/// transform result that needed truncation to fit `MAX_RESULT_BYTES` must
+/// never be applied as a silently-shortened success. An empty/whitespace-only
+/// result is likewise never applicable as a replacement.
+fn validate_result_text(text: String, overflowed: bool) -> TextTransformOutcome {
+    if overflowed || text.len() > MAX_RESULT_BYTES {
         TextTransformOutcome::Failed(TextTransformErrorCode::ResultTooLarge)
+    } else if text.trim().is_empty() {
+        TextTransformOutcome::Failed(TextTransformErrorCode::ResultEmpty)
     } else {
         TextTransformOutcome::Succeeded { text }
     }
@@ -635,11 +638,11 @@ mod tests {
     #[test]
     fn empty_or_whitespace_only_results_are_never_applicable() {
         assert_eq!(
-            validate_result_text("   \n\t".to_owned()),
+            validate_result_text("   \n\t".to_owned(), false),
             TextTransformOutcome::Failed(TextTransformErrorCode::ResultEmpty)
         );
         assert_eq!(
-            validate_result_text("ok".to_owned()),
+            validate_result_text("ok".to_owned(), false),
             TextTransformOutcome::Succeeded {
                 text: "ok".to_owned()
             }
@@ -650,9 +653,91 @@ mod tests {
     fn oversized_results_are_rejected_without_truncating() {
         let oversized = "a".repeat(MAX_RESULT_BYTES + 1);
         assert_eq!(
-            validate_result_text(oversized),
+            validate_result_text(oversized, false),
             TextTransformOutcome::Failed(TextTransformErrorCode::ResultTooLarge)
         );
+    }
+
+    #[test]
+    fn result_exactly_at_the_cap_succeeds() {
+        let exact = "a".repeat(MAX_RESULT_BYTES);
+        assert_eq!(
+            validate_result_text(exact.clone(), false),
+            TextTransformOutcome::Succeeded { text: exact }
+        );
+    }
+
+    #[test]
+    fn overflowed_collector_rejects_the_result_even_though_text_was_truncated_to_fit() {
+        // A truncated string that is itself within MAX_RESULT_BYTES must
+        // still be rejected once the collector reports the original
+        // response overflowed, rather than silently applied as a partial
+        // success.
+        let truncated_but_in_range = "a".repeat(MAX_RESULT_BYTES);
+        assert_eq!(
+            validate_result_text(truncated_but_in_range, true),
+            TextTransformOutcome::Failed(TextTransformErrorCode::ResultTooLarge)
+        );
+    }
+
+    fn event(generation: u64, method: &str, params: Value) -> RuntimeEvent {
+        RuntimeEvent {
+            generation,
+            kind: RuntimeEventKind::Notification {
+                method: method.to_owned(),
+                params: Some(params),
+            },
+        }
+    }
+
+    #[test]
+    fn overflowing_collected_text_propagates_to_a_rejected_outcome_not_a_partial_success() {
+        let max = 16;
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), max);
+        collector.observe(event(7, "item/completed", serde_json::json!({
+            "threadId":"thread-1", "turnId":"turn-1",
+            "item":{"id":"a","type":"agentMessage","text":"a".repeat(max + 5)}
+        })));
+        let terminal = collector
+            .observe(event(
+                7,
+                "turn/completed",
+                serde_json::json!({
+                    "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+                }),
+            ))
+            .expect("terminal outcome");
+        let (outcome, isolated) = settle_terminal(terminal, collector.text_overflowed());
+        assert!(!isolated);
+        assert_eq!(
+            outcome,
+            TextTransformOutcome::Failed(TextTransformErrorCode::ResultTooLarge)
+        );
+    }
+
+    #[test]
+    fn non_overflowing_collected_text_at_the_cap_still_succeeds() {
+        let max = 16;
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), max);
+        let body = "a".repeat(max);
+        collector.observe(event(7, "item/completed", serde_json::json!({
+            "threadId":"thread-1", "turnId":"turn-1",
+            "item":{"id":"a","type":"agentMessage","text":body.clone()}
+        })));
+        let terminal = collector
+            .observe(event(
+                7,
+                "turn/completed",
+                serde_json::json!({
+                    "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+                }),
+            ))
+            .expect("terminal outcome");
+        let (outcome, isolated) = settle_terminal(terminal, collector.text_overflowed());
+        assert!(!isolated);
+        assert_eq!(outcome, TextTransformOutcome::Succeeded { text: body });
     }
 
     #[test]

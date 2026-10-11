@@ -542,6 +542,7 @@ pub struct ProbeCollector {
     max_text_bytes: usize,
     terminal: Option<ProbeTerminal>,
     unsafe_tool_activity: bool,
+    overflowed: bool,
 }
 
 impl ProbeCollector {
@@ -565,6 +566,7 @@ impl ProbeCollector {
             max_text_bytes,
             terminal: None,
             unsafe_tool_activity: false,
+            overflowed: false,
         }
     }
 
@@ -647,14 +649,28 @@ impl ProbeCollector {
         self.unsafe_tool_activity
     }
 
+    /// True once any observed agent-message text had to be dropped because
+    /// it would have pushed the collected total past `max_text_bytes`. The
+    /// fixed connectivity Probe keeps treating its own truncated text as a
+    /// successful, bounded result; `crate::text_transform` instead uses this
+    /// flag to reject an overflowing result outright instead of silently
+    /// applying a truncated partial result.
+    pub fn text_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     fn append_bounded(&mut self, value: &str) {
         let remaining = self.max_text_bytes.saturating_sub(self.text_bytes);
         if remaining == 0 {
+            self.overflowed |= !value.is_empty();
             return;
         }
         let mut end = value.len().min(remaining);
         while !value.is_char_boundary(end) {
             end -= 1;
+        }
+        if end < value.len() {
+            self.overflowed = true;
         }
         self.text.push_str(&value[..end]);
         self.text_bytes = self.text_bytes.saturating_add(end);
@@ -919,5 +935,40 @@ mod tests {
         };
         assert!(text.len() <= MAX_PROBE_TEXT_BYTES);
         assert!(text.len() >= MAX_PROBE_TEXT_BYTES - 2);
+        assert!(collector.text_overflowed());
+    }
+
+    #[test]
+    fn text_at_or_under_the_cap_is_not_flagged_as_overflowed() {
+        let max = 16;
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), max);
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"a".repeat(max)}
+        })));
+        assert!(!collector.text_overflowed());
+    }
+
+    #[test]
+    fn overflow_mid_multibyte_char_is_flagged_and_collected_text_stays_valid_utf8() {
+        let max = 5;
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), max);
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"あああ"}
+        })));
+        assert!(collector.text_overflowed());
+        let terminal = collector.observe(event(
+            7,
+            "turn/completed",
+            json!({
+                "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+            }),
+        ));
+        let Some(ProbeTerminal::Completed(text)) = terminal else {
+            panic!("expected a completed text result");
+        };
+        assert!(text.len() <= max);
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
     }
 }
