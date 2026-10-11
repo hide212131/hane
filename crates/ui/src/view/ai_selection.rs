@@ -2567,7 +2567,7 @@ mod tests {
 
     fn open_popup_for_keyboard_tests(
         cx: &mut gpui::TestAppContext,
-    ) -> gpui::WindowHandle<EditorView> {
+    ) -> (Entity<EditorView>, &mut gpui::VisualTestContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
@@ -2584,7 +2584,7 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        view
+        (view, cx)
     }
 
     // PR #450 review: the reviewing screen previously had no focus stops of
@@ -2596,7 +2596,7 @@ mod tests {
     // then × last.
     #[gpui::test]
     fn tab_cycles_focus_through_the_reviewing_screens_own_stops(cx: &mut gpui::TestAppContext) {
-        let view = open_popup_for_keyboard_tests(cx);
+        let (view, cx) = open_popup_for_keyboard_tests(cx);
         view.update(cx, |view, cx| {
             view.ai_selection.phase = AiSelectionPhase::Reviewing {
                 result: "XYZ".to_owned(),
@@ -2637,7 +2637,7 @@ mod tests {
     fn tab_skips_the_replace_stop_in_the_reviewing_screen_once_the_result_is_unchanged(
         cx: &mut gpui::TestAppContext,
     ) {
-        let view = open_popup_for_keyboard_tests(cx);
+        let (view, cx) = open_popup_for_keyboard_tests(cx);
         view.update(cx, |view, cx| {
             view.ai_selection.phase = AiSelectionPhase::Reviewing {
                 result: "abc".to_owned(),
@@ -2665,7 +2665,7 @@ mod tests {
 
     #[gpui::test]
     fn enter_at_the_reviewing_replace_stop_applies_the_result(cx: &mut gpui::TestAppContext) {
-        let view = open_popup_for_keyboard_tests(cx);
+        let (view, cx) = open_popup_for_keyboard_tests(cx);
         view.update(cx, |view, cx| {
             view.ai_selection.phase = AiSelectionPhase::Reviewing {
                 result: "XYZ".to_owned(),
@@ -2690,7 +2690,7 @@ mod tests {
     fn enter_at_the_reviewing_regenerate_stop_starts_a_fresh_request(
         cx: &mut gpui::TestAppContext,
     ) {
-        let view = open_popup_for_keyboard_tests(cx);
+        let (view, cx) = open_popup_for_keyboard_tests(cx);
         view.update(cx, |view, cx| {
             view.ai_selection.confirmed_instruction = "直す".to_owned();
             view.ai_selection.phase = AiSelectionPhase::Reviewing {
@@ -2725,7 +2725,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         for focus in [AiSelectionFocusRegion::Discard, AiSelectionFocusRegion::Close] {
-            let view = open_popup_for_keyboard_tests(cx);
+            let (view, cx) = open_popup_for_keyboard_tests(cx);
             view.update(cx, |view, cx| {
                 view.ai_selection.phase = AiSelectionPhase::Reviewing {
                     result: "XYZ".to_owned(),
@@ -2763,7 +2763,7 @@ mod tests {
     fn tab_reaches_and_enter_activates_the_submitting_screens_stop_control(
         cx: &mut gpui::TestAppContext,
     ) {
-        let view = open_popup_for_keyboard_tests(cx);
+        let (view, cx) = open_popup_for_keyboard_tests(cx);
         view.update(cx, |view, cx| {
             view.ai_selection.pending = Some(pending(1, 1));
             view.ai_selection.phase = AiSelectionPhase::Submitting;
