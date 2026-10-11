@@ -211,13 +211,27 @@ impl AiSelectionState {
     /// Admits one text-transform request through the shared service and
     /// arms a background wait for its dedicated reply channel. Callers are
     /// responsible for re-validating `target`/`original_text` freshness
-    /// first (see `EditorView::ai_selection_target_is_fresh`).
+    /// first (see `EditorView::ai_selection_target_is_fresh`). This is the
+    /// single chokepoint every send path funnels through (free-text Enter,
+    /// the Send button, a saved-prompt row, and Regenerate), so re-checking
+    /// `text_transform_connection_ready` against a fresh snapshot here —
+    /// not only in the compose screen's own `ready`-gated Send button
+    /// render — is what keeps every one of those paths from enqueueing a
+    /// request while the connection is not actually ready (PR #450 review).
     fn start_request(&mut self, instruction: String, cx: &mut Context<EditorView>) {
         self.message = None;
         let Some(service) = self.service.clone() else {
             self.message = Some("AIサービスを利用できません。".to_owned());
             return;
         };
+        if !text_transform_connection_ready(&service.snapshot()) {
+            // Not an error: fall back to the compose screen's own existing
+            // not-ready display (the disabled Send button and its status
+            // line, both already recomputed from a fresh snapshot there)
+            // rather than surfacing a redundant message here.
+            self.phase = AiSelectionPhase::Composing;
+            return;
+        }
         let selected_text = self.original_text.clone();
         match service.try_submit_text_transform(instruction, selected_text) {
             Ok((operation_id, receiver)) => {
@@ -2811,5 +2825,133 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), "abcdef\n");
             assert!(!view.editor().can_undo());
         });
+    }
+
+    // PR #450 review: `ai_selection_start()` admitted a request through
+    // `start_request()` without re-checking `text_transform_connection_ready`
+    // against a fresh snapshot, so free-text Enter, Send/List Enter, a saved
+    // prompt's own click, and Regenerate could all enqueue a real request
+    // while the connection was not actually ready — the compose screen's
+    // disabled Send button was only a rendering-level gate, not an admission
+    // one. Every one of those paths funnels through the same `start_request`
+    // chokepoint, so this exercises each of them against one real, freshly
+    // spawned (and therefore still `OwnershipState::Unknown`, i.e. not
+    // ready) `AiServiceHandle` and asserts none of them ever admits a
+    // request (`handle.snapshot().busy` stays `None` throughout) or leaves
+    // `pending`/`phase` as if one had been.
+    #[gpui::test]
+    fn connection_not_ready_blocks_every_start_path_from_enqueueing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_ai::{
+            AiService, AiServiceConfig, FakeCredentialStore, ShellEnvironmentPolicyFormat,
+            SystemBrowserOpener,
+        };
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let app_data_root = std::env::temp_dir().join(format!(
+            "hane-ui-ai-selection-ready-gate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&app_data_root).unwrap();
+        let service = AiService::spawn(AiServiceConfig {
+            app_data_root: app_data_root.clone(),
+            binary_path: app_data_root.join("missing-codex-app-server"),
+            credential_store: Arc::new(FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        })
+        .unwrap();
+        let handle = service.handle();
+
+        let (view, cx) = open_popup_for_keyboard_tests(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.service = Some(handle.clone());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Left un-probed/unconfigured on purpose: `OwnershipState::Unknown`
+        // is not `Owned`, so `text_transform_connection_ready` reports not
+        // ready for the whole test, the same as a connection the user has
+        // not finished setting up.
+        assert_ne!(handle.snapshot().ownership, OwnershipState::Owned);
+
+        // 1) Free-text Enter: the pinned input's own `InputEvent::PressEnter`.
+        cx.simulate_input("直して");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+        });
+        assert!(handle.snapshot().busy.is_none());
+
+        // 2) Logical focus on `Send`, then Enter: the Send button's own
+        // click takes the same `ai_selection_submit_free_text` path.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+        });
+        assert!(handle.snapshot().busy.is_none());
+
+        // 3) A saved prompt's own row: Enter at `List` takes the same
+        // `ai_selection_run_saved_prompt` path as clicking it.
+        view.update(cx, |view, cx| {
+            view.ai_selection.saved_prompts = vec![saved_prompt(1, "直す")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::List);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.confirmed_instruction, "直す");
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+        });
+        assert!(handle.snapshot().busy.is_none());
+
+        // 4) Regenerate, from the reviewing screen: it never goes through
+        // `ai_selection_start`, so it must re-check readiness on its own
+        // way into the same `start_request` chokepoint.
+        view.update(cx, |view, cx| {
+            view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                result: "XYZ".to_owned(),
+                unchanged: false,
+            };
+            view.ai_selection.focus_region = AiSelectionFocusRegion::Regenerate;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+        assert!(handle.snapshot().busy.is_none());
+
+        drop(handle);
+        drop(service);
+        std::fs::remove_dir_all(app_data_root).unwrap();
     }
 }
