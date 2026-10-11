@@ -1,29 +1,34 @@
 //! Selection-scoped AI text transform: given an `instruction` and
 //! `selected_text`, runs one inference turn against the same
-//! application-owned runtime/connection the fixed connectivity Probe uses,
-//! and returns only the final replacement text (or a classified failure) to
-//! the one caller that asked for it — never into a global `AiSnapshot`.
+//! application-owned runtime/connection the fixed connectivity Probe uses —
+//! the same already-established ChatGPT/Codex or Custom Provider App
+//! Server connection, never one this module opens itself — and returns
+//! only the final replacement text (or a classified failure) to the one
+//! caller that asked for it — never into a global `AiSnapshot`.
 //!
 //! Per `docs/ai-selection-actions-implementation-spec.md` section 5, this
 //! module only ever receives `instruction` and `selected_text` as plain
 //! strings plus a request identity (the caller's `OperationId`); it has no
 //! GPUI, `DocumentSession`, or tab dependency, and never itself saves or
 //! edits a document. It shares the fixed Probe's generation-checked shared
-//! lock, interrupt/confirmed-stop, and event-correlation plumbing (via
-//! `crate::probe::ProbeCollector`/`ProbeTerminal`) so the two capabilities
-//! can never classify the same App Server behavior differently, but the
-//! fixed Probe's own request profile and document-free contract are left
-//! untouched: only this module would ever put `selected_text` on the wire.
+//! lock, interrupt/confirmed-stop, event-correlation, and mid-turn unsafe
+//! tool-activity detection (via `crate::probe::ProbeCollector`/
+//! `ProbeTerminal`) so the two capabilities can never classify the same App
+//! Server behavior differently, but the fixed Probe's own request profile
+//! and document-free contract are left untouched: only this module would
+//! ever put `selected_text` on the wire.
 //!
-//! It does not yet do so: [`text_transform_isolation_boundary_verified`]
-//! gates [`execute_text_transform`] to fail closed, before any settings-lock
-//! acquisition or App Server call, until an officially supported App
-//! Server/runtime configuration verifiably guarantees — before a request
-//! starts — that only `instruction`/`selected_text` can be read and that no
-//! write, shell/tool execution, or outbound network call can happen. See
-//! that function's own doc comment for why `sandbox: "read-only"` /
-//! `approvalPolicy: "never"` (section 5.2 step 3/5.3) do not by themselves
-//! establish this.
+//! Per the PR #450 decision (see the PR's discussion) resolving the review
+//! finding that `sandbox: "read-only"` / `approvalPolicy: "never"` (section
+//! 5.2 step 3/5.3) do not by themselves prove a turn is confined to reading
+//! only `instruction`/`selected_text`: model-side tool use is not refused
+//! outright, and this module does not gate every request behind a
+//! not-yet-available verified isolation boundary. It relies on the same
+//! boundary the fixed Probe already runs under — the existing App Server
+//! sandbox/approval policy plus [`crate::probe::ProbeCollector::has_unsafe_tool_activity`]'s
+//! mid-turn interrupt — so a detected tool/command item still fails the
+//! request as `SafetyProfileUnsupported` rather than being treated as a
+//! success.
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -86,19 +91,6 @@ pub enum TextTransformErrorCode {
     ContextLengthExceeded,
     ResultEmpty,
     ResultTooLarge,
-    /// The officially supported App Server/runtime boundary this module
-    /// would need to guarantee, *before* a request starts, that only
-    /// `instruction`/`selected_text` can be read and that no write,
-    /// shell/tool execution, or outbound network call can happen, has not
-    /// been verified. `sandbox: "read-only"` plus `approvalPolicy: "never"`
-    /// (see [`thread_start_params`]) do not by themselves prove this: a
-    /// read-only sandbox is a no-write guarantee, not a guarantee that
-    /// reads are confined to this request's own input, and declining an
-    /// approval request after it is raised cannot undo a read or send that
-    /// already happened before the decline. See the PR #450 review finding
-    /// this fixes. Until a verified boundary replaces this, every request
-    /// fails here, before `thread/start` is ever called.
-    IsolationBoundaryUnverified,
 }
 
 impl TextTransformErrorCode {
@@ -130,7 +122,6 @@ impl TextTransformErrorCode {
             Self::ContextLengthExceeded => "text_transform_context_length_exceeded",
             Self::ResultEmpty => "text_transform_result_empty",
             Self::ResultTooLarge => "text_transform_result_too_large",
-            Self::IsolationBoundaryUnverified => "text_transform_isolation_boundary_unverified",
         }
     }
 }
@@ -207,22 +198,6 @@ pub(crate) struct TextTransformExecution {
     pub deferred_events: Vec<RuntimeEvent>,
 }
 
-/// Whether the officially supported App Server/runtime configuration this
-/// module needs — a boundary, guaranteed before a request starts, that only
-/// `instruction`/`selected_text` can be read and that no write, shell/tool
-/// execution, or outbound network call can happen — has been verified
-/// against the exact bundled App Server binary. This is deliberately not a
-/// claim about `sandbox: "read-only"` / `approvalPolicy: "never"` as sent in
-/// [`thread_start_params`]: those are the server's own policy knobs, not
-/// proof of the above boundary, and this module must not treat them as
-/// such. Hardcoded to `false` until a verified replacement lands (tracked
-/// against the PR #450 review finding this fixes); do not flip this to
-/// `true` without an accompanying, verifiable enforcement mechanism and a
-/// regression test that exercises it.
-const fn text_transform_isolation_boundary_verified() -> bool {
-    false
-}
-
 /// Runs one text transform turn while holding the shared settings lock for
 /// the complete `thread/start` → turn terminal/confirmed-stop interval, the
 /// same contract `crate::probe::execute_probe` uses.
@@ -242,21 +217,6 @@ pub(crate) fn execute_text_transform(
     cwd: &Path,
     settings_generation: u64,
 ) -> TextTransformExecution {
-    // Fail closed before anything else: no settings-lock acquisition, no
-    // runtime/generation check, no `thread/start` or `turn/start`, so
-    // `instruction`/`selected_text` can never reach the App Server while
-    // the boundary `text_transform_isolation_boundary_verified` documents
-    // is unverified. This applies to every caller, including tests using
-    // synthetic text.
-    if !text_transform_isolation_boundary_verified() {
-        return TextTransformExecution {
-            outcome: TextTransformOutcome::Failed(
-                TextTransformErrorCode::IsolationBoundaryUnverified,
-            ),
-            isolated: false,
-            deferred_events: Vec::new(),
-        };
-    }
     if cancellation_requested(cancel_rx, operation_id, shutdown_rx, shutdown_seen) {
         return TextTransformExecution {
             outcome: TextTransformOutcome::Canceled,
@@ -822,32 +782,29 @@ mod tests {
         assert!(!isolated);
     }
 
-    /// PR #450 review finding: `sandbox: "read-only"` / `approvalPolicy:
-    /// "never"` alone do not prove that a text transform request cannot
-    /// read outside `instruction`/`selected_text`, write, execute a
-    /// shell/tool, or reach the network, and an approval decline after the
-    /// fact cannot undo an earlier read/send. This confirms, from a real
-    /// (never started) `AiRuntime` and settings store, that
-    /// `execute_text_transform` fails closed before ever touching either:
-    /// no settings-lock acquisition, no `thread/start`, no `turn/start` —
-    /// the runtime is left exactly as inert as it started.
+    /// Even with no additional gate ahead of it, `execute_text_transform`
+    /// must still go through the same generation-checked shared lock the
+    /// fixed Probe uses: against a real but never-started `AiRuntime`, the
+    /// generation check in [`with_generation_checked_lock`] must reject the
+    /// request as `RuntimeUnavailable` before any `thread/start`/`turn/start`
+    /// call, rather than attempting to call a runtime that was never ready.
     #[test]
-    fn execute_text_transform_fails_closed_before_any_lock_or_runtime_call() {
+    fn execute_text_transform_rejects_a_never_ready_runtime_before_any_rpc_call() {
         use crate::rpc::RejectAllServerRequests;
         use crate::runtime::RuntimeConfig;
         use std::sync::Arc;
         use std::sync::mpsc;
 
         let store = AiSettingsStore::new(
-            "hane-text-transform-isolation-test-settings.json",
-            "hane-text-transform-isolation-test-settings.lock",
-            "hane-text-transform-isolation-test-owner.lock",
+            "hane-text-transform-never-ready-test-settings.json",
+            "hane-text-transform-never-ready-test-settings.lock",
+            "hane-text-transform-never-ready-test-owner.lock",
         );
         let (events_tx, events_rx) = mpsc::sync_channel(1);
         let runtime = AiRuntime::spawn(
             RuntimeConfig::new(
                 "/nonexistent/unused-runtime-binary",
-                "hane-text-transform-isolation-test-owner.lock",
+                "hane-text-transform-never-ready-test-owner.lock",
             ),
             Arc::new(RejectAllServerRequests),
             events_tx,
@@ -874,15 +831,10 @@ mod tests {
 
         assert_eq!(
             execution.outcome,
-            TextTransformOutcome::Failed(TextTransformErrorCode::IsolationBoundaryUnverified)
+            TextTransformOutcome::Failed(TextTransformErrorCode::RuntimeUnavailable)
         );
         assert!(!execution.isolated);
         assert!(execution.deferred_events.is_empty());
-        // The runtime was never started by this call: still `Stopped` at
-        // generation 0, exactly as `AiRuntime::spawn` left it. If the gate
-        // had not fired first, this never-started runtime would instead
-        // have produced `RuntimeUnavailable`/`Busy` from the generation
-        // check, not this isolation outcome.
         let status = runtime.snapshot();
         assert_eq!(status.state, RuntimeState::Stopped);
         assert_eq!(status.generation, 0);

@@ -257,6 +257,14 @@ GitHub Copilotのcurrent-head full review finding（[PR #450のdiscussion](https
 
 この結果、選択文へのAI指示機能はIssueの受入条件（AC3「安全なサーバー要求拒否」を含む）を安全側で満たすが、実際にAIへ送信して結果を得る経路はfail-closedにより現在使用できない。公式にサポートされた検証可能な隔離境界（例: 同梱App Serverバイナリに対する`--strict-config`で確認済みの設定、またはHane自身がspawn時に適用するOS/プロセスレベルの隔離）を設計・実装し、`text_transform_isolation_boundary_verified()`をその検証済み条件に置き換える別設計が必要であり、これは本PRのscope外の後続作業として報告する。
 
+#### 9.1.2 既存App Server経路でのAC3再開（後続worker実行）
+
+[PR #450のコメント](https://github.com/hide212131/hane/pull/450#issuecomment-6113068392)で、9.1.1の「ツール利用を一切認めない」という解釈はユーザーの意図より広すぎることが明示された。ユーザーは必要ならモデル側のツール利用自体を絶対禁止にしない前提で、既存のChatGPT/Codex接続とCustom Provider接続のApp Server経路を使って選択文処理を再開することを許容した。
+
+これを受け、`execute_text_transform`冒頭の無条件fail-closed分岐と`text_transform_isolation_boundary_verified()`、`TextTransformErrorCode::IsolationBoundaryUnverified`を削除した。選択文処理は固定Probeと同じ既存の`sandbox: "read-only"`・`approvalPolicy: "never"`・サーバー要求拒否・`ProbeCollector::has_unsafe_tool_activity`による中断を境界として使い、tool/command item検出時は引き続き`SafetyProfileUnsupported`として失敗させる（成功とはしない）。入力は指示・選択文の2フィールドのみで、文書パス・他タブ・全文をコンテキストへ追加しない既存の構造化入力・専用workspace cwdはそのまま維持している。
+
+`text_transform.rs`のユニットテストは、無条件fail-closed削除後も実行されない`AiRuntime`に対しては既存の世代確認で`RuntimeUnavailable`になることを確認するテストに置き換えた。`crates/ai/tests/text_transform_service.rs`の統合テストは、fake App Serverに対する実際の成功経路（選択文・指示はApp Serverへ届くが開いている文書の内容は届かない）、mid-turn tool item検出による`SafetyProfileUnsupported`中断、Probe busy解消後の admit→cancelの3シナリオへ更新した。実ChatGPT/Codex/Custom接続でのT13検証はこのworker実行では未実施であり、Commanderの観測対象として残る。
+
 ## 10. 参考資料
 
 - [Wordのスクリーンリーダー／キーボード操作](https://support.microsoft.com/en-us/accessibility/copilot/use-copilot-in-word-with-a-screen-reader): Windows RewriteのAlt+I、macOS RewriteのControl+L、選択→結果確認→Replace。2026-10-10確認。
