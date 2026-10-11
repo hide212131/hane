@@ -40,7 +40,7 @@ use crate::line::{
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme, sync_component_theme};
 use gpui::{
-    Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, Corner, CursorStyle, Edges,
+    Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Edges,
     FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, PinchEvent, Pixels, Render,
     ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,

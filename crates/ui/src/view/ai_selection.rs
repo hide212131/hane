@@ -942,7 +942,7 @@ impl EditorView {
     /// `ai_selection_overlay_element`, plus the 1px top/bottom border), used
     /// only to decide whether it fits *below* the selection without
     /// clipping. The final on-screen position never uses this bound: it
-    /// comes from `Corner::TopLeft`/`Corner::BottomLeft` anchoring at the
+    /// comes from `Anchor::TopLeft`/`Anchor::BottomLeft` anchoring at the
     /// selection's own edge, which GPUI resolves against the popup's real
     /// measured size (see `ai_selection_overlay`). A short panel (e.g. an
     /// empty saved-prompt list) therefore never leaves an oversized gap
@@ -957,23 +957,23 @@ impl EditorView {
     /// otherwise. `ai_selection_overlay` lets GPUI resolve the opposite edge
     /// from the popup's real measured size, so the gap next to the selection
     /// always matches the actually rendered content. Falls back to
-    /// `Corner::TopLeft` near the top-left of the content area on the rare
+    /// `Anchor::TopLeft` near the top-left of the content area on the rare
     /// frame where no caret geometry has been resolved yet.
-    fn ai_selection_overlay_position(&self) -> (gpui::Point<Pixels>, Corner) {
+    fn ai_selection_overlay_position(&self) -> (gpui::Point<Pixels>, Anchor) {
         const GAP: f32 = 6.0;
         let base_x = self.main_column_left + self.theme.line_horizontal_padding;
         let base_y = self.theme.header_height + self.document_find_reserved_height();
         let Some(geometry) = self.caret_geometry() else {
-            return (point(px(base_x), px(base_y)), Corner::TopLeft);
+            return (point(px(base_x), px(base_y)), Anchor::TopLeft);
         };
         let x = self.main_column_left + geometry.x;
         let caret_top = base_y + geometry.y;
         let caret_bottom = caret_top + geometry.height;
         let window_bottom = base_y + self.viewport_height;
         if caret_bottom + GAP + Self::AI_SELECTION_POPUP_MAX_HEIGHT <= window_bottom {
-            (point(px(x), px(caret_bottom + GAP)), Corner::TopLeft)
+            (point(px(x), px(caret_bottom + GAP)), Anchor::TopLeft)
         } else {
-            (point(px(x), px(caret_top - GAP)), Corner::BottomLeft)
+            (point(px(x), px(caret_top - GAP)), Anchor::BottomLeft)
         }
     }
 
@@ -1532,7 +1532,7 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             let (position, corner) = view.ai_selection_overlay_position();
-            assert_eq!(corner, Corner::TopLeft);
+            assert_eq!(corner, Anchor::TopLeft);
             let base_y = view.theme.header_height + view.document_find_reserved_height();
             // caret_bottom + GAP, independent of the popup's actual content.
             let expected_y = base_y + 50.0 + 20.0 + 6.0;
@@ -1566,11 +1566,11 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             let (position, corner) = view.ai_selection_overlay_position();
-            assert_eq!(corner, Corner::BottomLeft);
+            assert_eq!(corner, Anchor::BottomLeft);
             let base_y = view.theme.header_height + view.document_find_reserved_height();
             let caret_top = base_y + 40.0;
             // caret_top - GAP: GPUI resolves the popup's top edge from this
-            // anchor using its real measured height (`Corner::BottomLeft`),
+            // anchor using its real measured height (`Anchor::BottomLeft`),
             // so this position never needs — and never bakes in — any
             // estimate of that height.
             let expected_y = caret_top - 6.0;
