@@ -2,7 +2,7 @@
 
 ## 状態
 
-第5.1節の8型とunit test 1件のファイル移動を、実装workerがファイル編集のみで適用した段階。この実装workerはshell/test/build/git実行権限を持たず、`cargo test`等は一切実行していない。変更後のコンパイル・テスト・Clippy・CI・独立レビュー・GUI要否確認は未実施であり、この記録だけでP1を受入済みとは扱わない。実際に実行していない検証を成功とは書かない。
+第5.1節の8型とunit test 1件のファイル移動を、実装workerがファイル編集のみで適用した段階。この実装workerはshell/test/build/git実行権限を持たず、`cargo test`等は一切実行していない（下記はこの適用直後の記録であり、変更していない）。その後、対象head `7ec7b7f7751e3ffc811e23f1177ae364c655e2cb` に対して変更後の検証を実施し、結果を「変更後の検証」節に追記した。current-headに対するCodeRabbitのfull reviewと最終mergeは本docs更新時点でも未実施であり、この記録だけでP1を受入済みとは扱わない。実際に実行していない検証を成功とは書かない。
 
 ## 対象
 
@@ -71,6 +71,24 @@ crate rootの公開名は移動前後で変化していない。`BoundarySide`�
 
 このworkerはshell実行権限を持たないため、上記の比較は差分適用後のファイル内容を読み直した上での目視確認であり、`cargo test`／`cargo doc`／`cargo fmt`／Clippyによる機械確認ではない。
 
+## 変更後の検証
+
+対象head: `7ec7b7f7751e3ffc811e23f1177ae364c655e2cb`（本docs修正前の実装候補、[PR #456](https://github.com/hide212131/hane/pull/456)）。変更前main/base: `90f51e1a965588b1796f05a6744c150ac5ba4a9f`。
+
+| 項目 | 結果 |
+| --- | --- |
+| presentation testインベントリ（移動前後比較） | 140件のまま変化なし。移動したunit testのmodule prefixだけが変わり、並べ替え後の一覧は変更前と一致。 |
+| `cargo test --locked -p hane-presentation` | 140 passed、0 failed/ignored。 |
+| `cargo test --locked -p hane-presentation --all-features` | 140 passed、0 failed/ignored。 |
+| `cargo test --workspace --locked` | 1,060 passed、0 failed/ignored。変更前と同数。 |
+| exact-head PR CI [run 38142125957](https://github.com/hide212131/hane/actions/runs/38142125957) | head `7ec7b7f...` でmacOS/Windows双方のworkspace tests、Clippy、macOS/Windows固有testがsuccess。 |
+| trusted verification [run 38141736262](https://github.com/hide212131/hane/actions/runs/38141736262) | workspace regression testsとClippyがsuccess。current-headに対する正確なPR CI証拠は上記run 38142125957を使う。 |
+| `git diff --check` | exit 0。移動した8型＋全implとunit test本体はbyte-identical、crate rootの公開8名も維持。 |
+| ローカル `cargo fmt --all -- --check` | rustfmt 1.99.0で未変更の `crates/ui/src/view.rs:14674` に既存差を検出。repo指定は1.98.1でローカルrustupがなく、変更前も同じ結果。この既存差分はP1と無関係であり、成功とは書かない。 |
+| GUI追加検証 | 設計書第9.4節により不要と判断。関数本体・条件・型契約・UI配線・layoutを変更していないことと、T1〜T7を含む契約/workspaceテスト成功およびRF0-04既存layout契約を根拠とする。実字形/paint/inputの未確認をunitテストで確認済みとは書かない。 |
+
+full review run `528c7787-b67e-43ab-a431-68ed26d8cb67` は、上記検証結果が反映される前の本docsの「状態」節・未実施記載と実際の検証状況の食い違いを指摘した。本節の追記はその食い違いを解消するdocs-only更新であり、新しいheadに対する最終full reviewとmergeはこの時点でも未実施である。
+
 ## 受入まで未実施
 
-変更後のコンパイル確認、`cargo test --locked -p hane-presentation -- --list`等によるテスト名・属性・入力・期待値の前後比較、`cargo test`/`--all-features`/workspace全体、`cargo clippy -- -D warnings`、`cargo doc`、`cargo fmt --all -- --check`、macOS・Windows CI、CodeRabbitのcurrent-head full review、実画面検証の要否確認、最終merge、実行計画とIssue本文への完了記録。これらは今回の実装workerの範囲外であり、独立した検証job・Commanderの再観測に委ねる。配置変更のみで関数本体・型契約・layout・UI接続を変えないと確認できた場合に限り、設計書第9.4節とRF0-04を根拠に追加GUI検証不要と記録できるが、その確認自体も今回は未実施である。
+変更後のコンパイル確認、テスト名・属性・入力・期待値の前後比較、`cargo test`/`--all-features`/workspace全体、exact-head CIでのClippy、macOS・Windows CI、GUI検証要否の確認は上記「変更後の検証」節に記録済みである。一方、`cargo doc`の変更後再実行、CodeRabbitの新しいheadに対するcurrent-head full review、最終merge、実行計画とIssue本文への完了記録は本docs更新時点でも未実施であり、今回のdocs-only修正の範囲外として独立した検証job・Commanderの再観測に委ねる。
