@@ -274,6 +274,15 @@ impl AiPromptsPage {
     }
 
     fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<EditorView>) {
+        // A save in flight already sent a snapshot of `self.draft` in its
+        // current order; removing an entry now would shift every later
+        // entry's position and make `apply_save`'s positional id
+        // reconciliation assign the wrong id to the wrong entry. Leave
+        // `pending_delete` set so the confirmation stays open and the user
+        // can retry once the save completes.
+        if self.busy {
+            return;
+        }
         let Some(index) = self.pending_delete.take() else {
             return;
         };
@@ -352,20 +361,35 @@ impl AiPromptsPage {
                 .spawn(async move { store_for(&root).save(expected_revision, drafts) })
                 .await;
             let _ = view.update(cx, move |view, cx| {
-                view.ai_prompts.apply_save(generation, outcome);
+                view.ai_prompts.apply_save(generation, cx, outcome);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    fn apply_save(&mut self, generation: u64, outcome: Result<UserPrompts, UserPromptsSaveError>) {
+    /// Title/body edits, adding a row, and switching the selected row are
+    /// never blocked while a save is in flight (only deleting is, in
+    /// `confirm_delete`); the user can keep working while the previous
+    /// snapshot is still being persisted. On success this must not discard
+    /// whatever that continued editing produced: it only adopts the ids the
+    /// store just assigned, using the fact that nothing can have shifted
+    /// `self.draft`'s existing positions in the meantime, so they still line
+    /// up with the snapshot that was actually sent.
+    fn apply_save(
+        &mut self,
+        generation: u64,
+        cx: &App,
+        outcome: Result<UserPrompts, UserPromptsSaveError>,
+    ) {
         if generation != self.save_generation {
             return;
         }
         self.busy = false;
         match outcome {
             Ok(saved) => {
+                self.flush_selected_from_inputs(cx);
+
                 self.revision = saved.revision;
                 self.baseline = saved
                     .prompts
@@ -376,10 +400,12 @@ impl AiPromptsPage {
                         prompt: p.prompt,
                     })
                     .collect();
-                self.draft = self.baseline.clone();
+                for (entry, saved_entry) in self.draft.iter_mut().zip(self.baseline.iter()) {
+                    if entry.id.is_none() {
+                        entry.id = saved_entry.id;
+                    }
+                }
                 self.selected = self.selected.min(self.draft.len().saturating_sub(1));
-                self.title_input = None;
-                self.body_input = None;
                 self.message = None;
                 if let Some(target) = self.pending_target.take() {
                     self.route_ready = Some(target);
@@ -861,7 +887,7 @@ mod tests {
                     view.ai_prompts
                         .title_input
                         .as_ref()
-                        .expect("inputs resync after save"),
+                        .expect("inputs stay populated after save"),
                     app
                 ),
                 "二番目",
@@ -991,6 +1017,219 @@ mod tests {
             view.read_with(cx, |view, _| view.ai_prompts.leave_prompt),
             Some(LeaveTarget::Category(SettingsCategory::Connection))
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Regression for #450: editing the selected prompt's title/body,
+    // switching to a different row, and adding a new row must all survive a
+    // save that was already in flight when they happened, instead of being
+    // silently replaced by the (now stale) snapshot that save sent.
+    #[gpui::test]
+    fn concurrent_edits_while_a_save_is_in_flight_are_not_lost(cx: &mut gpui::TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-ai-prompts-save-edit-race-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Prompts;
+            view.ai_prompts.root = Some(root.clone());
+            view.ai_prompts.loaded = true;
+            view.ai_prompts.load_error = None;
+            view.ai_prompts.revision = 0;
+            view.ai_prompts.baseline = vec![
+                UserPromptDraft {
+                    id: None,
+                    title: "一番目".to_owned(),
+                    prompt: "最初の指示".to_owned(),
+                },
+                UserPromptDraft {
+                    id: None,
+                    title: "二番目".to_owned(),
+                    prompt: "二番目の指示".to_owned(),
+                },
+            ];
+            view.ai_prompts.draft = view.ai_prompts.baseline.clone();
+            view.ai_prompts.selected = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                // Sends a snapshot of the two baseline entries and leaves
+                // the background save pending (it is not driven until the
+                // `run_until_parked` below).
+                view.ai_prompts.save(cx, None);
+                assert!(view.ai_prompts.busy, "the save must be in flight here");
+
+                // Switch to the second row and edit it while the save above
+                // is still pending.
+                view.ai_prompts.select(1, window, cx);
+                set_value(
+                    view.ai_prompts.title_input.as_ref().unwrap(),
+                    "二番目・編集後",
+                    window,
+                    cx,
+                );
+                set_textarea_value(
+                    view.ai_prompts.body_input.as_ref().unwrap(),
+                    "二番目の指示・編集後",
+                    window,
+                    cx,
+                );
+
+                // Add a brand-new third row and type into it too, still
+                // while the same save is pending.
+                view.ai_prompts.add(window, cx);
+                set_value(
+                    view.ai_prompts.title_input.as_ref().unwrap(),
+                    "三番目（保存中に追加）",
+                    window,
+                    cx,
+                );
+                set_textarea_value(
+                    view.ai_prompts.body_input.as_ref().unwrap(),
+                    "三番目の指示",
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, app| {
+            assert_eq!(view.ai_prompts.message, None, "save must not fail");
+            assert_eq!(view.ai_prompts.revision, 1);
+            assert_eq!(
+                view.ai_prompts.draft,
+                vec![
+                    UserPromptDraft {
+                        id: Some(1),
+                        title: "一番目".to_owned(),
+                        prompt: "最初の指示".to_owned(),
+                    },
+                    UserPromptDraft {
+                        id: Some(2),
+                        title: "二番目・編集後".to_owned(),
+                        prompt: "二番目の指示・編集後".to_owned(),
+                    },
+                    UserPromptDraft {
+                        id: None,
+                        title: "三番目（保存中に追加）".to_owned(),
+                        prompt: "三番目の指示".to_owned(),
+                    },
+                ],
+                "the title/body edit and the added row made during the save must survive"
+            );
+            assert_eq!(
+                view.ai_prompts.selected, 2,
+                "the row switched to during the save must stay selected"
+            );
+            assert_eq!(
+                value(view.ai_prompts.title_input.as_ref().unwrap(), app),
+                "三番目（保存中に追加）",
+                "the input must still show what was being typed, not be reset"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Regression for #450: deleting a row while a save is in flight would
+    // shift later entries' positions and make the success handler assign
+    // the wrong newly minted id to the wrong row. Deleting must be ignored
+    // until the save completes, and must work normally afterward.
+    #[gpui::test]
+    fn deleting_while_a_save_is_in_flight_is_ignored_until_it_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-ai-prompts-save-delete-race-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Prompts;
+            view.ai_prompts.root = Some(root.clone());
+            view.ai_prompts.loaded = true;
+            view.ai_prompts.load_error = None;
+            view.ai_prompts.revision = 0;
+            view.ai_prompts.baseline = vec![
+                UserPromptDraft {
+                    id: None,
+                    title: "一番目".to_owned(),
+                    prompt: "最初の指示".to_owned(),
+                },
+                UserPromptDraft {
+                    id: None,
+                    title: "二番目".to_owned(),
+                    prompt: "二番目の指示".to_owned(),
+                },
+                UserPromptDraft {
+                    id: None,
+                    title: "三番目".to_owned(),
+                    prompt: "三番目の指示".to_owned(),
+                },
+            ];
+            view.ai_prompts.draft = view.ai_prompts.baseline.clone();
+            view.ai_prompts.selected = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts.save(cx, None);
+                assert!(view.ai_prompts.busy, "the save must be in flight here");
+
+                view.ai_prompts.request_delete(1);
+                view.ai_prompts.confirm_delete(window, cx);
+                assert_eq!(
+                    view.ai_prompts.draft.len(),
+                    3,
+                    "deleting must be ignored while the save is in flight"
+                );
+                assert_eq!(
+                    view.ai_prompts.pending_delete,
+                    Some(1),
+                    "the confirmation must stay pending so the user can retry"
+                );
+            });
+        });
+
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_prompts.message, None, "save must not fail");
+            assert_eq!(view.ai_prompts.draft.len(), 3);
+        });
+
+        // Once the save has completed, deleting works normally again.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts.confirm_delete(window, cx);
+            });
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_prompts.draft.len(), 2);
+            assert_eq!(view.ai_prompts.pending_delete, None);
+        });
 
         let _ = std::fs::remove_dir_all(&root);
     }
