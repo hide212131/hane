@@ -19540,4 +19540,779 @@ mod tests {
         assert_eq!(scrollbar_bounds.origin.y, bar_bottom);
         assert_eq!(scrollbar_bounds.size.height, px(viewport_height));
     }
+
+    // Issue #304 (RF3-A, P1): pre-change contract tests for the input-
+    // destination decision the 14 normal editing-key actions in
+    // `actions.rs` already make between the document body, the sidebar
+    // filter, and an active inline rename, before that decision is
+    // consolidated into a dedicated resolver. These pin the *current*
+    // dispatch behavior directly (not by re-deriving it from the same
+    // `if sidebar_filter_is_focused() ... else if inline_rename_active()
+    // ... else` chain under test), so a later resolver extraction that
+    // changes any of these outcomes is caught here first.
+
+    fn focus_body_for_key_dispatch(cx: &mut gpui::VisualTestContext) {
+        // Mirrors a real click into the document before dispatching a key,
+        // the same way `secondary_f_opens_the_bar_and_focuses_its_input_...`
+        // does: all three destinations share one `FocusHandle`, so a key
+        // action is only routed by `sidebar_filter_focused`/`inline_rename`,
+        // never by which element GPUI itself focused.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn body_focused_normal_editing_keys_route_only_to_the_body_and_leave_sidebar_filter_and_inline_rename_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        // The trailing newline matches every other body fixture in this
+        // file; `SelectAll`/`Copy`/`Cut`/`Paste` below operate on the whole
+        // document (`len_bytes`), which includes it, while `Home`/`End`
+        // resolve through `line_content_range`, which excludes it.
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        // A filter value can linger unfocused after a real blur (`blur_sidebar_filter`
+        // clears focus/composition but not the text itself); seeding it here
+        // proves body-focused keys never touch it.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(3)))
+                .unwrap();
+            view.sidebar_filter = "stale-filter".to_owned();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(4))
+        );
+
+        cx.simulate_keystrokes("left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(3))
+        );
+
+        cx.simulate_keystrokes("shift-right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection {
+                anchor: SourceOffset(3),
+                active: SourceOffset(4),
+            }
+        );
+
+        // Left with a non-empty selection collapses to its start rather than
+        // moving one further grapheme left.
+        cx.simulate_keystrokes("left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(3))
+        );
+
+        cx.simulate_keystrokes("shift-left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection {
+                anchor: SourceOffset(3),
+                active: SourceOffset(2),
+            }
+        );
+
+        // Right with a non-empty (reversed) selection collapses to its end.
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(3))
+        );
+
+        cx.simulate_keystrokes("home");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(0))
+        );
+
+        cx.simulate_keystrokes("end");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(6))
+        );
+
+        cx.simulate_keystrokes("shift-home");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection {
+                anchor: SourceOffset(6),
+                active: SourceOffset(0),
+            }
+        );
+
+        cx.simulate_keystrokes("shift-end");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(6))
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().document().full_text()),
+            "abcdef\n"
+        );
+
+        cx.simulate_keystrokes("secondary-a");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection {
+                anchor: SourceOffset(0),
+                active: SourceOffset(7),
+            }
+        );
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcdef\n".to_owned())
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().document().full_text()),
+            "abcdef\n",
+            "Copy must not mutate the body"
+        );
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcdef\n".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+        });
+
+        cx.simulate_keystrokes("secondary-v");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sidebar_filter, "stale-filter",
+                "none of the 14 body-routed actions above may leak into the sidebar filter"
+            );
+            assert!(!view.sidebar_filter_focused);
+            assert!(!view.inline_rename_active());
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_filter_focused_normal_editing_keys_route_only_to_the_filter_and_leave_the_body_and_inline_rename_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("untouched body text\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        // `sidebar_filter_is_focused()` is checked first in every one of the
+        // 14 actions, before `inline_rename_active()`; seeding a non-empty
+        // `inline_rename` at the same time (impossible through the real UI,
+        // since `focus_sidebar_filter` always cancels a rename first) pins
+        // that priority directly, independently of how a future resolver
+        // might implement it.
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_keyboard_focus = true;
+            view.sidebar_filter = "abcdef".to_owned();
+            view.sidebar_filter_selected_range = 3..3;
+            view.sidebar_filter_selection_reversed = false;
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Stale.md"),
+                text: "stale-rename".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..12,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            4..4
+        );
+
+        cx.simulate_keystrokes("left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            3..3
+        );
+
+        cx.simulate_keystrokes("shift-right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            3..4
+        );
+
+        cx.simulate_keystrokes("left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            3..3
+        );
+
+        cx.simulate_keystrokes("shift-left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            2..3
+        );
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_selection_reversed));
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            3..3
+        );
+
+        cx.simulate_keystrokes("home");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            0..0
+        );
+
+        cx.simulate_keystrokes("end");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            6..6
+        );
+
+        cx.simulate_keystrokes("shift-home");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            0..6
+        );
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_selection_reversed));
+
+        cx.simulate_keystrokes("shift-end");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            6..6
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter.clone()),
+            "abcdef"
+        );
+
+        cx.simulate_keystrokes("secondary-a");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            0..6
+        );
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcdef".to_owned())
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter.clone()),
+            "abcdef",
+            "Copy must not mutate the filter"
+        );
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcdef".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "");
+            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+        });
+
+        cx.simulate_keystrokes("secondary-v");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "abcdef");
+            assert_eq!(view.sidebar_filter_selected_range, 6..6);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().document().full_text(),
+                "untouched body text\n",
+                "none of the 14 filter-routed actions above may leak into the body"
+            );
+            assert_eq!(
+                view.inline_rename.as_ref().unwrap().text,
+                "stale-rename",
+                "filter focus must win over a simultaneously-populated inline rename"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn inline_rename_active_normal_editing_keys_route_only_to_the_rename_field_and_leave_the_body_and_sidebar_filter_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("untouched body text\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        // A filter value can legitimately linger, unfocused, during a
+        // rename (nothing clears `sidebar_filter` on `begin_inline_rename`);
+        // seeding it here proves rename-routed keys never touch it either.
+        view.update(cx, |view, cx| {
+            view.sidebar_filter = "stale-filter".to_owned();
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "abcdef".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 3..3,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            4..4
+        );
+
+        cx.simulate_keystrokes("left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            3..3
+        );
+
+        cx.simulate_keystrokes("shift-right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            3..4
+        );
+
+        cx.simulate_keystrokes("left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            3..3
+        );
+
+        cx.simulate_keystrokes("shift-left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            2..3
+        );
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            3..3
+        );
+
+        cx.simulate_keystrokes("home");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            0..0
+        );
+
+        cx.simulate_keystrokes("end");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            6..6
+        );
+
+        cx.simulate_keystrokes("shift-home");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            0..6
+        );
+
+        cx.simulate_keystrokes("shift-end");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            6..6
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_render_state().unwrap().text),
+            "abcdef"
+        );
+
+        cx.simulate_keystrokes("secondary-a");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_selection().unwrap().0),
+            0..6
+        );
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcdef".to_owned())
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inline_rename_render_state().unwrap().text),
+            "abcdef",
+            "Copy must not mutate the rename field"
+        );
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("abcdef".to_owned())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.inline_rename_render_state().unwrap().text, "");
+            assert_eq!(view.inline_rename_selection().unwrap().0, 0..0);
+        });
+
+        cx.simulate_keystrokes("secondary-v");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.inline_rename_render_state().unwrap().text, "abcdef");
+            assert_eq!(view.inline_rename_selection().unwrap().0, 6..6);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().document().full_text(),
+                "untouched body text\n",
+                "none of the 14 rename-routed actions above may leak into the body"
+            );
+            assert_eq!(
+                view.sidebar_filter, "stale-filter",
+                "none of the 14 rename-routed actions above may leak into the sidebar filter"
+            );
+            assert!(!view.sidebar_filter_focused);
+        });
+    }
+
+    // Issue #304 (RF3-A, P1): Cut's "single target" contract already holds
+    // structurally (the same `if sidebar_filter_is_focused() ... else if
+    // inline_rename_active() ... else` chain used for every other action
+    // above picks exactly one of body/filter/rename as Cut's source); what
+    // is specific to Cut is that it both reads *and mutates* its target, so
+    // it must not corrupt a rename whose filesystem operation is already
+    // in flight (`InlineRename::pending`). `cut`'s own clipboard write does
+    // not check `pending` (only the delete that follows does), so Cut
+    // during a pending rename degrades to a Copy rather than a no-op.
+    #[gpui::test]
+    fn cut_during_a_pending_inline_rename_copies_to_the_clipboard_without_mutating_the_in_flight_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("placeholder\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Report.md"),
+                text: "Report".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..6,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: true,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("Report".to_owned()),
+            "Cut must still copy the pending rename's selected text"
+        );
+        view.read_with(cx, |view, _| {
+            let rename = view.inline_rename.as_ref().expect("rename stays active");
+            assert_eq!(
+                rename.text, "Report",
+                "Cut must not shorten the name of a rename already in flight"
+            );
+            assert_eq!(rename.selected_range, 0..6);
+            assert!(rename.pending);
+        });
+    }
+
+    // Issue #304 (RF3-A, P1): the body, filter, and rename paths resolve
+    // "one character" with three different helpers today (`move_grapheme`'s
+    // `previous_grapheme`/`next_grapheme` in `crates/editor`, vs.
+    // `previous_inline_rename_boundary`/`next_inline_rename_boundary` shared
+    // by the filter and the rename field in `view.rs`); all three must keep
+    // agreeing that a combining mark and a surrogate-pair emoji are each one
+    // grapheme, through the actual key-dispatch path, not just the movement
+    // unit tests already covering the helpers directly
+    // (`grapheme_movement_keeps_combining_sequence_together`,
+    // `inline_rename_movement_uses_grapheme_boundaries`).
+    #[gpui::test]
+    fn left_right_backspace_and_delete_treat_a_combining_mark_and_a_surrogate_pair_emoji_as_one_grapheme_in_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "a\u{301}🙂羽";
+        let combining_end = "a\u{301}".len();
+        let emoji_end = "a\u{301}🙂".len();
+        let len = text.len();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for expected in [combining_end, emoji_end, len] {
+            cx.simulate_keystrokes("right");
+            assert_eq!(
+                view.read_with(cx, |view, _| view.editor().selection()),
+                Selection::caret(SourceOffset(expected))
+            );
+        }
+        // Right at the document end is a no-op.
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(len))
+        );
+
+        for expected in [emoji_end, combining_end, 0] {
+            cx.simulate_keystrokes("left");
+            assert_eq!(
+                view.read_with(cx, |view, _| view.editor().selection()),
+                Selection::caret(SourceOffset(expected))
+            );
+        }
+        // Left at the document start is a no-op.
+        cx.simulate_keystrokes("left");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(0))
+        );
+
+        cx.simulate_keystrokes("delete");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "🙂羽");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+        });
+
+        // Backspace at the document start is a no-op.
+        cx.simulate_keystrokes("backspace");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "🙂羽");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+        });
+
+        cx.simulate_keystrokes("right");
+        let emoji_len = "🙂".len();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(emoji_len))
+        );
+
+        cx.simulate_keystrokes("backspace");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "羽");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+        });
+
+        cx.simulate_keystrokes("right");
+        let han_len = "羽".len();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(han_len))
+        );
+
+        // Delete at the document end (now past the only remaining
+        // grapheme) is a no-op.
+        cx.simulate_keystrokes("delete");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "羽");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(han_len)));
+        });
+    }
+
+    #[gpui::test]
+    fn left_right_backspace_and_delete_treat_a_combining_mark_and_a_zwj_emoji_sequence_as_one_grapheme_in_the_sidebar_filter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "a\u{301}👩‍💻z";
+        let combining_end = "a\u{301}".len();
+        let emoji_end = "a\u{301}👩‍💻".len();
+        let len = text.len();
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("placeholder\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_keyboard_focus = true;
+            view.sidebar_filter = text.to_owned();
+            view.sidebar_filter_selected_range = 0..0;
+            view.sidebar_filter_selection_reversed = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for expected in [combining_end, emoji_end, len] {
+            cx.simulate_keystrokes("right");
+            assert_eq!(
+                view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+                expected..expected
+            );
+        }
+
+        for expected in [emoji_end, combining_end, 0] {
+            cx.simulate_keystrokes("left");
+            assert_eq!(
+                view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+                expected..expected
+            );
+        }
+
+        cx.simulate_keystrokes("delete");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "👩\u{200d}💻z");
+            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+        });
+
+        // Backspace at the start of the filter is a no-op.
+        cx.simulate_keystrokes("backspace");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "👩\u{200d}💻z");
+            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+        });
+
+        let emoji_len = "👩‍💻".len();
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            emoji_len..emoji_len
+        );
+
+        cx.simulate_keystrokes("backspace");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "z");
+            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+        });
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            1..1
+        );
+
+        // Delete at the end of the filter is a no-op.
+        cx.simulate_keystrokes("delete");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "z");
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+        });
+    }
+
+    #[gpui::test]
+    fn right_and_backspace_treat_a_zwj_emoji_sequence_as_one_grapheme_in_inline_rename_too(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "a\u{301}👩‍💻z";
+        let combining_end = "a\u{301}".len();
+        let emoji_end = "a\u{301}👩‍💻".len();
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("placeholder\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: text.to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..0,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Read `selected_range` directly rather than through
+        // `inline_rename_selection()`, which reports UTF-16 offsets: the
+        // surrogate-pair emoji in `text` makes those diverge from the byte
+        // offsets `combining_end`/`emoji_end` describe.
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .inline_rename
+                .as_ref()
+                .unwrap()
+                .selected_range
+                .clone()),
+            combining_end..combining_end
+        );
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .inline_rename
+                .as_ref()
+                .unwrap()
+                .selected_range
+                .clone()),
+            emoji_end..emoji_end
+        );
+
+        // One grapheme-cluster-wide Backspace removes the whole emoji
+        // sequence (combining mark included), not one UTF-16 code unit.
+        cx.simulate_keystrokes("backspace");
+        view.read_with(cx, |view, _| {
+            let rename = view.inline_rename.as_ref().unwrap();
+            assert_eq!(rename.text, "a\u{301}z");
+            assert_eq!(rename.selected_range, combining_end..combining_end);
+        });
+
+        cx.simulate_keystrokes("backspace");
+        view.read_with(cx, |view, _| {
+            let rename = view.inline_rename.as_ref().unwrap();
+            assert_eq!(rename.text, "z");
+            assert_eq!(rename.selected_range, 0..0);
+        });
+    }
 }
