@@ -19957,7 +19957,9 @@ mod tests {
             6..6
         );
         assert_eq!(
-            view.read_with(cx, |view, _| view.inline_rename_render_state().unwrap().text),
+            view.read_with(cx, |view, _| {
+                view.inline_rename_render_state().unwrap().text
+            }),
             "abcdef"
         );
 
@@ -19973,7 +19975,9 @@ mod tests {
             Some("abcdef".to_owned())
         );
         assert_eq!(
-            view.read_with(cx, |view, _| view.inline_rename_render_state().unwrap().text),
+            view.read_with(cx, |view, _| {
+                view.inline_rename_render_state().unwrap().text
+            }),
             "abcdef",
             "Copy must not mutate the rename field"
         );
@@ -20159,7 +20163,10 @@ mod tests {
         cx.simulate_keystrokes("delete");
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().document().full_text(), "羽");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(han_len)));
+            assert_eq!(
+                view.editor().selection(),
+                Selection::caret(SourceOffset(han_len))
+            );
         });
     }
 

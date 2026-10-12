@@ -1,9 +1,9 @@
 # RF3-A P1 検証記録
 
-Issue: [#304](https://github.com/hide212131/hane/issues/304)  
-実装PR: [#477](https://github.com/hide212131/hane/pull/477)  
-設計正本: [入力先判定の実装仕様](https://github.com/hide212131/hane/blob/cbf468b3d622f9c3f0f2823fdb5f03bc9cc58ee0/docs/refactor-rf3a-input-routing-implementation-spec.md)  
-作業ブランチ: `refactor/rf3a-p1-input-routing-20261012`  
+Issue: [#304](https://github.com/hide212131/hane/issues/304)\
+実装PR: [#477](https://github.com/hide212131/hane/pull/477)\
+設計正本: [入力先判定の実装仕様](https://github.com/hide212131/hane/blob/cbf468b3d622f9c3f0f2823fdb5f03bc9cc58ee0/docs/refactor-rf3a-input-routing-implementation-spec.md)\
+作業ブランチ: `refactor/rf3a-p1-input-routing-20261012`\
 開始base/current base: `c17dd0e62ad6f67d1aa6db9e23df5105e5b5884e`
 
 ## P1 の範囲と候補差分
