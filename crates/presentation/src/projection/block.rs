@@ -558,6 +558,7 @@ fn joined_run_disclosure(
         .reduce(union_disclosure)
 }
 
+#[cfg(test)]
 fn present_joined_run(
     lines: &[BlockLine<'_>],
     revision: Revision,
