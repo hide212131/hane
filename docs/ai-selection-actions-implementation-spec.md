@@ -235,7 +235,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 通常の実装担当はAGENTSとCommander Policyに従う。制限されたworkerは許可されたRead/Edit/Write等だけを使い、shell、git、テスト実行、認証情報の取得を行わない。trusted finalizerのpush後にexact-head CIを最初の検証として確認し、成功前に検証済みとしない。
 
-最終候補ではcurrent mainへの影響を確認し、required CI、CodeRabbitのcurrent-head full review、必要な両OSの実画面と実接続の証拠を揃える。機能Issueの成立を妨げる不具合、データ損失、安全性、未知の必要証拠は残したままmergeしない。関係のない改善の全件解消を求めてscopeを広げない。mergeとIssue closeは実装workerに任せない。
+最終候補ではcurrent mainへの影響を確認し、required CI、GitHub上のcurrent-head full review（レビューIDと対象head SHAを記録したもの）、必要な両OSの実画面と実接続の証拠を揃える。機能Issueの成立を妨げる不具合、データ損失、安全性、未知の必要証拠は残したままmergeしない。関係のない改善の全件解消を求めてscopeを広げない。mergeとIssue closeは実装workerに任せない。
 
 ### 9.1 現在の実装状況（このworker実行時点、exact-head CI実行前）
 
