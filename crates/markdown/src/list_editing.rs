@@ -902,8 +902,8 @@ mod tests {
     #[test]
     fn empty_nested_backspace_outdents_and_top_level_backspace_removes_marker() {
         assert_eq!(
-            replacement("- A\n  - ", 6, ListEditIntent::Backspace),
-            ("- A\n- ".into(), 4)
+            replacement("- A\n  - ", 8, ListEditIntent::Backspace),
+            ("- A\n- ".into(), 6)
         );
         assert_eq!(
             replacement("- ", 2, ListEditIntent::Backspace),
