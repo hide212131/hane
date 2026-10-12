@@ -2553,9 +2553,7 @@ mod tests {
         cx.run_until_parked();
 
         view.update(cx, |view, cx| {
-            view.ai_selection
-                .saved_prompts
-                .push(saved_prompt(1, " \n\t "));
+            view.ai_selection.saved_prompts = vec![saved_prompt(1, " \n\t ")];
             let prompt = view.ai_selection.saved_prompts[0].prompt.clone();
             view.ai_selection_run_saved_prompt(prompt, cx);
             cx.notify();
