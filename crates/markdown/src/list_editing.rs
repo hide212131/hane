@@ -593,10 +593,15 @@ pub fn plan_list_edit(
             let empty = source
                 .get(item.body_range.as_usize())
                 .is_some_and(str::is_empty);
-            let empty_action = matches!(intent, ListEditIntent::Enter)
-                || (matches!(intent, ListEditIntent::Backspace)
-                    && caret.0 <= item.body_range.start.0);
-            if empty && empty_action && on_opening_line {
+            // Both Enter and Backspace exit the empty item only when the
+            // caret sits exactly at the empty body's start; a caret inside
+            // or before the marker prefix is ordinary editing, not an exit,
+            // so it must not be claimed here or fall through to the generic
+            // same-level Enter split below.
+            if empty && on_opening_line {
+                if caret.0 != item.body_range.start.0 {
+                    return Ok(ListEditPlanResult::NotApplicable);
+                }
                 if !exit_is_trustworthy(item) {
                     return Ok(ListEditPlanResult::NotApplicable);
                 }
@@ -900,6 +905,27 @@ mod tests {
             replacement("- A\n  - ", 6, ListEditIntent::Backspace),
             ("- A\n- ".into(), 4)
         );
+        assert_eq!(
+            replacement("- ", 2, ListEditIntent::Backspace),
+            ("".into(), 0)
+        );
+    }
+
+    /// Issue #472: the empty-item exit is only eligible when the caret sits
+    /// exactly at the empty body's start. A caret inside the marker prefix
+    /// (`-<caret> `) must not be consumed by the list-exit planner for
+    /// either intent, so ordinary editing proceeds instead.
+    #[test]
+    fn empty_item_exit_requires_exact_body_start_caret() {
+        assert!(not_applicable("- ", 1, ListEditIntent::Enter));
+        assert!(not_applicable("- ", 1, ListEditIntent::Backspace));
+    }
+
+    /// Control case for the above: the exact body-start caret (`- <caret>`)
+    /// still exits the empty item for both intents.
+    #[test]
+    fn empty_item_exit_still_applies_at_exact_body_start_caret() {
+        assert_eq!(replacement("- ", 2, ListEditIntent::Enter), ("".into(), 0));
         assert_eq!(
             replacement("- ", 2, ListEditIntent::Backspace),
             ("".into(), 0)
