@@ -558,10 +558,6 @@ fn joined_run_disclosure(
         .reduce(union_disclosure)
 }
 
-/// Balanced interval index. Each subtree stores its greatest source end, so
-/// a long enclosing construct does not force a scan of unrelated short spans.
-#[derive(Clone, Debug)]
-
 fn present_joined_run(
     lines: &[BlockLine<'_>],
     revision: Revision,
