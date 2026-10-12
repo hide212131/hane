@@ -11027,6 +11027,92 @@ mod tests {
         );
     }
 
+    /// Issue #472 owner report (comment on #460): the owner's actual
+    /// reproduction is a document *pre-loaded* with an already-existing
+    /// blank line and trailing prose after the trailing empty item (source
+    /// `- abc\n- def\n- \n\nx`, caret placed by byte offset directly after the
+    /// empty item's own marker), not one built incrementally by typing as
+    /// the test above does. This drives that exact shape through the real
+    /// `EditorView::backspace` action/focus path so the regression and fix
+    /// are proven against the reported case, not just the synthesized one.
+    #[gpui::test]
+    fn real_backspace_keystroke_exits_a_preloaded_trailing_empty_item_before_existing_prose(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "- abc\n- def\n- \n\nx";
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        // Set the byte caret and editor focus directly, the way the owner's
+        // already-open document and placed caret arrived at that state,
+        // rather than reconstructing it via mouse clicks and typed keys.
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(14)))
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        // The real Backspace key must reach `EditorView::backspace` and
+        // remove the trailing empty item's marker, not silently leave
+        // `- ` untouched the way the owner observed.
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().document().full_text(),
+                "- abc\n- def\n\n\n\nx",
+                "a real Backspace keystroke on a preloaded document must \
+                 remove the trailing empty item's marker instead of \
+                 leaving it untouched"
+            );
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(13)));
+        });
+
+        // Whatever is typed next, through real key dispatch, must land in
+        // its own ordinary paragraph: never back inside the exited
+        // ListItem, and not merged with the preexisting "x" paragraph.
+        cx.simulate_input("ghi");
+        cx.run_until_parked();
+        let text = view.read_with(cx, |view, _| view.editor().document().full_text());
+        assert_eq!(text, "- abc\n- def\n\nghi\n\nx");
+
+        let parsed =
+            hane_markdown::parse_document(Revision(1), SourceRange::new(0, text.len()), &text);
+        let paragraphs: Vec<_> = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, hane_markdown::NodeKind::Paragraph))
+            .collect();
+        assert_eq!(
+            paragraphs.len(),
+            2,
+            "expected \"ghi\" and the preexisting \"x\" to be two distinct \
+             paragraphs, got {paragraphs:?}"
+        );
+        for paragraph in &paragraphs {
+            assert!(
+                !parsed
+                    .tree
+                    .ancestors(paragraph.0)
+                    .skip(1)
+                    .any(|ancestor| matches!(
+                        parsed.tree.node(ancestor).map(|node| node.kind),
+                        Some(hane_markdown::NodeKind::ListItem { .. })
+                    )),
+                "paragraph {paragraph:?} must not be a descendant of a ListItem"
+            );
+        }
+        assert!(
+            text[paragraphs[1].1.source_range.as_usize()].contains('x'),
+            "expected the trailing paragraph to still contain the original \
+             \"x\", got {paragraphs:?}"
+        );
+    }
+
     #[test]
     fn every_line_resolves_to_its_markdown_block() {
         let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";

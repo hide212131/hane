@@ -212,11 +212,12 @@ pub fn build_list_edit_projection(parsed: &MarkdownParse, source: &str) -> ListE
                 Some(NodeKind::Quote)
             )
         });
+        let opening_line_end_abs = parsed.source_range.start.0 + line_end_rel;
         items.push(ListEditItem {
             item_range: item_node.source_range,
             subtree_range: SourceRange::new(
                 parsed.source_range.start.0 + line_start_rel,
-                item_node.source_range.end.0,
+                item_subtree_end(&parsed.tree, *item_id, opening_line_end_abs),
             ),
             list_range: list_node.source_range,
             marker_range: *marker_range,
@@ -983,6 +984,55 @@ mod tests {
         );
     }
 
+    /// Issue #472: `pulldown_cmark` must look ahead past a trailing blank
+    /// line to confirm a list really ends when the next line is unindented,
+    /// non-list prose. That lookahead previously left the blank line
+    /// attributed to the last (empty) item's own reported range, which made
+    /// `exit_is_safe_to_collapse` think the item owned real content past its
+    /// opening line and refuse the exit as a no-op — leaving the marker
+    /// untouched instead of removing it. An existing blank line already
+    /// following the exited item must still be reused, not duplicated.
+    #[test]
+    fn backspace_exits_trailing_empty_item_already_followed_by_a_blank_line_and_prose() {
+        let text = "- abc\n- def\n- \n\nx";
+        let (after_exit, caret) = replacement(text, 14, ListEditIntent::Backspace);
+        assert_eq!(after_exit, "- abc\n- def\n\n\n\nx");
+        assert_eq!(caret, 13);
+
+        let mut typed = after_exit;
+        typed.insert_str(caret, "ghi");
+        assert_eq!(typed, "- abc\n- def\n\nghi\n\nx");
+
+        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+        let paragraphs: Vec<_> = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
+            .collect();
+        assert_eq!(
+            paragraphs.len(),
+            2,
+            "expected \"ghi\" and \"x\" to be two distinct paragraphs, got {paragraphs:?}"
+        );
+        for paragraph in &paragraphs {
+            assert!(
+                !parsed
+                    .tree
+                    .ancestors(paragraph.0)
+                    .skip(1)
+                    .any(|ancestor| matches!(
+                        parsed.tree.node(ancestor).map(|node| node.kind),
+                        Some(NodeKind::ListItem { .. })
+                    )),
+                "paragraph {paragraph:?} must not be a descendant of a ListItem"
+            );
+        }
+        assert!(
+            typed[paragraphs[1].1.source_range.as_usize()].contains('x'),
+            "expected the trailing paragraph to still contain \"x\", got {paragraphs:?}"
+        );
+    }
+
     #[test]
     fn enter_on_trailing_empty_top_level_item_creates_paragraph_boundary() {
         let text = "- abc\n- def\n- ";
@@ -1599,6 +1649,28 @@ mod tests {
             }
         }
     }
+}
+
+/// The real extent of a parser list item's subtree, derived from its last
+/// child rather than trusted from `pulldown_cmark`'s own reported range.
+///
+/// When a list ends because the next line is unindented, non-list content
+/// (rather than another item at the same or a deeper level), `pulldown_cmark`
+/// must look ahead past any trailing blank lines to decide that the list
+/// really ends there. That lookahead can leave the blank lines attributed to
+/// the *last* item's reported range even though nothing in the tree actually
+/// owns them, which previously made an otherwise-empty trailing item look
+/// like it had content past its own opening line and blocked its exit. An
+/// item's real children already cover every byte it actually owns, so using
+/// the last child's end (or the opening line's own end, for an item with no
+/// children at all) excludes that lookahead-only trailing span.
+fn item_subtree_end(tree: &crate::MarkdownTree, item_id: NodeId, opening_line_end: usize) -> usize {
+    tree.children(item_id)
+        .iter()
+        .filter_map(|child| tree.node(*child))
+        .map(|child| child.source_range.end.0)
+        .max()
+        .map_or(opening_line_end, |end| end.max(opening_line_end))
 }
 
 fn find_task_marker(tree: &crate::MarkdownTree, id: NodeId) -> Option<SourceRange> {
