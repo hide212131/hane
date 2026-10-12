@@ -1177,6 +1177,11 @@ enum Granularity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HeightBlock {
     id: BlockId,
+    /// Document revision the owning `IndexedBlock` was parsed at. Included so
+    /// an edit that leaves range, line count, and estimated height unchanged
+    /// (e.g. inline text replaced within the same line) is still treated as a
+    /// change instead of reusing a stale measured height.
+    revision: Revision,
     line_count: usize,
     source_range: SourceRange,
     estimated_height_bits: u32,
@@ -1320,9 +1325,12 @@ fn rebase_ordinal_after_splice(
 }
 
 /// Keeps measured geometry across a formal index publication when the same
-/// source range still has the same line count and initial height estimate.
-/// A new parse must not temporarily replace measured heading heights with
-/// estimates while the user is typing near the bottom of a document.
+/// block id and revision still has the same source range, line count, and
+/// initial height estimate. A new parse must not temporarily replace measured
+/// heading heights with estimates while the user is typing near the bottom of
+/// a document, but a block whose revision changed must not inherit a
+/// measurement taken before the edit — its content may render at a different
+/// height even when range, line count, and initial estimate happen to match.
 fn preserve_measured_block_heights(
     previous_blocks: &HeightBlocks,
     previous_heights: &HeightIndex,
@@ -1339,6 +1347,8 @@ fn preserve_measured_block_heights(
         };
         measured.insert(
             (
+                block.id,
+                block.revision,
                 block.source_range.start.0,
                 block.source_range.end.0,
                 block.line_count,
@@ -1352,6 +1362,8 @@ fn preserve_measured_block_heights(
             continue;
         };
         let Some(height) = measured.get(&(
+            block.id,
+            block.revision,
             block.source_range.start.0,
             block.source_range.end.0,
             block.line_count,
@@ -4742,6 +4754,7 @@ impl EditorView {
                         .enumerate()
                         .map(|(ordinal, block)| HeightBlock {
                             id: block.id,
+                            revision: block.revision,
                             line_count: block.line_count,
                             source_range: block.source_range,
                             estimated_height_bits: heights
@@ -4824,6 +4837,7 @@ impl EditorView {
             .zip(&initial_heights)
             .map(|(block, estimated_height)| HeightBlock {
                 id: block.id,
+                revision: block.revision,
                 line_count: block.line_count,
                 source_range: block.source_range,
                 estimated_height_bits: estimated_height.to_bits(),
@@ -11077,18 +11091,21 @@ mod tests {
         let inserted = [
             HeightBlock {
                 id: BlockId(20),
+                revision: Revision(0),
                 line_count: 1,
                 source_range: SourceRange::new(20, 21),
                 estimated_height_bits: 20.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(21),
+                revision: Revision(0),
                 line_count: 1,
                 source_range: SourceRange::new(21, 22),
                 estimated_height_bits: 21.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(22),
+                revision: Revision(0),
                 line_count: 1,
                 source_range: SourceRange::new(22, 23),
                 estimated_height_bits: 22.0_f32.to_bits(),
@@ -11117,6 +11134,7 @@ mod tests {
         let mut flat = (0..300)
             .map(|id| HeightBlock {
                 id: BlockId(id),
+                revision: Revision(0),
                 line_count: id as usize % 5 + 1,
                 source_range: SourceRange::new(id as usize, id as usize + 1),
                 estimated_height_bits: (id as f32).to_bits(),
@@ -11126,18 +11144,21 @@ mod tests {
         let inserted = [
             HeightBlock {
                 id: BlockId(1_000),
+                revision: Revision(0),
                 line_count: 2,
                 source_range: SourceRange::new(1_000, 1_001),
                 estimated_height_bits: 1_000.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(1_001),
+                revision: Revision(0),
                 line_count: 3,
                 source_range: SourceRange::new(1_001, 1_002),
                 estimated_height_bits: 1_001.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(1_002),
+                revision: Revision(0),
                 line_count: 4,
                 source_range: SourceRange::new(1_002, 1_003),
                 estimated_height_bits: 1_002.0_f32.to_bits(),
@@ -11156,12 +11177,14 @@ mod tests {
         let previous = [
             HeightBlock {
                 id: BlockId(0),
+                revision: Revision(1),
                 line_count: 1,
                 source_range: SourceRange::new(0, 8),
                 estimated_height_bits: 53.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(1),
+                revision: Revision(1),
                 line_count: 1,
                 source_range: SourceRange::new(8, 18),
                 estimated_height_bits: 49.0_f32.to_bits(),
@@ -11172,18 +11195,21 @@ mod tests {
         let next = [
             HeightBlock {
                 id: BlockId(0),
+                revision: Revision(1),
                 line_count: 1,
                 source_range: SourceRange::new(0, 8),
                 estimated_height_bits: 53.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(1),
+                revision: Revision(1),
                 line_count: 1,
                 source_range: SourceRange::new(8, 18),
                 estimated_height_bits: 49.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(2),
+                revision: Revision(1),
                 line_count: 1,
                 source_range: SourceRange::new(18, 22),
                 estimated_height_bits: 20.0_f32.to_bits(),
@@ -11203,6 +11229,7 @@ mod tests {
         let changed = [
             HeightBlock {
                 id: BlockId(0),
+                revision: Revision(1),
                 line_count: 1,
                 source_range: SourceRange::new(0, 8),
                 estimated_height_bits: 42.9_f32.to_bits(),
@@ -11222,6 +11249,62 @@ mod tests {
         assert_eq!(changed_heights.height(0), Some(42.9));
         assert_eq!(changed_heights.height(1), Some(58.0));
         assert_eq!(changed_heights.height(2), Some(20.0));
+    }
+
+    /// Guards the CodeRabbit-reported regression where a background
+    /// re-reconciliation reused a stale measured height for a block whose
+    /// content changed (bumping its revision) without changing its source
+    /// range, line count, or initial height estimate.
+    #[test]
+    fn full_height_rebuild_does_not_inherit_measurement_across_a_revision_change() {
+        let previous = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(1),
+            line_count: 1,
+            source_range: SourceRange::new(0, 8),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        let previous_heights = HeightIndex::new([72.0]);
+
+        let unchanged = previous.clone();
+        let mut unchanged_heights = HeightIndex::new([53.0]);
+        preserve_measured_block_heights(
+            &previous,
+            &previous_heights,
+            &unchanged,
+            &mut unchanged_heights,
+        );
+        assert_eq!(
+            unchanged_heights.height(0),
+            Some(72.0),
+            "a block whose id, revision, range, line count, and estimate all \
+             match must keep the previously measured height"
+        );
+
+        let revised = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(2),
+            line_count: 1,
+            source_range: SourceRange::new(0, 8),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        let mut revised_heights = HeightIndex::new([53.0]);
+        preserve_measured_block_heights(
+            &previous,
+            &previous_heights,
+            &revised,
+            &mut revised_heights,
+        );
+        assert_eq!(
+            revised_heights.height(0),
+            Some(53.0),
+            "a revision bump must not inherit the old measured height even \
+             when range, line count, and estimate happen to match"
+        );
     }
 
     #[test]
@@ -11384,6 +11467,117 @@ mod tests {
                 outside_old - update.replaced_blocks + update.inserted_blocks
             };
             assert_eq!(view.heights.height(outside_new), Some(measured));
+        });
+    }
+
+    /// Guards the CodeRabbit-reported regression where the incremental
+    /// equality check that decides whether a splice changed anything compared
+    /// id, range, line count, and estimated height, but not revision. A block
+    /// whose text changed without moving its boundaries or its line count
+    /// then looked unchanged and kept a height measured before the edit.
+    #[gpui::test]
+    fn apply_height_index_update_resets_height_when_only_revision_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "one\n\ntwo\n\nthree\n\nfour\n\nlast\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+
+        view.update(cx, |view, _cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+
+            let edited_ordinal = 2;
+            let edited_block = index
+                .block(edited_ordinal)
+                .expect("\"three\" block exists");
+            let estimate_before = view
+                .height_blocks
+                .get(edited_ordinal)
+                .expect("\"three\" height block exists")
+                .estimated_height_bits;
+
+            let stale_measured = 987.0;
+            let kept_measured = 123.0;
+            view.heights.update(edited_ordinal, stale_measured);
+            view.heights.update(0, kept_measured);
+
+            let replacement = "eerht";
+            view.editor_mut()
+                .replace_range_recorded(
+                    edited_block.source_range,
+                    replacement,
+                    Selection::caret(SourceOffset(
+                        edited_block.source_range.start.0 + replacement.len(),
+                    )),
+                )
+                .unwrap();
+            let document = view.editor().document().clone();
+            let update = view
+                .block_index
+                .apply_edits(&document)
+                .expect("incremental index update");
+            assert!(
+                edited_ordinal >= update.first_replaced_block
+                    && edited_ordinal < update.first_replaced_block + update.replaced_blocks,
+                "the edit must land inside the window the incremental update replaces"
+            );
+
+            assert!(view.apply_height_index_update(&update));
+
+            let index = view.current_index().expect("current incremental index");
+            let updated_block = index
+                .block(edited_ordinal)
+                .expect("\"three\" block still exists");
+            assert_eq!(
+                updated_block.id, edited_block.id,
+                "the paragraph keeps its id across the in-place edit"
+            );
+            assert_eq!(
+                updated_block.source_range, edited_block.source_range,
+                "fixture keeps the block's source range identical across the edit"
+            );
+            assert_eq!(
+                updated_block.line_count, edited_block.line_count,
+                "fixture keeps the block's line count identical across the edit"
+            );
+            assert_ne!(
+                updated_block.revision, edited_block.revision,
+                "the edit must bump the block's revision"
+            );
+
+            let estimate_after = view
+                .height_blocks
+                .get(edited_ordinal)
+                .expect("\"three\" height block exists")
+                .estimated_height_bits;
+            assert_eq!(
+                estimate_before, estimate_after,
+                "fixture keeps the initial height estimate identical across the \
+                 edit so only the revision differs"
+            );
+
+            assert_ne!(
+                view.heights.height(edited_ordinal),
+                Some(stale_measured),
+                "a revision change must not keep reusing a height measured \
+                 before the edit, even when range, line count, and estimate match"
+            );
+            assert_eq!(
+                view.heights.height(0),
+                Some(kept_measured),
+                "a block outside the update window keeps its measured height"
+            );
         });
     }
 
