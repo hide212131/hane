@@ -64,15 +64,17 @@ pub use source_map::{
 };
 
 use display::{block_display_kind, estimated_height, syntax_display};
-use hane_document::{
-    Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
-};
+use hane_document::{Bias, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
+#[cfg(test)]
+use hane_document::RevisionDelta;
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection,
-    ListProjectionItem, ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId,
-    NodeKind, TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
+    BlockIndex, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection, ListProjectionItem,
+    ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
+    TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
     has_delimiter_markers, is_table_delimiter, parse_document,
 };
+#[cfg(test)]
+use hane_markdown::{BlockId, Confidence};
 use std::ops::Range;
 
 /// Physical source lines a block covers.
