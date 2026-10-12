@@ -10638,6 +10638,308 @@ mod tests {
         });
     }
 
+    /// Issue #472 (design spec exit contract, §8-9): a nested empty item's
+    /// exit (one-level outdent) followed immediately by the resulting
+    /// top-level empty item's own exit must each use the current-revision
+    /// projection freshly rebuilt after the previous edit, not a projection
+    /// cached from before either edit. The parent/child list structure the
+    /// first exit leaves behind must stay intact, and text typed at the
+    /// final caret must land in a Paragraph outside any ListItem.
+    #[gpui::test]
+    fn consecutive_nested_then_top_level_exit_preserves_list_structure_and_typed_paragraph(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view =
+            gpui::AppContext::new(cx, |cx| EditorView::new("- A\n  - B\n  - ", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+
+            // First exit: the trailing nested empty item outdents one level,
+            // becoming a new trailing top-level empty item.
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B\n- ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(12)));
+
+            // Second exit: a freshly rebuilt projection on the post-outdent
+            // source must see this as a top-level empty item and remove its
+            // marker, not reuse any projection captured during the first call.
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B\n\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(11)));
+
+            view.editor_mut().insert_text("ghi").unwrap();
+            view.after_input(cx);
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B\n\nghi");
+
+            let text = view.editor().document().full_text();
+            let parsed =
+                hane_markdown::parse_document(Revision(1), SourceRange::new(0, text.len()), &text);
+            let list_items: Vec<_> = parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| matches!(node.kind, hane_markdown::NodeKind::ListItem { .. }))
+                .collect();
+            assert_eq!(
+                list_items.len(),
+                2,
+                "expected \"A\" and \"B\" to remain two separate list items, got {list_items:?}"
+            );
+            assert!(text[list_items[0].1.source_range.as_usize()].contains('A'));
+            assert!(text[list_items[1].1.source_range.as_usize()].contains('B'));
+
+            let ghi_paragraph = parsed
+                .tree
+                .iter()
+                .find(|(_, node)| {
+                    matches!(node.kind, hane_markdown::NodeKind::Paragraph)
+                        && text[node.source_range.as_usize()].contains("ghi")
+                })
+                .expect("expected a paragraph containing \"ghi\"");
+            assert!(
+                !parsed
+                    .tree
+                    .ancestors(ghi_paragraph.0)
+                    .skip(1)
+                    .any(|ancestor| matches!(
+                        parsed.tree.node(ancestor).map(|node| node.kind),
+                        Some(hane_markdown::NodeKind::ListItem { .. })
+                    )),
+                "the paragraph for \"ghi\" must not be a descendant of a ListItem"
+            );
+        });
+    }
+
+    /// Issue #472 (design spec exit contract, §8-9): exiting a trailing
+    /// top-level empty task item must remove only that item's own recognized
+    /// task prefix. A preceding sibling's nested child task item -- itself
+    /// also a task marker -- must stay byte-for-byte untouched; nothing must
+    /// leak from the exit's range replacement into the sibling subtree.
+    #[gpui::test]
+    fn top_level_task_item_exit_does_not_disturb_a_sibling_subtrees_task_marker(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "- [ ] A\n  - [x] child\n- [ ] ";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            assert_eq!(
+                view.editor().document().full_text(),
+                "- [ ] A\n  - [x] child\n\n"
+            );
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(23)));
+
+            let text = view.editor().document().full_text();
+            // The exit only touched its own trailing line; the parent and its
+            // nested task item keep their original bytes verbatim.
+            assert!(text.starts_with("- [ ] A\n  - [x] child\n"));
+
+            let parsed =
+                hane_markdown::parse_document(Revision(1), SourceRange::new(0, text.len()), &text);
+            let list_items: Vec<_> = parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| matches!(node.kind, hane_markdown::NodeKind::ListItem { .. }))
+                .collect();
+            assert_eq!(
+                list_items.len(),
+                2,
+                "expected the parent and child task items to remain ListItems, got {list_items:?}"
+            );
+            let hane_markdown::NodeKind::ListItem { task: parent_task } = list_items[0].1.kind
+            else {
+                panic!("expected the parent item to be a ListItem");
+            };
+            let hane_markdown::NodeKind::ListItem { task: child_task } = list_items[1].1.kind
+            else {
+                panic!("expected the nested child to be a ListItem");
+            };
+            assert_eq!(
+                parent_task,
+                Some(false),
+                "the exited sibling's own parent task marker must be unaffected"
+            );
+            assert_eq!(
+                child_task,
+                Some(true),
+                "the nested child's checked task marker must not be removed or flipped"
+            );
+        });
+    }
+
+    /// Issue #472 (design spec exit contract, §8-9): when the exited item is
+    /// not the first block in the document, its prefix/body/caret offsets
+    /// are nonzero absolute byte offsets that also sit after earlier
+    /// multi-byte UTF-8 content. The exit must still compute a valid,
+    /// UTF-8-boundary-aligned replacement range instead of panicking or
+    /// producing an invalid range.
+    #[gpui::test]
+    fn top_level_exit_with_preceding_content_uses_nonzero_byte_offsets_without_panicking(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "intro\n\n- \u{65e5}\u{672c}\n- ";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            assert_eq!(
+                view.status, None,
+                "the exit must not report a range/boundary error"
+            );
+            assert_eq!(
+                view.editor().document().full_text(),
+                "intro\n\n- \u{65e5}\u{672c}\n\n"
+            );
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(17)));
+        });
+    }
+
+    /// Issue #472 (design spec Undo/Redo contract, §13): a list exit applied
+    /// through `apply_list_edit_intent`/`after_input` and a subsequent normal
+    /// character insertion are two separate recorded transactions. Undo must
+    /// unwind them independently (typing first, then the exit), and Redo
+    /// must restore both in the same order, with the exact source and caret
+    /// at each step.
+    #[gpui::test]
+    fn list_exit_and_subsequent_typing_undo_redo_as_separate_transactions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("- abc\n- def\n- ", "Untitled", cx)
+        });
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            let before_exit = Selection::caret(end);
+            view.editor_mut().set_selection(before_exit).unwrap();
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            let after_exit = Selection::caret(SourceOffset(13));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            assert_eq!(view.editor().selection(), after_exit);
+
+            view.editor_mut().insert_text("xyz").unwrap();
+            view.after_input(cx);
+            let after_typing = Selection::caret(SourceOffset(16));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\nxyz");
+            assert_eq!(view.editor().selection(), after_typing);
+
+            view.dispatch(EditorCommand::Undo, cx);
+            assert_eq!(
+                view.editor().document().full_text(),
+                "- abc\n- def\n\n",
+                "the first undo must unwind only the typed text"
+            );
+            assert_eq!(view.editor().selection(), after_exit);
+
+            view.dispatch(EditorCommand::Undo, cx);
+            assert_eq!(
+                view.editor().document().full_text(),
+                "- abc\n- def\n- ",
+                "the second undo must unwind the exit itself"
+            );
+            assert_eq!(view.editor().selection(), before_exit);
+
+            view.dispatch(EditorCommand::Redo, cx);
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            assert_eq!(view.editor().selection(), after_exit);
+
+            view.dispatch(EditorCommand::Redo, cx);
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\nxyz");
+            assert_eq!(view.editor().selection(), after_typing);
+        });
+    }
+
+    /// Issue #472 (design spec IME contract, §11): an IME commit that starts
+    /// right after a list exit must land in ordinary document text, not
+    /// inside the exited ListItem's prefix. The committed text must end up
+    /// in a Paragraph with no ListItem ancestor.
+    #[gpui::test]
+    fn ime_commit_after_a_list_exit_lands_in_an_outside_paragraph(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("- abc\n- def\n- ", "Untitled", cx)
+        });
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+
+            view.editor_mut()
+                .replace_and_mark_text(None, "\u{306b}", Some(1..1))
+                .unwrap();
+            assert!(view.editor().ime().is_some());
+            view.editor_mut().commit_text(None, "\u{306b}").unwrap();
+            view.after_input(cx);
+
+            assert!(view.editor().ime().is_none());
+            let text = view.editor().document().full_text();
+            assert_eq!(text, "- abc\n- def\n\n\u{306b}");
+
+            let parsed =
+                hane_markdown::parse_document(Revision(1), SourceRange::new(0, text.len()), &text);
+            let committed_paragraph = parsed
+                .tree
+                .iter()
+                .find(|(_, node)| {
+                    matches!(node.kind, hane_markdown::NodeKind::Paragraph)
+                        && text[node.source_range.as_usize()].contains('\u{306b}')
+                })
+                .expect("expected a paragraph containing the committed text");
+            assert!(
+                !parsed
+                    .tree
+                    .ancestors(committed_paragraph.0)
+                    .skip(1)
+                    .any(|ancestor| matches!(
+                        parsed.tree.node(ancestor).map(|node| node.kind),
+                        Some(hane_markdown::NodeKind::ListItem { .. })
+                    )),
+                "the committed text must not be a descendant of a ListItem"
+            );
+        });
+    }
+
+    /// Issue #472 (design spec IME contract, §11): cancelling an IME
+    /// composition that started right after a list exit must restore
+    /// exactly the exited source and caret, without reintroducing the
+    /// removed list marker.
+    #[gpui::test]
+    fn ime_cancel_after_a_list_exit_restores_the_exited_source_without_a_list_prefix(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("- abc\n- def\n- ", "Untitled", cx)
+        });
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            let exited = Selection::caret(SourceOffset(13));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            assert_eq!(view.editor().selection(), exited);
+
+            view.editor_mut()
+                .replace_and_mark_text(None, "\u{306b}", Some(1..1))
+                .unwrap();
+            assert!(view.editor().ime().is_some());
+
+            view.perform_cancel_composition(cx);
+
+            assert!(view.editor().ime().is_none());
+            assert_eq!(
+                view.editor().document().full_text(),
+                "- abc\n- def\n\n",
+                "cancel must restore exactly the exited source, not reintroduce a list marker"
+            );
+            assert_eq!(view.editor().selection(), exited);
+        });
+    }
+
     #[test]
     fn every_line_resolves_to_its_markdown_block() {
         let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";
