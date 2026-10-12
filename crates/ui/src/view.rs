@@ -1177,7 +1177,14 @@ enum Granularity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HeightBlock {
     id: BlockId,
+    /// Document revision the owning `IndexedBlock` was parsed at. Included so
+    /// an edit that leaves range, line count, and estimated height unchanged
+    /// (e.g. inline text replaced within the same line) is still treated as a
+    /// change instead of reusing a stale measured height.
+    revision: Revision,
     line_count: usize,
+    source_range: SourceRange,
+    estimated_height_bits: u32,
 }
 
 const HEIGHT_BLOCK_CHUNK_TARGET: usize = 128;
@@ -1187,6 +1194,9 @@ struct HeightBlocks {
     chunks: Vec<Vec<HeightBlock>>,
     counts: Vec<usize>,
     len: usize,
+    /// Content width used to estimate and measure every entry in this height
+    /// snapshot. A width change invalidates wrapping-dependent measurements.
+    content_width_bits: Option<u32>,
 }
 
 impl FromIterator<HeightBlock> for HeightBlocks {
@@ -1200,6 +1210,7 @@ impl FromIterator<HeightBlock> for HeightBlocks {
             chunks,
             counts: Vec::new(),
             len: blocks.len(),
+            content_width_bits: None,
         };
         this.retree();
         this
@@ -1315,6 +1326,62 @@ fn rebase_ordinal_after_splice(
     anchor_id
         .and_then(|id| inserted.iter().position(|block| block.id == id))
         .map_or(replaced.start.min(new_len - 1), |at| replaced.start + at)
+}
+
+/// Keeps measured geometry across a formal index publication when the same
+/// block id and revision still has the same source range, line count, and
+/// initial height estimate at the same content width. A new parse must not
+/// temporarily replace measured heading heights with estimates while the user
+/// is typing near the bottom of a document, but a block whose revision changed
+/// must not inherit a measurement taken before the edit — its content may
+/// render at a different height even when range, line count, and initial
+/// estimate happen to match.
+fn preserve_measured_block_heights(
+    previous_blocks: &HeightBlocks,
+    previous_heights: &HeightIndex,
+    next_blocks: &HeightBlocks,
+    next_heights: &mut HeightIndex,
+) {
+    if previous_blocks.content_width_bits != next_blocks.content_width_bits {
+        return;
+    }
+
+    let mut measured = HashMap::with_capacity(previous_blocks.len());
+    for ordinal in 0..previous_blocks.len() {
+        let Some(block) = previous_blocks.get(ordinal) else {
+            continue;
+        };
+        let Some(height) = previous_heights.height(ordinal) else {
+            continue;
+        };
+        measured.insert(
+            (
+                block.id,
+                block.revision,
+                block.source_range.start.0,
+                block.source_range.end.0,
+                block.line_count,
+                block.estimated_height_bits,
+            ),
+            height,
+        );
+    }
+    for ordinal in 0..next_blocks.len() {
+        let Some(block) = next_blocks.get(ordinal) else {
+            continue;
+        };
+        let Some(height) = measured.get(&(
+            block.id,
+            block.revision,
+            block.source_range.start.0,
+            block.source_range.end.0,
+            block.line_count,
+            block.estimated_height_bits,
+        )) else {
+            continue;
+        };
+        next_heights.update(ordinal, *height);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4682,29 +4749,48 @@ impl EditorView {
     /// Swaps in a height index, keeping the reader where they were: the scroll
     /// position is carried across on the source offset at the top of the
     /// viewport, read before the swap and resolved after it.
-    fn install_heights(&mut self, granularity: Granularity, heights: HeightIndex) {
+    fn install_heights(&mut self, granularity: Granularity, mut heights: HeightIndex) {
         let anchor = self.top_source_offset();
         let intra = (!self.heights.is_empty()).then(|| {
             let item = self.heights.block_at_y(self.scroll_y);
             self.scroll_y - self.heights.prefix_sum(item)
         });
-        self.granularity = granularity;
-        self.heights = heights;
-        self.height_blocks = if granularity == Granularity::Blocks {
+        let mut next_height_blocks = if granularity == Granularity::Blocks {
             self.current_index()
                 .map(|index| {
                     index
                         .blocks()
-                        .map(|block| HeightBlock {
+                        .enumerate()
+                        .map(|(ordinal, block)| HeightBlock {
                             id: block.id,
+                            revision: block.revision,
                             line_count: block.line_count,
+                            source_range: block.source_range,
+                            estimated_height_bits: heights
+                                .height(ordinal)
+                                .unwrap_or_default()
+                                .to_bits(),
                         })
-                        .collect()
+                        .collect::<HeightBlocks>()
                 })
                 .unwrap_or_default()
         } else {
             HeightBlocks::default()
         };
+        if granularity == Granularity::Blocks {
+            next_height_blocks.content_width_bits = Some(self.content_width.to_bits());
+        }
+        if granularity == Granularity::Blocks && self.granularity == Granularity::Blocks {
+            preserve_measured_block_heights(
+                &self.height_blocks,
+                &self.heights,
+                &next_height_blocks,
+                &mut heights,
+            );
+        }
+        self.granularity = granularity;
+        self.heights = heights;
+        self.height_blocks = next_height_blocks;
         self.scroll_y = anchor.map_or(self.scroll_y, |offset| {
             let top = self.scroll_for_offset(offset);
             let item = self.heights.block_at_y(top);
@@ -4744,22 +4830,6 @@ impl EditorView {
         else {
             return false;
         };
-        let next = inserted
-            .iter()
-            .map(|block| HeightBlock {
-                id: block.id,
-                line_count: block.line_count,
-            })
-            .collect::<Vec<_>>();
-        if self.height_blocks.range_eq(first..old_end, &next) {
-            return true;
-        }
-        let old_top = (!self.heights.is_empty()).then(|| {
-            let ordinal = self.heights.block_at_y(self.scroll_y);
-            let id = self.height_blocks.get(ordinal).map(|block| block.id);
-            let intra = self.scroll_y - self.heights.prefix_sum(ordinal);
-            (id, ordinal, intra)
-        });
         let line_height = self.line_height();
         let disclosure = self.active_height_disclosure();
         let initial_heights = inserted
@@ -4774,6 +4844,26 @@ impl EditorView {
                 )
             })
             .collect::<Vec<_>>();
+        let next = inserted
+            .iter()
+            .zip(&initial_heights)
+            .map(|(block, estimated_height)| HeightBlock {
+                id: block.id,
+                revision: block.revision,
+                line_count: block.line_count,
+                source_range: block.source_range,
+                estimated_height_bits: estimated_height.to_bits(),
+            })
+            .collect::<Vec<_>>();
+        if self.height_blocks.range_eq(first..old_end, &next) {
+            return true;
+        }
+        let old_top = (!self.heights.is_empty()).then(|| {
+            let ordinal = self.heights.block_at_y(self.scroll_y);
+            let id = self.height_blocks.get(ordinal).map(|block| block.id);
+            let intra = self.scroll_y - self.heights.prefix_sum(ordinal);
+            (id, ordinal, intra)
+        });
         self.heights.splice(first..old_end, initial_heights);
         self.height_blocks.splice(first..old_end, &next);
 
@@ -11013,15 +11103,24 @@ mod tests {
         let inserted = [
             HeightBlock {
                 id: BlockId(20),
+                revision: Revision(0),
                 line_count: 1,
+                source_range: SourceRange::new(20, 21),
+                estimated_height_bits: 20.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(21),
+                revision: Revision(0),
                 line_count: 1,
+                source_range: SourceRange::new(21, 22),
+                estimated_height_bits: 21.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(22),
+                revision: Revision(0),
                 line_count: 1,
+                source_range: SourceRange::new(22, 23),
+                estimated_height_bits: 22.0_f32.to_bits(),
             },
         ];
         assert_eq!(
@@ -11047,22 +11146,34 @@ mod tests {
         let mut flat = (0..300)
             .map(|id| HeightBlock {
                 id: BlockId(id),
+                revision: Revision(0),
                 line_count: id as usize % 5 + 1,
+                source_range: SourceRange::new(id as usize, id as usize + 1),
+                estimated_height_bits: (id as f32).to_bits(),
             })
             .collect::<Vec<_>>();
         let mut blocks = flat.iter().copied().collect::<HeightBlocks>();
         let inserted = [
             HeightBlock {
                 id: BlockId(1_000),
+                revision: Revision(0),
                 line_count: 2,
+                source_range: SourceRange::new(1_000, 1_001),
+                estimated_height_bits: 1_000.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(1_001),
+                revision: Revision(0),
                 line_count: 3,
+                source_range: SourceRange::new(1_001, 1_002),
+                estimated_height_bits: 1_001.0_f32.to_bits(),
             },
             HeightBlock {
                 id: BlockId(1_002),
+                revision: Revision(0),
                 line_count: 4,
+                source_range: SourceRange::new(1_002, 1_003),
+                estimated_height_bits: 1_002.0_f32.to_bits(),
             },
         ];
         flat.splice(127..131, inserted);
@@ -11071,6 +11182,176 @@ mod tests {
         assert!(blocks.range_eq(0..flat.len(), &flat));
         assert_eq!(blocks.get(126), flat.get(126).copied());
         assert_eq!(blocks.get(130), flat.get(130).copied());
+    }
+
+    #[test]
+    fn full_height_rebuild_keeps_measurements_for_unchanged_source_blocks() {
+        let previous = [
+            HeightBlock {
+                id: BlockId(0),
+                revision: Revision(1),
+                line_count: 1,
+                source_range: SourceRange::new(0, 8),
+                estimated_height_bits: 53.0_f32.to_bits(),
+            },
+            HeightBlock {
+                id: BlockId(1),
+                revision: Revision(1),
+                line_count: 1,
+                source_range: SourceRange::new(8, 18),
+                estimated_height_bits: 49.0_f32.to_bits(),
+            },
+        ]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        let next = [
+            HeightBlock {
+                id: BlockId(0),
+                revision: Revision(1),
+                line_count: 1,
+                source_range: SourceRange::new(0, 8),
+                estimated_height_bits: 53.0_f32.to_bits(),
+            },
+            HeightBlock {
+                id: BlockId(1),
+                revision: Revision(1),
+                line_count: 1,
+                source_range: SourceRange::new(8, 18),
+                estimated_height_bits: 49.0_f32.to_bits(),
+            },
+            HeightBlock {
+                id: BlockId(2),
+                revision: Revision(1),
+                line_count: 1,
+                source_range: SourceRange::new(18, 22),
+                estimated_height_bits: 20.0_f32.to_bits(),
+            },
+        ]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        let previous_heights = HeightIndex::new([72.0, 58.0]);
+        let mut next_heights = HeightIndex::new([53.0, 49.0, 20.0]);
+
+        preserve_measured_block_heights(&previous, &previous_heights, &next, &mut next_heights);
+
+        assert_eq!(next_heights.height(0), Some(72.0));
+        assert_eq!(next_heights.height(1), Some(58.0));
+        assert_eq!(next_heights.height(2), Some(20.0));
+
+        let changed = [
+            HeightBlock {
+                id: BlockId(0),
+                revision: Revision(1),
+                line_count: 1,
+                source_range: SourceRange::new(0, 8),
+                estimated_height_bits: 42.9_f32.to_bits(),
+            },
+            next.get(1).unwrap(),
+            next.get(2).unwrap(),
+        ]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        let mut changed_heights = HeightIndex::new([42.9, 49.0, 20.0]);
+        preserve_measured_block_heights(
+            &previous,
+            &previous_heights,
+            &changed,
+            &mut changed_heights,
+        );
+        assert_eq!(changed_heights.height(0), Some(42.9));
+        assert_eq!(changed_heights.height(1), Some(58.0));
+        assert_eq!(changed_heights.height(2), Some(20.0));
+    }
+
+    /// Guards the CodeRabbit-reported regression where a background
+    /// re-reconciliation reused a stale measured height for a block whose
+    /// content changed (bumping its revision) without changing its source
+    /// range, line count, or initial height estimate.
+    #[test]
+    fn full_height_rebuild_does_not_inherit_measurement_across_a_revision_change() {
+        let previous = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(1),
+            line_count: 1,
+            source_range: SourceRange::new(0, 8),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        let previous_heights = HeightIndex::new([72.0]);
+
+        let unchanged = previous.clone();
+        let mut unchanged_heights = HeightIndex::new([53.0]);
+        preserve_measured_block_heights(
+            &previous,
+            &previous_heights,
+            &unchanged,
+            &mut unchanged_heights,
+        );
+        assert_eq!(
+            unchanged_heights.height(0),
+            Some(72.0),
+            "a block whose id, revision, range, line count, and estimate all \
+             match must keep the previously measured height"
+        );
+
+        let revised = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(2),
+            line_count: 1,
+            source_range: SourceRange::new(0, 8),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        let mut revised_heights = HeightIndex::new([53.0]);
+        preserve_measured_block_heights(
+            &previous,
+            &previous_heights,
+            &revised,
+            &mut revised_heights,
+        );
+        assert_eq!(
+            revised_heights.height(0),
+            Some(53.0),
+            "a revision bump must not inherit the old measured height even \
+             when range, line count, and estimate happen to match"
+        );
+    }
+
+    #[test]
+    fn full_height_rebuild_does_not_inherit_measurement_across_a_width_change() {
+        let mut previous = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(1),
+            line_count: 2,
+            source_range: SourceRange::new(0, 18),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        previous.content_width_bits = Some(720.0_f32.to_bits());
+        let previous_heights = HeightIndex::new([72.0]);
+
+        let mut next = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(1),
+            line_count: 2,
+            source_range: SourceRange::new(0, 18),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        next.content_width_bits = Some(960.0_f32.to_bits());
+        let mut next_heights = HeightIndex::new([53.0]);
+
+        preserve_measured_block_heights(&previous, &previous_heights, &next, &mut next_heights);
+
+        assert_eq!(
+            next_heights.height(0),
+            Some(53.0),
+            "a width change must not inherit a wrapping-dependent measurement"
+        );
     }
 
     #[test]
@@ -11233,6 +11514,120 @@ mod tests {
                 outside_old - update.replaced_blocks + update.inserted_blocks
             };
             assert_eq!(view.heights.height(outside_new), Some(measured));
+        });
+    }
+
+    /// Guards the CodeRabbit-reported regression where the incremental
+    /// equality check that decides whether a splice changed anything compared
+    /// id, range, line count, and estimated height, but not revision. A block
+    /// whose text changed without moving its boundaries or its line count
+    /// then looked unchanged and kept a height measured before the edit.
+    #[gpui::test]
+    fn apply_height_index_update_resets_height_when_only_revision_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "one\n\ntwo\n\nthree\n\nfour\n\nlast\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+
+        view.update(cx, |view, _cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+
+            let edited_ordinal = 2;
+            let edited_block = index
+                .block(edited_ordinal)
+                .expect("\"three\" block exists");
+            let estimate_before = view
+                .height_blocks
+                .get(edited_ordinal)
+                .expect("\"three\" height block exists")
+                .estimated_height_bits;
+
+            let stale_measured = 987.0;
+            let kept_measured = 123.0;
+            view.heights.update(edited_ordinal, stale_measured);
+            view.heights.update(0, kept_measured);
+
+            let replacement = "eerht";
+            let edited_text_start = source
+                .find("three")
+                .expect("fixture contains the edited paragraph text");
+            view.editor_mut()
+                .replace_range_recorded(
+                    SourceRange::new(edited_text_start, edited_text_start + "three".len()),
+                    replacement,
+                    Selection::caret(SourceOffset(
+                        edited_text_start + replacement.len(),
+                    )),
+                )
+                .unwrap();
+            let document = view.editor().document().clone();
+            let update = view
+                .block_index
+                .apply_edits(&document)
+                .expect("incremental index update");
+            assert!(
+                edited_ordinal >= update.first_replaced_block
+                    && edited_ordinal < update.first_replaced_block + update.replaced_blocks,
+                "the edit must land inside the window the incremental update replaces"
+            );
+
+            assert!(view.apply_height_index_update(&update));
+
+            let index = view.current_index().expect("current incremental index");
+            let updated_block = index
+                .block(edited_ordinal)
+                .expect("\"three\" block still exists");
+            assert_eq!(
+                updated_block.id, edited_block.id,
+                "the paragraph keeps its id across the in-place edit"
+            );
+            assert_eq!(
+                updated_block.source_range, edited_block.source_range,
+                "fixture keeps the block's source range identical across the edit"
+            );
+            assert_eq!(
+                updated_block.line_count, edited_block.line_count,
+                "fixture keeps the block's line count identical across the edit"
+            );
+            assert_ne!(
+                updated_block.revision, edited_block.revision,
+                "the edit must bump the block's revision"
+            );
+
+            let estimate_after = view
+                .height_blocks
+                .get(edited_ordinal)
+                .expect("\"three\" height block exists")
+                .estimated_height_bits;
+            assert_eq!(
+                estimate_before, estimate_after,
+                "fixture keeps the initial height estimate identical across the \
+                 edit so only the revision differs"
+            );
+
+            assert_ne!(
+                view.heights.height(edited_ordinal),
+                Some(stale_measured),
+                "a revision change must not keep reusing a height measured \
+                 before the edit, even when range, line count, and estimate match"
+            );
+            assert_eq!(
+                view.heights.height(0),
+                Some(kept_measured),
+                "a block outside the update window keeps its measured height"
+            );
         });
     }
 
