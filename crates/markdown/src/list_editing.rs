@@ -90,6 +90,15 @@ pub struct ListEditItem {
     pub body_indent_columns: usize,
     pub previous_sibling: Option<usize>,
     pub parent_item: Option<usize>,
+    /// Whether the formal parser owns this item (from
+    /// `MarkdownParse::list_item_markers`) rather than the opening-line-only
+    /// lexical recovery fallback below. A recovered candidate with no
+    /// confirmed link to a real list may just be ordinary text that happens
+    /// to look like a marker (see `exit_is_eligible`).
+    pub is_parser_item: bool,
+    /// Whether this item sits inside a blockquote. The opening line's bytes
+    /// include the quote marker, so a prefix edit here would also remove it.
+    pub in_quote: bool,
 }
 
 /// Exact-current-revision list metadata used by the input path. Unlike the
@@ -197,6 +206,12 @@ pub fn build_list_edit_projection(parsed: &MarkdownParse, source: &str) -> ListE
             parsed.source_range.start.0 + body_start_rel,
             parsed.source_range.start.0 + line_end_rel,
         );
+        let in_quote = parsed.tree.ancestors(*item_id).skip(1).any(|ancestor| {
+            matches!(
+                parsed.tree.node(ancestor).map(|node| node.kind),
+                Some(NodeKind::Quote)
+            )
+        });
         items.push(ListEditItem {
             item_range: item_node.source_range,
             subtree_range: SourceRange::new(
@@ -219,6 +234,8 @@ pub fn build_list_edit_projection(parsed: &MarkdownParse, source: &str) -> ListE
             body_indent_columns,
             previous_sibling: None,
             parent_item: None,
+            is_parser_item: true,
+            in_quote,
         });
     }
 
@@ -348,6 +365,8 @@ pub fn build_list_edit_projection(parsed: &MarkdownParse, source: &str) -> ListE
             body_indent_columns,
             previous_sibling: previous.map(|(index, _)| index),
             parent_item: parent_index,
+            is_parser_item: false,
+            in_quote: false,
         });
     }
 
@@ -578,6 +597,9 @@ pub fn plan_list_edit(
                 || (matches!(intent, ListEditIntent::Backspace)
                     && caret.0 <= item.body_range.start.0);
             if empty && empty_action && on_opening_line {
+                if !exit_is_eligible(&source, item) {
+                    return Ok(ListEditPlanResult::NotApplicable);
+                }
                 if item.depth <= 1 {
                     return Ok(ListEditPlanResult::Handled(exit_top_level_item(
                         &source, item,
@@ -609,6 +631,22 @@ pub fn plan_list_edit(
             }))
         }
     }
+}
+
+/// Whether an empty item is safe to collapse into its surrounding paragraph
+/// or outdent. Protects three cases the design calls "do not touch": a raw
+/// recovery candidate with no confirmed link to a real list (it may just be
+/// ordinary text that happens to look like a marker), an item still inside a
+/// blockquote (its opening line's bytes include the quote marker, so a
+/// prefix edit here would also remove it), and an item whose subtree reaches
+/// past its own opening line (nested content or a continuation paragraph
+/// that must keep its owning item).
+fn exit_is_eligible(source: &str, item: &ListEditItem) -> bool {
+    let trustworthy =
+        item.is_parser_item || item.parent_item.is_some() || item.previous_sibling.is_some();
+    let opening_line_only = item.subtree_range.end.0
+        <= line_end_inclusive(source.as_bytes(), item.prefix_range.start.0);
+    trustworthy && !item.in_quote && opening_line_only
 }
 
 /// Removes a top-level empty item's marker and, if needed, makes the
@@ -883,6 +921,61 @@ mod tests {
             ("- A\n\n\n- C".into(), 4)
         );
     }
+
+    fn not_applicable(text: &str, caret: usize, intent: ListEditIntent) -> bool {
+        let source_range = SourceRange::new(0, text.len());
+        let parsed = parse_document(Revision(1), source_range, text);
+        let projection = build_list_edit_projection(&parsed, text);
+        matches!(
+            plan_list_edit(
+                &RopeBuffer::from_text(text),
+                &projection,
+                SourceSelection::caret(SourceOffset(caret)),
+                intent,
+            )
+            .unwrap(),
+            ListEditPlanResult::NotApplicable
+        )
+    }
+
+    /// An item whose opening line is blank but which owns descendant content
+    /// (a nested sublist here) is not "empty": removing its marker would
+    /// orphan that content, so the item is not an exit target.
+    #[test]
+    fn empty_opening_line_with_nested_content_is_not_an_exit_target() {
+        let text = "- \n  - child";
+        assert!(not_applicable(text, 2, ListEditIntent::Backspace));
+        assert!(not_applicable(text, 2, ListEditIntent::Enter));
+    }
+
+    /// An empty item still inside a blockquote is left alone: its opening
+    /// line's bytes include the quote marker (`> `), and this exit operation
+    /// does not know how to edit around it without also removing that marker.
+    #[test]
+    fn empty_item_inside_quote_is_not_an_exit_target() {
+        let text = "> - A\n> - \n";
+        assert!(not_applicable(text, 10, ListEditIntent::Backspace));
+    }
+
+    /// A bare `- ` right after a plain paragraph, with no blank line between
+    /// them, cannot interrupt that paragraph per CommonMark, so it is not a
+    /// real list item — it is ordinary continuation text that only looks
+    /// like a marker. The lexical recovery fallback still records a
+    /// candidate for it (so Tab/Enter metadata stays available), but the
+    /// exit operation must not treat ordinary prose as a list to collapse.
+    #[test]
+    fn isolated_raw_marker_after_a_plain_paragraph_is_not_an_exit_target() {
+        let text = "para\n- ";
+        assert!(not_applicable(text, text.len(), ListEditIntent::Backspace));
+    }
+
+    /// A body made of non-ASCII whitespace (here U+3000 IDEOGRAPHIC SPACE) is
+    /// real content, not an empty item, even though it looks blank.
+    #[test]
+    fn non_ascii_whitespace_body_is_not_an_exit_target() {
+        let text = "- A\n- \u{3000}";
+        assert!(not_applicable(text, text.len(), ListEditIntent::Backspace));
+    }
 }
 
 fn find_task_marker(tree: &crate::MarkdownTree, id: NodeId) -> Option<SourceRange> {
@@ -1008,4 +1101,18 @@ fn line_end(source: &[u8], offset: usize) -> usize {
         .iter()
         .position(|byte| matches!(*byte, b'\n' | b'\r'))
         .map_or(source.len(), |at| offset + at)
+}
+
+/// The line's content end (see [`line_end`]) plus its own terminator, i.e.
+/// the start of the next physical line, or the source end if there is none.
+fn line_end_inclusive(source: &[u8], offset: usize) -> usize {
+    let end = line_end(source, offset);
+    if end >= source.len() {
+        return end;
+    }
+    if source[end] == b'\r' && source.get(end + 1) == Some(&b'\n') {
+        end + 2
+    } else {
+        end + 1
+    }
 }

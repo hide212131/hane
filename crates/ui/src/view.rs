@@ -10552,22 +10552,35 @@ mod tests {
             assert_eq!(empty_item.body_range, SourceRange::new(14, 14));
 
             assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(12)));
+            // Exiting the trailing empty item must also establish the
+            // paragraph boundary the design requires: a bare "\n" would
+            // still make the next typed line a lazy continuation of "def",
+            // so the exit inserts the blank line that separates them.
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(13)));
 
             let index = BlockIndex::from_buffer(view.editor().document());
             let projection = index
-                .list_edit_projection_at(view.editor().document(), SourceOffset(12))
+                .list_edit_projection_at(view.editor().document(), SourceOffset(13))
                 .expect("current projection after marker removal");
             assert!(
-                projection.item_at(SourceOffset(12)).is_none(),
+                projection.item_at(SourceOffset(13)).is_none(),
                 "the paragraph caret must no longer be owned by the preceding list item: {projection:#?}"
             );
 
             view.editor_mut().insert_text("xyz").unwrap();
             view.after_input(cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\nxyz");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(15)));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\nxyz");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(16)));
+
+            let index = BlockIndex::from_buffer(view.editor().document());
+            let projection = index
+                .list_edit_projection_at(view.editor().document(), SourceOffset(16))
+                .expect("current projection after typing the following paragraph");
+            assert!(
+                projection.item_at(SourceOffset(16)).is_none(),
+                "the typed paragraph must belong to the document, not the preceding list item: {projection:#?}"
+            );
         });
     }
 
