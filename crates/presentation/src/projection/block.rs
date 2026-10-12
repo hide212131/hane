@@ -652,11 +652,5 @@ fn present_joined_run_with_list_projection(
     }
 }
 
-/// Presents one physical source line with Phase 4 block polish. The block-level
-/// [`LineContext`] is supplied by the caller from the document context index;
-/// standalone image recognition is local to this source slice. Presentation owns
-/// every display-kind and style-run decision here so the UI renders purely by
-/// [`BlockKind`]/[`StyleKind`] without re-inspecting the source.
-
 #[cfg(test)]
 mod tests;
