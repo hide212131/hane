@@ -30,7 +30,8 @@ pub fn trailing_blank_lines(document: &RopeBuffer, span: &Range<usize>) -> usize
         .count()
 }
 
-/// Initial height of every block in the index, from the line height alone.
+/// Initial height of every block in the index, estimated from its display kind
+/// and physical line count.
 ///
 /// Seeds the [`crate::HeightIndex`] at block granularity, and is re-run whenever the
 /// block count changes. It uses the same block-local calculation as incremental
@@ -93,7 +94,14 @@ pub fn block_height_with_disclosure(
     } else {
         0
     };
-    line_height * block.line_count.saturating_sub(collapsed) as f32
+    let visible_lines = block.line_count.saturating_sub(collapsed);
+    let first_line_height = if visible_lines == 0 {
+        0.0
+    } else {
+        estimated_height(block_display_kind(block.kind), line_height)
+    };
+    first_line_height
+        + line_height * visible_lines.saturating_sub(1) as f32
         + line_height * trailing_empty_lines as f32
 }
 
