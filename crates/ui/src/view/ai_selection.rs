@@ -26,7 +26,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiServiceHandle, AiSnapshot, OperationId,
     OwnershipState, TextTransformErrorCode, TextTransformOutcome, UserPrompt, UserPrompts,
-    UserPromptsLoadError,
+    UserPromptsLoadError, initial_default_draft,
 };
 use hane_session::FileStateStore;
 use std::sync::mpsc::RecvTimeoutError;
@@ -45,6 +45,22 @@ const AI_SELECTION_RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
 /// `ai_selection_overlay_element`'s `max_h` and the below/above fit check in
 /// `ai_selection_overlay_position` so the two stay in sync.
 const AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT: f32 = 320.0;
+
+/// The built-in suggestion shown in the saved-prompt list only while nothing
+/// has ever been saved (`UserPromptsStore::load` returned `Ok(None)`),
+/// mirroring the settings page's own blank-state default
+/// (`ai_prompts::AiPromptsState::apply_load`'s `Ok(None)` branch). `id: 0` is
+/// never issued by `UserPromptsStore`, so this can never collide with a real
+/// saved prompt; running it (`ai_selection_run_saved_prompt`) only ever sends
+/// its `prompt` text and never persists it.
+fn default_saved_prompt() -> UserPrompt {
+    let draft = initial_default_draft();
+    UserPrompt {
+        id: 0,
+        title: draft.title,
+        prompt: draft.prompt,
+    }
+}
 
 /// One popup invocation's fixed target, captured once when it opens (section
 /// 4). `instance`+`revision` together detect both "a different document
@@ -188,10 +204,15 @@ impl AiSelectionState {
         }
         self.saved_prompts = match outcome {
             Ok(Some(prompts)) => prompts.prompts,
+            // Nothing has ever been saved: show the same built-in suggestion
+            // the settings page's own blank state shows
+            // (`ai_prompts::AiPromptsState::apply_load`'s `Ok(None)` branch),
+            // not an empty list — PR #450 review.
+            Ok(None) => vec![default_saved_prompt()],
             // A load failure must not pretend saved data exists; showing an
             // empty "未登録" list (rather than, say, retrying with a default)
             // is the honest answer for this read-only menu.
-            Ok(None) | Err(_) => Vec::new(),
+            Err(_) => Vec::new(),
         };
         // A reload can shrink or empty the list out from under a keyboard
         // focus that was pointed into it; never leave `list_focus_index`
@@ -2223,11 +2244,20 @@ mod tests {
         });
 
         // A reload landing while the list holds focus (e.g. the prompts were
-        // deleted from the settings page in another window) must not leave
-        // this pointed at an item that no longer exists.
+        // deleted from the settings page in another window, leaving a saved
+        // — not never-saved — empty list) must not leave this pointed at an
+        // item that no longer exists.
         view.update(cx, |view, cx| {
             let generation = view.ai_selection.prompts_load_generation;
-            view.ai_selection.apply_saved_prompts(generation, Ok(None));
+            view.ai_selection.apply_saved_prompts(
+                generation,
+                Ok(Some(UserPrompts {
+                    schema_version: hane_ai::USER_PROMPTS_SCHEMA_VERSION,
+                    revision: 1,
+                    next_id: 1,
+                    prompts: Vec::new(),
+                })),
+            );
             cx.notify();
         });
         cx.run_until_parked();
@@ -2236,6 +2266,58 @@ mod tests {
             assert!(view.ai_selection.saved_prompts.is_empty());
             assert_eq!(view.ai_selection.list_focus_index, None);
             assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+    }
+
+    #[gpui::test]
+    fn loading_saved_prompts_for_the_first_time_shows_the_built_in_default_suggestion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // `Ok(None)` ("the file has never been saved", per `UserPromptsStore::
+        // load`'s own doc comment) must show `initial_default_draft()`'s
+        // suggestion, not an empty list — mirroring the settings page's own
+        // blank-state default (`ai_prompts::AiPromptsState::apply_load`'s
+        // `Ok(None)` branch). A genuine load failure (`Err`) must still show
+        // the empty list, never this default.
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let generation = view.ai_selection.prompts_load_generation;
+            view.ai_selection.apply_saved_prompts(generation, Ok(None));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.saved_prompts, vec![default_saved_prompt()]);
+        });
+
+        view.update(cx, |view, cx| {
+            let generation = view.ai_selection.prompts_load_generation;
+            view.ai_selection.apply_saved_prompts(
+                generation,
+                Err(UserPromptsLoadError::Io(std::io::Error::other("boom"))),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.saved_prompts.is_empty());
         });
     }
 
