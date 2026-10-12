@@ -593,12 +593,12 @@ current-head CI [run 38223198052](https://github.com/hide212131/hane/actions/run
 
 ### 9.18 RF2-B: presentationの機械的分割 第5PR — block projection（#302 P5）
 
-P5実装PR [#475](https://github.com/hide212131/hane/pull/475) は、受入済みP4 base `feb846cb68bb9f0abf4dbfbd64722ce513a4076d` からblock組立をprivateな `projection/block.rs` へ分割する。検証済みcode headは `f1f6cc3086cd3607b2d7bc87edcdf41960bdec2c`。crate-rootの公開入口と親moduleの共有parse/indexを維持した。
+P5実装PR [#475](https://github.com/hide212131/hane/pull/475) は、block組立をprivateな `projection/block.rs` へ分割する。mainの#474が加えた見出し表示倍率に基づく初期高さ計算と回帰testを維持し、PR branchをcurrent main `20291f83ccfa5e4c238fe5a7de7f25983f22b3fc` へ同期した。P5の限定修正head `91ec96cc89934e38b5a2b7d9295871dd3ee10033`、base同期merge commit `43ea2d7cde1e167bedb2e83ab04ab3058de1d199`。
 
-code head `f1f6cc3` のtrusted verifier [run 38236527917](https://github.com/hide212131/hane/actions/runs/38236527917) とexact-head PR CI [run 38236675589](https://github.com/hide212131/hane/actions/runs/38236675589) は成功。CIではmacOS/Windows all-features workspace tests・ClippyとOS固有testが成功し、macOS arm64・Rust 1.98.1の通常構成 `cargo test --workspace --locked` も成功した。P4 baseとcode headのrustdocはいずれもexit 0、同じ9件の既存warning。`git diff --check` はexit 0。workspace全体の `cargo fmt --all -- --check` は既存format差分を検出して失敗し、P4 baseにもprojection内の同じ差分があったため、成功とは扱っていない。
+高さ計算の限定修正を対象にしたtrusted verifier [run 38240449733](https://github.com/hide212131/hane/actions/runs/38240449733) はworkspace all-features testsとClippyが成功。統合候補でmacOS arm64・Rust 1.98.1の通常構成 `cargo test --workspace --locked` とpresentation rustdocが成功し、rustdoc warningは従来と同じ9件。`git diff --check` は成功。workspace `cargo fmt --all -- --check` は既存format差分のため失敗し、成功とは扱っていない。
 
-P5前後でunit testは合計54件のまま。12件を `projection/block/tests.rs` へ移し、42件を親に残した。test名・属性・signature・関数本体は移動前後で同じ。詳細なシンボル表、12件の対応表、検証と復旧方法は [P5検証記録](refactor-rf2b-p5-evidence.md) にある。最終PR headの必須CI・CodeRabbit review・merge statusは [PR #475](https://github.com/hide212131/hane/pull/475) に記録する。UI配線・描画・layout・native inputを変更していないため、設計書§9.4に沿い追加GUI validationは不要と判断した。
+P5の元移動ではP4 baseのunit test 54件のうち12件を `projection/block/tests.rs` へ移し、42件を親に残した。test名・属性・signature・本体を維持した。mainの#474が追加した回帰testを含むcurrent統合候補は55件（親43件、block子module 12件）。シンボル表、test対応表、検証・復旧は [P5検証記録](refactor-rf2b-p5-evidence.md) にある。最終headの必須CI、CodeRabbit full review、未解決thread、merge statusは [PR #475](https://github.com/hide212131/hane/pull/475) に記録する。UI配線・描画・layout・native inputは変更していないため、設計書§9.4に沿い追加GUI validationは不要と判断した。
 
-RF2-B全体のP1〜P4受入記録は§9.14〜§9.17、P5の検証記録は本節を参照する。Issue #302はP1〜P5とIssue全体の受入条件を確認した後に完了する。
+RF2-B全体のP1〜P4受入記録は§9.14〜§9.17、P5の検証記録は本節を参照する。Issue #302はP1〜P5とIssue全体の受入条件を最終確認した後に完了する。
 
 （P1受入時点の履歴）P1のみ受入済みで、P2以降は未着手だった。Issue #302の他の受入条件が未完了のため、当時はIssueをopenのまま維持した。後続段階の進捗は§9.15〜§9.18に記録する。

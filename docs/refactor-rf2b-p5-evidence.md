@@ -1,15 +1,15 @@
 # RF2-B P5 検証記録 — block projection の分割
 
-確認日: 2026-10-12
-Issue: [#302](https://github.com/hide212131/hane/issues/302)
-実装PR: [#475](https://github.com/hide212131/hane/pull/475)
-設計: [`docs/refactor-rf2b-implementation-spec.md`](refactor-rf2b-implementation-spec.md) §4.2、§5.4、§6、§8〜§11
-
-この記録はP5の検証証拠をまとめる。ここに記載した `f1f6cc3086cd3607b2d7bc87edcdf41960bdec2c` は、実装コードを含む検証済みheadである。この後に追加する本記録と実行計画の変更は文書だけである。最終PR head、そのheadに対する必須CIと独立レビューの状態はPR #475のChecksとConversationを参照する。
+- 確認日: 2026-10-12
+- Issue: [#302](https://github.com/hide212131/hane/issues/302)
+- 実装PR: [#475](https://github.com/hide212131/hane/pull/475)
+- 設計: [`docs/refactor-rf2b-implementation-spec.md`](refactor-rf2b-implementation-spec.md) §4.2、§5.4、§6、§8〜§11
 
 ## 移動範囲とAPI
 
-受入済みP4 base `feb846cb68bb9f0abf4dbfbd64722ce513a4076d` から、block assemblyを親の `projection/mod.rs` からprivateな子module `projection/block.rs` へ分割した。
+P5の機械的分割は、受入済みP4 base `feb846cb68bb9f0abf4dbfbd64722ce513a4076d` からblock組立を親の `projection/mod.rs` からprivateな子module `projection/block.rs` へ移した。`f1f6cc3086cd3607b2d7bc87edcdf41960bdec2c` がこの移動の検証済みcode headである。
+
+mainには後続PR #474（commit `20291f83ccfa5e4c238fe5a7de7f25983f22b3fc`）が入り、block単位の初期高さ計算を見出し表示倍率へ対応させ、回帰testを追加した。移動後の同じ計算を保つため、Claude workerの限定修正commit `91ec96cc89934e38b5a2b7d9295871dd3ee10033` でそのロジックを `projection/block.rs` の移動先へ反映した。現在のPR候補にはmainをmerge commit `43ea2d7cde1e167bedb2e83ab04ab3058de1d199` で取り込み、P5のmodule移動とmainの変更を同じ履歴に含めた。
 
 | 責務 | `projection/block.rs`へ移した項目 | 親 `projection/mod.rs`に残した項目 |
 | --- | --- | --- |
@@ -18,11 +18,13 @@ Issue: [#302](https://github.com/hide212131/hane/issues/302)
 | block表示 | `present_block`、`present_block_with_list_projection`、`present_block_with_table_projection` | `parse_joined_block`、`parse_joined_span`と行生成補助 |
 | disclosureとjoined run | `disclosure_runs`、`run_uses_shared_parse`、`expected_disclosures`、`merged_disclosure`、`union_disclosure`、`joined_run_disclosure`、`present_joined_run_with_list_projection`、test-only `present_joined_run` | parse結果とindexの所有権、再利用条件 |
 
-`projection/block.rs`はprivateのままにした。crate rootの `lib.rs` に差分はなく、従来の公開名を親moduleから再exportしている。新しい外部公開名、adapter、重複実装は加えていない。P5差分はMarkdownのblock組立配置だけで、処理順、条件、fallback、source/visual契約は変えていない。
+`projection/block.rs`はprivateのままにした。crate rootの `lib.rs` に差分はなく、従来の公開名を親moduleから再exportしている。新しい外部公開名、adapter、重複実装は加えていない。#474の見出し高さ計算はP5の移動先で維持した。
 
 ## unit testの移動
 
-P4 baseでは `projection/tests.rs` に54件あったunit testが、P5後も合計54件である。12件を `projection/block/tests.rs` へ移し、42件を親の `projection/tests.rs` に残した。移動前後でtest名、`#[test]`属性、signatureと関数本体を比較し、差分がないことを確認した。追加・削除されたtestはない。
+P4 baseには `projection/tests.rs` に54件のunit testがあった。P5の移動時点でも合計54件で、そのうち12件を `projection/block/tests.rs` へ移し、42件を親に残した。移動前後でtest名、`#[test]`属性、signatureと関数本体を比較し、移動した12件は同一であることを確認した。
+
+その後mainの#474が `initial_block_heights_account_for_heading_scale_and_trailing_blank_lines` を追加した。現在の統合候補にはこれを1件だけ保持し、親に43件、block子moduleに12件、合計55件ある。P5によるtestの追加・削除はない。
 
 | 移動前 | 移動後 |
 | --- | --- |
@@ -43,21 +45,16 @@ P4 baseでは `projection/tests.rs` に54件あったunit testが、P5後も合�
 
 | 確認 | 対象 | 結果 |
 | --- | --- | --- |
-| Trusted verifier [run #38236527917](https://github.com/hide212131/hane/actions/runs/38236527917) | code head `f1f6cc3`; `cargo test --workspace --all-features --locked` と `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | 成功 |
-| PR CI [run #38236675589](https://github.com/hide212131/hane/actions/runs/38236675589), attempt 2 | code head `f1f6cc3`; macOS・Windows all-features workspace testsとClippy、macOS固有2件、Windows IME通知test | 成功 |
-| 通常構成 workspace tests | macOS arm64、Rust 1.98.1、`cargo test --workspace --locked`、code head `f1f6cc3` | exit 0 |
-| presentation rustdoc | P4 baseとcode head `f1f6cc3`、`cargo doc --locked -p hane-presentation --no-deps` | 両方exit 0。warningは両方9件で同一。private itemへの既存リンクとtest-only `present_joined_run`への既存リンクで、P5による増加なし |
-| `git diff --check` | P4 baseからcode head `f1f6cc3` | exit 0 |
-| `cargo fmt --all -- --check` | workspace全体 | **失敗**。多数の既存format差分を検出。P4 baseにも `projection/mod.rs` と `projection/tests.rs` の同じ既存差分があり、移したtest本体も移動前と同じ内容だった。修正範囲外を一括formatせず、P5でformat checkが成功したとは扱わない |
+| Trusted verifier [run #38236527917](https://github.com/hide212131/hane/actions/runs/38236527917) とPR CI [run #38236675589](https://github.com/hide212131/hane/actions/runs/38236675589), attempt 2 | 当初のP5 code head `f1f6cc3` | all-features workspace tests、macOS/Windows CI、ClippyとOS固有testが成功。後続main同期前の履歴として記録 |
+| Claude fix verifier [run #38240449733](https://github.com/hide212131/hane/actions/runs/38240449733) | `91ec96cc`。#474高さ計算を移動先へ反映 | workspace all-features regression testsとClippyが成功 |
+| macOS通常構成workspace tests | 統合候補merge commit `43ea2d7c`、macOS arm64、Rust 1.98.1、`cargo test --workspace --locked` | exit 0 |
+| presentation rustdoc | 同じ統合候補、`cargo doc --locked -p hane-presentation --no-deps` | exit 0、9件のwarning。P4 baseと元P5 code headでも同じ9件で、private itemへの既存リンクとtest-only `present_joined_run`への既存リンク |
+| base同期と差分 | current main `20291f83` と統合候補 `43ea2d7c` | current mainはPR branchの祖先。P5の子module移動、共有API、既存testの差分が残り、`git diff --check` はexit 0 |
+| current PR head CI / CodeRabbit full review / merge | 文書更新後の最終PR head | 対象head、base、実行状態と結果を[PR #475](https://github.com/hide212131/hane/pull/475)に記録する |
+| `cargo fmt --all -- --check` | Rust 1.98.1、workspace全体 | **失敗**。workspaceの広い既存format差分を検出。P4 baseからの確認でもprojection内に同じ差分があり、今回format成功とは扱わない |
 
-macOS/Windowsのall-features CIは、通常構成で無効になるcfgの動作まで代替したものではない。通常構成は別途、上記macOS Rust 1.98.1のworkspace testで確認した。
+macOS/Windowsのall-features CIは通常構成で無効になるcfgの動作を代替しないため、通常構成は上記macOS workspace testで別に確認した。P5はUI配線・描画・layout・native inputを変更していない。設計書§9.4に沿い、追加の実画面検証は不要と判断した。性能測定は行わず、性能改善は主張しない。
 
-## GUI、性能、復旧
+## 復旧
 
-UI配線、描画、layout、native inputに変更はない。設計書§9.4に照らして新規の実画面検証は不要と判断した。性能測定は行っておらず、性能改善を主張しない。
-
-分割を戻す場合はPR #475のrevertを使う。後続の変更が `projection/block.rs` に入った場合は、該当する変更を確認してから戻す。
-
-## 最終受入の参照
-
-上記CI・通常構成・API/test移動比較は検証済みcode head `f1f6cc3` に対する記録である。文書だけを更新した最終PR headの必須CI、CodeRabbit full review、未解決thread、merge結果は[PR #475](https://github.com/hide212131/hane/pull/475)に記録する。Issue #302はP1〜P5とIssue全体の受入条件を確認するまでopenのままにする。
+分割を戻す場合はPR #475のrevertを使う。後続の変更が `projection/block.rs` に入った場合は、該当変更を確認してから戻す。最終PR headのCI、review、未解決thread、merge結果はPR #475に記録する。
