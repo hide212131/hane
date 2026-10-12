@@ -112,7 +112,8 @@ pub fn trailing_blank_lines(document: &RopeBuffer, span: &Range<usize>) -> usize
         .count()
 }
 
-/// Initial height of every block in the index, from the line height alone.
+/// Initial height of every block in the index, estimated from its display kind
+/// and physical line count.
 ///
 /// Seeds the [`HeightIndex`] at block granularity, and is re-run whenever the
 /// block count changes. It uses the same block-local calculation as incremental
@@ -175,7 +176,14 @@ pub fn block_height_with_disclosure(
     } else {
         0
     };
-    line_height * block.line_count.saturating_sub(collapsed) as f32
+    let visible_lines = block.line_count.saturating_sub(collapsed);
+    let first_line_height = if visible_lines == 0 {
+        0.0
+    } else {
+        estimated_height(block_display_kind(block.kind), line_height)
+    };
+    first_line_height
+        + line_height * visible_lines.saturating_sub(1) as f32
         + line_height * trailing_empty_lines as f32
 }
 
@@ -3582,6 +3590,18 @@ pub fn present_markdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_block_heights_account_for_heading_scale_and_trailing_blank_lines() {
+        let document = RopeBuffer::from_text("# title\n\n## section\n\nbody\n");
+        let index = BlockIndex::from_buffer(&document);
+
+        assert_eq!(
+            block_heights(&document, &index, 20.0),
+            vec![53.0, 49.0, 40.0],
+            "heading rows use their display scale and blank rows keep normal height"
+        );
+    }
 
     #[test]
     fn initial_block_heights_keep_the_caret_owned_fence_row_visible() {
