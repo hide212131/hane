@@ -971,8 +971,7 @@ impl EditorView {
     /// A saved prompt's title was clicked/activated: its body is sent
     /// immediately, never combined with whatever is in the free-text field.
     fn ai_selection_run_saved_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
-        let prompt = prompt.trim().to_owned();
-        if prompt.is_empty() {
+        if prompt.trim().is_empty() {
             return;
         }
         self.ai_selection_start(prompt, cx);
@@ -2475,6 +2474,98 @@ mod tests {
             );
             assert!(view.ai_selection.open);
             assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn saved_prompt_with_surrounding_whitespace_is_sent_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // The saved prompt's own body has leading/trailing whitespace and an
+        // internal newline, exactly as `ai_prompts.rs` would persist it. Only
+        // the all-whitespace check may trim; the value actually sent must
+        // stay byte-for-byte identical to what was saved.
+        let padded_prompt = "  直して\n直す\t\n".to_owned();
+        view.update(cx, |view, cx| {
+            view.ai_selection.saved_prompts = vec![saved_prompt(1, &padded_prompt)];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::List);
+            assert_eq!(view.ai_selection.list_focus_index, Some(0));
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.confirmed_instruction, padded_prompt);
+            assert_eq!(
+                view.ai_selection.message.as_deref(),
+                Some("AIサービスを利用できません。")
+            );
+            assert!(view.ai_selection.open);
+            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+        });
+    }
+
+    #[gpui::test]
+    fn whitespace_only_saved_prompt_is_rejected_without_sending(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.ai_selection
+                .saved_prompts
+                .push(saved_prompt(1, " \n\t "));
+            let prompt = view.ai_selection.saved_prompts[0].prompt.clone();
+            view.ai_selection_run_saved_prompt(prompt, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.confirmed_instruction.is_empty());
+            assert!(view.ai_selection.message.is_none());
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
         });
     }
 
