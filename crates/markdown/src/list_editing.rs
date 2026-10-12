@@ -895,8 +895,7 @@ mod tests {
         let last_paragraph = parsed
             .tree
             .iter()
-            .filter(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
-            .next_back()
+            .rfind(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
             .expect("expected a trailing paragraph for \"ghi\"");
         assert!(
             !parsed
