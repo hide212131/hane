@@ -1317,13 +1317,17 @@ mod tests {
                 SourceRange::new(0, after_exit.len()),
                 &after_exit,
             );
+            // Ancestor ListItems' ranges span their descendants, so every
+            // ListItem enclosing "c" matches this filter; pick the one with
+            // the smallest range, i.e. the innermost (deepest) item itself.
             let child_item = parsed
                 .tree
                 .iter()
-                .find(|(_, node)| {
+                .filter(|(_, node)| {
                     matches!(node.kind, NodeKind::ListItem { .. })
                         && after_exit[node.source_range.as_usize()].contains('c')
                 })
+                .min_by_key(|(_, node)| node.source_range.len_bytes())
                 .map(|(id, _)| id)
                 .unwrap_or_else(|| {
                     panic!("{intent:?}: expected a ListItem containing \"c\" in {after_exit:?}")
