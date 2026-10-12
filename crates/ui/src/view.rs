@@ -1194,6 +1194,9 @@ struct HeightBlocks {
     chunks: Vec<Vec<HeightBlock>>,
     counts: Vec<usize>,
     len: usize,
+    /// Content width used to estimate and measure every entry in this height
+    /// snapshot. A width change invalidates wrapping-dependent measurements.
+    content_width_bits: Option<u32>,
 }
 
 impl FromIterator<HeightBlock> for HeightBlocks {
@@ -1207,6 +1210,7 @@ impl FromIterator<HeightBlock> for HeightBlocks {
             chunks,
             counts: Vec::new(),
             len: blocks.len(),
+            content_width_bits: None,
         };
         this.retree();
         this
@@ -1326,17 +1330,22 @@ fn rebase_ordinal_after_splice(
 
 /// Keeps measured geometry across a formal index publication when the same
 /// block id and revision still has the same source range, line count, and
-/// initial height estimate. A new parse must not temporarily replace measured
-/// heading heights with estimates while the user is typing near the bottom of
-/// a document, but a block whose revision changed must not inherit a
-/// measurement taken before the edit — its content may render at a different
-/// height even when range, line count, and initial estimate happen to match.
+/// initial height estimate at the same content width. A new parse must not
+/// temporarily replace measured heading heights with estimates while the user
+/// is typing near the bottom of a document, but a block whose revision changed
+/// must not inherit a measurement taken before the edit — its content may
+/// render at a different height even when range, line count, and initial
+/// estimate happen to match.
 fn preserve_measured_block_heights(
     previous_blocks: &HeightBlocks,
     previous_heights: &HeightIndex,
     next_blocks: &HeightBlocks,
     next_heights: &mut HeightIndex,
 ) {
+    if previous_blocks.content_width_bits != next_blocks.content_width_bits {
+        return;
+    }
+
     let mut measured = HashMap::with_capacity(previous_blocks.len());
     for ordinal in 0..previous_blocks.len() {
         let Some(block) = previous_blocks.get(ordinal) else {
@@ -4746,7 +4755,7 @@ impl EditorView {
             let item = self.heights.block_at_y(self.scroll_y);
             self.scroll_y - self.heights.prefix_sum(item)
         });
-        let next_height_blocks = if granularity == Granularity::Blocks {
+        let mut next_height_blocks = if granularity == Granularity::Blocks {
             self.current_index()
                 .map(|index| {
                     index
@@ -4768,6 +4777,9 @@ impl EditorView {
         } else {
             HeightBlocks::default()
         };
+        if granularity == Granularity::Blocks {
+            next_height_blocks.content_width_bits = Some(self.content_width.to_bits());
+        }
         if granularity == Granularity::Blocks && self.granularity == Granularity::Blocks {
             preserve_measured_block_heights(
                 &self.height_blocks,
@@ -11304,6 +11316,41 @@ mod tests {
             Some(53.0),
             "a revision bump must not inherit the old measured height even \
              when range, line count, and estimate happen to match"
+        );
+    }
+
+    #[test]
+    fn full_height_rebuild_does_not_inherit_measurement_across_a_width_change() {
+        let mut previous = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(1),
+            line_count: 2,
+            source_range: SourceRange::new(0, 18),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        previous.content_width_bits = Some(720.0_f32.to_bits());
+        let previous_heights = HeightIndex::new([72.0]);
+
+        let mut next = [HeightBlock {
+            id: BlockId(0),
+            revision: Revision(1),
+            line_count: 2,
+            source_range: SourceRange::new(0, 18),
+            estimated_height_bits: 53.0_f32.to_bits(),
+        }]
+        .into_iter()
+        .collect::<HeightBlocks>();
+        next.content_width_bits = Some(960.0_f32.to_bits());
+        let mut next_heights = HeightIndex::new([53.0]);
+
+        preserve_measured_block_heights(&previous, &previous_heights, &next, &mut next_heights);
+
+        assert_eq!(
+            next_heights.height(0),
+            Some(53.0),
+            "a width change must not inherit a wrapping-dependent measurement"
         );
     }
 
