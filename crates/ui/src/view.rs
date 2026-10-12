@@ -20322,5 +20322,26 @@ mod tests {
             assert_eq!(rename.text, "z");
             assert_eq!(rename.selected_range, 0..0);
         });
+
+        // Forward Delete from immediately after the combining grapheme must
+        // remove the whole following ZWJ emoji sequence and leave the caret
+        // at the same byte offset. Neither unrelated input target may change.
+        view.update(cx, |view, cx| {
+            let rename = view.inline_rename.as_mut().unwrap();
+            rename.text = text.to_owned();
+            rename.selected_range = combining_end..combining_end;
+            rename.selection_reversed = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("delete");
+        view.read_with(cx, |view, _| {
+            let rename = view.inline_rename.as_ref().unwrap();
+            assert_eq!(rename.text, "a\u{301}z");
+            assert_eq!(rename.selected_range, combining_end..combining_end);
+            assert_eq!(view.editor().document().full_text(), "placeholder\n");
+            assert_eq!(view.sidebar_filter, "");
+        });
     }
 }

@@ -59,19 +59,31 @@ PR-triggered CI run 38256599965の初回attemptは`action_required`・jobなし�
 
 すべて一時ファイル上で行い、最後に本文とファイル名が元の内容であることを確認した。この手動確認はmacOSの直接入力経路を対象とし、Windows GUI確認や日本語IMEの受入確認を代替しない。
 
+2026-10-13にWindows 11 ARM64で、PR head `c3bd89c811668cc1d5c83c9bc5e095cdd3214c20`の製品コードを`cargo build --locked -p hane`でビルドし、一時fixtureと専用`HANE_STATE_DIR`で画面確認した。後続のこのPR内変更はテストと記録のみで、製品コードは変わっていない。
+
+| 操作 | 結果 |
+|---|---|
+| `RouteTarget.md`本文でRightを4回、Backspace、Ctrl+Z | 一時本文が変更され、Undoで`Route body fixture`へ復元 |
+| sidebar filterに`Body`を入力してから消去 | 一覧だけが`BodyTarget.md`へ絞られ、本文は`Route body fixture`のまま。消去後は全fixtureが再表示 |
+| `RenameTarget.md`のinline renameでBackspace、Escape | 名前欄が空になり、Escapeで`RenameTarget.md`へ戻る。本文`Rename fixture`を保持 |
+| 本文検索へ`fixture`を入力 | 2文書の検索結果が表示され、本文`Rename fixture`は不変 |
+
+確認は一時fixtureのみを使い、ユーザーデータへは触れていない。操作の最初のclickはVMの入力captureに使われる場合があるため、欄のフォーカスを画面で確認してから入力した。
+
 Hosted macOS GUI run [38258736475](https://github.com/hide212131/hane/actions/runs/38258736475) は同じcandidate head `c7fa87e`で実施した。clean build、本文のASCII編集・保存・Undo/Redo・再オープン、基本的な日本語IME composition、OS scroll、GPUI click/source-offset probe（8/8）は成功。包括シナリオは`inline_syntax_boundary`で失敗した。OCR box clickがcanonical offsetと一致せず、procedure自身が独立した製品失敗として扱わないよう記録している。併せて観測されたUp移動、IME Undo、drag selection、formatting toggle/save/reopenの結果はP2/P3またはIssue #101由来の既知境界ケースを含むため、このrun単独でP1 routingの合否を決めない。[evidence artifact](https://github.com/hide212131/hane/actions/runs/38258736475)を参照。
 
-CodeRabbit full reviewは記録更新直前head `25c5249`・base `c17dd0e`を対象に完了した（run `ee08b3b0-8027-45b8-b0c4-ea560c2be801`、[review 5492367991](https://github.com/hide212131/hane/pull/477#pullrequestreview-5492367991)）。1件のnitpickはinline renameのUnicode前方Deleteのaction-path test追加。確認した現行経路ではDeleteが既存の`next_inline_rename_boundary`を呼び、そのhelperのgrapheme境界は既存unit testで確認済みである。Jev dispositionは`follow_up`で、現行PRの製品不具合ではなく追加テスト候補として記録する。該当するaction-path testがない点は残るため、後続候補として扱う。
+CodeRabbit full reviewは記録更新直前head `25c5249`・base `c17dd0e`を対象に完了した（run `ee08b3b0-8027-45b8-b0c4-ea560c2be801`、[review 5492367991](https://github.com/hide212131/hane/pull/477#pullrequestreview-5492367991)）。1件のnitpickはinline renameのUnicode前方Deleteのaction-path test追加。レビュー指摘に沿い、結合文字直後のDeleteでZWJ emoji全体を除去し、カーソル位置と本文/filterの不変を確認するaction-path testを追加した。対象testはmacOSで成功。PRの現headでの独立full reviewは未実施。
 
 ## 受入に残る確認
 
 | 確認 | 状態 |
 |---|---|
 | macOS P1直接画面確認 | 完了（上記一時アプリ） |
-| Windows P1直接画面確認 | 未実施 |
+| Windows P1直接画面確認 | 完了（上記Windows 11 ARM64、一時fixture） |
 | 記録更新前head `25c5249`のCodeRabbit full review | 完了（上記review）。1件のtest-only follow-up findingを記録 |
-| 記録更新後headのcurrent-head CI | 未実施。今回のcommitはこの記録のみを変更する |
-| 記録更新後headのCodeRabbit full review | 未実施。current-head CI成功後、利用枠が戻ったら再依頼する |
+| action-path Delete回帰test | 完了。macOS targeted test 1件成功 |
+| 現headのcurrent-head CI | 未実施。test-only変更と記録をpush後に確認する |
+| 現headのCodeRabbit full review | 未実施。利用枠が戻ったら再依頼する |
 | final head/base・差分・復旧方法の記録 | 未完了 |
 
-P1はまだ受入済みではない。このPRはopen、Issue #304もopenのまま。Windows画面確認、記録更新後headのCI、CodeRabbit full review、最終差分と復旧方法を確認してから受入を判断する。未実施の確認をpassとして扱わない。
+P1はまだ受入済みではない。このPRはopen、Issue #304もopenのまま。現headのCI、CodeRabbit full review、最終差分と復旧方法を確認してから受入を判断する。未実施の確認をpassとして扱わない。
