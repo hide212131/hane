@@ -2,19 +2,16 @@
 //! (Issue #449), against the same fake App Server fixture the Probe
 //! integration tests use.
 //!
-//! Per `crate::text_transform`'s module doc comment, a later current-head
-//! review ([PR #450 review](https://github.com/hide212131/hane/pull/450#pullrequestreview-5485871355))
-//! and Issue #449 established that this operation's previous reliance on
-//! `sandbox: "read-only"` / `approvalPolicy: "never"` plus mid-turn
-//! `ProbeCollector::has_unsafe_tool_activity` detection/interrupt is not a
-//! verified pre-execution tool-denial boundary (it only observes a tool item
-//! the App Server already started). `execute_text_transform` now fails
-//! closed unconditionally before it would call `thread/start`/`turn/start`,
-//! so this suite instead asserts that `instruction`/`selected_text` never
-//! reach the fake App Server fixture at all, regardless of how far the
-//! request was admitted. The shared `ProbeCollector`/interrupt logic itself
-//! remains covered via the fixed Probe's own integration tests in
-//! `account_service.rs` (e.g.
+//! Per `crate::text_transform`'s module doc comment, this operation runs
+//! over the existing ChatGPT/Codex or Custom Provider App Server connection
+//! under the same `sandbox: "read-only"` / `approvalPolicy: "never"` plus
+//! mid-turn `ProbeCollector::has_unsafe_tool_activity` boundary the fixed
+//! Probe uses: `instruction`/`selected_text` are sent as this operation's own
+//! structured `turn/start` input, a detected tool/command item still fails
+//! the request as `SafetyProfileUnsupported` rather than being treated as a
+//! success, and the open document's content is never added to that input.
+//! The shared `ProbeCollector`/interrupt logic itself is also covered via the
+//! fixed Probe's own integration tests in `account_service.rs` (e.g.
 //! `interrupt_ack_alone_does_not_release_probe_guard_before_child_stops`,
 //! `probe_tool_item_start_is_not_reported_as_success`), since
 //! `text_transform.rs` shares that code with `probe.rs`.
@@ -162,7 +159,7 @@ fn prepare_connected_service(scenario: &str) -> (AiService, PathBuf) {
 }
 
 #[test]
-fn text_transform_fails_closed_before_the_app_server_ever_sees_the_request() {
+fn text_transform_succeeds_over_the_app_server_without_sending_the_open_document() {
     let (service, data_root) = prepare_connected_service("probe_success");
     std::fs::write(
         data_root.join("open-document.md"),
@@ -175,34 +172,59 @@ fn text_transform_fails_closed_before_the_app_server_ever_sees_the_request() {
     let (id, reply_rx) = handle
         .try_submit_text_transform(instruction.to_owned(), selected_text.to_owned())
         .unwrap();
-    assert_eq!(
-        wait_for_result(&service, id),
-        SafeOperationResult::Failed(
-            TextTransformErrorCode::PreExecutionToolDenialUnverified.stable_code()
-        )
-    );
+    assert_eq!(wait_for_result(&service, id), SafeOperationResult::Succeeded);
 
     let outcome = reply_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("the request's own reply channel delivers exactly one outcome");
     assert_eq!(
         outcome,
-        TextTransformOutcome::Failed(TextTransformErrorCode::PreExecutionToolDenialUnverified)
+        TextTransformOutcome::Succeeded {
+            text: "Mock reply".to_owned()
+        }
     );
 
-    // Pending a verified pre-execution tool-denial mechanism, neither this
-    // request's selected_text/instruction nor the open document's content
-    // ever reach the App Server fixture.
+    // The request's own structured input carried instruction/selected_text,
+    // but never the open document's content.
     let record = std::fs::read_to_string(
         data_root.join("ai/codex-chatgpt/.hane-fake-app-server-probe-record"),
     )
     .unwrap_or_default();
-    assert!(find_turn_start_with_selected_text(&record, selected_text).is_none());
+    let turn_start = find_turn_start_with_selected_text(&record, selected_text)
+        .expect("turn/start must carry this request's selected_text");
+    let input_text = turn_start["input"][0]["text"].as_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(input_text).unwrap();
+    assert_eq!(payload["instruction"], instruction);
     assert!(!record.contains("DO_NOT_SEND_DOCUMENT_449"));
 
-    // The snapshot never carries this operation's text either.
-    let snapshot = handle.snapshot();
-    assert!(!format!("{snapshot:?}").contains(selected_text));
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[test]
+fn text_transform_fails_as_safety_profile_unsupported_on_a_mid_turn_tool_item() {
+    let (service, data_root) = prepare_connected_service("probe_tool_item");
+    let handle = service.handle();
+    let selected_text = "選択テキスト";
+    let (id, reply_rx) = handle
+        .try_submit_text_transform("校正する".to_owned(), selected_text.to_owned())
+        .unwrap();
+    assert_eq!(
+        wait_for_result(&service, id),
+        SafeOperationResult::Failed(
+            TextTransformErrorCode::SafetyProfileUnsupported.stable_code()
+        )
+    );
+    assert_eq!(
+        reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        TextTransformOutcome::Failed(TextTransformErrorCode::SafetyProfileUnsupported)
+    );
+
+    // The request itself was still sent (this is mid-turn detection, not
+    // pre-execution denial), but the detected tool item must never be
+    // reported as a success, and the turn must be interrupted.
+    let record = wait_for_probe_record(&data_root, "INTERRUPT_ACK");
+    assert!(find_turn_start_with_selected_text(&record, selected_text).is_some());
 
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);
@@ -245,27 +267,22 @@ fn text_transform_is_rejected_as_busy_while_a_probe_is_in_flight_and_is_admitted
     assert_eq!(wait_for_result(&service, probe_id), SafeOperationResult::Canceled);
 
     // Once the Probe has released the guard, a text transform is admitted
-    // again (the busy check above was about admission, not this gate), but
-    // it still fails closed immediately rather than reaching the App Server.
+    // again (the busy check above was about admission, not this gate), and
+    // this time it reaches the App Server, which this scenario leaves the
+    // turn pending on until interrupted.
     let selected_text = "選択テキスト";
     let (id, reply_rx) = handle
         .try_submit_text_transform("校正する".to_owned(), selected_text.to_owned())
         .unwrap();
-    assert_eq!(
-        wait_for_result(&service, id),
-        SafeOperationResult::Failed(
-            TextTransformErrorCode::PreExecutionToolDenialUnverified.stable_code()
-        )
-    );
+    let record = wait_for_probe_record(&data_root, selected_text);
+    assert!(find_turn_start_with_selected_text(&record, selected_text).is_some());
+
+    handle.cancel(id).unwrap();
+    assert_eq!(wait_for_result(&service, id), SafeOperationResult::Canceled);
     assert_eq!(
         reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-        TextTransformOutcome::Failed(TextTransformErrorCode::PreExecutionToolDenialUnverified)
+        TextTransformOutcome::Canceled
     );
-    let record = std::fs::read_to_string(
-        data_root.join("ai/codex-chatgpt/.hane-fake-app-server-probe-record"),
-    )
-    .unwrap_or_default();
-    assert!(!record.contains(selected_text));
 
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);

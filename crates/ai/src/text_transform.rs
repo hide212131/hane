@@ -19,46 +19,29 @@
 //! ever put `selected_text` on the wire.
 //!
 //! Per the PR #450 discussion resuming this operation over the existing
-//! App Server connection, this module relied on the same boundary the fixed
-//! Probe already runs under — `sandbox: "read-only"` / `approvalPolicy:
+//! App Server connection, this module runs under the same boundary the
+//! fixed Probe already runs under — `sandbox: "read-only"` / `approvalPolicy:
 //! "never"` plus [`crate::probe::ProbeCollector::has_unsafe_tool_activity`]'s
-//! mid-turn interrupt — so a detected tool/command item failed the request
+//! mid-turn interrupt — so a detected tool/command item fails the request
 //! as `SafetyProfileUnsupported` rather than being treated as a success.
 //!
-//! A later current-head review
+//! An earlier current-head review
 //! ([PR #450 review](https://github.com/hide212131/hane/pull/450#pullrequestreview-5485871355))
-//! and Issue #449 ("外部ファイル読込・シェル・ツール実行を許可しない") established that this is
-//! not sufficient: `has_unsafe_tool_activity` only observes an `item/started`
-//! notification for a tool/command item the App Server has *already begun
-//! executing* and interrupts the turn afterward — it is mid-turn detection,
-//! not pre-execution denial, and ADR-0032 §10 requires a verified
-//! enforcement boundary before any such safety-relevant behavior is relied
-//! on. Checking the vendored
-//! `protocol-schema/0.157.1/codex_app_server_protocol*.schemas.json` for a
-//! documented, already-supported mechanism that forces a client-side
-//! approval decision *before* any sandboxed/tool action runs found none this
-//! worker could treat as verified: `sandbox`/`sandboxPolicy` only constrain
-//! what an already-started action may do, not whether it starts;
-//! `approvalPolicy`'s string values (`"untrusted" | "on-request" | "never"`)
-//! are, per established Codex CLI semantics, either auto-running (`"never"`,
-//! `"on-request"`) or still auto-running an internal "trusted command"
-//! allow-list including plain reads without any client approval round-trip
-//! (`"untrusted"`); the `granular` variant's `sandbox_approval`/`rules`
-//! booleans and `Config.tools` (`ToolsV2`, which only configures
-//! `web_search`) carry no description text anywhere in the vendored schema.
-//! ADR-0032 §10 requires real `--strict-config` binary verification before
-//! relying on any such setting, which this Read/Edit/Write/Glob/Grep-only
-//! worker has no shell/build/test/binary-execution access to perform.
-//!
-//! Rather than ship an unverified assumption or weaken the acceptance
-//! criteria to look satisfied, [`execute_text_transform`] now fails closed
-//! unconditionally (see [`pre_execution_tool_denial_verified`]) before it
-//! would acquire the shared settings lock or call `thread/start`, so
-//! `instruction`/`selected_text` are never transmitted to the App Server
-//! until a verified pre-execution denial mechanism replaces this gate. The
-//! fixed Probe's own request profile, document-free contract, and
-//! `sandbox: "read-only"` / `approvalPolicy: "never"` settings are left
-//! untouched by this: only this module's gate changed.
+//! argued that this mid-turn detection (`has_unsafe_tool_activity` only
+//! observes an `item/started` notification for a tool/command item the App
+//! Server has *already begun executing*, then interrupts the turn) is not a
+//! verified pre-execution denial boundary per ADR-0032 §10, and a
+//! now-superseded revision of this module made `execute_text_transform` fail
+//! closed unconditionally before `thread/start`/`turn/start` so nothing was
+//! ever sent to the App Server. The Issue owner has since withdrawn the
+//! blanket "model-side tool use must never be allowed" reading of Issue #449
+//! (see
+//! [PR #450 のコメント](https://github.com/hide212131/hane/pull/450#issuecomment-6116283994)),
+//! so this module resumes selection text transforms over the existing App
+//! Server connection: the fixed Probe's own request profile, document-free
+//! contract, and `sandbox: "read-only"` / `approvalPolicy: "never"` settings
+//! are unchanged, and a tool/command item still never counts as a success —
+//! it just no longer blocks every request before it is even sent.
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -121,7 +104,6 @@ pub enum TextTransformErrorCode {
     ContextLengthExceeded,
     ResultEmpty,
     ResultTooLarge,
-    PreExecutionToolDenialUnverified,
 }
 
 impl TextTransformErrorCode {
@@ -153,9 +135,6 @@ impl TextTransformErrorCode {
             Self::ContextLengthExceeded => "text_transform_context_length_exceeded",
             Self::ResultEmpty => "text_transform_result_empty",
             Self::ResultTooLarge => "text_transform_result_too_large",
-            Self::PreExecutionToolDenialUnverified => {
-                "text_transform_pre_execution_tool_denial_unverified"
-            }
         }
     }
 }
@@ -232,17 +211,6 @@ pub(crate) struct TextTransformExecution {
     pub deferred_events: Vec<RuntimeEvent>,
 }
 
-/// Deliberately hard-coded to `false`. This is not a feature flag to flip
-/// without new evidence: it may only return `true` once a documented,
-/// already-supported App Server mechanism is identified and verified (per
-/// ADR-0032 §10, against the actual bundled binary with `--strict-config` or
-/// equivalent real-process confirmation) to deny a shell/file-read/tool
-/// invocation *before* it executes, for this request path. See the module
-/// doc comment above for what was checked and why none qualified yet.
-fn pre_execution_tool_denial_verified() -> bool {
-    false
-}
-
 /// Runs one text transform turn while holding the shared settings lock for
 /// the complete `thread/start` → turn terminal/confirmed-stop interval, the
 /// same contract `crate::probe::execute_probe` uses.
@@ -262,19 +230,6 @@ pub(crate) fn execute_text_transform(
     cwd: &Path,
     settings_generation: u64,
 ) -> TextTransformExecution {
-    if !pre_execution_tool_denial_verified() {
-        // Unconditional fail-closed: `instruction`/`selected_text` must never
-        // reach `thread/start`/`turn/start` while this is false, regardless
-        // of cancellation state, settings lock availability, or runtime
-        // readiness.
-        return TextTransformExecution {
-            outcome: TextTransformOutcome::Failed(
-                TextTransformErrorCode::PreExecutionToolDenialUnverified,
-            ),
-            isolated: false,
-            deferred_events: Vec::new(),
-        };
-    }
     if cancellation_requested(cancel_rx, operation_id, shutdown_rx, shutdown_seen) {
         return TextTransformExecution {
             outcome: TextTransformOutcome::Canceled,
@@ -849,40 +804,61 @@ mod tests {
         assert!(!isolated);
     }
 
-    /// Issue #449 / ADR-0032 §10: until a verified pre-execution tool-denial
-    /// mechanism is identified for this request path (see the module doc
-    /// comment), the gate must stay hard-coded closed.
+    /// `execute_text_transform` checks cancellation before it would acquire
+    /// the generation-checked shared lock the fixed Probe uses, let alone
+    /// call `thread/start`/`turn/start`: against a real but never-started
+    /// `AiRuntime`, a cancellation already pending on `cancel_rx` must still
+    /// report `Canceled` (not `RuntimeUnavailable`), and the runtime/channels
+    /// must be left untouched by this call.
     #[test]
-    fn pre_execution_tool_denial_is_hard_coded_unverified() {
-        assert!(!pre_execution_tool_denial_verified());
+    fn execute_text_transform_reports_canceled_before_any_lock_or_rpc_call_when_already_canceled() {
+        let (execution, runtime, shutdown_seen) =
+            run_against_never_ready_runtime("canceled", /* cancel_before_call */ true);
+
+        assert_eq!(execution.outcome, TextTransformOutcome::Canceled);
+        assert!(!execution.isolated);
+        assert!(execution.deferred_events.is_empty());
+        assert!(!shutdown_seen);
+        let status = runtime.snapshot();
+        assert_eq!(status.state, RuntimeState::Stopped);
+        assert_eq!(status.generation, 0);
     }
 
-    /// `execute_text_transform` must fail closed unconditionally, before it
-    /// would even acquire the generation-checked shared lock the fixed Probe
-    /// uses, let alone call `thread/start`/`turn/start`: against a real but
-    /// never-started `AiRuntime`, and even with a cancellation already
-    /// pending on `cancel_rx`, the outcome must still be
-    /// `PreExecutionToolDenialUnverified` (not `RuntimeUnavailable`, not
-    /// `Canceled`), and the runtime/channels must be left untouched by this
-    /// call.
+    /// Without a pending cancellation, a never-ready `AiRuntime` is reported
+    /// as `RuntimeUnavailable` via the same generation-checked shared lock
+    /// the fixed Probe uses, not treated as a usable connection.
     #[test]
-    fn execute_text_transform_fails_closed_unconditionally_before_any_lock_or_rpc_call() {
+    fn execute_text_transform_reports_runtime_unavailable_for_a_never_ready_runtime() {
+        let (execution, _runtime, shutdown_seen) =
+            run_against_never_ready_runtime("unavailable", /* cancel_before_call */ false);
+
+        assert_eq!(
+            execution.outcome,
+            TextTransformOutcome::Failed(TextTransformErrorCode::RuntimeUnavailable)
+        );
+        assert!(!execution.isolated);
+        assert!(!shutdown_seen);
+    }
+
+    fn run_against_never_ready_runtime(
+        unique_suffix: &str,
+        cancel_before_call: bool,
+    ) -> (TextTransformExecution, AiRuntime, bool) {
         use crate::rpc::RejectAllServerRequests;
         use crate::runtime::RuntimeConfig;
         use std::sync::Arc;
         use std::sync::mpsc;
 
-        let store = AiSettingsStore::new(
-            "hane-text-transform-never-ready-test-settings.json",
-            "hane-text-transform-never-ready-test-settings.lock",
-            "hane-text-transform-never-ready-test-owner.lock",
-        );
+        let settings_path =
+            format!("hane-text-transform-never-ready-test-{unique_suffix}-settings.json");
+        let settings_lock_path =
+            format!("hane-text-transform-never-ready-test-{unique_suffix}-settings.lock");
+        let owner_lock_path =
+            format!("hane-text-transform-never-ready-test-{unique_suffix}-owner.lock");
+        let store = AiSettingsStore::new(&settings_path, &settings_lock_path, &owner_lock_path);
         let (events_tx, events_rx) = mpsc::sync_channel(1);
         let runtime = AiRuntime::spawn(
-            RuntimeConfig::new(
-                "/nonexistent/unused-runtime-binary",
-                "hane-text-transform-never-ready-test-owner.lock",
-            ),
+            RuntimeConfig::new("/nonexistent/unused-runtime-binary", &owner_lock_path),
             Arc::new(RejectAllServerRequests),
             events_tx,
         );
@@ -890,9 +866,9 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let mut shutdown_seen = false;
         let operation_id = crate::service::OperationId(1);
-        // A pending cancellation must not change the outcome: the fail-closed
-        // gate takes priority over every other branch in this function.
-        cancel_tx.send(operation_id).unwrap();
+        if cancel_before_call {
+            cancel_tx.send(operation_id).unwrap();
+        }
 
         let execution = execute_text_transform(
             &store,
@@ -909,16 +885,6 @@ mod tests {
             Path::new("/nonexistent/unused-cwd"),
             0,
         );
-
-        assert_eq!(
-            execution.outcome,
-            TextTransformOutcome::Failed(TextTransformErrorCode::PreExecutionToolDenialUnverified)
-        );
-        assert!(!execution.isolated);
-        assert!(execution.deferred_events.is_empty());
-        assert!(!shutdown_seen);
-        let status = runtime.snapshot();
-        assert_eq!(status.state, RuntimeState::Stopped);
-        assert_eq!(status.generation, 0);
+        (execution, runtime, shutdown_seen)
     }
 }

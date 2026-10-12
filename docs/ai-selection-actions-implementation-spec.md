@@ -249,13 +249,13 @@ T05〜T08に対応する回帰テスト（複数byte文字の byte-accurate置�
 
 このworkerはRead/Edit/Write/Glob/Grepのみに制限されており、`cargo build`/`cargo test`/`cargo clippy`やGUIを一切実行していない。T11〜T13（Windows/macOS実画面、実ChatGPT/Codex/Custom接続）は本PRで未実施のまま。exact-head CIでの最初の検証、CodeRabbitのreview、GUI validationは、この後のCommanderの観測対象。
 
-#### 9.1.1 tool・ファイル隔離の未解決と、送信をfail-closedにした対応（後続worker実行）
+#### 9.1.1 tool・ファイル隔離の未解決と、送信をfail-closedにした対応（後続worker実行・9.1.2で撤回）
 
 GitHub Copilotのcurrent-head full review finding（[PR #450のdiscussion](https://github.com/hide212131/hane/pull/450#discussion_r4242355110)）とADR-0032 §10の指摘を受け、`thread_start_params`の`sandbox: "read-only"`・`approvalPolicy: "never"`だけでは、専用workspace外の読み取りやshell/tool実行を禁止した根拠にならず、承認拒否は先行した読み取り・送信を取り消せないことを確認した。同梱App Serverの実バイナリに対する`--strict-config`検証やOS/プロセスレベルの隔離の実効性確認には、このworkerには無いcargo build/test/実バイナリ実行権限が必要であり、今回のworker実行では公式にサポートされた検証済みの隔離境界を確立できなかった。
 
 この根本原因だけについて、`crates/ai/src/text_transform.rs`の`execute_text_transform`を、設定共有ロックの取得や`thread/start`呼び出しより前の最初の分岐で無条件にfail-closedさせ、新しい`TextTransformErrorCode::IsolationBoundaryUnverified`を返すようにした（`text_transform_isolation_boundary_verified()`が`false`を返す間、合成文を含むすべての要求が対象）。これにより選択文・指示は（テスト用の合成文であっても）App Serverへ一切送信されない。回帰テストとして、`text_transform.rs`内のユニットテストで実際の`AiRuntime`/`AiSettingsStore`を使い、ロック取得やruntime呼び出しが一度も発生しないことを確認し、`crates/ai/tests/text_transform_service.rs`の統合テストでfakeApp Serverに対して選択文を含むturn/startが一切記録されないことを確認している。従来この統合テストにあった成功経路・interrupt-ack・tool-item検出のシナリオ別検証は、text transform経由では到達不能になったため削除したが、これらが使う`ProbeCollector`/interrupt確認の共有ロジック自体は`account_service.rs`側の固定Probe向けテスト（`probe_tool_item_start_is_not_reported_as_success`、`interrupt_ack_alone_does_not_release_probe_guard_before_child_stops`）で引き続き検証されている。
 
-この結果、選択文へのAI指示機能はIssueの受入条件（AC3「安全なサーバー要求拒否」を含む）を安全側で満たすが、実際にAIへ送信して結果を得る経路はfail-closedにより現在使用できない。公式にサポートされた検証可能な隔離境界（例: 同梱App Serverバイナリに対する`--strict-config`で確認済みの設定、またはHane自身がspawn時に適用するOS/プロセスレベルの隔離）を設計・実装し、`text_transform_isolation_boundary_verified()`をその検証済み条件に置き換える別設計が必要であり、これは本PRのscope外の後続作業として報告する。
+このworker実行時点では、選択文へのAI指示機能はIssueの受入条件（AC3「安全なサーバー要求拒否」を含む）をfail-closedという安全側に倒した形で満たすとしたが、実際にAIへ送信して結果を得る経路は使用できなかった。これは9.1.2で撤回され、現在の実装の説明としては使わない。
 
 #### 9.1.2 既存App Server経路でのAC3再開（後続worker実行）
 
@@ -265,7 +265,7 @@ GitHub Copilotのcurrent-head full review finding（[PR #450のdiscussion](https
 
 `text_transform.rs`のユニットテストは、無条件fail-closed削除後も実行されない`AiRuntime`に対しては既存の世代確認で`RuntimeUnavailable`になることを確認するテストに置き換えた。`crates/ai/tests/text_transform_service.rs`の統合テストは、fake App Serverに対する実際の成功経路（選択文・指示はApp Serverへ届くが開いている文書の内容は届かない）、mid-turn tool item検出による`SafetyProfileUnsupported`中断、Probe busy解消後の admit→cancelの3シナリオへ更新した。実ChatGPT/Codex/Custom接続でのT13検証はこのworker実行では未実施であり、Commanderの観測対象として残る。
 
-#### 9.1.3 pre-execution tool denialの未解決と、再度のfail-closed対応（後続worker実行）
+#### 9.1.3 pre-execution tool denialの未解決と、再度のfail-closed対応（後続worker実行・9.1.4で撤回）
 
 [PR #450のcurrent-head review](https://github.com/hide212131/hane/pull/450#pullrequestreview-5485871355)とIssue #449「外部ファイル読込・シェル・ツール実行を許可しない」を受け、9.1.2で復元した`sandbox: "read-only"`・`approvalPolicy: "never"`・`ProbeCollector::has_unsafe_tool_activity`による中断は、tool/command itemの`item/started`通知（=App Serverが既に実行を開始した後の通知）を検知してからinterruptするmid-turn検出に過ぎず、実行前の拒否（pre-execution tool denial）の根拠にはならないことを確認した。
 
@@ -273,7 +273,15 @@ GitHub Copilotのcurrent-head full review finding（[PR #450のdiscussion](https
 
 したがって、このPR実行では公式にサポートされた検証済みのpre-execution tool denial機構を確立できなかった。受入条件を弱めて満たしたように見せる、または別の認証・接続経路へ切り替えることは行わず、`text_transform.rs`に`pre_execution_tool_denial_verified()`（`false`固定）を追加し、`execute_text_transform`冒頭で共有設定ロック取得や`thread/start`呼び出しより前に無条件へ`TextTransformErrorCode::PreExecutionToolDenialUnverified`としてfail closedさせた。固定Probe（`probe.rs`）の`sandbox: "read-only"`・`approvalPolicy: "never"`・既存の`ProbeCollector`共有ロジックはそのまま変更していない。
 
-`crates/ai/tests/text_transform_service.rs`は、admission（busy判定）を経て実際に`execute_text_transform`へ到達した要求が、fake App Serverへ`instruction`/`selected_text`を一切送らずに`PreExecutionToolDenialUnverified`で終わることを確認する内容へ更新した。`text_transform.rs`のユニットテストは、未起動の`AiRuntime`・pending cancellationのいずれであってもこのgateが最優先で働くことを確認している。公式に検証済みの代替機構（例: Hane自身がspawn時に適用するOS/プロセスレベルの隔離、または採用版バイナリで実際に確認した設定）を設計・実装し、`pre_execution_tool_denial_verified()`をその検証済み条件に置き換える設計は本PRのscope外の後続作業として報告する。
+`crates/ai/tests/text_transform_service.rs`は、admission（busy判定）を経て実際に`execute_text_transform`へ到達した要求が、fake App Serverへ`instruction`/`selected_text`を一切送らずに`PreExecutionToolDenialUnverified`で終わることを確認する内容へ更新した。`text_transform.rs`のユニットテストは、未起動の`AiRuntime`・pending cancellationのいずれであってもこのgateが最優先で働くことを確認していた。公式に検証済みの代替機構（例: Hane自身がspawn時に適用するOS/プロセスレベルの隔離、または採用版バイナリで実際に確認した設定）を設計・実装し、`pre_execution_tool_denial_verified()`をその検証済み条件に置き換える設計を本PRのscope外の後続作業として報告したが、9.1.4で経緯が変わったため、この節は現在の実装の説明ではなく履歴として残す。
+
+#### 9.1.4 pre-execution denial要求の撤回と、既存App Server経路への復帰（後続worker実行）
+
+[Issue #449](https://github.com/hide212131/hane/issues/449)の所有者は、9.1.3が前提とした「モデル側のツール利用を実行前に拒否できないなら一律fail-closedにする」という要求を撤回し、Issue本文へ反映した（参照: [PR #450のコメント](https://github.com/hide212131/hane/pull/450#issuecomment-6116283994)）。ADR-0032 §10が要求する「実バイナリへの`--strict-config`等の実プロセス検証」自体は、Read/Edit/Write/Glob/Grepのみに制限されたworker実行では今回も実施できていないが、この検証が無いことを理由にAC3を満たすまで送信を一律fail-closedにする、という9.1.3の対応方針そのものが要求から外れたため、9.1.3の`pre_execution_tool_denial_verified()`・`TextTransformErrorCode::PreExecutionToolDenialUnverified`・`execute_text_transform`冒頭の無条件fail-closed分岐を削除し、9.1.2の実装（既存の`sandbox: "read-only"`・`approvalPolicy: "never"`・サーバー要求拒否・`ProbeCollector::has_unsafe_tool_activity`によるmid-turn中断を境界として使い、tool/command item検出時は引き続き`SafetyProfileUnsupported`として失敗させる。成功とはしない）へ復帰した。9.1.1/9.1.3のように「fail-closedでAC3を安全側に満たす」という記述は、現在の実装の説明としては使わない。
+
+`TEXT_TRANSFORM_BASE_INSTRUCTIONS`/`TEXT_TRANSFORM_DEVELOPER_INSTRUCTIONS`（5.2節5.）、`turn/start`の2フィールド限定入力、専用workspace cwd、固定Probe自身の固定入力・profileは変更していない。これらの上位指示文は安全性の保証そのものではなく（5.3節の既存の注記のとおり）、実際の境界は`sandbox`/`approvalPolicy`/mid-turn検出である。
+
+`crates/ai/src/text_transform.rs`のユニットテストは、未起動の`AiRuntime`に対して、pending cancellationがあれば`Canceled`、無ければ既存の世代確認による`RuntimeUnavailable`になることを確認する2件に置き換えた。`crates/ai/tests/text_transform_service.rs`の統合テストは、fake App Serverに対する実際の成功経路（選択文・指示はApp Serverへ届くが開いている文書の内容は届かない）、mid-turn tool item検出による`SafetyProfileUnsupported`中断、Probe busy解消後の admit→cancelの3シナリオに復帰した。実ChatGPT/Codex/Custom接続でのT13検証はこのworker実行では未実施であり、Commanderの観測対象として残る。
 
 ## 10. 参考資料
 
