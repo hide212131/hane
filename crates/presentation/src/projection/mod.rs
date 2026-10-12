@@ -3115,7 +3115,7 @@ fn table_alignments(source: &str) -> Vec<TableAlignment> {
         .collect()
 }
 
-fn table_row_from_projection(
+pub(crate) fn table_row_from_projection(
     line: &VisualLine,
     projection: Option<&TableProjection>,
     range: SourceRange,
@@ -3325,7 +3325,7 @@ fn unescaped_table_pipes(source: &str, content_end: usize) -> Vec<usize> {
     pipes
 }
 
-fn present_table_line(
+pub(crate) fn present_table_line(
     line_id: u64,
     revision: Revision,
     range: SourceRange,

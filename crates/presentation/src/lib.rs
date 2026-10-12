@@ -66,6 +66,9 @@ pub use projection::{
     present_block_with_table_projection, present_markdown, present_markdown_with_disclosure,
     present_polished_line, table_delimiter_is_collapsed, trailing_blank_lines,
 };
+// `layout` calls these directly as `crate::...`; keep them reachable crate-wide
+// without adding them to the public API above.
+use projection::{present_table_line, table_row_from_projection};
 pub use source_map::{
     BoundarySide, MappingSegment, MarkerEdge, PositionCandidate, SourceMap, Visibility,
     VisualOffset, VisualRange,
