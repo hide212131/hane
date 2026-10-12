@@ -2108,9 +2108,24 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        // No saved prompts: `reload_ai_selection_saved_prompts` is still
-        // in flight/empty here, same as a freshly opened popup with none
-        // saved yet.
+        // A saved — not never-saved — empty list, unlike `Ok(None)`'s own
+        // built-in default suggestion (see
+        // `loading_saved_prompts_for_the_first_time_shows_the_built_in_default_suggestion`),
+        // actually leaves the list empty, which is what this test exercises.
+        view.update(cx, |view, cx| {
+            let generation = view.ai_selection.prompts_load_generation;
+            view.ai_selection.apply_saved_prompts(
+                generation,
+                Ok(Some(UserPrompts {
+                    schema_version: hane_ai::USER_PROMPTS_SCHEMA_VERSION,
+                    revision: 1,
+                    next_id: 1,
+                    prompts: Vec::new(),
+                })),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.ai_selection.saved_prompts.is_empty());
         });
@@ -2482,6 +2497,24 @@ mod tests {
                     .unwrap();
                 view.open_ai_selection(window, cx);
             });
+        });
+        cx.run_until_parked();
+
+        // A saved — not never-saved — empty list, unlike `Ok(None)`'s own
+        // built-in default suggestion, actually leaves the list empty, which
+        // is what this test's "Input -> Send -> Close" tab order relies on.
+        view.update(cx, |view, cx| {
+            let generation = view.ai_selection.prompts_load_generation;
+            view.ai_selection.apply_saved_prompts(
+                generation,
+                Ok(Some(UserPrompts {
+                    schema_version: hane_ai::USER_PROMPTS_SCHEMA_VERSION,
+                    revision: 1,
+                    next_id: 1,
+                    prompts: Vec::new(),
+                })),
+            );
+            cx.notify();
         });
         cx.run_until_parked();
 
