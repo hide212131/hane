@@ -17,6 +17,7 @@ projection の再利用キャッシュ最適化は後続作業として残す。
 ## 関連
 
 - [Issue #220](https://github.com/hide212131/hane/issues/220)
+- [Issue #460](https://github.com/hide212131/hane/issues/460)
 - [Pull Request #221](https://github.com/hide212131/hane/pull/221)
 - ADR-0005: Revision とバックグラウンド処理
 - ADR-0007: IME Composition モデル
@@ -286,19 +287,25 @@ replacement は次の形で作る。
 位置または空本文末尾に限る。
 
 - nested item は subtree 全体を一階層 outdent し、marker は維持する。
-- top-level item は list marker / task prefix を除去し、同じ physical line を通常 paragraph にする。
-- Enter 自体は新しい transient state を作らない。結果 source が parser にとって有効な通常 paragraph になる。
+- top-level item は marker / task prefix を除去して通常 paragraph にする。その際、入力後の source が直前・
+  直後のリスト項目から独立した通常 paragraph になるために必要な段落境界を同じ source edit で作る。
+- 既存の空行が必要な境界を満たす場合は追加しない。既存の複数空行を詰めず、変更しない source の改行形式
+  （LF / CRLF / CR）を保持する。後続リストがある場合はそれも通常 paragraph から分離して保つ。
+- top-level item に子孫や継続本文がある場合、開始行が空でも item 全体は終了対象ではない。
+- source が parser のリスト項目として確認できない回復候補、引用接頭辞を巻き込む操作、ASCII space/tab 以外
+  の Unicode 空白だけで構成される本文（例: U+3000 IDEOGRAPHIC SPACE）は、今回の終了操作では変更しない。
+- 終了操作は必要な原文置換と編集後 caret を一つの recorded edit として適用する。空行だけの時点では空の
+  Paragraph node が存在すると仮定せず、文字入力後に通常 Paragraph となることを検証する。
 
     - A
       - B
       - |
 
+    Enter:
+
     - A
       - B
     - |
-
-top-level の場合は、line ending を残して marker prefix だけを削除する。文書末なら source は直前の改行で
-終わるか、既存の line ending を持つ。空行を追加するかどうかを View の都合で決めない。
 
 ### 6. Shift+Enter
 
@@ -366,13 +373,18 @@ Tab と Shift+Tab の source operation は、対象 subtree の連続 source ran
 ### 8. 空 item の後退削除
 
 selection が caret のみで、caret が空 item の body start にあるときだけ list-aware Backspace / macOS Delete
-を適用する。
+を適用する。Enter と Backspace は最上位空 item の同じ終了契約を使う。
 
 - nested item は Enter と同じく subtree 全体を一階層 outdent する。
-- top-level item は marker / task prefix を削除して通常 paragraph にする。
-- 非空 item、本文中、selection 付きの Backspace は既存の通常文字削除に戻す。
-- Enter 直後の特別な「直前の newline を undo する」context は作らない。必要なら通常の Undo が Enter の
-  一つの transaction を戻す。
+- top-level item は marker / task prefix を除去し、入力後に通常 paragraph として解析されるために必要な
+  前後の段落境界を同じ source edit で作る。
+- 必要な境界が既にある場合は重ねず、既存の複数空行・LF / CRLF / CR を保持する。後続項目がある場合は
+  その原文とリスト所属を保つ。
+- 子孫または継続本文を含む item、引用接頭辞を巻き込む位置、parser が list item と認識していない候補、
+  見えにくい Unicode 本文を「空」と判定するケースは変更しない。
+- 非空本文、本文中、selection 付きの Backspace は既存の通常文字削除に戻す。
+- Enter 直後の特別な「直前の newline を undo する」context は作らない。必要なら通常の Undo が一回の
+  recorded replacement を戻す。
 
     - A
       - B
