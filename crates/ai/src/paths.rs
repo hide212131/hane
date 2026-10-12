@@ -7,9 +7,12 @@
 //!   ai-settings.lock
 //!   credential-journal.json
 //!   runtime-owner.lock
+//!   user-prompts.json          <- saved selection-action prompts (crate::prompts)
+//!   user-prompts.lock
 //!   codex-chatgpt/    <- ChatGPT connection's CODEX_HOME
 //!   codex-custom/     <- Custom Provider connection's CODEX_HOME
-//!   probe-workspace/  <- connectivity-probe-only empty working directory
+//!   probe-workspace/           <- connectivity-probe-only empty working directory
+//!   text-transform-workspace/  <- selection text-transform-only empty working directory
 //! ```
 //!
 //! Both connections' `CODEX_HOME` are kept separate so ChatGPT credentials
@@ -52,6 +55,18 @@ impl AiPaths {
         self.root.join("runtime-owner.lock")
     }
 
+    /// Saved selection-action prompts (`crate::prompts`), independent of
+    /// `AiSettings`: a connection/credential change must never touch this
+    /// file, and this file must never affect `settings_generation` or
+    /// runtime restart decisions.
+    pub fn user_prompts_path(&self) -> PathBuf {
+        self.root.join("user-prompts.json")
+    }
+
+    pub fn user_prompts_lock_path(&self) -> PathBuf {
+        self.root.join("user-prompts.lock")
+    }
+
     pub fn chatgpt_codex_home(&self) -> PathBuf {
         self.root.join("codex-chatgpt")
     }
@@ -72,40 +87,70 @@ impl AiPaths {
     /// becoming the next App Server's cwd. The directory is under Hane app
     /// data and is never a document path.
     pub fn create_probe_workspace(&self) -> std::io::Result<PathBuf> {
-        static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
-        let base = self.probe_workspace();
-        std::fs::create_dir_all(&base)?;
-        loop {
-            let sequence = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
-            let candidate = base.join(format!("runtime-{}-{sequence}", std::process::id()));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => return Ok(candidate),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        create_prefixed_workspace(&self.probe_workspace(), "runtime")
     }
 
     /// Removes runtime workspaces left by a prior process after an abnormal
     /// exit. The caller must hold the runtime owner lock and have no active
     /// child, which proves that no App Server can still be using these paths.
     pub fn cleanup_probe_workspaces(&self) -> std::io::Result<()> {
-        let base = self.probe_workspace();
-        let entries = match std::fs::read_dir(&base) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        cleanup_prefixed_workspaces(&self.probe_workspace())
+    }
+
+    /// A dedicated, otherwise-empty working directory for one selection text
+    /// transform request (`crate::text_transform`). Separate from
+    /// `probe_workspace` so the fixed connectivity Probe's own workspace
+    /// directory and cleanup sweep are never shared with (or affected by) a
+    /// capability that, unlike Probe, sends user-selected document text.
+    /// Never the user's document folder or current working directory.
+    pub fn text_transform_workspace(&self) -> PathBuf {
+        self.root.join("text-transform-workspace")
+    }
+
+    /// Creates a fresh, empty, per-request workspace for one text transform
+    /// turn. See `create_probe_workspace` for why a unique directory matters.
+    pub fn create_text_transform_workspace(&self) -> std::io::Result<PathBuf> {
+        create_prefixed_workspace(&self.text_transform_workspace(), "run")
+    }
+
+    /// Removes text transform workspaces left by a prior process after an
+    /// abnormal exit. Same precondition as `cleanup_probe_workspaces`.
+    pub fn cleanup_text_transform_workspaces(&self) -> std::io::Result<()> {
+        cleanup_prefixed_workspaces(&self.text_transform_workspace())
+    }
+}
+
+fn create_prefixed_workspace(base: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(base)?;
+    loop {
+        let sequence = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
+        let candidate = base.join(format!("{prefix}-{}-{sequence}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_dir()
-                && entry.file_name().to_string_lossy().starts_with("runtime-")
-            {
+        }
+    }
+}
+
+fn cleanup_prefixed_workspaces(base: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("runtime-") || name.starts_with("run-") {
                 std::fs::remove_dir_all(entry.path())?;
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -152,5 +197,25 @@ mod tests {
 
         assert!(!stale.exists());
         assert!(unrelated.is_dir());
+    }
+
+    #[test]
+    fn text_transform_workspace_is_distinct_from_the_probe_workspace_and_cleans_up_independently() {
+        let root = std::env::temp_dir()
+            .join(format!("hane-ai-text-transform-paths-{}", std::process::id()));
+        let paths = AiPaths::new(&root);
+        let probe = paths.create_probe_workspace().unwrap();
+        let transform = paths.create_text_transform_workspace().unwrap();
+
+        assert_ne!(paths.text_transform_workspace(), paths.probe_workspace());
+        assert!(transform.starts_with(paths.text_transform_workspace()));
+        assert!(std::fs::read_dir(&transform).unwrap().next().is_none());
+
+        std::fs::write(transform.join("stale.txt"), "fixture").unwrap();
+        paths.cleanup_text_transform_workspaces().unwrap();
+        assert!(!transform.exists());
+        // The unrelated probe workspace is untouched by the text transform
+        // cleanup sweep.
+        assert!(probe.exists());
     }
 }

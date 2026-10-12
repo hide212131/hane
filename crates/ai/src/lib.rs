@@ -13,6 +13,7 @@ mod models;
 mod owner_lock;
 mod paths;
 mod probe;
+mod prompts;
 mod protocol;
 mod provider;
 mod rpc;
@@ -21,6 +22,7 @@ mod secrets;
 mod service;
 mod settings;
 mod settings_lock;
+mod text_transform;
 
 pub use account::{
     AccountError, AccountState, CancelStatus, account_read_params, completed_login_matches,
@@ -40,6 +42,11 @@ pub use models::{ChatGptModel, ModelListError, fetch_chatgpt_models, saved_model
 pub use owner_lock::{OwnerLock, OwnerLockGuard};
 pub use paths::AiPaths;
 pub use probe::{ProbeErrorCode, ProbeResult, ProbeStatus};
+pub use prompts::{
+    MAX_PROMPT_BODY_BYTES, MAX_PROMPT_COUNT, MAX_PROMPT_TITLE_CHARS, USER_PROMPTS_SCHEMA_VERSION,
+    UserPrompt, UserPromptDraft, UserPrompts, UserPromptsLoadError, UserPromptsSaveError,
+    UserPromptsStore, initial_default_draft,
+};
 pub use protocol::{ErrorObject, IncomingMessage, ParseError, RequestId};
 pub use provider::{
     CUSTOM_PROVIDER_ENV_KEY, CUSTOM_PROVIDER_ID, CustomProviderConfigError, CustomProviderMaterial,
@@ -65,3 +72,8 @@ pub use settings::{
     ChatGptConnectionSettings, CustomConnectionSettings, SaveError,
 };
 pub use settings_lock::{AiSettingsExclusiveGuard, AiSettingsLock, AiSettingsSharedGuard};
+pub use text_transform::{
+    MAX_INSTRUCTION_BYTES, MAX_RESULT_BYTES, MAX_SELECTED_TEXT_BYTES, TEXT_TRANSFORM_TIMEOUT,
+    TextTransformErrorCode, TextTransformOutcome,
+    validate_request as validate_text_transform_request,
+};

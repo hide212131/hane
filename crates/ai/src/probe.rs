@@ -52,6 +52,7 @@ pub enum ProbeErrorCode {
     ProviderFailed,
     Canceled,
     Isolated,
+    ContextLengthExceeded,
 }
 
 impl ProbeErrorCode {
@@ -76,6 +77,7 @@ impl ProbeErrorCode {
             Self::ProviderFailed => "provider_failed",
             Self::Canceled => "canceled",
             Self::Isolated => "runtime_isolated",
+            Self::ContextLengthExceeded => "context_length_exceeded",
         }
     }
 }
@@ -524,6 +526,17 @@ fn cancellation_requested(
 
 /// Collects only completed agent messages belonging to the exact runtime,
 /// thread, and turn. Item IDs and output size are bounded.
+///
+/// `crate::text_transform` reuses this same collector (via
+/// [`ProbeCollector::with_max_text_bytes`] plus
+/// [`ProbeCollector::allow_tool_activity`]) for the identical
+/// generation/thread/turn-matching and duplicate-item handling a selection
+/// text transform turn also needs, just with its own (much larger) result
+/// size cap and its own tool-activity policy: unlike the fixed Probe, a
+/// detected tool/command item there is not by itself disqualifying (see
+/// `fail_on_tool_activity` below). The fixed connectivity Probe's own public
+/// [`ProbeCollector::new`] constructor, its [`MAX_PROBE_TEXT_BYTES`] cap, and
+/// its "a tool/command item fails the turn" contract are unchanged by this.
 pub struct ProbeCollector {
     runtime_generation: u64,
     thread_id: String,
@@ -531,12 +544,24 @@ pub struct ProbeCollector {
     item_ids: HashSet<String>,
     text: String,
     text_bytes: usize,
+    max_text_bytes: usize,
     terminal: Option<ProbeTerminal>,
     unsafe_tool_activity: bool,
+    fail_on_tool_activity: bool,
+    overflowed: bool,
 }
 
 impl ProbeCollector {
     pub fn new(runtime_generation: u64, thread_id: String, turn_id: String) -> Self {
+        Self::with_max_text_bytes(runtime_generation, thread_id, turn_id, MAX_PROBE_TEXT_BYTES)
+    }
+
+    pub(crate) fn with_max_text_bytes(
+        runtime_generation: u64,
+        thread_id: String,
+        turn_id: String,
+        max_text_bytes: usize,
+    ) -> Self {
         Self {
             runtime_generation,
             thread_id,
@@ -544,9 +569,25 @@ impl ProbeCollector {
             item_ids: HashSet::new(),
             text: String::new(),
             text_bytes: 0,
+            max_text_bytes,
             terminal: None,
             unsafe_tool_activity: false,
+            fail_on_tool_activity: true,
+            overflowed: false,
         }
+    }
+
+    /// Opts this collector out of the fixed Probe's own "any tool/command
+    /// item fails the turn" contract: a tool item is still tracked (see
+    /// [`ProbeCollector::has_unsafe_tool_activity`]), but no longer turns a
+    /// correlated turn terminal into
+    /// [`ProbeErrorCode::SafetyProfileUnsupported`] by itself. The fixed
+    /// Probe itself never calls this, so its own contract is unchanged; only
+    /// `crate::text_transform` does, per the Issue #449 owner's withdrawal of
+    /// the blanket "model-side tool use must never be allowed" reading.
+    pub(crate) fn allow_tool_activity(mut self) -> Self {
+        self.fail_on_tool_activity = false;
+        self
     }
 
     pub fn observe(&mut self, event: RuntimeEvent) -> Option<ProbeTerminal> {
@@ -598,7 +639,7 @@ impl ProbeCollector {
                 }
                 let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
                 let error = turn.get("error").filter(|error| !error.is_null());
-                if self.unsafe_tool_activity {
+                if self.unsafe_tool_activity && self.fail_on_tool_activity {
                     Some(ProbeTerminal::Failed(
                         ProbeErrorCode::SafetyProfileUnsupported,
                     ))
@@ -628,14 +669,28 @@ impl ProbeCollector {
         self.unsafe_tool_activity
     }
 
+    /// True once any observed agent-message text had to be dropped because
+    /// it would have pushed the collected total past `max_text_bytes`. The
+    /// fixed connectivity Probe keeps treating its own truncated text as a
+    /// successful, bounded result; `crate::text_transform` instead uses this
+    /// flag to reject an overflowing result outright instead of silently
+    /// applying a truncated partial result.
+    pub fn text_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     fn append_bounded(&mut self, value: &str) {
-        let remaining = MAX_PROBE_TEXT_BYTES.saturating_sub(self.text_bytes);
+        let remaining = self.max_text_bytes.saturating_sub(self.text_bytes);
         if remaining == 0 {
+            self.overflowed |= !value.is_empty();
             return;
         }
         let mut end = value.len().min(remaining);
         while !value.is_char_boundary(end) {
             end -= 1;
+        }
+        if end < value.len() {
+            self.overflowed = true;
         }
         self.text.push_str(&value[..end]);
         self.text_bytes = self.text_bytes.saturating_add(end);
@@ -647,7 +702,12 @@ impl ProbeCollector {
     }
 }
 
-fn is_tool_activity(item_type: &str) -> bool {
+/// Shared with `crate::text_transform`: both observe the same set of App
+/// Server item kinds as tool activity, so a safety-relevant item type added
+/// to one is never silently missed by the other, even though each decides
+/// separately (via [`ProbeCollector::allow_tool_activity`]) whether that
+/// activity by itself ends the turn as a failure.
+pub(crate) fn is_tool_activity(item_type: &str) -> bool {
     matches!(
         item_type,
         "commandExecution"
@@ -661,7 +721,12 @@ fn is_tool_activity(item_type: &str) -> bool {
     ) || item_type.to_ascii_lowercase().contains("tool")
 }
 
-fn classify_provider_error(error: &Value) -> ProbeErrorCode {
+/// Maps a raw provider error payload to a stable classification without ever
+/// copying its free-text message into a snapshot or log. `crate::text_transform`
+/// reuses this same mapping against `ProbeErrorCode`'s equivalent variants,
+/// so the two capabilities never classify the same provider status
+/// differently.
+pub(crate) fn classify_provider_error(error: &Value) -> ProbeErrorCode {
     fn scan(value: &Value) -> Option<u16> {
         match value {
             Value::Object(fields) => {
@@ -683,6 +748,7 @@ fn classify_provider_error(error: &Value) -> ProbeErrorCode {
     match info.and_then(Value::as_str) {
         Some("unauthorized") => return ProbeErrorCode::Unauthorized,
         Some("rateLimitExceeded") => return ProbeErrorCode::RateLimited,
+        Some("contextWindowExceeded") => return ProbeErrorCode::ContextLengthExceeded,
         _ => {}
     }
     match scan(error) {
@@ -819,6 +885,17 @@ mod tests {
     }
 
     #[test]
+    fn context_window_exceeded_is_classified_distinctly_from_provider_failed() {
+        let mut collector = new_collector();
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"partial"}
+        })));
+        assert_eq!(collector.observe(event(7, "turn/completed", json!({
+            "threadId":"thread-1", "turn":{"id":"turn-1","status":"failed","error":{"message":"secret diagnostic","codexErrorInfo":"contextWindowExceeded"}}
+        }))), Some(ProbeTerminal::Failed(ProbeErrorCode::ContextLengthExceeded)));
+    }
+
+    #[test]
     fn tool_activity_never_becomes_a_successful_probe() {
         let mut collector = new_collector();
         assert_eq!(collector.observe(event(7, "item/started", json!({
@@ -836,6 +913,30 @@ mod tests {
             Some(ProbeTerminal::Failed(
                 ProbeErrorCode::SafetyProfileUnsupported
             ))
+        );
+    }
+
+    #[test]
+    fn allow_tool_activity_lets_a_tool_item_be_followed_by_a_successful_terminal() {
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), MAX_PROBE_TEXT_BYTES)
+                .allow_tool_activity();
+        assert_eq!(collector.observe(event(7, "item/started", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"tool-1","type":"commandExecution"}
+        }))), None);
+        assert!(collector.has_unsafe_tool_activity());
+        assert_eq!(collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"OK"}
+        }))), None);
+        assert_eq!(
+            collector.observe(event(
+                7,
+                "turn/completed",
+                json!({
+                    "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+                })
+            )),
+            Some(ProbeTerminal::Completed("OK".into()))
         );
     }
 
@@ -891,5 +992,40 @@ mod tests {
         };
         assert!(text.len() <= MAX_PROBE_TEXT_BYTES);
         assert!(text.len() >= MAX_PROBE_TEXT_BYTES - 2);
+        assert!(collector.text_overflowed());
+    }
+
+    #[test]
+    fn text_at_or_under_the_cap_is_not_flagged_as_overflowed() {
+        let max = 16;
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), max);
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"a".repeat(max)}
+        })));
+        assert!(!collector.text_overflowed());
+    }
+
+    #[test]
+    fn overflow_mid_multibyte_char_is_flagged_and_collected_text_stays_valid_utf8() {
+        let max = 5;
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), max);
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"あああ"}
+        })));
+        assert!(collector.text_overflowed());
+        let terminal = collector.observe(event(
+            7,
+            "turn/completed",
+            json!({
+                "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+            }),
+        ));
+        let Some(ProbeTerminal::Completed(text)) = terminal else {
+            panic!("expected a completed text result");
+        };
+        assert!(text.len() <= max);
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
     }
 }
