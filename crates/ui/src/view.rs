@@ -10584,6 +10584,60 @@ mod tests {
         });
     }
 
+    /// Issue #460: a top-level empty item that still owns descendant content
+    /// is a protected exit target. Enter/Backspace must consume the key as
+    /// a no-op instead of falling back to ordinary editing, which would
+    /// otherwise remove the marker and orphan the nested child.
+    #[gpui::test]
+    fn empty_item_with_nested_content_is_consumed_as_a_no_op(cx: &mut gpui::TestAppContext) {
+        for intent in [ListEditIntent::Backspace, ListEditIntent::Enter] {
+            let source = "- \n  - child";
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+            view.update(cx, |view, cx| {
+                let caret = Selection::caret(SourceOffset(2));
+                view.editor_mut().set_selection(caret).unwrap();
+                let revision_before = view.editor().document().revision();
+                let can_undo_before = view.editor().can_undo();
+
+                assert!(view.apply_list_edit_intent(intent, cx));
+                assert_eq!(view.editor().document().full_text(), source);
+                assert_eq!(view.editor().selection(), caret);
+                assert_eq!(view.editor().document().revision(), revision_before);
+                assert_eq!(view.editor().can_undo(), can_undo_before);
+
+                view.dispatch(EditorCommand::Undo, cx);
+                assert_eq!(view.editor().document().full_text(), source);
+                assert_eq!(view.editor().selection(), caret);
+            });
+        }
+    }
+
+    /// Issue #460: an empty item inside a blockquote is a protected exit
+    /// target because its opening line's bytes include the quote marker.
+    /// Backspace must consume the key as a no-op instead of falling back to
+    /// ordinary editing, which would otherwise remove the quote marker too.
+    #[gpui::test]
+    fn empty_item_inside_quote_is_consumed_as_a_no_op(cx: &mut gpui::TestAppContext) {
+        let source = "> - A\n> - \n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let caret = Selection::caret(SourceOffset(10));
+            view.editor_mut().set_selection(caret).unwrap();
+            let revision_before = view.editor().document().revision();
+            let can_undo_before = view.editor().can_undo();
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            assert_eq!(view.editor().document().full_text(), source);
+            assert_eq!(view.editor().selection(), caret);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert_eq!(view.editor().can_undo(), can_undo_before);
+
+            view.dispatch(EditorCommand::Undo, cx);
+            assert_eq!(view.editor().document().full_text(), source);
+            assert_eq!(view.editor().selection(), caret);
+        });
+    }
+
     #[test]
     fn every_line_resolves_to_its_markdown_block() {
         let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";

@@ -94,7 +94,7 @@ pub struct ListEditItem {
     /// `MarkdownParse::list_item_markers`) rather than the opening-line-only
     /// lexical recovery fallback below. A recovered candidate with no
     /// confirmed link to a real list may just be ordinary text that happens
-    /// to look like a marker (see `exit_is_eligible`).
+    /// to look like a marker (see `exit_is_trustworthy`).
     pub is_parser_item: bool,
     /// Whether this item sits inside a blockquote. The opening line's bytes
     /// include the quote marker, so a prefix edit here would also remove it.
@@ -597,8 +597,13 @@ pub fn plan_list_edit(
                 || (matches!(intent, ListEditIntent::Backspace)
                     && caret.0 <= item.body_range.start.0);
             if empty && empty_action && on_opening_line {
-                if !exit_is_eligible(&source, item) {
+                if !exit_is_trustworthy(item) {
                     return Ok(ListEditPlanResult::NotApplicable);
+                }
+                if !exit_is_safe_to_collapse(&source, item) {
+                    return Ok(ListEditPlanResult::Handled(MarkdownEditPlan::NoOp {
+                        selection_after: selection,
+                    }));
                 }
                 if item.depth <= 1 {
                     return Ok(ListEditPlanResult::Handled(exit_top_level_item(
@@ -633,20 +638,29 @@ pub fn plan_list_edit(
     }
 }
 
-/// Whether an empty item is safe to collapse into its surrounding paragraph
-/// or outdent. Protects three cases the design calls "do not touch": a raw
-/// recovery candidate with no confirmed link to a real list (it may just be
-/// ordinary text that happens to look like a marker), an item still inside a
-/// blockquote (its opening line's bytes include the quote marker, so a
-/// prefix edit here would also remove it), and an item whose subtree reaches
-/// past its own opening line (nested content or a continuation paragraph
-/// that must keep its owning item).
-fn exit_is_eligible(source: &str, item: &ListEditItem) -> bool {
-    let trustworthy =
-        item.is_parser_item || item.parent_item.is_some() || item.previous_sibling.is_some();
+/// Whether an empty item is confirmed as a real list item rather than a raw
+/// lexical recovery candidate with no confirmed link to a real list (it may
+/// just be ordinary text that happens to look like a marker). An
+/// untrustworthy candidate is not a list-aware exit target at all: it falls
+/// back to ordinary editing instead of being consumed as a no-op, so that
+/// plain prose that merely looks like a marker still edits normally.
+fn exit_is_trustworthy(item: &ListEditItem) -> bool {
+    item.is_parser_item || item.parent_item.is_some() || item.previous_sibling.is_some()
+}
+
+/// Whether a trustworthy empty item is safe to collapse into its surrounding
+/// paragraph or outdent. Protects two cases the design calls "do not touch":
+/// an item still inside a blockquote (its opening line's bytes include the
+/// quote marker, so a prefix edit here would also remove it), and an item
+/// whose subtree reaches past its own opening line (nested content or a
+/// continuation paragraph that must keep its owning item). These items are
+/// confirmed list items, so the exit key must still be consumed as a no-op
+/// rather than falling back to ordinary editing, which could otherwise
+/// mutate the protected content.
+fn exit_is_safe_to_collapse(source: &str, item: &ListEditItem) -> bool {
     let opening_line_only = item.subtree_range.end.0
         <= line_end_inclusive(source.as_bytes(), item.prefix_range.start.0);
-    trustworthy && !item.in_quote && opening_line_only
+    !item.in_quote && opening_line_only
 }
 
 /// Removes a top-level empty item's marker and, if needed, makes the
@@ -990,23 +1004,42 @@ mod tests {
         )
     }
 
+    /// Asserts the plan consumes the key as a no-op that leaves the given
+    /// caret untouched, rather than falling back to ordinary editing.
+    fn no_op_keeps_caret(text: &str, caret: usize, intent: ListEditIntent) -> bool {
+        let source_range = SourceRange::new(0, text.len());
+        let parsed = parse_document(Revision(1), source_range, text);
+        let projection = build_list_edit_projection(&parsed, text);
+        let selection = SourceSelection::caret(SourceOffset(caret));
+        matches!(
+            plan_list_edit(&RopeBuffer::from_text(text), &projection, selection, intent).unwrap(),
+            ListEditPlanResult::Handled(MarkdownEditPlan::NoOp { selection_after })
+                if selection_after == selection
+        )
+    }
+
     /// An item whose opening line is blank but which owns descendant content
     /// (a nested sublist here) is not "empty": removing its marker would
-    /// orphan that content, so the item is not an exit target.
+    /// orphan that content. It is still a confirmed list item, so the key is
+    /// consumed as a no-op instead of falling back to ordinary editing,
+    /// which would otherwise mutate the parent item's protected content.
     #[test]
-    fn empty_opening_line_with_nested_content_is_not_an_exit_target() {
+    fn empty_opening_line_with_nested_content_is_an_exit_no_op() {
         let text = "- \n  - child";
-        assert!(not_applicable(text, 2, ListEditIntent::Backspace));
-        assert!(not_applicable(text, 2, ListEditIntent::Enter));
+        assert!(no_op_keeps_caret(text, 2, ListEditIntent::Backspace));
+        assert!(no_op_keeps_caret(text, 2, ListEditIntent::Enter));
     }
 
     /// An empty item still inside a blockquote is left alone: its opening
     /// line's bytes include the quote marker (`> `), and this exit operation
-    /// does not know how to edit around it without also removing that marker.
+    /// does not know how to edit around it without also removing that
+    /// marker. It is still a confirmed list item, so the key is consumed as
+    /// a no-op instead of falling back to ordinary editing, which would
+    /// otherwise remove the quote marker along with the list marker.
     #[test]
-    fn empty_item_inside_quote_is_not_an_exit_target() {
+    fn empty_item_inside_quote_is_an_exit_no_op() {
         let text = "> - A\n> - \n";
-        assert!(not_applicable(text, 10, ListEditIntent::Backspace));
+        assert!(no_op_keeps_caret(text, 10, ListEditIntent::Backspace));
     }
 
     /// A bare `- ` right after a plain paragraph, with no blank line between
