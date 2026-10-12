@@ -36,7 +36,9 @@ fn empty_height_index_round_trips_through_splice() {
 fn zero_height_entries_preserve_boundary_and_eof_selection() {
     let heights = HeightIndex::new([10.0, 0.0, 20.0, 0.0]);
     assert_eq!(
-        (0..=4).map(|end| heights.prefix_sum(end)).collect::<Vec<_>>(),
+        (0..=4)
+            .map(|end| heights.prefix_sum(end))
+            .collect::<Vec<_>>(),
         vec![0.0, 10.0, 10.0, 30.0, 30.0]
     );
     assert_eq!(heights.block_at_y(10.0), 2);
