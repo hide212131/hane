@@ -1366,6 +1366,76 @@ mod tests {
         }
     }
 
+    /// Same contract as `empty_nested_item_with_descendant_outdents_whole_subtree`,
+    /// but with bare CR line endings (no LF at all) throughout the source.
+    /// `transform_subtree` previously split physical lines with
+    /// `str::split_inclusive('\n')`, which treats a CR-only source as a
+    /// single unsplit line, so only the subtree's first line was shifted and
+    /// the nested child's own indentation was left untouched. Every `\r` here
+    /// is one byte, so all offsets match the LF case exactly.
+    #[test]
+    fn empty_nested_item_with_descendant_outdents_whole_subtree_with_cr_line_endings() {
+        let text = "- A\r  - \r    - c";
+        let caret = 8;
+        for intent in [ListEditIntent::Enter, ListEditIntent::Backspace] {
+            let (after_exit, new_caret) = replacement(text, caret, intent);
+            assert_eq!(
+                after_exit, "- A\r- \r  - c",
+                "{intent:?}: unexpected replacement"
+            );
+            assert_eq!(new_caret, 6, "{intent:?}: unexpected caret");
+
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(0, after_exit.len()),
+                &after_exit,
+            );
+            let child_item = parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| {
+                    matches!(node.kind, NodeKind::ListItem { .. })
+                        && after_exit[node.source_range.as_usize()].contains('c')
+                })
+                .min_by_key(|(_, node)| node.source_range.len_bytes())
+                .map(|(id, _)| id)
+                .unwrap_or_else(|| {
+                    panic!("{intent:?}: expected a ListItem containing \"c\" in {after_exit:?}")
+                });
+            assert_eq!(
+                parsed.tree.list_depth(child_item),
+                2,
+                "{intent:?}: expected \"c\" to stay a depth-2 nested item in {after_exit:?}"
+            );
+            let parent_item = parsed
+                .tree
+                .ancestors(child_item)
+                .skip(1)
+                .find(|ancestor| {
+                    matches!(
+                        parsed.tree.node(*ancestor).map(|node| node.kind),
+                        Some(NodeKind::ListItem { .. })
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!("{intent:?}: expected \"c\" to have a ListItem ancestor in {after_exit:?}")
+                });
+            assert_eq!(
+                parsed.tree.list_depth(parent_item),
+                1,
+                "{intent:?}: expected the emptied former-nested item to now be depth-1 in {after_exit:?}"
+            );
+            let (_, parent_ordinal) = parsed
+                .tree
+                .list_item_ordinal(parent_item)
+                .unwrap_or_else(|| panic!("{intent:?}: expected the parent item to have a list owner"));
+            assert_eq!(
+                parent_ordinal, 1,
+                "{intent:?}: expected the emptied item to remain \"A\"'s next sibling in {after_exit:?}"
+            );
+        }
+    }
+
     /// An empty item still inside a blockquote is left alone: its opening
     /// line's bytes include the quote marker (`> `), and this exit operation
     /// does not know how to edit around it without also removing that
@@ -1741,6 +1811,46 @@ mod tests {
             }
         }
     }
+
+    /// `transform_subtree` must shift every physical line of the subtree by
+    /// the same column delta while keeping each line's own terminator bytes
+    /// untouched, even when those terminators mix CRLF, bare CR, and LF
+    /// within the same subtree. Exercised directly against `transform_subtree`
+    /// (rather than through `plan_list_edit`) so the terminator bytes in the
+    /// source are exact and not an artifact of how the parser happens to
+    /// report ranges.
+    #[test]
+    fn transform_subtree_preserves_mixed_line_endings() {
+        let source = "- A\r\n  - B\r    - C\n";
+        let subtree_range = SourceRange::new(5, source.len());
+        let item = ListEditItem {
+            item_range: subtree_range,
+            subtree_range,
+            list_range: SourceRange::new(0, source.len()),
+            marker_range: SourceRange::new(5, 5),
+            prefix_range: SourceRange::new(5, 5),
+            body_range: SourceRange::new(5, 5),
+            marker: ListMarker::Unordered { bullet: b'-' },
+            list_start: None,
+            ordinal: 1,
+            depth: 2,
+            task: None,
+            marker_indent_columns: 2,
+            body_indent_columns: 4,
+            previous_sibling: None,
+            parent_item: None,
+            is_parser_item: true,
+            in_quote: false,
+        };
+        let MarkdownEditPlan::Replace {
+            range, replacement, ..
+        } = transform_subtree(source, &item, -2, SourceOffset(5))
+        else {
+            panic!("expected a Replace plan");
+        };
+        assert_eq!(range, subtree_range);
+        assert_eq!(replacement, "- B\r  - C\n");
+    }
 }
 
 /// The real extent of a parser list item's subtree, derived from its last
@@ -1788,12 +1898,7 @@ fn transform_subtree(
     let original = source.get(range.as_usize()).unwrap_or_default();
     let mut replacement =
         String::with_capacity(original.len().saturating_add(delta.max(0) as usize));
-    let mut at = 0;
-    for part in original.split_inclusive('\n') {
-        let ending_len = if part.ends_with("\r\n") { 2 } else { 1 };
-        let content_end = part.len().saturating_sub(ending_len);
-        let content = &part[..content_end];
-        let ending = &part[content_end..];
+    for (content, ending) in split_physical_lines(original) {
         if delta >= 0 {
             replacement.push_str(&" ".repeat(delta as usize));
             replacement.push_str(content);
@@ -1801,16 +1906,6 @@ fn transform_subtree(
             replacement.push_str(&remove_columns(content, (-delta) as usize));
         }
         replacement.push_str(ending);
-        at += part.len();
-    }
-    if at < original.len() {
-        let content = &original[at..];
-        if delta >= 0 {
-            replacement.push_str(&" ".repeat(delta as usize));
-            replacement.push_str(content);
-        } else {
-            replacement.push_str(&remove_columns(content, (-delta) as usize));
-        }
     }
     let line_start = line_start(source.as_bytes(), caret.0);
     let leading = caret.0.saturating_sub(line_start);
@@ -1825,6 +1920,43 @@ fn transform_subtree(
         replacement,
         selection_after: SourceSelection::caret(SourceOffset(mapped)),
     }
+}
+
+/// Splits `text` into physical lines, pairing each line's content with its
+/// own line-terminator bytes (`"\n"`, `"\r\n"`, `"\r"`, or `""` for a final
+/// line with no terminator). Unlike `str::split_inclusive('\n')`, a bare `\r`
+/// not followed by `\n` still ends its line here, so a subtree using only CR
+/// terminators (no LF at all) is still split into one entry per line rather
+/// than collapsed into a single line.
+fn split_physical_lines(text: &str) -> Vec<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                lines.push((&text[line_start..i], &text[i..i + 1]));
+                i += 1;
+                line_start = i;
+            }
+            b'\r' => {
+                let end = if bytes.get(i + 1) == Some(&b'\n') {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                lines.push((&text[line_start..i], &text[i..end]));
+                i = end;
+                line_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if line_start < bytes.len() {
+        lines.push((&text[line_start..], ""));
+    }
+    lines
 }
 
 fn remove_columns(line: &str, columns_to_remove: usize) -> String {
