@@ -877,6 +877,46 @@ mod tests {
         );
     }
 
+    /// PR #472 review: a descendant item's own task marker (`[ ]` on
+    /// `  - [ ] child`) must not be mistaken for the parent item's marker.
+    /// Before the fix, `find_task_marker` recursed into the child subtree and
+    /// clamped the parent's body to that child marker's line, leaving the
+    /// parent's body range empty even though "A" is real, non-empty content.
+    /// That falsely triggered the protected empty-item exit path and absorbed
+    /// ordinary edits at the parent's own body-start caret.
+    #[test]
+    fn parent_task_marker_is_not_confused_with_descendant_task_marker() {
+        let text = "- A\n  - [ ] child";
+        let source_range = SourceRange::new(0, text.len());
+        let parsed = parse_document(Revision(1), source_range, text);
+        let projection = build_list_edit_projection(&parsed, text);
+
+        let (_, parent) = projection
+            .item_at(SourceOffset(2))
+            .expect("expected an item at \"A\"");
+        assert_eq!(parent.task, None, "parent item must not be a task item");
+        assert_eq!(
+            &text[parent.body_range.as_usize()],
+            "A",
+            "parent body must stay non-empty"
+        );
+
+        let (_, child) = projection
+            .item_at(SourceOffset(text.find("child").unwrap()))
+            .expect("expected an item at \"child\"");
+        assert_eq!(child.task, Some(false), "child item must keep its own task marker");
+
+        // Caret byte 3 sits immediately after "A", at the parent's
+        // body-start/body-end boundary. Enter must proceed as an ordinary
+        // same-level split (not the empty-item exit no-op), and Backspace
+        // must fall back to ordinary deletion instead of being absorbed.
+        assert_eq!(
+            replacement(text, 3, ListEditIntent::Enter),
+            ("- A\n- \n  - [ ] child".into(), 6)
+        );
+        assert!(not_applicable(text, 3, ListEditIntent::Backspace));
+    }
+
     #[test]
     fn tab_moves_item_and_subtree_under_previous_sibling() {
         assert_eq!(
@@ -1875,17 +1915,18 @@ fn item_subtree_end(tree: &crate::MarkdownTree, item_id: NodeId, opening_line_en
         .map_or(opening_line_end, |end| end.max(opening_line_end))
 }
 
+/// A `TaskMarker` is always pushed as a direct child of its own owning
+/// `ListItem` (the parser emits `Event::TaskListMarker` while that item is
+/// still the open container, before any nested paragraph or sublist opens),
+/// so only `id`'s direct children can ever be its task marker. Recursing into
+/// descendants would also match a nested item's own task marker — e.g. for
+/// `- A\n  - [ ] child`, the child item's `[ ]` is not `A`'s marker — which
+/// would wrongly shrink `A`'s non-empty body down to an empty range.
 fn find_task_marker(tree: &crate::MarkdownTree, id: NodeId) -> Option<SourceRange> {
-    for child in tree.children(id) {
+    tree.children(id).iter().find_map(|child| {
         let node = tree.node(*child)?;
-        if matches!(node.kind, NodeKind::TaskMarker(_)) {
-            return Some(node.source_range);
-        }
-        if let Some(found) = find_task_marker(tree, *child) {
-            return Some(found);
-        }
-    }
-    None
+        matches!(node.kind, NodeKind::TaskMarker(_)).then_some(node.source_range)
+    })
 }
 
 fn transform_subtree(
