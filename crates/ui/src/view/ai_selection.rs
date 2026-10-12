@@ -470,6 +470,9 @@ fn text_transform_error_message(code: TextTransformErrorCode) -> String {
         TextTransformErrorCode::ResultTooLarge => {
             "AIの結果が大きすぎるため適用できません。".to_owned()
         }
+        TextTransformErrorCode::PreExecutionToolDenialUnverified => {
+            "この操作の安全な実行を確認できないため、現在利用できません。".to_owned()
+        }
     }
 }
 

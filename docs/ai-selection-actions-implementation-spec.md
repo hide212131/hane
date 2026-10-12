@@ -265,6 +265,16 @@ GitHub Copilotのcurrent-head full review finding（[PR #450のdiscussion](https
 
 `text_transform.rs`のユニットテストは、無条件fail-closed削除後も実行されない`AiRuntime`に対しては既存の世代確認で`RuntimeUnavailable`になることを確認するテストに置き換えた。`crates/ai/tests/text_transform_service.rs`の統合テストは、fake App Serverに対する実際の成功経路（選択文・指示はApp Serverへ届くが開いている文書の内容は届かない）、mid-turn tool item検出による`SafetyProfileUnsupported`中断、Probe busy解消後の admit→cancelの3シナリオへ更新した。実ChatGPT/Codex/Custom接続でのT13検証はこのworker実行では未実施であり、Commanderの観測対象として残る。
 
+#### 9.1.3 pre-execution tool denialの未解決と、再度のfail-closed対応（後続worker実行）
+
+[PR #450のcurrent-head review](https://github.com/hide212131/hane/pull/450#pullrequestreview-5485871355)とIssue #449「外部ファイル読込・シェル・ツール実行を許可しない」を受け、9.1.2で復元した`sandbox: "read-only"`・`approvalPolicy: "never"`・`ProbeCollector::has_unsafe_tool_activity`による中断は、tool/command itemの`item/started`通知（=App Serverが既に実行を開始した後の通知）を検知してからinterruptするmid-turn検出に過ぎず、実行前の拒否（pre-execution tool denial）の根拠にはならないことを確認した。
+
+この根本原因だけについて、同梱Codex App Serverの採用版（`crates/ai/protocol-schema/0.157.1/`）が実行前に拒否できる、サポート済みの強制機構があるかを確認した。`ThreadStartParams`/`TurnStartParams`の`sandbox`/`sandboxPolicy`は実行開始後の制約（書込み禁止等）であり実行の可否ではない。`approvalPolicy`の文字列値は`"untrusted" | "on-request" | "never"`のみで、確立されたCodex CLIの用語では`"never"`/`"on-request"`は承認なしで実行され、`"untrusted"`も内部の「trusted command」許可リスト（単純な読み取りを含む）には承認を求めない。`granular`変種の`sandbox_approval`/`rules`等のbooleanと`Config.tools`（`ToolsV2`、`web_search`のみ設定可能）には、ベンダー同梱schemaのどこにも説明文がない。ADR-0032 §10はこの種の安全関連設定を採用前に実バイナリへの`--strict-config`等の実プロセス検証を要求しているが、このworker実行はRead/Edit/Write/Glob/Grepのみに制限されており、shell/build/test/実バイナリ実行の権限を持たない。
+
+したがって、このPR実行では公式にサポートされた検証済みのpre-execution tool denial機構を確立できなかった。受入条件を弱めて満たしたように見せる、または別の認証・接続経路へ切り替えることは行わず、`text_transform.rs`に`pre_execution_tool_denial_verified()`（`false`固定）を追加し、`execute_text_transform`冒頭で共有設定ロック取得や`thread/start`呼び出しより前に無条件へ`TextTransformErrorCode::PreExecutionToolDenialUnverified`としてfail closedさせた。固定Probe（`probe.rs`）の`sandbox: "read-only"`・`approvalPolicy: "never"`・既存の`ProbeCollector`共有ロジックはそのまま変更していない。
+
+`crates/ai/tests/text_transform_service.rs`は、admission（busy判定）を経て実際に`execute_text_transform`へ到達した要求が、fake App Serverへ`instruction`/`selected_text`を一切送らずに`PreExecutionToolDenialUnverified`で終わることを確認する内容へ更新した。`text_transform.rs`のユニットテストは、未起動の`AiRuntime`・pending cancellationのいずれであってもこのgateが最優先で働くことを確認している。公式に検証済みの代替機構（例: Hane自身がspawn時に適用するOS/プロセスレベルの隔離、または採用版バイナリで実際に確認した設定）を設計・実装し、`pre_execution_tool_denial_verified()`をその検証済み条件に置き換える設計は本PRのscope外の後続作業として報告する。
+
 ## 10. 参考資料
 
 - [Wordのスクリーンリーダー／キーボード操作](https://support.microsoft.com/en-us/accessibility/copilot/use-copilot-in-word-with-a-screen-reader): Windows RewriteのAlt+I、macOS RewriteのControl+L、選択→結果確認→Replace。2026-10-10確認。
