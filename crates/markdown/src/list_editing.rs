@@ -644,7 +644,17 @@ pub fn plan_list_edit(
 /// untrustworthy candidate is not a list-aware exit target at all: it falls
 /// back to ordinary editing instead of being consumed as a no-op, so that
 /// plain prose that merely looks like a marker still edits normally.
+///
+/// At the top level (`depth <= 1`) a `parent_item`/`previous_sibling` link
+/// only proves a chain between raw recovery candidates, not that the formal
+/// parser recognizes a real list here, so top-level exit requires
+/// `is_parser_item` itself. Nested items keep the existing, looser check:
+/// a confirmed parent or sibling link there is still anchored to a real
+/// list structure, because depth > 1 cannot arise without one.
 fn exit_is_trustworthy(item: &ListEditItem) -> bool {
+    if item.depth <= 1 {
+        return item.is_parser_item;
+    }
     item.is_parser_item || item.parent_item.is_some() || item.previous_sibling.is_some()
 }
 
@@ -1052,6 +1062,20 @@ mod tests {
     fn isolated_raw_marker_after_a_plain_paragraph_is_not_an_exit_target() {
         let text = "para\n- ";
         assert!(not_applicable(text, text.len(), ListEditIntent::Backspace));
+    }
+
+    /// Chaining two raw recovery candidates at the same top-level indent (a
+    /// paragraph followed by two marker-like lines with no blank line to
+    /// interrupt it) gives the second candidate a `previous_sibling` link to
+    /// the first, purely from lexical chaining. Neither is recognized by the
+    /// formal parser, so this must not be trusted as a top-level exit target
+    /// just because a sibling link exists; it falls back to ordinary
+    /// editing instead.
+    #[test]
+    fn raw_recovery_previous_sibling_at_top_level_is_not_an_exit_target() {
+        let text = "para\n- A\n- ";
+        assert!(not_applicable(text, text.len(), ListEditIntent::Backspace));
+        assert!(not_applicable(text, text.len(), ListEditIntent::Enter));
     }
 
     /// A body made of non-ASCII whitespace (here U+3000 IDEOGRAPHIC SPACE) is
