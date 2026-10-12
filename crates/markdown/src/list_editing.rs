@@ -1017,9 +1017,11 @@ mod tests {
         );
     }
 
-    /// Issue #460 / E04: a preceding line made only of ASCII whitespace is
-    /// still a blank line for boundary purposes, determined per actual line
-    /// content rather than by counting line terminators.
+    /// Issue #460: a preceding line made only of ASCII whitespace (here
+    /// three spaces) is still a blank line for boundary purposes, determined
+    /// per actual line content rather than by counting line terminators.
+    /// Extra coverage alongside the matrix's E04 row, which uses a
+    /// space-then-tab blank line instead.
     #[test]
     fn trailing_empty_top_level_exit_after_whitespace_only_blank_line_adds_no_extra_blank_line() {
         let text = "- abc\n- def\n   \n- ";
@@ -1167,8 +1169,9 @@ mod tests {
         );
     }
 
-    /// Issue #460 / E13: offsets into multi-byte UTF-8 content stay in byte
-    /// positions, not char positions, on both sides of the exit point.
+    /// Issue #460: offsets into multi-byte UTF-8 content stay in byte
+    /// positions, not char positions, on both sides of the exit point. Extra
+    /// coverage alongside the matrix's E13 row, which uses `日本🙂` instead.
     #[test]
     fn utf8_content_on_both_sides_uses_byte_offsets() {
         let text = "- \u{3042}\n- \n- \u{3044}";
@@ -1312,14 +1315,15 @@ mod tests {
                 caret_after: 13,
                 extra: ExitContractExtra::RetainsListItems(&["abc", "def"]),
             },
-            // E02: CRLF line endings on both preceding lines.
+            // E02: the item is the entire document, so there is no line
+            // before or after it and neither separator is needed.
             ExitContractCase {
-                label: "E02 CRLF line endings",
-                text: "- abc\r\n- def\r\n- ",
-                caret: 16,
-                range: (14, 16),
-                replacement: "\r\n",
-                caret_after: 16,
+                label: "E02 document start and end",
+                text: "- ",
+                caret: 2,
+                range: (0, 2),
+                replacement: "",
+                caret_after: 0,
                 extra: ExitContractExtra::None,
             },
             // E03: an existing blank line before the exit already satisfies
@@ -1333,26 +1337,27 @@ mod tests {
                 caret_after: 13,
                 extra: ExitContractExtra::None,
             },
-            // E04: a whitespace-only line still counts as an existing blank
-            // line for the same reason.
+            // E04: a whitespace-only line (a space followed by a tab) still
+            // counts as an existing blank line for the same reason.
             ExitContractCase {
                 label: "E04 whitespace-only blank line before",
-                text: "- abc\n- def\n   \n- ",
-                caret: 18,
-                range: (16, 18),
+                text: "- abc\n- def\n \t\n- ",
+                caret: 17,
+                range: (15, 17),
                 replacement: "",
-                caret_after: 16,
+                caret_after: 15,
                 extra: ExitContractExtra::None,
             },
-            // E05: 0-3 leading spaces keep the item at the same (top) level,
-            // and the exit must still remove the whole indented opening line.
+            // E05: an explicit trailing line terminator after the exited
+            // item's own opening line, with nothing following it, must be
+            // treated the same as no terminator at all: no right separator.
             ExitContractCase {
-                label: "E05 leading indentation",
-                text: "  - abc\n  - def\n  - ",
-                caret: 20,
-                range: (16, 20),
+                label: "E05 item followed by a trailing EOL",
+                text: "- abc\n- def\n- \n",
+                caret: 14,
+                range: (12, 14),
                 replacement: "\n",
-                caret_after: 17,
+                caret_after: 13,
                 extra: ExitContractExtra::None,
             },
             // E06: an empty item between two unordered siblings needs a real
@@ -1378,70 +1383,72 @@ mod tests {
                 caret_after: 6,
                 extra: ExitContractExtra::RetainsListItems(&["A", "C"]),
             },
-            // E08: existing multiple blank lines before the exit are not
-            // collapsed; only the missing right separator is added.
+            // E08: existing blank lines are already present on both sides of
+            // the exit, so neither separator is added.
             ExitContractCase {
-                label: "E08 multiple blank lines before exit",
-                text: "- A\n\n- \n- C",
+                label: "E08 existing blank lines on both sides",
+                text: "- A\n\n- \n\n- C",
                 caret: 7,
                 range: (5, 7),
-                replacement: "\n",
+                replacement: "",
                 caret_after: 5,
                 extra: ExitContractExtra::None,
             },
-            // E09: symmetric to E08, with the existing multiple blank lines
-            // after the exit instead.
+            // E09: CRLF line endings on both preceding lines, with the exit
+            // trailing the document.
             ExitContractCase {
-                label: "E09 multiple blank lines after exit",
-                text: "- A\n- \n\n- C",
+                label: "E09 CRLF line endings",
+                text: "- abc\r\n- def\r\n- ",
+                caret: 16,
+                range: (14, 16),
+                replacement: "\r\n",
+                caret_after: 16,
+                extra: ExitContractExtra::None,
+            },
+            // E10: bare CR line endings (no LF at all) on a middle item
+            // between two siblings, which still needs a real blank line on
+            // both sides.
+            ExitContractCase {
+                label: "E10 bare CR line endings on a middle item",
+                text: "- A\r- \r- C",
                 caret: 6,
                 range: (4, 6),
-                replacement: "\n",
+                replacement: "\r\r",
                 caret_after: 5,
                 extra: ExitContractExtra::None,
             },
-            // E10: bare CR line endings (no LF at all), not just CRLF.
+            // E11: mixed line endings, where each separator is built from its
+            // own side's existing end-of-line bytes: LF before, CRLF after.
             ExitContractCase {
-                label: "E10 bare CR line endings",
-                text: "- abc\r- def\r- ",
-                caret: 14,
-                range: (12, 14),
-                replacement: "\r",
-                caret_after: 13,
+                label: "E11 LF before and CRLF after",
+                text: "3. A\n4. \r\n5. C",
+                caret: 8,
+                range: (5, 8),
+                replacement: "\n\r\n",
+                caret_after: 6,
                 extra: ExitContractExtra::None,
             },
-            // E11: the exited item is the first line of the document, so
-            // there is no line "before" it and only a right separator is
-            // needed.
+            // E12: three leading spaces is the boundary case that still
+            // keeps the item at the same (top) level, and the exit must
+            // still remove the whole indented opening line.
             ExitContractCase {
-                label: "E11 document start",
-                text: "- \n5. C",
-                caret: 2,
-                range: (0, 2),
+                label: "E12 three-space leading indentation",
+                text: "   - abc\n   - def\n   - ",
+                caret: 23,
+                range: (18, 23),
                 replacement: "\n",
-                caret_after: 0,
+                caret_after: 19,
                 extra: ExitContractExtra::None,
             },
-            // E12: mixed CRLF/LF, where each separator is built from its own
-            // side's existing end-of-line bytes rather than a fixed style.
-            ExitContractCase {
-                label: "E12 mixed CRLF/LF separators",
-                text: "3. A\r\n4. \n5. C",
-                caret: 9,
-                range: (6, 9),
-                replacement: "\r\n\n",
-                caret_after: 8,
-                extra: ExitContractExtra::None,
-            },
-            // E13: multi-byte UTF-8 content on both sides; offsets stay in
-            // bytes, not chars.
+            // E13: multi-byte UTF-8 content on both sides, including a
+            // non-BMP emoji; offsets stay in bytes, not chars.
             ExitContractCase {
                 label: "E13 UTF-8 byte offsets",
-                text: "- \u{3042}\n- \n- \u{3044}",
-                caret: 8,
-                range: (6, 8),
+                text: "- \u{65e5}\u{672c}\n- \n- \u{1f642}",
+                caret: 11,
+                range: (9, 11),
                 replacement: "\n\n",
-                caret_after: 7,
+                caret_after: 10,
                 extra: ExitContractExtra::None,
             },
             // E14: a marker whose body is empty because it touches the line
@@ -1467,15 +1474,17 @@ mod tests {
                 caret_after: 5,
                 extra: ExitContractExtra::FollowingProseStaysSeparateParagraph,
             },
-            // E16: the item is the entire document, so there is no line
-            // before or after it and neither separator is needed.
+            // E16: three existing line endings (two blank lines) already
+            // precede a trailing empty item; they must not be collapsed, and
+            // since the item is last in the document no right separator is
+            // needed either.
             ExitContractCase {
-                label: "E16 document start and end",
-                text: "- ",
-                caret: 2,
-                range: (0, 2),
+                label: "E16 three existing line endings before trailing item",
+                text: "- A\n\n\n- ",
+                caret: 8,
+                range: (6, 8),
                 replacement: "",
-                caret_after: 0,
+                caret_after: 6,
                 extra: ExitContractExtra::None,
             },
         ];
