@@ -1,6 +1,18 @@
 use super::*;
 
 #[test]
+fn initial_block_heights_account_for_heading_scale_and_trailing_blank_lines() {
+    let document = RopeBuffer::from_text("# title\n\n## section\n\nbody\n");
+    let index = BlockIndex::from_buffer(&document);
+
+    assert_eq!(
+        block_heights(&document, &index, 20.0),
+        vec![53.0, 49.0, 40.0],
+        "heading rows use their display scale and blank rows keep normal height"
+    );
+}
+
+#[test]
 fn initial_block_heights_keep_the_caret_owned_fence_row_visible() {
     let document = RopeBuffer::from_text("```\n```");
     let index = BlockIndex::from_buffer(&document);
