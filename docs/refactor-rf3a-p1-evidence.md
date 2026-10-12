@@ -10,7 +10,9 @@ Issue: [#304](https://github.com/hide212131/hane/issues/304)
 
 開始base/current base: `c17dd0e62ad6f67d1aa6db9e23df5105e5b5884e`
 
-この記録の更新前PR head: `c7fa87e1657eb62194f7297382ff708d075fd105`
+P1製品コードhead: `c7fa87e1657eb62194f7297382ff708d075fd105`
+
+今回の記録更新直前PR head: `25c5249ee4b095b55f5bbed2239d1d78057a95e4`
 
 ## P1 の範囲と候補差分
 
@@ -35,6 +37,7 @@ Issue: [#304](https://github.com/hide212131/hane/issues/304)
 |---|---|---|
 | workspace all-features tests、macOS/Windows | 成功 | `c7fa87e1657eb62194f7297382ff708d075fd105`、[PR CI run 38256599965 attempt 2](https://github.com/hide212131/hane/actions/runs/38256599965) |
 | OS固有チェックとworkspace Clippy | 成功。macOS fallback glyph/input source、Windows IME notification dispatchを含む | 同上 |
+| P1記録更新前headのcurrent-head CI | 成功。macOS/Windows workspace tests、OS固有チェック、Clippy | `25c5249ee4b095b55f5bbed2239d1d78057a95e4`、[run 38261671394](https://github.com/hide212131/hane/actions/runs/38261671394) |
 | 前のcandidate verifier | 成功（workspace regression tests、Clippy） | `44762e39485da9d95fe539449802aff9abf0b15e`、[run 38256022657](https://github.com/hide212131/hane/actions/runs/38256022657) |
 | `git diff --check` | 成功。base `c17dd0e` からP1候補 `c7fa87e` まで | `c7fa87e1657eb62194f7297382ff708d075fd105` |
 | `cargo fmt --all -- --check` | 失敗。固定Rust 1.98.1で、baseにもある既存の127箇所の差分を検出。candidateとの比較では追加行周辺に新しいformatter差分なし | `c17dd0e` と `c7fa87e` の比較 |
@@ -58,14 +61,17 @@ PR-triggered CI run 38256599965の初回attemptは`action_required`・jobなし�
 
 Hosted macOS GUI run [38258736475](https://github.com/hide212131/hane/actions/runs/38258736475) は同じcandidate head `c7fa87e`で実施した。clean build、本文のASCII編集・保存・Undo/Redo・再オープン、基本的な日本語IME composition、OS scroll、GPUI click/source-offset probe（8/8）は成功。包括シナリオは`inline_syntax_boundary`で失敗した。OCR box clickがcanonical offsetと一致せず、procedure自身が独立した製品失敗として扱わないよう記録している。併せて観測されたUp移動、IME Undo、drag selection、formatting toggle/save/reopenの結果はP2/P3またはIssue #101由来の既知境界ケースを含むため、このrun単独でP1 routingの合否を決めない。[evidence artifact](https://github.com/hide212131/hane/actions/runs/38258736475)を参照。
 
+CodeRabbit full reviewは記録更新直前head `25c5249`・base `c17dd0e`を対象に完了した（run `ee08b3b0-8027-45b8-b0c4-ea560c2be801`、[review 5492367991](https://github.com/hide212131/hane/pull/477#pullrequestreview-5492367991)）。1件のnitpickはinline renameのUnicode前方Deleteのaction-path test追加。確認した現行経路ではDeleteが既存の`next_inline_rename_boundary`を呼び、そのhelperのgrapheme境界は既存unit testで確認済みである。Jev dispositionは`follow_up`で、現行PRの製品不具合ではなく追加テスト候補として記録する。該当するaction-path testがない点は残るため、後続候補として扱う。
+
 ## 受入に残る確認
 
 | 確認 | 状態 |
 |---|---|
 | macOS P1直接画面確認 | 完了（上記一時アプリ） |
 | Windows P1直接画面確認 | 未実施 |
-| CodeRabbit current-head full review | 未実施。自動レビューはこのOSS repositoryでは手動full reviewが必要としてskip |
-| 記録更新後headのcurrent-head CI | 未実施 |
+| 記録更新前head `25c5249`のCodeRabbit full review | 完了（上記review）。1件のtest-only follow-up findingを記録 |
+| 記録更新後headのcurrent-head CI | 未実施。今回のcommitはこの記録のみを変更する |
+| 記録更新後headのCodeRabbit full review | 未実施。current-head CI成功後、利用枠が戻ったら再依頼する |
 | final head/base・差分・復旧方法の記録 | 未完了 |
 
 P1はまだ受入済みではない。このPRはopen、Issue #304もopenのまま。Windows画面確認、記録更新後headのCI、CodeRabbit full review、最終差分と復旧方法を確認してから受入を判断する。未実施の確認をpassとして扱わない。
