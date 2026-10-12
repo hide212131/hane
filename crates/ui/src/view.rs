@@ -11513,12 +11513,15 @@ mod tests {
             view.heights.update(0, kept_measured);
 
             let replacement = "eerht";
+            let edited_text_start = source
+                .find("three")
+                .expect("fixture contains the edited paragraph text");
             view.editor_mut()
                 .replace_range_recorded(
-                    edited_block.source_range,
+                    SourceRange::new(edited_text_start, edited_text_start + "three".len()),
                     replacement,
                     Selection::caret(SourceOffset(
-                        edited_block.source_range.start.0 + replacement.len(),
+                        edited_text_start + replacement.len(),
                     )),
                 )
                 .unwrap();
