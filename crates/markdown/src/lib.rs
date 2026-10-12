@@ -62,11 +62,10 @@ pub use syntax::{
     MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment, TableParse,
 };
 
-use hane_document::{Revision, SourceRange};
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hane_document::{Revision, SourceRange};
 
     #[test]
     fn code_padding_tracks_semantic_spaces_instead_of_container_bytes() {

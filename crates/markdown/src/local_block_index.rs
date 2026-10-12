@@ -117,6 +117,7 @@ pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -
 mod tests {
     use super::*;
     use crate::block_index::BlockIndex;
+    use hane_document::{LineId, RopeBuffer, SourceOffset, TextBuffer};
 
     #[test]
     fn local_index_sees_a_fence_that_opens_inside_the_lookback_window() {
