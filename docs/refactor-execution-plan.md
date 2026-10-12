@@ -591,5 +591,14 @@ P4実装PR [#473](https://github.com/hide212131/hane/pull/473) はmerge済み。
 
 current-head CI [run 38223198052](https://github.com/hide212131/hane/actions/runs/38223198052) でmacOS/Windowsのworkspace tests、OS固有検証、Clippyが成功。trusted verifier [run 38220846721](https://github.com/hide212131/hane/actions/runs/38220846721) はcode head `a61645195eaf276eaeee3d9b99e87fe2de06f12e` のworkspace all-features testsとClippyが成功。CodeRabbit full review [run e44ff4ba-2761-4eb4-a312-539cc08f16e1](https://github.com/hide212131/hane/pull/473#issuecomment-6119168976) はcurrent candidate headで完了し、actionable commentなし、未解決threadなし。移動表、可視性比較、テスト比較、復旧方法は [P4証拠記録](https://github.com/hide212131/hane/blob/feb846cb68bb9f0abf4dbfbd64722ce513a4076d/docs/refactor-rf2b-p4-evidence.md)。UI配線・layout・描画・native inputに変更がないため、設計書§9.4に沿い新規GUI validationは不要と判断した。
 
-**現在の再開位置: P5。** P1〜P4を受入済みとし、次はmain `feb846cb68bb9f0abf4dbfbd64722ce513a4076d` から別PRで設計書第5.4節のblock組立を `projection/block.rs` へ分離する。P5受入と#302の最終条件照合まではIssueをopenのまま保つ。
-P1のみ受入済み。P2以降は未着手であり、本節から自動的に継続しない。Issue #302の他の受入条件は未完了のため、Issueは閉じない。
+### 9.18 RF2-B: presentationの機械的分割 第5PR — block projection（#302 P5）
+
+P5実装PR [#475](https://github.com/hide212131/hane/pull/475) は、受入済みP4 base `feb846cb68bb9f0abf4dbfbd64722ce513a4076d` からblock組立をprivateな `projection/block.rs` へ分割する。検証済みcode headは `f1f6cc3086cd3607b2d7bc87edcdf41960bdec2c`。crate-rootの公開入口と親moduleの共有parse/indexを維持した。
+
+code head `f1f6cc3` のtrusted verifier [run 38236527917](https://github.com/hide212131/hane/actions/runs/38236527917) とexact-head PR CI [run 38236675589](https://github.com/hide212131/hane/actions/runs/38236675589) は成功。CIではmacOS/Windows all-features workspace tests・ClippyとOS固有testが成功し、macOS arm64・Rust 1.98.1の通常構成 `cargo test --workspace --locked` も成功した。P4 baseとcode headのrustdocはいずれもexit 0、同じ9件の既存warning。`git diff --check` はexit 0。workspace全体の `cargo fmt --all -- --check` は既存format差分を検出して失敗し、P4 baseにもprojection内の同じ差分があったため、成功とは扱っていない。
+
+P5前後でunit testは合計54件のまま。12件を `projection/block/tests.rs` へ移し、42件を親に残した。test名・属性・signature・関数本体は移動前後で同じ。詳細なシンボル表、12件の対応表、検証と復旧方法は [P5検証記録](refactor-rf2b-p5-evidence.md) にある。最終PR headの必須CI・CodeRabbit review・merge statusは [PR #475](https://github.com/hide212131/hane/pull/475) に記録する。UI配線・描画・layout・native inputを変更していないため、設計書§9.4に沿い追加GUI validationは不要と判断した。
+
+RF2-B全体のP1〜P4受入記録は§9.14〜§9.17、P5の検証記録は本節を参照する。Issue #302はP1〜P5とIssue全体の受入条件を確認した後に完了する。
+
+（P1受入時点の履歴）P1のみ受入済みで、P2以降は未着手だった。Issue #302の他の受入条件が未完了のため、当時はIssueをopenのまま維持した。後続段階の進捗は§9.15〜§9.18に記録する。
