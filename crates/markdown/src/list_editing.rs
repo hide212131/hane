@@ -673,37 +673,52 @@ fn exit_is_safe_to_collapse(source: &str, item: &ListEditItem) -> bool {
     !item.in_quote && opening_line_only
 }
 
-/// Removes a top-level empty item's marker and, if needed, makes the
-/// resulting blank line a real paragraph boundary instead of a lazy
-/// continuation of the previous item.
+/// Removes a top-level empty item's marker and, if needed, inserts a real
+/// blank-line boundary on each side of the exit point instead of relying on
+/// a single shared line terminator.
 ///
 /// Deleting only the marker (`item.prefix_range`) already leaves this line
-/// blank, because the item's body is empty by construction. Whenever there is
-/// content both before and after that blank line, the line terminators on
-/// each side of it already sandwich it into a genuine blank line, so the
-/// list ends there and nothing more needs to change. The one case that is
-/// not already a complete blank line is when this item sits at the very end
-/// of the source (no trailing line terminator of its own) *and* the line
-/// immediately before it is not itself already blank: there the deletion
-/// leaves only a single terminator before an open end, which is not a
-/// blank-line boundary, so a matching terminator is appended to complete it.
-/// An item with nothing before it, or whose previous line is already blank
-/// (including a line made only of ASCII space/tab), needs no boundary at
-/// all: that previous blank line already satisfies the boundary, and adding
-/// another would insert a spurious extra blank line.
+/// blank, because the item's body is empty by construction, but whatever the
+/// caller types next at the caret becomes an ordinary paragraph that a
+/// single shared terminator cannot protect from either neighbor: without a
+/// blank line of its own on the left, the typed text is a lazy continuation
+/// of the previous block's paragraph; without one on the right, content that
+/// cannot itself interrupt a paragraph without a blank line (an ordered item
+/// not starting at 1, or plain prose) gets absorbed into it instead of
+/// staying separate. So each side is decided independently, built from that
+/// side's own existing end-of-line bytes, and only when real content sits
+/// directly against it with no existing blank line already there — a side
+/// with nothing (document start/end) or an already-blank neighbor (including
+/// a line of only ASCII space/tab) needs no separator, to avoid inserting a
+/// spurious extra blank line or duplicating an existing boundary. Everything
+/// beyond this item's own line, including any following item's raw bytes,
+/// is left untouched.
 fn exit_top_level_item(source: &str, item: &ListEditItem) -> MarkdownEditPlan {
     let line_start = item.prefix_range.start.0;
-    let line_end = item.prefix_range.end.0;
+    let line_text_end = item.prefix_range.end.0;
+    let after_line = line_end_inclusive(source.as_bytes(), line_start);
     let has_previous = line_start > 0;
-    let has_following = line_end < source.len();
-    let needs_boundary =
-        has_previous && !has_following && !previous_line_is_blank(source, line_start);
-    let replacement = if needs_boundary {
-        line_terminator_before(source, line_start).to_owned()
+    let has_following = after_line < source.len();
+
+    let left_separator = if has_previous && !previous_line_is_blank(source, line_start) {
+        line_terminator_before(source, line_start)
     } else {
-        String::new()
+        ""
     };
+    let right_separator = if has_following && !following_line_is_blank(source, after_line) {
+        &source[line_text_end..after_line]
+    } else {
+        ""
+    };
+
+    let mut replacement = String::with_capacity(left_separator.len() + right_separator.len());
+    replacement.push_str(left_separator);
+    // When a right separator exists, the caret must land between the two
+    // separators so that whatever is typed next lands inside the new
+    // paragraph rather than inside either separator.
     let new_caret = SourceOffset(line_start + replacement.len());
+    replacement.push_str(right_separator);
+
     MarkdownEditPlan::Replace {
         range: item.prefix_range,
         replacement,
@@ -740,6 +755,14 @@ fn previous_line_is_blank(source: &str, item_line_start: usize) -> bool {
     let content_end = item_line_start - terminator_len;
     let previous_start = line_start(bytes, content_end);
     is_ascii_blank(&source[previous_start..content_end])
+}
+
+/// Whether the physical line starting at `following_line_start` is blank,
+/// symmetric to [`previous_line_is_blank`]. `following_line_start` must be
+/// less than `source.len()`.
+fn following_line_is_blank(source: &str, following_line_start: usize) -> bool {
+    let content_end = line_end(source.as_bytes(), following_line_start);
+    is_ascii_blank(&source[following_line_start..content_end])
 }
 
 fn item_prefix(source: &str, item: &ListEditItem) -> String {
@@ -980,22 +1003,154 @@ mod tests {
         );
     }
 
+    /// Issue #460 / E06: an empty item sitting directly between two other
+    /// items (no existing blank line on either side) needs a genuine blank
+    /// line on *both* sides of the exit point, not just the single shared
+    /// line terminator that a plain deletion would leave. Otherwise typed
+    /// text at the caret would be a lazy continuation of `A`'s paragraph on
+    /// the left, merging it back into the previous item.
     #[test]
-    fn empty_top_level_item_between_siblings_keeps_a_single_blank_line() {
-        // The line terminators already on both sides of the emptied item
-        // already form a complete blank line, so no extra one is inserted.
+    fn empty_top_level_item_between_siblings_gets_blank_lines_on_both_sides() {
+        let (after_exit, caret) = replacement("- A\n- \n- C", 6, ListEditIntent::Backspace);
+        assert_eq!(after_exit, "- A\n\n\n\n- C");
+        assert_eq!(caret, 5);
+
+        let mut typed = after_exit;
+        typed.insert_str(caret, "ghi");
+        assert_eq!(typed, "- A\n\nghi\n\n- C");
+    }
+
+    /// Issue #460 / E07: an ordered item whose exit is immediately followed
+    /// by another ordered item cannot rely on the shared line terminator
+    /// either: an ordered marker that does not start at 1 cannot interrupt a
+    /// paragraph without a blank line, so without a right separator typed
+    /// text would absorb the following item into its own paragraph instead
+    /// of leaving it as a list.
+    #[test]
+    fn empty_top_level_item_between_ordered_siblings_gets_blank_lines_on_both_sides() {
+        let text = "3. A\n4. \n5. C";
+        let (after_exit, caret) = replacement(text, 8, ListEditIntent::Backspace);
+        assert_eq!(after_exit, "3. A\n\n\n\n5. C");
+        assert_eq!(caret, 6);
+
+        let mut typed = after_exit;
+        typed.insert_str(caret, "ghi");
+        assert_eq!(typed, "3. A\n\nghi\n\n5. C");
+
+        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+        let list_items: Vec<_> = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .collect();
         assert_eq!(
-            replacement("- A\n- \n- C", 6, ListEditIntent::Backspace),
-            ("- A\n\n- C".into(), 4)
+            list_items.len(),
+            2,
+            "expected \"3. A\" and \"5. C\" to remain two separate list items, got {list_items:?}"
+        );
+        let last_item_text = &typed[list_items[1].1.source_range.as_usize()];
+        assert!(
+            last_item_text.contains('C'),
+            "expected the trailing list item to still contain \"C\", got {last_item_text:?}"
+        );
+        let paragraph = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
+            .expect("expected a paragraph for \"ghi\"");
+        assert!(
+            !parsed
+                .tree
+                .ancestors(paragraph.0)
+                .skip(1)
+                .any(|ancestor| matches!(
+                    parsed.tree.node(ancestor).map(|node| node.kind),
+                    Some(NodeKind::ListItem { .. })
+                )),
+            "the paragraph for \"ghi\" must not be a descendant of a ListItem"
         );
     }
 
+    /// Existing blank lines are never duplicated: when the line before the
+    /// exit point is already blank, only the right side still needs its own
+    /// separator.
+    #[test]
+    fn existing_multiple_blank_lines_before_exit_are_not_collapsed() {
+        assert_eq!(
+            replacement("- A\n\n- \n- C", 7, ListEditIntent::Backspace),
+            ("- A\n\n\n\n- C".into(), 5)
+        );
+    }
+
+    /// Symmetric to the previous case: when the line after the exit point
+    /// is already blank, only the left side still needs its own separator.
     #[test]
     fn existing_multiple_blank_lines_after_exit_are_not_collapsed() {
         assert_eq!(
             replacement("- A\n- \n\n- C", 6, ListEditIntent::Backspace),
-            ("- A\n\n\n- C".into(), 4)
+            ("- A\n\n\n\n- C".into(), 5)
         );
+    }
+
+    /// Issue #460 / E15: plain prose (not a list marker at all) directly
+    /// after the exited item is just as vulnerable to absorption as a
+    /// restarting ordered item, since a bare text line can never interrupt a
+    /// paragraph without a blank line.
+    #[test]
+    fn empty_top_level_item_before_plain_prose_gets_a_right_separator() {
+        let text = "- A\n- \nplain text";
+        let (after_exit, caret) = replacement(text, 6, ListEditIntent::Backspace);
+        assert_eq!(after_exit, "- A\n\n\n\nplain text");
+        assert_eq!(caret, 5);
+
+        let mut typed = after_exit;
+        typed.insert_str(caret, "ghi");
+        assert_eq!(typed, "- A\n\nghi\n\nplain text");
+
+        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+        let paragraphs: Vec<_> = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
+            .collect();
+        assert_eq!(
+            paragraphs.len(),
+            2,
+            "expected \"ghi\" and \"plain text\" to be two distinct paragraphs, got {paragraphs:?}"
+        );
+    }
+
+    /// An item with nothing before it only ever needs a right separator: a
+    /// document cannot have a line "before" its own first line.
+    #[test]
+    fn empty_top_level_item_at_document_start_only_gets_a_right_separator() {
+        assert_eq!(
+            replacement("- \n5. C", 2, ListEditIntent::Backspace),
+            ("\n\n5. C".into(), 0)
+        );
+    }
+
+    /// Mixed CRLF/LF line endings: each separator is built from its own
+    /// side's existing end-of-line bytes, not a hardcoded style.
+    #[test]
+    fn mixed_line_endings_build_each_separator_from_its_own_side() {
+        let text = "3. A\r\n4. \n5. C";
+        assert_eq!(
+            replacement(text, 9, ListEditIntent::Backspace),
+            ("3. A\r\n\r\n\n\n5. C".into(), 8)
+        );
+    }
+
+    /// Issue #460 / E13: offsets into multi-byte UTF-8 content stay in byte
+    /// positions, not char positions, on both sides of the exit point.
+    #[test]
+    fn utf8_content_on_both_sides_uses_byte_offsets() {
+        let text = "- \u{3042}\n- \n- \u{3044}";
+        let item_byte_len = "- \u{3042}\n".len();
+        let caret = item_byte_len + "- ".len();
+        let (after_exit, new_caret) = replacement(text, caret, ListEditIntent::Backspace);
+        assert_eq!(after_exit, "- \u{3042}\n\n\n\n- \u{3044}");
+        assert_eq!(new_caret, item_byte_len + 1);
     }
 
     fn not_applicable(text: &str, caret: usize, intent: ListEditIntent) -> bool {
