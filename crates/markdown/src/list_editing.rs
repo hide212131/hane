@@ -659,17 +659,22 @@ fn exit_is_eligible(source: &str, item: &ListEditItem) -> bool {
 /// each side of it already sandwich it into a genuine blank line, so the
 /// list ends there and nothing more needs to change. The one case that is
 /// not already a complete blank line is when this item sits at the very end
-/// of the source (no trailing line terminator of its own): there the
-/// deletion leaves only a single terminator before an open end, which is not
-/// a blank-line boundary, so a matching terminator is appended to complete
-/// it. An item with nothing before it needs no boundary at all, matching the
-/// existing "sole item" exit behavior.
+/// of the source (no trailing line terminator of its own) *and* the line
+/// immediately before it is not itself already blank: there the deletion
+/// leaves only a single terminator before an open end, which is not a
+/// blank-line boundary, so a matching terminator is appended to complete it.
+/// An item with nothing before it, or whose previous line is already blank
+/// (including a line made only of ASCII space/tab), needs no boundary at
+/// all: that previous blank line already satisfies the boundary, and adding
+/// another would insert a spurious extra blank line.
 fn exit_top_level_item(source: &str, item: &ListEditItem) -> MarkdownEditPlan {
     let line_start = item.prefix_range.start.0;
     let line_end = item.prefix_range.end.0;
     let has_previous = line_start > 0;
     let has_following = line_end < source.len();
-    let replacement = if has_previous && !has_following {
+    let needs_boundary =
+        has_previous && !has_following && !previous_line_is_blank(source, line_start);
+    let replacement = if needs_boundary {
         line_terminator_before(source, line_start).to_owned()
     } else {
         String::new()
@@ -691,6 +696,26 @@ fn line_terminator_before(source: &str, line_start: usize) -> &str {
     } else {
         &source[line_start - 1..line_start]
     }
+}
+
+/// Whether the physical line immediately before `line_start` is blank, i.e.
+/// empty or made only of ASCII space/tab (see [`is_ascii_blank`]). Determined
+/// from the actual line content rather than counting terminators, so a line
+/// of only whitespace still counts as an existing boundary. `line_start` must
+/// be greater than `0`.
+fn previous_line_is_blank(source: &str, item_line_start: usize) -> bool {
+    let bytes = source.as_bytes();
+    let terminator_len = if item_line_start >= 2
+        && bytes[item_line_start - 2] == b'\r'
+        && bytes[item_line_start - 1] == b'\n'
+    {
+        2
+    } else {
+        1
+    };
+    let content_end = item_line_start - terminator_len;
+    let previous_start = line_start(bytes, content_end);
+    is_ascii_blank(&source[previous_start..content_end])
 }
 
 fn item_prefix(source: &str, item: &ListEditItem) -> String {
@@ -901,6 +926,34 @@ mod tests {
         assert_eq!(
             replacement(text, text.len(), ListEditIntent::Backspace),
             ("- abc\r\n- def\r\n\r\n".into(), 16)
+        );
+    }
+
+    /// Issue #460 / E03: when a trailing empty top-level item is preceded by
+    /// an already-blank line, that existing blank line already satisfies the
+    /// paragraph boundary, so exiting must not insert a second one.
+    #[test]
+    fn trailing_empty_top_level_exit_after_existing_blank_line_adds_no_extra_blank_line() {
+        let text = "- abc\n- def\n\n- ";
+        assert_eq!(
+            replacement(text, text.len(), ListEditIntent::Backspace),
+            ("- abc\n- def\n\n".into(), 13)
+        );
+        assert_eq!(
+            replacement(text, text.len(), ListEditIntent::Enter),
+            ("- abc\n- def\n\n".into(), 13)
+        );
+    }
+
+    /// Issue #460 / E04: a preceding line made only of ASCII whitespace is
+    /// still a blank line for boundary purposes, determined per actual line
+    /// content rather than by counting line terminators.
+    #[test]
+    fn trailing_empty_top_level_exit_after_whitespace_only_blank_line_adds_no_extra_blank_line() {
+        let text = "- abc\n- def\n   \n- ";
+        assert_eq!(
+            replacement(text, text.len(), ListEditIntent::Backspace),
+            ("- abc\n- def\n   \n".into(), 16)
         );
     }
 
