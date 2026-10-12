@@ -1267,6 +1267,329 @@ mod tests {
         let text = "- A\n- \u{3000}";
         assert!(not_applicable(text, text.len(), ListEditIntent::Backspace));
     }
+
+    /// Extra structural proof required for a handful of design-spec §8 exit
+    /// cases, beyond the shared range/replacement/caret contract and the
+    /// `ghi`-stays-outside-any-`ListItem` check every case gets.
+    #[derive(Clone, Copy)]
+    enum ExitContractExtra {
+        None,
+        /// The named items, in source order, must still exist as `ListItem`s
+        /// and each must still contain its given text.
+        RetainsListItems(&'static [&'static str]),
+        /// Plain prose immediately after the exited item must stay its own
+        /// `Paragraph`, distinct from the one holding the typed `ghi`.
+        FollowingProseStaysSeparateParagraph,
+    }
+
+    /// Issue #460 design spec §8: an empty top-level item's Enter and
+    /// Backspace share one exit contract (`plan_list_edit` reaches the same
+    /// branch for both intents before dispatching on `empty`/`on_opening_line`).
+    /// Each row fixes the exact source range, replacement bytes, and
+    /// post-edit caret the planner must produce for both intents, across the
+    /// design's full E01-E16 example matrix.
+    struct ExitContractCase {
+        label: &'static str,
+        text: &'static str,
+        caret: usize,
+        range: (usize, usize),
+        replacement: &'static str,
+        caret_after: usize,
+        extra: ExitContractExtra,
+    }
+
+    #[test]
+    fn empty_top_level_exit_contract_matrix() {
+        let cases = [
+            // E01: the basic case, two preceding sibling items and nothing
+            // following; both must still be ListItems after the exit.
+            ExitContractCase {
+                label: "E01 basic top-level exit",
+                text: "- abc\n- def\n- ",
+                caret: 14,
+                range: (12, 14),
+                replacement: "\n",
+                caret_after: 13,
+                extra: ExitContractExtra::RetainsListItems(&["abc", "def"]),
+            },
+            // E02: CRLF line endings on both preceding lines.
+            ExitContractCase {
+                label: "E02 CRLF line endings",
+                text: "- abc\r\n- def\r\n- ",
+                caret: 16,
+                range: (14, 16),
+                replacement: "\r\n",
+                caret_after: 16,
+                extra: ExitContractExtra::None,
+            },
+            // E03: an existing blank line before the exit already satisfies
+            // the left boundary, so no extra separator is added.
+            ExitContractCase {
+                label: "E03 existing blank line before",
+                text: "- abc\n- def\n\n- ",
+                caret: 15,
+                range: (13, 15),
+                replacement: "",
+                caret_after: 13,
+                extra: ExitContractExtra::None,
+            },
+            // E04: a whitespace-only line still counts as an existing blank
+            // line for the same reason.
+            ExitContractCase {
+                label: "E04 whitespace-only blank line before",
+                text: "- abc\n- def\n   \n- ",
+                caret: 18,
+                range: (16, 18),
+                replacement: "",
+                caret_after: 16,
+                extra: ExitContractExtra::None,
+            },
+            // E05: 0-3 leading spaces keep the item at the same (top) level,
+            // and the exit must still remove the whole indented opening line.
+            ExitContractCase {
+                label: "E05 leading indentation",
+                text: "  - abc\n  - def\n  - ",
+                caret: 20,
+                range: (16, 20),
+                replacement: "\n",
+                caret_after: 17,
+                extra: ExitContractExtra::None,
+            },
+            // E06: an empty item between two unordered siblings needs a real
+            // blank line on both sides, and both siblings must remain
+            // ListItems afterward.
+            ExitContractCase {
+                label: "E06 between unordered siblings",
+                text: "- A\n- \n- C",
+                caret: 6,
+                range: (4, 6),
+                replacement: "\n\n",
+                caret_after: 5,
+                extra: ExitContractExtra::RetainsListItems(&["A", "C"]),
+            },
+            // E07: the same shape with ordered markers, where a non-1 ordinal
+            // cannot interrupt a paragraph without a blank line either.
+            ExitContractCase {
+                label: "E07 between ordered siblings",
+                text: "3. A\n4. \n5. C",
+                caret: 8,
+                range: (5, 8),
+                replacement: "\n\n",
+                caret_after: 6,
+                extra: ExitContractExtra::RetainsListItems(&["A", "C"]),
+            },
+            // E08: existing multiple blank lines before the exit are not
+            // collapsed; only the missing right separator is added.
+            ExitContractCase {
+                label: "E08 multiple blank lines before exit",
+                text: "- A\n\n- \n- C",
+                caret: 7,
+                range: (5, 7),
+                replacement: "\n",
+                caret_after: 5,
+                extra: ExitContractExtra::None,
+            },
+            // E09: symmetric to E08, with the existing multiple blank lines
+            // after the exit instead.
+            ExitContractCase {
+                label: "E09 multiple blank lines after exit",
+                text: "- A\n- \n\n- C",
+                caret: 6,
+                range: (4, 6),
+                replacement: "\n",
+                caret_after: 5,
+                extra: ExitContractExtra::None,
+            },
+            // E10: bare CR line endings (no LF at all), not just CRLF.
+            ExitContractCase {
+                label: "E10 bare CR line endings",
+                text: "- abc\r- def\r- ",
+                caret: 14,
+                range: (12, 14),
+                replacement: "\r",
+                caret_after: 13,
+                extra: ExitContractExtra::None,
+            },
+            // E11: the exited item is the first line of the document, so
+            // there is no line "before" it and only a right separator is
+            // needed.
+            ExitContractCase {
+                label: "E11 document start",
+                text: "- \n5. C",
+                caret: 2,
+                range: (0, 2),
+                replacement: "\n",
+                caret_after: 0,
+                extra: ExitContractExtra::None,
+            },
+            // E12: mixed CRLF/LF, where each separator is built from its own
+            // side's existing end-of-line bytes rather than a fixed style.
+            ExitContractCase {
+                label: "E12 mixed CRLF/LF separators",
+                text: "3. A\r\n4. \n5. C",
+                caret: 9,
+                range: (6, 9),
+                replacement: "\r\n\n",
+                caret_after: 8,
+                extra: ExitContractExtra::None,
+            },
+            // E13: multi-byte UTF-8 content on both sides; offsets stay in
+            // bytes, not chars.
+            ExitContractCase {
+                label: "E13 UTF-8 byte offsets",
+                text: "- \u{3042}\n- \n- \u{3044}",
+                caret: 8,
+                range: (6, 8),
+                replacement: "\n\n",
+                caret_after: 7,
+                extra: ExitContractExtra::None,
+            },
+            // E14: a marker whose body is empty because it touches the line
+            // ending directly, with no separator space at all after it.
+            ExitContractCase {
+                label: "E14 no-space marker",
+                text: "- abc\n- def\n-\n",
+                caret: 13,
+                range: (12, 13),
+                replacement: "\n",
+                caret_after: 13,
+                extra: ExitContractExtra::None,
+            },
+            // E15: plain prose (not a list marker) directly after the exit;
+            // it cannot interrupt a paragraph without a blank line either, so
+            // it must stay a separate paragraph from the typed text.
+            ExitContractCase {
+                label: "E15 before plain prose",
+                text: "- A\n- \nplain text",
+                caret: 6,
+                range: (4, 6),
+                replacement: "\n\n",
+                caret_after: 5,
+                extra: ExitContractExtra::FollowingProseStaysSeparateParagraph,
+            },
+            // E16: the item is the entire document, so there is no line
+            // before or after it and neither separator is needed.
+            ExitContractCase {
+                label: "E16 document start and end",
+                text: "- ",
+                caret: 2,
+                range: (0, 2),
+                replacement: "",
+                caret_after: 0,
+                extra: ExitContractExtra::None,
+            },
+        ];
+
+        for case in &cases {
+            for intent in [ListEditIntent::Enter, ListEditIntent::Backspace] {
+                let source_range = SourceRange::new(0, case.text.len());
+                let parsed = parse_document(Revision(1), source_range, case.text);
+                let projection = build_list_edit_projection(&parsed, case.text);
+                let result = plan_list_edit(
+                    &RopeBuffer::from_text(case.text),
+                    &projection,
+                    SourceSelection::caret(SourceOffset(case.caret)),
+                    intent,
+                )
+                .unwrap();
+                let ListEditPlanResult::Handled(MarkdownEditPlan::Replace {
+                    range,
+                    replacement,
+                    selection_after,
+                }) = result
+                else {
+                    panic!("{}: expected a Replace plan for {intent:?}", case.label);
+                };
+                assert_eq!(
+                    (range.start.0, range.end.0),
+                    case.range,
+                    "{}: unexpected source range for {intent:?}",
+                    case.label
+                );
+                assert_eq!(
+                    replacement, case.replacement,
+                    "{}: unexpected replacement for {intent:?}",
+                    case.label
+                );
+                assert_eq!(
+                    selection_after,
+                    SourceSelection::caret(SourceOffset(case.caret_after)),
+                    "{}: unexpected caret for {intent:?}",
+                    case.label
+                );
+
+                let mut typed = case.text.to_string();
+                typed.replace_range(case.range.0..case.range.1, &replacement);
+                typed.insert_str(case.caret_after, "ghi");
+
+                let typed_parsed =
+                    parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+                let ghi_paragraph = typed_parsed
+                    .tree
+                    .iter()
+                    .find(|(_, node)| {
+                        matches!(node.kind, NodeKind::Paragraph)
+                            && typed[node.source_range.as_usize()].contains("ghi")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{}: expected a paragraph containing \"ghi\" in {typed:?}",
+                            case.label
+                        )
+                    });
+                assert!(
+                    !typed_parsed
+                        .tree
+                        .ancestors(ghi_paragraph.0)
+                        .skip(1)
+                        .any(|ancestor| matches!(
+                            typed_parsed.tree.node(ancestor).map(|node| node.kind),
+                            Some(NodeKind::ListItem { .. })
+                        )),
+                    "{}: the paragraph for \"ghi\" must not be a descendant of a ListItem in {typed:?}",
+                    case.label
+                );
+
+                match case.extra {
+                    ExitContractExtra::None => {}
+                    ExitContractExtra::RetainsListItems(expected_items) => {
+                        let list_items: Vec<_> = typed_parsed
+                            .tree
+                            .iter()
+                            .filter(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                            .collect();
+                        assert_eq!(
+                            list_items.len(),
+                            expected_items.len(),
+                            "{}: expected {expected_items:?} to remain ListItems, got {list_items:?} in {typed:?}",
+                            case.label
+                        );
+                        for (item, expected_text) in
+                            list_items.iter().zip(expected_items.iter().copied())
+                        {
+                            assert!(
+                                typed[item.1.source_range.as_usize()].contains(expected_text),
+                                "{}: expected a ListItem containing {expected_text:?} in {typed:?}",
+                                case.label
+                            );
+                        }
+                    }
+                    ExitContractExtra::FollowingProseStaysSeparateParagraph => {
+                        let paragraphs = typed_parsed
+                            .tree
+                            .iter()
+                            .filter(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
+                            .count();
+                        assert_eq!(
+                            paragraphs, 2,
+                            "{}: expected \"ghi\" and the following prose to be two distinct paragraphs in {typed:?}",
+                            case.label
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn find_task_marker(tree: &crate::MarkdownTree, id: NodeId) -> Option<SourceRange> {
