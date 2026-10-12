@@ -31,6 +31,9 @@ use crate::rpc::RejectAllServerRequests;
 use crate::runtime::{AiRuntime, RuntimeEvent, RuntimeEventKind, RuntimeState};
 use crate::secrets::{CredentialRef, CredentialStore};
 use crate::settings::{ActiveConnection, AiSettings, AiSettingsStore, SaveError};
+use crate::text_transform::{
+    self, TextTransformOutcome, validate_request as validate_text_transform_request,
+};
 
 const COMMAND_CAPACITY: usize = 16;
 const SUBSCRIBER_NOTIFICATION_CAPACITY: usize = 1;
@@ -51,6 +54,9 @@ pub enum ServiceBusyReason {
     Account,
     Models,
     Probe,
+    /// One selection AI text transform turn (Issue #449). Mutually exclusive
+    /// with every other AI operation via the same admission gate Probe uses.
+    TextTransform,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +122,12 @@ pub struct AiSnapshot {
     pub persistence: PersistenceState,
     pub probe_status: ProbeStatus,
     pub probe_result: Option<ProbeResult>,
+    /// Runtime-wide isolation after a child process's exit could not be
+    /// confirmed, regardless of which AI operation (Probe or text
+    /// transform) observed it. Decoupled from `probe_status` so a
+    /// text-transform-triggered isolation never mutates the fixed Probe's
+    /// own `probe_status`/`probe_result`.
+    pub runtime_isolated: bool,
 }
 
 impl Default for AiSnapshot {
@@ -138,6 +150,7 @@ impl Default for AiSnapshot {
             persistence: PersistenceState::Clean,
             probe_status: ProbeStatus::NotRun,
             probe_result: None,
+            runtime_isolated: false,
         }
     }
 }
@@ -148,6 +161,9 @@ pub enum AdmissionError {
     QueueFull,
     Unavailable,
     WrongOperation,
+    /// The request was rejected before being queued at all: it never
+    /// changed `busy`/ownership state and never reached the worker thread.
+    InvalidInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +220,14 @@ enum WorkerCommand {
         old_credential_ref: CredentialRef,
         settings_without_credential: AiSettings,
     },
+    /// One selection AI text transform turn. `reply_tx` is this specific
+    /// request's own dedicated channel: the result is delivered there only,
+    /// never through `AiSnapshot` (section 5.1).
+    TextTransform {
+        instruction: String,
+        selected_text: String,
+        reply_tx: SyncSender<TextTransformOutcome>,
+    },
 }
 
 pub struct AiService {
@@ -229,13 +253,21 @@ impl AiServiceHandle {
 
     pub fn try_submit(&self, command: AiCommand) -> Result<OperationId, AdmissionError> {
         let snapshot = self.shared.snapshot.lock().unwrap();
-        let isolated = snapshot.probe_status == ProbeStatus::Isolated;
+        let isolated = snapshot.runtime_isolated;
         let owned_elsewhere = snapshot.ownership == OwnershipState::OwnedElsewhere;
         drop(snapshot);
         if owned_elsewhere && command != AiCommand::OpenSettings {
             return Err(AdmissionError::Unavailable);
         }
-        if isolated && command != AiCommand::RetryProbeStop {
+        // `OpenSettings` is the existing recovery entry point users already
+        // reach (the settings view's own recover action) while isolated, in
+        // addition to the explicit `RetryProbeStop`. Every other command
+        // stays rejected at admission so it never touches busy/ownership
+        // state against a runtime whose prior child exit is unconfirmed.
+        if isolated
+            && command != AiCommand::RetryProbeStop
+            && command != AiCommand::OpenSettings
+        {
             return Err(AdmissionError::Unavailable);
         }
         if !isolated && command == AiCommand::RetryProbeStop {
@@ -301,6 +333,37 @@ impl AiServiceHandle {
         )
     }
 
+    /// Admits one selection AI text transform request. Validates
+    /// `instruction`/`selected_text` against
+    /// `crate::text_transform::validate_request`, then checks runtime-wide
+    /// isolation (`AiSnapshot::runtime_isolated`), *before* touching
+    /// `busy`/ownership state at all, so an invalid or isolated request
+    /// never blocks a later, valid one. On success, the result (and only
+    /// the result — never a document, never this request's own
+    /// instruction/selection text) is delivered exactly once on the
+    /// returned `Receiver`, not through `snapshot()`.
+    pub fn try_submit_text_transform(
+        &self,
+        instruction: String,
+        selected_text: String,
+    ) -> Result<(OperationId, Receiver<TextTransformOutcome>), AdmissionError> {
+        validate_text_transform_request(&instruction, &selected_text)
+            .map_err(|_| AdmissionError::InvalidInput)?;
+        if self.shared.snapshot.lock().unwrap().runtime_isolated {
+            return Err(AdmissionError::Unavailable);
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let id = self.enqueue(
+            WorkerCommand::TextTransform {
+                instruction,
+                selected_text,
+                reply_tx,
+            },
+            ServiceBusyReason::TextTransform,
+        )?;
+        Ok((id, reply_rx))
+    }
+
     fn enqueue(
         &self,
         command: WorkerCommand,
@@ -348,7 +411,12 @@ impl AiServiceHandle {
         let busy = *self.shared.busy.lock().unwrap();
         if !matches!(
             busy,
-            Some((id, ServiceBusyReason::Login | ServiceBusyReason::Probe)) if id == target
+            Some((
+                id,
+                ServiceBusyReason::Login
+                    | ServiceBusyReason::Probe
+                    | ServiceBusyReason::TextTransform
+            )) if id == target
         ) {
             return Err(AdmissionError::WrongOperation);
         }
@@ -592,6 +660,23 @@ fn handle_command(
     match queued.command {
         WorkerCommand::Action(AiCommand::OpenSettings) => {
             publish_busy(shared, queued.id, ServiceBusyReason::Recovering);
+            // `OpenSettings` is the existing recovery entry point users
+            // already reach (the settings view's own recover action), so it
+            // must be able to confirm an isolated runtime's stop itself
+            // instead of only failing on `restart_blocked` below.
+            let was_isolated = shared.snapshot.lock().unwrap().runtime_isolated;
+            if was_isolated && !attempt_isolation_recovery(state, paths, shared) {
+                mutate(shared, |snapshot| {
+                    snapshot.ownership = OwnershipState::Unavailable
+                });
+                finish(
+                    shared,
+                    queued.id,
+                    SafeOperationResult::Failed("recovery_failed"),
+                    LoginState::Idle,
+                );
+                return;
+            }
             match open_settings(
                 paths,
                 settings_store,
@@ -920,6 +1005,27 @@ fn handle_command(
                 settings,
             );
         }
+        WorkerCommand::TextTransform {
+            instruction,
+            selected_text,
+            reply_tx,
+        } => {
+            run_text_transform_command(
+                queued.id,
+                instruction,
+                selected_text,
+                reply_tx,
+                config,
+                paths,
+                settings_store,
+                shared,
+                state,
+                settings,
+                cancel_rx,
+                shutdown_rx,
+                shutdown,
+            );
+        }
     }
 }
 
@@ -1051,6 +1157,7 @@ fn run_probe_command(
             snapshot.probe_status = ProbeStatus::Isolated;
             snapshot.probe_result = None;
             snapshot.ownership = OwnershipState::Unavailable;
+            snapshot.runtime_isolated = true;
         });
         sync_runtime_snapshot(shared, runtime);
         finish(
@@ -1090,6 +1197,187 @@ fn run_probe_command(
         };
     });
     finish(shared, id, operation_result, LoginState::Idle);
+}
+
+/// Runs one selection AI text transform turn. Mirrors `run_probe_command`'s
+/// ownership/runtime/workspace handling, but delivers its outcome on
+/// `reply_tx` (this request's own channel) instead of `AiSnapshot`, and
+/// never touches `snapshot.probe_status`/`snapshot.probe_result`, which
+/// remain exclusively the fixed Probe's own fields.
+#[allow(clippy::too_many_arguments)]
+fn run_text_transform_command(
+    id: OperationId,
+    instruction: String,
+    selected_text: String,
+    reply_tx: SyncSender<TextTransformOutcome>,
+    config: &AiServiceConfig,
+    paths: &AiPaths,
+    settings_store: &AiSettingsStore,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &AiSettings,
+    cancel_rx: &Receiver<OperationId>,
+    shutdown_rx: &Receiver<()>,
+    shutdown: &mut bool,
+) {
+    let snapshot = shared.snapshot.lock().unwrap().clone();
+    let model = match probe_model(settings, &snapshot, config.credential_store.as_ref()) {
+        Ok(model) => model,
+        Err(code) => {
+            let mapped = map_probe_error_code_for_text_transform(code);
+            let _ = reply_tx.try_send(TextTransformOutcome::Failed(mapped));
+            finish(
+                shared,
+                id,
+                SafeOperationResult::Failed(mapped.stable_code()),
+                LoginState::Idle,
+            );
+            return;
+        }
+    };
+    publish_busy(shared, id, ServiceBusyReason::TextTransform);
+
+    if ensure_runtime(config, paths, settings, shared, state).is_err() {
+        let owner_elsewhere =
+            shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere;
+        let code = if owner_elsewhere {
+            text_transform::TextTransformErrorCode::OwnedElsewhere
+        } else {
+            text_transform::TextTransformErrorCode::RuntimeUnavailable
+        };
+        let _ = reply_tx.try_send(TextTransformOutcome::Failed(code));
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed(code.stable_code()),
+            LoginState::Idle,
+        );
+        return;
+    }
+    let runtime = state
+        .runtime
+        .as_ref()
+        .expect("ensure_runtime returned Ready runtime");
+    let Some(events_rx) = state.runtime_events.as_ref() else {
+        let code = text_transform::TextTransformErrorCode::RuntimeUnavailable;
+        let _ = reply_tx.try_send(TextTransformOutcome::Failed(code));
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed(code.stable_code()),
+            LoginState::Idle,
+        );
+        return;
+    };
+    let workspace = match paths.create_text_transform_workspace() {
+        Ok(workspace) => workspace,
+        Err(_) => {
+            let code = text_transform::TextTransformErrorCode::RuntimeUnavailable;
+            let _ = reply_tx.try_send(TextTransformOutcome::Failed(code));
+            finish(
+                shared,
+                id,
+                SafeOperationResult::Failed(code.stable_code()),
+                LoginState::Idle,
+            );
+            return;
+        }
+    };
+
+    let mut shutdown_seen = false;
+    let execution = text_transform::execute_text_transform(
+        settings_store,
+        runtime,
+        events_rx,
+        cancel_rx,
+        shutdown_rx,
+        &mut shutdown_seen,
+        id,
+        settings.active_connection,
+        &model,
+        &instruction,
+        &selected_text,
+        &workspace,
+        settings.settings_generation,
+    );
+    // Mirrors `run_probe_command`: an isolated child's working directory
+    // must survive until a later confirmed stop.
+    if !execution.isolated {
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+    *shutdown |= shutdown_seen;
+    state
+        .deferred_runtime_events
+        .extend(execution.deferred_events);
+    if execution.isolated {
+        // Never touches `probe_status`/`probe_result` (see this function's
+        // doc comment): only the runtime-wide isolation flag records that
+        // this child's exit is unconfirmed.
+        mutate(shared, |snapshot| {
+            snapshot.ownership = OwnershipState::Unavailable;
+            snapshot.runtime_isolated = true;
+        });
+        sync_runtime_snapshot(shared, runtime);
+        let _ = reply_tx.try_send(TextTransformOutcome::Failed(
+            text_transform::TextTransformErrorCode::Isolated,
+        ));
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed(
+                text_transform::TextTransformErrorCode::Isolated.stable_code(),
+            ),
+            LoginState::Idle,
+        );
+        return;
+    }
+    let operation_result = match &execution.outcome {
+        TextTransformOutcome::Succeeded { .. } => SafeOperationResult::Succeeded,
+        TextTransformOutcome::Canceled => SafeOperationResult::Canceled,
+        TextTransformOutcome::TimedOut => SafeOperationResult::TimedOut,
+        TextTransformOutcome::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
+    };
+    let owns_runtime_lock = runtime
+        .with_owner_lock(|owner| owner.is_some())
+        .unwrap_or(false);
+    sync_runtime_snapshot(shared, runtime);
+    mutate(shared, |snapshot| {
+        snapshot.ownership = if owns_runtime_lock {
+            OwnershipState::Owned
+        } else {
+            OwnershipState::Unknown
+        };
+    });
+    let _ = reply_tx.try_send(execution.outcome);
+    finish(shared, id, operation_result, LoginState::Idle);
+}
+
+fn map_probe_error_code_for_text_transform(
+    code: ProbeErrorCode,
+) -> text_transform::TextTransformErrorCode {
+    use text_transform::TextTransformErrorCode as T;
+    match code {
+        ProbeErrorCode::InvalidConfiguration => T::InvalidConfiguration,
+        ProbeErrorCode::AccountUnavailable => T::AccountUnavailable,
+        ProbeErrorCode::ModelUnavailable => T::ModelUnavailable,
+        ProbeErrorCode::CredentialUnavailable => T::CredentialUnavailable,
+        ProbeErrorCode::OwnedElsewhere => T::OwnedElsewhere,
+        ProbeErrorCode::Busy => T::Busy,
+        ProbeErrorCode::RuntimeUnavailable => T::RuntimeUnavailable,
+        ProbeErrorCode::StaleGeneration => T::StaleGeneration,
+        ProbeErrorCode::Unauthorized => T::Unauthorized,
+        ProbeErrorCode::Forbidden => T::Forbidden,
+        ProbeErrorCode::RateLimited => T::RateLimited,
+        ProbeErrorCode::Network => T::Network,
+        ProbeErrorCode::TimedOut => T::TimedOut,
+        ProbeErrorCode::ProtocolMismatch => T::ProtocolMismatch,
+        ProbeErrorCode::NotificationOverflow => T::NotificationOverflow,
+        ProbeErrorCode::SafetyProfileUnsupported => T::SafetyProfileUnsupported,
+        ProbeErrorCode::ProviderFailed => T::ProviderFailed,
+        ProbeErrorCode::Canceled => T::Canceled,
+        ProbeErrorCode::Isolated => T::Isolated,
+        ProbeErrorCode::ContextLengthExceeded => T::ContextLengthExceeded,
+    }
 }
 
 fn probe_model(
@@ -1160,26 +1448,9 @@ fn retry_probe_stop(
     state: &mut WorkerState,
 ) {
     publish_busy(shared, id, ServiceBusyReason::Recovering);
-    let confirmed = state.runtime.as_ref().is_some_and(|runtime| {
-        runtime.stop().is_ok_and(|status| {
-            status.state == RuntimeState::Stopped
-                || (status.state == RuntimeState::Failed && !status.restart_blocked)
-        })
-    });
-    if confirmed {
-        mutate(shared, |snapshot| {
-            snapshot.probe_status = ProbeStatus::NotRun;
-            snapshot.probe_result = None;
-        });
-        if let Some(runtime) = state.runtime.as_ref() {
-            sync_runtime_snapshot(shared, runtime);
-        }
-        reacquire_owner_lock_after_runtime_stop(state, paths, shared);
+    if attempt_isolation_recovery(state, paths, shared) {
         finish(shared, id, SafeOperationResult::Succeeded, LoginState::Idle);
     } else {
-        mutate(shared, |snapshot| {
-            snapshot.probe_status = ProbeStatus::Isolated
-        });
         finish(
             shared,
             id,
@@ -1187,6 +1458,53 @@ fn retry_probe_stop(
             LoginState::Idle,
         );
     }
+}
+
+/// Confirms that a runtime left isolated by an unconfirmed child exit
+/// (`AiSnapshot::runtime_isolated`, set by either the fixed Probe or a
+/// selection AI text transform turn) has actually stopped, and only then
+/// reacquires ownership and cleans up whichever operation's retained
+/// workspace (probe or text-transform) was left behind. If the stop still
+/// cannot be confirmed, isolation and the retained workspace are preserved
+/// so a later retry can observe the same unconfirmed child again.
+///
+/// Only resets `probe_status`/`probe_result` when isolation was itself
+/// recorded through `probe_status == Isolated`: a text-transform-triggered
+/// isolation must never overwrite an unrelated prior Probe result.
+fn attempt_isolation_recovery(
+    state: &mut WorkerState,
+    paths: &AiPaths,
+    shared: &Arc<SharedServiceState>,
+) -> bool {
+    let confirmed = state.runtime.as_ref().is_some_and(|runtime| {
+        runtime.stop().is_ok_and(|status| {
+            status.state == RuntimeState::Stopped
+                || (status.state == RuntimeState::Failed && !status.restart_blocked)
+        })
+    });
+    if let Some(runtime) = state.runtime.as_ref() {
+        sync_runtime_snapshot(shared, runtime);
+    }
+    if !confirmed {
+        mutate(shared, |snapshot| {
+            snapshot.runtime_isolated = true;
+        });
+        return false;
+    }
+    let was_probe_isolated = shared.snapshot.lock().unwrap().probe_status == ProbeStatus::Isolated;
+    mutate(shared, |snapshot| {
+        snapshot.runtime_isolated = false;
+        if was_probe_isolated {
+            snapshot.probe_status = ProbeStatus::NotRun;
+            snapshot.probe_result = None;
+        }
+    });
+    reacquire_owner_lock_after_runtime_stop(state, paths, shared);
+    if shared.snapshot.lock().unwrap().ownership == OwnershipState::Owned {
+        let _ = paths.cleanup_probe_workspaces();
+        let _ = paths.cleanup_text_transform_workspaces();
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)] // One serialized worker operation spans persistence and runtime application.
@@ -1735,6 +2053,9 @@ fn open_settings(
     if !runtime_owns && state.owner_guard.is_some() {
         paths
             .cleanup_probe_workspaces()
+            .map_err(|_| OwnerOpenError::Failed)?;
+        paths
+            .cleanup_text_transform_workspaces()
             .map_err(|_| OwnerOpenError::Failed)?;
     }
     if let Some(owner) = state.owner_guard.as_ref() {
@@ -2566,6 +2887,7 @@ mod tests {
         let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
         let snapshot = AiSnapshot {
             probe_status: ProbeStatus::Isolated,
+            runtime_isolated: true,
             ..AiSnapshot::default()
         };
         let shared = Arc::new(SharedServiceState {
@@ -2593,14 +2915,76 @@ mod tests {
     }
 
     #[test]
-    fn retry_probe_stop_reacquires_owner_lock_after_confirmed_stop() {
+    fn isolated_runtime_admits_the_existing_open_settings_recovery_entry_point() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(2);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        let snapshot = AiSnapshot {
+            runtime_isolated: true,
+            ownership: OwnershipState::Unavailable,
+            ..AiSnapshot::default()
+        };
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(snapshot),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared,
+        };
+
+        assert!(handle.try_submit(AiCommand::OpenSettings).is_ok());
+    }
+
+    #[test]
+    fn isolated_runtime_rejects_text_transform_without_touching_busy_state() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(2);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        let snapshot = AiSnapshot {
+            runtime_isolated: true,
+            ownership: OwnershipState::Unavailable,
+            ..AiSnapshot::default()
+        };
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(snapshot),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared,
+        };
+
+        assert!(matches!(
+            handle.try_submit_text_transform("instruction".to_owned(), "text".to_owned()),
+            Err(AdmissionError::Unavailable)
+        ));
+        assert!(handle.snapshot().busy.is_none());
+    }
+
+    fn next_isolation_test_root(label: &str) -> PathBuf {
         static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
-        let data_root = std::env::temp_dir().join(format!(
-            "hane-ai-retry-probe-stop-{}-{}",
+        std::env::temp_dir().join(format!(
+            "hane-ai-{label}-{}-{}",
             std::process::id(),
             NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
+        ))
+    }
+
+    #[test]
+    fn retry_probe_stop_reacquires_owner_lock_after_confirmed_stop() {
+        let data_root = next_isolation_test_root("retry-probe-stop");
         let paths = AiPaths::new(&data_root);
+        // Either operation may have left its own retained workspace behind;
+        // a confirmed stop must clean up both.
+        let probe_workspace = paths.create_probe_workspace().unwrap();
+        let text_transform_workspace = paths.create_text_transform_workspace().unwrap();
         let (events_tx, _events_rx) = mpsc::sync_channel(1);
         let runtime = AiRuntime::spawn(
             RuntimeConfig::new("unused-runtime-binary", paths.runtime_owner_lock_path()),
@@ -2619,6 +3003,7 @@ mod tests {
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
                 probe_status: ProbeStatus::Isolated,
+                runtime_isolated: true,
                 ..AiSnapshot::default()
             }),
             busy: Mutex::new(None),
@@ -2632,6 +3017,7 @@ mod tests {
         let snapshot = shared.snapshot.lock().unwrap();
         assert_eq!(snapshot.probe_status, ProbeStatus::NotRun);
         assert_eq!(snapshot.ownership, OwnershipState::Owned);
+        assert!(!snapshot.runtime_isolated);
         assert_eq!(
             snapshot.last_result,
             Some((OperationId(1), SafeOperationResult::Succeeded))
@@ -2640,8 +3026,103 @@ mod tests {
             state.owner_guard.as_ref().map(OwnerLockGuard::path),
             Some(paths.runtime_owner_lock_path().as_path())
         );
+        assert!(!probe_workspace.exists());
+        assert!(!text_transform_workspace.exists());
         drop(snapshot);
         drop(state);
+        let _ = std::fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn confirmed_stop_recovery_never_overwrites_an_unrelated_prior_probe_result() {
+        // Simulates isolation triggered by a text-transform turn: the
+        // runtime is isolated, but `probe_status` holds an earlier,
+        // unrelated successful Probe result that must survive recovery.
+        let data_root = next_isolation_test_root("retry-text-transform-isolation");
+        let paths = AiPaths::new(&data_root);
+        let (events_tx, _events_rx) = mpsc::sync_channel(1);
+        let runtime = AiRuntime::spawn(
+            RuntimeConfig::new("unused-runtime-binary", paths.runtime_owner_lock_path()),
+            Arc::new(RejectAllServerRequests),
+            events_tx,
+        );
+        let mut state = WorkerState {
+            runtime: Some(runtime),
+            runtime_events: None,
+            owner_guard: None,
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+        };
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot {
+                probe_status: ProbeStatus::Succeeded,
+                runtime_isolated: true,
+                ..AiSnapshot::default()
+            }),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+
+        let recovered = attempt_isolation_recovery(&mut state, &paths, &shared);
+
+        assert!(recovered);
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(
+            snapshot.probe_status,
+            ProbeStatus::Succeeded,
+            "a text-transform-triggered isolation must never touch an unrelated probe_status"
+        );
+        assert!(!snapshot.runtime_isolated);
+        assert_eq!(snapshot.ownership, OwnershipState::Owned);
+        drop(snapshot);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn unconfirmed_stop_preserves_isolation_and_the_retained_workspace() {
+        let data_root = next_isolation_test_root("retry-unconfirmed-stop");
+        let paths = AiPaths::new(&data_root);
+        let text_transform_workspace = paths.create_text_transform_workspace().unwrap();
+        // No runtime instance at all: the worker cannot confirm any stop,
+        // which must be treated the same as an unconfirmed child exit.
+        let mut state = WorkerState {
+            runtime: None,
+            runtime_events: None,
+            owner_guard: None,
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+        };
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot {
+                runtime_isolated: true,
+                ownership: OwnershipState::Unavailable,
+                ..AiSnapshot::default()
+            }),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+
+        let recovered = attempt_isolation_recovery(&mut state, &paths, &shared);
+
+        assert!(!recovered);
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert!(snapshot.runtime_isolated);
+        assert_eq!(snapshot.ownership, OwnershipState::Unavailable);
+        drop(snapshot);
+        drop(state);
+        assert!(
+            text_transform_workspace.exists(),
+            "an unconfirmed stop must not clean up the retained workspace"
+        );
         let _ = std::fs::remove_dir_all(data_root);
     }
 

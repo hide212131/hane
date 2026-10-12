@@ -65,6 +65,7 @@ impl Element for InputCapture {
     ) {
         if !self.input.read(cx).inline_rename_active()
             && !self.input.read(cx).sidebar_filter_is_focused()
+            && !self.input.read(cx).ai_selection_blocks_editor_keys()
         {
             let focus = self.input.read(cx).focus_handle.clone();
             window.handle_input(
