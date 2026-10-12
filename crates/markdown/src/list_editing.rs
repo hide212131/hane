@@ -1064,16 +1064,17 @@ mod tests {
         assert!(not_applicable(text, text.len(), ListEditIntent::Backspace));
     }
 
-    /// Chaining two raw recovery candidates at the same top-level indent (a
-    /// paragraph followed by two marker-like lines with no blank line to
-    /// interrupt it) gives the second candidate a `previous_sibling` link to
-    /// the first, purely from lexical chaining. Neither is recognized by the
-    /// formal parser, so this must not be trusted as a top-level exit target
-    /// just because a sibling link exists; it falls back to ordinary
-    /// editing instead.
+    /// Chaining two raw recovery candidates at the same top-level indent
+    /// inside an unterminated fenced code block (which CommonMark extends to
+    /// the end of the document) gives the second candidate a
+    /// `previous_sibling` link to the first, purely from lexical chaining
+    /// over the raw lines; the formal parser recognizes neither as a list
+    /// item, since both are swallowed as code block content. This must not
+    /// be trusted as a top-level exit target just because a sibling link
+    /// exists; it falls back to ordinary editing instead.
     #[test]
     fn raw_recovery_previous_sibling_at_top_level_is_not_an_exit_target() {
-        let text = "para\n- A\n- ";
+        let text = "```\n- A\n- ";
         assert!(not_applicable(text, text.len(), ListEditIntent::Backspace));
         assert!(not_applicable(text, text.len(), ListEditIntent::Enter));
     }
