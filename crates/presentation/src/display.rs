@@ -655,7 +655,7 @@ impl VisualBlock {
 /// Display kind for a whole block. The syntax-display table distinguishes a
 /// container node (a table, a list) that decides its block appearance from a
 /// node that contributes a display kind while presenting one physical line.
-pub(super) fn block_display_kind(kind: NodeKind) -> BlockKind {
+pub(crate) fn block_display_kind(kind: NodeKind) -> BlockKind {
     syntax_display(kind).indexed_block
 }
 
@@ -665,17 +665,17 @@ pub(super) fn block_display_kind(kind: NodeKind) -> BlockKind {
 /// which case the raw-source fallback applies. This function is the single seam
 /// between the parser vocabulary and the display vocabulary.
 #[derive(Clone, Copy)]
-pub(super) struct SyntaxDisplay {
+pub(crate) struct SyntaxDisplay {
     /// The type a top-level indexed block displays as. Containers may choose a
     /// display even when they do not represent a presentable tree node.
     indexed_block: BlockKind,
     /// The type a presentable tree node contributes to a line.
-    pub(super) node_block: Option<BlockKind>,
-    pub(super) inline_style: Option<StyleKind>,
+    pub(crate) node_block: Option<BlockKind>,
+    pub(crate) inline_style: Option<StyleKind>,
     line_context: LineContext,
 }
 
-pub(super) const fn syntax_display(kind: NodeKind) -> SyntaxDisplay {
+pub(crate) const fn syntax_display(kind: NodeKind) -> SyntaxDisplay {
     let default = SyntaxDisplay {
         indexed_block: BlockKind::Unsupported,
         node_block: None,
@@ -747,7 +747,7 @@ pub(super) const fn syntax_display(kind: NodeKind) -> SyntaxDisplay {
     }
 }
 
-pub(super) fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
+pub(crate) fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
     const BASE_LINE_HEIGHT: f32 = 26.0;
     const IMAGE_ROW_HEIGHT_AT_BASE_ZOOM: f32 = 190.0;
 
