@@ -10940,6 +10940,93 @@ mod tests {
         });
     }
 
+    /// Issue #472 (design spec exit contract, §8-9): every exit test above
+    /// calls `apply_list_edit_intent` directly, never through a real key
+    /// event. This drives the same "- abc\n- def\n- " trailing-empty-item
+    /// scenario through the actual `EditorView::backspace` action/focus
+    /// path (`cx.simulate_keystrokes`, the same dispatch a physical
+    /// Backspace key uses), with every character and `Enter` press also
+    /// going through real key dispatch so the index backing the exit is the
+    /// one `after_input`/`apply_edits` builds incrementally, not a
+    /// from-scratch parse. It checks all three things the real key press
+    /// must do: reach `EditorView::backspace` at all, remove the empty
+    /// item's own marker rather than leaving it untouched, and land the
+    /// next typed text in an ordinary paragraph outside any ListItem.
+    #[gpui::test]
+    fn real_backspace_keystroke_exits_a_trailing_empty_top_level_item(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context the same way a real
+        // click would before typing (see `ctrl_tab_cycles_file_tabs_in_order_and_wraps`).
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        // Type the reproduction document through real key dispatch: the
+        // `Enter` list-continuation is a real `backspace`-sibling action,
+        // not a programmatic shortcut, and each character insertion goes
+        // through the real text-input path and its own `after_input` pass.
+        cx.simulate_input("- abc");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("def");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n- ");
+        });
+
+        // The real Backspace key must reach `EditorView::backspace` and
+        // apply the same exit the direct `apply_list_edit_intent` calls
+        // above do, not silently do nothing and not fall back to an
+        // ordinary single-character delete.
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().document().full_text(),
+                "- abc\n- def\n\n",
+                "a real Backspace keystroke must remove the trailing empty \
+                 item's marker and open the paragraph boundary the exit \
+                 contract requires"
+            );
+        });
+
+        // Whatever is typed next, still through real key dispatch, must
+        // land in an ordinary paragraph, never back inside the exited
+        // ListItem.
+        cx.simulate_input("ghi");
+        cx.run_until_parked();
+        let text = view.read_with(cx, |view, _| view.editor().document().full_text());
+        assert_eq!(text, "- abc\n- def\n\nghi");
+        let parsed =
+            hane_markdown::parse_document(Revision(1), SourceRange::new(0, text.len()), &text);
+        let last_paragraph = parsed
+            .tree
+            .iter()
+            .rfind(|(_, node)| matches!(node.kind, hane_markdown::NodeKind::Paragraph))
+            .expect("expected a trailing paragraph for \"ghi\"");
+        assert!(
+            !parsed
+                .tree
+                .ancestors(last_paragraph.0)
+                .skip(1)
+                .any(|ancestor| matches!(
+                    parsed.tree.node(ancestor).map(|node| node.kind),
+                    Some(hane_markdown::NodeKind::ListItem { .. })
+                )),
+            "the paragraph for \"ghi\" must not be a descendant of a ListItem"
+        );
+    }
+
     #[test]
     fn every_line_resolves_to_its_markdown_block() {
         let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";
