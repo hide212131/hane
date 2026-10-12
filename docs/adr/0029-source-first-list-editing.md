@@ -292,8 +292,8 @@ replacement は次の形で作る。
 - 既存の空行が必要な境界を満たす場合は追加しない。既存の複数空行を詰めず、変更しない source の改行形式
   （LF / CRLF / CR）を保持する。後続リストがある場合はそれも通常 paragraph から分離して保つ。
 - top-level item に子孫や継続本文がある場合、開始行が空でも item 全体は終了対象ではない。
-- source が parser のリスト項目として確認できない回復候補、引用接頭辞を巻き込む操作、空白以外の Unicode
-  文字を含む本文は、今回の終了操作では変更しない。
+- source が parser のリスト項目として確認できない回復候補、引用接頭辞を巻き込む操作、ASCII space/tab 以外
+  の Unicode 空白だけで構成される本文（例: U+3000 IDEOGRAPHIC SPACE）は、今回の終了操作では変更しない。
 - 終了操作は必要な原文置換と編集後 caret を一つの recorded edit として適用する。空行だけの時点では空の
   Paragraph node が存在すると仮定せず、文字入力後に通常 Paragraph となることを検証する。
 
