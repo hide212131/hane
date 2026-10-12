@@ -571,4 +571,34 @@ P1実装はPR [#456](https://github.com/hide212131/hane/pull/456)。製品コー
 - 設計書第9.4節に照らし追加の実画面検証は不要と判断した。UI配線・layout・描画処理は変更していない。実字形・paint・inputをunit testで確認済みとは扱わない。
 - current-headのCodeRabbit full reviewは実施していない。ユーザーの指示によりGitHub Code Reviewへ切替え、review [5483760984](https://github.com/hide212131/hane/pull/456#pullrequestreview-5483760984) をPR head `0a9d214...` に記録した。findingなし・blocking issueなし。review主体はこのtaskのGitHub認証 `hide212131` で、PR authorと同じであり、独立reviewとは扱わない。旧headに対するCodeRabbit指摘は証拠文書の記載不整合で、head `0a9d214...` までに修正済み。
 
-P1のみ受入済み。P2以降は未着手であり、本節から自動的に継続しない。Issue #302の他の受入条件は未完了のため、Issueは閉じない。
+
+
+### 9.15 RF2-B: presentationの機械的分割 第2PR — 高さ索引（#302 P2）
+
+P2実装PR [#468](https://github.com/hide212131/hane/pull/468) はmerge済み。変更前mainは `b7f665e1a68c0c884b8faa239c07f1b9ec39f8d3`、受入候補headは `a75fc2f297e9cd4523e6cae7ed309e18f16ae840`、merge commitは `ca9b1b61e0317101f5f994f7aa3259431056584d`。数値の高さ索引とスクロール基準、および対応unit testを `height_index.rs` へ機械的に移し、境界testを追加した。描画・スクロールの意味は変更していない。
+
+exact-head CI [run 38206227448](https://github.com/hide212131/hane/actions/runs/38206227448) でmacOS/Windowsのworkspace all-features tests、OS固有検証とClippyが成功。CodeRabbit full review [run d829a34b-4590-41de-b1b3-82c8c4b286d5](https://github.com/hide212131/hane/pull/468#issuecomment-6117486836) はactionable commentなし。移動表・公開API・検証記録は [P2証拠記録](https://github.com/hide212131/hane/blob/ca9b1b61e0317101f5f994f7aa3259431056584d/docs/refactor-rf2b-p2-evidence.md)。
+
+### 9.16 RF2-B: presentationの機械的分割 第3PR — display（#302 P3）
+
+P3実装PR [#469](https://github.com/hide212131/hane/pull/469) はmerge済み。変更前baseは `6191362e64ba9e2d8776b523ee3f4a9b62ef35e7`、受入候補headは `0260e994362e93cf2ce31851ea39e7678da11329`、merge/current main（P4開始時）は `b55ffaca14b9741c0bff44c66b55d2e6b4714d59`。表示型・方針と対応する既存test 2件をprivate `display.rs` へ移し、crate-rootの公開名を維持した。
+
+exact-head CI [run 38210042590](https://github.com/hide212131/hane/actions/runs/38210042590) でmacOS/Windowsのworkspace tests・ClippyとOS固有検証が成功。macOS arm64・Rust 1.98.1で同headの通常workspace testsも成功。CodeRabbit full review [run f7a35424-2552-4a51-a6f1-a520922ead4f](https://github.com/hide212131/hane/pull/469#pullrequestreview-PRR_kwDOUETGuM8AAAABRw9u3w) は製品コードにblocking findingなし。詳細なPR受入記録はPR本文にある。P3受入後の証拠Markdownのみの追記commit `e1eb9ebacf434c41f4b4d3afb5a171666ec3ca92` は当該実装PRには含まれない。
+
+### 9.17 RF2-B: presentationの機械的分割 第4PR — projection親module（#302 P4）
+
+P4実装PR [#473](https://github.com/hide212131/hane/pull/473) はmerge済み。baseは `b55ffaca14b9741c0bff44c66b55d2e6b4714d59`、受入候補headは `654767366f57d3b7fb4bda1e0251f2fddc0595d9`、merge commitは `feb846cb68bb9f0abf4dbfbd64722ce513a4076d`。残りの行・ブロックprojectionをprivate `projection/mod.rs` へ移し、既存unit test 54件を `projection/tests.rs` へ移した。crate-root public free function 15件を再exportし、integration testsの位置とimportも維持した。P5の `projection/block.rs` 分割は含まない。
+
+current-head CI [run 38223198052](https://github.com/hide212131/hane/actions/runs/38223198052) でmacOS/Windowsのworkspace tests、OS固有検証、Clippyが成功。trusted verifier [run 38220846721](https://github.com/hide212131/hane/actions/runs/38220846721) はcode head `a61645195eaf276eaeee3d9b99e87fe2de06f12e` のworkspace all-features testsとClippyが成功。CodeRabbit full review [run e44ff4ba-2761-4eb4-a312-539cc08f16e1](https://github.com/hide212131/hane/pull/473#issuecomment-6119168976) はcurrent candidate headで完了し、actionable commentなし、未解決threadなし。移動表、可視性比較、テスト比較、復旧方法は [P4証拠記録](https://github.com/hide212131/hane/blob/feb846cb68bb9f0abf4dbfbd64722ce513a4076d/docs/refactor-rf2b-p4-evidence.md)。UI配線・layout・描画・native inputに変更がないため、設計書§9.4に沿い新規GUI validationは不要と判断した。
+
+### 9.18 RF2-B: presentationの機械的分割 第5PR — block projection（#302 P5）
+
+P5実装PR [#475](https://github.com/hide212131/hane/pull/475) は、block組立をprivateな `projection/block.rs` へ分割する。mainの#474が加えた見出し表示倍率に基づく初期高さ計算と回帰testを維持し、PR branchをcurrent main `20291f83ccfa5e4c238fe5a7de7f25983f22b3fc` へ同期した。P5の限定修正head `91ec96cc89934e38b5a2b7d9295871dd3ee10033`、base同期merge commit `43ea2d7cde1e167bedb2e83ab04ab3058de1d199`。
+
+高さ計算の限定修正を対象にしたtrusted verifier [run 38240449733](https://github.com/hide212131/hane/actions/runs/38240449733) はworkspace all-features testsとClippyが成功。統合候補でmacOS arm64・Rust 1.98.1の通常構成 `cargo test --workspace --locked` とpresentation rustdocが成功し、rustdoc warningは従来と同じ9件。`git diff --check` は成功。workspace `cargo fmt --all -- --check` は既存format差分のため失敗し、成功とは扱っていない。
+
+P5の元移動ではP4 baseのunit test 54件のうち12件を `projection/block/tests.rs` へ移し、42件を親に残した。test名・属性・signature・本体を維持した。mainの#474が追加した回帰testを含むcurrent統合候補は55件（親43件、block子module 12件）。シンボル表、test対応表、検証・復旧は [P5検証記録](refactor-rf2b-p5-evidence.md) にある。最終headの必須CI、CodeRabbit full review、未解決thread、merge statusは [PR #475](https://github.com/hide212131/hane/pull/475) に記録する。UI配線・描画・layout・native inputは変更していないため、設計書§9.4に沿い追加GUI validationは不要と判断した。
+
+RF2-B全体のP1〜P4受入記録は§9.14〜§9.17、P5の検証記録は本節を参照する。Issue #302はP1〜P5とIssue全体の受入条件を最終確認した後に完了する。
+
+（P1受入時点の履歴）P1のみ受入済みで、P2以降は未着手だった。Issue #302の他の受入条件が未完了のため、当時はIssueをopenのまま維持した。後続段階の進捗は§9.15〜§9.18に記録する。
