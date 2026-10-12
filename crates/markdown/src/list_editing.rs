@@ -665,18 +665,36 @@ fn exit_is_trustworthy(item: &ListEditItem) -> bool {
 }
 
 /// Whether a trustworthy empty item is safe to collapse into its surrounding
-/// paragraph or outdent. Protects two cases the design calls "do not touch":
-/// an item still inside a blockquote (its opening line's bytes include the
-/// quote marker, so a prefix edit here would also remove it), and an item
-/// whose subtree reaches past its own opening line (nested content or a
-/// continuation paragraph that must keep its owning item). These items are
-/// confirmed list items, so the exit key must still be consumed as a no-op
-/// rather than falling back to ordinary editing, which could otherwise
-/// mutate the protected content.
+/// paragraph or outdent. Protects two cases the design calls "do not touch",
+/// at the depths where each actually applies:
+///
+/// - An item still inside a blockquote, at any depth: its opening line's
+///   bytes include the quote marker, so a prefix edit here would also remove
+///   it, and neither `exit_top_level_item` nor `transform_subtree` knows how
+///   to edit around that marker.
+/// - A *top-level* item whose subtree reaches past its own opening line
+///   (nested content or a continuation paragraph): `exit_top_level_item`
+///   only ever removes that one opening line, so any descendant past it
+///   would be orphaned by the exit (per ADR-0029's top-level contract).
+///
+/// A *nested* item (`depth > 1`) is not held to that second rule: per
+/// ADR-0029, exiting it always outdents the whole matched subtree by one
+/// level through `transform_subtree`, which shifts every line of
+/// `subtree_range` — descendants included — so they keep their relative
+/// structure under the new, shallower item. There is nothing here for that
+/// subtree to be orphaned from.
+///
+/// A protected item is still a confirmed list item, so the exit key must
+/// still be consumed as a no-op rather than falling back to ordinary
+/// editing, which could otherwise mutate the protected content.
 fn exit_is_safe_to_collapse(source: &str, item: &ListEditItem) -> bool {
-    let opening_line_only = item.subtree_range.end.0
-        <= line_end_inclusive(source.as_bytes(), item.prefix_range.start.0);
-    !item.in_quote && opening_line_only
+    if item.in_quote {
+        return false;
+    }
+    if item.depth > 1 {
+        return true;
+    }
+    item.subtree_range.end.0 <= line_end_inclusive(source.as_bytes(), item.prefix_range.start.0)
 }
 
 /// Removes a top-level empty item's marker and, if needed, inserts a real
@@ -1272,6 +1290,76 @@ mod tests {
         let text = "- \n  - child";
         assert!(no_op_keeps_caret(text, 2, ListEditIntent::Backspace));
         assert!(no_op_keeps_caret(text, 2, ListEditIntent::Enter));
+    }
+
+    /// Issue #472: unlike a top-level item, a *nested* empty item that owns
+    /// descendants is not protected by `exit_is_safe_to_collapse`'s
+    /// opening-line-only guard, because its exit always goes through
+    /// `transform_subtree`, which outdents the whole matched subtree —
+    /// descendants included — by one level instead of removing only the
+    /// opening line. Both Enter and Backspace must therefore outdent the
+    /// nested empty item together with its own nested child, keeping the
+    /// child's relative structure as a descendant of the now-shallower item.
+    #[test]
+    fn empty_nested_item_with_descendant_outdents_whole_subtree() {
+        let text = "- A\n  - \n    - c";
+        let caret = 8;
+        for intent in [ListEditIntent::Enter, ListEditIntent::Backspace] {
+            let (after_exit, new_caret) = replacement(text, caret, intent);
+            assert_eq!(
+                after_exit, "- A\n- \n  - c",
+                "{intent:?}: unexpected replacement"
+            );
+            assert_eq!(new_caret, 6, "{intent:?}: unexpected caret");
+
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(0, after_exit.len()),
+                &after_exit,
+            );
+            let child_item = parsed
+                .tree
+                .iter()
+                .find(|(_, node)| {
+                    matches!(node.kind, NodeKind::ListItem { .. })
+                        && after_exit[node.source_range.as_usize()].contains('c')
+                })
+                .map(|(id, _)| id)
+                .unwrap_or_else(|| {
+                    panic!("{intent:?}: expected a ListItem containing \"c\" in {after_exit:?}")
+                });
+            assert_eq!(
+                parsed.tree.list_depth(child_item),
+                2,
+                "{intent:?}: expected \"c\" to stay a depth-2 nested item in {after_exit:?}"
+            );
+            let parent_item = parsed
+                .tree
+                .ancestors(child_item)
+                .skip(1)
+                .find(|ancestor| {
+                    matches!(
+                        parsed.tree.node(*ancestor).map(|node| node.kind),
+                        Some(NodeKind::ListItem { .. })
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!("{intent:?}: expected \"c\" to have a ListItem ancestor in {after_exit:?}")
+                });
+            assert_eq!(
+                parsed.tree.list_depth(parent_item),
+                1,
+                "{intent:?}: expected the emptied former-nested item to now be depth-1 in {after_exit:?}"
+            );
+            let (_, parent_ordinal) = parsed
+                .tree
+                .list_item_ordinal(parent_item)
+                .unwrap_or_else(|| panic!("{intent:?}: expected the parent item to have a list owner"));
+            assert_eq!(
+                parent_ordinal, 1,
+                "{intent:?}: expected the emptied item to remain \"A\"'s next sibling in {after_exit:?}"
+            );
+        }
     }
 
     /// An empty item still inside a blockquote is left alone: its opening
