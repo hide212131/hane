@@ -365,6 +365,29 @@ fn main() {
                         let _ = writeln!(stdout, "{notification}");
                         let _ = stdout.flush();
                     }
+                    "text_transform_tool_item_then_success" => {
+                        for (method, params) in [
+                            (
+                                "item/started",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"cmd-1","type":"commandExecution"}}),
+                            ),
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"message-1","type":"agentMessage","text":"Mock reply after tool"}}),
+                            ),
+                            (
+                                "turn/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turn":{"id":"fake-turn-1","status":"completed","error":null}}),
+                            ),
+                        ] {
+                            let notification = serde_json::json!({"method":method,"params":params});
+                            if writeln!(stdout, "{notification}").is_err()
+                                || stdout.flush().is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 if fake_scenario.trim() == "probe_turn_timeout" {

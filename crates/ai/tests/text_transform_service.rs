@@ -4,17 +4,22 @@
 //!
 //! Per `crate::text_transform`'s module doc comment, this operation runs
 //! over the existing ChatGPT/Codex or Custom Provider App Server connection
-//! under the same `sandbox: "read-only"` / `approvalPolicy: "never"` plus
-//! mid-turn `ProbeCollector::has_unsafe_tool_activity` boundary the fixed
-//! Probe uses: `instruction`/`selected_text` are sent as this operation's own
-//! structured `turn/start` input, a detected tool/command item still fails
-//! the request as `SafetyProfileUnsupported` rather than being treated as a
-//! success, and the open document's content is never added to that input.
-//! The shared `ProbeCollector`/interrupt logic itself is also covered via the
-//! fixed Probe's own integration tests in `account_service.rs` (e.g.
-//! `interrupt_ack_alone_does_not_release_probe_guard_before_child_stops`,
-//! `probe_tool_item_start_is_not_reported_as_success`), since
-//! `text_transform.rs` shares that code with `probe.rs`.
+//! under the same `sandbox: "read-only"` / `approvalPolicy: "never"`
+//! boundary the fixed Probe uses: `instruction`/`selected_text` are sent as
+//! this operation's own structured `turn/start` input, and the open
+//! document's content is never added to that input. Per the Issue #449
+//! owner's withdrawal of the blanket "model-side tool use must never be
+//! allowed" reading, a mid-turn tool/command item is no longer disqualifying
+//! by itself here (unlike the fixed Probe's own unchanged contract): this
+//! file's `text_transform_succeeds_after_a_mid_turn_tool_item_followed_by_the_final_agent_message`
+//! test covers that path, while the fixed Probe's own tool-rejection
+//! regression stays covered by `account_service.rs`'s
+//! `probe_tool_item_start_is_not_reported_as_success`, since
+//! `text_transform.rs` shares the underlying `ProbeCollector`/interrupt logic
+//! with `probe.rs` but not its tool-activity policy. The shared interrupt
+//! logic itself is also covered via the fixed Probe's own integration tests
+//! in `account_service.rs` (e.g.
+//! `interrupt_ack_alone_does_not_release_probe_guard_before_child_stops`).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,7 +29,7 @@ use hane_ai::{
     AccountState, AdmissionError, AiCommand, AiService, AiServiceConfig,
     BrowserOpenError, BrowserOpener, FakeCredentialStore, ModelListState,
     OperationId, SafeOperationResult, ServiceBusyReason, ShellEnvironmentPolicyFormat,
-    TextTransformErrorCode, TextTransformOutcome,
+    TextTransformOutcome,
 };
 
 #[derive(Default)]
@@ -202,29 +207,30 @@ fn text_transform_succeeds_over_the_app_server_without_sending_the_open_document
 }
 
 #[test]
-fn text_transform_fails_as_safety_profile_unsupported_on_a_mid_turn_tool_item() {
-    let (service, data_root) = prepare_connected_service("probe_tool_item");
+fn text_transform_succeeds_after_a_mid_turn_tool_item_followed_by_the_final_agent_message() {
+    let (service, data_root) =
+        prepare_connected_service("text_transform_tool_item_then_success");
     let handle = service.handle();
     let selected_text = "選択テキスト";
     let (id, reply_rx) = handle
         .try_submit_text_transform("校正する".to_owned(), selected_text.to_owned())
         .unwrap();
-    assert_eq!(
-        wait_for_result(&service, id),
-        SafeOperationResult::Failed(
-            TextTransformErrorCode::SafetyProfileUnsupported.stable_code()
-        )
-    );
+    assert_eq!(wait_for_result(&service, id), SafeOperationResult::Succeeded);
     assert_eq!(
         reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-        TextTransformOutcome::Failed(TextTransformErrorCode::SafetyProfileUnsupported)
+        TextTransformOutcome::Succeeded {
+            text: "Mock reply after tool".to_owned()
+        }
     );
 
-    // The request itself was still sent (this is mid-turn detection, not
-    // pre-execution denial), but the detected tool item must never be
-    // reported as a success, and the turn must be interrupted.
-    let record = wait_for_probe_record(&data_root, "INTERRUPT_ACK");
+    // Per Issue #449's owner withdrawing the blanket tool-use ban, a
+    // model-side tool item used mid-turn is no longer disqualifying by
+    // itself: the request still reached the App Server and ran through to
+    // the final correlated `agentMessage`/turn terminal instead of being
+    // interrupted on sight.
+    let record = wait_for_probe_record(&data_root, selected_text);
     assert!(find_turn_start_with_selected_text(&record, selected_text).is_some());
+    assert!(!record.contains("INTERRUPT_ACK"));
 
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);

@@ -528,12 +528,15 @@ fn cancellation_requested(
 /// thread, and turn. Item IDs and output size are bounded.
 ///
 /// `crate::text_transform` reuses this same collector (via
-/// [`ProbeCollector::with_max_text_bytes`]) for the identical
-/// generation/thread/turn-matching, duplicate-item, and tool-activity
-/// detection a selection text transform turn also needs, just with its own
-/// (much larger) result size cap. The fixed connectivity Probe's own public
-/// [`ProbeCollector::new`] constructor and its [`MAX_PROBE_TEXT_BYTES`] cap
-/// are unchanged by this.
+/// [`ProbeCollector::with_max_text_bytes`] plus
+/// [`ProbeCollector::allow_tool_activity`]) for the identical
+/// generation/thread/turn-matching and duplicate-item handling a selection
+/// text transform turn also needs, just with its own (much larger) result
+/// size cap and its own tool-activity policy: unlike the fixed Probe, a
+/// detected tool/command item there is not by itself disqualifying (see
+/// `fail_on_tool_activity` below). The fixed connectivity Probe's own public
+/// [`ProbeCollector::new`] constructor, its [`MAX_PROBE_TEXT_BYTES`] cap, and
+/// its "a tool/command item fails the turn" contract are unchanged by this.
 pub struct ProbeCollector {
     runtime_generation: u64,
     thread_id: String,
@@ -544,6 +547,7 @@ pub struct ProbeCollector {
     max_text_bytes: usize,
     terminal: Option<ProbeTerminal>,
     unsafe_tool_activity: bool,
+    fail_on_tool_activity: bool,
     overflowed: bool,
 }
 
@@ -568,8 +572,22 @@ impl ProbeCollector {
             max_text_bytes,
             terminal: None,
             unsafe_tool_activity: false,
+            fail_on_tool_activity: true,
             overflowed: false,
         }
+    }
+
+    /// Opts this collector out of the fixed Probe's own "any tool/command
+    /// item fails the turn" contract: a tool item is still tracked (see
+    /// [`ProbeCollector::has_unsafe_tool_activity`]), but no longer turns a
+    /// correlated turn terminal into
+    /// [`ProbeErrorCode::SafetyProfileUnsupported`] by itself. The fixed
+    /// Probe itself never calls this, so its own contract is unchanged; only
+    /// `crate::text_transform` does, per the Issue #449 owner's withdrawal of
+    /// the blanket "model-side tool use must never be allowed" reading.
+    pub(crate) fn allow_tool_activity(mut self) -> Self {
+        self.fail_on_tool_activity = false;
+        self
     }
 
     pub fn observe(&mut self, event: RuntimeEvent) -> Option<ProbeTerminal> {
@@ -621,7 +639,7 @@ impl ProbeCollector {
                 }
                 let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
                 let error = turn.get("error").filter(|error| !error.is_null());
-                if self.unsafe_tool_activity {
+                if self.unsafe_tool_activity && self.fail_on_tool_activity {
                     Some(ProbeTerminal::Failed(
                         ProbeErrorCode::SafetyProfileUnsupported,
                     ))
@@ -684,10 +702,11 @@ impl ProbeCollector {
     }
 }
 
-/// Shared with `crate::text_transform`, which runs under the same tool-use
-/// safety profile: both must treat the same set of App Server item kinds as
-/// unsafe tool activity, so a safety-relevant item type added to one is never
-/// silently missed by the other.
+/// Shared with `crate::text_transform`: both observe the same set of App
+/// Server item kinds as tool activity, so a safety-relevant item type added
+/// to one is never silently missed by the other, even though each decides
+/// separately (via [`ProbeCollector::allow_tool_activity`]) whether that
+/// activity by itself ends the turn as a failure.
 pub(crate) fn is_tool_activity(item_type: &str) -> bool {
     matches!(
         item_type,
@@ -894,6 +913,30 @@ mod tests {
             Some(ProbeTerminal::Failed(
                 ProbeErrorCode::SafetyProfileUnsupported
             ))
+        );
+    }
+
+    #[test]
+    fn allow_tool_activity_lets_a_tool_item_be_followed_by_a_successful_terminal() {
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), MAX_PROBE_TEXT_BYTES)
+                .allow_tool_activity();
+        assert_eq!(collector.observe(event(7, "item/started", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"tool-1","type":"commandExecution"}
+        }))), None);
+        assert!(collector.has_unsafe_tool_activity());
+        assert_eq!(collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"OK"}
+        }))), None);
+        assert_eq!(
+            collector.observe(event(
+                7,
+                "turn/completed",
+                json!({
+                    "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+                })
+            )),
+            Some(ProbeTerminal::Completed("OK".into()))
         );
     }
 
