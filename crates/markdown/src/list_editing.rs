@@ -267,7 +267,7 @@ pub fn build_list_edit_projection(parsed: &MarkdownParse, source: &str) -> ListE
             None
         };
         let mut body_start = body_start.min(line.len());
-        if line[body_start..].trim().is_empty() {
+        if is_ascii_blank(&line[body_start..]) {
             body_start = line.len();
         }
         let marker_indent_columns = columns(&line[..indent_end]);
@@ -417,6 +417,14 @@ fn raw_list_marker(line: &str) -> Option<(usize, usize, ListMarker)> {
     ))
 }
 
+/// Whether `text` contains only ASCII space/tab bytes (including none at
+/// all). Unlike `str::trim`, this does not treat other Unicode whitespace
+/// (e.g. U+3000 IDEOGRAPHIC SPACE) as blank, so a line item whose body is
+/// made of such characters keeps its real, non-empty content.
+fn is_ascii_blank(text: &str) -> bool {
+    text.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+}
+
 fn same_marker_kind(left: ListMarker, right: ListMarker) -> bool {
     matches!(
         (left, right),
@@ -559,19 +567,21 @@ pub fn plan_list_edit(
             }))
         }
         ListEditIntent::Enter | ListEditIntent::Backspace => {
+            // `body_range` already excludes any leading ASCII space/tab run
+            // after the marker, so a literal empty slice is the only "blank
+            // body" case; other Unicode whitespace is real content and must
+            // not be treated as an empty item (see `is_ascii_blank`).
             let empty = source
                 .get(item.body_range.as_usize())
-                .is_some_and(|text| text.trim().is_empty());
+                .is_some_and(str::is_empty);
             let empty_action = matches!(intent, ListEditIntent::Enter)
                 || (matches!(intent, ListEditIntent::Backspace)
                     && caret.0 <= item.body_range.start.0);
             if empty && empty_action && on_opening_line {
                 if item.depth <= 1 {
-                    return Ok(ListEditPlanResult::Handled(MarkdownEditPlan::Replace {
-                        range: item.prefix_range,
-                        replacement: String::new(),
-                        selection_after: SourceSelection::caret(item.prefix_range.start),
-                    }));
+                    return Ok(ListEditPlanResult::Handled(exit_top_level_item(
+                        &source, item,
+                    )));
                 }
                 let Some(parent) = item.parent_item.and_then(|at| projection.items.get(at)) else {
                     return Ok(ListEditPlanResult::NotApplicable);
@@ -598,6 +608,50 @@ pub fn plan_list_edit(
                 selection_after: SourceSelection::caret(new_caret),
             }))
         }
+    }
+}
+
+/// Removes a top-level empty item's marker and, if needed, makes the
+/// resulting blank line a real paragraph boundary instead of a lazy
+/// continuation of the previous item.
+///
+/// Deleting only the marker (`item.prefix_range`) already leaves this line
+/// blank, because the item's body is empty by construction. Whenever there is
+/// content both before and after that blank line, the line terminators on
+/// each side of it already sandwich it into a genuine blank line, so the
+/// list ends there and nothing more needs to change. The one case that is
+/// not already a complete blank line is when this item sits at the very end
+/// of the source (no trailing line terminator of its own): there the
+/// deletion leaves only a single terminator before an open end, which is not
+/// a blank-line boundary, so a matching terminator is appended to complete
+/// it. An item with nothing before it needs no boundary at all, matching the
+/// existing "sole item" exit behavior.
+fn exit_top_level_item(source: &str, item: &ListEditItem) -> MarkdownEditPlan {
+    let line_start = item.prefix_range.start.0;
+    let line_end = item.prefix_range.end.0;
+    let has_previous = line_start > 0;
+    let has_following = line_end < source.len();
+    let replacement = if has_previous && !has_following {
+        line_terminator_before(source, line_start).to_owned()
+    } else {
+        String::new()
+    };
+    let new_caret = SourceOffset(line_start + replacement.len());
+    MarkdownEditPlan::Replace {
+        range: item.prefix_range,
+        replacement,
+        selection_after: SourceSelection::caret(new_caret),
+    }
+}
+
+/// The line terminator (`"\n"`, `"\r\n"`, or `"\r"`) ending the line
+/// immediately before `line_start`. `line_start` must be greater than `0`.
+fn line_terminator_before(source: &str, line_start: usize) -> &str {
+    let bytes = source.as_bytes();
+    if line_start >= 2 && bytes[line_start - 2] == b'\r' && bytes[line_start - 1] == b'\n' {
+        &source[line_start - 2..line_start]
+    } else {
+        &source[line_start - 1..line_start]
     }
 }
 
@@ -758,6 +812,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, ListEditPlanResult::NotApplicable);
+    }
+
+    /// Issue #460 / E01: exiting the trailing empty top-level item must make
+    /// the next typed line a real paragraph, not a lazy continuation of the
+    /// previous item's body.
+    #[test]
+    fn backspace_on_trailing_empty_top_level_item_creates_paragraph_boundary() {
+        let text = "- abc\n- def\n- ";
+        let (after_exit, caret) = replacement(text, text.len(), ListEditIntent::Backspace);
+        assert_eq!(after_exit, "- abc\n- def\n\n");
+        assert_eq!(caret, after_exit.len());
+
+        let mut typed = after_exit;
+        typed.insert_str(caret, "ghi");
+        assert_eq!(typed, "- abc\n- def\n\nghi");
+
+        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+        let last_paragraph = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
+            .next_back()
+            .expect("expected a trailing paragraph for \"ghi\"");
+        assert!(
+            !parsed
+                .tree
+                .ancestors(last_paragraph.0)
+                .skip(1)
+                .any(|ancestor| matches!(
+                    parsed.tree.node(ancestor).map(|node| node.kind),
+                    Some(NodeKind::ListItem { .. })
+                )),
+            "the paragraph for \"ghi\" must not be a descendant of a ListItem"
+        );
+    }
+
+    #[test]
+    fn enter_on_trailing_empty_top_level_item_creates_paragraph_boundary() {
+        let text = "- abc\n- def\n- ";
+        assert_eq!(
+            replacement(text, text.len(), ListEditIntent::Enter),
+            ("- abc\n- def\n\n".into(), 13)
+        );
+    }
+
+    #[test]
+    fn trailing_empty_top_level_exit_preserves_crlf() {
+        let text = "- abc\r\n- def\r\n- ";
+        assert_eq!(
+            replacement(text, text.len(), ListEditIntent::Backspace),
+            ("- abc\r\n- def\r\n\r\n".into(), 16)
+        );
+    }
+
+    #[test]
+    fn empty_top_level_item_between_siblings_keeps_a_single_blank_line() {
+        // The line terminators already on both sides of the emptied item
+        // already form a complete blank line, so no extra one is inserted.
+        assert_eq!(
+            replacement("- A\n- \n- C", 6, ListEditIntent::Backspace),
+            ("- A\n\n- C".into(), 4)
+        );
+    }
+
+    #[test]
+    fn existing_multiple_blank_lines_after_exit_are_not_collapsed() {
+        assert_eq!(
+            replacement("- A\n- \n\n- C", 6, ListEditIntent::Backspace),
+            ("- A\n\n\n- C".into(), 4)
+        );
     }
 }
 

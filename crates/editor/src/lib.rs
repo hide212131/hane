@@ -486,6 +486,43 @@ mod tests {
         assert_eq!(editor.selection(), Selection::caret(SourceOffset(6)));
     }
 
+    /// Issue #460: mirrors the paragraph-boundary replacement that
+    /// `hane_markdown::list_editing::plan_list_edit` now plans when exiting
+    /// a trailing empty top-level list item (hane-editor does not depend on
+    /// hane-markdown, so the plan's range/replacement/selection are given
+    /// literally, as in `recorded_range_replacement_is_one_undoable_structural_transaction`).
+    #[test]
+    fn trailing_list_exit_and_next_typed_paragraph_undo_redo_independently() {
+        let mut editor = Editor::new("- abc\n- def\n- ");
+        editor
+            .set_selection(Selection::caret(SourceOffset(14)))
+            .unwrap();
+        editor
+            .replace_range_recorded(
+                SourceRange::new(12, 14),
+                "\n",
+                Selection::caret(SourceOffset(13)),
+            )
+            .unwrap();
+        assert_eq!(editor.document().full_text(), "- abc\n- def\n\n");
+
+        editor.dispatch(EditorCommand::Insert("ghi")).unwrap();
+        assert_eq!(editor.document().full_text(), "- abc\n- def\n\nghi");
+
+        editor.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(editor.document().full_text(), "- abc\n- def\n\n");
+        assert_eq!(editor.selection(), Selection::caret(SourceOffset(13)));
+
+        editor.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(editor.document().full_text(), "- abc\n- def\n- ");
+        assert_eq!(editor.selection(), Selection::caret(SourceOffset(14)));
+
+        editor.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(editor.document().full_text(), "- abc\n- def\n\n");
+        editor.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(editor.document().full_text(), "- abc\n- def\n\nghi");
+    }
+
     #[test]
     fn consecutive_backspace_and_delete_are_grouped() {
         let mut backspace = Editor::new("日本語");
