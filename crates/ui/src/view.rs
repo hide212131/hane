@@ -98,6 +98,7 @@ mod background_parse;
 mod content_search;
 mod document_find;
 mod inline_rename;
+pub(crate) mod input_routing;
 mod session_save;
 mod sidebar;
 mod sidebar_filter;
