@@ -1,4 +1,5 @@
 use crate::view::EditorView;
+use crate::view::input_routing::InputTarget;
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
 use hane_editor::EditorCommand;
 use hane_markdown::ListEditIntent;
@@ -249,7 +250,15 @@ command_actions! {
     },
     Backspace ("backspace") => backspace |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.backspace_sidebar_filter(cx); } else if view.inline_rename_active() { view.backspace_inline_rename(cx); } else if !view.apply_list_edit_intent(ListEditIntent::Backspace, cx) { view.dispatch(EditorCommand::Backspace, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.backspace_sidebar_filter(cx),
+            InputTarget::InlineRename => view.backspace_inline_rename(cx),
+            InputTarget::Body => {
+                if !view.apply_list_edit_intent(ListEditIntent::Backspace, cx) {
+                    view.dispatch(EditorCommand::Backspace, cx);
+                }
+            }
+        }
     },
     Indent ("tab") => indent |view, window, cx| {
         if view.ai_selection_handle_tab(true, window, cx) {
@@ -287,15 +296,27 @@ command_actions! {
     },
     Delete ("delete") => delete |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.delete_sidebar_filter(cx); } else if view.inline_rename_active() { view.delete_inline_rename(cx); } else { view.dispatch(EditorCommand::Delete, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.delete_sidebar_filter(cx),
+            InputTarget::InlineRename => view.delete_inline_rename(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::Delete, cx),
+        }
     },
     Left ("left") => left |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.move_sidebar_filter_left(false, cx); } else if view.inline_rename_active() { view.move_inline_rename_left(false, cx); } else { view.dispatch(EditorCommand::MoveLeft { extend: false }, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.move_sidebar_filter_left(false, cx),
+            InputTarget::InlineRename => view.move_inline_rename_left(false, cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveLeft { extend: false }, cx),
+        }
     },
     Right ("right") => right |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.move_sidebar_filter_right(false, cx); } else if view.inline_rename_active() { view.move_inline_rename_right(false, cx); } else { view.dispatch(EditorCommand::MoveRight { extend: false }, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.move_sidebar_filter_right(false, cx),
+            InputTarget::InlineRename => view.move_inline_rename_right(false, cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveRight { extend: false }, cx),
+        }
     },
     Up ("up") => up |view, window, cx| {
         if view.ai_selection_handle_vertical_arrow(false, cx) || view.document_find_input_is_focused() {
@@ -321,11 +342,19 @@ command_actions! {
     },
     SelectLeft ("shift-left") => select_left |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.select_sidebar_filter_left(cx); } else if view.inline_rename_active() { view.select_inline_rename_left(cx); } else { view.dispatch(EditorCommand::MoveLeft { extend: true }, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.select_sidebar_filter_left(cx),
+            InputTarget::InlineRename => view.select_inline_rename_left(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveLeft { extend: true }, cx),
+        }
     },
     SelectRight ("shift-right") => select_right |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.select_sidebar_filter_right(cx); } else if view.inline_rename_active() { view.select_inline_rename_right(cx); } else { view.dispatch(EditorCommand::MoveRight { extend: true }, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.select_sidebar_filter_right(cx),
+            InputTarget::InlineRename => view.select_inline_rename_right(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveRight { extend: true }, cx),
+        }
     },
     SelectUp ("shift-up") => select_up |view, window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
@@ -339,27 +368,43 @@ command_actions! {
     },
     SelectAll ("secondary-a") => select_all |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.select_all_sidebar_filter(cx); } else if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::SelectAll, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.select_all_sidebar_filter(cx),
+            InputTarget::InlineRename => view.select_all_inline_rename(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::SelectAll, cx),
+        }
     },
     Home ("home") => home |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.move_sidebar_filter_home(cx); } else if view.inline_rename_active() { view.move_inline_rename_home(cx); } else { view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.move_sidebar_filter_home(cx),
+            InputTarget::InlineRename => view.move_inline_rename_home(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx),
+        }
     },
     End ("end") => end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.move_sidebar_filter_end(cx); } else if view.inline_rename_active() { view.move_inline_rename_end(cx); } else { view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx); }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.move_sidebar_filter_end(cx),
+            InputTarget::InlineRename => view.move_inline_rename_end(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx),
+        }
     },
     SelectHome ("shift-home") => select_home |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.select_sidebar_filter_home(cx); return; }
-        if view.inline_rename_active() { view.select_inline_rename_home(cx); return; }
-        view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.select_sidebar_filter_home(cx),
+            InputTarget::InlineRename => view.select_inline_rename_home(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx),
+        }
     },
     SelectEnd ("shift-end") => select_end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() { view.select_sidebar_filter_end(cx); return; }
-        if view.inline_rename_active() { view.select_inline_rename_end(cx); return; }
-        view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.select_sidebar_filter_end(cx),
+            InputTarget::InlineRename => view.select_inline_rename_end(cx),
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx),
+        }
     },
     DocumentStart ("secondary-up") => document_start |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
@@ -393,12 +438,10 @@ command_actions! {
     },
     Copy ("secondary-c") => copy |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        let text = if view.sidebar_filter_is_focused() {
-            view.selected_sidebar_filter_text()
-        } else if view.inline_rename_active() {
-            view.selected_inline_rename_text()
-        } else {
-            view.editor().selected_text().ok()
+        let text = match view.input_target() {
+            InputTarget::SidebarFilter => view.selected_sidebar_filter_text(),
+            InputTarget::InlineRename => view.selected_inline_rename_text(),
+            InputTarget::Body => view.editor().selected_text().ok(),
         };
         if let Some(text) = text && !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -406,33 +449,32 @@ command_actions! {
     },
     Cut ("secondary-x") => cut |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        let text = if view.sidebar_filter_is_focused() {
-            view.selected_sidebar_filter_text()
-        } else if view.inline_rename_active() {
-            view.selected_inline_rename_text()
-        } else {
-            view.editor().selected_text().ok()
+        let target = view.input_target();
+        let text = match target {
+            InputTarget::SidebarFilter => view.selected_sidebar_filter_text(),
+            InputTarget::InlineRename => view.selected_inline_rename_text(),
+            InputTarget::Body => view.editor().selected_text().ok(),
         };
         if let Some(text) = text && !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            if view.sidebar_filter_is_focused() {
-                view.delete_sidebar_filter(cx);
-            } else if view.inline_rename_active() {
-                view.delete_inline_rename(cx);
-            } else {
-                view.dispatch(EditorCommand::Backspace, cx);
+            match target {
+                InputTarget::SidebarFilter => view.delete_sidebar_filter(cx),
+                InputTarget::InlineRename => view.delete_inline_rename(cx),
+                InputTarget::Body => view.dispatch(EditorCommand::Backspace, cx),
             }
         }
     },
     Paste ("secondary-v") => paste |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            if view.sidebar_filter_is_focused() {
-                view.replace_sidebar_filter_text(None, &text, cx);
-            } else if view.inline_rename_active() {
-                view.replace_inline_rename_text(None, &text, cx);
-            } else {
-                view.dispatch(EditorCommand::Insert(&text), cx);
+            match view.input_target() {
+                InputTarget::SidebarFilter => {
+                    view.replace_sidebar_filter_text(None, &text, cx);
+                }
+                InputTarget::InlineRename => {
+                    view.replace_inline_rename_text(None, &text, cx);
+                }
+                InputTarget::Body => view.dispatch(EditorCommand::Insert(&text), cx),
             }
         }
     },
