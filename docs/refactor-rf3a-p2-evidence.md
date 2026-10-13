@@ -24,7 +24,7 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 
 初期PR head `85343f1f66981b1ec4822aace8a42d44b47c2c5f`には、この検証記録のみが追加されており、P2の製品コード変更とP2テスト変更はまだない。PR #477のP1はmerge済みで、開始時のmainと作業ブランチの親は上記SHA。
 
-設計§9に沿い、既存handlerに対する契約テストを先に追加し、その変更前候補を検証してから、別のコミットでP2 routingを変更する。以下の4回はP2契約テストだけの変更前候補。routingの製品コード変更はまだ行っていない。
+設計§9に沿い、既存handlerに対する契約テストを先に追加し、その変更前候補を検証してから、別のコミットでP2 routingを変更する。以下の5候補にはP2契約テストだけを追加した。routing製品コードを切り替える前に、各契約とworkspace tests / Clippyを検証している。最後の候補は、先行するrouting部分候補でも未接続だった§6本文専用操作6 actionだけの契約テスト。
 
 ## 変更前候補の検証
 
@@ -34,8 +34,9 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 | `2e03ce600473bd28511f187a80dff1026cdcfb5c` | [38415088569](https://github.com/hide212131/hane/actions/runs/38415088569) | workspace tests 453 passed / 1 failed、Clippy成功。追加したAI IME Escapeテストの期待値が誤っていた。テスト環境では合成中の本文が `ばdef\n` になるため、次のテスト専用変更で期待値を修正。製品動作の失敗ではない |
 | `132d12d8243295bd0a2e3ad33671d637d5dc9b16` | [38418233529](https://github.com/hide212131/hane/actions/runs/38418233529) | 修正後のmacOS workspace all-features tests と Clippy 成功 |
 | `e14238a6a123c2c0b92e30916b6db0c6e625b745` | [38419394944](https://github.com/hide212131/hane/actions/runs/38419394944) | macOS 26 arm64 runner。workspace tests 455 passed / 0 failed、Clippy成功 |
+| `0f1edda0f467d52e77edb2784bef4ec92cded277` | [38424963164](https://github.com/hide212131/hane/actions/runs/38424963164) | §6の文書端移動4種・Undo/Redoをfilter / rename中に本文へ漏らさない2件の契約テストを追加。macOS 26 arm64、workspace tests 457 passed / 0 failed、Clippy成功。commitは `view.rs` のテスト追加のみ |
 
-最後の候補には、本文・フィルタ・名前変更欄の入力分離、Tabのlist plannerとUndo履歴、上下・Escapeの優先順、検索UIのEscape/F3などの既存動作を固定するP2契約テストを追加した。これらはP2 routing切替前に合格した基準結果である。
+4つの先行候補には、本文・filter・renameの入力分離、Tabのlist plannerとUndo履歴、上下・Escapeの優先順、検索UIのEscape/F3などを固定するP2契約テストを追加した。後続候補 `0f1edda0` は§6の本文専用6 actionを、filterとrenameそれぞれで本文のtext / selection / undo-redo履歴を保つ契約として固定した。これらは対象routing切替前に合格した基準結果である。
 
 ## P2 routingの部分候補
 
@@ -49,7 +50,7 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 
 | 確認 | 状態 | 証拠 |
 |---|---|---|
-| P2契約テストの追加（R07–R10、対象R12） | 完了（製品コード変更前） | [PR #488](https://github.com/hide212131/hane/pull/488)、上記候補run |
+| P2契約テストの追加（R07–R10、対象R12、§6本文専用6 action） | 完了（対応するrouting変更前） | [PR #488](https://github.com/hide212131/hane/pull/488)、特に[run 38424963164](https://github.com/hide212131/hane/actions/runs/38424963164) |
 | 変更前P2候補の workspace tests / Clippy | 完了。最終候補は455 passed、Clippy成功 | [run 38419394944](https://github.com/hide212131/hane/actions/runs/38419394944) |
 | P2 routing部分候補のworkspace tests / Clippy | 成功（ただし§6の6 action未接続につき部分結果） | [run 38422215097](https://github.com/hide212131/hane/actions/runs/38422215097) |
 | routing変更後のcurrent-head CI（macOS / Windowsを含む該当check） | 未実施 | — |
@@ -58,4 +59,4 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 | Windowsの変更対象キー入力・日本語IMEの実画面確認 | 未実施 | — |
 | 最終diff・旧分岐・復旧方法の確認 | 未実施 | — |
 
-「未実施」は失敗・成功のどちらも意味しない。未接続の6 actionはテストを先に追加し、routing変更後の候補head、実行環境、コマンド、終了状態、およびリンクを証拠が得られた時点で追記する。未確認をpassとして扱わず、Issue #304はP1–P3全体の受入までopenのままとする。
+「未実施」は失敗・成功のどちらも意味しない。未接続の6 actionには変更前テストを追加・検証済み。routing変更後の候補head、実行環境、コマンド、終了状態、およびリンクを証拠が得られた時点で追記する。未確認をpassとして扱わず、Issue #304はP1–P3全体の受入までopenのままとする。
