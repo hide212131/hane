@@ -20,16 +20,18 @@
 //! is absolute and explicit.
 //!
 //! The bundled package's `manifest.json` is a `schema_version = 1` document
-//! naming the exact `target` (one of [`WINDOWS_X64_TARGET`]/
-//! [`MACOS_ARM64_TARGET`]) it was built for, the upstream `version` and
-//! `source_commit` it came from, the `archive_sha256` of the upstream
-//! archive it was extracted from, a `files` inventory (each entry's `path`
-//! relative to the manifest, and that file's own `sha256`), the bundled
-//! `licenses` file list, and a `profile` identifying the sandbox/approval
-//! profile the bundle was packaged for. This module only verifies the
-//! `entrypoint` file's own integrity against its `files` entry; it does not
-//! (yet) audit every other inventoried file or license -- that remains a
-//! later distribution-pipeline slice.
+//! naming a `bundle_id`, the exact target triple (one of
+//! [`WINDOWS_X64_TARGET`]/[`MACOS_ARM64_TARGET`]) it was built for, the
+//! upstream `codex_version` and `source_commit` it came from, the
+//! `archive_sha256` of the upstream archive it was extracted from, a `files`
+//! inventory, the bundled `licenses` file list, and the `runtime_profile`/
+//! `config_profile`/`state_profile` the bundle was packaged for. Every
+//! `files` entry (not only the `entrypoint`) names a `path` relative to the
+//! manifest, a `type`, its `size`, its `sha256`, and whether it is
+//! `executable`; resolution verifies every entry's existence, type, size,
+//! hash, and executable attribute, and that its `path` cannot resolve
+//! outside the manifest's own directory. License auditing and the archive
+//! fetch/extract pipeline itself remain a later distribution-pipeline slice.
 
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -49,8 +51,12 @@ pub const BUNDLE_DIR_NAME: &str = "codex-app-server";
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-pub const WINDOWS_X64_TARGET: &str = "windows-x64";
-pub const MACOS_ARM64_TARGET: &str = "macos-arm64";
+pub const WINDOWS_X64_TARGET: &str = "x86_64-pc-windows-msvc";
+pub const MACOS_ARM64_TARGET: &str = "aarch64-apple-darwin";
+
+/// The only recognized `files` entry `type`. Any other value is treated as
+/// an unknown-schema inventory entry and rejected fail-closed.
+const RUNTIME_MANIFEST_FILE_TYPE_FILE: &str = "file";
 
 /// The current platform's manifest `target` identifier, or `None` when this
 /// host is neither of the two P0 targets the bundled package's manifest
@@ -87,16 +93,21 @@ pub enum RuntimeDistributionErrorCode {
     /// The bundled manifest's `target` does not match this host, or this
     /// host is neither of the two P0 targets at all.
     UnsupportedTarget,
-    /// A file's computed `sha256` does not match the manifest's recorded
-    /// value.
+    /// A `files` inventory entry's computed `sha256` does not match the
+    /// manifest's recorded value, or its actual size does not match the
+    /// manifest's recorded `size`.
     IntegrityMismatch,
     /// A candidate file or the manifest could not be read because of
     /// filesystem permissions.
     AccessDenied,
     /// A candidate exists but is not a usable executable: not a regular
-    /// file, empty, missing the executable permission bit (Unix), or (for
-    /// the bundled package) described by a `manifest.json` that is not valid
-    /// JSON, not `schema_version = 1`, or missing a required contract field.
+    /// file, empty, missing or unexpectedly carrying the executable
+    /// permission bit (Unix) relative to its manifest `executable` flag, or
+    /// (for the bundled package) described by a `manifest.json` that is not
+    /// valid JSON, not `schema_version = 1`, missing a required contract
+    /// field, or whose `files` inventory has an unknown `type`, a duplicate
+    /// or out-of-bundle `path`, or no entry for `entrypoint` marked
+    /// `executable`.
     InvalidExecutable,
     /// The binary spawned, but the `initialize` JSON-RPC handshake did not
     /// complete (see `crate::runtime::RuntimeError::Handshake`).
@@ -106,13 +117,13 @@ pub enum RuntimeDistributionErrorCode {
 impl RuntimeDistributionErrorCode {
     pub fn stable_code(self) -> &'static str {
         match self {
-            Self::ExplicitPathNotAbsolute => "runtime_distribution_explicit_path_not_absolute",
-            Self::Missing => "runtime_distribution_missing",
-            Self::UnsupportedTarget => "runtime_distribution_unsupported_target",
-            Self::IntegrityMismatch => "runtime_distribution_integrity_mismatch",
-            Self::AccessDenied => "runtime_distribution_access_denied",
-            Self::InvalidExecutable => "runtime_distribution_invalid_executable",
-            Self::InitializeFailed => "runtime_distribution_initialize_failed",
+            Self::ExplicitPathNotAbsolute => "runtime_explicit_path_not_absolute",
+            Self::Missing => "runtime_missing",
+            Self::UnsupportedTarget => "runtime_target_unsupported",
+            Self::IntegrityMismatch => "runtime_integrity_mismatch",
+            Self::AccessDenied => "runtime_access_denied",
+            Self::InvalidExecutable => "runtime_invalid_executable",
+            Self::InitializeFailed => "runtime_initialize_failed",
         }
     }
 }
@@ -124,15 +135,23 @@ pub enum RuntimeBinarySource {
     BundledPackage,
 }
 
-/// One entry in a manifest's `files` inventory.
+/// One entry in a manifest's `files` inventory: a runtime-dependent file's
+/// `path` relative to the manifest, its `type` (currently always `"file"`),
+/// declared `size` in bytes, `sha256`, and whether it must carry the
+/// executable attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RuntimeManifestFile {
     pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub size: u64,
     pub sha256: String,
+    pub executable: bool,
 }
 
-/// The `profile` fields a manifest carries, identifying the sandbox/approval
-/// profile the bundled App Server was packaged against.
+/// One of the `runtime_profile`/`config_profile`/`state_profile` fields a
+/// manifest carries, identifying the sandbox/approval, configuration, or
+/// state profile the bundled App Server was packaged against.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RuntimeManifestProfile {
     pub name: String,
@@ -141,20 +160,25 @@ pub struct RuntimeManifestProfile {
 }
 
 /// The bundled package's `manifest.json` contract: `schema_version = 1`,
-/// naming the exact `target`, upstream `version`/`source_commit`, the
-/// `archive_sha256` of the upstream archive it was extracted from, a `files`
-/// inventory, bundled `licenses`, and a `profile`. See the module docs.
+/// a `bundle_id`, naming the exact target triple, upstream
+/// `codex_version`/`source_commit`, the `archive_sha256` of the upstream
+/// archive it was extracted from, a `files` inventory, bundled `licenses`,
+/// and the `runtime_profile`/`config_profile`/`state_profile`. See the
+/// module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RuntimeManifest {
     pub schema_version: u32,
+    pub bundle_id: String,
     pub target: String,
-    pub version: String,
+    pub codex_version: String,
     pub entrypoint: String,
     pub source_commit: String,
     pub archive_sha256: String,
     pub files: Vec<RuntimeManifestFile>,
     pub licenses: Vec<String>,
-    pub profile: RuntimeManifestProfile,
+    pub runtime_profile: RuntimeManifestProfile,
+    pub config_profile: RuntimeManifestProfile,
+    pub state_profile: RuntimeManifestProfile,
 }
 
 /// The outcome of a successful resolution: an absolute `binary_path` ready
@@ -233,15 +257,15 @@ fn resolve_bundled_package(
         return Err(RuntimeDistributionErrorCode::UnsupportedTarget);
     }
 
-    let entrypoint_path = resolve_within_bundle(bundle_dir, &manifest.entrypoint)?;
-    validate_executable_file(&entrypoint_path)?;
+    // Every inventoried runtime-dependent file -- not only the entrypoint --
+    // must exist, match its declared type/size/hash/executable attribute,
+    // and resolve inside `bundle_dir`.
+    for file in &manifest.files {
+        let file_path = resolve_within_bundle(bundle_dir, &file.path)?;
+        validate_inventory_file(&file_path, file)?;
+    }
 
-    let entrypoint_file = manifest
-        .files
-        .iter()
-        .find(|file| file.path == manifest.entrypoint)
-        .ok_or(RuntimeDistributionErrorCode::InvalidExecutable)?;
-    verify_file_integrity(&entrypoint_path, &entrypoint_file.sha256)?;
+    let entrypoint_path = resolve_within_bundle(bundle_dir, &manifest.entrypoint)?;
 
     Ok(ResolvedRuntimeBinary {
         binary_path: entrypoint_path,
@@ -251,52 +275,118 @@ fn resolve_bundled_package(
 }
 
 /// Required-contract-field presence/well-formedness, independent of the
-/// current host: a manifest with a blank or missing contract field is
-/// treated the same as a structurally invalid document, regardless of
+/// current host: a manifest with a blank or missing contract field, an
+/// unknown `files` entry `type`, a duplicate or out-of-bundle `files` path,
+/// or an `entrypoint` that is not itself a `files` entry marked `executable`
+/// is treated the same as a structurally invalid document, regardless of
 /// whether this host would otherwise be able to use it.
 fn validate_manifest_shape(
     manifest: &RuntimeManifest,
 ) -> Result<(), RuntimeDistributionErrorCode> {
     let non_blank = |s: &str| !s.trim().is_empty();
-    let shape_ok = manifest.schema_version == MANIFEST_SCHEMA_VERSION
+    let profile_ok = |profile: &RuntimeManifestProfile| non_blank(&profile.name);
+
+    let top_level_ok = manifest.schema_version == MANIFEST_SCHEMA_VERSION
+        && non_blank(&manifest.bundle_id)
         && non_blank(&manifest.target)
-        && non_blank(&manifest.version)
+        && non_blank(&manifest.codex_version)
         && non_blank(&manifest.entrypoint)
         && non_blank(&manifest.source_commit)
-        && non_blank(&manifest.archive_sha256)
+        && is_sha256_hex(&manifest.archive_sha256)
         && !manifest.files.is_empty()
-        && manifest
-            .files
-            .iter()
-            .all(|file| non_blank(&file.path) && non_blank(&file.sha256))
         && !manifest.licenses.is_empty()
         && manifest.licenses.iter().all(|license| non_blank(license))
-        && non_blank(&manifest.profile.name);
-    if shape_ok {
-        Ok(())
-    } else {
-        Err(RuntimeDistributionErrorCode::InvalidExecutable)
+        && profile_ok(&manifest.runtime_profile)
+        && profile_ok(&manifest.config_profile)
+        && profile_ok(&manifest.state_profile);
+    if !top_level_ok {
+        return Err(RuntimeDistributionErrorCode::InvalidExecutable);
     }
+
+    let mut seen_paths = std::collections::HashSet::with_capacity(manifest.files.len());
+    for file in &manifest.files {
+        let shape_ok = non_blank(&file.path)
+            && has_valid_relative_path(&file.path)
+            && file.kind == RUNTIME_MANIFEST_FILE_TYPE_FILE
+            && is_sha256_hex(&file.sha256)
+            && seen_paths.insert(file.path.as_str());
+        if !shape_ok {
+            return Err(RuntimeDistributionErrorCode::InvalidExecutable);
+        }
+    }
+
+    match manifest
+        .files
+        .iter()
+        .find(|file| file.path == manifest.entrypoint)
+    {
+        Some(file) if file.executable => Ok(()),
+        _ => Err(RuntimeDistributionErrorCode::InvalidExecutable),
+    }
+}
+
+/// Whether `relative` is a non-empty, relative path made only of normal
+/// components (no absolute path, no `.`/`..`), so a manifest-provided path
+/// can never resolve outside the directory it is joined onto.
+fn has_valid_relative_path(relative: &str) -> bool {
+    use std::path::Component;
+    let relative_path = Path::new(relative);
+    !relative_path.as_os_str().is_empty()
+        && !relative_path.is_absolute()
+        && relative_path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Whether `value` is a well-formed lowercase-or-uppercase hex-encoded
+/// SHA-256 digest (64 hex digits), independent of whether it matches any
+/// particular file's actual content.
+fn is_sha256_hex(value: &str) -> bool {
+    let value = value.trim();
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Joins `relative` (a manifest-provided, package-relative path) onto
 /// `bundle_dir`, rejecting anything that would resolve outside of it (e.g. a
-/// `..` component), so a corrupted or tampered manifest can never point the
-/// resolved binary at an arbitrary filesystem location.
+/// `..` component), so a corrupted or tampered manifest can never point a
+/// resolved file at an arbitrary filesystem location.
 fn resolve_within_bundle(
     bundle_dir: &Path,
     relative: &str,
 ) -> Result<PathBuf, RuntimeDistributionErrorCode> {
-    use std::path::Component;
-    let relative_path = Path::new(relative);
-    if relative_path.is_absolute()
-        || relative_path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !has_valid_relative_path(relative) {
         return Err(RuntimeDistributionErrorCode::InvalidExecutable);
     }
-    Ok(bundle_dir.join(relative_path))
+    Ok(bundle_dir.join(Path::new(relative)))
+}
+
+/// Verifies one `files` inventory entry against the filesystem: it must
+/// exist as a regular file of exactly the declared `size`, carry (or lack)
+/// the executable attribute exactly as declared (Unix only; Windows has no
+/// equivalent permission bit to check), and hash to the declared `sha256`.
+fn validate_inventory_file(
+    path: &Path,
+    file: &RuntimeManifestFile,
+) -> Result<(), RuntimeDistributionErrorCode> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return Err(classify_io_error(&error)),
+    };
+    if !metadata.is_file() {
+        return Err(RuntimeDistributionErrorCode::InvalidExecutable);
+    }
+    if metadata.len() != file.size {
+        return Err(RuntimeDistributionErrorCode::IntegrityMismatch);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let is_executable = metadata.permissions().mode() & 0o111 != 0;
+        if is_executable != file.executable {
+            return Err(RuntimeDistributionErrorCode::InvalidExecutable);
+        }
+    }
+    verify_file_integrity(path, &file.sha256)
 }
 
 fn validate_executable_file(path: &Path) -> Result<(), RuntimeDistributionErrorCode> {
@@ -537,32 +627,83 @@ mod tests {
         dir
     }
 
-    fn write_entrypoint(bundle_dir: &Path, name: &str, contents: &[u8]) -> (PathBuf, String) {
+    fn write_entrypoint(bundle_dir: &Path, name: &str, contents: &[u8]) -> (PathBuf, String, u64) {
+        write_file(bundle_dir, name, contents, true)
+    }
+
+    /// Writes `contents` at `bundle_dir/name`, setting (Unix only) the
+    /// executable permission bit according to `executable`, and returns the
+    /// path, hex `sha256`, and byte length a manifest `files` entry for it
+    /// would declare.
+    fn write_file(
+        bundle_dir: &Path,
+        name: &str,
+        contents: &[u8],
+        executable: bool,
+    ) -> (PathBuf, String, u64) {
         let path = bundle_dir.join(name);
         std::fs::write(&path, contents).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mode = if executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         }
-        (path, sha256_hex(contents))
+        (path, sha256_hex(contents), contents.len() as u64)
     }
 
-    fn manifest_json(target: &str, entrypoint: &str, entrypoint_sha256: &str) -> String {
-        format!(
-            r#"{{
-                "schema_version": 1,
-                "target": "{target}",
-                "version": "1.2.3",
-                "entrypoint": "{entrypoint}",
-                "source_commit": "deadbeef",
-                "archive_sha256": "{archive_sha}",
-                "files": [{{"path": "{entrypoint}", "sha256": "{entrypoint_sha256}"}}],
-                "licenses": ["LICENSE.txt"],
-                "profile": {{"name": "default"}}
-            }}"#,
-            archive_sha = "0".repeat(64),
-        )
+    /// A minimal, structurally valid manifest: `entrypoint_path` as the sole
+    /// `files` entry (declared `executable: true`), with `entrypoint_sha256`
+    /// and `entrypoint_size` as its `sha256`/`size`.
+    fn base_manifest_value(
+        target: &str,
+        entrypoint_path: &str,
+        entrypoint_sha256: &str,
+        entrypoint_size: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "bundle_id": "codex-app-server-bundle",
+            "target": target,
+            "codex_version": "1.2.3",
+            "entrypoint": entrypoint_path,
+            "source_commit": "deadbeef",
+            "archive_sha256": "0".repeat(64),
+            "files": [
+                {
+                    "path": entrypoint_path,
+                    "type": "file",
+                    "size": entrypoint_size,
+                    "sha256": entrypoint_sha256,
+                    "executable": true,
+                }
+            ],
+            "licenses": ["LICENSE.txt"],
+            "runtime_profile": {"name": "default"},
+            "config_profile": {"name": "default"},
+            "state_profile": {"name": "default"},
+        })
+    }
+
+    fn add_file_entry(
+        manifest: &mut serde_json::Value,
+        path: &str,
+        kind: &str,
+        size: u64,
+        sha256: &str,
+        executable: bool,
+    ) {
+        manifest["files"].as_array_mut().unwrap().push(serde_json::json!({
+            "path": path,
+            "type": kind,
+            "size": size,
+            "sha256": sha256,
+            "executable": executable,
+        }));
+    }
+
+    fn write_manifest(dir: &Path, manifest: &serde_json::Value) {
+        std::fs::write(dir.join(MANIFEST_FILE_NAME), manifest.to_string()).unwrap();
     }
 
     #[test]
@@ -597,7 +738,7 @@ mod tests {
     #[test]
     fn explicit_valid_override_resolves_and_bypasses_the_bundle() {
         let dir = next_fixture_dir("explicit-ok");
-        let (path, _) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let (path, _, _) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
         let resolved =
             resolve_runtime_binary(Some(path.as_os_str()), Path::new("/should/not/be/read"))
                 .unwrap();
@@ -624,10 +765,100 @@ mod tests {
     #[test]
     fn bundled_package_wrong_schema_version_is_invalid() {
         let dir = next_fixture_dir("bundle-wrong-schema");
-        let (_, sha) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
-        let manifest = manifest_json(WINDOWS_X64_TARGET, "codex-app-server", &sha)
-            .replacen("\"schema_version\": 1", "\"schema_version\": 2", 1);
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        manifest["schema_version"] = serde_json::json!(2);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    fn bundled_package_missing_required_field_is_invalid() {
+        let dir = next_fixture_dir("bundle-missing-field");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        for field in [
+            "schema_version",
+            "bundle_id",
+            "target",
+            "codex_version",
+            "entrypoint",
+            "source_commit",
+            "archive_sha256",
+            "files",
+            "licenses",
+            "runtime_profile",
+            "config_profile",
+            "state_profile",
+        ] {
+            let mut manifest =
+                base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+            manifest.as_object_mut().unwrap().remove(field);
+            write_manifest(&dir, &manifest);
+            let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+            assert_eq!(
+                result,
+                Err(RuntimeDistributionErrorCode::InvalidExecutable),
+                "removing {field} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_package_blank_or_malformed_required_field_is_invalid() {
+        let dir = next_fixture_dir("bundle-blank-field");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        for (field, value) in [
+            ("bundle_id", serde_json::json!("")),
+            ("codex_version", serde_json::json!("   ")),
+            ("source_commit", serde_json::json!("")),
+            ("archive_sha256", serde_json::json!("not-a-hash")),
+        ] {
+            let mut manifest =
+                base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            write_manifest(&dir, &manifest);
+            let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+            assert_eq!(
+                result,
+                Err(RuntimeDistributionErrorCode::InvalidExecutable),
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_package_duplicate_file_path_is_invalid() {
+        let dir = next_fixture_dir("bundle-duplicate-path");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        add_file_entry(&mut manifest, "codex-app-server", "file", len, &sha, true);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    fn bundled_package_unknown_file_type_is_invalid() {
+        let dir = next_fixture_dir("bundle-unknown-type");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        manifest["files"][0]["type"] = serde_json::json!("symlink");
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    fn bundled_package_entrypoint_not_marked_executable_is_invalid() {
+        let dir = next_fixture_dir("bundle-entrypoint-not-exec-flag");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        manifest["files"][0]["executable"] = serde_json::json!(false);
+        write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
     }
@@ -635,9 +866,9 @@ mod tests {
     #[test]
     fn bundled_package_target_mismatch_is_unsupported() {
         let dir = next_fixture_dir("bundle-target-mismatch");
-        let (_, sha) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
-        let manifest = manifest_json(MACOS_ARM64_TARGET, "codex-app-server", &sha);
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let manifest = base_manifest_value(MACOS_ARM64_TARGET, "codex-app-server", &sha, len);
+        write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::UnsupportedTarget));
     }
@@ -645,9 +876,9 @@ mod tests {
     #[test]
     fn bundled_package_on_an_unsupported_host_is_unsupported_regardless_of_manifest() {
         let dir = next_fixture_dir("bundle-unsupported-host");
-        let (_, sha) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
-        let manifest = manifest_json(WINDOWS_X64_TARGET, "codex-app-server", &sha);
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, None);
         assert_eq!(result, Err(RuntimeDistributionErrorCode::UnsupportedTarget));
     }
@@ -655,8 +886,19 @@ mod tests {
     #[test]
     fn bundled_package_entrypoint_outside_the_bundle_is_invalid() {
         let dir = next_fixture_dir("bundle-escape");
-        let manifest = manifest_json(WINDOWS_X64_TARGET, "../escaped", &"0".repeat(64));
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let manifest = base_manifest_value(WINDOWS_X64_TARGET, "../escaped", &"0".repeat(64), 16);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    fn bundled_package_dependent_file_path_escaping_is_invalid() {
+        let dir = next_fixture_dir("bundle-dependent-escape");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        add_file_entry(&mut manifest, "../escaped", "file", 10, &"a".repeat(64), false);
+        write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
     }
@@ -664,8 +906,20 @@ mod tests {
     #[test]
     fn bundled_package_missing_entrypoint_file_is_missing() {
         let dir = next_fixture_dir("bundle-missing-entrypoint");
-        let manifest = manifest_json(WINDOWS_X64_TARGET, "codex-app-server", &"0".repeat(64));
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let manifest =
+            base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &"0".repeat(64), 16);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::Missing));
+    }
+
+    #[test]
+    fn bundled_package_dependent_file_missing_is_missing() {
+        let dir = next_fixture_dir("bundle-dependent-missing");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        add_file_entry(&mut manifest, "libcodex.so", "file", 10, &"a".repeat(64), false);
+        write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::Missing));
     }
@@ -673,26 +927,53 @@ mod tests {
     #[test]
     fn bundled_package_integrity_mismatch_is_reported() {
         let dir = next_fixture_dir("bundle-integrity-mismatch");
-        write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let (_, _, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
         let wrong_sha = "1".repeat(64);
-        let manifest = manifest_json(WINDOWS_X64_TARGET, "codex-app-server", &wrong_sha);
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &wrong_sha, len);
+        write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::IntegrityMismatch));
     }
 
     #[test]
+    fn bundled_package_size_mismatch_is_integrity_mismatch() {
+        let dir = next_fixture_dir("bundle-size-mismatch");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len + 1);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::IntegrityMismatch));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundled_package_executable_attribute_mismatch_is_invalid() {
+        let dir = next_fixture_dir("bundle-exec-attr-mismatch");
+        let (_, sha, len) = write_file(&dir, "codex-app-server", b"binary-contents", false);
+        let manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
     fn bundled_package_valid_manifest_resolves_the_entrypoint() {
         let dir = next_fixture_dir("bundle-ok");
-        let (entrypoint_path, sha) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
-        let manifest = manifest_json(WINDOWS_X64_TARGET, "codex-app-server", &sha);
-        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let (entrypoint_path, sha, len) =
+            write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let (_, dep_sha, dep_len) = write_file(&dir, "libcodex.so", b"shared-library", false);
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        add_file_entry(&mut manifest, "libcodex.so", "file", dep_len, &dep_sha, false);
+        write_manifest(&dir, &manifest);
         let resolved = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET)).unwrap();
         assert_eq!(resolved.binary_path, entrypoint_path);
         assert_eq!(resolved.source, RuntimeBinarySource::BundledPackage);
         let manifest = resolved.manifest.unwrap();
-        assert_eq!(manifest.version, "1.2.3");
-        assert_eq!(manifest.profile.name, "default");
+        assert_eq!(manifest.codex_version, "1.2.3");
+        assert_eq!(manifest.runtime_profile.name, "default");
+        assert_eq!(manifest.config_profile.name, "default");
+        assert_eq!(manifest.state_profile.name, "default");
+        assert_eq!(manifest.files.len(), 2);
     }
 
     #[test]
