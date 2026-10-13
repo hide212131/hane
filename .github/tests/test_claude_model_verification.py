@@ -9,10 +9,12 @@ verify_claude_model = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(verify_claude_model)
 
 
-def execution(model="claude-sonnet-5-5", usage_model="claude-sonnet-5-5"):
+def execution(model="claude-sonnet-5-5", usage_model="claude-sonnet-5-5", usage=None):
+    if usage is None:
+        usage = {"inputTokens": 1}
     return [
         {"type": "system", "subtype": "init", "model": model, "parent_tool_use_id": None},
-        {"type": "result", "modelUsage": {usage_model: {"inputTokens": 1}}},
+        {"type": "result", "modelUsage": {usage_model: usage}},
     ]
 
 
@@ -30,8 +32,33 @@ class ClaudeModelVerificationTests(unittest.TestCase):
                 verify_claude_model.verify_execution(execution(model))
 
     def test_requires_result_usage_for_sonnet_55(self):
-        with self.assertRaisesRegex(ValueError, "did not report Sonnet 5.5 model usage"):
+        with self.assertRaisesRegex(ValueError, "did not report positive Sonnet 5.5 token usage"):
             verify_claude_model.verify_execution(execution(usage_model="claude-sonnet-5"))
+
+    def test_requires_positive_sonnet_55_token_usage(self):
+        token_fields = (
+            "inputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+        )
+        for field in token_fields:
+            with self.subTest(field=field):
+                usage = {name: 0 for name in token_fields}
+                usage[field] = 1
+                result = verify_claude_model.verify_execution(execution(usage=usage))
+                self.assertEqual(result["session_model"], "claude-sonnet-5-5")
+
+        for usage in (
+            {},
+            {field: 0 for field in token_fields},
+            {field: -1 for field in token_fields},
+            {field: True for field in token_fields},
+        ):
+            with self.subTest(usage=usage), self.assertRaisesRegex(
+                ValueError, "positive Sonnet 5.5 token usage"
+            ):
+                verify_claude_model.verify_execution(execution(usage=usage))
 
     def test_reports_all_runtime_usage_models(self):
         payload = execution()

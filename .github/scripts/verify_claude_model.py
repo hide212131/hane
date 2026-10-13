@@ -12,10 +12,25 @@ EXPECTED_MODEL = "claude-sonnet-5-5"
 MODEL_ID = re.compile(r"claude-sonnet-5-5(?:-[0-9]{8})?")
 USAGE_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._:-]{0,127}")
 MAX_EXECUTION_BYTES = 16 * 1024 * 1024
+USAGE_TOKEN_FIELDS = (
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+)
 
 
 def _is_expected_model(value: Any) -> bool:
     return isinstance(value, str) and MODEL_ID.fullmatch(value) is not None
+
+
+def _has_positive_token_usage(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(
+        type(value.get(field)) is int and value[field] > 0
+        for field in USAGE_TOKEN_FIELDS
+    )
 
 
 def verify_execution(payload: Any) -> dict[str, Any]:
@@ -33,20 +48,27 @@ def verify_execution(payload: Any) -> dict[str, Any]:
     if len(primary_models) != 1 or not _is_expected_model(primary_models[0]):
         raise ValueError("Claude session did not report the configured Sonnet 5.5 model")
 
-    usage_models = sorted({
-        model
-        for event in payload
-        if isinstance(event, dict) and event.get("type") == "result"
-        for model in (event.get("modelUsage") or {})
-        if isinstance(model, str) and USAGE_MODEL_ID.fullmatch(model)
-    })
-    if not any(_is_expected_model(model) for model in usage_models):
-        raise ValueError("Claude result did not report Sonnet 5.5 model usage")
+    usage_models = set()
+    has_expected_model_usage = False
+    for event in payload:
+        if not isinstance(event, dict) or event.get("type") != "result":
+            continue
+        model_usage = event.get("modelUsage")
+        if not isinstance(model_usage, dict):
+            continue
+        for model, usage in model_usage.items():
+            if not isinstance(model, str) or not USAGE_MODEL_ID.fullmatch(model):
+                continue
+            usage_models.add(model)
+            if _is_expected_model(model) and _has_positive_token_usage(usage):
+                has_expected_model_usage = True
+    if not has_expected_model_usage:
+        raise ValueError("Claude result did not report positive Sonnet 5.5 token usage")
 
     return {
         "requested_model": EXPECTED_MODEL,
         "session_model": primary_models[0],
-        "usage_models": usage_models,
+        "usage_models": sorted(usage_models),
     }
 
 
