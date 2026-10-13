@@ -230,7 +230,7 @@ class BuildBundleTests(unittest.TestCase):
 
             result = fixture.build(output_dir)
 
-            self.assertEqual(result, output_dir)
+            self.assertEqual(result, output_dir.resolve())
             manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["schema_version"], 1)
             self.assertEqual(manifest["target"], "test-target")
