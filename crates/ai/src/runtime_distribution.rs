@@ -445,8 +445,8 @@ impl Sha256 {
         self.absorb(&zeros[..zero_pad]);
         self.absorb(&bit_len.to_be_bytes());
         let mut out = [0u8; 32];
-        for (chunk, value) in out.chunks_exact_mut(4).zip(self.state.iter()) {
-            chunk.copy_from_slice(&value.to_be_bytes());
+        for (i, value) in self.state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&value.to_be_bytes());
         }
         out
     }
