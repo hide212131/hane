@@ -1952,6 +1952,110 @@ mod tests {
         });
     }
 
+    // Issue #304 (RF3-A, P2): pre-change contract tests pinning F3/Shift+F3's
+    // own `sidebar_filter_is_focused()`/`inline_rename_active()` guard
+    // (`actions.rs`) before P2 connects it to the P1 `input_target()`
+    // resolver. Seeding the filter/rename flag after `open_document_find`
+    // (impossible through the real UI, which always closes an active rename
+    // and never focuses the filter while the find bar is open) pins this
+    // priority directly, the same way the sibling tests in `view.rs` do for
+    // the other normal/special keys.
+    #[gpui::test]
+    fn f3_and_shift_f3_are_no_ops_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+            assert!(view.sidebar_filter_is_focused());
+        });
+
+        cx.simulate_keystrokes("shift-f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+        });
+    }
+
+    #[gpui::test]
+    fn f3_and_shift_f3_are_no_ops_while_inline_rename_is_active(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+            assert!(view.inline_rename_active());
+        });
+
+        cx.simulate_keystrokes("shift-f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+        });
+    }
+
     #[gpui::test]
     fn shift_enter_in_the_search_field_moves_to_the_previous_match_without_editing_the_document(
         cx: &mut gpui::TestAppContext,

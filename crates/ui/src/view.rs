@@ -20344,4 +20344,309 @@ mod tests {
             assert_eq!(view.sidebar_filter, "");
         });
     }
+
+    // Issue #304 (RF3-A, P2): pre-change contract tests for the special-key
+    // handlers (`Indent`/`Outdent`, `Up`/`Down`, `PrevFileTab`) that
+    // `actions.rs` still routes with their own independent
+    // `sidebar_filter_is_focused()`/`inline_rename_active()` checks instead
+    // of through the P1 `input_target()` resolver above. These pin the
+    // *current* short-circuit order, the list planner's single-execution
+    // and undo-history pipeline, and the filter/rename no-op outcome
+    // directly, the same way the P1 block pins the 14 normal editing-key
+    // actions, before P2 connects these special keys to `input_target()`
+    // too. `F3`/`Shift+F3`'s own filter/rename guard is pinned next to
+    // their other tests in `document_find.rs`; `Enter`/`Shift+Enter`'s
+    // filter/rename and list/history behavior already has real-key-dispatch
+    // coverage elsewhere in this module (see
+    // `inline_rename_enter_commits_ime_composition_before_the_rename` and
+    // `real_backspace_keystroke_exits_a_trailing_empty_top_level_item`).
+
+    #[gpui::test]
+    fn tab_and_shift_tab_run_the_list_planner_through_real_key_dispatch_and_record_undo_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("- A\n- B", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(7)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
+            assert!(view.editor().can_undo());
+        });
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n- B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B");
+        });
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n- B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+        });
+    }
+
+    #[gpui::test]
+    fn tab_and_shift_tab_are_no_ops_outside_a_list_context_and_never_insert_a_literal_tab_character(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("plain\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "plain\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+            assert!(!view.editor().can_undo());
+        });
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "plain\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+            assert!(!view.editor().can_undo());
+        });
+    }
+
+    #[gpui::test]
+    fn up_and_down_move_the_body_caret_vertically_through_real_key_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(0))
+        );
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(6))
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_filter_focused_up_and_down_do_not_move_the_body_caret(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.sidebar_filter_focused = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 1..1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert!(view.sidebar_filter_is_focused());
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+        });
+    }
+
+    #[gpui::test]
+    fn inline_rename_active_up_and_down_do_not_move_the_body_caret(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "abcdef".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 3..3,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_tab_does_not_switch_tabs_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_is_focused()));
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_tab_does_not_switch_tabs_while_inline_rename_is_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+    }
 }
