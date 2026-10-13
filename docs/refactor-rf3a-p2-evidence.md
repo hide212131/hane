@@ -12,7 +12,7 @@ Issue: [#304](https://github.com/hide212131/hane/issues/304)
 
 この検証記録を初期化したPR head: `85343f1f66981b1ec4822aace8a42d44b47c2c5f`
 
-P2契約テスト最終候補（製品コード変更前）: `e14238a6a123c2c0b92e30916b6db0c6e625b745`
+P2契約テスト最終候補（製品コード変更前）: `0f1edda0f467d52e77edb2784bef4ec92cded277`
 
 ## P2の範囲
 
@@ -69,7 +69,7 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 | 確認 | 状態 | 証拠 |
 |---|---|---|
 | P2契約テストの追加（R07–R10、対象R12、§6本文専用6 action） | 完了（対応するrouting変更前） | [PR #488](https://github.com/hide212131/hane/pull/488)、特に[run 38424963164](https://github.com/hide212131/hane/actions/runs/38424963164) |
-| 変更前P2候補の workspace tests / Clippy | 完了。最終候補は455 passed、Clippy成功 | [run 38419394944](https://github.com/hide212131/hane/actions/runs/38419394944) |
+| 変更前P2候補の workspace tests / Clippy | 完了。最終候補 `0f1edda0` は457 passed、Clippy成功 | [run 38424963164](https://github.com/hide212131/hane/actions/runs/38424963164) |
 | P2 routing部分候補のworkspace tests / Clippy | 成功（ただし§6の6 action未接続につき部分結果） | [run 38422215097](https://github.com/hide212131/hane/actions/runs/38422215097) |
 | P2 routing全対象の候補workspace tests / Clippy | 成功。workspace tests 457 passed、Clippy成功（macOSのみ） | [run 38427825319](https://github.com/hide212131/hane/actions/runs/38427825319) |
 | P2 routing候補 `d1eeec8` のPR CI（macOS / Windows） | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38432156856（attempt 2）](https://github.com/hide212131/hane/actions/runs/38432156856) |
