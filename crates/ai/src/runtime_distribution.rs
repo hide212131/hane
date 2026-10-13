@@ -30,8 +30,13 @@
 //! manifest, a `type`, its `size`, its `sha256`, and whether it is
 //! `executable`; resolution verifies every entry's existence, type, size,
 //! hash, and executable attribute, and that its `path` cannot resolve
-//! outside the manifest's own directory. License auditing and the archive
-//! fetch/extract pipeline itself remain a later distribution-pipeline slice.
+//! outside the manifest's own directory -- lexically, and also on disk: the
+//! bundle directory itself and every path component resolving a `files`
+//! entry or the `entrypoint` is rejected if it is a symlink or (on Windows)
+//! another reparse point (including a junction/mount point), so a bundled
+//! symlink can never redirect a verified entry to a file outside the
+//! bundle. License auditing and the archive fetch/extract pipeline itself
+//! remain a later distribution-pipeline slice.
 
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -357,7 +362,54 @@ fn resolve_within_bundle(
     if !has_valid_relative_path(relative) {
         return Err(RuntimeDistributionErrorCode::InvalidExecutable);
     }
+    reject_symlink_escape(bundle_dir, relative)?;
     Ok(bundle_dir.join(Path::new(relative)))
+}
+
+/// Rejects `bundle_dir` itself, or any path component resolving `relative`
+/// onto it, that is a symlink or (on Windows) another reparse point --
+/// including a junction/mount point, which Rust's `FileType::is_symlink`
+/// also reports as such. `has_valid_relative_path` already guarantees
+/// `relative` is lexically contained (no `..`/absolute component); this
+/// additionally guarantees the *resolved* path never traverses a symlinked
+/// directory or file to a location outside `bundle_dir`, which a purely
+/// lexical check cannot catch. A component that does not exist yet simply
+/// stops the walk -- the subsequent existence check reports that case as
+/// [`RuntimeDistributionErrorCode::Missing`], not as a symlink escape.
+fn reject_symlink_escape(
+    bundle_dir: &Path,
+    relative: &str,
+) -> Result<(), RuntimeDistributionErrorCode> {
+    if !check_not_symlink(bundle_dir)? {
+        return Ok(());
+    }
+    let mut current = bundle_dir.to_path_buf();
+    for component in Path::new(relative).components() {
+        current.push(component);
+        if !check_not_symlink(&current)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// `Ok(true)` if `path` exists and is not a symlink/reparse point, `Ok(false)`
+/// if it does not exist (yet), or an error classifying why it could not be
+/// inspected (permission denied) or that it is a symlink/reparse point
+/// (treated as [`RuntimeDistributionErrorCode::InvalidExecutable`], matching
+/// the existing "not a regular file" classification).
+fn check_not_symlink(path: &Path) -> Result<bool, RuntimeDistributionErrorCode> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                Err(RuntimeDistributionErrorCode::InvalidExecutable)
+            } else {
+                Ok(true)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(classify_io_error(&error)),
+    }
 }
 
 /// Verifies one `files` inventory entry against the filesystem: it must
@@ -898,6 +950,64 @@ mod tests {
         let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
         let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
         add_file_entry(&mut manifest, "../escaped", "file", 10, &"a".repeat(64), false);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundled_package_entrypoint_symlink_escaping_the_bundle_is_invalid() {
+        use std::os::unix::fs::symlink;
+        let dir = next_fixture_dir("bundle-entrypoint-symlink-escape");
+        let outside_dir = next_fixture_dir("bundle-entrypoint-symlink-escape-outside");
+        let (_, sha, len) = write_file(&outside_dir, "secret", b"outside-contents", true);
+        symlink(outside_dir.join("secret"), dir.join("codex-app-server")).unwrap();
+        let manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundled_package_dependent_file_symlink_escaping_the_bundle_is_invalid() {
+        use std::os::unix::fs::symlink;
+        let dir = next_fixture_dir("bundle-dependent-symlink-escape");
+        let outside_dir = next_fixture_dir("bundle-dependent-symlink-escape-outside");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let (_, dep_sha, dep_len) = write_file(&outside_dir, "libcodex.so", b"outside-lib", false);
+        symlink(
+            outside_dir.join("libcodex.so"),
+            dir.join("libcodex.so"),
+        )
+        .unwrap();
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        add_file_entry(&mut manifest, "libcodex.so", "file", dep_len, &dep_sha, false);
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundled_package_file_under_symlinked_directory_escaping_the_bundle_is_invalid() {
+        use std::os::unix::fs::symlink;
+        let dir = next_fixture_dir("bundle-symlinked-dir-escape");
+        let outside_dir = next_fixture_dir("bundle-symlinked-dir-escape-outside");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let (_, dep_sha, dep_len) =
+            write_file(&outside_dir, "libcodex.so", b"outside-lib", false);
+        symlink(&outside_dir, dir.join("linked")).unwrap();
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        add_file_entry(
+            &mut manifest,
+            "linked/libcodex.so",
+            "file",
+            dep_len,
+            &dep_sha,
+            false,
+        );
         write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
