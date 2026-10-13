@@ -720,6 +720,10 @@ mod tests {
             let mode = if executable { 0o755 } else { 0o644 };
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         }
+        #[cfg(not(unix))]
+        {
+            let _ = executable;
+        }
         (path, sha256_hex(contents), contents.len() as u64)
     }
 
