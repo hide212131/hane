@@ -161,7 +161,7 @@ PR #102 の残件は、個別 review comment に対する局所 workaround と�
 
 各修正後は新しい exact head で review threads を取り直し、outdated 化した指摘、新規 finding、残存 finding を再分類する。
 
-AADW v1 で Issue #110 が対象としていた canonical snapshot / Claude fix worker / merge gate の同期契約は、現行 AADW v2 の進行判断には使わない。current GitHub facts と `docs/aadw-command-policy.md` を正本として Commander が判断する。
+AADW v1 で Issue #110 が対象としていた canonical snapshot / Claude fix worker / merge gate の同期契約は、現行 AADW v3 の進行判断には使わない。current GitHub facts と `docs/aadw-command-policy.md` を正本として Commander が判断する。
 
 ## 結果
 

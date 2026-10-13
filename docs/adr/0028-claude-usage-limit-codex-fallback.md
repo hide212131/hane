@@ -11,7 +11,6 @@
 ## 関連
 
 - Issue #241
-- ADR-0027: AADW v2 は ChatGPT Commander と GitHub facts を核にする
 - ADR-0031: AADW v3。Claude優先・条件付きCodexを引き継ぐ
 
 ## 背景

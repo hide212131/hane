@@ -20,7 +20,9 @@ def test_fallback_is_completed_claude_run_only_and_uses_exact_checkpoint():
     assert '.failure_category == "usage_or_rate_limit"' in WORKFLOW
     assert ".run_attempt == $run_attempt" in WORKFLOW
     assert ".workflow_sha == $workflow_sha" in WORKFLOW
-    assert "AADW_COMMANDER_HANDOFF_V2" in WORKFLOW
+    assert "source-handoff" in WORKFLOW
+    assert "AADW_COMMANDER_HANDOFF_V2" not in WORKFLOW
+    assert ".agents/skills/hane-issue-workflow/*" in WORKFLOW
     assert "Download the exact Claude Commander handoff" in WORKFLOW
 
 

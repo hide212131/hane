@@ -67,7 +67,7 @@ workerの使用可能な道具は `Read,Edit,Write,Glob,Grep` であり、GitHub
 
 `prepare`が成功して初めて依頼が受理されたと扱う。`skipped`なら未開始であり、Issueへ投稿していないか、必要な行が正しいか、default branchの契約が反映済みかを確認する。`prepare`の失敗なら権限、head移動、closed/paused、fork、重複依頼などの具体的な理由を読む。原因を確かめず同じコメントを再送しない。
 
-workerが成功した後も、patchの生成、trusted finalizerのpush、変更後のexact head、`verify`とrequired CIを別々に確認する。workerはshellやGit認証情報を持たず、pushと検証はworkflow側が行う。空patch、検証失敗、モデル不一致、取得できない結果を完了としない。
+workerが成功した後も、実行結果が示すsession modelとmodel usage、patchの生成、trusted finalizerのpush、変更後のexact head、`verify`とrequired CIを別々に確認する。Sonnet 5.5の実行確認に失敗した場合はpatchをpushせず、利用上限fallbackにも流さない。workerはshellやGit認証情報を持たず、pushと検証はworkflow側が行う。空patch、検証失敗、モデル不一致、取得できない結果を完了としない。
 
 モデル指定は `claude-sonnet-5-5` を使用する。runで確認できた実行モデルと設定上の指定を区別し、実行モデルが取得できない場合は「設定確認のみ」と記録する。Sonnet 5.5が使えない場合に、旧モデルへ黙って切り替えない。
 

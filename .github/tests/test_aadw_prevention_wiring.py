@@ -24,11 +24,13 @@ class WiringTests(unittest.TestCase):
         self.assertLess(text.index('id: claude'), text.index('path: trusted-validator'))
         self.assertIn('ref: ${{ github.workflow_sha }}', text)
         self.assertIn('aadw-claude-fix-pr-', text)
+        self.assertIn('--model claude-sonnet-5-5', text)
+        self.assertIn('verify_claude_model.py', text)
 
     def test_mutation_keeps_empty_patch_and_stop_guards(self):
         text = (ROOT / '.github/workflows/claude-fix.yml').read_text()
         self.assertIn('aadw_action_contract.py request', text)
-        self.assertIn('Claude worker produced no product-code change.', text)
+        self.assertIn('Claude worker produced no repository change.', text)
         self.assertGreaterEqual(text.count('<!-- AADW_PAUSED -->'), 2)
         self.assertIn('if [[ "$current_sha" != "$expected_sha" ]]', text)
         self.assertIn('--tools "Read,Edit,Write,Glob,Grep"', text)
@@ -39,11 +41,20 @@ class WiringTests(unittest.TestCase):
         self.assertIn('cargo clippy --workspace --all-targets --all-features --locked -- -D warnings', verify)
         self.assertIn('test "$TEST_RESULT" = success && test "$LINT_RESULT" = success', verify)
         self.assertIn('if: ${{ !cancelled() }}', verify)
+        self.assertIn('AADW_COMMANDER_HANDOFF_V3', text)
+        self.assertNotIn('AADW_COMMANDER_HANDOFF_V2', text)
+        self.assertIn('--model claude-sonnet-5-5', text)
+        self.assertIn('verify_claude_model.py', text)
+        self.assertIn('.agents/skills/hane-issue-workflow/*', text)
+        self.assertLess(text.index('id: model_verify'), text.index('Build untrusted worker patch'))
+        self.assertIn("steps.claude.outcome == 'failure' || steps.model_verify.outcome == 'success'", text)
+        self.assertIn("steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success'", text)
 
     def test_all_new_contract_tests_are_in_regular_ci(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         for path in ('.github/tests/test_aadw_action_contract.py',
                      '.github/tests/test_aadw_prevention_wiring.py',
+                     '.github/tests/test_claude_model_verification.py',
                      'scripts/tests/test_aadw_gui_observation.py'):
             self.assertIn('python3 ' + path, text)
 

@@ -10,7 +10,8 @@ import re
 
 CLASSES = {"initial", "product", "test", "measurement", "environment", "unknown"}
 SHA = re.compile(r"[0-9a-f]{40}")
-MARKERS = {"implement": "AADW_COMMANDER_HANDOFF_V2", "diagnose": "AADW_DIAGNOSTIC_REQUEST_V1"}
+MARKERS = {"implement": "AADW_COMMANDER_HANDOFF_V3", "diagnose": "AADW_DIAGNOSTIC_REQUEST_V1"}
+IMPLEMENT_MARKER_PREFIX = "AADW_COMMANDER_HANDOFF_"
 
 
 def field(body: str, name: str) -> str:
@@ -22,10 +23,17 @@ def field(body: str, name: str) -> str:
 
 def parse_request(body: str) -> dict:
     action = field(body, "AADW_ACTION")
-    if action not in MARKERS or body.splitlines().count(MARKERS[action]) != 1:
+    if action not in MARKERS:
+        raise ValueError("unsupported action")
+    lines = body.splitlines()
+    handoff_markers = [line for line in lines if line.startswith(IMPLEMENT_MARKER_PREFIX)]
+    if action == "implement":
+        if handoff_markers != [MARKERS[action]]:
+            raise ValueError("missing action-specific request marker")
+        if MARKERS["diagnose"] in lines:
+            raise ValueError("diagnostic and implementation markers cannot be combined")
+    elif lines.count(MARKERS[action]) != 1 or handoff_markers:
         raise ValueError("missing action-specific request marker")
-    if MARKERS["diagnose" if action == "implement" else "implement"] in body.splitlines():
-        raise ValueError("diagnostic and implementation markers cannot be combined")
     head = field(body, "AADW_TARGET_HEAD").lower()
     if not SHA.fullmatch(head):
         raise ValueError("target head must be a full SHA")
@@ -42,6 +50,15 @@ def parse_request(body: str) -> dict:
         raise ValueError("evidence must reference GitHub facts")
     return {"action": action, "target_sha": head, "failure_class": category,
             "root_cause": root, "evidence": evidence}
+
+
+def validate_source_handoff(body: str, target_sha: str) -> dict:
+    request = parse_request(body)
+    if request["action"] != "implement":
+        raise ValueError("usage-limit fallback requires an implementation handoff")
+    if request["target_sha"] != target_sha:
+        raise ValueError("source handoff target does not match the checkpoint head")
+    return request
 
 
 def validate_request(body: str, pr: dict, repository: str, history: list, actor: str,
@@ -118,6 +135,9 @@ def main() -> None:
     result.add_argument("report", type=Path)
     result.add_argument("patch", type=Path)
     result.add_argument("output", type=Path)
+    source = sub.add_parser("source-handoff")
+    source.add_argument("handoff", type=Path)
+    source.add_argument("target_sha")
     args = parser.parse_args()
     if args.command == "request":
         pages = read_json(args.history, 16 * 1024 * 1024)
@@ -125,10 +145,14 @@ def main() -> None:
         value = validate_request(os.environ["COMMENT_BODY"], read_json(args.pr, 1024 * 1024),
                                  os.environ["REPOSITORY"], history, os.environ["ACTOR"],
                                  int(os.environ["COMMENT_ID"]))
-    else:
+    elif args.command == "diagnosis":
         if args.patch.is_symlink() or not args.patch.is_file():
             raise ValueError("patch observation is missing")
         value = diagnostic_result(read_json(args.report), read_json(args.request), args.patch.stat().st_size > 0)
+    else:
+        if args.handoff.is_symlink() or not args.handoff.is_file() or args.handoff.stat().st_size > 65536:
+            raise ValueError("source handoff must be a bounded regular file")
+        value = validate_source_handoff(args.handoff.read_text(encoding="utf-8"), args.target_sha.lower())
     args.output.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 

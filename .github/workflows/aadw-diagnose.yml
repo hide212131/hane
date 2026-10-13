@@ -62,7 +62,7 @@ jobs:
 
       - name: Run bounded diagnostic worker without repository write credentials
         id: claude
-        uses: anthropics/claude-code-base-action@dd60ce53fe3364200a307753f2dd9dc70cb3c960
+        uses: anthropics/claude-code-base-action@0adbfaf05435b2e2b7150cb122ba44727b98bf12
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -94,10 +94,15 @@ jobs:
             provider responses. Do not edit the target to satisfy the diagnosis.
           claude_args: |
             --add-dir pr-head
-            --model claude-sonnet-5
+            --model claude-sonnet-5-5
             --max-turns 80
             --tools "Read,Write,Glob,Grep"
             --allowedTools "Read,Write,Glob,Grep"
+
+      - name: Confirm Claude used Sonnet 5.5
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: python3 .github/scripts/verify_claude_model.py "$EXECUTION_FILE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Reacquire trusted result validator after worker execution
         uses: actions/checkout@v6

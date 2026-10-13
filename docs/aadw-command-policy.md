@@ -288,9 +288,11 @@ merge は expected head SHA を指定して行う。expected head は concurrent
 
 既存の修正依頼には、以下の必須行を含める。SHA・原因ID・evidence URLは実際の値へ置き換える。各行を一つずつ記載する。
 
+実装用PRがない場合の準備と初回依頼、workerが読める設計の渡し方、投稿後の`prepare`確認は[Claude実行手順](aadw-claude-execution.md)に従う。通常の実装マーカーは現在のmainが受け付ける`AADW_COMMANDER_HANDOFF_V3`とする。
+
 ```text
 @claude
-AADW_COMMANDER_HANDOFF_V2
+AADW_COMMANDER_HANDOFF_V3
 AADW_ACTION: implement
 AADW_TARGET_HEAD: <40桁のcurrent head>
 AADW_FAILURE_CLASS: product

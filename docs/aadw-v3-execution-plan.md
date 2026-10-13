@@ -6,7 +6,7 @@
 
 設計Issue [#332](https://github.com/hide212131/hane/issues/332) / PR #334を、利用者指定により[#336](https://github.com/hide212131/hane/issues/336)で改訂する。実装は[#333](https://github.com/hide212131/hane/issues/333)。[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)と[v3設計書](agentic-development-workflow-v3.md)を参照する。
 
-**入口はChatGPTアプリ、実装はActions経由のClaude優先・条件付きCodex、通常レビューはCodeRabbit、GUIはv2と同じく必要時に実行する。** 独立したCodex App Server実行器を作ることからは始めない。
+**入口はChatGPTアプリ、実装はActions経由のClaude優先・条件付きCodex、通常レビューはCodeRabbit、GUIは既存経路を必要時に実行する。** 独立したCodex App Server実行器を作ることからは始めない。
 
 設計文書を置いただけでは稼働を切り替えない。[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)が現行運用の正本であり、Jev統合やCodeRabbit標準化のような運用切替は個別Issue/PRで正本を更新して有効化する。以下の段階は実装計画であって独自のworkflow stateではない。進捗はGitHubのIssue/PRと証拠で確認する。
 
@@ -18,7 +18,7 @@ Claude workerのRead/Edit/Write/Glob/Grep限定と別finalizerを維持する。
 
 既存の利用上限fallbackはsource run/attempt・checkpoint・依頼者・headを検証する。Codexの固定版・利用可能モデル/推論量・認証/課金方式を確認する。promptにモデル名を書いただけで実指定済みにしない。実装停滞での切替は新規条件として、初期はCommanderが判断する。認証失敗・環境故障・head変更で無条件fallbackしない。
 
-受入証拠はアプリからの依頼、対応するActions run、実際の差分、CI、担当終了と切替の記録である。通常コード・テストの実装は現行v2のClaudeへ依頼し、保護されたworkflow・Policy・認証の変更を同じ依頼へ混ぜない。
+受入証拠はアプリからの依頼、対応するActions run、実際の差分、CI、担当終了と切替の記録である。通常コード・テストの実装は[Claude実行手順](aadw-claude-execution.md)に従ってClaudeへ依頼し、保護されたworkflow・Policy・認証の変更を通常の製品依頼へ混ぜない。
 
 ## 2. V3-2: アプリからJevを呼び、限定した判断を検査する
 
@@ -78,20 +78,20 @@ Actions内から次のActionsへ送る場合は`GITHUB_TOKEN`のイベント制�
 | T16 | CI成功だが受入条件やGUIの裏付け不足 | 追加検証へ進めるか停止し、COMPLETEや検証免除にしない |
 | T17 | ActionsからClaude/GUI・外部CodeRabbitへ依頼 | 実認証・actor・イベントの受理を確認し、コメント成功だけで実行済みとしない |
 | T18 | 同じ原因の反復、明示された停止条件または提供側の上限到達 | 新しいactionを止め、未解決事項と全試行の利用量を返す。利用者が指定していない費用上限は設けない |
-| T19 | アプリ中断後の再開/v2への復帰 | 外部runの継続・終了とcurrent factsを確認し、二重writer/重複依頼を防ぐ |
+| T19 | アプリ中断後に以前の作業文脈へ戻る | 外部runの継続・終了とcurrent factsを確認し、二重writer/重複依頼を防ぐ |
 | T20 | COMPLETEだがreview/GUI/CIが不足 | 完了候補にとどめ、mergeしない |
 | T21 | 費用不明、途中失敗、親子usage | unknownをゼロにせず、失敗を除外せず、二重加算しない |
 
 fixture、実API/外部App、実GUIは証拠の種類を分ける。すべてを実サービスで実施する必要はないが、接続と実行の確認をfixtureだけで完了したことにはしない。
 
-## 6. 停止・再開・v2への復帰
+## 6. 停止・再開・以前の作業文脈への復帰
 
 停止時は新しいactionを発行せず、既に起動したworker/GUI/reviewの状態を確認する。旧workerをキャンセルする場合は実際の終了を確認してから次のwriterへ渡す。未反映patch、candidate、run/attempt、未解決検証と費用履歴を残し、秘密情報は含めない。
 
-再開時はGitHubのcurrent head/base、実行済み操作、稼働中runを読み直し、古いJev回答・COMPLETEやアプリの会話履歴だけで進めない。v2復帰は新たなv3依頼を止め、担当と未完了差分をCommanderへ渡す。既存Issue/PRや失敗証拠を消さない。
+再開時はGitHubのcurrent head/base、実行済み操作、稼働中runを読み直し、古いJev回答・COMPLETEやアプリの会話履歴だけで進めない。以前の作業文脈へ戻る場合は新たな依頼を止め、担当と未完了差分をCommanderへ渡す。既存Issue/PRや失敗証拠を消さない。
 
 ## 7. PR分割と今回の非対象
 
-アプリ連携、Jev、CodeRabbit設定、GUIの不足procedure、評価・有効化は必要な範囲でPRを分ける。既存v2で通常コードをClaudeに実装させ、workflow/Policy/認証等の変更は明示した運用基盤PRにする。全域リファクタリング#297を待つ前提は置かず、変更する経路の進行中PRとの重なりだけ確認する。
+アプリ連携、Jev、CodeRabbit設定、GUIの不足procedure、評価・有効化は必要な範囲でPRを分ける。通常コードをClaudeに実装させ、workflow/Policy/認証等の変更は明示した運用基盤PRにする。全域リファクタリング#297を待つ前提は置かず、変更する経路の進行中PRとの重なりだけ確認する。
 
 今回の#336はMarkdownとIssue情報だけを変更し、コード・workflow・秘密情報・依存関係・バージョン・現行Policy・既存fallbackを変えない。今回のPR自体のGUI実行は不要。文書検査、current-headの現行Codexレビュー、該当CIを確認する。#333はopenを維持し、文書mergeを実装・実API・GUI・v3有効化の完了と扱わない。

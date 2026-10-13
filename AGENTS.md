@@ -23,8 +23,10 @@ Hane の現行の AI Agent Development Workflow（AADW）は v3 とする。段�
 - 全体設計: [AADW v3 設計書](docs/agentic-development-workflow-v3.md)
 - 設計判断: [ADR-0031](docs/adr/0031-aadw-v3-jev-bounded-execution.md)
 - Commander の判断ルール: [AADW Commander Policy](docs/aadw-command-policy.md)
+- Claude への実行手順: [AADW v3 Claude 実行手順](docs/aadw-claude-execution.md)
+- Hane Issue workflow skill: [.agents/skills/hane-issue-workflow/SKILL.md](.agents/skills/hane-issue-workflow/SKILL.md)
 
-[AADW v2 設計書](docs/agentic-development-workflow-v2.md) は v3 が引き継ぐ既存経路の参照資料として扱い、現行の役割分担の正本にはしない。旧 [AI Agent Development Workflow](docs/agentic-development-workflow.md) は v1 の履歴資料である。
+通常の実装PRがない場合、Commanderは実装用PRを文書だけの準備commitで作り、そのcurrent headにClaudeへの依頼を一度投稿する。詳細な必須項目と受理確認は上記の実行手順とCommander Policyに従う。Issueへの `/implement` は実装入口として使わない。旧 [AI Agent Development Workflow](docs/agentic-development-workflow.md) は v1 の履歴資料である。
 
 AADW は独立した workflow / state machine を持たない。ChatGPT が Commander として GitHub 上の current facts / evidence を読み、Jev に通常の意味判断を委ねる。Commander は選ばれた action の客観的な権限・鮮度・required evidence を確認して一つだけ実行し、その結果を再び観測する。
 
@@ -78,4 +80,4 @@ AADW 専用の collector、wrapper、workflow、status、receipt、Gate は前�
 
 Jevは依頼解釈、作業範囲、原因分類、検証計画、次の action など通常の意味判断を担当し、利用可能な既存handlerがあればその選択も行う。ChatGPT Commander は GitHub の事実・権限・required evidence を確認し、選ばれた一 action を実行する。費用・性能の追加評価や事前閾値を Jev 利用の条件にしない。Issue #333 は残るv3導入作業を追跡し、この運用だけをもって Issue 全体を完了扱いにしない。
 
-GUIはv2のADR-0024と既存Hosted/ローカル経路を引き継ぎ、必須scenarioの未実施・fail・blocked・unknownを免除しない。CodeRabbitはIssue #360の実run検証とIssue #373の切替を経て通常レビュー担当とし、Automatic Review + Automatic Incremental Reviewを使う。最終受入は自動増分レビューだけで済ませず、current-headのmanual full reviewを確認する。アプリ終了後の無人継続や独立App Server実行器など、残るv3機能の移行状態は個別のIssue/PRで確認する。
+GUIはADR-0024と既存Hosted/ローカル経路を使い、必須scenarioの未実施・fail・blocked・unknownを免除しない。CodeRabbitはIssue #360の実run検証とIssue #373の切替を経て通常レビュー担当とし、Automatic Review + Automatic Incremental Reviewを使う。最終受入は自動増分レビューだけで済ませず、current-headのmanual full reviewを確認する。アプリ終了後の無人継続や独立App Server実行器など、残るv3機能の移行状態は個別のIssue/PRで確認する。

@@ -4,9 +4,9 @@
 
 ## 状態
 
-2026-10-13時点の調査・設計を保存する。基準mainは `af981629011f04f68b25c8b58e476eb3eeffa624`。
+2026-10-13時点の調査・設計と実装範囲を記録する。基準mainは `af981629011f04f68b25c8b58e476eb3eeffa624`。このPRはIssue #486で明示された運用基盤専用の変更候補であり、保護パス拒否や通常workerの権限は緩めない。
 
-**この文書と実行手順書の追加だけでは、workflow、モデル、起動マーカー、既存Policyの変更は反映されない。** このセッションでは `.github/scripts/aadw_action_contract.py` の更新をGitHub接続ツールへ要求したが、OpenAIの安全確認でブロックされ、更新されていない。別のAPI経路で同じ書込みを迂回していない。運用基盤を変更できる担当は、この記録とcurrent factsを確認してから実装する。
+初回の準備時にGitHub接続ツールへ要求した `.github/scripts/aadw_action_contract.py` の更新は、安全確認でブロックされており適用されなかった。この事実は当時の状態の記録である。利用者が本Issueの完遂を明示した後、権限を持つ担当がこの運用基盤専用PR内で変更を実装している。通常製品workerへ送ったり、保護パス拒否を迂回・解除したりしていない。
 
 要求・範囲・完了条件の正本は [Issue #486](https://github.com/hide212131/hane/issues/486)。利用者の要求は、現行契約から旧世代の依存を完全に除くこと、Sonnet 5.5へ揃えること、Claudeへの初回実装指示で迷わないことである。初回実装の操作手順は [aadw-claude-execution.md](aadw-claude-execution.md) にまとめた。
 
@@ -14,7 +14,7 @@
 
 current main、#486、本設計PR、`.github/workflows/claude-fix.yml`、`.github/workflows/aadw-diagnose.yml`、`.github/workflows/codex-usage-limit-fallback.yml`、`.github/scripts/aadw_action_contract.py`、関連する `.github/tests/`、AGENTS、CLAUDE、Commander Policy、ADR-0031を読む。進行中の同領域PRがないか調べる。
 
-引用された `hane-issue-workflow` は、基準SHAの `.agents/skills/` には見つからなかった。同ディレクトリで確認できたのは `hane-gui-test` である。この事実だけで利用者PCのユーザー領域や別のskill配置まで不在と判断しない。ローカル担当は、読み込まれたskillの実パスと内容を確認する。
+引用された `hane-issue-workflow` は、基準SHAの `.agents/skills/` には見つからなかった。同ディレクトリで確認できたのは `hane-gui-test` である。この実行環境では読み込まれたskillの実パスと内容を確認し、repositoryの入口を参照するよう更新した。別PCのユーザー領域まで更新済みとは判断しない。
 
 本件は利用者が明示的に依頼した運用基盤の変更である。製品コードを変更する通常workerのfinalizerは `.github/`、AGENTS、CLAUDE、Commander Policy等を拒否する。そこへ本件の修正を依頼して失敗させたり、拒否条件を削除したりしない。通常の製品実装は引き続きClaudeへ任せる。
 
@@ -29,6 +29,8 @@ current main、#486、本設計PR、`.github/workflows/claude-fix.yml`、`.githu
 | `.github/workflows/codex-usage-limit-fallback.yml` | source handoffの検査を正規マーカーに一致させる | usage_or_rate_limitだけ、元run/attempt/actor、checkpoint、同一対象head、二重writer防止、認証失敗等との区別 |
 | `.github/workflows/aadw-diagnose.yml` | モデルを `claude-sonnet-5-5` に変更 | 診断専用、repository変更とpush禁止、source差分ゼロ、診断結果のschemaと対象head検査 |
 | `.github/tests/test_codex_usage_limit_fallback.py` と契約の関連テスト | 正常系の期待値を正規マーカーへ更新し、旧入力・混在・重複の拒否を追加 | 既存の権限・鮮度・checkpoint・空patch・失敗分類のテスト |
+| Claude Code actionとモデル検査 | Sonnet 5.5を含むClaude Code CLIを固定するaction revisionへ更新。実行結果のprimary modelとmodel usageを検査し、未確認・不一致ならpushを止める | action revisionはfull SHAで固定し、raw実行ログやusage値をjob summaryへ出さない |
+| `.agents/skills/hane-issue-workflow/` | repository管理の薄いskill入口を追加し、normal workerのpatchから保護する | 実行markerや長い判断ルールはPolicyとrunbookを正とする |
 
 実装parserで、例えば `AADW_COMMANDER_HANDOFF_` で始まる単独行が正規マーカー以外だったら拒否する。正規マーカーを一行含むだけで、旧マーカーと混在した入力を通してはいけない。現在の診断用 `AADW_DIAGNOSTIC_REQUEST_V1` は診断要求の形式番号であり、今回の実装マーカー統一とは別である。形式番号を無関係に書き換えない。
 
@@ -41,7 +43,7 @@ current main、#486、本設計PR、`.github/workflows/claude-fix.yml`、`.githu
 基準SHAのコード検索で旧世代への参照を確認した主な文書は以下である。機械的な一括置換で過去の検証結果を改ざんせず、現行契約、履歴、AADWとは無関係なバージョン名を区別する。
 
 - 現行の入口・正本: `AGENTS.md`、`CLAUDE.md`、`docs/aadw-command-policy.md`、`docs/agentic-development-workflow-v3.md`、`docs/aadw-v3-execution-plan.md`、`docs/adr/0031-aadw-v3-jev-bounded-execution.md`。
-- 専用旧文書: `docs/agentic-development-workflow-v2.md`、`docs/adr/0027-aadw-v2-chatgpt-commander.md`。必要な現行の制約をv3側へ移してから、現行treeから削除する。
+- 専用旧文書: `docs/agentic-development-workflow-v2.md`、`docs/adr/0027-aadw-v2-chatgpt-commander.md`。必要な現行の制約をv3側へ移したうえで、本PRで現行treeから削除した。
 - 関連する設計・操作手順: `docs/adr/README.md`、ADR-0023、ADR-0024、ADR-0025、ADR-0026、ADR-0028、`docs/local-gui-validation.md`、`docs/local-gui-validate-cli.md`、`docs/refactor-plan.md`、`docs/refactor-execution-plan.md`。
 - 履歴資料: `docs/final-judgement.md`、`docs/claude-retry-state.md`、`docs/agentic-implementation-recovery.md`、`docs/agentic-development-workflow.md`、`docs/aadw-v3-v3-1-validation.md`。現行版を誤認させる案内を除く。監査に必要な記録は当時のcommitへ明示的に参照させるか、旧運用の文書自体を現行treeから取り除き、削除された現行パスへの生きたリンクを残さない。
 
@@ -68,7 +70,7 @@ CLAUDEの説明は実際のworker権限に合わせる。Actions workerにshell�
 | 実装要求 | 正規マーカー、initial/product/testの受付、単独旧マーカー・世代混在・marker重複・field重複の拒否 |
 | 誤実装の防止 | measurement/environment/unknownの拒否、diagnoseとの混在拒否 |
 | 既存のガード | stale head、fork、closed/paused、権限不足、同一要求の再送、checkpoint不一致、空patch、保護パス変更の拒否 |
-| 設定の一致 | 全ての有効なClaude呼出しのmodel、実装受付とfallbackのsource契約、文書テンプレートとparserの一致 |
+| 設定の一致 | 全ての有効なClaude呼出しのmodel、実行結果のprimary model/usage、実装受付とfallbackのsource契約、文書テンプレートとparserの一致 |
 | 文書 | 削除文書への生きた相対リンクなし、現行正本に旧世代を参照しないと分からない記述なし |
 
 Pythonテストの起動方法とworkflow構文検査はcurrent `ci.yml` に合わせる。検査を省略したのに成功と書かない。製品Rustコードを変更しない本件で製品GUIを一律の完了条件にしないが、required CIとcurrent-headのCodeRabbit full reviewは既存Policyに従う。
