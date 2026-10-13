@@ -2501,14 +2501,10 @@ fn ensure_runtime<'a>(
         Err(Some(code)) => {
             mutate(shared, |snapshot| {
                 snapshot.runtime_distribution_error = Some(code);
-                snapshot.ownership = OwnershipState::Unavailable;
             });
             return Err(());
         }
         Err(None) => {
-            mutate(shared, |snapshot| {
-                snapshot.ownership = OwnershipState::Unavailable;
-            });
             return Err(());
         }
     };
@@ -3381,6 +3377,142 @@ mod tests {
             Err(AdmissionError::Unavailable)
         ));
         assert!(handle.snapshot().busy.is_none());
+    }
+
+    #[test]
+    fn runtime_resolution_diagnostic_preserves_owned_settings() {
+        let data_root = next_isolation_test_root("runtime-resolution-ownership");
+        let paths = AiPaths::new(&data_root);
+        std::fs::create_dir_all(paths.root()).unwrap();
+        let owner_guard = OwnerLock::new(paths.runtime_owner_lock_path())
+            .try_acquire()
+            .unwrap()
+            .expect("the test must own the runtime lock");
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot {
+                ownership: OwnershipState::Owned,
+                ..AiSnapshot::default()
+            }),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let mut state = WorkerState {
+            runtime: None,
+            runtime_events: None,
+            owner_guard: Some(owner_guard),
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
+        };
+        let config = AiServiceConfig {
+            app_data_root: data_root.clone(),
+            binary_path: PathBuf::new(),
+            binary_resolution_error: Some(RuntimeDistributionErrorCode::UnsupportedTarget),
+            credential_store: Arc::new(crate::secrets::FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        };
+
+        assert!(ensure_runtime(
+            &config,
+            &paths,
+            &AiSettings::default(),
+            &shared,
+            &mut state,
+        )
+        .is_err());
+
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(snapshot.ownership, OwnershipState::Owned);
+        assert_eq!(
+            snapshot.runtime_distribution_error,
+            Some(RuntimeDistributionErrorCode::UnsupportedTarget)
+        );
+        assert!(state.owner_guard.is_some());
+        drop(snapshot);
+        assert!(settings_actions_allowed(&shared));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn missing_runtime_preserves_owned_settings_without_a_distribution_diagnostic() {
+        let data_root = next_isolation_test_root("missing-runtime-ownership");
+        let paths = AiPaths::new(&data_root);
+        std::fs::create_dir_all(paths.root()).unwrap();
+        let owner_guard = OwnerLock::new(paths.runtime_owner_lock_path())
+            .try_acquire()
+            .unwrap()
+            .expect("the test must own the runtime lock");
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot {
+                ownership: OwnershipState::Owned,
+                ..AiSnapshot::default()
+            }),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let mut state = WorkerState {
+            runtime: None,
+            runtime_events: None,
+            owner_guard: Some(owner_guard),
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
+        };
+        let config = AiServiceConfig {
+            app_data_root: data_root.clone(),
+            binary_path: PathBuf::new(),
+            binary_resolution_error: None,
+            credential_store: Arc::new(crate::secrets::FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        };
+
+        assert!(ensure_runtime(
+            &config,
+            &paths,
+            &AiSettings::default(),
+            &shared,
+            &mut state,
+        )
+        .is_err());
+
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(snapshot.ownership, OwnershipState::Owned);
+        assert_eq!(snapshot.runtime_distribution_error, None);
+        assert_eq!(snapshot.runtime_install, RuntimeInstallState::NotInstalled);
+        assert!(state.owner_guard.is_some());
+
+        drop(snapshot);
+        assert!(settings_actions_allowed(&shared));
+
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared: shared.clone(),
+        };
+        assert!(handle.try_submit(AiCommand::InstallRuntime).is_ok());
+        assert!(matches!(
+            command_rx.try_recv().unwrap().command,
+            WorkerCommand::Action(AiCommand::InstallRuntime)
+        ));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_root);
     }
 
     fn next_isolation_test_root(label: &str) -> PathBuf {
