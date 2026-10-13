@@ -20461,21 +20461,16 @@ mod tests {
         });
     }
 
-    // Issue #304 (RF3-A, P2): pre-change contract tests for the special-key
-    // handlers (`Indent`/`Outdent`, `Up`/`Down`, `PrevFileTab`) that
-    // `actions.rs` still routes with their own independent
-    // `sidebar_filter_is_focused()`/`inline_rename_active()` checks instead
-    // of through the P1 `input_target()` resolver above. These pin the
-    // *current* short-circuit order, the list planner's single-execution
-    // and undo-history pipeline, and the filter/rename no-op outcome
-    // directly, the same way the P1 block pins the 14 normal editing-key
-    // actions, before P2 connects these special keys to `input_target()`
-    // too. `F3`/`Shift+F3`'s own filter/rename guard is pinned next to
-    // their other tests in `document_find.rs`; `Enter`/`Shift+Enter`'s
-    // filter/rename and list/history behavior already has real-key-dispatch
-    // coverage elsewhere in this module (see
-    // `inline_rename_enter_commits_ime_composition_before_the_rename` and
-    // `real_backspace_keystroke_exits_a_trailing_empty_top_level_item`).
+    // Issue #304 (RF3-A, P2): `Indent`/`Outdent`, `Up`/`Down`, and
+    // `PrevFileTab` は現在、共通の `input_target()` resolver に接続されている。
+    // ここでは、sidebar filter / inline rename では no-op になり、body では
+    // list planner を一度だけ実行して編集履歴へ記録する、という契約を
+    // 実キー dispatch で固定する。`content-search`、`document-find`、AI
+    // 専用のガードは resolver より前に残り、それらが入力を消費する場合も
+    // この入力先判定の契約を変更しない。`F3`/`Shift+F3` の filter / rename
+    // ガードは `document_find.rs` の関連テストで、`Enter`/`Shift+Enter` の
+    // filter / rename と list / history の契約はこのモジュールの既存の
+    // 実キー dispatch テストで固定している。
 
     #[gpui::test]
     fn tab_and_shift_tab_run_the_list_planner_through_real_key_dispatch_and_record_undo_history(
@@ -20680,10 +20675,12 @@ mod tests {
         });
     }
 
-    // Issue #304 (RF3-A, P2): `Shift+Up`/`Shift+Down` already route through the
-    // P1 `input_target()` resolver (unlike the plain `Up`/`Down` handlers
-    // above), so these pin the *current* selection-extension contract as a
-    // regression guard rather than a pre-change snapshot.
+    // Issue #304 (RF3-A, P2): `Shift+Up`/`Shift+Down` は現在、共通の
+    // `input_target()` resolver に接続されている。body では selection を
+    // 垂直方向へ拡張し、sidebar filter / inline rename では body の selection
+    // を変更しない、という契約を実キー dispatch で固定する。
+    // `content-search`、`document-find`、AI 専用のガードは resolver より前に
+    // 維持される。
     #[gpui::test]
     fn shift_up_and_shift_down_extend_the_body_selection_vertically_through_real_key_dispatch(
         cx: &mut gpui::TestAppContext,
@@ -20897,15 +20894,12 @@ mod tests {
         assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
     }
 
-    // Issue #304 (RF3-A, P2 design §6): DocumentStart/DocumentEnd and their
-    // Select variants, and Undo/Redo, are the 6 body-only actions `actions.rs`
-    // still routes through their own independent
-    // `sidebar_filter_is_focused()`/`inline_rename_active()` early-return
-    // guards rather than through `input_target()`. These pin the current
-    // "consume the key, touch nothing" outcome of those guards directly
-    // (body text, body selection, and the undo/redo stack all stay exactly
-    // as they were) before a later change connects these 6 actions to the
-    // resolver too.
+    // Issue #304 (RF3-A, P2 design §6): `DocumentStart`/`DocumentEnd` と
+    // Select variants、`Undo`/`Redo` の6つの本文専用 action は現在、共通の
+    // `input_target()` resolver に接続されている。sidebar filter / inline
+    // rename ではキーを消費して body の text・selection・undo/redo stack
+    // を変更しない、という契約をここで固定する。`content-search`、
+    // `document-find`、AI 専用のガードは resolver より前に維持される。
 
     #[gpui::test]
     fn sidebar_filter_focused_document_navigation_and_undo_redo_are_no_ops_for_the_body(
