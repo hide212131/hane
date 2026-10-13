@@ -81,6 +81,31 @@ fn initialize_barrier_reaches_ready_then_calls_and_stops_cleanly() {
     );
 }
 
+/// Regression coverage for `RuntimeConfig::spawn_child`'s Windows-only
+/// `CREATE_NO_WINDOW` creation flag: Hane must not flash a console window for
+/// the App Server child, while stdin/stdout/stderr piping and the JSON-RPC
+/// transport stay intact. `test/hasConsoleWindow` asks the fake App Server
+/// itself whether Windows gave it a console window.
+#[cfg(windows)]
+#[test]
+fn start_on_windows_does_not_create_a_console_window_for_the_app_server() {
+    let config = base_config("no_console_window");
+    let (runtime, _events) = spawn_runtime(config);
+
+    let status = runtime.start().expect("start should succeed");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    let result = runtime
+        .call("test/hasConsoleWindow", None, Duration::from_secs(5))
+        .expect("hasConsoleWindow call should succeed over the piped transport");
+    assert_eq!(
+        result["hasConsoleWindow"], false,
+        "the App Server child must be spawned with CREATE_NO_WINDOW"
+    );
+
+    let _ = runtime.stop();
+}
+
 #[test]
 fn start_times_out_and_transitions_to_failed_when_server_never_responds() {
     let mut config = base_config("never_respond");

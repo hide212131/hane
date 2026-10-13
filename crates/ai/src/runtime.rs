@@ -275,6 +275,15 @@ impl RuntimeConfig {
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Suppress the console window Windows would otherwise flash for
+            // this console subsystem binary; stdin/stdout/stderr stay piped
+            // above regardless, so the JSON-RPC transport is unaffected.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.spawn()
     }
 }
