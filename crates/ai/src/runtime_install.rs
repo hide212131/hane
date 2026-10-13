@@ -70,7 +70,9 @@ const MACOS_ARM64_INVENTORY_JSON: &str = include_str!(concat!(
 const MAX_ENTRY_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB, matching the build-time tool's cap.
 const MAX_TOTAL_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB, matching the build-time tool's cap.
 const MAX_REDIRECT_HOPS: u32 = 5;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_SPEED_LIMIT: u64 = 1024;
+const DOWNLOAD_SPEED_TIME: Duration = Duration::from_secs(60);
 const VERIFY_START_TIMEOUT: Duration = Duration::from_secs(20);
 const SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -370,9 +372,7 @@ impl ArchiveDownloader for CurlArchiveDownloader {
             // expose more than one HTTP response block in proxy setups.
             command.arg("--suppress-connect-headers");
             command.arg("--proto").arg("=https");
-            command
-                .arg("--max-time")
-                .arg(DOWNLOAD_TIMEOUT.as_secs().to_string());
+            apply_download_timeout_args(&mut command);
             command
                 .arg("--max-filesize")
                 .arg(spec.archive_size.to_string());
@@ -478,6 +478,18 @@ fn apply_no_console_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn apply_no_console_window(_command: &mut Command) {}
+
+/// Bounds connection setup and detects stalled transfers without limiting the
+/// total time for a transfer that continues to make progress.
+fn apply_download_timeout_args(command: &mut Command) {
+    command
+        .arg("--connect-timeout")
+        .arg(DOWNLOAD_CONNECT_TIMEOUT.as_secs().to_string())
+        .arg("--speed-limit")
+        .arg(DOWNLOAD_SPEED_LIMIT.to_string())
+        .arg("--speed-time")
+        .arg(DOWNLOAD_SPEED_TIME.as_secs().to_string());
+}
 
 /// Spawns `command` (with stdin/stdout/stderr all discarded -- this module
 /// only cares about `-o`/`-D` file outputs and the exit status) and polls
@@ -896,6 +908,29 @@ pub fn install_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curl_download_uses_connection_and_stall_timeouts_without_total_time_limit() {
+        let mut command = Command::new("curl");
+        apply_download_timeout_args(&mut command);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "--connect-timeout".to_owned(),
+                "30".to_owned(),
+                "--speed-limit".to_owned(),
+                "1024".to_owned(),
+                "--speed-time".to_owned(),
+                "60".to_owned(),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--max-time"));
+    }
 
     #[test]
     fn permission_denied_install_errors_stay_distinct_from_generic_failures() {
