@@ -2867,7 +2867,10 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        view.read_with(cx, |view, _| assert!(view.editor().ime().is_some()));
+        let body_source_before_escape = view.read_with(cx, |view, _| {
+            assert!(view.editor().ime().is_some());
+            view.editor().document().full_text()
+        });
 
         // The input still holds focus with its own in-progress composition,
         // going into this Escape.
@@ -2894,7 +2897,11 @@ mod tests {
                 view.editor().ime().is_some(),
                 "the body's own composition, seeded only to detect a leak, must survive untouched"
             );
-            assert_eq!(view.editor().document().full_text(), "abcdef\n");
+            assert_eq!(
+                view.editor().document().full_text(),
+                body_source_before_escape,
+                "the body's own composition source must be untouched by the input's Escape"
+            );
         });
 
         let marked_after_escape = cx.update(|window, app| {
