@@ -48,7 +48,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::rpc::RejectAllServerRequests;
-use crate::runtime::{AiRuntime, RuntimeConfig, RuntimeState};
+use crate::runtime::{AiRuntime, RuntimeConfig, RuntimeError, RuntimeState};
 use crate::runtime_distribution::{
     self, MACOS_ARM64_TARGET, RuntimeManifest, RuntimeManifestFile, RuntimeManifestProfile,
     WINDOWS_X64_TARGET, current_target,
@@ -248,8 +248,12 @@ pub enum RuntimeInstallErrorCode {
     /// confirmed.
     VerificationFailed,
     /// A staging directory could not be created, or the verified candidate
-    /// could not be published to `AiPaths::runtime_install_dir`.
+    /// could not be published to `AiPaths::runtime_install_dir` for a reason
+    /// other than permission denial.
     StagingFailed,
+    /// An install-related filesystem or child-process operation was rejected
+    /// by the operating system due to insufficient permissions.
+    PermissionDenied,
     /// The user canceled the install, or Hane is shutting down.
     Canceled,
 }
@@ -266,8 +270,31 @@ impl RuntimeInstallErrorCode {
             Self::AmbiguousEntrypoint => "runtime_install_ambiguous_entrypoint",
             Self::VerificationFailed => "runtime_install_verification_failed",
             Self::StagingFailed => "runtime_install_staging_failed",
+            Self::PermissionDenied => "runtime_install_permission_denied",
             Self::Canceled => "runtime_install_canceled",
         }
+    }
+}
+
+pub(crate) fn map_io_error(
+    error: &io::Error,
+    fallback: RuntimeInstallErrorCode,
+) -> RuntimeInstallErrorCode {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        RuntimeInstallErrorCode::PermissionDenied
+    } else {
+        fallback
+    }
+}
+
+pub(crate) fn map_distribution_error(
+    error: runtime_distribution::RuntimeDistributionErrorCode,
+    fallback: RuntimeInstallErrorCode,
+) -> RuntimeInstallErrorCode {
+    if error == runtime_distribution::RuntimeDistributionErrorCode::AccessDenied {
+        RuntimeInstallErrorCode::PermissionDenied
+    } else {
+        fallback
     }
 }
 
@@ -358,12 +385,25 @@ impl ArchiveDownloader for CurlArchiveDownloader {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     return Err(RuntimeInstallErrorCode::Canceled);
                 }
-                Err(_) => return Err(RuntimeInstallErrorCode::NetworkDownloadFailed),
+                Err(error) => {
+                    return Err(map_io_error(
+                        &error,
+                        RuntimeInstallErrorCode::NetworkDownloadFailed,
+                    ));
+                }
             };
             if !status.success() {
                 return Err(RuntimeInstallErrorCode::NetworkDownloadFailed);
             }
-            let headers = std::fs::read_to_string(&header_path).unwrap_or_default();
+            let headers = match std::fs::read_to_string(&header_path) {
+                Ok(headers) => headers,
+                Err(error) => {
+                    return Err(map_io_error(
+                        &error,
+                        RuntimeInstallErrorCode::NetworkDownloadFailed,
+                    ));
+                }
+            };
             let _ = std::fs::remove_file(&header_path);
             let status_code = parse_http_status(&headers)
                 .ok_or(RuntimeInstallErrorCode::NetworkDownloadFailed)?;
@@ -411,7 +451,12 @@ impl ArchiveExtractor for TarArchiveExtractor {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 return Err(RuntimeInstallErrorCode::Canceled);
             }
-            Err(_) => return Err(RuntimeInstallErrorCode::ExtractionFailed),
+            Err(error) => {
+                return Err(map_io_error(
+                    &error,
+                    RuntimeInstallErrorCode::ExtractionFailed,
+                ));
+            }
         };
         if status.success() {
             Ok(())
@@ -537,8 +582,9 @@ fn find_header_value(headers: &str, name: &str) -> Option<String> {
 }
 
 fn verify_downloaded_size(path: &Path, expected_size: u64) -> Result<(), RuntimeInstallErrorCode> {
-    let metadata =
-        std::fs::metadata(path).map_err(|_| RuntimeInstallErrorCode::NetworkDownloadFailed)?;
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        map_io_error(&error, RuntimeInstallErrorCode::NetworkDownloadFailed)
+    })?;
     if metadata.len() == expected_size {
         Ok(())
     } else {
@@ -550,8 +596,9 @@ fn verify_archive_integrity(
     path: &Path,
     expected_sha256_hex: &str,
 ) -> Result<(), RuntimeInstallErrorCode> {
-    let actual = runtime_distribution::sha256_hex_of_file(path)
-        .map_err(|_| RuntimeInstallErrorCode::IntegrityMismatch)?;
+    let actual = runtime_distribution::sha256_hex_of_file(path).map_err(|error| {
+        map_distribution_error(error, RuntimeInstallErrorCode::IntegrityMismatch)
+    })?;
     if actual.eq_ignore_ascii_case(expected_sha256_hex.trim()) {
         Ok(())
     } else {
@@ -584,14 +631,19 @@ fn build_inventory_from_extracted_tree(
     let mut stack = vec![PathBuf::new()];
     while let Some(relative_dir) = stack.pop() {
         let absolute_dir = payload_dir.join(&relative_dir);
-        let entries = std::fs::read_dir(&absolute_dir)
-            .map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)?;
+        let entries = std::fs::read_dir(&absolute_dir).map_err(|error| {
+            map_io_error(&error, RuntimeInstallErrorCode::ExtractionFailed)
+        })?;
         for entry in entries {
-            let entry = entry.map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)?;
+            let entry = entry.map_err(|error| {
+                map_io_error(&error, RuntimeInstallErrorCode::ExtractionFailed)
+            })?;
             let relative_path = relative_dir.join(entry.file_name());
             let absolute_path = payload_dir.join(&relative_path);
             let not_symlink = runtime_distribution::check_not_symlink(&absolute_path)
-                .map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)?;
+                .map_err(|error| {
+                    map_distribution_error(error, RuntimeInstallErrorCode::ExtractionFailed)
+                })?;
             if !not_symlink {
                 // Vanished between `read_dir` and this check; treat as not
                 // present rather than racily reporting a false positive.
@@ -599,7 +651,9 @@ fn build_inventory_from_extracted_tree(
             }
             let file_type = entry
                 .file_type()
-                .map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)?;
+                .map_err(|error| {
+                    map_io_error(&error, RuntimeInstallErrorCode::ExtractionFailed)
+                })?;
             if file_type.is_dir() {
                 stack.push(relative_path);
                 continue;
@@ -615,8 +669,9 @@ fn build_inventory_from_extracted_tree(
             if !seen_casefold.insert(posix_path.to_lowercase()) {
                 return Err(RuntimeInstallErrorCode::ExtractionFailed);
             }
-            let metadata = std::fs::metadata(&absolute_path)
-                .map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)?;
+            let metadata = std::fs::metadata(&absolute_path).map_err(|error| {
+                map_io_error(&error, RuntimeInstallErrorCode::ExtractionFailed)
+            })?;
             let size = metadata.len();
             if size > MAX_ENTRY_SIZE {
                 return Err(RuntimeInstallErrorCode::ExtractionFailed);
@@ -625,8 +680,9 @@ fn build_inventory_from_extracted_tree(
             if total_size > MAX_TOTAL_SIZE {
                 return Err(RuntimeInstallErrorCode::ExtractionFailed);
             }
-            let sha256 = runtime_distribution::sha256_hex_of_file(&absolute_path)
-                .map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)?;
+            let sha256 = runtime_distribution::sha256_hex_of_file(&absolute_path).map_err(
+                |error| map_distribution_error(error, RuntimeInstallErrorCode::ExtractionFailed),
+            )?;
             let executable = is_executable(&metadata);
             inventory.push(RuntimeManifestFile {
                 path: posix_path,
@@ -712,10 +768,13 @@ fn verify_candidate_runtime(
     entrypoint: &Path,
     verify_root: &Path,
 ) -> Result<(), RuntimeInstallErrorCode> {
-    std::fs::create_dir_all(verify_root).map_err(|_| RuntimeInstallErrorCode::VerificationFailed)?;
+    std::fs::create_dir_all(verify_root).map_err(|error| {
+        map_io_error(&error, RuntimeInstallErrorCode::VerificationFailed)
+    })?;
     let codex_home = verify_root.join("codex-home");
-    std::fs::create_dir_all(&codex_home)
-        .map_err(|_| RuntimeInstallErrorCode::VerificationFailed)?;
+    std::fs::create_dir_all(&codex_home).map_err(|error| {
+        map_io_error(&error, RuntimeInstallErrorCode::VerificationFailed)
+    })?;
     let mut config = RuntimeConfig::new(entrypoint, verify_root.join("owner.lock"));
     config.codex_home = Some(codex_home);
     config.inherit_parent_home = false;
@@ -724,11 +783,18 @@ fn verify_candidate_runtime(
     let (events_tx, _events_rx) = mpsc::sync_channel(16);
     let runtime = AiRuntime::spawn(config, Arc::new(RejectAllServerRequests), events_tx);
     let start_result = runtime.start();
+    let start_permission_denied = matches!(
+        &start_result,
+        Err(RuntimeError::OwnerLock(error) | RuntimeError::Spawn(error))
+            if error.kind() == io::ErrorKind::PermissionDenied
+    );
     let started = matches!(start_result, Ok(status) if status.state == RuntimeState::Ready);
     let shutdown_status = runtime.shutdown();
     let stopped = shutdown_status.state == RuntimeState::Stopped;
     if started && stopped {
         Ok(())
+    } else if start_permission_denied {
+        Err(RuntimeInstallErrorCode::PermissionDenied)
     } else {
         Err(RuntimeInstallErrorCode::VerificationFailed)
     }
@@ -772,8 +838,9 @@ pub fn install_runtime(
         return Err(RuntimeInstallErrorCode::Canceled);
     }
     let payload_dir = staging_dir.join("payload");
-    std::fs::create_dir_all(&payload_dir)
-        .map_err(|_| RuntimeInstallErrorCode::StagingFailed)?;
+    std::fs::create_dir_all(&payload_dir).map_err(|error| {
+        map_io_error(&error, RuntimeInstallErrorCode::StagingFailed)
+    })?;
     extractor.extract(&archive_path, &payload_dir, is_canceled)?;
     let _ = std::fs::remove_file(&archive_path);
     if is_canceled() {
@@ -820,14 +887,51 @@ pub fn install_runtime(
     };
     let manifest_json =
         serde_json::to_vec_pretty(&manifest).map_err(|_| RuntimeInstallErrorCode::StagingFailed)?;
-    std::fs::write(payload_dir.join("manifest.json"), manifest_json)
-        .map_err(|_| RuntimeInstallErrorCode::StagingFailed)?;
+    std::fs::write(payload_dir.join("manifest.json"), manifest_json).map_err(|error| {
+        map_io_error(&error, RuntimeInstallErrorCode::StagingFailed)
+    })?;
     Ok(payload_dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_denied_install_errors_stay_distinct_from_generic_failures() {
+        assert_eq!(
+            map_io_error(
+                &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                RuntimeInstallErrorCode::StagingFailed,
+            ),
+            RuntimeInstallErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            map_io_error(
+                &std::io::Error::other("generic install failure"),
+                RuntimeInstallErrorCode::StagingFailed,
+            ),
+            RuntimeInstallErrorCode::StagingFailed
+        );
+        assert_eq!(
+            map_distribution_error(
+                runtime_distribution::RuntimeDistributionErrorCode::AccessDenied,
+                RuntimeInstallErrorCode::ExtractionFailed,
+            ),
+            RuntimeInstallErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            map_distribution_error(
+                runtime_distribution::RuntimeDistributionErrorCode::InvalidExecutable,
+                RuntimeInstallErrorCode::ExtractionFailed,
+            ),
+            RuntimeInstallErrorCode::ExtractionFailed
+        );
+        assert_eq!(
+            RuntimeInstallErrorCode::PermissionDenied.stable_code(),
+            "runtime_install_permission_denied"
+        );
+    }
 
     #[test]
     fn lock_keeps_the_two_fixed_archive_sizes_and_hashes() {

@@ -36,7 +36,7 @@ use crate::runtime_distribution::{
 };
 use crate::runtime_install::{
     CurlArchiveDownloader, RuntimeInstallErrorCode, RuntimeInstallState, TarArchiveExtractor,
-    install_runtime, install_spec_for_current_target,
+    install_runtime, install_spec_for_current_target, map_distribution_error, map_io_error,
 };
 use crate::secrets::{CredentialRef, CredentialStore};
 use crate::settings::{ActiveConnection, AiSettings, AiSettingsStore, SaveError};
@@ -1647,8 +1647,12 @@ fn run_install_runtime_command(
 
     let staging_dir = match paths.create_runtime_install_staging() {
         Ok(path) => path,
-        Err(_) => {
-            finish_install_runtime_error(id, RuntimeInstallErrorCode::StagingFailed, shared);
+        Err(error) => {
+            finish_install_runtime_error(
+                id,
+                map_io_error(&error, RuntimeInstallErrorCode::StagingFailed),
+                shared,
+            );
             return;
         }
     };
@@ -1689,14 +1693,18 @@ fn run_install_runtime_command(
 
     // Validate the generated manifest with the same resolver that all later
     // AI operations use before making the candidate visible in app-data.
-    if resolve_runtime_binary(None, &payload_dir).is_err() {
+    if let Err(code) = resolve_runtime_binary(None, &payload_dir) {
         let _ = std::fs::remove_dir_all(&staging_dir);
-        finish_install_runtime_error(id, RuntimeInstallErrorCode::ExtractionFailed, shared);
+        finish_install_runtime_error(
+            id,
+            map_distribution_error(code, RuntimeInstallErrorCode::ExtractionFailed),
+            shared,
+        );
         return;
     }
-    if publish_runtime_install(paths, &payload_dir).is_err() {
+    if let Err(code) = publish_runtime_install(paths, &payload_dir) {
         let _ = std::fs::remove_dir_all(&staging_dir);
-        finish_install_runtime_error(id, RuntimeInstallErrorCode::StagingFailed, shared);
+        finish_install_runtime_error(id, code, shared);
         return;
     }
     let _ = std::fs::remove_dir_all(&staging_dir);
@@ -1752,17 +1760,28 @@ fn publish_runtime_install(
     let Some(parent) = install_dir.parent() else {
         return Err(RuntimeInstallErrorCode::StagingFailed);
     };
-    std::fs::create_dir_all(parent).map_err(|_| RuntimeInstallErrorCode::StagingFailed)?;
-    if !payload_dir.is_dir()
-        || !runtime_distribution::check_not_symlink(payload_dir)
-            .map_err(|_| RuntimeInstallErrorCode::StagingFailed)?
-    {
+    std::fs::create_dir_all(parent)
+        .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?;
+    let payload_not_symlink = runtime_distribution::check_not_symlink(payload_dir).map_err(
+        |error| map_distribution_error(error, RuntimeInstallErrorCode::StagingFailed),
+    )?;
+    if !payload_not_symlink {
+        return Err(RuntimeInstallErrorCode::StagingFailed);
+    }
+    let payload_metadata = std::fs::metadata(payload_dir)
+        .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?;
+    if !payload_metadata.is_dir() {
         return Err(RuntimeInstallErrorCode::StagingFailed);
     }
 
-    let final_exists = runtime_distribution::check_not_symlink(&install_dir)
-        .map_err(|_| RuntimeInstallErrorCode::StagingFailed)?;
-    if final_exists && !install_dir.is_dir() {
+    let final_exists = runtime_distribution::check_not_symlink(&install_dir).map_err(|error| {
+        map_distribution_error(error, RuntimeInstallErrorCode::StagingFailed)
+    })?;
+    if final_exists
+        && !std::fs::metadata(&install_dir)
+            .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?
+            .is_dir()
+    {
         return Err(RuntimeInstallErrorCode::StagingFailed);
     }
     let backup = if final_exists {
@@ -1776,7 +1795,7 @@ fn publish_runtime_install(
     };
     if let Some(backup) = &backup {
         std::fs::rename(&install_dir, backup)
-            .map_err(|_| RuntimeInstallErrorCode::StagingFailed)?;
+            .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?;
     }
 
     match std::fs::rename(payload_dir, &install_dir) {
@@ -1786,11 +1805,11 @@ fn publish_runtime_install(
             }
             Ok(())
         }
-        Err(_) => {
+        Err(error) => {
             if let Some(backup) = backup {
                 let _ = std::fs::rename(backup, &install_dir);
             }
-            Err(RuntimeInstallErrorCode::StagingFailed)
+            Err(map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))
         }
     }
 }
@@ -2449,9 +2468,9 @@ fn map_distribution_code_to_install_code(
         RuntimeDistributionErrorCode::IntegrityMismatch => {
             RuntimeInstallErrorCode::IntegrityMismatch
         }
+        RuntimeDistributionErrorCode::AccessDenied => RuntimeInstallErrorCode::PermissionDenied,
         RuntimeDistributionErrorCode::Missing
         | RuntimeDistributionErrorCode::ExplicitPathNotAbsolute
-        | RuntimeDistributionErrorCode::AccessDenied
         | RuntimeDistributionErrorCode::InvalidExecutable
         | RuntimeDistributionErrorCode::InitializeFailed => {
             RuntimeInstallErrorCode::VerificationFailed
@@ -3439,6 +3458,18 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn runtime_access_denied_maps_to_install_permission_without_changing_generic_failures() {
+        assert_eq!(
+            map_distribution_code_to_install_code(RuntimeDistributionErrorCode::AccessDenied),
+            RuntimeInstallErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            map_distribution_code_to_install_code(RuntimeDistributionErrorCode::InvalidExecutable),
+            RuntimeInstallErrorCode::VerificationFailed
+        );
     }
 
     #[test]

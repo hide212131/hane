@@ -135,6 +135,9 @@ fn runtime_install_error_label(code: RuntimeInstallErrorCode) -> &'static str {
         RuntimeInstallErrorCode::StagingFailed => {
             "導入候補をHane専用領域へ安全に公開できませんでした"
         }
+        RuntimeInstallErrorCode::PermissionDenied => {
+            "導入先のHane専用領域へのアクセス権限がありません"
+        }
         RuntimeInstallErrorCode::Canceled => "導入を取り消しました",
     }
 }
@@ -3541,6 +3544,14 @@ mod tests {
                 RuntimeInstallErrorCode::NetworkDownloadFailed
             )),
             "再試行"
+        );
+        assert!(
+            runtime_install_error_label(RuntimeInstallErrorCode::PermissionDenied)
+                .contains("権限")
+        );
+        assert_eq!(
+            RuntimeInstallErrorCode::PermissionDenied.stable_code(),
+            "runtime_install_permission_denied"
         );
     }
 
