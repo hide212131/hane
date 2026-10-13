@@ -20680,6 +20680,137 @@ mod tests {
         });
     }
 
+    // Issue #304 (RF3-A, P2): `Shift+Up`/`Shift+Down` already route through the
+    // P1 `input_target()` resolver (unlike the plain `Up`/`Down` handlers
+    // above), so these pin the *current* selection-extension contract as a
+    // regression guard rather than a pre-change snapshot.
+    #[gpui::test]
+    fn shift_up_and_shift_down_extend_the_body_selection_vertically_through_real_key_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection {
+                anchor: SourceOffset(6),
+                active: SourceOffset(0),
+            }
+        );
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(6))
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_filter_focused_shift_up_and_shift_down_do_not_change_the_body_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.sidebar_filter_focused = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 1..1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter, "abc");
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert!(view.sidebar_filter_is_focused());
+        });
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter, "abc");
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert!(view.sidebar_filter_is_focused());
+        });
+    }
+
+    #[gpui::test]
+    fn inline_rename_active_shift_up_and_shift_down_do_not_change_the_body_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "abcdef".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 3..3,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            let rename = view.inline_rename.as_ref().unwrap();
+            assert_eq!(rename.text, "abcdef");
+            assert_eq!(rename.selected_range, 3..3);
+        });
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            let rename = view.inline_rename.as_ref().unwrap();
+            assert_eq!(rename.text, "abcdef");
+            assert_eq!(rename.selected_range, 3..3);
+        });
+    }
+
     #[gpui::test]
     fn ctrl_shift_tab_does_not_switch_tabs_while_the_sidebar_filter_is_focused(
         cx: &mut gpui::TestAppContext,
