@@ -131,9 +131,13 @@ pub struct RuntimeInstallSpec {
 
 /// The fixed hosts allowed to ever serve the archive's bytes, on the initial
 /// request or any redirect hop: the GitHub release-asset page and the
-/// storage host it redirects downloads to. Matches
-/// the GitHub release hosts allowed for the direct download.
-const ALLOWED_HOSTS: &[&str] = &["github.com", "objects.githubusercontent.com"];
+/// official storage hosts it redirects downloads to. Matches the GitHub
+/// release hosts allowed for the direct download.
+const ALLOWED_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 
 /// Builds [`RuntimeInstallSpec`] for this host's current target
 /// ([`current_target`]), reading the pinned lock/inventory data embedded at
@@ -815,8 +819,18 @@ mod tests {
             &allowed,
         )
         .is_ok());
+        assert!(check_allowed_url(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/123456789/abcdef/package.tar.gz",
+            &allowed,
+        )
+        .is_ok());
         assert!(check_allowed_url("http://github.com/package.tar.gz", &allowed).is_err());
         assert!(check_allowed_url("https://evil.example/package.tar.gz", &allowed).is_err());
+        assert!(check_allowed_url(
+            "https://release-assets.githubusercontent.com.evil.example/package.tar.gz",
+            &allowed,
+        )
+        .is_err());
         assert!(check_allowed_url("https://github.com:8443/package.tar.gz", &allowed).is_err());
         assert!(check_allowed_url("https://user:secret@github.com/package.tar.gz", &allowed).is_err());
     }

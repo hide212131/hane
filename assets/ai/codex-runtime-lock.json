@@ -3,7 +3,7 @@
   "upstream_tag": "rust-v0.157.1",
   "codex_version": "0.157.1",
   "source_commit": "36650394c5b38c2990ccf2a3457165ca3e9d9726",
-  "allowed_hosts": ["github.com", "objects.githubusercontent.com"],
+  "allowed_hosts": ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"],
   "targets": {
     "x86_64-pc-windows-msvc": {
       "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-app-server-package-x86_64-pc-windows-msvc.tar.gz",
