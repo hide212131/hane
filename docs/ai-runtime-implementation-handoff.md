@@ -4,12 +4,12 @@
 
 ## 1. 最初の作業
 
-**最初は[#480](https://github.com/hide212131/hane/issues/480)だけを実装する。** 目的は、Codexを別途導入していないPCで、Haneの完成配布物からAIの接続操作を始められるようにすること。更新・Skills・汎用Pluginを同じ実装PRへ入れない。
+**最初は[#480](https://github.com/hide212131/hane/issues/480)だけを実装する。** 目的は、Codexを別途導入していないWindows/macOSで、設定画面のボタンから固定版をダウンロードし、Hane専用領域へ安全に初回導入できるようにすること。初回AI利用はネット接続必須とする。Haneの配布物にはruntime実行ファイルを入れず、修復・署名カタログ更新・Skills・汎用Pluginを同じ実装PRへ入れない。
 
 設計ブランチは`docs/479-managed-codex-runtime-design`。親は[#479](https://github.com/hide212131/hane/issues/479)。資料は次の順に読む。
 
 1. [ADR-0033](adr/0033-managed-codex-runtime-and-extensions.md): 方針と初版の対象範囲。
-2. [配布・更新詳細](ai-runtime-distribution-implementation-spec.md): まずP0、第2〜6節とR01〜R12。
+2. [配布・導入詳細](ai-runtime-distribution-implementation-spec.md): まずP0、第1〜7節・第9〜11節とR01〜R13。
 3. [Skills/Package詳細](ai-extensions-implementation-spec.md): P0では境界だけ確認し、実装しない。
 
 調査基準mainは`af981629011f04f68b25c8b58e476eb3eeffa624`、公開版v0.26.0は`5c2e703334c66c09575b549030aa1ccb913920dd`。実装開始時にはmain、対象Issue、設計PR head/状態、関連PR、AGENTS.md、現在の実装・レビュー手順を再取得する。このSHAを未来のcurrent headとして扱わない。
@@ -20,39 +20,41 @@
 
 | Issue | 対象 | 開始条件 | 完了する利用者操作 |
 |---|---|---|---|
-| [#480 / P0](https://github.com/hide212131/hane/issues/480) | 同梱・位置解決・診断 | 設計とcurrent codeを照合 | 配布物だけで専用Serverを起動し、AI接続を開始 |
-| [#481 / P1](https://github.com/hide212131/hane/issues/481) | 導入・修復・独立更新 | P0のresolver/manifestが確定 | ボタンから導入/修復/検証済み版更新 |
+| [#480 / P0](https://github.com/hide212131/hane/issues/480) | 固定版の初回ダウンロード・導入・診断 | 設計とcurrent codeを照合 | 設定画面から取得・検証し、Hane専用領域へ導入してAI接続を開始 |
+| [#481 / P1](https://github.com/hide212131/hane/issues/481) | 専用版の修復・復旧・署名カタログ更新 | P0が利用可能 | ボタンから破損修復・既知正常版への復旧・検証済み版更新 |
 | [#482 / P2](https://github.com/hide212131/hane/issues/482) | 文章指示SKILL.md | P0が利用可能。P1は必須依存でない | 専用フォルダー→承認→選択文AI |
 | [#483 / P3](https://github.com/hide212131/hane/issues/483) | SkillsのみのローカルPackage | P2の一覧/registry/snapshotが確定 | 複数スキルの導入/更新/削除 |
 
-個人開発ではP0→P1→P2→P3を推奨する。P1の署名カタログ公開や将来のネイティブPlugin仕様が未整備でも、P0の配布修正は止めない。
-
+個人開発ではP0→P1→P2→P3を推奨する。P1署名鍵の準備や将来のネイティブPlugin仕様が未整備でも、P0の初回導入は止めない。
 ## 3. P0の具体的な実装順
 
-### A. 実際の公式完全パッケージを確認する
+### A. 固定した公式完全パッケージと再配布条件を確認する
 
-詳細設計第2節に記載した2 targetの固定assetを取得し、hash、source tag/commit、entrypoint、全内容と必要ライセンスを確認する。macOS bare serverでの過去試験は今回のWindows/完全パッケージの合格にしない。
+詳細設計第2節の2 targetについて固定assetを取得し、source tag/commit、archive size/SHA-256、内容inventory、entrypoint、必要なライセンス表示を確認する。macOS bare serverでの過去試験は完全パッケージやWindowsの証拠にしない。ライセンス監査で未確認の第三者物が残る場合、解決まで配布物の受入を止め、確認済みのように扱わない。
 
-`assets/ai/codex-runtime-lock.json`、`assets/ai/inventory/<target>-0.157.1.json`、取得/検査スクリプトを作る。実ファイルの一覧と表示条件が確定してから、同梱物をコードへ組み込む。第三者表示やOS依存物が不足していれば正確に報告し、latestや他アプリ内のバイナリで穴埋めしない。
+`assets/ai/codex-runtime-lock.json`、`assets/ai/inventory/<target>-0.157.1.json`、レビュー済みLICENSE/NOTICE資料を作る。これらは小さな固定メタデータと表示資料であり、runtime executableをHaneの配布物へ追加しない。実際の上流内容とライセンス範囲が確定する前に、想定の補助プログラム名や文書をでっち上げない。
 
-### B. locatorと診断を実装する
+### B. 初回ダウンロード・導入・診断を実装する
 
-`main.rs`内の隣接ファイル選択を`runtime_distribution.rs`へ移し、同梱manifest/明示開発パスを型で区別する。いずれも絶対パスとし、PATH探索を作らない。relative HANE_STATE_DIRやoverrideも明確なAI設定エラーとして扱う。
+起動時の自動通信やPATH探索を追加せず、AI設定画面の「インストール」操作を入口にする。lockに固定したGitHub Release assetだけをHTTPS取得し、source/redirect host、サイズ、SHA-256、展開inventory、target、entrypointを検査する。失敗はnetwork/hash/size/content/license/target/access/initializeなど原因別に表示する。
 
-missing、integrity、target、access、invalid executable、initializeの分類をUIへ渡す。未導入を「ログインしていない」と誤診しない。Windowsではchild起動時に不要なコンソールウインドウが出ないことも実画面で確認する。
+payloadはHane app-data内の新しいstagingへ展開し、絶対パス・traversal・symlink/reparse・衝突・容量超過を拒否する。専用の一時CODEX_HOMEと空cwdでversion/initialize/停止を確認し、認証情報や通常HOMEを渡さない。成功後のみ不変のinstallationとして公開してactive pointerを更新する。処理中キャンセル、途中失敗、次回起動時の中断状態もIssue #480の契約に合わせる。
 
-### C. 完成配布物を作る
+`main.rs`の隣接server選択をHane管理版のresolverへ集約する。明示的な絶対開発pathは型で区別し、異常時に管理版へ無言fallbackしない。相対`HANE_STATE_DIR`、未導入、破損、target不一致、権限不足、実行形式不正、initialize失敗を異なる診断にする。Windows childにはconsole windowを作らない起動フラグを適用し、完成配布物から確認する。
 
-WindowsのstagingとMacの.appへ完全パッケージ/manifest/ライセンスを追加する。Haneの既存Explorer連携用ファイルは残す。完成ZIPを新しい場所へ展開し、そこから実行する試験を追加する。配布条件をCI path filterへ反映し、runtime未配置で試験がskipされたケースを合格にしない。
+### C. Hane配布物をruntimeなしで検証する
 
-### D. 機能と非干渉を確認する
+Windows ZIPとmacOS `.app`は小さなlock/inventoryと必要な表示資料だけを含み、runtime実行ファイルを含まないことを確認する。完成配布物を新しい場所へ展開し、Codex/Node/PATH上のCodexがないオンライン環境から「インストール」を操作して導入・初期化できることを2 OSそれぞれで記録する。Haneの既存Explorer連携用ファイルは維持する。
 
-R01〜R12をpass/fail/not-runに分ける。`cargo test -p hane-ai --locked`、`cargo test --workspace --locked`、変更箇所のformat、`git diff --check`を実行する。全体formatの既存差分を直すためだけに無関係なファイルを変更しない。
+配布工程の変更は必要最小限にし、`.github/**`またはworkflow保護ルールを変える必要がある場合は、Haneの専用ops手順に従う。権限やレビュー条件を弱めて通さない。runtime未配置をskip扱いにするCIは合格根拠にしない。
 
-新規スクリプトのテストはローカルfixtureを用意し、破損/不正path/サイズ超過/不足ファイルを再現する。成功コマンド・終了コードは実際に実行した値だけを記録する。
+### D. 機能・非干渉を確認する
 
-WindowsとmacOSで、通常Codex未導入の起動、実ChatGPTログイン、実Custom接続、通常Codexとの非干渉を分けて記録する。実アカウント/資格情報が与えられていなければ該当試験だけ未実施とし、実装や模擬試験の結果を捨てずに残す。ユーザーのauth.jsonをコピーして試験を通さない。
+R01〜R13をpass/fail/not-runに分ける。`cargo test -p hane-ai --locked`、`cargo test --workspace --locked`、変更箇所のformat、`git diff --check`を実行する。全体formatの既存差分を直すためだけに無関係なファイルを変更しない。
 
+fixtureで破損archive、hash/size不一致、悪意あるpath、リンク/reparse、容量超過、redirect拒否、ネットワーク失敗、キャンセル、activation中断を再現する。成功コマンド・終了コードは実際に実行した値だけを記録する。
+
+WindowsとmacOSで、完成配布物からの初回導入、実ChatGPTログイン、実Custom接続、通常Codexとの非干渉、no-consoleを分けて記録する。実アカウント/資格情報が与えられていなければ該当試験だけ未実施とし、実装や模擬試験結果を捨てない。ユーザーのauth.jsonをコピーして試験を通さない。
 ## 4. P1実装時の補足契約
 
 候補healthで既存coordinatorを再利用するときも、通常runtimeを起動したまま候補をspawnしない。AIがidleであることを確認し、既存の所有guard・設定ロック順序を維持して通常childを停止する。health用CODEX_HOMEを使った検査・停止後、適用しない場合/失敗した場合は同じguardのもとで旧configへ戻す。restoreに失敗したら失敗を可視化する。ネットワークダウンロード中はこの所有権の切替を行わない。
@@ -75,8 +77,8 @@ catalog署名ファイルの形式は`{"schema_version":1,"key_id":"…","algori
 
 | 環境 | 主に実施すること |
 |---|---|
-| Windows x64 | 完成ZIP、補助物、ファイルロック/停止/誤exe、GUI、実認証、通常Codexとの同時利用 |
-| macOS arm64 | 完成.app、非書換え更新、実行属性/配布保護、GUI、実認証、通常Codexとの同時利用 |
+| Windows x64 | runtimeなしの完成ZIP、設定画面からの導入、展開/アクセス/停止/誤exe、no-console、GUI、実認証、通常Codexとの同時利用 |
+| macOS arm64 | runtimeなしの完成.app、設定画面からの導入、実行属性/配布保護、GUI、実認証、通常Codexとの同時利用 |
 | CI/ローカル自動試験 | manifest/展開/署名/状態遷移/競合/模擬provider/入力payload/回帰 |
 
 一方のOSでの成功をもう一方へ転記しない。既存のテストに合格しても、追加した機能の実画面や完成配布物を未確認ならそのまま残す。
