@@ -444,33 +444,45 @@ command_actions! {
     },
     DocumentStart ("secondary-up") => document_start |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
-        view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToStart { extend: false }, cx),
+        }
     },
     DocumentEnd ("secondary-down") => document_end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
-        view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx),
+        }
     },
     SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
-        view.dispatch(EditorCommand::MoveToStart { extend: true }, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToStart { extend: true }, cx),
+        }
     },
     SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
-        view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
+            InputTarget::Body => view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx),
+        }
     },
     Undo ("secondary-z") => undo |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
-        view.dispatch(EditorCommand::Undo, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
+            InputTarget::Body => view.dispatch(EditorCommand::Undo, cx),
+        }
     },
     Redo ("secondary-shift-z") => redo |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
-        view.dispatch(EditorCommand::Redo, cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
+            InputTarget::Body => view.dispatch(EditorCommand::Redo, cx),
+        }
     },
     Copy ("secondary-c") => copy |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }

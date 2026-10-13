@@ -17,16 +17,16 @@ impl EditorView {
     /// SelectRight, SelectAll, Home, End, SelectHome, SelectEnd, Copy, Cut,
     /// Paste), and, since RF3-A P2 (Issue #304), for the special-key actions
     /// Enter/Shift+Enter, Tab/Shift+Tab, Up/Down, Shift+Up/Shift+Down,
-    /// Escape, NextFileTab/PrevFileTab, and
-    /// DocumentFindNext/DocumentFindPrevious, after each of those actions'
-    /// own unrelated short-circuits (content search, document find, AI
-    /// selection, settings, menus, ...) have already run. Every one of
-    /// those actions calls this once per dispatch and routes to exactly one
-    /// of the existing body `Editor`, sidebar filter, or inline rename
-    /// handlers below. Document navigation (DocumentStart/DocumentEnd and
-    /// their Select variants) and Undo/Redo keep their own independent
-    /// `sidebar_filter_is_focused`/`inline_rename_active` guards, since they
-    /// are out of RF3-A P2's scope.
+    /// Escape, NextFileTab/PrevFileTab, DocumentFindNext/DocumentFindPrevious,
+    /// the body-only document navigation actions
+    /// DocumentStart/DocumentEnd/SelectDocumentStart/SelectDocumentEnd, and
+    /// Undo/Redo, after each of those actions' own unrelated short-circuits
+    /// (content search, document find, AI selection, settings, menus, ...)
+    /// have already run. Every one of those actions calls this once per
+    /// dispatch and routes to exactly one of the existing body `Editor`,
+    /// sidebar filter, or inline rename handlers below; the document
+    /// navigation and Undo/Redo actions are body-only and no-op for
+    /// `SidebarFilter`/`InlineRename`.
     pub(crate) fn input_target(&self) -> InputTarget {
         if self.sidebar_filter_is_focused() {
             InputTarget::SidebarFilter
