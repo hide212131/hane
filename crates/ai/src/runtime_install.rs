@@ -502,22 +502,24 @@ fn resolve_redirect_url(current: &str, location: &str) -> Result<String, Runtime
 /// parser straightforward to exercise and defensive for alternate transports.
 fn last_http_response_block(headers: &str) -> Option<String> {
     let normalized = headers.replace("\r\n", "\n");
-    normalized
-        .split("\n\n")
-        .filter(|block| {
-            block
-                .lines()
-                .next()
-                .is_some_and(|line| line.trim_start().starts_with("HTTP/"))
-        })
-        .next_back()
-        .map(str::to_owned)
+    let mut last_block = None;
+    for block in normalized.split("\n\n") {
+        if block
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_start().starts_with("HTTP/"))
+        {
+            last_block = Some(block.to_owned());
+        }
+    }
+    last_block
 }
 
 /// Parses the status code from the final response block in a curl `-D`-dumped
 /// header (`HTTP/1.1 302 Found\r\n...`).
 fn parse_http_status(headers: &str) -> Option<u16> {
-    let first_line = last_http_response_block(headers)?.lines().next()?.trim();
+    let block = last_http_response_block(headers)?;
+    let first_line = block.lines().next()?.trim();
     first_line.split_whitespace().nth(1)?.parse().ok()
 }
 
