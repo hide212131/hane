@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -103,6 +105,20 @@ class RequestTests(unittest.TestCase):
         ):
             with self.subTest(body=body, target_sha=target_sha), self.assertRaises(ValueError):
                 contract.validate_source_handoff(body, target_sha)
+
+    def test_source_handoff_cli_writes_validated_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            handoff = root / "handoff.txt"
+            output = root / "validated.json"
+            handoff.write_text(request(), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/aadw_action_contract.py"),
+                 "source-handoff", str(handoff), HEAD, str(output)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["target_sha"], HEAD)
 
     def test_other_users_and_current_comment_do_not_count(self):
         self.validate(history=[{"id": 1, "user": {"login": "outsider"}, "body": request()},

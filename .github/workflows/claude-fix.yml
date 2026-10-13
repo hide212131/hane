@@ -303,12 +303,20 @@ jobs:
             --tools "Read,Edit,Write,Glob,Grep"
             --allowedTools "Read,Edit,Write,Glob,Grep"
 
+      - name: Reacquire trusted Claude model verifier after worker
+        if: ${{ steps.claude.outcome == 'success' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-model-verifier
+          persist-credentials: false
+
       - name: Confirm Claude used Sonnet 5.5
         id: model_verify
         if: ${{ steps.claude.outcome == 'success' }}
         env:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
-        run: python3 .github/scripts/verify_claude_model.py "$EXECUTION_FILE" >> "$GITHUB_STEP_SUMMARY"
+        run: python3 trusted-model-verifier/.github/scripts/verify_claude_model.py "$EXECUTION_FILE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build untrusted worker patch from a fresh expected-head checkout
         if: ${{ always() && !cancelled() && (steps.claude.outcome == 'failure' || steps.model_verify.outcome == 'success') }}

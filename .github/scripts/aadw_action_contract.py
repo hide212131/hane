@@ -138,6 +138,7 @@ def main() -> None:
     source = sub.add_parser("source-handoff")
     source.add_argument("handoff", type=Path)
     source.add_argument("target_sha")
+    source.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "request":
         pages = read_json(args.history, 16 * 1024 * 1024)

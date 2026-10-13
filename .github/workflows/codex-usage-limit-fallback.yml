@@ -120,7 +120,8 @@ jobs:
           fi
 
           handoff="$GITHUB_WORKSPACE/checkpoint/commander-handoff.txt"
-          python3 control/.github/scripts/aadw_action_contract.py source-handoff "$handoff" "$target_sha"
+          python3 control/.github/scripts/aadw_action_contract.py source-handoff \
+            "$handoff" "$target_sha" "$RUNNER_TEMP/source-handoff.json"
 
           permission="$(
             gh api \
@@ -294,7 +295,8 @@ jobs:
           gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
             --jq '{number,title,body,head,base}' > "$CONTEXT_FILE"
 
-          python3 control/.github/scripts/aadw_action_contract.py source-handoff "$HANDOFF_FILE" "$TARGET_SHA"
+          python3 control/.github/scripts/aadw_action_contract.py source-handoff \
+            "$HANDOFF_FILE" "$TARGET_SHA" "$RUNNER_TEMP/source-handoff.json"
 
           chmod -R a-w "$HANDOFF_DIR" "$CONTEXT_DIR"
 

@@ -26,6 +26,10 @@ class WiringTests(unittest.TestCase):
         self.assertIn('aadw-claude-fix-pr-', text)
         self.assertIn('--model claude-sonnet-5-5', text)
         self.assertIn('verify_claude_model.py', text)
+        self.assertIn('Reacquire trusted Claude model verifier after worker', text)
+        self.assertIn('path: trusted-model-verifier', text)
+        self.assertLess(text.index('id: claude'), text.index('Reacquire trusted Claude model verifier after worker'))
+        self.assertIn('trusted-model-verifier/.github/scripts/verify_claude_model.py', text)
 
     def test_mutation_keeps_empty_patch_and_stop_guards(self):
         text = (ROOT / '.github/workflows/claude-fix.yml').read_text()
@@ -47,6 +51,8 @@ class WiringTests(unittest.TestCase):
         self.assertIn('verify_claude_model.py', text)
         self.assertIn('.agents/skills/hane-issue-workflow/*', text)
         self.assertLess(text.index('id: model_verify'), text.index('Build untrusted worker patch'))
+        self.assertLess(text.index('id: claude'), text.index('Reacquire trusted Claude model verifier after worker'))
+        self.assertIn('trusted-model-verifier/.github/scripts/verify_claude_model.py', text)
         self.assertIn("steps.claude.outcome == 'failure' || steps.model_verify.outcome == 'success'", text)
         self.assertIn("steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success'", text)
 

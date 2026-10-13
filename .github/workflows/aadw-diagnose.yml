@@ -99,10 +99,17 @@ jobs:
             --tools "Read,Write,Glob,Grep"
             --allowedTools "Read,Write,Glob,Grep"
 
+      - name: Reacquire trusted Claude model verifier after worker
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-model-verifier
+          persist-credentials: false
+
       - name: Confirm Claude used Sonnet 5.5
         env:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
-        run: python3 .github/scripts/verify_claude_model.py "$EXECUTION_FILE" >> "$GITHUB_STEP_SUMMARY"
+        run: python3 trusted-model-verifier/.github/scripts/verify_claude_model.py "$EXECUTION_FILE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Reacquire trusted result validator after worker execution
         uses: actions/checkout@v6
