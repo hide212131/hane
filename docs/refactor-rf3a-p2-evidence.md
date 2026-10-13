@@ -54,9 +54,9 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 | `d1eeec8b098fae17705d4ddee99df74a7df480a0`（P2製品候補） | [AADW run 38431613844](https://github.com/hide212131/hane/actions/runs/38431613844)、[PR CI 38432156856（attempt 2）](https://github.com/hide212131/hane/actions/runs/38432156856) | P2 routingとshift-up/down契約テストを含む。AADW workspace tests 460 passed / 0 failed、Clippy成功。PR CIもmacOS / Windowsのworkspace tests・OS固有IME通知テスト・Clippyがすべて成功 |
 | 検証記録のみの更新 | [PR CI 38436263637](https://github.com/hide212131/hane/actions/runs/38436263637) | macOS / Windowsともworkspace tests、OS固有IME通知テスト、Clippyが成功 |
 
-この候補では対象P2 actionすべてが共通の `input_target()` を使う。P2の受入判定はcurrent-headのPR CI、独立review、必要なmacOS / Windows実画面確認、旧分岐とdiff監査の完了後に行う。
+この候補では対象P2 actionすべてが共通の `input_target()` を使う。P2の受入判定は、最終PR headのCI、独立review、必要なmacOS / Windows実画面確認、旧分岐とdiff監査の完了後に行う。
 
-## 現headのGUI確認
+## P2 routing候補のGUI確認
 
 - 対象アプリは `d1eeec8b098fae17705d4ddee99df74a7df480a0` からビルドしたmacOS候補。fixture用の一時フォルダ `/tmp/hane-p2-gui-folder` と分離した状態 `/tmp/hane-p2-gui-state` を使用した。
 - Sidebar filterにフォーカスし、上下・Shift+上下・Tab・Return・Command+上下・Command+Shift+上下・Undo/Redo・Control+Tab・Escapeを送った。filter値が保たれ、別の文書本文は `rename fixture` のまま変わらなかった。
@@ -72,11 +72,12 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 | 変更前P2候補の workspace tests / Clippy | 完了。最終候補は455 passed、Clippy成功 | [run 38419394944](https://github.com/hide212131/hane/actions/runs/38419394944) |
 | P2 routing部分候補のworkspace tests / Clippy | 成功（ただし§6の6 action未接続につき部分結果） | [run 38422215097](https://github.com/hide212131/hane/actions/runs/38422215097) |
 | P2 routing全対象の候補workspace tests / Clippy | 成功。workspace tests 457 passed、Clippy成功（macOSのみ） | [run 38427825319](https://github.com/hide212131/hane/actions/runs/38427825319) |
-| routing変更後のcurrent-head CI（macOS / Windows） | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38432156856（attempt 2）](https://github.com/hide212131/hane/actions/runs/38432156856) |
-| routing変更後のcurrent-head独立review | 未実施。CodeRabbitは自動レビュー対象外（repository star countが10未満）のため、最終候補CI成功後にfull reviewを依頼する | — |
-| macOSのP2変更対象キー入力（IME以外）の実画面確認 | 完了。filter / rename / 本文に対するfocused確認 | 上記「現headのGUI確認」 |
+| P2 routing候補 `d1eeec8` のPR CI（macOS / Windows） | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38432156856（attempt 2）](https://github.com/hide212131/hane/actions/runs/38432156856) |
+| 証拠記録のIME範囲修正後（head `f492484`）のPR CI | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38437398264](https://github.com/hide212131/hane/actions/runs/38437398264) |
+| P2 routing候補の独立review | 未完了。CodeRabbitにfull reviewを依頼したが、included reviewのrate limitで実行されなかった。利用枠が戻った後に再依頼する | [レビュー依頼とrate limit応答](https://github.com/hide212131/hane/pull/488#issuecomment-6151212199) |
+| macOSのP2変更対象キー入力（IME以外）の実画面確認 | 完了。filter / rename / 本文に対するfocused確認 | 上記「P2 routing候補のGUI確認」 |
 | P2の日本語IME preedit中Enter / Escape確認 | 未実施。設計§11.2によりmacOS / Windows両方が必要 | — |
 | WindowsのP2対象キー入力・日本語IMEの実画面確認 | 未実施。接続先にユーザーのPowerPoint / Notesが表示され、VMwareのWindows guestも隔離試験環境と確認できないため未使用 | — |
 | 最終diff・旧分岐・復旧方法の確認 | 未実施 | — |
 
-「未実施」は失敗・成功のどちらも意味しない。P2 routingは現headでAADW検証とmacOS / Windows CIが成功し、macOSのP2キー経路を一時fixtureで確認した。macOS / Windowsの日本語IME実画面確認、WindowsのP2キー経路、最終候補の独立review、diff監査は未完了であり、P2はまだ受入済みではない。Issue #304はP1–P3全体の受入までopenのままとする。
+「未実施」は失敗・成功のどちらも意味しない。P2 routing候補はAADW検証とmacOS / WindowsのCIが成功し、macOSのP2キー経路を一時fixtureで確認した。macOS / Windowsの日本語IME実画面確認、WindowsのP2キー経路、最終PR headでの独立review、diff監査は未完了であり、P2はまだ受入済みではない。Issue #304はP1–P3全体の受入までopenのままとする。
