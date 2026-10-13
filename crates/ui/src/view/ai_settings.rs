@@ -152,6 +152,13 @@ fn runtime_install_action_label(state: RuntimeInstallState) -> &'static str {
     }
 }
 
+fn runtime_install_not_installed_probe_guidance() -> String {
+    format!(
+        "先にCodex App Serverの「{}」を押してください。",
+        runtime_install_action_label(RuntimeInstallState::NotInstalled)
+    )
+}
+
 fn custom_settings_match_openai(name: &str, base_url: &str) -> bool {
     name.trim() == OPENAI_PROVIDER_NAME
         && base_url.trim().trim_end_matches('/') == OPENAI_PROVIDER_URL
@@ -3078,7 +3085,7 @@ impl AiSettingsPage {
         } else if self.service.is_none() {
             Some("AIサービスを利用できません。Markdown編集は引き続き利用できます。".to_owned())
         } else if matches!(self.snapshot.runtime_install, RuntimeInstallState::NotInstalled) {
-            Some("先にCodex App Serverの「インストール」を押してください。".to_owned())
+            Some(runtime_install_not_installed_probe_guidance())
         } else if let RuntimeInstallState::Failed(code) = self.snapshot.runtime_install {
             Some(format!("Codex App Serverを導入できません: {}", runtime_install_error_label(code)))
         } else if dirty {
@@ -3552,6 +3559,14 @@ mod tests {
         assert_eq!(
             RuntimeInstallErrorCode::PermissionDenied.stable_code(),
             "runtime_install_permission_denied"
+        );
+    }
+
+    #[test]
+    fn not_installed_probe_guidance_matches_the_install_button_label() {
+        assert_eq!(
+            runtime_install_not_installed_probe_guidance(),
+            "先にCodex App Serverの「ダウンロードしてインストール」を押してください。"
         );
     }
 
