@@ -29,6 +29,7 @@ use crate::probe::{ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
 use crate::runtime::{AiRuntime, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime_distribution;
 use crate::runtime_distribution::{
     EXPLICIT_OVERRIDE_ENV_VAR, RuntimeDistributionErrorCode, classify_handshake_failure,
     classify_spawn_error, resolve_runtime_binary,
