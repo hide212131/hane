@@ -139,6 +139,16 @@ fn runtime_install_error_label(code: RuntimeInstallErrorCode) -> &'static str {
     }
 }
 
+fn runtime_install_action_label(state: RuntimeInstallState) -> &'static str {
+    match state {
+        RuntimeInstallState::NotInstalled => "ダウンロードしてインストール",
+        RuntimeInstallState::Failed(_) => "再試行",
+        RuntimeInstallState::Downloading
+        | RuntimeInstallState::Verifying
+        | RuntimeInstallState::Installed => "インストール",
+    }
+}
+
 fn custom_settings_match_openai(name: &str, base_url: &str) -> bool {
     name.trim() == OPENAI_PROVIDER_NAME
         && base_url.trim().trim_end_matches('/') == OPENAI_PROVIDER_URL
@@ -1010,16 +1020,8 @@ impl AiSettingsPage {
                 })
                 .into_any_element()
         } else {
-            let install_label = if matches!(
-                self.snapshot.runtime_install,
-                RuntimeInstallState::Failed(_)
-            ) {
-                "再試行"
-            } else {
-                "インストール"
-            };
             Button::new("ai-runtime-install")
-                .label(install_label)
+                .label(runtime_install_action_label(self.snapshot.runtime_install))
                 .primary()
                 .disabled(
                     service.is_none()
@@ -3525,6 +3527,20 @@ mod tests {
         assert!(
             custom_key_guidance(CredentialEdit::Delete, true)
                 .contains("「保存して適用」を押した後に確定")
+        );
+    }
+
+    #[test]
+    fn runtime_install_action_labels_explain_first_download_and_preserve_retry() {
+        assert_eq!(
+            runtime_install_action_label(RuntimeInstallState::NotInstalled),
+            "ダウンロードしてインストール"
+        );
+        assert_eq!(
+            runtime_install_action_label(RuntimeInstallState::Failed(
+                RuntimeInstallErrorCode::NetworkDownloadFailed
+            )),
+            "再試行"
         );
     }
 
