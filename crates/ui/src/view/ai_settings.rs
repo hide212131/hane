@@ -985,6 +985,14 @@ impl AiSettingsPage {
         };
         let service = self.service.clone();
         let view = cx.entity();
+        let action_selector = if matches!(
+            self.snapshot.busy,
+            Some((_, ServiceBusyReason::InstallingRuntime))
+        ) {
+            "ai-runtime-install-cancel"
+        } else {
+            "ai-runtime-install"
+        };
         let action = if let Some((operation, ServiceBusyReason::InstallingRuntime)) = self.snapshot.busy
         {
             let service_for_cancel = service.clone();
@@ -1032,8 +1040,13 @@ impl AiSettingsPage {
                 })
                 .into_any_element()
         };
+        let action = div()
+            .id(format!("{action_selector}-wrapper"))
+            .debug_selector(move || action_selector.to_owned())
+            .child(action);
         div()
             .id("ai-runtime-install-section")
+            .debug_selector(|| "ai-runtime-install-section".to_owned())
             .w_full()
             .px(px(16.0))
             .py(px(14.0))
@@ -3546,8 +3559,16 @@ mod tests {
         assert!(cx.debug_bounds("ai-chatgpt-model-lock").is_some());
         assert!(cx.debug_bounds("ai-chatgpt-model-section").is_none());
         assert!(cx.debug_bounds("ai-settings-savebar").is_some());
-        assert!(cx.debug_bounds("ai-runtime-install-section").is_some());
-        assert!(cx.debug_bounds("ai-runtime-install").is_some());
+        let runtime_install_section = cx
+            .debug_bounds("ai-runtime-install-section")
+            .expect("runtime install section is rendered");
+        assert!(runtime_install_section.size.width > px(0.0));
+        assert!(runtime_install_section.size.height > px(0.0));
+        let runtime_install_button = cx
+            .debug_bounds("ai-runtime-install")
+            .expect("runtime install button is rendered");
+        assert!(runtime_install_button.size.width > px(0.0));
+        assert!(runtime_install_button.size.height > px(0.0));
 
         let api_key_connection = cx
             .debug_bounds("ai-connection-custom")
