@@ -2,8 +2,9 @@
 
 These never touch the network or any real upstream archive: every test
 builds a small synthetic `tar.gz` in a temporary directory and a matching
-synthetic lock/pinned-inventory, then exercises the pipeline against those
-fixtures via `archive_override`. No secrets or user environment are used.
+synthetic lock/pinned-inventory/vendored-license-document, then exercises
+the pipeline against those fixtures via `archive_override`. No secrets or
+user environment are used.
 """
 
 from __future__ import annotations
@@ -64,6 +65,10 @@ def make_tar_gz(path: Path, entries: list) -> None:
 ENTRYPOINT_CONTENT = b"fake-codex-app-server-binary"
 LIBRARY_CONTENT = b"fake-shared-library"
 LICENSE_CONTENT = b"fake license text"
+VENDORED_NOTICE_CONTENT = b"fake vendored NOTICE text, copied from upstream at a pinned ref"
+
+DEFAULT_SOURCE_URL = "https://github.com/example/example/blob/deadbeefcafe/LICENSE.txt"
+DEFAULT_SOURCE_REF = "deadbeefcafe"
 
 
 def standard_entries():
@@ -99,16 +104,80 @@ def standard_inventory() -> list:
     )
 
 
-class PipelineFixture:
-    """Builds a self-contained lock + pinned inventory + archive under a
-    temporary directory, mirroring the real `assets/ai/` layout closely
-    enough for `build_bundle` to run unmodified against it."""
+def archive_license_entry(
+    *,
+    name: str = "LICENSE.txt",
+    archive_path: str = "LICENSE.txt",
+    applies_to: list = None,
+    content: bytes = LICENSE_CONTENT,
+    url: str = DEFAULT_SOURCE_URL,
+    ref: str = DEFAULT_SOURCE_REF,
+    sha256: str = None,
+) -> dict:
+    return {
+        "name": name,
+        "applies_to": applies_to if applies_to is not None else ["codex-app-server"],
+        "source": {
+            "type": "archive",
+            "path": archive_path,
+            "url": url,
+            "ref": ref,
+            "sha256": sha256 if sha256 is not None else sha256_hex(content),
+        },
+    }
 
-    def __init__(self, tmp_root: Path, *, archive_entries=None, pinned_inventory=None, licenses=None):
+
+def vendored_license_entry(
+    *,
+    name: str = "NOTICE",
+    vendored_path: str = "licenses/codex/NOTICE",
+    applies_to: list = None,
+    content: bytes = VENDORED_NOTICE_CONTENT,
+    url: str = "https://github.com/example/example/blob/deadbeefcafe/NOTICE",
+    ref: str = DEFAULT_SOURCE_REF,
+    sha256: str = None,
+) -> dict:
+    return {
+        "name": name,
+        "applies_to": applies_to if applies_to is not None else ["codex-app-server"],
+        "source": {
+            "type": "vendored",
+            "path": vendored_path,
+            "url": url,
+            "ref": ref,
+            "sha256": sha256 if sha256 is not None else sha256_hex(content),
+        },
+    }
+
+
+def default_license_entries() -> list:
+    return [archive_license_entry()]
+
+
+class PipelineFixture:
+    """Builds a self-contained lock + pinned inventory + archive (+ optional
+    vendored license documents) under a temporary directory, mirroring the
+    real `assets/ai/` layout closely enough for `build_bundle` to run
+    unmodified against it."""
+
+    def __init__(
+        self,
+        tmp_root: Path,
+        *,
+        archive_entries=None,
+        pinned_inventory=None,
+        licenses=None,
+        vendored_files: dict = None,
+    ):
         self.tmp_root = tmp_root
         self.lock_dir = tmp_root / "lock-dir"
         self.lock_dir.mkdir()
         (self.lock_dir / "inventory").mkdir()
+
+        for relative, content in (vendored_files or {}).items():
+            vendored_path = self.lock_dir / relative
+            vendored_path.parent.mkdir(parents=True, exist_ok=True)
+            vendored_path.write_bytes(content)
 
         self.archive_path = tmp_root / "archive.tar.gz"
         make_tar_gz(self.archive_path, archive_entries if archive_entries is not None else standard_entries())
@@ -132,7 +201,7 @@ class PipelineFixture:
                             "archive_sha256": sha256_hex(archive_bytes),
                             "entrypoint_name": "codex-app-server",
                             "inventory": "inventory/test-target-1.0.0.json",
-                            "licenses": licenses if licenses is not None else ["LICENSE.txt"],
+                            "licenses": licenses if licenses is not None else default_license_entries(),
                             "runtime_profile": {"name": "default"},
                             "config_profile": {"name": "default"},
                             "state_profile": {"name": "default"},
@@ -170,6 +239,16 @@ class BuildBundleTests(unittest.TestCase):
             self.assertEqual(manifest["entrypoint"], "codex-app-server")
             self.assertEqual(manifest["licenses"], ["LICENSE.txt"])
             self.assertEqual(len(manifest["files"]), 3)
+
+            self.assertEqual(len(manifest["license_sources"]), 1)
+            recorded = manifest["license_sources"][0]
+            self.assertEqual(recorded["name"], "LICENSE.txt")
+            self.assertEqual(recorded["applies_to"], ["codex-app-server"])
+            self.assertEqual(recorded["source"]["type"], "archive")
+            self.assertEqual(recorded["source"]["path"], "LICENSE.txt")
+            self.assertEqual(recorded["source"]["url"], DEFAULT_SOURCE_URL)
+            self.assertEqual(recorded["source"]["ref"], DEFAULT_SOURCE_REF)
+            self.assertEqual(recorded["source"]["sha256"], sha256_hex(LICENSE_CONTENT))
 
             payload_entrypoint = output_dir / "payload" / "codex-app-server"
             self.assertEqual(payload_entrypoint.read_bytes(), ENTRYPOINT_CONTENT)
@@ -326,31 +405,20 @@ class BuildBundleTests(unittest.TestCase):
         finally:
             pcr.MAX_ENTRY_SIZE = original_max
 
-    def test_empty_license_list_is_fail_closed(self):
+    def test_missing_pinned_inventory_is_fail_closed(self):
         with TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
-            fixture = PipelineFixture(tmp_root, licenses=[])
+            fixture = PipelineFixture(tmp_root)
+            (tmp_root / "lock-dir" / "inventory" / "test-target-1.0.0.json").unlink()
             with self.assertRaises(pcr.PipelineError):
                 fixture.build(tmp_root / "out" / "bundle")
 
-    def test_missing_license_file_is_rejected(self):
+    def test_pinned_inventory_hash_mismatch_is_rejected(self):
         with TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
-            fixture = PipelineFixture(tmp_root, licenses=["MISSING-LICENSE.txt"])
-            with self.assertRaises(pcr.PipelineError):
-                fixture.build(tmp_root / "out" / "bundle")
-
-    def test_license_name_collision_is_rejected(self):
-        with TemporaryDirectory() as tmp:
-            tmp_root = Path(tmp)
-            entries = standard_entries() + [{"name": "nested/LICENSE.txt", "content": b"other license", "mode": 0o644}]
-            pinned = standard_inventory() + inventory_for([("nested/LICENSE.txt", b"other license", False)])
-            fixture = PipelineFixture(
-                tmp_root,
-                archive_entries=entries,
-                pinned_inventory=pinned,
-                licenses=["LICENSE.txt", "nested/LICENSE.txt"],
-            )
+            tampered = standard_inventory()
+            tampered[0]["sha256"] = "1" * 64
+            fixture = PipelineFixture(tmp_root, pinned_inventory=tampered)
             with self.assertRaises(pcr.PipelineError):
                 fixture.build(tmp_root / "out" / "bundle")
 
@@ -378,24 +446,203 @@ class BuildBundleTests(unittest.TestCase):
             tmp_root = Path(tmp)
             entries = [{"name": "LICENSE.txt", "content": LICENSE_CONTENT, "mode": 0o644}]
             pinned = inventory_for([("LICENSE.txt", LICENSE_CONTENT, False)])
-            fixture = PipelineFixture(tmp_root, archive_entries=entries, pinned_inventory=pinned, licenses=["LICENSE.txt"])
+            fixture = PipelineFixture(
+                tmp_root,
+                archive_entries=entries,
+                pinned_inventory=pinned,
+                licenses=[archive_license_entry(applies_to=["LICENSE.txt"])],
+            )
             with self.assertRaises(pcr.PipelineError):
                 fixture.build(tmp_root / "out" / "bundle")
 
-    def test_missing_pinned_inventory_is_fail_closed(self):
+
+class LicenseProvenanceTests(unittest.TestCase):
+    """Fixture coverage for the license `source`/`applies_to`/SHA-256
+    validation `validate_and_copy_licenses` performs: both `"archive"` and
+    `"vendored"` source types, each must hash-match real bytes, each
+    `applies_to` entry must name a real inventory path, and every
+    executable inventory entry must be covered by some license."""
+
+    def test_empty_license_list_is_fail_closed(self):
         with TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
-            fixture = PipelineFixture(tmp_root)
-            (tmp_root / "lock-dir" / "inventory" / "test-target-1.0.0.json").unlink()
+            fixture = PipelineFixture(tmp_root, licenses=[])
             with self.assertRaises(pcr.PipelineError):
                 fixture.build(tmp_root / "out" / "bundle")
 
-    def test_pinned_inventory_hash_mismatch_is_rejected(self):
+    def test_missing_archive_license_file_is_rejected(self):
         with TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
-            tampered = standard_inventory()
-            tampered[0]["sha256"] = "1" * 64
-            fixture = PipelineFixture(tmp_root, pinned_inventory=tampered)
+            fixture = PipelineFixture(
+                tmp_root, licenses=[archive_license_entry(archive_path="MISSING-LICENSE.txt")]
+            )
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_archive_license_hash_mismatch_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(tmp_root, licenses=[archive_license_entry(sha256="0" * 64)])
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_license_name_collision_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            entries = standard_entries() + [{"name": "nested/LICENSE.txt", "content": b"other license", "mode": 0o644}]
+            pinned = standard_inventory() + inventory_for([("nested/LICENSE.txt", b"other license", False)])
+            fixture = PipelineFixture(
+                tmp_root,
+                archive_entries=entries,
+                pinned_inventory=pinned,
+                licenses=[
+                    archive_license_entry(),
+                    archive_license_entry(
+                        archive_path="nested/LICENSE.txt",
+                        content=b"other license",
+                        applies_to=["nested/LICENSE.txt"],
+                    ),
+                ],
+            )
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_applies_to_unknown_path_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(
+                tmp_root, licenses=[archive_license_entry(applies_to=["does-not-exist-in-archive"])]
+            )
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_empty_applies_to_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(tmp_root, licenses=[archive_license_entry(applies_to=[])])
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_uncovered_executable_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            entries = standard_entries() + [{"name": "bin/helper-tool", "content": b"helper-bin", "mode": 0o755}]
+            pinned = standard_inventory() + inventory_for([("bin/helper-tool", b"helper-bin", True)])
+            fixture = PipelineFixture(
+                tmp_root,
+                archive_entries=entries,
+                pinned_inventory=pinned,
+                licenses=[archive_license_entry(applies_to=["codex-app-server"])],
+            )
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_unsupported_source_type_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            entry = archive_license_entry()
+            entry["source"]["type"] = "network-fetch"
+            fixture = PipelineFixture(tmp_root, licenses=[entry])
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_source_missing_url_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            entry = archive_license_entry()
+            del entry["source"]["url"]
+            fixture = PipelineFixture(tmp_root, licenses=[entry])
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_source_missing_ref_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            entry = archive_license_entry()
+            del entry["source"]["ref"]
+            fixture = PipelineFixture(tmp_root, licenses=[entry])
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_source_malformed_sha256_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            entry = archive_license_entry(sha256="not-hex")
+            fixture = PipelineFixture(tmp_root, licenses=[entry])
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_valid_vendored_license_is_accepted_and_recorded(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(
+                tmp_root,
+                licenses=[
+                    archive_license_entry(),
+                    vendored_license_entry(),
+                ],
+                vendored_files={"licenses/codex/NOTICE": VENDORED_NOTICE_CONTENT},
+            )
+            output_dir = tmp_root / "out" / "bundle"
+
+            fixture.build(output_dir)
+
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(sorted(manifest["licenses"]), ["LICENSE.txt", "NOTICE"])
+            vendored_copy = output_dir / "licenses" / "NOTICE"
+            self.assertEqual(vendored_copy.read_bytes(), VENDORED_NOTICE_CONTENT)
+
+            [vendored_record] = [r for r in manifest["license_sources"] if r["name"] == "NOTICE"]
+            self.assertEqual(vendored_record["source"]["type"], "vendored")
+            self.assertEqual(vendored_record["source"]["path"], "licenses/codex/NOTICE")
+            self.assertEqual(vendored_record["source"]["sha256"], sha256_hex(VENDORED_NOTICE_CONTENT))
+
+    def test_vendored_license_missing_file_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(
+                tmp_root,
+                licenses=[archive_license_entry(), vendored_license_entry()],
+                vendored_files={},
+            )
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_vendored_license_hash_mismatch_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(
+                tmp_root,
+                licenses=[archive_license_entry(), vendored_license_entry(sha256="0" * 64)],
+                vendored_files={"licenses/codex/NOTICE": VENDORED_NOTICE_CONTENT},
+            )
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_vendored_license_empty_file_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(
+                tmp_root,
+                licenses=[
+                    archive_license_entry(),
+                    vendored_license_entry(content=b"", sha256=sha256_hex(b"")),
+                ],
+                vendored_files={"licenses/codex/NOTICE": b""},
+            )
+            with self.assertRaises(pcr.PipelineError):
+                fixture.build(tmp_root / "out" / "bundle")
+
+    def test_vendored_license_path_escaping_lock_dir_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            fixture = PipelineFixture(
+                tmp_root,
+                licenses=[
+                    archive_license_entry(),
+                    vendored_license_entry(vendored_path="../escaped-outside-lock-dir/NOTICE"),
+                ],
+            )
             with self.assertRaises(pcr.PipelineError):
                 fixture.build(tmp_root / "out" / "bundle")
 

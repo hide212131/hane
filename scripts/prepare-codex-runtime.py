@@ -27,9 +27,20 @@ Given `--target <triple>`, it:
    for that exact target+version (`inventory` field in the lock). A
    missing or mismatched pinned inventory is a fail-closed error: this tool
    never invents or silently accepts inventory data it cannot confirm.
-5. Copies only the license/notice documents the lock explicitly lists (by
-   archive-relative path) into the bundle's `licenses/`. An empty or
-   missing license list is fail-closed: no bundle is produced, because the
+5. Copies only the license/notice documents the lock explicitly lists into
+   the bundle's `licenses/`. Each `licenses[]` entry names the executable
+   or helper component(s) it applies to (`applies_to`, matched against
+   `payload/`-relative inventory paths) and a `source` the document's bytes
+   must hash-match: either `"type": "archive"` (a path inside the payload
+   archive itself) or `"type": "vendored"` (a license/notice document this
+   repository carries under `assets/ai/`, next to the lock, together with
+   the upstream URL/ref it was copied from). A document merely existing at
+   that path is never enough on its own -- its actual content must hash to
+   the lock's pinned `source.sha256`. An empty license list, a source file
+   that is missing/empty, a content hash mismatch, an unsupported
+   `source.type`, an `applies_to` entry that does not match any inventory
+   path, or an executable/helper inventory entry no license's `applies_to`
+   covers, are all fail-closed: no bundle is produced, because the
    rights/attribution for the upstream helper binaries have not been
    confirmed yet.
 6. Writes `manifest.json` (the `schema_version = 1` contract
@@ -284,27 +295,150 @@ def resolve_entrypoint(inventory: list, entrypoint_name: str) -> str:
     return matches[0]
 
 
-def copy_licenses(payload_dir: Path, license_relative_paths: list, licenses_dir: Path) -> list:
-    if not license_relative_paths:
+LICENSE_SOURCE_TYPES = frozenset({"archive", "vendored"})
+
+
+def _require_nonblank_str(value, message: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PipelineError(message)
+    return value
+
+
+def _require_sha256_hex(value, message: str) -> str:
+    text = _require_nonblank_str(value, message)
+    if len(text) != 64 or any(char not in "0123456789abcdefABCDEF" for char in text):
+        raise PipelineError(message)
+    return text
+
+
+def validate_and_copy_licenses(
+    *,
+    license_entries: list,
+    inventory: list,
+    payload_dir: Path,
+    lock_dir: Path,
+    licenses_dir: Path,
+) -> tuple:
+    """Validates every `licenses[]` entry the lock declares for this target
+    against the actually-extracted `inventory`, copies each entry's
+    hash-verified document into `licenses_dir`, and returns
+    `(copied_names, license_records)` where `license_records` carries each
+    entry's `applies_to`/`source` provenance (with `source.sha256` set to
+    the just-verified actual content hash) for the manifest.
+
+    Fail-closed (raises `PipelineError`, copies nothing) when: the list is
+    empty; an entry is malformed; `applies_to` is empty or names a path not
+    present in `inventory`; `source.type` is not a supported type; the
+    referenced source document is missing; its actual bytes do not hash to
+    the declared `source.sha256`; a license document's output `name`
+    collides with another entry's; or any `executable` inventory entry is
+    not covered by at least one license's `applies_to`.
+    """
+    if not license_entries:
         raise PipelineError(
             "lockに実在確認済みのlicense文書が列挙されていません。"
             "ライセンス確認が未完了のためbundleを作成できません(fail-closed)。"
         )
+
+    inventory_paths = {file_entry["path"] for file_entry in inventory}
+    executable_paths = {file_entry["path"] for file_entry in inventory if file_entry["executable"]}
+
     licenses_dir.mkdir(parents=True, exist_ok=True)
     copied_names = []
     seen_names = set()
-    for relative in license_relative_paths:
-        components = validate_relative_member_path(relative)
-        source = payload_dir.joinpath(*components)
-        if not source.is_file():
-            raise PipelineError(f"lockが指すlicense文書がarchive内に見つかりません: {relative!r}")
-        name = components[-1]
+    covered_paths = set()
+    license_records = []
+
+    for raw_entry in license_entries:
+        if not isinstance(raw_entry, dict):
+            raise PipelineError(f"license entryがobjectではありません: {raw_entry!r}")
+
+        name = _require_nonblank_str(raw_entry.get("name"), f"license entryにnameがありません: {raw_entry!r}")
+        name_components = validate_relative_member_path(name)
+        if len(name_components) != 1:
+            raise PipelineError(f"license entryのnameはファイル名のみ許可します(階層不可): {name!r}")
+
+        applies_to = raw_entry.get("applies_to")
+        if not isinstance(applies_to, list) or not applies_to:
+            raise PipelineError(f"license entry {name!r} にapplies_toがありません(適用対象の欠落)")
+        for target_path in applies_to:
+            if not isinstance(target_path, str) or target_path not in inventory_paths:
+                raise PipelineError(
+                    f"license entry {name!r} のapplies_toがarchive内に存在しないpathを指しています"
+                    f"(未対応component): {target_path!r}"
+                )
+
+        source = raw_entry.get("source")
+        if not isinstance(source, dict):
+            raise PipelineError(f"license entry {name!r} にsourceがありません")
+        source_type = source.get("type")
+        if source_type not in LICENSE_SOURCE_TYPES:
+            raise PipelineError(f"license entry {name!r} のsource.typeが未対応です: {source_type!r}")
+        source_path_raw = _require_nonblank_str(
+            source.get("path"), f"license entry {name!r} のsource.pathがありません"
+        )
+        source_url = _require_nonblank_str(
+            source.get("url"), f"license entry {name!r} のsource.urlがありません"
+        )
+        source_ref = _require_nonblank_str(
+            source.get("ref"), f"license entry {name!r} のsource.refがありません"
+        )
+        declared_sha256 = _require_sha256_hex(
+            source.get("sha256"), f"license entry {name!r} のsource.sha256が不正または欠落しています"
+        )
+
+        source_components = validate_relative_member_path(source_path_raw)
+        if source_type == "archive":
+            source_file = payload_dir.joinpath(*source_components)
+            missing_message = (
+                f"license entry {name!r} のarchive内source文書が見つかりません: {source_path_raw!r}"
+            )
+        else:
+            source_file = lock_dir.joinpath(*source_components)
+            missing_message = (
+                f"license entry {name!r} のvendored source文書が見つかりません: {source_path_raw!r}. "
+                "repositoryにlicense文書をvendorしてlockへ記録してから再実行してください。"
+            )
+
+        if not source_file.is_file():
+            raise PipelineError(missing_message)
+
+        content = source_file.read_bytes()
+        if not content:
+            raise PipelineError(f"license entry {name!r} のsource文書が空です: {source_path_raw!r}")
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256.lower() != declared_sha256.lower():
+            raise PipelineError(
+                f"license entry {name!r} のsource文書のSHA-256がlockと一致しません: {source_path_raw!r}"
+            )
+
         if name in seen_names:
             raise PipelineError(f"license文書のファイル名が衝突しています: {name!r}")
         seen_names.add(name)
-        shutil.copyfile(source, licenses_dir / name)
+        (licenses_dir / name).write_bytes(content)
         copied_names.append(name)
-    return copied_names
+        covered_paths.update(applies_to)
+        license_records.append(
+            {
+                "name": name,
+                "applies_to": sorted(set(applies_to)),
+                "source": {
+                    "type": source_type,
+                    "path": source_path_raw,
+                    "url": source_url,
+                    "ref": source_ref,
+                    "sha256": actual_sha256,
+                },
+            }
+        )
+
+    uncovered = sorted(executable_paths - covered_paths)
+    if uncovered:
+        raise PipelineError(
+            "実行可能ファイルにlicenseの適用対象が不足しています(未対応component): " + ", ".join(uncovered)
+        )
+
+    return copied_names, license_records
 
 
 class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -416,7 +550,13 @@ def build_bundle(
         entrypoint = resolve_entrypoint(inventory, entry["entrypoint_name"])
 
         licenses_dir = build_tmp / LICENSES_DIR_NAME
-        license_names = copy_licenses(payload_dir, entry["licenses"], licenses_dir)
+        license_names, license_records = validate_and_copy_licenses(
+            license_entries=entry["licenses"],
+            inventory=inventory,
+            payload_dir=payload_dir,
+            lock_dir=lock_path.parent,
+            licenses_dir=licenses_dir,
+        )
 
         manifest = {
             "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -427,7 +567,16 @@ def build_bundle(
             "source_commit": lock["source_commit"],
             "archive_sha256": entry["archive_sha256"],
             "files": inventory,
+            # `licenses`: the existing `Vec<String>` contract
+            # `crates/ai/src/runtime_distribution.rs` already resolves
+            # against (bundled filenames under `licenses/`, unchanged by
+            # this pipeline revision). `license_sources` is additive: the
+            # full per-document provenance (`applies_to`/`source`) this
+            # pipeline just verified, for audit tooling and future
+            # consumers -- existing manifest readers ignore unknown
+            # fields.
             "licenses": license_names,
+            "license_sources": license_records,
             "runtime_profile": entry["runtime_profile"],
             "config_profile": entry["config_profile"],
             "state_profile": entry["state_profile"],
