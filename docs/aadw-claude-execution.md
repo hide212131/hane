@@ -30,24 +30,29 @@ GitHub connectorを使う場合は、branch作成→文書の作成・commit→D
 
 次のテンプレートの値を実際の値に置き換え、**実装用PRのConversation**へ投稿する。行頭の機械用項目は各一行とし、コードフェンスで囲まない。
 
-@claude<br>
-AADW_COMMANDER_HANDOFF_V3<br>
-AADW_ACTION: implement<br>
-AADW_TARGET_HEAD: &lt;PRの40桁current head SHA&gt;<br>
-AADW_FAILURE_CLASS: initial<br>
-AADW_ROOT_CAUSE: issue-&lt;番号&gt;-&lt;フェーズ&gt;-initial<br>
-AADW_EVIDENCE: https://github.com/&lt;owner&gt;/&lt;repo&gt;/issues/&lt;番号&gt;<br><br>
-&#35;&#35; 今回の依頼<br>
-&lt;目的と今回の対象範囲。新規実装なら、その旨を明記する。&gt;<br><br>
-&#35;&#35; 読むもの<br>
-&lt;pr-head/から読める、採用済みの設計書と関連コードのパス。&gt;<br><br>
-&#35;&#35; 受入条件<br>
-&lt;今回のフェーズで満たす条件。Issue全体の完了条件と区別する。&gt;<br><br>
-&#35;&#35; 対象外<br>
-&lt;変更してはいけない責務、別フェーズ、他PRの範囲。&gt;<br><br>
-依頼本文で指定した範囲だけを実装してください。製品変更ではコードと直接関連するテストを、文書のみの運用確認では指定した文書だけを変更してください。<br>
-このworkerではshell、git、gh、test/build/lint実行、commit、pushは行わないでください。<br>
-実行できない検証を実施済みとせず、必要な検証を結果に書いてください。<br>
+@claude
+AADW_COMMANDER_HANDOFF_V3
+AADW_ACTION: implement
+AADW_TARGET_HEAD: &lt;PRの40桁current head SHA&gt;
+AADW_FAILURE_CLASS: initial
+AADW_ROOT_CAUSE: issue-&lt;番号&gt;-&lt;フェーズ&gt;-initial
+AADW_EVIDENCE: https://github.com/&lt;owner&gt;/&lt;repo&gt;/issues/&lt;番号&gt;
+
+&#35;&#35; 今回の依頼
+&lt;目的と今回の対象範囲。新規実装なら、その旨を明記する。&gt;
+
+&#35;&#35; 読むもの
+&lt;pr-head/から読める、採用済みの設計書と関連コードのパス。&gt;
+
+&#35;&#35; 受入条件
+&lt;今回のフェーズで満たす条件。Issue全体の完了条件と区別する。&gt;
+
+&#35;&#35; 対象外
+&lt;変更してはいけない責務、別フェーズ、他PRの範囲。&gt;
+
+依頼本文で指定した範囲だけを実装してください。製品変更ではコードと直接関連するテストを、文書のみの運用確認では指定した文書だけを変更してください。
+このworkerではshell、git、gh、test/build/lint実行、commit、pushは行わないでください。
+実行できない検証を実施済みとせず、必要な検証を結果に書いてください。
 次工程の起動、モデル切替、merge、Issue closeは行わないでください。
 
 workerの使用可能な道具は `Read,Edit,Write,Glob,Grep` であり、GitHubのIssueやPRのURLへ自由にアクセスできるとは仮定しない。**URLだけを渡さず、実装に必要な決定事項と受入条件をコメントに含める。設計書は対象branchから読めるようにする。** 設計の採用に別PRのmergeが必要なら、先にその状態を確認する。
