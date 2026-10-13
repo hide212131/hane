@@ -30,13 +30,13 @@ GitHub connectorを使う場合は、branch作成→文書の作成・commit→D
 
 次のテンプレートの値を実際の値に置き換え、**実装用PRのConversation**へ投稿する。行頭の機械用項目は各一行とし、コードフェンスで囲まない。
 
-@claude
-AADW_COMMANDER_HANDOFF_V3
-AADW_ACTION: implement
-AADW_TARGET_HEAD: &lt;PRの40桁current head SHA&gt;
-AADW_FAILURE_CLASS: initial
-AADW_ROOT_CAUSE: issue-&lt;番号&gt;-&lt;フェーズ&gt;-initial
-AADW_EVIDENCE: https://github.com/&lt;owner&gt;/&lt;repo&gt;/issues/&lt;番号&gt;
+@claude\
+AADW_COMMANDER_HANDOFF_V3\
+AADW_ACTION: implement\
+AADW_TARGET_HEAD: &lt;PRの40桁current head SHA&gt;\
+AADW_FAILURE_CLASS: initial\
+AADW_ROOT_CAUSE: issue-&lt;番号&gt;-&lt;フェーズ&gt;-initial\
+AADW_EVIDENCE: https://github.com/&lt;owner&gt;/&lt;repo&gt;/issues/&lt;番号&gt;\
 
 &#35;&#35; 今回の依頼
 &lt;目的と今回の対象範囲。新規実装なら、その旨を明記する。&gt;
