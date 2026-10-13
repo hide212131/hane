@@ -19866,6 +19866,122 @@ mod tests {
         });
     }
 
+    // RF3-A P2 contract test (Issue #304, design spec §9 R07): pins
+    // `actions.rs`'s existing `Newline`/`ShiftNewline` short-circuit for the
+    // sidebar filter — while it is focused and mid-composition, Enter must
+    // only call `commit_sidebar_filter_composition` and then `return`,
+    // before ever reaching `insert_newline`/`apply_list_edit_intent`, and
+    // without blurring the filter or falling through to the body or an
+    // inline rename.
+    #[gpui::test]
+    fn sidebar_filter_enter_during_composition_only_commits_and_leaves_focus_and_the_body_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("untouched body text\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_keyboard_focus = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 3..3;
+            view.sidebar_filter_selection_reversed = false;
+            // Mirrors a real in-progress Japanese conversion: marks "abc" +
+            // the composing kana rather than committing it outright.
+            view.replace_and_mark_sidebar_filter_text(None, "か", None, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_filter_has_composition());
+            assert_eq!(view.sidebar_filter, "abcか");
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sidebar_filter_has_composition(),
+                "Enter must commit the in-progress composition"
+            );
+            assert_eq!(
+                view.sidebar_filter, "abcか",
+                "committing must keep the composed text, not discard or extend it"
+            );
+            assert!(
+                view.sidebar_filter_focused,
+                "confirming a composition must not blur the filter"
+            );
+            assert!(!view.inline_rename_active());
+            assert_eq!(
+                view.editor().document().full_text(),
+                "untouched body text\n",
+                "the commit-only Enter must never fall through to inserting a newline in the body"
+            );
+        });
+    }
+
+    // RF3-A P2 contract test (Issue #304, design spec §9 R09): pins
+    // `actions.rs`'s existing `CancelComposition` short-circuit for the
+    // sidebar filter — the first Escape while composing must only call
+    // `cancel_sidebar_filter_composition` (reverting to the pre-composition
+    // snapshot) and keep the filter focused; only a second, separate Escape
+    // with no composition left may call `blur_sidebar_filter`.
+    #[gpui::test]
+    fn sidebar_filter_escape_cancels_composition_before_a_second_escape_blurs_the_filter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("untouched body text\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_keyboard_focus = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 3..3;
+            view.sidebar_filter_selection_reversed = false;
+            view.replace_and_mark_sidebar_filter_text(None, "か", None, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_filter_has_composition());
+            assert_eq!(view.sidebar_filter, "abcか");
+        });
+
+        // The first Escape must cancel the composition only, reverting to
+        // the pre-composition text and keeping the filter focused — never
+        // also blurring it on the same keystroke.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_has_composition());
+            assert_eq!(
+                view.sidebar_filter, "abc",
+                "cancelling must restore the pre-composition snapshot"
+            );
+            assert!(
+                view.sidebar_filter_focused,
+                "the first, composition-cancelling Escape must not blur the filter"
+            );
+        });
+
+        // With no composition left, a second, separate Escape blurs the
+        // filter normally.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_focused);
+        });
+    }
+
     #[gpui::test]
     fn inline_rename_active_normal_editing_keys_route_only_to_the_rename_field_and_leave_the_body_and_sidebar_filter_untouched(
         cx: &mut gpui::TestAppContext,
