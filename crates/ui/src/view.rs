@@ -20765,4 +20765,207 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
         assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
     }
+
+    // Issue #304 (RF3-A, P2 design §6): DocumentStart/DocumentEnd and their
+    // Select variants, and Undo/Redo, are the 6 body-only actions `actions.rs`
+    // still routes through their own independent
+    // `sidebar_filter_is_focused()`/`inline_rename_active()` early-return
+    // guards rather than through `input_target()`. These pin the current
+    // "consume the key, touch nothing" outcome of those guards directly
+    // (body text, body selection, and the undo/redo stack all stay exactly
+    // as they were) before a later change connects these 6 actions to the
+    // resolver too.
+
+    #[gpui::test]
+    fn sidebar_filter_focused_document_navigation_and_undo_redo_are_no_ops_for_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        // Two edits separated by an unrelated caret move land in separate
+        // undo transactions (adjacent same-kind inserts otherwise coalesce);
+        // undoing the second once leaves both a pending undo (the first
+        // insert) and a pending redo (the second), so the loop below proves
+        // Undo/Redo are really no-ops, not merely idempotent.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.editor_mut().insert_text("A").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.editor_mut().insert_text("B").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::Undo, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().can_undo());
+            assert!(view.editor().can_redo());
+        });
+
+        let body_text = view.read_with(cx, |view, _| view.editor().document().full_text());
+        let body_selection = view.read_with(cx, |view, _| view.editor().selection());
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 1..1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let undo_key = if cfg!(target_os = "macos") { "cmd-z" } else { "ctrl-z" };
+        let redo_key = if cfg!(target_os = "macos") {
+            "cmd-shift-z"
+        } else {
+            "ctrl-shift-z"
+        };
+        for keystroke in [
+            "secondary-up",
+            "secondary-down",
+            "secondary-shift-up",
+            "secondary-shift-down",
+            undo_key,
+            redo_key,
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().document().full_text(),
+                    body_text,
+                    "{keystroke} must not edit the body while the sidebar filter is focused"
+                );
+                assert_eq!(
+                    view.editor().selection(),
+                    body_selection,
+                    "{keystroke} must not move the body caret while the sidebar filter is focused"
+                );
+                assert!(
+                    view.editor().can_undo(),
+                    "{keystroke} must not consume undo history while the sidebar filter is focused"
+                );
+                assert!(
+                    view.editor().can_redo(),
+                    "{keystroke} must not consume redo history while the sidebar filter is focused"
+                );
+                assert_eq!(view.sidebar_filter, "abc");
+                assert_eq!(view.sidebar_filter_selected_range, 1..1);
+                assert!(view.sidebar_filter_is_focused());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn inline_rename_active_document_navigation_and_undo_redo_are_no_ops_for_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        // See the sidebar-filter variant above for why these two edits must
+        // land in separate undo transactions.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.editor_mut().insert_text("A").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.editor_mut().insert_text("B").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::Undo, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().can_undo());
+            assert!(view.editor().can_redo());
+        });
+
+        let body_text = view.read_with(cx, |view, _| view.editor().document().full_text());
+        let body_selection = view.read_with(cx, |view, _| view.editor().selection());
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "abcdef".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 3..3,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let undo_key = if cfg!(target_os = "macos") { "cmd-z" } else { "ctrl-z" };
+        let redo_key = if cfg!(target_os = "macos") {
+            "cmd-shift-z"
+        } else {
+            "ctrl-shift-z"
+        };
+        for keystroke in [
+            "secondary-up",
+            "secondary-down",
+            "secondary-shift-up",
+            "secondary-shift-down",
+            undo_key,
+            redo_key,
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().document().full_text(),
+                    body_text,
+                    "{keystroke} must not edit the body while an inline rename is active"
+                );
+                assert_eq!(
+                    view.editor().selection(),
+                    body_selection,
+                    "{keystroke} must not move the body caret while an inline rename is active"
+                );
+                assert!(
+                    view.editor().can_undo(),
+                    "{keystroke} must not consume undo history while an inline rename is active"
+                );
+                assert!(
+                    view.editor().can_redo(),
+                    "{keystroke} must not consume redo history while an inline rename is active"
+                );
+                assert_eq!(view.inline_rename.as_ref().unwrap().text, "abcdef");
+                assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+                assert!(view.inline_rename_active());
+            });
+        }
+    }
 }
