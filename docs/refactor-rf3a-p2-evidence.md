@@ -37,17 +37,25 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 
 最後の候補には、本文・フィルタ・名前変更欄の入力分離、Tabのlist plannerとUndo履歴、上下・Escapeの優先順、検索UIのEscape/F3などの既存動作を固定するP2契約テストを追加した。これらはP2 routing切替前に合格した基準結果である。
 
+## P2 routingの部分候補
+
+| Candidate head | Workflow run | 結果 |
+|---|---|---|
+| `8cac74fe702b2f075010fbf81ee2b2191f895dc6` | [38422215097](https://github.com/hide212131/hane/actions/runs/38422215097) | macOS 26 arm64 runner。workspace tests 455 passed / 0 failed、Clippy成功。Enter / Shift+Enter、Tab / Shift+Tab、上下、Escape、tab切替、F3の一部をresolverへ接続した部分候補。diff監査で §6 の DocumentStart/End、SelectDocumentStart/End、Undo/Redo の6 actionが旧guardのままと判明したため、P2受入候補としては未完了。 |
+
+この6 actionはfilter / renameが対象のとき本文だけの操作を行わず、本文へfall throughもしない契約を追加テストで先に固定してからroutingを接続する。
+
 ## 検証状況
 
 | 確認 | 状態 | 証拠 |
 |---|---|---|
 | P2契約テストの追加（R07–R10、対象R12） | 完了（製品コード変更前） | [PR #488](https://github.com/hide212131/hane/pull/488)、上記候補run |
 | 変更前P2候補の workspace tests / Clippy | 完了。最終候補は455 passed、Clippy成功 | [run 38419394944](https://github.com/hide212131/hane/actions/runs/38419394944) |
-| P2 routing変更後の対象テスト・workspace tests / Clippy | 未実施 | — |
+| P2 routing部分候補のworkspace tests / Clippy | 成功（ただし§6の6 action未接続につき部分結果） | [run 38422215097](https://github.com/hide212131/hane/actions/runs/38422215097) |
 | routing変更後のcurrent-head CI（macOS / Windowsを含む該当check） | 未実施 | — |
 | routing変更後のcurrent-head独立review | 未実施 | — |
 | macOSの変更対象キー入力・日本語IMEの実画面確認 | 未実施 | — |
 | Windowsの変更対象キー入力・日本語IMEの実画面確認 | 未実施 | — |
 | 最終diff・旧分岐・復旧方法の確認 | 未実施 | — |
 
-「未実施」は失敗・成功のどちらも意味しない。routing変更後の候補head、実行環境、コマンド、終了状態、およびリンクを証拠が得られた時点で追記する。未確認をpassとして扱わず、Issue #304はP1–P3全体の受入までopenのままとする。
+「未実施」は失敗・成功のどちらも意味しない。未接続の6 actionはテストを先に追加し、routing変更後の候補head、実行環境、コマンド、終了状態、およびリンクを証拠が得られた時点で追記する。未確認をpassとして扱わず、Issue #304はP1–P3全体の受入までopenのままとする。
