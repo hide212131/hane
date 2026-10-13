@@ -966,7 +966,10 @@ mod tests {
             executable: true,
         };
         assert_eq!(
-            diff_against_pinned_inventory(&[file.clone()], &[file.clone(), file.clone()]),
+            diff_against_pinned_inventory(
+                std::slice::from_ref(&file),
+                &[file.clone(), file.clone()],
+            ),
             Err(RuntimeInstallErrorCode::ExtractionFailed)
         );
         assert_eq!(
