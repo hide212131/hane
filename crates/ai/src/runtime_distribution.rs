@@ -369,12 +369,16 @@ fn resolve_within_bundle(
 /// Rejects `bundle_dir` itself, or any path component resolving `relative`
 /// onto it, that is a symlink or (on Windows) another reparse point --
 /// including a junction/mount point, which Rust's `FileType::is_symlink`
-/// also reports as such. `has_valid_relative_path` already guarantees
-/// `relative` is lexically contained (no `..`/absolute component); this
-/// additionally guarantees the *resolved* path never traverses a symlinked
-/// directory or file to a location outside `bundle_dir`, which a purely
-/// lexical check cannot catch. A component that does not exist yet simply
-/// stops the walk -- the subsequent existence check reports that case as
+/// does *not* report as a symlink (its Windows implementation only
+/// recognizes the `IO_REPARSE_TAG_SYMLINK` reparse tag, not
+/// `IO_REPARSE_TAG_MOUNT_POINT`), so [`check_not_symlink`] additionally
+/// checks the raw `FILE_ATTRIBUTE_REPARSE_POINT` bit on Windows.
+/// `has_valid_relative_path` already guarantees `relative` is lexically
+/// contained (no `..`/absolute component); this additionally guarantees the
+/// *resolved* path never traverses a symlinked or reparse-point directory or
+/// file to a location outside `bundle_dir`, which a purely lexical check
+/// cannot catch. A component that does not exist yet simply stops the walk
+/// -- the subsequent existence check reports that case as
 /// [`RuntimeDistributionErrorCode::Missing`], not as a symlink escape.
 fn reject_symlink_escape(
     bundle_dir: &Path,
@@ -398,14 +402,29 @@ fn reject_symlink_escape(
 /// inspected (permission denied) or that it is a symlink/reparse point
 /// (treated as [`RuntimeDistributionErrorCode::InvalidExecutable`], matching
 /// the existing "not a regular file" classification).
+///
+/// On Windows this does not rely solely on `FileType::is_symlink()`: its
+/// Windows implementation only recognizes the `IO_REPARSE_TAG_SYMLINK`
+/// reparse tag, so a junction/mount point (`IO_REPARSE_TAG_MOUNT_POINT`) or
+/// any other reparse point would otherwise pass through unrejected. Instead
+/// this additionally checks the raw `FILE_ATTRIBUTE_REPARSE_POINT` bit via
+/// [`std::os::windows::fs::MetadataExt::file_attributes`], which every
+/// reparse point carries regardless of its specific tag.
 fn check_not_symlink(path: &Path) -> Result<bool, RuntimeDistributionErrorCode> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
-                Err(RuntimeDistributionErrorCode::InvalidExecutable)
-            } else {
-                Ok(true)
+                return Err(RuntimeDistributionErrorCode::InvalidExecutable);
             }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(RuntimeDistributionErrorCode::InvalidExecutable);
+                }
+            }
+            Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(classify_io_error(&error)),
@@ -1008,6 +1027,57 @@ mod tests {
             &dep_sha,
             false,
         );
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    /// Creates a directory junction at `junction` pointing at `target` via
+    /// `mklink /J`, which (unlike a symbolic link) does not require
+    /// administrator privileges or Developer Mode on Windows.
+    #[cfg(windows)]
+    fn create_junction(junction: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(junction)
+            .arg(target)
+            .status()
+            .expect("failed to run mklink /J");
+        assert!(status.success(), "mklink /J failed to create the junction fixture");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bundled_package_file_under_directory_junction_escaping_the_bundle_is_invalid() {
+        let dir = next_fixture_dir("bundle-junction-dir-escape");
+        let outside_dir = next_fixture_dir("bundle-junction-dir-escape-outside");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let (_, dep_sha, dep_len) = write_file(&outside_dir, "libcodex.so", b"outside-lib", false);
+        create_junction(&dir.join("linked"), &outside_dir);
+        let mut manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        add_file_entry(
+            &mut manifest,
+            "linked/libcodex.so",
+            "file",
+            dep_len,
+            &dep_sha,
+            false,
+        );
+        write_manifest(&dir, &manifest);
+        let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
+        assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bundled_package_entrypoint_as_a_junction_itself_is_invalid() {
+        let dir = next_fixture_dir("bundle-junction-entrypoint");
+        let outside_dir = next_fixture_dir("bundle-junction-entrypoint-outside");
+        let manifest =
+            base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &"0".repeat(64), 16);
+        create_junction(&dir.join("codex-app-server"), &outside_dir);
         write_manifest(&dir, &manifest);
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
