@@ -1,8 +1,8 @@
-//! Resolves the absolute path to the embedded Codex App Server executable
-//! that `crate::runtime::RuntimeConfig`/`AiRuntime` spawn, and classifies
-//! every way that resolution (or the subsequent `initialize` handshake) can
-//! fail into a small, stable set of diagnostic codes a caller can surface to
-//! the user (see `AiSnapshot`/the AI settings screen).
+//! Resolves the absolute path to the Codex App Server executable that
+//! `crate::runtime::RuntimeConfig`/`AiRuntime` spawn, and classifies every
+//! way that resolution (or the subsequent `initialize` handshake) can fail
+//! into a small, stable set of diagnostic codes a caller can surface to the
+//! user (see `AiSnapshot`/the AI settings screen).
 //!
 //! Resolution has exactly two candidates, tried in this fixed order, with no
 //! further fallback:
@@ -10,16 +10,19 @@
 //! 1. An explicit override via the `HANE_CODEX_APP_SERVER` environment
 //!    variable. If set, it must be an absolute path to a valid executable;
 //!    a relative, missing, or otherwise invalid override is reported as its
-//!    own diagnostic and never falls back to the bundled package.
-//! 2. The P0 bundled package: a `manifest.json` (schema contract below) next
-//!    to the bundled files in [`BUNDLE_DIR_NAME`], itself next to the
-//!    current executable.
+//!    own diagnostic and never falls back to the installed package.
+//! 2. The installed package: a `manifest.json` (schema contract below) next
+//!    to the files `crate::runtime_install` downloaded and verified on the
+//!    user's first explicit "install" action, under a directory this
+//!    crate's caller resolves (in production, `AiPaths::runtime_install_dir`
+//!    under Hane's own app data, never next to the current executable and
+//!    never requiring a build-time bundling step).
 //!
 //! Neither candidate is ever searched for via `PATH`, an adjacent legacy
 //! flat executable, or another application's internals: every resolved path
 //! is absolute and explicit.
 //!
-//! The bundled package's `manifest.json` is a `schema_version = 1` document
+//! The installed package's `manifest.json` is a `schema_version = 1` document
 //! naming a `bundle_id`, the exact target triple (one of
 //! [`WINDOWS_X64_TARGET`]/[`MACOS_ARM64_TARGET`]) it was built for, the
 //! upstream `codex_version` and `source_commit` it came from, the
@@ -42,16 +45,12 @@ use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The explicit override environment variable. Highest priority; see the
-/// module docs for why a bad override never falls back to the bundled
+/// module docs for why a bad override never falls back to the installed
 /// package.
 pub const EXPLICIT_OVERRIDE_ENV_VAR: &str = "HANE_CODEX_APP_SERVER";
-
-/// The directory, next to the current executable, that holds the bundled
-/// package's `manifest.json` and files.
-pub const BUNDLE_DIR_NAME: &str = "codex-app-server";
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -64,7 +63,7 @@ pub const MACOS_ARM64_TARGET: &str = "aarch64-apple-darwin";
 const RUNTIME_MANIFEST_FILE_TYPE_FILE: &str = "file";
 
 /// The current platform's manifest `target` identifier, or `None` when this
-/// host is neither of the two P0 targets the bundled package's manifest
+/// host is neither of the two P0 targets the installed package's manifest
 /// contract supports.
 pub fn current_target() -> Option<&'static str> {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
@@ -76,13 +75,6 @@ pub fn current_target() -> Option<&'static str> {
     }
 }
 
-/// `<current_exe parent>/codex-app-server`, the bundled package directory
-/// `resolve_runtime_binary` reads a `manifest.json` from when no explicit
-/// override is set.
-pub fn default_bundle_dir(current_exe: &Path) -> Option<PathBuf> {
-    current_exe.parent().map(|dir| dir.join(BUNDLE_DIR_NAME))
-}
-
 /// Every distinct, stable way runtime binary resolution (or, via
 /// [`classify_spawn_error`]/[`classify_handshake_failure`], the subsequent
 /// spawn/`initialize` handshake) can fail. Each variant is meant to be shown
@@ -92,10 +84,10 @@ pub fn default_bundle_dir(current_exe: &Path) -> Option<PathBuf> {
 pub enum RuntimeDistributionErrorCode {
     /// `HANE_CODEX_APP_SERVER` was set to a non-absolute path.
     ExplicitPathNotAbsolute,
-    /// The resolved candidate (explicit override, bundled manifest, or a
+    /// The resolved candidate (explicit override, installed manifest, or a
     /// file the manifest names) does not exist.
     Missing,
-    /// The bundled manifest's `target` does not match this host, or this
+    /// The installed manifest's `target` does not match this host, or this
     /// host is neither of the two P0 targets at all.
     UnsupportedTarget,
     /// A `files` inventory entry's computed `sha256` does not match the
@@ -108,7 +100,7 @@ pub enum RuntimeDistributionErrorCode {
     /// A candidate exists but is not a usable executable: not a regular
     /// file, empty, missing or unexpectedly carrying the executable
     /// permission bit (Unix) relative to its manifest `executable` flag, or
-    /// (for the bundled package) described by a `manifest.json` that is not
+    /// (for the installed package) described by a `manifest.json` that is not
     /// valid JSON, not `schema_version = 1`, missing a required contract
     /// field, or whose `files` inventory has an unknown `type`, a duplicate
     /// or out-of-bundle `path`, or no entry for `entrypoint` marked
@@ -144,7 +136,7 @@ pub enum RuntimeBinarySource {
 /// `path` relative to the manifest, its `type` (currently always `"file"`),
 /// declared `size` in bytes, `sha256`, and whether it must carry the
 /// executable attribute.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeManifestFile {
     pub path: String,
     #[serde(rename = "type")]
@@ -156,21 +148,21 @@ pub struct RuntimeManifestFile {
 
 /// One of the `runtime_profile`/`config_profile`/`state_profile` fields a
 /// manifest carries, identifying the sandbox/approval, configuration, or
-/// state profile the bundled App Server was packaged against.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// state profile the installed App Server was packaged against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeManifestProfile {
     pub name: String,
     #[serde(default)]
     pub notes: Option<String>,
 }
 
-/// The bundled package's `manifest.json` contract: `schema_version = 1`,
+/// The installed package's `manifest.json` contract: `schema_version = 1`,
 /// a `bundle_id`, naming the exact target triple, upstream
 /// `codex_version`/`source_commit`, the `archive_sha256` of the upstream
 /// archive it was extracted from, a `files` inventory, bundled `licenses`,
 /// and the `runtime_profile`/`config_profile`/`state_profile`. See the
 /// module docs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeManifest {
     pub schema_version: u32,
     pub bundle_id: String,
@@ -346,7 +338,7 @@ fn has_valid_relative_path(relative: &str) -> bool {
 /// Whether `value` is a well-formed lowercase-or-uppercase hex-encoded
 /// SHA-256 digest (64 hex digits), independent of whether it matches any
 /// particular file's actual content.
-fn is_sha256_hex(value: &str) -> bool {
+pub(crate) fn is_sha256_hex(value: &str) -> bool {
     let value = value.trim();
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -410,7 +402,7 @@ fn reject_symlink_escape(
 /// this additionally checks the raw `FILE_ATTRIBUTE_REPARSE_POINT` bit via
 /// [`std::os::windows::fs::MetadataExt::file_attributes`], which every
 /// reparse point carries regardless of its specific tag.
-fn check_not_symlink(path: &Path) -> Result<bool, RuntimeDistributionErrorCode> {
+pub(crate) fn check_not_symlink(path: &Path) -> Result<bool, RuntimeDistributionErrorCode> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -435,7 +427,7 @@ fn check_not_symlink(path: &Path) -> Result<bool, RuntimeDistributionErrorCode> 
 /// exist as a regular file of exactly the declared `size`, carry (or lack)
 /// the executable attribute exactly as declared (Unix only; Windows has no
 /// equivalent permission bit to check), and hash to the declared `sha256`.
-fn validate_inventory_file(
+pub(crate) fn validate_inventory_file(
     path: &Path,
     file: &RuntimeManifestFile,
 ) -> Result<(), RuntimeDistributionErrorCode> {
@@ -502,7 +494,7 @@ fn classify_io_error(error: &io::Error) -> RuntimeDistributionErrorCode {
     }
 }
 
-fn sha256_hex_of_file(path: &Path) -> Result<String, RuntimeDistributionErrorCode> {
+pub(crate) fn sha256_hex_of_file(path: &Path) -> Result<String, RuntimeDistributionErrorCode> {
     let mut file = std::fs::File::open(path).map_err(|error| classify_io_error(&error))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -1191,15 +1183,6 @@ mod tests {
         assert_eq!(
             classify_spawn_error(&io::Error::other("boom")),
             RuntimeDistributionErrorCode::InvalidExecutable
-        );
-    }
-
-    #[test]
-    fn default_bundle_dir_is_the_fixed_sibling_directory() {
-        let exe = Path::new("/opt/hane/hane");
-        assert_eq!(
-            default_bundle_dir(exe),
-            Some(PathBuf::from("/opt/hane/codex-app-server"))
         );
     }
 }

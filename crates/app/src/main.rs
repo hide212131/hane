@@ -8,11 +8,11 @@ use gpui::Focusable;
 use gpui::{App, AppContext, Bounds, Global, WindowBounds, WindowOptions, px, size};
 use hane_ai::{
     AiService, AiServiceConfig, EXPLICIT_OVERRIDE_ENV_VAR, OsCredentialStore,
-    ShellEnvironmentPolicyFormat, SystemBrowserOpener, default_bundle_dir, resolve_runtime_binary,
+    ShellEnvironmentPolicyFormat, SystemBrowserOpener, resolve_runtime_binary,
 };
 use hane_session::{FileStateStore, StateStores};
 use hane_ui::{AppAssets, EditorView, register_key_bindings};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(target_os = "windows")]
@@ -29,19 +29,21 @@ impl Global for AppOwnedAiService {}
 
 fn start_ai_service() -> Option<AiService> {
     let state = FileStateStore::from_environment().ok()?;
-    let current_exe = std::env::current_exe().ok()?;
-    let bundle_dir = default_bundle_dir(&current_exe)?;
     let explicit_override = std::env::var_os(EXPLICIT_OVERRIDE_ENV_VAR);
-    // Resolution failure must never prevent the Markdown editor from
-    // opening: a placeholder `binary_path` and the recorded diagnostic flow
-    // into the AI service's own single startup path (see
-    // `hane_ai::AiServiceConfig::binary_resolution_error`), which surfaces
-    // it to the user instead of spawning anything with it.
-    let (binary_path, binary_resolution_error) =
-        match resolve_runtime_binary(explicit_override.as_deref(), &bundle_dir) {
-            Ok(resolved) => (resolved.binary_path, None),
-            Err(code) => (PathBuf::new(), Some(code)),
-        };
+    // A runtime is never resolved from the Hane ZIP/.app. The only startup
+    // candidate is an explicit diagnostic override; otherwise the service
+    // starts with an empty placeholder and resolves Hane's app-data install
+    // directory without contacting the network. Resolution failure must
+    // never prevent the Markdown editor from opening.
+    let (binary_path, binary_resolution_error) = match explicit_override.as_deref() {
+        Some(explicit_override) => {
+            match resolve_runtime_binary(Some(explicit_override), Path::new("")) {
+                Ok(resolved) => (resolved.binary_path, None),
+                Err(code) => (PathBuf::new(), Some(code)),
+            }
+        }
+        None => (PathBuf::new(), None),
+    };
     AiService::spawn(AiServiceConfig {
         app_data_root: state.root().to_path_buf(),
         binary_path,

@@ -19,6 +19,7 @@ mod provider;
 mod rpc;
 mod runtime;
 mod runtime_distribution;
+mod runtime_install;
 mod secrets;
 mod service;
 mod settings;
@@ -62,7 +63,12 @@ pub use runtime::{
 pub use runtime_distribution::{
     EXPLICIT_OVERRIDE_ENV_VAR, ResolvedRuntimeBinary, RuntimeBinarySource,
     RuntimeDistributionErrorCode, RuntimeManifest, classify_handshake_failure,
-    classify_spawn_error, default_bundle_dir, resolve_runtime_binary,
+    classify_spawn_error, resolve_runtime_binary,
+};
+pub use runtime_install::{
+    ArchiveDownloader, ArchiveExtractor, CurlArchiveDownloader, RuntimeInstallErrorCode,
+    RuntimeInstallSpec, RuntimeInstallState, TarArchiveExtractor, install_runtime,
+    install_spec_for_current_target,
 };
 pub use secrets::{
     CredentialRef, CredentialStore, CredentialStoreError, FakeCredentialStore, OsCredentialStore,

@@ -14,7 +14,8 @@ use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiServiceHandle, AiSettings,
     AiSnapshot, ChatGptConnectionSettings, CustomConnectionSettings, LoginState, ModelListState,
     OperationId, OwnershipState, PersistenceState, ProbeErrorCode, ProbeStatus,
-    RuntimeDistributionErrorCode, SafeOperationResult, ServiceBusyReason,
+    RuntimeDistributionErrorCode, RuntimeInstallErrorCode, RuntimeInstallState,
+    SafeOperationResult, ServiceBusyReason,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -79,7 +80,7 @@ fn custom_key_guidance(edit: CredentialEdit, registered: bool) -> &'static str {
 }
 
 /// Distinct, user-facing Japanese labels for every
-/// `RuntimeDistributionErrorCode`, so a missing bundle, an unsupported
+/// `RuntimeDistributionErrorCode`, so a missing installed package, an unsupported
 /// target, a corrupted/tampered file, a permissions problem, an invalid
 /// executable, and a failed `initialize` handshake are never collapsed into
 /// one generic "AI is unavailable" message.
@@ -93,7 +94,7 @@ fn runtime_distribution_error_label(code: RuntimeDistributionErrorCode) -> &'sta
             "この環境向けのCodex App Serverに対応していません"
         }
         RuntimeDistributionErrorCode::IntegrityMismatch => {
-            "Codex App Serverの内容が同梱時の記録と一致しません"
+            "Codex App Serverの内容が導入時の記録と一致しません"
         }
         RuntimeDistributionErrorCode::AccessDenied => {
             "Codex App Serverへのアクセスが拒否されました"
@@ -104,6 +105,40 @@ fn runtime_distribution_error_label(code: RuntimeDistributionErrorCode) -> &'sta
         RuntimeDistributionErrorCode::InitializeFailed => {
             "Codex App Serverの初期化に失敗しました"
         }
+    }
+}
+
+fn runtime_install_error_label(code: RuntimeInstallErrorCode) -> &'static str {
+    match code {
+        RuntimeInstallErrorCode::UnsupportedTarget => {
+            "この環境向けの固定版Codex App Serverに対応していません"
+        }
+        RuntimeInstallErrorCode::DisallowedRedirectHost => {
+            "ダウンロード先のHTTPSホストが許可された範囲外です"
+        }
+        RuntimeInstallErrorCode::NetworkDownloadFailed => {
+            "固定版Codex App Serverを取得できませんでした"
+        }
+        RuntimeInstallErrorCode::SizeMismatch => "取得したアーカイブのサイズが一致しません",
+        RuntimeInstallErrorCode::IntegrityMismatch => {
+            "取得したアーカイブのSHA-256が一致しません"
+        }
+        RuntimeInstallErrorCode::ExtractionFailed => {
+            "アーカイブの安全な展開または内容検査に失敗しました"
+        }
+        RuntimeInstallErrorCode::AmbiguousEntrypoint => {
+            "実行入口を一意に特定できませんでした"
+        }
+        RuntimeInstallErrorCode::LicenseAuditIncomplete => {
+            "必要なLICENSE/NOTICEの監査が未完了のため導入を中止しました"
+        }
+        RuntimeInstallErrorCode::VerificationFailed => {
+            "導入候補の初期化・停止確認に失敗しました"
+        }
+        RuntimeInstallErrorCode::StagingFailed => {
+            "導入候補をHane専用領域へ安全に公開できませんでした"
+        }
+        RuntimeInstallErrorCode::Canceled => "導入を取り消しました",
     }
 }
 
@@ -832,7 +867,8 @@ impl AiSettingsPage {
                     )
                     .mb(px(6.0)),
             )
-            .child(self.current_connection_section(theme, cx));
+            .child(self.current_connection_section(theme, cx))
+            .child(self.runtime_install_section(theme, cx));
         if matches!(
             self.snapshot.ownership,
             OwnershipState::Unknown | OwnershipState::OwnedElsewhere | OwnershipState::Unavailable
@@ -924,6 +960,129 @@ impl AiSettingsPage {
             .overflow_hidden()
             .child(scroll)
             .children(savebar)
+    }
+
+    fn runtime_install_section(
+        &self,
+        theme: Theme,
+        cx: &mut Context<EditorView>,
+    ) -> impl IntoElement {
+        let (state_label, state_note) = match self.snapshot.runtime_install {
+            RuntimeInstallState::NotInstalled => (
+                "未導入",
+                "初回AI利用時に必要な固定版を、明示的な操作でHane専用領域へ導入します。",
+            ),
+            RuntimeInstallState::Downloading => (
+                "取得中",
+                "公式の固定版アーカイブを取得しています。完了するまで画面を閉じても処理は続きます。",
+            ),
+            RuntimeInstallState::Verifying => (
+                "検証中",
+                "サイズ、SHA-256、ファイル一覧、実行入口、ライセンス情報を検証しています。",
+            ),
+            RuntimeInstallState::Installed => (
+                "導入済み",
+                "検証済みのCodex App ServerをHane専用領域から使用します。",
+            ),
+            RuntimeInstallState::Failed(code) => ("導入に失敗", runtime_install_error_label(code)),
+        };
+        let service = self.service.clone();
+        let view = cx.entity();
+        let action = if let Some((operation, ServiceBusyReason::InstallingRuntime)) = self.snapshot.busy
+        {
+            let service_for_cancel = service.clone();
+            Button::new("ai-runtime-install-cancel")
+                .label("導入を取り消す")
+                .on_click(move |_, _, app| {
+                    if let Some(service) = &service_for_cancel
+                        && let Err(error) = service.cancel(operation)
+                    {
+                        view.update(app, |view, cx| {
+                            view.ai_settings.message = Some(admission_message(error));
+                            cx.notify();
+                        });
+                    }
+                })
+                .into_any_element()
+        } else {
+            let install_label = if matches!(
+                self.snapshot.runtime_install,
+                RuntimeInstallState::Failed(_)
+            ) {
+                "再試行"
+            } else {
+                "インストール"
+            };
+            Button::new("ai-runtime-install")
+                .label(install_label)
+                .primary()
+                .disabled(
+                    service.is_none()
+                        || self.snapshot.ownership != OwnershipState::Owned
+                        || self.snapshot.recovery_required
+                        || matches!(self.snapshot.runtime_install, RuntimeInstallState::Installed)
+                        || self.snapshot.busy.is_some(),
+                )
+                .on_click(move |_, _, app| {
+                    if let Some(service) = &service
+                        && let Err(error) = service.try_submit(AiCommand::InstallRuntime)
+                    {
+                        view.update(app, |view, cx| {
+                            view.ai_settings.message = Some(admission_message(error));
+                            cx.notify();
+                        });
+                    }
+                })
+                .into_any_element()
+        };
+        div()
+            .id("ai-runtime-install-section")
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(if theme.editor_background < 0x888888 {
+                0x373b43
+            } else {
+                theme.table_border
+            }))
+            .bg(rgb(if theme.editor_background < 0x888888 {
+                0x1e2126
+            } else {
+                theme.code_background
+            }))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(gpui_kit_assets::IconName::Sparkles)
+                                    .size(px(14.0))
+                                    .text_color(rgb(theme.link_foreground)),
+                            )
+                            .child(div().font_weight(gpui::FontWeight::MEDIUM).child("Codex App Server")),
+                    )
+                    .child(div().text_size(px(11.0)).child(state_label))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.quote_foreground))
+                            .child(state_note),
+                    ),
+            )
+            .child(action)
     }
 
     fn current_connection_section(
@@ -1514,7 +1673,7 @@ impl AiSettingsPage {
             OwnershipState::Unavailable => "利用不可",
         };
         let distribution = match self.snapshot.runtime_distribution_error {
-            None => "Codex App Server同梱版と実行中バージョン: 画面からは確認できません".to_owned(),
+            None => "Codex App Serverの導入状態: 上の導入欄に表示しています".to_owned(),
             Some(code) => format!(
                 "Codex App Serverの検出に失敗しました: {}",
                 runtime_distribution_error_label(code)
@@ -2903,6 +3062,10 @@ impl AiSettingsPage {
             Some("安全プロファイルの確認が終わるまで応答確認は使えません。".to_owned())
         } else if self.service.is_none() {
             Some("AIサービスを利用できません。Markdown編集は引き続き利用できます。".to_owned())
+        } else if matches!(self.snapshot.runtime_install, RuntimeInstallState::NotInstalled) {
+            Some("先にCodex App Serverの「インストール」を押してください。".to_owned())
+        } else if let RuntimeInstallState::Failed(code) = self.snapshot.runtime_install {
+            Some(format!("Codex App Serverを導入できません: {}", runtime_install_error_label(code)))
         } else if dirty {
             Some(
                 "未保存の変更があります。先に「保存して適用」するか、「変更を破棄」してください。"
@@ -3053,6 +3216,10 @@ impl AiSettingsPage {
                 ServiceBusyReason::TextTransform => (
                     "選択範囲をAIで処理中です",
                     "結果を確認できるまで、ほかのAI操作は実行できません。",
+                ),
+                ServiceBusyReason::InstallingRuntime => (
+                    "Codex App Serverを導入中です",
+                    "取得と検証が終わるまで、ほかのAI操作は実行できません。",
                 ),
             }
         } else if self.snapshot.persistence == PersistenceState::NotCommitted {
@@ -3382,6 +3549,8 @@ mod tests {
         assert!(cx.debug_bounds("ai-chatgpt-model-lock").is_some());
         assert!(cx.debug_bounds("ai-chatgpt-model-section").is_none());
         assert!(cx.debug_bounds("ai-settings-savebar").is_some());
+        assert!(cx.debug_bounds("ai-runtime-install-section").is_some());
+        assert!(cx.debug_bounds("ai-runtime-install").is_some());
 
         let api_key_connection = cx
             .debug_bounds("ai-connection-custom")
@@ -3516,6 +3685,7 @@ mod tests {
             view.ai_settings.snapshot.runtime_state = hane_ai::RuntimeState::Ready;
             view.ai_settings.snapshot.runtime_generation = 1;
             view.ai_settings.snapshot.configured_settings_generation = 1;
+            view.ai_settings.snapshot.runtime_install = RuntimeInstallState::Installed;
             cx.notify();
         });
         cx.run_until_parked();

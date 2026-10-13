@@ -67,6 +67,33 @@ impl AiPaths {
         self.root.join("user-prompts.lock")
     }
 
+    /// Where the first-use download/install flow (`crate::runtime_install`)
+    /// publishes a verified Codex App Server runtime: the directory
+    /// `crate::runtime_distribution::resolve_runtime_binary` reads a
+    /// `manifest.json` from when no explicit override is set. Never touched
+    /// until the user explicitly starts an install from the AI settings
+    /// screen; absent entirely before that.
+    pub fn runtime_install_dir(&self) -> PathBuf {
+        self.root.join("runtime")
+    }
+
+    /// Parent of every in-progress install's own staging directory (see
+    /// `create_runtime_install_staging`). Never read by
+    /// `resolve_runtime_binary`: a candidate only becomes visible there once
+    /// it is atomically moved into `runtime_install_dir`.
+    pub fn runtime_install_staging_root(&self) -> PathBuf {
+        self.root.join("runtime-staging")
+    }
+
+    /// Creates a fresh, empty, uniquely named staging directory for one
+    /// install attempt. The caller downloads, extracts, and verifies
+    /// entirely inside this directory and is responsible for removing it
+    /// (on cancellation or failure) or atomically replacing
+    /// `runtime_install_dir` with it (on success); no other code reads it.
+    pub fn create_runtime_install_staging(&self) -> std::io::Result<PathBuf> {
+        create_prefixed_workspace(&self.runtime_install_staging_root(), "install")
+    }
+
     pub fn chatgpt_codex_home(&self) -> PathBuf {
         self.root.join("codex-chatgpt")
     }
