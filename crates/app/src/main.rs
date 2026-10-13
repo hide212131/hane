@@ -7,8 +7,8 @@
 use gpui::Focusable;
 use gpui::{App, AppContext, Bounds, Global, WindowBounds, WindowOptions, px, size};
 use hane_ai::{
-    AiService, AiServiceConfig, OsCredentialStore, ShellEnvironmentPolicyFormat,
-    SystemBrowserOpener,
+    AiService, AiServiceConfig, EXPLICIT_OVERRIDE_ENV_VAR, OsCredentialStore,
+    ShellEnvironmentPolicyFormat, SystemBrowserOpener, default_bundle_dir, resolve_runtime_binary,
 };
 use hane_session::{FileStateStore, StateStores};
 use hane_ui::{AppAssets, EditorView, register_key_bindings};
@@ -29,23 +29,23 @@ impl Global for AppOwnedAiService {}
 
 fn start_ai_service() -> Option<AiService> {
     let state = FileStateStore::from_environment().ok()?;
-    let binary_path = std::env::var_os("HANE_CODEX_APP_SERVER")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let executable = std::env::current_exe().ok()?;
-            let directory = executable.parent()?;
-            #[cfg(target_os = "windows")]
-            let name = "codex-app-server.exe";
-            #[cfg(not(target_os = "windows"))]
-            let name = "codex-app-server";
-            Some(directory.join(name))
-        })?;
-    if !binary_path.is_absolute() {
-        return None;
-    }
+    let current_exe = std::env::current_exe().ok()?;
+    let bundle_dir = default_bundle_dir(&current_exe)?;
+    let explicit_override = std::env::var_os(EXPLICIT_OVERRIDE_ENV_VAR);
+    // Resolution failure must never prevent the Markdown editor from
+    // opening: a placeholder `binary_path` and the recorded diagnostic flow
+    // into the AI service's own single startup path (see
+    // `hane_ai::AiServiceConfig::binary_resolution_error`), which surfaces
+    // it to the user instead of spawning anything with it.
+    let (binary_path, binary_resolution_error) =
+        match resolve_runtime_binary(explicit_override.as_deref(), &bundle_dir) {
+            Ok(resolved) => (resolved.binary_path, None),
+            Err(code) => (PathBuf::new(), Some(code)),
+        };
     AiService::spawn(AiServiceConfig {
         app_data_root: state.root().to_path_buf(),
         binary_path,
+        binary_resolution_error,
         credential_store: Arc::new(OsCredentialStore::new("com.hide212131.hane.ai")),
         browser_opener: Arc::new(SystemBrowserOpener),
         shell_env_format: ShellEnvironmentPolicyFormat::Filters,

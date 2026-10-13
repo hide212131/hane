@@ -28,7 +28,10 @@ use crate::paths::AiPaths;
 use crate::probe::{ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
-use crate::runtime::{AiRuntime, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime::{AiRuntime, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime_distribution::{
+    RuntimeDistributionErrorCode, classify_handshake_failure, classify_spawn_error,
+};
 use crate::secrets::{CredentialRef, CredentialStore};
 use crate::settings::{ActiveConnection, AiSettings, AiSettingsStore, SaveError};
 use crate::text_transform::{
@@ -128,6 +131,12 @@ pub struct AiSnapshot {
     /// text-transform-triggered isolation never mutates the fixed Probe's
     /// own `probe_status`/`probe_result`.
     pub runtime_isolated: bool,
+    /// The most recent runtime binary resolution or spawn/`initialize`
+    /// handshake failure (see `crate::runtime_distribution`), distinct from
+    /// every other `RuntimeError`. Cleared as soon as the runtime next
+    /// reaches `RuntimeState::Ready`. `None` means resolution/startup has
+    /// not (yet, or currently) failed in a way this module classifies.
+    pub runtime_distribution_error: Option<RuntimeDistributionErrorCode>,
 }
 
 impl Default for AiSnapshot {
@@ -151,6 +160,7 @@ impl Default for AiSnapshot {
             probe_status: ProbeStatus::NotRun,
             probe_result: None,
             runtime_isolated: false,
+            runtime_distribution_error: None,
         }
     }
 }
@@ -474,6 +484,15 @@ impl BrowserOpener for SystemBrowserOpener {
 pub struct AiServiceConfig {
     pub app_data_root: PathBuf,
     pub binary_path: PathBuf,
+    /// Set by the caller (see `crates/app/src/main.rs::start_ai_service`)
+    /// when resolving the embedded Codex App Server binary itself already
+    /// failed (see
+    /// `crate::runtime_distribution::resolve_runtime_binary`), e.g. a
+    /// missing bundle or an unsupported target. When `Some`, `binary_path`
+    /// is a meaningless placeholder: every runtime start is short-circuited
+    /// before it is ever used, and this code is surfaced directly as
+    /// `AiSnapshot::runtime_distribution_error`.
+    pub binary_resolution_error: Option<RuntimeDistributionErrorCode>,
     pub credential_store: Arc<dyn CredentialStore>,
     pub browser_opener: Arc<dyn BrowserOpener>,
     pub shell_env_format: ShellEnvironmentPolicyFormat,
@@ -2017,6 +2036,9 @@ fn sync_runtime_snapshot(shared: &Arc<SharedServiceState>, runtime: &AiRuntime) 
         snapshot.runtime_state = status.state;
         snapshot.runtime_generation = status.generation;
         snapshot.configured_settings_generation = configured;
+        if status.state == RuntimeState::Ready {
+            snapshot.runtime_distribution_error = None;
+        }
     });
 }
 
@@ -2105,6 +2127,14 @@ fn open_settings(
     }
 }
 
+fn classify_runtime_start_error(error: &RuntimeError) -> Option<RuntimeDistributionErrorCode> {
+    match error {
+        RuntimeError::Spawn(io_error) => Some(classify_spawn_error(io_error)),
+        RuntimeError::Handshake(_) => Some(classify_handshake_failure()),
+        _ => None,
+    }
+}
+
 fn ensure_runtime<'a>(
     config: &AiServiceConfig,
     paths: &AiPaths,
@@ -2112,6 +2142,18 @@ fn ensure_runtime<'a>(
     shared: &Arc<SharedServiceState>,
     state: &'a mut WorkerState,
 ) -> Result<&'a AiRuntime, ()> {
+    // Resolution already failed before this `AiServiceConfig` was built (see
+    // `crates/app/src/main.rs::start_ai_service`): `binary_path` is a
+    // meaningless placeholder, so never reach a spawn attempt with it. Every
+    // AI operation goes through this one gate, so this alone surfaces the
+    // resolution diagnostic for all of them.
+    if let Some(code) = config.binary_resolution_error {
+        mutate(shared, |snapshot| {
+            snapshot.runtime_distribution_error = Some(code);
+            snapshot.ownership = OwnershipState::Unavailable;
+        });
+        return Err(());
+    }
     let needs_config = state.runtime.as_ref().is_none_or(|runtime| {
         runtime.configured_settings_generation() != settings.settings_generation
     });
@@ -2152,7 +2194,12 @@ fn ensure_runtime<'a>(
                 );
                 state.runtime_events = Some(event_rx);
                 let owner = state.owner_guard.take().ok_or(())?;
-                if runtime.start_with_owner_lock(owner).is_err() {
+                if let Err(error) = runtime.start_with_owner_lock(owner) {
+                    if let Some(code) = classify_runtime_start_error(&error) {
+                        mutate(shared, |snapshot| {
+                            snapshot.runtime_distribution_error = Some(code)
+                        });
+                    }
                     mutate(shared, |snapshot| {
                         snapshot.ownership = OwnershipState::Unknown
                     });
@@ -2183,13 +2230,21 @@ fn ensure_runtime<'a>(
         } else {
             runtime.start()
         };
-        if result.is_err() {
+        if let Err(error) = &result {
+            if let Some(code) = classify_runtime_start_error(error) {
+                mutate(shared, |snapshot| {
+                    snapshot.runtime_distribution_error = Some(code)
+                });
+            }
             mutate(shared, |snapshot| {
                 snapshot.ownership = OwnershipState::Unknown
             });
             return Err(());
         }
     }
+    mutate(shared, |snapshot| {
+        snapshot.runtime_distribution_error = None;
+    });
     state.runtime.as_ref().ok_or(())
 }
 

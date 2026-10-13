@@ -74,6 +74,7 @@ fn spawn_service(root: PathBuf, browser_opener: Arc<dyn BrowserOpener>) -> AiSer
     AiService::spawn(AiServiceConfig {
         app_data_root: root,
         binary_path: PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server")),
+        binary_resolution_error: None,
         credential_store: Arc::new(FakeCredentialStore::new()),
         browser_opener,
         shell_env_format: ShellEnvironmentPolicyFormat::Filters,
@@ -178,6 +179,7 @@ fn app_service_handles_early_login_completion_models_logout_and_view_recreation(
     let service = AiService::spawn(AiServiceConfig {
         app_data_root: data_root.clone(),
         binary_path: PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server")),
+        binary_resolution_error: None,
         credential_store: credential_store.clone(),
         browser_opener: browser.clone(),
         shell_env_format: ShellEnvironmentPolicyFormat::Filters,

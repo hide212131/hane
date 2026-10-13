@@ -14,7 +14,7 @@ use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiServiceHandle, AiSettings,
     AiSnapshot, ChatGptConnectionSettings, CustomConnectionSettings, LoginState, ModelListState,
     OperationId, OwnershipState, PersistenceState, ProbeErrorCode, ProbeStatus,
-    SafeOperationResult, ServiceBusyReason,
+    RuntimeDistributionErrorCode, SafeOperationResult, ServiceBusyReason,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -74,6 +74,35 @@ fn custom_key_guidance(edit: CredentialEdit, registered: bool) -> &'static str {
         }
         (CredentialEdit::Delete, _) => {
             "削除は「保存して適用」を押した後に確定します。保存前なら「元に戻す」で取り消せます。"
+        }
+    }
+}
+
+/// Distinct, user-facing Japanese labels for every
+/// `RuntimeDistributionErrorCode`, so a missing bundle, an unsupported
+/// target, a corrupted/tampered file, a permissions problem, an invalid
+/// executable, and a failed `initialize` handshake are never collapsed into
+/// one generic "AI is unavailable" message.
+fn runtime_distribution_error_label(code: RuntimeDistributionErrorCode) -> &'static str {
+    match code {
+        RuntimeDistributionErrorCode::ExplicitPathNotAbsolute => {
+            "HANE_CODEX_APP_SERVERには絶対パスを指定してください"
+        }
+        RuntimeDistributionErrorCode::Missing => "Codex App Serverの実行ファイルが見つかりません",
+        RuntimeDistributionErrorCode::UnsupportedTarget => {
+            "この環境向けのCodex App Serverに対応していません"
+        }
+        RuntimeDistributionErrorCode::IntegrityMismatch => {
+            "Codex App Serverの内容が同梱時の記録と一致しません"
+        }
+        RuntimeDistributionErrorCode::AccessDenied => {
+            "Codex App Serverへのアクセスが拒否されました"
+        }
+        RuntimeDistributionErrorCode::InvalidExecutable => {
+            "Codex App Serverの実行ファイルが不正です"
+        }
+        RuntimeDistributionErrorCode::InitializeFailed => {
+            "Codex App Serverの初期化に失敗しました"
         }
     }
 }
@@ -1484,6 +1513,13 @@ impl AiSettingsPage {
             OwnershipState::OwnedElsewhere => "別のHaneが管理中",
             OwnershipState::Unavailable => "利用不可",
         };
+        let distribution = match self.snapshot.runtime_distribution_error {
+            None => "Codex App Server同梱版と実行中バージョン: 画面からは確認できません".to_owned(),
+            Some(code) => format!(
+                "Codex App Serverの検出に失敗しました: {}",
+                runtime_distribution_error_label(code)
+            ),
+        };
         div()
             .id("ai-diagnostics-section")
             .w_full()
@@ -1503,7 +1539,7 @@ impl AiSettingsPage {
                 self.snapshot.configured_settings_generation,
                 self.snapshot.runtime_generation
             ))
-            .child("Codex App Server同梱版と実行中バージョン: 画面からは確認できません")
+            .child(distribution)
             .child("秘密のAPI key、token、auth URLは表示・記録しません")
     }
 
@@ -3451,6 +3487,7 @@ mod tests {
         let service = AiService::spawn(AiServiceConfig {
             app_data_root: app_data_root.clone(),
             binary_path: app_data_root.join("missing-codex-app-server"),
+            binary_resolution_error: None,
             credential_store: Arc::new(FakeCredentialStore::new()),
             browser_opener: Arc::new(SystemBrowserOpener),
             shell_env_format: ShellEnvironmentPolicyFormat::Filters,
