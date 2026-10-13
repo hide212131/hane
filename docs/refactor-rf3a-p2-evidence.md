@@ -2,11 +2,15 @@
 
 Issue: [#304](https://github.com/hide212131/hane/issues/304)
 
+実装PR: [#488（Draft）](https://github.com/hide212131/hane/pull/488)
+
 設計正本: [入力先判定の実装仕様](https://github.com/hide212131/hane/blob/cbf468b3d622f9c3f0f2823fdb5f03bc9cc58ee0/docs/refactor-rf3a-input-routing-implementation-spec.md)
 
 作業ブランチ: `refactor/rf3a-p2-input-routing-20261013`
 
 開始時のmain / branch base: `af981629011f04f68b25c8b58e476eb3eeffa624`（P1 PR #477 のmerge commit）
+
+この検証記録を初期化したPR head: `85343f1f66981b1ec4822aace8a42d44b47c2c5f`
 
 ## P2の範囲
 
@@ -16,7 +20,7 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 
 ## 開始時の状態
 
-この初期記録の作成時点で、P2の製品コード変更とP2テスト変更はまだない。PR #477のP1はmerge済みで、開始時のmainと作業ブランチは上記SHA。変更前のP2テスト一覧、テスト実行結果、CI、review、macOS / Windowsの実画面確認はまだ記録していない。
+初期PR head `85343f1f66981b1ec4822aace8a42d44b47c2c5f`には、この検証記録のみが追加されており、P2の製品コード変更とP2テスト変更はまだない。PR #477のP1はmerge済みで、開始時のmainと作業ブランチの親は上記SHA。変更前のP2テスト一覧、テスト実行結果、CI、review、macOS / Windowsの実画面確認はまだ記録していない。
 
 設計§9に沿い、最初の変更では既存handlerに対する契約テストを追加し、その変更前候補の検証を確認してから、別のコミットでP2 routingを変更する。
 
