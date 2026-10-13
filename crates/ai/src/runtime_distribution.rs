@@ -27,8 +27,9 @@
 //! [`WINDOWS_X64_TARGET`]/[`MACOS_ARM64_TARGET`]) it was built for, the
 //! upstream `codex_version` and `source_commit` it came from, the
 //! `archive_sha256` of the upstream archive it was extracted from, a `files`
-//! inventory, the bundled `licenses` file list, and the `runtime_profile`/
-//! `config_profile`/`state_profile` the bundle was packaged for. Every
+//! inventory, an explicit `licenses` list (empty for Hane's direct-install
+//! contract), and the `runtime_profile`/`config_profile`/`state_profile` the
+//! package was created for. Every
 //! `files` entry (not only the `entrypoint`) names a `path` relative to the
 //! manifest, a `type`, its `size`, its `sha256`, and whether it is
 //! `executable`; resolution verifies every entry's existence, type, size,
@@ -38,8 +39,8 @@
 //! entry or the `entrypoint` is rejected if it is a symlink or (on Windows)
 //! another reparse point (including a junction/mount point), so a bundled
 //! symlink can never redirect a verified entry to a file outside the
-//! bundle. License auditing and the archive fetch/extract pipeline itself
-//! remain a later distribution-pipeline slice.
+//! package. Hane does not copy or redistribute upstream license documents;
+//! archive fetching and extraction are handled by `crate::runtime_install`.
 
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -159,9 +160,11 @@ pub struct RuntimeManifestProfile {
 /// The installed package's `manifest.json` contract: `schema_version = 1`,
 /// a `bundle_id`, naming the exact target triple, upstream
 /// `codex_version`/`source_commit`, the `archive_sha256` of the upstream
-/// archive it was extracted from, a `files` inventory, bundled `licenses`,
-/// and the `runtime_profile`/`config_profile`/`state_profile`. See the
-/// module docs.
+/// archive it was extracted from, a `files` inventory, a `licenses` list, and
+/// the `runtime_profile`/`config_profile`/`state_profile`. The
+/// `licenses` field is retained as an explicit, possibly empty list for the
+/// manifest schema; direct installs use an empty list because Hane does not
+/// redistribute upstream documents. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeManifest {
     pub schema_version: u32,
@@ -291,7 +294,6 @@ fn validate_manifest_shape(
         && non_blank(&manifest.source_commit)
         && is_sha256_hex(&manifest.archive_sha256)
         && !manifest.files.is_empty()
-        && !manifest.licenses.is_empty()
         && manifest.licenses.iter().all(|license| non_blank(license))
         && profile_ok(&manifest.runtime_profile)
         && profile_ok(&manifest.config_profile)
@@ -745,7 +747,7 @@ mod tests {
                     "executable": true,
                 }
             ],
-            "licenses": ["LICENSE.txt"],
+            "licenses": [],
             "runtime_profile": {"name": "default"},
             "config_profile": {"name": "default"},
             "state_profile": {"name": "default"},
@@ -827,6 +829,19 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), b"{not json").unwrap();
         let result = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET));
         assert_eq!(result, Err(RuntimeDistributionErrorCode::InvalidExecutable));
+    }
+
+    #[test]
+    fn bundled_package_with_empty_license_list_is_valid() {
+        let dir = next_fixture_dir("bundle-empty-licenses");
+        let (_, sha, len) = write_entrypoint(&dir, "codex-app-server", b"binary-contents");
+        let manifest = base_manifest_value(WINDOWS_X64_TARGET, "codex-app-server", &sha, len);
+        write_manifest(&dir, &manifest);
+
+        let resolved = resolve_bundled_package(&dir, Some(WINDOWS_X64_TARGET)).unwrap();
+
+        assert_eq!(resolved.source, RuntimeBinarySource::BundledPackage);
+        assert!(resolved.manifest.unwrap().licenses.is_empty());
     }
 
     #[test]

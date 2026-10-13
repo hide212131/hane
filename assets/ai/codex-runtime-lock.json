@@ -11,7 +11,6 @@
       "archive_sha256": "7ca926f4fc443c0ead83109314e9a97bf43d2da276be147f1919a4b5e62dfa8b",
       "entrypoint_name": "codex-app-server.exe",
       "inventory": "inventory/x86_64-pc-windows-msvc-0.157.1.json",
-      "licenses": [],
       "runtime_profile": { "name": "default" },
       "config_profile": { "name": "default" },
       "state_profile": { "name": "default" }
@@ -22,7 +21,6 @@
       "archive_sha256": "9a6033c9fe30260e71d784d003ad1e2de2a55c93e24a24856e8433029a3f811a",
       "entrypoint_name": "codex-app-server",
       "inventory": "inventory/aarch64-apple-darwin-0.157.1.json",
-      "licenses": [],
       "runtime_profile": { "name": "default" },
       "config_profile": { "name": "default" },
       "state_profile": { "name": "default" }

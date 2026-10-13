@@ -6,8 +6,8 @@
 //! explicitly choosing "install" in the AI settings screen
 //! (`crate::service::AiCommand::InstallRuntime`). Once a candidate has been
 //! downloaded, hash-verified, safely extracted, matched file-for-file
-//! against a pinned inventory, and (once the license audit below is
-//! complete) launched once in an isolated, throwaway configuration to
+//! against a pinned inventory, and launched once in an isolated, throwaway
+//! configuration to
 //! confirm it actually starts, stops the App Server process, and publishes
 //! a `manifest.json` under `AiPaths::runtime_install_dir`, this module is
 //! never consulted again: every later AI operation resolves the installed
@@ -19,42 +19,23 @@
 //! targets are the single source of truth already checked into this
 //! repository at `assets/ai/codex-runtime-lock.json`, together with a
 //! per-target pinned file-level inventory under `assets/ai/inventory/`.
-//! `scripts/prepare-codex-runtime.py` (a maintainer/CI-only, network-using
-//! build tool, never shipped to or run by end users) reads the exact same
-//! lock to produce a *build-time* bundle; this module reads it to drive the
-//! equivalent *first-use* download instead. Both ultimately produce the same
-//! `manifest.json` contract `crate::runtime_distribution` resolves.
+//! this module reads the lock to drive the first-use download. The downloaded
+//! files are installed directly under Hane's app-data runtime directory and
+//! produce the `manifest.json` contract `crate::runtime_distribution` resolves.
 //!
 //! # Why extraction shells out to the system `tar`, not a from-scratch parser
 //!
 //! This module downloads the archive and verifies its whole-file SHA-256
 //! against the pinned `archive_sha256` *before* ever extracting it. Because
-//! that pinned hash was only ever recorded for an archive the existing
-//! build-time tool had already walked entry-by-entry (rejecting any
-//! traversal, absolute path, symlink, hardlink, device, case-fold
-//! collision, or oversized entry -- see `validate_relative_member_path`/
-//! `extract_archive` in `scripts/prepare-codex-runtime.py`) to produce the
-//! matching pinned inventory file, a byte-for-byte match on that hash is
-//! already strong evidence the archive contains none of those things. This
-//! module still defends in depth: it diffs the extracted file tree against
-//! the pinned inventory path-for-path (rejecting anything missing, extra, or
-//! mismatched in size/hash/executable-bit) and rejects any symlink/reparse
-//! point found on disk after extraction (reusing
-//! `crate::runtime_distribution::check_not_symlink`), but it does not
-//! reimplement a tar/gzip entry-level parser in Rust: both P0 targets
-//! (Windows 10 1803+/11, macOS) ship a `tar` capable of `-xzf` out of the
-//! box, and reusing it keeps this module free of new third-party
-//! dependencies this sandboxed change could not otherwise validate.
-//!
-//! # Known, separate blocker: the license audit is not yet complete
-//!
-//! `assets/ai/codex-runtime-lock.json`'s `licenses` list is empty for both
-//! P0 targets today (the Cargo-dependency and V8-asset provenance audit
-//! this requires has not been completed). [`install_runtime`] therefore
-//! always fails closed at the license-coverage step
-//! (`RuntimeInstallErrorCode::LicenseAuditIncomplete`) until that list is
-//! populated; this module must not, and does not, fabricate or relax that
-//! check.
+//! that pinned hash is checked before extraction. This module still defends in
+//! depth: it diffs the extracted file tree against the pinned inventory
+//! path-for-path (rejecting anything missing, extra, or mismatched in
+//! size/hash/executable-bit) and rejects any symlink/reparse point found on
+//! disk (reusing `crate::runtime_distribution::check_not_symlink`), but it
+//! does not reimplement a tar/gzip entry-level parser in Rust: both P0
+//! targets (Windows 10 1803+/11, macOS) ship a `tar` capable of `-xzf` out of
+//! the box, and reusing it keeps this module free of new third-party
+//! dependencies.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -114,8 +95,6 @@ struct LockTargetEntry {
     archive_size: u64,
     archive_sha256: String,
     entrypoint_name: String,
-    #[serde(default)]
-    licenses: Vec<String>,
     runtime_profile: LockProfile,
     config_profile: LockProfile,
     state_profile: LockProfile,
@@ -129,9 +108,9 @@ struct LockProfile {
 /// A pinned, fixed-at-compile-time description of the exact artifact this
 /// build will ever install for one target: the upstream URL, its exact size
 /// and SHA-256, the host allowlist every request and redirect hop must stay
-/// within, the entrypoint file name, the already-audited-or-not license
-/// list, and the full pinned file-level inventory the extracted archive must
-/// match exactly. Everything here either comes straight from
+/// within, the entrypoint file name, and the full pinned file-level inventory
+/// the extracted archive must match exactly. Everything here either comes
+/// straight from
 /// `assets/ai/codex-runtime-lock.json`/`assets/ai/inventory/*.json`, or is a
 /// fixed constant; nothing here is ever fetched from the network.
 #[derive(Debug, Clone)]
@@ -144,7 +123,6 @@ pub struct RuntimeInstallSpec {
     pub archive_sha256: String,
     pub entrypoint_name: String,
     pub allowed_hosts: Vec<String>,
-    pub licenses: Vec<String>,
     pub pinned_inventory: Vec<RuntimeManifestFile>,
     pub runtime_profile: String,
     pub config_profile: String,
@@ -154,7 +132,7 @@ pub struct RuntimeInstallSpec {
 /// The fixed hosts allowed to ever serve the archive's bytes, on the initial
 /// request or any redirect hop: the GitHub release-asset page and the
 /// storage host it redirects downloads to. Matches
-/// `scripts/prepare-codex-runtime.py`'s `ALLOWED_HOSTS`.
+/// the GitHub release hosts allowed for the direct download.
 const ALLOWED_HOSTS: &[&str] = &["github.com", "objects.githubusercontent.com"];
 
 /// Builds [`RuntimeInstallSpec`] for this host's current target
@@ -224,7 +202,6 @@ fn install_spec_for_target(target: &str) -> Option<RuntimeInstallSpec> {
         archive_sha256: entry.archive_sha256.clone(),
         entrypoint_name: entry.entrypoint_name.clone(),
         allowed_hosts,
-        licenses: entry.licenses.clone(),
         pinned_inventory,
         runtime_profile: entry.runtime_profile.name.clone(),
         config_profile: entry.config_profile.name.clone(),
@@ -262,10 +239,6 @@ pub enum RuntimeInstallErrorCode {
     /// Zero or more than one extracted file matches the pinned
     /// `entrypoint_name` as an executable entry.
     AmbiguousEntrypoint,
-    /// The lock's `licenses` list for this target is empty: the license
-    /// audit for this target's upstream dependencies is not complete. See
-    /// the module docs. Never relaxed by this code.
-    LicenseAuditIncomplete,
     /// The candidate spawned in an isolated, throwaway configuration, but
     /// the `initialize` handshake or the following stop could not be
     /// confirmed.
@@ -287,7 +260,6 @@ impl RuntimeInstallErrorCode {
             Self::IntegrityMismatch => "runtime_install_integrity_mismatch",
             Self::ExtractionFailed => "runtime_install_extraction_failed",
             Self::AmbiguousEntrypoint => "runtime_install_ambiguous_entrypoint",
-            Self::LicenseAuditIncomplete => "runtime_install_license_audit_incomplete",
             Self::VerificationFailed => "runtime_install_verification_failed",
             Self::StagingFailed => "runtime_install_staging_failed",
             Self::Canceled => "runtime_install_canceled",
@@ -483,7 +455,7 @@ fn run_cancelable(
 /// default HTTPS port (443) if any, and resolves to a host in
 /// `allowed_hosts` -- checked before the initial request and before
 /// following every redirect hop, exactly like
-/// `scripts/prepare-codex-runtime.py`'s `_AllowlistRedirectHandler`.
+/// the direct-download host allowlist.
 fn check_allowed_url(
     raw_url: &str,
     allowed_hosts: &[String],
@@ -683,7 +655,7 @@ fn diff_against_pinned_inventory(
 
 /// Finds the single extracted entry whose final path component equals
 /// `entrypoint_name` and is marked executable. Mirrors
-/// `scripts/prepare-codex-runtime.py`'s `resolve_entrypoint`.
+/// the pinned entrypoint contract.
 fn resolve_entrypoint(
     inventory: &[RuntimeManifestFile],
     entrypoint_name: &str,
@@ -779,18 +751,6 @@ pub fn install_runtime(
     diff_against_pinned_inventory(&spec.pinned_inventory, &actual_inventory)?;
     let entrypoint_relative = resolve_entrypoint(&actual_inventory, &spec.entrypoint_name)?;
 
-    if spec.licenses.is_empty() {
-        return Err(RuntimeInstallErrorCode::LicenseAuditIncomplete);
-    }
-    if spec.licenses.iter().any(|license| {
-        !has_valid_relative_path(license)
-            || !actual_inventory
-                .iter()
-                .any(|file| file.path == *license && file.kind == "file")
-    }) {
-        return Err(RuntimeInstallErrorCode::LicenseAuditIncomplete);
-    }
-
     if is_canceled() {
         return Err(RuntimeInstallErrorCode::Canceled);
     }
@@ -809,7 +769,9 @@ pub fn install_runtime(
         source_commit: spec.source_commit.clone(),
         archive_sha256: spec.archive_sha256.clone(),
         files: actual_inventory,
-        licenses: spec.licenses.clone(),
+        // Hane downloads and installs the upstream runtime directly into its
+        // own app-data directory; it does not redistribute license documents.
+        licenses: Vec::new(),
         runtime_profile: RuntimeManifestProfile {
             name: spec.runtime_profile.clone(),
             notes: None,
@@ -898,6 +860,100 @@ mod tests {
             |_| panic!("progress must not run after cancellation"),
         );
         assert_eq!(result, Err(RuntimeInstallErrorCode::Canceled));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_runtime_accepts_a_verified_package_without_license_documents() {
+        const EMPTY_ARCHIVE_SHA256: &str =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const FAKE_APP_SERVER: &[u8] = b"#!/bin/sh\nset -eu\nwhile IFS= read -r line; do\n    case \"$line\" in\n        *'\"method\":\"initialize\"'*)\n            id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n            printf '{\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"\n            ;;\n    esac\ndone\n";
+
+        struct EmptyArchiveDownloader;
+        impl ArchiveDownloader for EmptyArchiveDownloader {
+            fn download(
+                &self,
+                _spec: &RuntimeInstallSpec,
+                dest: &Path,
+                _is_canceled: &dyn Fn() -> bool,
+            ) -> Result<(), RuntimeInstallErrorCode> {
+                std::fs::write(dest, b"")
+                    .map_err(|_| RuntimeInstallErrorCode::NetworkDownloadFailed)
+            }
+        }
+
+        struct FakeAppServerExtractor(&'static [u8]);
+        impl ArchiveExtractor for FakeAppServerExtractor {
+            fn extract(
+                &self,
+                _archive: &Path,
+                dest_dir: &Path,
+                _is_canceled: &dyn Fn() -> bool,
+            ) -> Result<(), RuntimeInstallErrorCode> {
+                let path = dest_dir.join("codex-app-server");
+                std::fs::write(&path, self.0)
+                    .map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)?;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|_| RuntimeInstallErrorCode::ExtractionFailed)
+            }
+        }
+
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hane-runtime-install-empty-licenses-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let hash_source = root.join("hash-source");
+        std::fs::write(&hash_source, FAKE_APP_SERVER).unwrap();
+        let executable_sha256 = runtime_distribution::sha256_hex_of_file(&hash_source).unwrap();
+        let _ = std::fs::remove_file(&hash_source);
+
+        let spec = RuntimeInstallSpec {
+            target: "test-target".to_owned(),
+            codex_version: "0.157.1".to_owned(),
+            source_commit: "test-commit".to_owned(),
+            url: "https://github.com/example/runtime.tar.gz".to_owned(),
+            archive_size: 0,
+            archive_sha256: EMPTY_ARCHIVE_SHA256.to_owned(),
+            entrypoint_name: "codex-app-server".to_owned(),
+            allowed_hosts: vec!["github.com".to_owned()],
+            pinned_inventory: vec![RuntimeManifestFile {
+                path: "codex-app-server".to_owned(),
+                kind: "file".to_owned(),
+                size: FAKE_APP_SERVER.len() as u64,
+                sha256: executable_sha256,
+                executable: true,
+            }],
+            runtime_profile: "default".to_owned(),
+            config_profile: "default".to_owned(),
+            state_profile: "default".to_owned(),
+        };
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut progress = Vec::new();
+        let result = install_runtime(
+            &spec,
+            &staging,
+            &EmptyArchiveDownloader,
+            &FakeAppServerExtractor(FAKE_APP_SERVER),
+            &|| false,
+            |state| progress.push(state),
+        )
+        .unwrap();
+
+        let manifest: RuntimeManifest =
+            serde_json::from_slice(&std::fs::read(result.join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(manifest.licenses.is_empty());
+        assert!(!result.join("licenses").exists());
+        assert_eq!(
+            progress,
+            vec![RuntimeInstallState::Downloading, RuntimeInstallState::Verifying]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

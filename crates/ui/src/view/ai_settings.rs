@@ -129,9 +129,6 @@ fn runtime_install_error_label(code: RuntimeInstallErrorCode) -> &'static str {
         RuntimeInstallErrorCode::AmbiguousEntrypoint => {
             "実行入口を一意に特定できませんでした"
         }
-        RuntimeInstallErrorCode::LicenseAuditIncomplete => {
-            "必要なLICENSE/NOTICEの監査が未完了のため導入を中止しました"
-        }
         RuntimeInstallErrorCode::VerificationFailed => {
             "導入候補の初期化・停止確認に失敗しました"
         }
@@ -978,7 +975,7 @@ impl AiSettingsPage {
             ),
             RuntimeInstallState::Verifying => (
                 "検証中",
-                "サイズ、SHA-256、ファイル一覧、実行入口、ライセンス情報を検証しています。",
+                "サイズ、SHA-256、ファイル一覧、実行入口、安全な展開を検証しています。",
             ),
             RuntimeInstallState::Installed => (
                 "導入済み",
