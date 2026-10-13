@@ -44,7 +44,15 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 |---|---|---|
 | `8cac74fe702b2f075010fbf81ee2b2191f895dc6` | [38422215097](https://github.com/hide212131/hane/actions/runs/38422215097) | macOS 26 arm64 runner。workspace tests 455 passed / 0 failed、Clippy成功。Enter / Shift+Enter、Tab / Shift+Tab、上下、Escape、tab切替、F3の一部をresolverへ接続した部分候補。diff監査で §6 の DocumentStart/End、SelectDocumentStart/End、Undo/Redo の6 actionが旧guardのままと判明したため、P2受入候補としては未完了。 |
 
-この6 actionはfilter / renameが対象のとき本文だけの操作を行わず、本文へfall throughもしない契約を追加テストで先に固定してからroutingを接続する。
+この6 actionは、filter / rename中に本文操作も履歴操作も行わない変更前契約を `0f1edda0` で固定・検証した。その後、以下の候補で同じ既存guardの後にresolverを使うよう接続した。
+
+## P2 routing候補
+
+| Candidate head | Workflow run | 結果 |
+|---|---|---|
+| `b1f27640a5699ce8d6963542b588fcf96d0def00` | [38427825319](https://github.com/hide212131/hane/actions/runs/38427825319) | DocumentStart/End、SelectDocumentStart/End、Undo/Redoを共通resolverへ接続。macOS 26 arm64 runner、workspace tests 457 passed / 0 failed、Clippy成功 |
+
+この候補では対象P2 actionすべてが共通の `input_target()` を使う。P2の受入判定はcurrent-headのPR CI、独立review、必要なmacOS / Windows実画面確認、旧分岐とdiff監査の完了後に行う。
 
 ## 検証状況
 
@@ -53,10 +61,11 @@ P3のplatform入力8 callback、capture登録判定、IME接続、および文�
 | P2契約テストの追加（R07–R10、対象R12、§6本文専用6 action） | 完了（対応するrouting変更前） | [PR #488](https://github.com/hide212131/hane/pull/488)、特に[run 38424963164](https://github.com/hide212131/hane/actions/runs/38424963164) |
 | 変更前P2候補の workspace tests / Clippy | 完了。最終候補は455 passed、Clippy成功 | [run 38419394944](https://github.com/hide212131/hane/actions/runs/38419394944) |
 | P2 routing部分候補のworkspace tests / Clippy | 成功（ただし§6の6 action未接続につき部分結果） | [run 38422215097](https://github.com/hide212131/hane/actions/runs/38422215097) |
+| P2 routing全対象の候補workspace tests / Clippy | 成功。workspace tests 457 passed、Clippy成功（macOSのみ） | [run 38427825319](https://github.com/hide212131/hane/actions/runs/38427825319) |
 | routing変更後のcurrent-head CI（macOS / Windowsを含む該当check） | 未実施 | — |
 | routing変更後のcurrent-head独立review | 未実施 | — |
 | macOSの変更対象キー入力・日本語IMEの実画面確認 | 未実施 | — |
 | Windowsの変更対象キー入力・日本語IMEの実画面確認 | 未実施 | — |
 | 最終diff・旧分岐・復旧方法の確認 | 未実施 | — |
 
-「未実施」は失敗・成功のどちらも意味しない。未接続の6 actionには変更前テストを追加・検証済み。routing変更後の候補head、実行環境、コマンド、終了状態、およびリンクを証拠が得られた時点で追記する。未確認をpassとして扱わず、Issue #304はP1–P3全体の受入までopenのままとする。
+「未実施」は失敗・成功のどちらも意味しない。§6の6 actionにはrouting変更前テストを追加・検証し、routing変更後候補 `b1f27640` のworkspace tests / ClippyもmacOSで成功した。Windowsを含むcurrent-head CI、GUI確認、独立reviewは別途記録し、未確認をpassへ変えない。未確認をpassとして扱わず、Issue #304はP1–P3全体の受入までopenのままとする。
