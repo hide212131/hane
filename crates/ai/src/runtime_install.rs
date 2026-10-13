@@ -687,8 +687,11 @@ fn verify_candidate_runtime(
     verify_root: &Path,
 ) -> Result<(), RuntimeInstallErrorCode> {
     std::fs::create_dir_all(verify_root).map_err(|_| RuntimeInstallErrorCode::VerificationFailed)?;
+    let codex_home = verify_root.join("codex-home");
+    std::fs::create_dir_all(&codex_home)
+        .map_err(|_| RuntimeInstallErrorCode::VerificationFailed)?;
     let mut config = RuntimeConfig::new(entrypoint, verify_root.join("owner.lock"));
-    config.codex_home = Some(verify_root.join("codex-home"));
+    config.codex_home = Some(codex_home);
     config.inherit_parent_home = false;
     config.working_directory = Some(verify_root.join("workspace"));
     config.start_timeout = VERIFY_START_TIMEOUT;
@@ -876,12 +879,32 @@ mod tests {
         assert_eq!(result, Err(RuntimeInstallErrorCode::Canceled));
     }
 
+    #[test]
+    fn candidate_verification_fails_closed_when_codex_home_cannot_be_created() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let verify_root = std::env::temp_dir().join(format!(
+            "hane-runtime-install-codex-home-failure-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&verify_root).unwrap();
+        std::fs::write(verify_root.join("codex-home"), b"not a directory").unwrap();
+
+        let result = verify_candidate_runtime(
+            Path::new("/missing/codex-app-server"),
+            &verify_root,
+        );
+
+        assert_eq!(result, Err(RuntimeInstallErrorCode::VerificationFailed));
+        let _ = std::fs::remove_dir_all(verify_root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_runtime_accepts_a_verified_package_without_license_documents() {
         const EMPTY_ARCHIVE_SHA256: &str =
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        const FAKE_APP_SERVER: &[u8] = b"#!/bin/sh\nset -eu\nwhile IFS= read -r line; do\n    case \"$line\" in\n        *'\"method\":\"initialize\"'*)\n            id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n            printf '{\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"\n            ;;\n    esac\ndone\n";
+        const FAKE_APP_SERVER: &[u8] = b"#!/bin/sh\nset -eu\ntest -d \"${CODEX_HOME:?}\"\nwhile IFS= read -r line; do\n    case \"$line\" in\n        *'\"method\":\"initialize\"'*)\n            id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n            printf '{\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"\n            ;;\n    esac\ndone\n";
 
         struct EmptyArchiveDownloader;
         impl ArchiveDownloader for EmptyArchiveDownloader {
