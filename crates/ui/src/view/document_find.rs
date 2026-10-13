@@ -1283,6 +1283,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn escape_closes_content_search_first_and_leaves_the_find_bar_as_the_next_escape_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        // Open Content Search first, then the find bar on top of it: opening
+        // the find bar only blurs Content Search's own focus flags (see
+        // `opening_the_find_bar_clears_content_search_input_focus` above), it
+        // never closes the sidebar, so both can report a leave-on-escape
+        // candidate for the same Escape at once — a real state reachable
+        // through the existing public open paths, not a synthetic one.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.content_search_sidebar_visible());
+            assert!(view.document_find.open);
+            // Both overlays are simultaneously willing to leave on the same
+            // Escape: this is the ambiguous-priority state this test guards.
+            assert!(view.content_search_should_leave_on_escape());
+            assert!(view.document_find_should_leave_on_escape());
+        });
+
+        // `CancelComposition`'s handler in `actions.rs` checks Content
+        // Search's `content_search_should_leave_on_escape` before the find
+        // bar's `document_find_should_leave_on_escape`, so only Content
+        // Search must close on this Escape.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.content_search_sidebar_visible());
+            // The find bar is untouched: it is the next Escape's candidate,
+            // not closed alongside Content Search on this one.
+            assert!(view.document_find.open);
+            assert!(view.document_find_should_leave_on_escape());
+        });
+
+        // A second, separate Escape then reaches the find bar and closes it,
+        // confirming it really was next in line rather than coincidentally
+        // still open.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
+        });
+    }
+
+    #[gpui::test]
     fn an_empty_query_reports_no_result_without_scanning(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("aa aa aa\n", "Untitled", cx));
