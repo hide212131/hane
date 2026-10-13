@@ -338,6 +338,10 @@ impl ArchiveDownloader for CurlArchiveDownloader {
             let mut command = Command::new("curl");
             apply_no_console_window(&mut command);
             command.arg("--silent");
+            // Keep the proxy's CONNECT response out of the -D header dump.
+            // The response is still parsed defensively below because curl can
+            // expose more than one HTTP response block in proxy setups.
+            command.arg("--suppress-connect-headers");
             command.arg("--proto").arg("=https");
             command
                 .arg("--max-time")
@@ -490,17 +494,37 @@ fn resolve_redirect_url(current: &str, location: &str) -> Result<String, Runtime
     Ok(resolved.into())
 }
 
-/// Parses the status code from the first line of a curl `-D`-dumped header
-/// block (`HTTP/1.1 302 Found\r\n...`).
+/// Returns the final HTTP response block from a curl `-D`-dumped header.
+///
+/// A proxy can prepend a `200 Connection established` block before the
+/// release response, so the first block is not necessarily the response for
+/// the requested URL. Curl uses CRLF, but accepting LF as well keeps this
+/// parser straightforward to exercise and defensive for alternate transports.
+fn last_http_response_block(headers: &str) -> Option<String> {
+    let normalized = headers.replace("\r\n", "\n");
+    normalized
+        .split("\n\n")
+        .filter(|block| {
+            block
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim_start().starts_with("HTTP/"))
+        })
+        .next_back()
+        .map(str::to_owned)
+}
+
+/// Parses the status code from the final response block in a curl `-D`-dumped
+/// header (`HTTP/1.1 302 Found\r\n...`).
 fn parse_http_status(headers: &str) -> Option<u16> {
-    let first_line = headers.lines().next()?;
+    let first_line = last_http_response_block(headers)?.lines().next()?.trim();
     first_line.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Finds the value of the header named `name` (case-insensitive) in a curl
-/// `-D`-dumped header block.
+/// Finds the value of the header named `name` (case-insensitive) in the final
+/// response block of a curl `-D`-dumped header.
 fn find_header_value(headers: &str, name: &str) -> Option<String> {
-    headers.lines().find_map(|line| {
+    last_http_response_block(headers)?.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         if key.trim().eq_ignore_ascii_case(name) {
             Some(value.trim().to_string())
@@ -836,6 +860,38 @@ mod tests {
         .is_err());
         assert!(check_allowed_url("https://github.com:8443/package.tar.gz", &allowed).is_err());
         assert!(check_allowed_url("https://user:secret@github.com/package.tar.gz", &allowed).is_err());
+    }
+
+    #[test]
+    fn proxy_connect_response_is_ignored_when_parsing_a_release_redirect() {
+        let headers = concat!(
+            "HTTP/1.1 200 Connection established\r\n",
+            "Proxy-Agent: test-proxy\r\n",
+            "\r\n",
+            "HTTP/1.1 302 Found\r\n",
+            "Location: https://release-assets.githubusercontent.com/archive.tar.gz\r\n",
+            "\r\n",
+        );
+
+        assert_eq!(parse_http_status(headers), Some(302));
+        assert_eq!(
+            find_header_value(headers, "location"),
+            Some("https://release-assets.githubusercontent.com/archive.tar.gz".to_owned())
+        );
+    }
+
+    #[test]
+    fn proxy_connect_response_is_ignored_when_parsing_the_final_success() {
+        let headers = concat!(
+            "HTTP/1.1 200 Connection established\n",
+            "\n",
+            "HTTP/2 200\n",
+            "content-length: 123\n",
+            "\n",
+        );
+
+        assert_eq!(parse_http_status(headers), Some(200));
+        assert_eq!(find_header_value(headers, "location"), None);
     }
 
     #[test]
