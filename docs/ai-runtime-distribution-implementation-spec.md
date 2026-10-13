@@ -8,15 +8,15 @@
 
 現在の`main.rs::start_ai_service`は実行ファイルの位置を決めて`AiService`へ渡す。`AiService`が設定・認証・モデル・接続確認・選択文処理を管理し、`AiRuntime`が子プロセスの開始/終了を直列化する。これらを置換する第二のAIサービスは作らない。[C1][C2]
 
-P0では同梱・位置解決・診断・配布物試験を実装する。P1では専用領域への導入/修復/更新を加える。対象はWindows x64、macOS arm64。Linux/Windows arm64/macOS Intelの追加、文書モデル、汎用Pluginは対象外。
+P0では、AI設定画面の明示操作を入口に、固定版の完全App Server packageを取得・検査し、Hane専用領域へ初回導入する。初回のAI利用にはインターネット接続を必須とする。Hane ZIP / .appへruntime実行ファイルは同梱しない。P1では専用領域の修復、署名済みカタログからの更新、旧版復旧を加える。対象はWindows x64、macOS arm64。Linux/Windows arm64/macOS Intelの追加、文書モデル、汎用Pluginは対象外。
 
-AI用プログラムの異常はAI機能だけの異常とし、エディタ起動、ファイル操作、保存を妨げない。起動直後にネットワークへ更新確認を行わない。
+初回導入をアプリ起動時に自動実行しない。利用者がAI設定の「インストール」を押したときだけネットワークへ接続する。AI用プログラムの異常はAI機能だけの異常とし、エディタ起動、ファイル操作、保存を妨げない。
 
 ## 2. 固定する初期配布物
 
 ### 2.1 取得情報
 
-初期候補は公式`rust-v0.157.1`の**完全App Serverパッケージ**。通常CLI用`codex-package-*`やbare standaloneのアーカイブとは別物である。2026-10-13にGitHub Releaseの資産メタデータを確認した。[O1]
+初回導入は公式`rust-v0.157.1`の**完全App Serverパッケージ**をHaneからオンデマンド取得する。通常CLI用`codex-package-*`やbare standalone archiveとは別物である。2026-10-13にGitHub Releaseの資産メタデータを確認し、固定バイト列を取得してarchive全体のSHA-256とファイルinventoryが一致することも確認した。[O1]
 
 | 項目 | Windows x64 | macOS arm64 |
 |---|---|---|
@@ -27,11 +27,9 @@ AI用プログラムの異常はAI機能だけの異常とし、エディタ起�
 | SHA-256 | `7ca926f4fc443c0ead83109314e9a97bf43d2da276be147f1919a4b5e62dfa8b` | `9a6033c9fe30260e71d784d003ad1e2de2a55c93e24a24856e8433029a3f811a` |
 | payload内entrypoint | `bin/codex-app-server.exe` | `bin/codex-app-server` |
 
-取得URLは`https://github.com/openai/codex/releases/download/rust-v0.157.1/`にasset名を連結したもの。entrypointは同タグの`.github/dotslash-config.json`で確認した。[O2]
+取得URLは`https://github.com/openai/codex/releases/download/rust-v0.157.1/`にasset名を連結したもの。GitHub redirect先は実測で`release-assets.githubusercontent.com`だった。実装ではHTTPSを維持し、元URLとredirect先の各hostを許可リストで検証する。entrypointは同tagの`.github/dotslash-config.json`で確認した。[O2]
 
-同タグのsource commitは既存検証記録が`36650394c5b38c2990ccf2a3457165ca3e9d9726`を記録している。P0取得処理でtagの解決結果を再確認し、一致しない場合は停止する。[C5]
-
-**今回アーカイブ本体のダウンロード・展開・実行、全付属ライセンスの監査は行っていない。** ここに示したハッシュは上流メタデータとの照合値であり、実装担当が取得バイト列を検査して初めて一致を証明できる。
+同tagのsource commitは`36650394c5b38c2990ccf2a3457165ca3e9d9726`。現在のruntime packageはmacOSで展開し、Codex/Node.jsのない一時環境からApp Server `--version`、JSON-RPC initialize、stdin closeによる正常停止まで成功した。これはHaneの導入画面、完成したHane配布物、Windows実機の受入試験を代替しない。
 
 ### 2.2 配布lockと内容一覧
 
@@ -45,23 +43,9 @@ LICENSE/NOTICEは採用タグと配布依存物に対応するものを保存す
 
 ### 3.1 配置
 
+HaneのZIP / .appにはruntimeの実行ファイルを置かず、小さな固定lock、inventory、検査済みLICENSE/NOTICE資料だけをアプリ資産として含める。利用者の明示的な操作で取得したpayloadとmanifestはHane app-dataへ置く。
+
 ```text
-Windowsの配布フォルダー/
-  hane.exe
-  runtime/codex/
-    manifest.json
-    licenses/...
-    payload/bin/codex-app-server.exe
-    payload/...                     # 上流完全パッケージの全内容
-
-Hane.app/Contents/
-  MacOS/hane
-  Resources/codex/
-    manifest.json
-    licenses/...
-    payload/bin/codex-app-server
-    payload/...
-
 <Hane app data>/ai/
   codex-chatgpt/                      # 既存。移動しない
   codex-custom/                       # 既存。移動しない
@@ -76,25 +60,23 @@ Hane.app/Contents/
   runtime-health/<operation-id>/
 ```
 
-`bundle-id`は`codex-<version>-<archive-sha先頭12文字>`、`installation-id`と`operation-id`はHaneが生成するランダムIDとする。同一版の修復も新しいinstallation-idへ展開し、使用中のファイルを上書きしない。IDはASCII英数字とハイフンのみ、最大96文字。entrypointを含む相対パスはmanifestから解決し、正規化後に所有root内であることを確認する。
+`bundle-id`は`codex-<version>-<archive-sha先頭12文字>)、`installation-id`と`operation-id`はHaneが生成するランダムIDとする。同一版の修復もP1で新しいinstallation-idへ展開し、使用中のファイルを上書きしない。IDはASCII英数字とハイフンのみ、最大96文字。entrypointを含む相対パスはmanifestから解決し、正規化後に所有root内であることを確認する。
 
-app dataは既存の`FileStateStore::from_environment()`を使う。Windows標準は`%LOCALAPPDATA%\Hane`、macOS標準は`~/Library/Application Support/Hane`。`HANE_STATE_DIR`を尊重し、AIで使うrootが相対パスなら明確に設定エラーを返す。他アプリのCODEX_HOMEを代わりに使わない。[C3]
+app-dataは既存の`FileStateStore::from_environment()`を使う。Windows標準は`%LOCALAPPDATA%\\Hane`、macOS標準は`~/Library/Application Support/Hane`。`HANE_STATE_DIR`を尊重し、AIで使うrootが相対パスなら明確に設定エラーを返す。他アプリのCODEX_HOMEを代わりに使わない。[C3]
 
 ### 3.2 優先順位
 
-1. 明示的な`HANE_CODEX_APP_SERVER`。絶対パスのstandalone executableのみ。表示は「開発用指定・Hane管理対象外」。異常ならその原因を表示し、別候補へ無言で切り替えない。P1の導入/更新/修復を無効にする。
-2. `active-runtime.json`が選んだ、Hane検証済みの管理パッケージ。署名済み/埋込manifestに含まれるIDと実体を照合する。
-3. active指定がない場合の同梱パッケージ。
+1. 明示的な`HANE_CODEX_APP_SERVER`。絶対パスのstandalone executableのみ。表示は「開発用指定・Hane管理対象外」。異常なら原因を表示し、管理版へ無言fallbackしない。P1の修復/更新を無効にする。
+2. `active-runtime.json`が選んだ、Haneが検査済みの専用インストール版。
+3. active指定がない場合は`Missing`として「インストール」ボタンを表示する。
 
-隣接する任意の旧`codex-app-server.exe`、PATH上の`codex`、Codex Desktop/IDEの内部実行ファイルは探索しない。開発で外部standaloneを使う必要がある場合は明示変数に統一する。
-
-active指定の破損は見つからなかったことにして無視しない。第8節の復旧契約に合致する場合だけ旧成功版/同梱版へ戻し、画面にも復旧を表示する。許可されていないdowngradeを自動で行わない。
+隣接する任意の旧`codex-app-server.exe`、PATH上の`codex`、Codex Desktop/IDEの内部実行ファイルは探索しない。Hane配布物や通常Codexのインストール先を変更しない。active指定の破損は見つからなかったことにして無視しない。第8節の復旧契約に合致するときだけ旧成功版へ戻す。
 
 ### 3.3 manifestとポインター
 
-`manifest.json`の必須項目は`schema_version=1`、`bundle_id`、`target`、`codex_version`、`source_commit`、`entrypoint`、`archive_sha256`、`files`、`licenses`、`runtime_profile`、`config_profile`、`state_profile`。未知schemaは拒否する。`files`はpath/type/size/sha256/実行属性を持ち、全実行依存物を覆う。署名済みカタログはmanifest自体のSHAも固定する。
+固定lockは`assets/ai/codex-runtime-lock.json`に置き、schema、version、source commit、target、asset URL/ID/size/SHA、entrypoint、runtime/config/state profile、全license sourceを固定する。実行時にlatestを解決しない。`manifest.json`は`schema_version=1`、`bundle_id`、`target`、`codex_version`、`source_commit`、`entrypoint`、`archive_sha256`、`files`、`licenses`、`runtime_profile`、`config_profile`、`state_profile`を持つ。未知schemaは拒否する。各`files` entryは相対path/type/size/sha256/実行属性を持ち、全payloadファイルを覆う。
 
-`active-runtime.json`は`schema_version=1`、単調増加`revision`、`current`、`previous_successful`。各参照は`source=bundled|managed`、target/bundle-id/installation-idのみを持つ。同梱参照はinstallation-idなし。任意の絶対パス、URL、キー、CODEX_HOMEは保存しない。既存`ai-settings.json`と`user-prompts.json`は移行しない。
+`active-runtime.json`は`schema_version=1`、単調増加`revision`、`current`、`previous_successful`を持つ。各参照はtarget/bundle-id/installation-idだけを持ち、任意の絶対パス、URL、キー、CODEX_HOMEを保存しない。P0初回導入時はcurrentのみを設定し、既存の`ai-settings.json`と`user-prompts.json`は移行しない。
 
 ポインターとjournalには既存のatomic fileユーティリティを使う。rename後の耐久性未確認を「保存前失敗」と同じに扱わない。journalに認証データを含めない。
 
@@ -105,69 +87,94 @@ active指定の破損は見つからなかったことにして無視しない�
 | 場所 | 責務 |
 |---|---|
 | 新規`crates/ai/src/runtime_distribution.rs` | manifest、locator、完全性検査、診断型。P0から使う |
-| 新規`crates/ai/src/runtime_install.rs` | 取得、検証、展開、health、cancel。P1で追加 |
-| `paths.rs` | 上記専用パスと限定的な掃除 |
-| `service.rs` | インストール状態、UI操作受付、既存所有ロック/AI操作との調停 |
-| `runtime.rs` / `connect.rs` | 既存の唯一の起動/停止経路、選択版の再設定。第二の通常ランタイムを作らない |
+| 新規`crates/ai/src/runtime_install.rs` | 固定版取得、検証、展開、health、cancel、P0初回導入。P1で修復/更新を追加 |
+| `paths.rs` | Hane専用runtime root、staging/health、限定的な掃除 |
+| `service.rs` | インストール状態、操作受付、既存所有ロック/AI操作との調停 |
+| `runtime.rs` / `connect.rs` | 既存の唯一の起動/停止経路、選択版の再設定。第二の通常runtimeを作らない |
 | `main.rs` | exeとapp-dataをresolverへ渡す。固定binary_pathの組み立てを除く |
-| AI設定画面 | 検査結果表示とボタン、モデル/認証/接続確認との状態連動 |
+| AI設定画面 | 未導入状態・進捗・検査結果・診断と明示的なボタン |
 
-`AiServiceConfig`はresolverに必要な配布root・app-dataと既存credential/browser依存を受け取る。試験では候補情報を注入できるようにする。開発用明示パスもresolverの一経路にし、テスト用に実グローバル環境を変更しない。
+`AiServiceConfig`はresolverに必要なapp-dataと既存credential/browser依存を受け取る。試験ではdownload source、候補情報、clockを注入できるようにする。開発用明示パスもresolverの一経路にし、テスト用に実グローバル環境を変更しない。
 
-UI向けに`RuntimeInstallationSnapshot`を追加する。`source`、`installed_version`、`available_version`、`status`、`diagnostic`、`operation_id`、`downloaded_bytes/total_bytes`を持つ。秘密を含むコマンド引数・環境変数・HTTP header・生RPC・認証ファイルを含めない。
-
-`status`は`CheckingLocal / Missing / Available / Downloading / Verifying / ReadyToActivate / Activating / Failed`。認証済み状態とインストール済み状態を同一視しない。Availableはローカルプログラムが使用可能という意味で、実AI応答確認の成功ではない。
+UI向けの`RuntimeInstallationSnapshot`は`source`、`installed_version`、`available_version`、`status`、`diagnostic`、`operation_id`、`downloaded_bytes/total_bytes`を持つ。秘密を含む引数・環境変数・HTTP header・生RPC・認証ファイルは含めない。
 
 ### 4.2 操作と診断コード
 
-新規操作は`InspectRuntime`、`InstallRecommended`、`RepairRuntime`、`CheckRuntimeUpdate`、`InstallRuntimeUpdate`、`RestoreBundledRuntime`。cancelは既存OperationIdの流儀に合わせる。すべての通常runtime起動/停止は既存coordinatorへ委譲する。
+P0操作は`InspectRuntime`と`InstallRecommended`。P1で`RepairRuntime`、`CheckRuntimeUpdate`、`InstallRuntimeUpdate`、`RestorePreviousRuntime`を追加する。cancelは既存OperationIdの流儀に合わせる。すべての通常runtime起動/停止は既存coordinatorへ委譲する。
 
 | stable code | 意味と画面 |
 |---|---|
 | `runtime_missing` | 実行ファイルまたは必須付属物がない。「AI用プログラムが見つかりません」 |
-| `runtime_integrity_mismatch` | 内容が承認manifestと不一致。「AI用プログラムが破損しています」 |
-| `runtime_target_unsupported` | OS/CPU対象外。適切な配布物を案内 |
-| `runtime_access_denied` | 読み取り/実行/保存の権限不足。Windows保護機能等は原因の断定をしない |
-| `runtime_invalid_executable` | 不正な実行形式。通常CLIや誤ったCPU版も区別できる範囲で表示 |
-| `runtime_initialize_failed` | 存在・内容検査後に初期化が失敗。欠損と呼ばない |
-| `runtime_update_untrusted` | カタログ署名/取得物検査が不一致 |
-| `runtime_update_incompatible` | Hane/profile/状態互換の対象外 |
+| `runtime_network_failed` | 取得失敗/timeout/オフライン。固定版を未取得として表示 |
+| `runtime_download_untrusted` | 不許可host、redirect、archive size/hash、manifestの検証不一致 |
+| `runtime_integrity_mismatch` | 導入後の内容が承認manifestと不一致。「AI用プログラムが破損しています」 |
+| `runtime_target_unsupported` | OS/CPU対象外。対応targetを案内 |
+| `runtime_access_denied` | 読取/実行/保存の権限不足 |
+| `runtime_invalid_executable` | 不正な実行形式。通常CLIや誤CPU版も区別できる範囲で表示 |
+| `runtime_initialize_failed` | 内容検査後の初期化が失敗。欠損とは呼ばない |
+| `runtime_update_untrusted` | P1カタログ署名/取得物検査の不一致 |
+| `runtime_update_incompatible` | P1でHane/profile/状態互換の対象外 |
 | `runtime_install_io` | ディスク不足/保存失敗。OSコードは秘密を除いたローカル診断に限る |
 
-既存の`owned_elsewhere`、busy、timeout、restart-blockedの分類は維持する。`RuntimeError::Spawn`のio::ErrorKindとWindows OSエラーを分類し、文言の部分一致だけに依存しない。詳しいパスは利用者のローカル画面で確認できるが、通常ログ・公開証拠にはユーザー名を含むパスを載せない。
+既存の`owned_elsewhere`、busy、timeout、restart-blockedの分類は維持する。`RuntimeError::Spawn`のio::ErrorKindとWindows OSエラーを分類し、文言の部分一致だけに依存しない。詳しいパスは利用者のローカル画面で確認できるが、通常ログ・公開証拠にユーザー名を含むpathを載せない。
 
 ## 5. 設定画面
 
-AI設定の先頭に「AI用プログラム」を追加する。使用中の版、同梱/専用インストール/開発用指定、検査状態を表示する。導入前に「Hane専用として追加します。他のCodexは変更しません」を表示する。
+AI設定の先頭に「AI用プログラム」を追加する。現在の版、取得元、導入検査状態を表示する。「Hane専用として追加します。他のCodexは変更しません」を導入前に表示する。導入前に推論しない。
 
 | 状態 | 主な操作 |
 |---|---|
-| 正常な同梱/管理版 | 更新を確認。更新があれば版と変更内容を表示して「更新する」 |
-| 未導入 | 「インストール」。固定recommendedを使う |
-| 破損 | 「修復」。新しいinstallationへ再導入する |
-| ダウンロード中 | 進捗/取消。文書編集と既存AI処理は継続できる |
-| AI使用中で候補準備済み | 「AI処理が終わってから適用できます」。自動で使用中処理を中断しない |
-| 開発用指定 | パスと管理対象外を表示。インストール/修復/更新は無効 |
+| 未導入 | 固定版・概算サイズ・初回ネット接続が必要と示し「インストール」 |
+| ダウンロード/検証中 | 進捗/取消。文書編集と既存AI処理は継続 |
+| 正常な専用版 | 「導入済み」表示。更新確認はP1 |
+| 破損 | 修復はP1。P0では診断と失敗内容を表示 |
+| AI使用中で候補準備済み | P1で「AI処理が終わってから適用できます」。自動で使用中処理を中断しない |
+| 開発用指定 | pathと管理対象外を表示。install/repair/updateを無効化 |
 
-「インストール/更新する」の一操作で取得から適用まで進む。ただし適用時に他のAI操作が動いていれば候補を保持して明示的な「適用」を待ち、後から無断で再起動しない。先に利用者の文書を保存させる必要はない。
+未導入時の「インストール」一操作で固定版の取得から初回導入まで進める。AI設定の「接続確認」は導入/initializeと区別する。導入成功後に自動で推論せず、既存ブラウザログインは利用者が必要に応じて操作する。
 
-Programの初期化確認と、課金や契約枠を使う可能性のある「接続確認」を別ボタン/状態として維持する。導入成功後に自動で推論しない。既存のブラウザログインは必要に応じて利用者が操作する。
+## 6. P0: 初回ダウンロード
 
-## 6. P0: 配布パイプライン
+Haneの製品配布工程にCodex実行ファイルを追加しない。固定lock、inventory、検査済みlicense資料だけを小さなアプリ資産として配布する。利用者のPCでは実行時にPython/Node.js/npmを要求せず、Rust側のruntime installerが固定HTTPS URLから取得する。Haneのビルド時にlatestへ置換しない。
 
-`assets/ai/codex-runtime-lock.json`を読む共通の取得/検査スクリプトを`scripts/prepare-codex-runtime.py`として追加する。Pythonは**ビルド用**であり利用者のWindowsへ要求しない。引数は`--target <triple> --output <root> --lock <path>`。ネットワーク処理は固定HTTPS URLだけを使い、取得物と展開物の検査に失敗したら非0で終了する。
+完成したWindows ZIPおよびmacOS .appから起動し、Codex/Node/PATH上のCodex/開発用overrideを見せない試験環境で、設定画面の「インストール」操作を行う。実際の固定archiveを取得し、archive hash、inventory、license文書、展開先、initialize/stopを確認する。Hane配布物を展開し直して試験し、開発ツリーのfixtureのみで受入済みにしない。初回取得にはインターネット接続が必要であり、ネットワークなしではAIのみ利用不可、文書編集は継続できる。
 
-Windowsは完成stagingへ`runtime/codex`一式をコピーしてからZIP化する。macOSは`bundle-macos.sh`で`Contents/Resources/codex`を配置してから最終検査する。調査時の同スクリプトにはコード署名工程はない。署名/公証を追加する場合は全実行物を配置し終えてから適切に署名し、実行時の.app書換えでは修復しない。[C4]
+CI path filterはruntime code、固定lock/inventory/licenses、対応するtestsを対象にする。runtime binaryを各OS release assetへ同梱するためのworkflow変更は行わない。ライセンスまたは固定inventoryに不足があれば、installerと検査処理はfail closedにする。テストのskipは成功扱いにしない。
 
-完成ZIPを別ディレクトリに展開してP0試験を行う。開発用target内のbare executableを試験するだけでは不足する。テスト用に通常Codex・Node・開発用環境変数を見せず、必要なOS変数は維持する。
+## 7. P0: 固定版の取得・展開・初回導入
 
-変更対象のCI path filterへ`crates/ai/**`、配布lock/inventory、取得スクリプト、mac bundle、release workflowを含める。資産がないために試験をskipした場合は合格としない。P0の機能PRでCargo版を勝手に上げず、既存のリリース手順で配布する。
+### 7.1 P0固定lockとP1署名カタログ
 
-## 7. P1: 取得・展開・適用
+P0はHane本体に含むレビュー済みlockだけからCodex 0.157.1を取得する。ユーザー指定URL、latest、無署名catalog、通常Codexのコピーは使わない。公式GitHub release assetのURLはIssue #480と本節2.1で固定する。HTTPSを必須にし、redirectは実測・レビュー済みのGitHub資産配信hostだけを許可する。取得元URL、各redirect host、status、サイズを秘密のqueryを除いて記録する。
 
-### 7.1 取得元の信頼
+P1独立更新はGitHub Releases上の固定入口`ai-runtime-catalog-v1/catalog.json`と`catalog.sig`を使う。このtag/資産は新規実装する公開物で、現在存在するとは扱わない。P1 catalogは最大256 KiB。Ed25519のdetached signatureを取得したJSONの生bytesに対して検証してからparseする。JSON再整形や独自canonicalizationを署名入力にしない。署名はbase64の64 bytes、key IDを持ち、公開鍵はHane本体に埋め込む。暗号実装を自作せず既存ライブラリを使う。
 
-P1aはレビュー済みの埋込lockだけからrecommendedを取得する。P1bの独立更新はGitHub Releases上の固定入口`ai-runtime-catalog-v1/catalog.json`と`catalog.sig`を使う。このtag/資産は**新規実装する公開物で、現在存在するとは扱わない**。
+P1 catalogにはschema、channel=stable、単調増加sequence、issued_at、expires_at、entriesを置く。entryはtarget、Hane version range、bundle/manifest URL・size・hash、runtime/config/state profile、許可する更新元bundle IDとrollback先ID、検証証拠URLを持つ。署名済みでもHaneが知らないschema/profileや不明な更新元には適用しない。最高受理sequenceより古いもの、期限切れ、未来時刻が5分を超えるもの、未知key ID、署名不一致は更新不可。catalog有効期限は最大30日とし、時計異常なら説明付きで停止する。既存版での編集/AI起動は止めない。
+
+P1秘密鍵はmaintainerが生成・管理し、リポジトリへ置かず保護されたrelease環境だけで使う。catalog検証/対象OS試験後に明示公開する。鍵未設定中はP0の固定版初回導入を利用可能とし、P1独立更新のみ利用不可と表示する。常駐サービスや複数チャンネルは作らない。
+
+### 7.2 展開と有限処理
+
+ダウンロード上限512 MiB、総展開上限2 GiB、最大10,000項目、manifestのファイル数/サイズ以内とする。HTTP接続20秒、無進捗60秒、全体15分を上限とし、有限の失敗をUIへ返す。これは内部timeoutであり利用者への完了予測ではない。ネットワーク再試行は利用者操作にし、永久retryをしない。
+
+展開は新しい同一ボリュームのstagingだけへ行う。絶対パス、`..`、drive prefix、Windows ADS、予約名、末尾dot/space、正規化/case-insensitive衝突、特殊デバイス項目を拒否する。既存root/親に予期しないsymlink/reparseがあれば停止する。
+
+通常はregular file/directoryのみを許可する。上流の承認inventoryに内部相対symlinkが実在する場合だけ、その正確なlink項目を許可できる。リンク先が同一payload内の検査済み通常ファイルであること、循環/連鎖がないこと、展開中にリンクを辿らないことを検査し、通常ファイル展開後に作成する。Windowsではreparseを作る必要のない公式Windows内容を前提に試験し、未知のlinkを追加承認しない。任意Packageにこの例外を流用しない。
+
+cancelではダウンロードと新規ファイル作成を止め、自分のstagingだけを消す。検査済みcandidateは保存しても自動適用しない。解凍器が指定外の場所へ書かないことを攻撃fixtureで確認する。
+
+### 7.3 healthと初回確定
+
+1. stagingへ取得し、圧縮hash、内容一覧、ライセンス、target/entrypointを検査する。
+2. 専用health CODEX_HOMEと空cwdで候補の`--version`、initialize/initialized/停止を確認する。既存runtimeの起動/停止機構を再利用し、同時に2つのサーバーを起動しない。通常の認証HOMEへ触れない。
+3. 検査中はOPENAI_API_KEY/既存認証/host session変数を渡さず、model/turn/account-loginを呼ばない。実AI接続確認はこのhealth checkに含めない。
+4. 全検査に成功したpayloadだけを不変installationとして保存し、`active-runtime.json`をatomic更新する。既存版がない初回導入でpointer更新が失敗したら、AI runtimeは未導入のままとしcandidateだけを掃除する。
+5. `runtime-install.lock`はstaging/final公開を守る。設定/owner lockと同時保持しない。通常AIがbusy、別Hane所有、終了未確認ならpointerを変えない。
+6. 適用直前にpointer revision、settings generation、candidate digestを再検査する。callbackはoperation IDとruntime generationが一致するものだけ反映する。
+
+### 7.4 P1独立更新
+
+P1bの独立更新はGitHub Releases上の固定入口`ai-runtime-catalog-v1/catalog.json`と`catalog.sig`を使う。このtag/資産は**新規実装する公開物で、現在存在するとは扱わない**。
 
 カタログは最大256 KiB。Ed25519のdetached signatureを**取得したJSONの生bytes**に対して検証後にparseする。JSONの再整形や独自canonicalizationを署名入力にしない。署名はbase64の64 bytes、key IDを持ち、公開鍵はHane本体に埋め込む。暗号実装を自作せず既存ライブラリを使う。
 
@@ -235,47 +242,47 @@ Windows補助プログラムのサービス/pipe/一時ファイル等に共有�
 
 | ID | 必須試験 |
 |---|---|
-| R01 | 2 targetの圧縮hash/source commit/content inventory/entrypoint一致 |
-| R02 | 全補助物と必要LICENSE/NOTICEを完成配布物から検査。欠落で失敗 |
-| R03 | Codex/Node/PATH上書きなしで完成ZIP/.appからinitialize/停止 |
-| R04 | 環境変数の明示パス、相対パス拒否、無言fallbackなし |
-| R05 | 欠損・破損・target相違・アクセス拒否・不正exe・初期化失敗を分類 |
-| R06 | AI異常でも編集/保存/設定画面が動く |
+| R01 | 2 targetの公式archive size/hash/source commit/content inventory/entrypoint一致 |
+| R02 | Hane製品配布物にruntime binaryを含めず、固定lock/inventory/license資料だけが含まれる |
+| R03 | 完成ZIP/.app、Codex/Node/PATH上Codexなし、オンライン環境から「インストール」を操作し、固定版を取得・検証・導入してinitialize/停止 |
+| R04 | 明示path、相対path拒否、無言fallbackなし、allowlist外redirect拒否 |
+| R05 | 欠損・破損・target相違・network失敗・hash不一致・アクセス拒否・不正exe・初期化失敗を分類 |
+| R06 | AI異常でも編集/保存/設定画面が動く。オフラインではAIだけ未導入と表示 |
 | R07 | Custom模擬先へ固定input/model/key、選択文AI回帰。秘密は記録しない |
 | R08 | 周辺AGENTS/config/Skills/他アプリ環境変数の不混入 |
 | R09 | Haneと通常Codexの同時ログイン/片方のログアウト/再起動の非干渉 |
 | R10 | Windows/macOSで実ChatGPTログインと固定接続確認。模擬と別記録 |
 | R11 | Windows/macOSで実Custom接続確認。利用者がキーを画面へ直接入力 |
-| R12 | exact-head CI/レビュー、2 OS GUI、完成配布物の再検証 |
+| R12 | Windows no-console、pipe transport、停止を完成Hane配布物から確認 |
+| R13 | exact-head CI/レビュー、2 OS GUI、完成Hane配布物の再検証 |
 
 ### P1
 
 | ID | 必須試験 |
 |---|---|
-| U01 | 未導入→固定recommended導入→エディタ再起動なしの接続開始 |
-| U02 | 同版修復が新installationに入り、実行中exeを上書きしない |
-| U03 | 正常署名カタログ、改ざん/未知鍵/schema/profile/期限/sequence拒否 |
-| U04 | 不適合Hane version/target/許可されていない更新対を拒否 |
-| U05 | HTTP断・timeout・不足容量・hash不一致・展開上限・cancel |
-| U06 | traversal/link/reparse/drive/ADS/case collisionの攻撃fixture |
-| U07 | AI中・ログイン中・別Hane所有時の適用拒否。文書編集は継続 |
-| U08 | pointer更新前/後、初期化後の各crashをjournalから復旧 |
-| U09 | Windows file lock、stop timeout、遅延callbackで二重起動なし |
-| U10 | 検証済み旧→新→旧でChatGPT/Custom状態を保つ |
-| U11 | 認証/通信/利用枠エラーでは自動downgradeしない |
-| U12 | .app/システムPATH/他Codex/Skills/プロンプトを変更しない |
-| U13 | 署名鍵なしでもP0/P1a可、P1bのみ不可。権限外URLへ接続しない |
-| U14 | 2 OS実画面、exact-head CI/レビュー、公開catalogと取得物の一致 |
+| U01 | 同版修復が新installationに入り、実行中exeを上書きしない |
+| U02 | 正常署名catalog、改ざん/未知鍵/schema/profile/期限/sequence拒否 |
+| U03 | 不適合Hane version/target/許可されていない更新対を拒否 |
+| U04 | HTTP断/timeout/不足容量/hash不一致/展開上限/cancel |
+| U05 | traversal/link/reparse/drive/ADS/case collisionの攻撃fixture |
+| U06 | AI中・ログイン中・別Hane所有時の適用拒否。文書編集は継続 |
+| U07 | pointer更新前/後、初期化後の各crashをjournalから復旧 |
+| U08 | Windows file lock、stop timeout、遅延callbackで二重起動なし |
+| U09 | 検証済み旧→新→旧でChatGPT/Custom状態を保つ |
+| U10 | 認証/通信/利用枠エラーでは自動downgradeしない |
+| U11 | .app/システムPATH/他Codex/Skills/プロンプトを変更しない |
+| U12 | P0/P1修復は署名鍵なしで使え、独立catalog更新だけ鍵なしで無効 |
+| U13 | 2 OS実画面、exact-head CI/レビュー、公開catalogと取得物の一致 |
 
-各IDはpass/fail/not-runを区別する。CIの模擬試験は実アカウント試験の代替にしない。実アカウント試験に必要なログイン・キーがなければ、そのIDを未実施と明記しIssueを閉じない。模擬試験までの実装やPRを放棄する理由にはしない。
+各IDはpass/fail/not-runを区別する。CIの模擬試験は実アカウント試験の代替にしない。実アカウント試験に必要なログイン・keyがなければ、そのIDを未実施と明記しIssueを閉じない。模擬試験までの実装やPRを放棄する理由にはしない。
 
-証拠は`docs/ai-runtime-evidence/<phase>-<head>/README.md`へ、OS/CPU、Hane exact head、配布hash、Codex versionとhash、実行コマンド/終了コード、対象/対象外、画面操作結果を保存する。本文・キー・token・生認証headerは含めない。
+証拠は`docs/ai-runtime-evidence/<phase>-<head>/README.md`へ、OS/CPU、Hane exact head、固定archive hash、Codex version、操作/終了結果、対象/対象外を保存する。本文・key・token・生認証headerは含めない。
 
 ## 11. 実装順序と完了の境界
 
-P0は(a)固定lock/inventory/license、(b)resolver/診断、(c)配布処理、(d)完成物試験の順。P1aは(a)専用保存/fixture、(b)取得・health・切替、(c)画面、(d)競合/復旧。P1bは(a)catalog検証・署名補助、(b)公開手順、(c)互換対試験、(d)実画面と配信検証の順。
+P0は(a)固定lock/inventory/license資料、(b)resolver/診断、(c)明示的な固定版download/安全な初回導入、(d)完成Hane配布物からの2 OS試験の順。P1は(a)専用保存/repair fixture、(b)署名catalog検証・更新とrollback、(c)画面、(d)競合/復旧の順。
 
-設計PRには製品コード、バイナリ、秘密鍵、CI成功の捏造、リリース操作を含めない。実装PRが開発運用ポリシーの変更を必要とすると判断した場合は、配布修正へ混ぜず理由を別途提示する。
+設計PRには製品コード、runtime binary、秘密鍵、CI成功の捏造、release操作を含めない。実装PRが開発運用policyの変更を必要とすると判断した場合は、配布修正へ混ぜず理由を別途提示する。
 
 ## 12. 参照
 
