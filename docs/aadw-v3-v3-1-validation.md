@@ -1,6 +1,6 @@
 # AADW v3 V3-1 検証記録
 
-Issue #333 の V3-1 について、既存の AADW v2 Claude 経路を ChatGPT アプリ内 Commander から実際に起動し、受理 run、worker patch、trusted finalizer、push 後の current-head CI を対応付けるための検証用ファイルです。
+Issue #333 の V3-1 で、当時のClaude実装経路をChatGPTアプリ内Commanderから起動した際の受理run、worker patch、trusted finalizer、push後のcurrent-head CIを対応付けた履歴記録です。ここに残る実行形式とモデル設定は現在の入口・モデル契約を証明しません。
 
 この初期コミットは PR を作るための最小の候補だけを置きます。現時点では Claude 実行、patch、finalizer、CI の成功を主張しません。
 
@@ -16,4 +16,4 @@ Claude worker は、この節の直後に `worker-edit` という見出しを一
 
 ## worker-edit
 
-この変更は Issue #333 / V3-1 の既存 AADW v2 Claude 経路の確認用です。worker（Claude）自身は shell、test、git、push のいずれも実行していません。この worker 編集の完了は、CI、review、GUI、merge の成功を主張するものではありません。
+この記録は Issue #333 / V3-1 の当時のClaude経路の確認用です。worker（Claude）自身は shell、test、git、push のいずれも実行していません。この worker 編集の完了は、CI、review、GUI、merge の成功を主張するものではありません。

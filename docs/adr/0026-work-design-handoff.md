@@ -2,7 +2,7 @@
 
 ## ステータス
 
-Superseded — [ADR-0027](0027-aadw-v2-chatgpt-commander.md) により置換。
+Superseded — [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) により置換。
 
 ## 注記
 
