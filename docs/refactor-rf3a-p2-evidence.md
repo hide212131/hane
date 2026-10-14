@@ -12,15 +12,19 @@ Issue: [#304](https://github.com/hide212131/hane/issues/304)
 
 この検証記録を初期化したPR head: `85343f1f66981b1ec4822aace8a42d44b47c2c5f`
 
-## 現行のhead / base / CI
+## 検証snapshot（P2 source/test validation snapshot）
 
-- 現行PR head: `448c9cae84f546710df233761ce94875ce7c885a`
-- 現行main / base: `28c6213a350953a833e16853ce29612b75180f5d`
-- 現行head CI: [run 38587333957](https://github.com/hide212131/hane/actions/runs/38587333957)。macOS / Windowsとも成功。
-- P2製品コードはGUI候補 `d1eeec8b098fae17705d4ddee99df74a7df480a0` 以降変更されていない。それ以降のPR変更は検証記録・テスト説明などで、P2のroutingを変えていない。
-- mainの進展（`28c6213`）はAADW workflow / docs / CIの範囲で、P2のproduct pathsには影響しない。根拠は、P2が扱う入力routingの製品コードとその周辺を変更していないため。
-- 前のheadでのCodeRabbit完了返信や現headでのstatus skippedは、current-head full reviewの代替にしない。現head `448c9cae` のfull reviewは未完了。
+この節の `25134e2b1a9793375d483e4bee27ee38413a0eb8` は、証跡修正を始めた時点のP2 source/test validation snapshotであり、この文書-only commit後のlive PR headではない。この証跡修正は新しいevidence-only commitを作るため、以後のlive PR head、CI、reviewの状態はこの文書ではなくPR metadata / GitHub checksで確認する。
+
+- 検証snapshot（PR head）: `25134e2b1a9793375d483e4bee27ee38413a0eb8`
+- snapshotのbase / current main: `28c6213a350953a833e16853ce29612b75180f5d`
+- snapshotのPR CI: [run 38590014438](https://github.com/hide212131/hane/actions/runs/38590014438)。このheadを検証し、macOS・Windowsのworkspace tests、IME通知テスト、Clippyが成功。最初はfinalizerのGITHUB_TOKEN pushによりapproval-required / action_requiredだったが、repo write権限で承認後に完了した。
+- snapshotのAADW exact-head verification: [run 38589757277](https://github.com/hide212131/hane/actions/runs/38589757277)。success。workerのSonnet 5.5使用確認とfinalizer pushを通過し、exact head `25134e2` でworkspace tests / Clippyを実行して成功。
+- `25134e2` は現在のP2コード候補を含む。P2製品コードはGUI候補 `d1eeec8b098fae17705d4ddee99df74a7df480a0` 以降変更されていない。それ以降のPR変更は検証記録・テスト説明などで、P2のroutingを変えていない。
+- P2 PR baseへ取り込んだmain commit `28c6213` は、[compare](https://github.com/hide212131/hane/compare/af981629011f04f68b25c8b58e476eb3eeffa624...28c6213a350953a833e16853ce29612b75180f5d)のとおりAADW workflow / docs / scripts / skillsだけで、`crates/ui` のP2 product pathsを変更していない。
+- snapshot `25134e2` 上のCodeRabbit current-head full reviewは未完了。以前のhead（`532` 系）のfull review返信と、current-headのmanual review required status skippedは、full reviewとして扱わない。この証跡修正後のlive headでcurrent-head CI成功を確認してから、full reviewが必要。
 - 最終diff監査は未実施。
+- 過去のhead（`448c9cae` など）とそのrunは履歴であり、現行の根拠にしない。
 
 P2契約テスト最終候補（製品コード変更前）: `0f1edda0f467d52e77edb2784bef4ec92cded277`
 
@@ -101,10 +105,11 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 | P2 routing候補 `d1eeec8` のPR CI（macOS / Windows） | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38432156856（attempt 2）](https://github.com/hide212131/hane/actions/runs/38432156856) |
 | 証拠記録のIME範囲修正後（head `f492484`）のPR CI | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38437398264](https://github.com/hide212131/hane/actions/runs/38437398264) |
 | PR head `27d0e53e` のWindows CI | 完了。workspace tests、Windows IME notification dispatch、Clippyが成功 | [run 38442871980](https://github.com/hide212131/hane/actions/runs/38442871980) |
-| P2 routing候補の独立review | 未完了。CodeRabbitにfull reviewを依頼したが、included reviewのrate limitで実行されなかった。利用枠が戻った後に再依頼する | [レビュー依頼とrate limit応答](https://github.com/hide212131/hane/pull/488#issuecomment-6151212199) |
+| snapshot `25134e2` のPR CI / AADW exact-head verification | 完了。macOS・Windowsのworkspace tests、IME通知テスト、Clippyが成功。AADW runもSonnet 5.5確認・finalizer push通過後に成功 | [PR CI 38590014438](https://github.com/hide212131/hane/actions/runs/38590014438)、[AADW run 38589757277](https://github.com/hide212131/hane/actions/runs/38589757277) |
+| P2 routing候補の独立review（current-head CodeRabbit full review） | 未完了。snapshot `25134e2` 上では未実施。以前のheadのfull review返信やcurrent-headのmanual review required status skippedはfull reviewとして扱わない。証跡修正後のlive headでCI成功を確認してから必要 | 以前のrate limit応答: [レビュー依頼](https://github.com/hide212131/hane/pull/488#issuecomment-6151212199)（履歴） |
 | macOSのP2変更対象キー入力（IME以外）の実画面確認 | 完了。filter / rename / 本文に対するfocused確認 | 上記「P2 routing候補のGUI確認」 |
 | P2の日本語IME preedit中Enter / Escape確認 | 完了（focused GUI確認）。Windowsはfilter / rename / 本文でcommit・cancelを実画面確認。macOSはユーザー確認でFilterのcommit・cancel・focus解除と本文不変を確認 | 上記「P2 routing候補のGUI確認」（macOSはユーザー確認、toolの撮影証拠ではない） |
 | WindowsのP2対象キー入力・日本語IMEの実画面確認 | 完了（focused GUI確認）。ユーザーから完了と確認済み。既存記録のとおりhook OFFでfilter / rename / 本文のIME、タブ切替、本文端移動、Ctrl+S / Ctrl+Yを確認。列挙したキー範囲は選択的で、全P2キーの網羅ではない | 上記「keyhac hook OFFで再確認」 |
 | 最終diff・旧分岐・復旧方法の確認 | 未実施 | — |
 
-「未実施」は失敗・成功のどちらも意味しない。P2 routing候補はAADW検証とmacOS / WindowsのCIが成功し、macOSのP2キー経路を一時fixtureで確認した。Windowsはhook ON時にCtrl系操作が干渉したため、hook OFFで同じhead・fixtureを再確認し、IMEと一部のキー経路を観測した。macOS / Windowsのfocused GUI確認（IMEのcommit・cancelを含む）は完了したが、列挙したキー範囲は選択的で、全P2キーを網羅したとは主張しない。現head `448c9cae` のCodeRabbit full reviewと最終diff監査は未完了であり、P2の受入状態はここでは判定しない。Issue #304はP1–P3全体の受入までopenのままとする。
+「未実施」は失敗・成功のどちらも意味しない。P2 routing候補はAADW検証とmacOS / WindowsのCIが成功し、macOSのP2キー経路を一時fixtureで確認した。Windowsはhook ON時にCtrl系操作が干渉したため、hook OFFで同じhead・fixtureを再確認し、IMEと一部のキー経路を観測した。macOS / Windowsのfocused GUI確認（IMEのcommit・cancelを含む）は完了したが、列挙したキー範囲は選択的で、全P2キーを網羅したとは主張しない。検証snapshot `25134e2` のCI（[run 38590014438](https://github.com/hide212131/hane/actions/runs/38590014438)、[AADW run 38589757277](https://github.com/hide212131/hane/actions/runs/38589757277)）は成功しているが、この文書-only commit後のlive PR headは別であり、そのCI / reviewはPR metadata / GitHub checksで確認する。current-head CodeRabbit full reviewは、証跡修正後のlive headでCI成功を確認してから必要で、現時点では未完了。最終diff監査も未完了であり、P2の受入状態はここでは判定しない。Issue #304はP1–P3全体の受入までopenのままとする。
