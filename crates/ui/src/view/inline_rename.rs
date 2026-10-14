@@ -194,6 +194,18 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Platform cancel (an empty, rangeless replacement during composition).
+    /// While a rename is pending the field is protected, so it is left as is.
+    pub(crate) fn cancel_inline_rename_composition_unless_pending(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_rename.as_ref().is_some_and(|rename| rename.pending) {
+            return;
+        }
+        self.cancel_inline_rename_composition(cx);
+    }
+
     pub(crate) fn selected_inline_rename_text(&self) -> Option<String> {
         let rename = self.inline_rename.as_ref()?;
         (!rename.selected_range.is_empty())

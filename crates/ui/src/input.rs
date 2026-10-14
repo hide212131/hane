@@ -282,16 +282,31 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // An empty, rangeless replacement during composition is the platform's
+        // cancel (Windows IME); it restores the pre-composition snapshot.
+        let platform_cancel = range_utf16.is_none() && new_text.is_empty();
         match self.input_target_for_text_callback() {
             InputTarget::InlineRename => {
-                self.replace_inline_rename_text(range_utf16, new_text, cx);
+                if platform_cancel && self.inline_rename_has_composition() {
+                    self.cancel_inline_rename_composition_unless_pending(cx);
+                } else {
+                    self.replace_inline_rename_text(range_utf16, new_text, cx);
+                }
                 return;
             }
             InputTarget::SidebarFilter => {
-                self.replace_sidebar_filter_text(range_utf16, new_text, cx);
+                if platform_cancel && self.sidebar_filter_has_composition() {
+                    self.cancel_sidebar_filter_composition(cx);
+                } else {
+                    self.replace_sidebar_filter_text(range_utf16, new_text, cx);
+                }
                 return;
             }
             InputTarget::Body => {}
+        }
+        if platform_cancel && self.editor().ime().is_some() {
+            self.perform_cancel_composition(cx);
+            return;
         }
         if range_utf16.is_none() && self.editor().ime().is_none() {
             self.insert_text(new_text, cx);
