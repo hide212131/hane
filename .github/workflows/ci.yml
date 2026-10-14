@@ -96,6 +96,9 @@ jobs:
       - name: Test Claude failure diagnostics
         run: python3 .github/tests/test_claude_failure_diagnostic.py
 
+      - name: Test Claude model verification
+        run: python3 .github/tests/test_claude_model_verification.py
+
       - name: Test Codex usage-limit fallback wiring
         run: python3 .github/tests/test_codex_usage_limit_fallback.py
 

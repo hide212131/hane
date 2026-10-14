@@ -54,9 +54,8 @@
 | [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md) | [ADR-0020](0020-block-virtualization.md)、[ADR-0021](0021-layout-lines-and-visual-coordinates.md)、[ADR-0022](0022-layout-cache-invalidation.md) |
 | [ADR-0008](0008-markdown-parsing-strategy.md) | [ADR-0018](0018-block-index.md)、[architecture](../architecture.md) |
 | [ADR-0009](0009-performance-harness.md) | [architecture](../architecture.md)、[baseline](../baseline/README.md) |
-| [ADR-0023](0023-ai-agent-development-workflow.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md)（v1→v2の履歴はADR-0027） |
-| [ADR-0026](0026-work-design-handoff.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md)（v1→v2の履歴はADR-0027） |
-| [ADR-0027](0027-aadw-v2-chatgpt-commander.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) |
+| [ADR-0023](0023-ai-agent-development-workflow.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) |
+| [ADR-0026](0026-work-design-handoff.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) |
 
 ## History
 
