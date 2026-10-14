@@ -3078,6 +3078,9 @@ mod tests {
                 };
                 view.focus_sidebar_filter(&event, window, cx);
                 view.replace_text_in_range(None, "ren", window, cx);
+                // Select the whole filter text so the filter selection route is
+                // distinguishable from a caret at the end of the text.
+                view.select_all_sidebar_filter(cx);
             });
         });
         cx.run_until_parked();
