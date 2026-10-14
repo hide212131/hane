@@ -2011,14 +2011,14 @@ mod tests {
         });
     }
 
-    // Issue #304 (RF3-A, P2): pre-change contract tests pinning F3/Shift+F3's
-    // own `sidebar_filter_is_focused()`/`inline_rename_active()` guard
-    // (`actions.rs`) before P2 connects it to the P1 `input_target()`
-    // resolver. Seeding the filter/rename flag after `open_document_find`
-    // (impossible through the real UI, which always closes an active rename
-    // and never focuses the filter while the find bar is open) pins this
-    // priority directly, the same way the sibling tests in `view.rs` do for
-    // the other normal/special keys.
+    // Issue #304 (RF3-A, P2): F3/Shift+F3 の契約テスト。現行のP2経路では、
+    // content-search専用guardの後で `input_target()` に振り分けられ、
+    // document-findのIME composition guardはBody側に残っている。
+    // `open_document_find` の後にfilter / renameの状態を設定する
+    // （実UIではrename中は検索を閉じ、検索バー表示中にfilterへfocusしない
+    // ため同時には成立しない）ことで、filter / rename時に検索位置と本文を
+    // 変えない契約を直接固定する。`view.rs` の他の通常キー・特殊キーの
+    // テストと同じ方針。
     #[gpui::test]
     fn f3_and_shift_f3_are_no_ops_while_the_sidebar_filter_is_focused(
         cx: &mut gpui::TestAppContext,

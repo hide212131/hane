@@ -12,6 +12,16 @@ Issue: [#304](https://github.com/hide212131/hane/issues/304)
 
 この検証記録を初期化したPR head: `85343f1f66981b1ec4822aace8a42d44b47c2c5f`
 
+## 現行のhead / base / CI
+
+- 現行PR head: `448c9cae84f546710df233761ce94875ce7c885a`
+- 現行main / base: `28c6213a350953a833e16853ce29612b75180f5d`
+- 現行head CI: [run 38587333957](https://github.com/hide212131/hane/actions/runs/38587333957)。macOS / Windowsとも成功。
+- P2製品コードはGUI候補 `d1eeec8b098fae17705d4ddee99df74a7df480a0` 以降変更されていない。それ以降のPR変更は検証記録・テスト説明などで、P2のroutingを変えていない。
+- mainの進展（`28c6213`）はAADW workflow / docs / CIの範囲で、P2のproduct pathsには影響しない。根拠は、P2が扱う入力routingの製品コードとその周辺を変更していないため。
+- 前のheadでのCodeRabbit完了返信や現headでのstatus skippedは、current-head full reviewの代替にしない。現head `448c9cae` のfull reviewは未完了。
+- 最終diff監査は未実施。
+
 P2契約テスト最終候補（製品コード変更前）: `0f1edda0f467d52e77edb2784bef4ec92cded277`
 
 ## P2の範囲
@@ -62,7 +72,7 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 - Sidebar filterにフォーカスし、上下・Shift+上下・Tab・Return・Command+上下・Command+Shift+上下・Undo/Redo・Control+Tab・Escapeを送った。filter値が保たれ、別の文書本文は `rename fixture` のまま変わらなかった。
 - `P2 input route.md` を選択してF2で名前変更に入り、上下・Shift+上下・Tab・Command+上下・Command+Shift+上下・Undo/Redoを送った。rename文字列と本文が変わらず、Returnで同じ名前を確定し、Escapeで編集を終了できた。
 - 本文にフォーカスしてShift+上下を送り、fixtureのファイル名と本文bytesが変わらないことを画面とファイル確認で確認した。
-- macOSではIME preedit中のEnter commit / Escape cancelを未実施。設計§11.2に従いmacOS側のIME実画面確認は残る。P3ではplatform callback接続後に一連の経路を再確認する。
+- macOSのIME実画面確認は2026-10-15（JST）に行われた。対象は `d1eeec8b098fae17705d4ddee99df74a7df480a0` からビルドした隔離fixtureの候補。ユーザー確認（このIssue / PR会話での報告）として、Filter欄で `nihongo` を入力してSpace変換後にEnterで確定し、別の変換中にEscapeで取り消し、次のEscapeでFilterのfocusが外れ、本文の `BODY-ANCHOR` は不変だった。検証後に読んだfixtureファイルのSHA-256は本文 `f3f1f7b8d07ae5347d4ccbd7b84a23f97a4a59f3af4ce1b5c286985e7a4c5c4c`、rename fixture `799649149f2b64afe595543f3b0767c055679579a2a671adaec348205c13101b` で、開始時と一致した。証拠源はユーザー確認と隔離fixtureの読取であり、toolで撮影した証拠ではない。P3ではplatform callback接続後に一連の経路を再確認する。
 - WindowsではPR head `27d0e53edf0322e08dc3c503a4112040270c0756` の `hane.exe` をビルドし、`target/p2-windows-fixture-20261014/work` の合成文書とfixture内に分離した状態ディレクトリで起動した。Windowsの日本語入力レイアウトは有効で、Microsoft IMEの候補ウィンドウを画面で確認した。
 - Sidebar filterではローマ字 `ka` のpreeditが `か` として表示された。Returnで確定し、Escapeではpreeditを取り消せた。本文と開いているタブは変わらず、filterは最後に空へ戻した。
 - Inline renameでもIME候補を表示できた。Returnはpreeditをrename draftへ確定し、続くEscapeでdraftを破棄して元のファイル名に戻った。合成中のEscapeはpreeditだけを取り消し、もう一度Escapeでrenameを終了できた。
@@ -93,8 +103,8 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 | PR head `27d0e53e` のWindows CI | 完了。workspace tests、Windows IME notification dispatch、Clippyが成功 | [run 38442871980](https://github.com/hide212131/hane/actions/runs/38442871980) |
 | P2 routing候補の独立review | 未完了。CodeRabbitにfull reviewを依頼したが、included reviewのrate limitで実行されなかった。利用枠が戻った後に再依頼する | [レビュー依頼とrate limit応答](https://github.com/hide212131/hane/pull/488#issuecomment-6151212199) |
 | macOSのP2変更対象キー入力（IME以外）の実画面確認 | 完了。filter / rename / 本文に対するfocused確認 | 上記「P2 routing候補のGUI確認」 |
-| P2の日本語IME preedit中Enter / Escape確認 | 部分完了。Windowsのfilter / rename / 本文でcommit・cancelを実画面確認。macOSは未確認 | Windowsの観測は上記「P2 routing候補のGUI確認」 |
-| WindowsのP2対象キー入力・日本語IMEの実画面確認 | 部分確認。hook OFFでfilter / rename / 本文のIME、タブ切替、本文端移動、Ctrl+S / Ctrl+Yを再確認。P2対象キー全体の網羅ではない | 上記「keyhac hook OFFで再確認」 |
+| P2の日本語IME preedit中Enter / Escape確認 | 完了（focused GUI確認）。Windowsはfilter / rename / 本文でcommit・cancelを実画面確認。macOSはユーザー確認でFilterのcommit・cancel・focus解除と本文不変を確認 | 上記「P2 routing候補のGUI確認」（macOSはユーザー確認、toolの撮影証拠ではない） |
+| WindowsのP2対象キー入力・日本語IMEの実画面確認 | 完了（focused GUI確認）。ユーザーから完了と確認済み。既存記録のとおりhook OFFでfilter / rename / 本文のIME、タブ切替、本文端移動、Ctrl+S / Ctrl+Yを確認。列挙したキー範囲は選択的で、全P2キーの網羅ではない | 上記「keyhac hook OFFで再確認」 |
 | 最終diff・旧分岐・復旧方法の確認 | 未実施 | — |
 
-「未実施」は失敗・成功のどちらも意味しない。P2 routing候補はAADW検証とmacOS / WindowsのCIが成功し、macOSのP2キー経路を一時fixtureで確認した。Windowsはhook ON時にCtrl系操作が干渉したため、hook OFFで同じhead・fixtureを再確認し、IMEと一部のキー経路を観測した。WindowsとmacOSのP2対象キー全体、macOSのIME実画面確認、最終PR headでの独立review、diff監査は未完了であり、P2の受入状態はここでは判定しない。Issue #304はP1–P3全体の受入までopenのままとする。
+「未実施」は失敗・成功のどちらも意味しない。P2 routing候補はAADW検証とmacOS / WindowsのCIが成功し、macOSのP2キー経路を一時fixtureで確認した。Windowsはhook ON時にCtrl系操作が干渉したため、hook OFFで同じhead・fixtureを再確認し、IMEと一部のキー経路を観測した。macOS / Windowsのfocused GUI確認（IMEのcommit・cancelを含む）は完了したが、列挙したキー範囲は選択的で、全P2キーを網羅したとは主張しない。現head `448c9cae` のCodeRabbit full reviewと最終diff監査は未完了であり、P2の受入状態はここでは判定しない。Issue #304はP1–P3全体の受入までopenのままとする。
