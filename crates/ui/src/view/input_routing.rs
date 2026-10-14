@@ -694,6 +694,122 @@ mod tests {
         composition_contract(cx, Surface::Rename, "ime-rename");
     }
 
+    // ----- IME cancel over a selection (Issue #304 P3 Windows report) -----
+
+    /// Selects the emoji, starts a composition over it through the real
+    /// callback, and returns the pre-composition `(text, selection)`.
+    fn start_composition_over_selected_emoji(
+        view: &TestView,
+        cx: &mut TestCx,
+        surface: Surface,
+    ) -> (String, Range<usize>) {
+        select_emoji_forward(cx);
+        let text = surface_text(view, cx, surface);
+        let selection = surface_selection(view, cx, surface);
+        assert_eq!(text, TEXT);
+        assert_eq!(selection, 1..5);
+
+        mark(view, cx, None, "か", None);
+        assert!(
+            query_marked(view, cx).is_some(),
+            "the composition replaced the selection and is marked"
+        );
+        assert_ne!(surface_text(view, cx, surface), TEXT);
+        (text, selection)
+    }
+
+    fn assert_cancel_restored(
+        view: &TestView,
+        cx: &mut TestCx,
+        surface: Surface,
+        original: &(String, Range<usize>),
+    ) {
+        assert_eq!(
+            surface_text(view, cx, surface),
+            original.0,
+            "the text selected before the composition must survive the cancel"
+        );
+        assert_eq!(surface_selection(view, cx, surface), original.1);
+        assert_eq!(query_marked(view, cx), None);
+        assert_other_surfaces_untouched(view, cx, surface);
+    }
+
+    /// Escape delivered through the real key dispatch cancels the composition.
+    fn escape_cancel_over_selection_contract(
+        cx: &mut gpui::TestAppContext,
+        surface: Surface,
+        label: &str,
+    ) {
+        let root = fixture_root(label);
+        let (view, cx) = prepare_surface(cx, surface, &root, TEXT);
+        let original = start_composition_over_selected_emoji(&view, cx, surface);
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_cancel_restored(&view, cx, surface, &original);
+
+        if surface == Surface::Rename {
+            // The first Escape only cancelled the composition.
+            assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(!view.read_with(cx, |view, _| view.inline_rename_active()));
+            assert!(rename_path(&root).exists(), "the file name is unchanged");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The Windows IME reports a cancelled composition as an empty
+    /// `replace_text_in_range(None, "")` (`WM_IME_COMPOSITION`, `lparam == 0`)
+    /// instead of an Escape key event. The pre-composition text must survive.
+    fn platform_cancel_over_selection_contract(
+        cx: &mut gpui::TestAppContext,
+        surface: Surface,
+        label: &str,
+    ) {
+        let root = fixture_root(label);
+        let (view, cx) = prepare_surface(cx, surface, &root, TEXT);
+        let original = start_composition_over_selected_emoji(&view, cx, surface);
+
+        replace(&view, cx, None, "");
+        cx.run_until_parked();
+        assert_cancel_restored(&view, cx, surface, &original);
+        if surface == Surface::Rename {
+            assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn body_escape_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        escape_cancel_over_selection_contract(cx, Surface::Body, "cancel-esc-body");
+    }
+
+    #[gpui::test]
+    fn filter_escape_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        escape_cancel_over_selection_contract(cx, Surface::Filter, "cancel-esc-filter");
+    }
+
+    #[gpui::test]
+    fn rename_escape_cancel_keeps_the_selected_text_then_closes(cx: &mut gpui::TestAppContext) {
+        escape_cancel_over_selection_contract(cx, Surface::Rename, "cancel-esc-rename");
+    }
+
+    #[gpui::test]
+    fn body_platform_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        platform_cancel_over_selection_contract(cx, Surface::Body, "cancel-plat-body");
+    }
+
+    #[gpui::test]
+    fn filter_platform_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        platform_cancel_over_selection_contract(cx, Surface::Filter, "cancel-plat-filter");
+    }
+
+    #[gpui::test]
+    fn rename_platform_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        platform_cancel_over_selection_contract(cx, Surface::Rename, "cancel-plat-rename");
+    }
+
     // ----- R11 -----
 
     fn body_text(view: &TestView, cx: &mut TestCx) -> String {
