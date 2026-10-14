@@ -1,3 +1,4 @@
+use crate::view::input_routing::InputTarget;
 use crate::view::{EditorView, InlineRenameRenderState};
 use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
@@ -211,19 +212,23 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        if self.inline_rename_active() {
-            let (text, actual) = self.inline_rename_text_for_range(range_utf16)?;
-            actual_range.replace(actual);
-            return Some(text);
+        match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => {
+                let (text, actual) = self.inline_rename_text_for_range(range_utf16)?;
+                actual_range.replace(actual);
+                Some(text)
+            }
+            InputTarget::SidebarFilter => {
+                let (text, actual) = self.sidebar_filter_text_for_range(range_utf16)?;
+                actual_range.replace(actual);
+                Some(text)
+            }
+            InputTarget::Body => {
+                let (text, actual) = self.editor().text_for_utf16_range(range_utf16).ok()?;
+                actual_range.replace(actual);
+                Some(text)
+            }
         }
-        if self.sidebar_filter_is_focused() {
-            let (text, actual) = self.sidebar_filter_text_for_range(range_utf16)?;
-            actual_range.replace(actual);
-            return Some(text);
-        }
-        let (text, actual) = self.editor().text_for_utf16_range(range_utf16).ok()?;
-        actual_range.replace(actual);
-        Some(text)
     }
 
     fn selected_text_range(
@@ -232,40 +237,41 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        if let Some((range, reversed)) = self.inline_rename_selection() {
-            return Some(UTF16Selection { range, reversed });
+        match self.input_target_for_selection_query() {
+            InputTarget::InlineRename => {
+                let (range, reversed) = self.inline_rename_selection()?;
+                Some(UTF16Selection { range, reversed })
+            }
+            InputTarget::SidebarFilter => {
+                let (range, reversed) = self.sidebar_filter_selection()?;
+                Some(UTF16Selection { range, reversed })
+            }
+            InputTarget::Body => Some(UTF16Selection {
+                range: self
+                    .editor()
+                    .source_range_to_utf16(self.editor().selection().range())
+                    .ok()?,
+                reversed: self.editor().selection().is_reversed(),
+            }),
         }
-        if let Some((range, reversed)) = self.sidebar_filter_selection() {
-            return Some(UTF16Selection { range, reversed });
-        }
-        Some(UTF16Selection {
-            range: self
-                .editor()
-                .source_range_to_utf16(self.editor().selection().range())
-                .ok()?,
-            reversed: self.editor().selection().is_reversed(),
-        })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        if self.inline_rename_active() {
-            return self.inline_rename_marked_range();
+        match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => self.inline_rename_marked_range(),
+            InputTarget::SidebarFilter => self.sidebar_filter_marked_range(),
+            InputTarget::Body => self
+                .editor()
+                .ime()
+                .and_then(|ime| self.editor().source_range_to_utf16(ime.marked_range).ok()),
         }
-        if self.sidebar_filter_is_focused() {
-            return self.sidebar_filter_marked_range();
-        }
-        self.editor()
-            .ime()
-            .and_then(|ime| self.editor().source_range_to_utf16(ime.marked_range).ok())
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if self.inline_rename_active() {
-            self.commit_inline_rename_composition(cx);
-        } else if self.sidebar_filter_is_focused() {
-            self.commit_sidebar_filter_composition(cx);
-        } else {
-            self.editor_mut().commit_composition();
+        match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => self.commit_inline_rename_composition(cx),
+            InputTarget::SidebarFilter => self.commit_sidebar_filter_composition(cx),
+            InputTarget::Body => self.editor_mut().commit_composition(),
         }
     }
 
@@ -276,13 +282,16 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.inline_rename_active() {
-            self.replace_inline_rename_text(range_utf16, new_text, cx);
-            return;
-        }
-        if self.sidebar_filter_is_focused() {
-            self.replace_sidebar_filter_text(range_utf16, new_text, cx);
-            return;
+        match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => {
+                self.replace_inline_rename_text(range_utf16, new_text, cx);
+                return;
+            }
+            InputTarget::SidebarFilter => {
+                self.replace_sidebar_filter_text(range_utf16, new_text, cx);
+                return;
+            }
+            InputTarget::Body => {}
         }
         if range_utf16.is_none() && self.editor().ime().is_none() {
             self.insert_text(new_text, cx);
@@ -306,23 +315,26 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.inline_rename_active() {
-            self.replace_and_mark_inline_rename_text(
-                range_utf16,
-                new_text,
-                new_selected_range_utf16,
-                cx,
-            );
-            return;
-        }
-        if self.sidebar_filter_is_focused() {
-            self.replace_and_mark_sidebar_filter_text(
-                range_utf16,
-                new_text,
-                new_selected_range_utf16,
-                cx,
-            );
-            return;
+        match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => {
+                self.replace_and_mark_inline_rename_text(
+                    range_utf16,
+                    new_text,
+                    new_selected_range_utf16,
+                    cx,
+                );
+                return;
+            }
+            InputTarget::SidebarFilter => {
+                self.replace_and_mark_sidebar_filter_text(
+                    range_utf16,
+                    new_text,
+                    new_selected_range_utf16,
+                    cx,
+                );
+                return;
+            }
+            InputTarget::Body => {}
         }
         if let Err(error) =
             self.editor_mut()
@@ -343,24 +355,12 @@ impl EntityInputHandler for EditorView {
         window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        if self.inline_rename_active() {
-            let state = self.inline_rename_render_state()?;
-            let line = shape_inline_rename_line(&state, window);
-            let caret = if state.selection_reversed {
-                state.selected_range.start
-            } else {
-                state.selected_range.end
-            };
-            return Some(Bounds {
-                origin: point(bounds.left() + line.x_for_index(caret), bounds.top()),
-                size: Size {
-                    width: px(1.0),
-                    height: bounds.size.height,
-                },
-            });
-        }
-        if self.sidebar_filter_is_focused() {
-            let state = self.text_input_render_state()?;
+        let short_field_state = match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => Some(self.inline_rename_render_state()?),
+            InputTarget::SidebarFilter => Some(self.text_input_render_state()?),
+            InputTarget::Body => None,
+        };
+        if let Some(state) = short_field_state {
             let line = shape_inline_rename_line(&state, window);
             let caret = if state.selection_reversed {
                 state.selected_range.start
@@ -393,15 +393,16 @@ impl EntityInputHandler for EditorView {
         window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        if self.inline_rename_active() {
-            return self.inline_rename_character_index_for_point(point, window);
+        match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => self.inline_rename_character_index_for_point(point, window),
+            InputTarget::SidebarFilter => {
+                self.sidebar_filter_character_index_for_point(point, window)
+            }
+            InputTarget::Body => self
+                .editor()
+                .source_range_to_utf16(SourceRange::empty(self.editor().selection().active.0))
+                .ok()
+                .map(|range| range.start),
         }
-        if self.sidebar_filter_is_focused() {
-            return self.sidebar_filter_character_index_for_point(point, window);
-        }
-        self.editor()
-            .source_range_to_utf16(SourceRange::empty(self.editor().selection().active.0))
-            .ok()
-            .map(|range| range.start)
     }
 }
