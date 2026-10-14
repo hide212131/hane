@@ -2804,6 +2804,117 @@ mod tests {
         });
     }
 
+    // RF3-A P2 contract test (Issue #304, design spec §9 R09): this pins the
+    // `CancelComposition` short-circuit order's `ai_selection_blocks_editor_keys`
+    // branch in `actions.rs` — reaching it must `return` before
+    // `perform_cancel_composition`/`after_input` ever run for the body, since
+    // `after_input` unconditionally calls `AiSelectionState::invalidate_for_edit`
+    // and would otherwise close this still-open popup and surface the
+    // stale-result status message on the very Escape that was only supposed
+    // to cancel the free-text input's own composition.
+    //
+    // Synthetic overlap: the real UI never lets the body hold its own IME
+    // composition while this popup is open (`open_ai_selection` refuses to
+    // open over one, and `ai_selection_blocks_editor_keys` keeps the body out
+    // of the input-capture path once it is open), so this seeds the body's
+    // composition directly on its `Editor`, bypassing normal focus routing,
+    // purely to make a leak from the input's Escape into the body's own
+    // composition-cancel observable in a single test.
+    #[gpui::test]
+    fn escape_that_cancels_the_ai_inputs_composition_does_not_leak_into_the_bodys_composition_cancel_or_after_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
+            assert!(view.ai_selection.input_focused);
+        });
+
+        let input = view
+            .read_with(cx, |view, _| view.ai_selection.input.clone())
+            .expect("input is initialized by open_ai_selection");
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "か", None, window, cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        // Synthetic: see the comment above this test for why the body can
+        // never really be composing here.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "ば", None)
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let body_source_before_escape = view.read_with(cx, |view, _| {
+            assert!(view.editor().ime().is_some());
+            view.editor().document().full_text()
+        });
+
+        // The input still holds focus with its own in-progress composition,
+        // going into this Escape.
+        let marked_before_escape = cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::marked_text_range(state, window, cx)
+            })
+        });
+        assert!(marked_before_escape.is_some());
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.ai_selection.open,
+                "a leak into the body's after_input would invalidate and close the still-open popup"
+            );
+            assert!(
+                view.status.is_none(),
+                "a leak into after_input's invalidate_for_edit would surface the stale-result status message"
+            );
+            assert!(
+                view.editor().ime().is_some(),
+                "the body's own composition, seeded only to detect a leak, must survive untouched"
+            );
+            assert_eq!(
+                view.editor().document().full_text(),
+                body_source_before_escape,
+                "the body's own composition source must be untouched by the input's Escape"
+            );
+        });
+
+        let marked_after_escape = cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::marked_text_range(state, window, cx)
+            })
+        });
+        assert!(
+            marked_after_escape.is_none(),
+            "the AI input's own composition must still be cancelled by this Escape"
+        );
+    }
+
     fn open_popup_for_keyboard_tests(
         cx: &mut gpui::TestAppContext,
     ) -> (Entity<EditorView>, &mut gpui::VisualTestContext) {
