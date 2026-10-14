@@ -3034,6 +3034,127 @@ mod tests {
         assert!(view.read_with(cx, |view, _| view.content_search_results_focused()));
     }
 
+    /// RF3-A P3 (Issue #304, design spec §3.2 / §9 R02): all 16 combinations of
+    /// rename / raw filter / content-search input / content-search results,
+    /// including the four with input and results both set. Those four cannot be
+    /// reached through the focus operations, so the two private content-search
+    /// flags are synthesized here, in the module that owns them. Expectations
+    /// are written per case and do not reuse the resolvers under test.
+    #[gpui::test]
+    fn platform_target_matrix_covers_all_sixteen_synthetic_focus_states(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::EntityInputHandler;
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hane-304-p3-synthetic-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let rename_path = root.join("Rename-me.md");
+        std::fs::write(&rename_path, "needle in the file").unwrap();
+
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("body-text\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Distinguishable texts: body "bod", filter "ren", rename "Ren".
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                let event = gpui::MouseDownEvent {
+                    position: point(px(0.0), px(0.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                };
+                view.focus_sidebar_filter(&event, window, cx);
+                view.replace_text_in_range(None, "ren", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        for bits in 0..16u8 {
+            let rename = bits & 1 != 0;
+            let filter = bits & 2 != 0;
+            let input = bits & 4 != 0;
+            let results = bits & 8 != 0;
+            let label = format!("rename={rename} filter={filter} input={input} results={results}");
+
+            if rename {
+                cx.update(|window, app| {
+                    view.update(app, |view, cx| {
+                        view.begin_inline_rename(
+                            rename_path.clone(),
+                            InlineRenameKind::File,
+                            window,
+                            cx,
+                        );
+                    });
+                });
+                cx.run_until_parked();
+            }
+
+            // Set the flags and query the callbacks in one update so no focus
+            // event can rewrite them in between.
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    if !rename {
+                        view.inline_rename = None;
+                    }
+                    view.sidebar_filter_focused = filter;
+                    view.content_search.input_focused = input;
+                    view.content_search.results_focused = results;
+
+                    let broad = filter || input || results;
+                    let expected_text = if rename {
+                        "Ren"
+                    } else if broad {
+                        "ren"
+                    } else {
+                        "bod"
+                    };
+                    let mut actual = None;
+                    let text = view.text_for_range(0..3, &mut actual, window, cx);
+                    assert_eq!(
+                        (text, actual),
+                        (Some(expected_text.to_owned()), Some(0..3)),
+                        "{label}: text callback"
+                    );
+
+                    let body = view.editor().selection();
+                    let body_selection = (body.range().start.0..body.range().end.0, body.is_reversed());
+                    let expected_selection = if rename {
+                        (0..9, false)
+                    } else if filter {
+                        (0..3, false)
+                    } else {
+                        body_selection
+                    };
+                    let selection = view
+                        .selected_text_range(false, window, cx)
+                        .map(|selection| (selection.range, selection.reversed));
+                    assert_eq!(selection, Some(expected_selection), "{label}: selection query");
+
+                    assert_eq!(
+                        view.body_input_capture_enabled(),
+                        !(rename || broad),
+                        "{label}: body capture"
+                    );
+                });
+            });
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[gpui::test]
     fn clicking_the_editor_body_clears_content_search_focus_so_backspace_reaches_the_editor(
         cx: &mut gpui::TestAppContext,

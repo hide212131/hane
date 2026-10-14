@@ -464,9 +464,10 @@ mod tests {
         search_until_results_are_focused(&view, cx);
 
         // The input and results flags are set exclusively by the existing
-        // focus operations, so the four combinations with both set cannot be
-        // reached without writing the private `ContentSearchState` flags.
-        // They are therefore not enumerated below; this pins why.
+        // focus operations, so the four combinations with both set are
+        // covered by the synthetic matrix in `content_search` (which owns the
+        // private flags); the twelve reachable ones are driven through real
+        // focus operations below.
         focus_search_input(&view, cx);
         view.read_with(cx, |view, _| {
             assert!(view.content_search_input_is_focused());
