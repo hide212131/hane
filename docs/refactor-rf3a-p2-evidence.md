@@ -62,7 +62,23 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 - Sidebar filterにフォーカスし、上下・Shift+上下・Tab・Return・Command+上下・Command+Shift+上下・Undo/Redo・Control+Tab・Escapeを送った。filter値が保たれ、別の文書本文は `rename fixture` のまま変わらなかった。
 - `P2 input route.md` を選択してF2で名前変更に入り、上下・Shift+上下・Tab・Command+上下・Command+Shift+上下・Undo/Redoを送った。rename文字列と本文が変わらず、Returnで同じ名前を確定し、Escapeで編集を終了できた。
 - 本文にフォーカスしてShift+上下を送り、fixtureのファイル名と本文bytesが変わらないことを画面とファイル確認で確認した。
-- この手動確認はP2対象キーの経路確認で、日本語IMEのpreedit中のEnter commit / Escape cancelは実施していない。設計§11.2に従い、これらのP2 IME実画面確認はmacOS・Windowsの両方で必要で、現在は両OSとも未確認。P3ではplatform callback接続後に一連の経路を再確認する。WindowsのP2対象キー経路も未確認。
+- macOSではIME preedit中のEnter commit / Escape cancelを未実施。設計§11.2に従いmacOS側のIME実画面確認は残る。P3ではplatform callback接続後に一連の経路を再確認する。
+- WindowsではPR head `27d0e53edf0322e08dc3c503a4112040270c0756` の `hane.exe` をビルドし、`target/p2-windows-fixture-20261014/work` の合成文書とfixture内に分離した状態ディレクトリで起動した。Windowsの日本語入力レイアウトは有効で、Microsoft IMEの候補ウィンドウを画面で確認した。
+- Sidebar filterではローマ字 `ka` のpreeditが `か` として表示された。Returnで確定し、Escapeではpreeditを取り消せた。本文と開いているタブは変わらず、filterは最後に空へ戻した。
+- Inline renameでもIME候補を表示できた。Returnはpreeditをrename draftへ確定し、続くEscapeでdraftを破棄して元のファイル名に戻った。合成中のEscapeはpreeditだけを取り消し、もう一度Escapeでrenameを終了できた。
+- 本文ではIME preedit中のEscape後、`01-navigation.md` のSHA-256が元fixtureと一致した。Returnで `か` を確定でき、Ctrl+Z後に同じ元SHA-256へ戻った。本文フォーカス中のCtrl+Tab / Ctrl+Shift+Tabで2つのfixture tabを往復し、Ctrl+Home / Ctrl+EndとCtrl+Shift+Homeも画面上で確認した。rename中のF3は検索を起動しなかった。
+- Windows上では常駐 `keyhac.exe` が動作していた。Ctrl+Yは本文へこのfixtureと無関係な既存文字列を挿入し、直後にUndoして元SHA-256を確認した。Ctrl+Sも本文検索UIを開いた。このキー変換環境の影響をHane単体へ帰属できないため、Ctrl+YとCtrl+Sを含むショートカットの結果は確定せず、追加のCtrl系操作を停止した。文字列自体は記録しない。
+- 終了前に2つのfixture文書のSHA-256が開始時の値と一致し、検証終了時点（この追記前）のPR checkoutはhead `27d0e53e` のままclean、検証用ウィンドウも閉じた。
+
+### keyhac hook OFFで再確認（2026-10-14）
+
+- 起動前の `keyhac.exe` 画面に「フックを OFF にしました」と表示され、検証後も同じ表示だった。開始時点ですでにOFFのため、状態を変更せずそのまま試験した。
+- PR head `27d0e53edf0322e08dc3c503a4112040270c0756` の `target/debug/hane.exe` を、同じ隔離fixture `target/p2-windows-fixture-20261014/work` とfixture内のstate / appdata / localappdataで起動した。開始時の `01-navigation.md` と `02-secondary.md` はそれぞれ元のSHA-256 `D64BBC1929D9D0F0BD5B641E59424AC7272490B599C583825A56955692A402E6`、`A0A7EEEDA81970C56958D9E838EB2717903FBCE148F5F30B7D9B08677E40C413` と一致した。
+- Filterにフォーカスし、Ctrl+Caps Lockの後に `ka` を入力するとMicrosoft IMEの候補一覧に `か` が表示された。Returnで確定し、Escapeではpreeditを取り消せた。Filterは空に戻した。FilterにフォーカスしたままのCtrl+Tabではタブは切り替わらなかった。
+- 本文でも `ka` のIME候補 `か` を表示できた。Returnで確定後にCtrl+Zで元の51 bytesへ戻り、Escapeのcancelでも本文は残らなかった。Ctrl+Yは直前の確定入力をredoし一時的に54 bytesとなり、Ctrl+Zで51 bytesに戻った。Ctrl+Sは検索UIを開かず、`Saved` を表示した。
+- 本文にフォーカスしてCtrl+Tab / Ctrl+Shift+Tabを送り、2つのfixture tabを往復した。Ctrl+Home / Ctrl+Endで本文の先頭 / 末尾へ移動し、Ctrl+Shift+Homeで本文を選択できた。
+- Sidebar行を選択してF2でinline renameを開始できた。IME候補 `か` はReturnでrename draftに確定し、Escapeで破棄して元のファイル名へ戻った。preedit中のEscapeは入力を取り消し、次のEscapeでrenameを終了した。rename中にF3を送っても検索UIは開かなかった。
+- 終了後、2つのfixture文書は元のSHA-256と一致し、ファイル名も元のまま。Haneのテストプロセスは終了し、`keyhac.exe` は起動したままhook OFFだった。
 
 ## 検証状況
 
@@ -74,10 +90,11 @@ P3のplatform入力8 callbackとcapture登録判定、および文字列・selec
 | P2 routing全対象の候補workspace tests / Clippy | 成功。workspace tests 457 passed、Clippy成功（macOSのみ） | [run 38427825319](https://github.com/hide212131/hane/actions/runs/38427825319) |
 | P2 routing候補 `d1eeec8` のPR CI（macOS / Windows） | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38432156856（attempt 2）](https://github.com/hide212131/hane/actions/runs/38432156856) |
 | 証拠記録のIME範囲修正後（head `f492484`）のPR CI | 完了。両OSのworkspace tests、OS固有IME通知テスト、Clippyが成功 | [PR CI 38437398264](https://github.com/hide212131/hane/actions/runs/38437398264) |
+| PR head `27d0e53e` のWindows CI | 完了。workspace tests、Windows IME notification dispatch、Clippyが成功 | [run 38442871980](https://github.com/hide212131/hane/actions/runs/38442871980) |
 | P2 routing候補の独立review | 未完了。CodeRabbitにfull reviewを依頼したが、included reviewのrate limitで実行されなかった。利用枠が戻った後に再依頼する | [レビュー依頼とrate limit応答](https://github.com/hide212131/hane/pull/488#issuecomment-6151212199) |
 | macOSのP2変更対象キー入力（IME以外）の実画面確認 | 完了。filter / rename / 本文に対するfocused確認 | 上記「P2 routing候補のGUI確認」 |
-| P2の日本語IME preedit中Enter / Escape確認 | 未実施。設計§11.2によりmacOS / Windows両方が必要 | — |
-| WindowsのP2対象キー入力・日本語IMEの実画面確認 | 未実施。接続先にユーザーのPowerPoint / Notesが表示され、VMwareのWindows guestも隔離試験環境と確認できないため未使用 | — |
+| P2の日本語IME preedit中Enter / Escape確認 | 部分完了。Windowsのfilter / rename / 本文でcommit・cancelを実画面確認。macOSは未確認 | Windowsの観測は上記「P2 routing候補のGUI確認」 |
+| WindowsのP2対象キー入力・日本語IMEの実画面確認 | 部分確認。hook OFFでfilter / rename / 本文のIME、タブ切替、本文端移動、Ctrl+S / Ctrl+Yを再確認。P2対象キー全体の網羅ではない | 上記「keyhac hook OFFで再確認」 |
 | 最終diff・旧分岐・復旧方法の確認 | 未実施 | — |
 
-「未実施」は失敗・成功のどちらも意味しない。P2 routing候補はAADW検証とmacOS / WindowsのCIが成功し、macOSのP2キー経路を一時fixtureで確認した。macOS / Windowsの日本語IME実画面確認、WindowsのP2キー経路、最終PR headでの独立review、diff監査は未完了であり、P2はまだ受入済みではない。Issue #304はP1–P3全体の受入までopenのままとする。
+「未実施」は失敗・成功のどちらも意味しない。P2 routing候補はAADW検証とmacOS / WindowsのCIが成功し、macOSのP2キー経路を一時fixtureで確認した。Windowsはhook ON時にCtrl系操作が干渉したため、hook OFFで同じhead・fixtureを再確認し、IMEと一部のキー経路を観測した。WindowsとmacOSのP2対象キー全体、macOSのIME実画面確認、最終PR headでの独立review、diff監査は未完了であり、P2の受入状態はここでは判定しない。Issue #304はP1–P3全体の受入までopenのままとする。
