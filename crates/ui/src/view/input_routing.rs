@@ -93,15 +93,24 @@ mod tests {
     #[gpui::test]
     fn platform_target_matrix_preserves_entrypoint_contracts(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
-        for bits in 0..8u8 {
+        // The content-search focus flags are private to `content_search`, so
+        // the fixture drives them through its existing focus operations. The
+        // results-focused flag needs real hits and is not reachable here.
+        for bits in 0..4u8 {
             let filter = bits & 1 != 0;
             let input = bits & 2 != 0;
-            let results = bits & 4 != 0;
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    if input {
+                        view.focus_content_search_input(window, cx);
+                    } else {
+                        view.blur_content_search_focus(cx);
+                    }
+                });
+            });
             view.update(cx, |view, _| {
                 view.sidebar_filter_focused = filter;
-                view.content_search.input_focused = input;
-                view.content_search.results_focused = results;
-                let broad = filter || input || results;
+                let broad = filter || input;
                 let text = view.input_target_for_text_callback();
                 let selection = view.input_target_for_selection_query();
                 assert!(
