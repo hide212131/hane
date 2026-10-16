@@ -1437,13 +1437,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     return;
                 };
 
-                if let Some(commit_text) = text {
-                    // An explicit empty commit is not a composition cancel. Remember it so the
-                    // matching `Done` does not turn it into `DeleteText`.
-                    state.ime_empty_commit = commit_text.is_empty();
-                    if commit_text.is_empty() {
-                        return;
-                    }
+                if let Some(commit_text) = commit_string_text(&mut state.ime_empty_commit, text) {
                     drop(state);
                     // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
                     // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
@@ -1472,8 +1466,12 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     return;
                 };
 
-                if let Some(text) = state.ime_pre_edit.take() {
-                    state.ime_empty_commit = false;
+                let action = done_action(
+                    &mut state.ime_pre_edit,
+                    &mut state.composing,
+                    &mut state.ime_empty_commit,
+                );
+                if let ImeDoneAction::SetMarkedText(text) = action {
                     drop(state);
                     window.handle_ime(ImeInput::SetMarkedText(text));
                     if let Some(area) = window.get_ime_area() {
@@ -1488,10 +1486,8 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                         }
                     }
                 } else {
-                    state.composing = false;
-                    let skip_delete = take_empty_commit_flag(&mut state.ime_empty_commit);
                     drop(state);
-                    if !skip_delete {
+                    if action == ImeDoneAction::DeleteText {
                         window.handle_ime(ImeInput::DeleteText);
                     }
                 }
@@ -1501,29 +1497,115 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
     }
 }
 
-/// Consumes the "explicit empty commit" marker at `Done`. Returns true when the
-/// `DeleteText` (composition cancel) must be skipped.
-fn take_empty_commit_flag(flag: &mut bool) -> bool {
-    std::mem::take(flag)
+/// Output of a text-input `Done` event.
+#[derive(Debug, PartialEq, Eq)]
+enum ImeDoneAction {
+    SetMarkedText(String),
+    DeleteText,
+    Nothing,
+}
+
+/// `CommitString` transition. An explicit empty commit is not a composition cancel, so it is
+/// remembered in `empty_commit` to keep the matching `Done` from becoming `DeleteText`.
+/// Returns the non-empty text to deliver, if any.
+fn commit_string_text(empty_commit: &mut bool, text: Option<String>) -> Option<String> {
+    let commit_text = text?;
+    *empty_commit = commit_text.is_empty();
+    if commit_text.is_empty() {
+        None
+    } else {
+        Some(commit_text)
+    }
+}
+
+/// `Done` transition. A pending preedit becomes `SetMarkedText`; otherwise the composition is
+/// cancelled with `DeleteText` unless an explicit empty commit was just seen (consumed here).
+fn done_action(
+    pre_edit: &mut Option<String>,
+    composing: &mut bool,
+    empty_commit: &mut bool,
+) -> ImeDoneAction {
+    if let Some(text) = pre_edit.take() {
+        *empty_commit = false;
+        ImeDoneAction::SetMarkedText(text)
+    } else {
+        *composing = false;
+        if std::mem::take(empty_commit) {
+            ImeDoneAction::Nothing
+        } else {
+            ImeDoneAction::DeleteText
+        }
+    }
 }
 
 #[cfg(test)]
 mod text_input_tests {
-    use super::take_empty_commit_flag;
+    use super::{ImeDoneAction, commit_string_text, done_action};
 
-    #[test]
-    fn empty_commit_done_skips_delete_once() {
-        let mut flag = true;
-        assert!(take_empty_commit_flag(&mut flag));
-        assert!(!flag);
-        // A later ordinary Done still cancels.
-        assert!(!take_empty_commit_flag(&mut flag));
+    #[derive(Default)]
+    struct Fields {
+        composing: bool,
+        pre_edit: Option<String>,
+        empty_commit: bool,
+    }
+
+    impl Fields {
+        fn commit(&mut self, text: Option<&str>) -> Option<String> {
+            self.composing = false;
+            commit_string_text(&mut self.empty_commit, text.map(str::to_string))
+        }
+
+        fn done(&mut self) -> ImeDoneAction {
+            done_action(&mut self.pre_edit, &mut self.composing, &mut self.empty_commit)
+        }
     }
 
     #[test]
-    fn ordinary_done_does_not_skip_delete() {
-        let mut flag = false;
-        assert!(!take_empty_commit_flag(&mut flag));
+    fn empty_commit_then_done_skips_delete_once() {
+        let mut f = Fields {
+            composing: true,
+            ..Default::default()
+        };
+        assert_eq!(f.commit(Some("")), None);
+        assert_eq!(f.done(), ImeDoneAction::Nothing);
+        assert!(!f.composing);
+        // A later ordinary Done still cancels.
+        assert_eq!(f.done(), ImeDoneAction::DeleteText);
+    }
+
+    #[test]
+    fn ordinary_done_deletes_text() {
+        let mut f = Fields {
+            composing: true,
+            ..Default::default()
+        };
+        assert_eq!(f.done(), ImeDoneAction::DeleteText);
+        assert!(!f.composing);
+    }
+
+    #[test]
+    fn non_empty_commit_is_delivered_and_done_still_deletes() {
+        let mut f = Fields::default();
+        assert_eq!(f.commit(Some("あ")), Some("あ".to_string()));
+        assert!(!f.empty_commit);
+        assert_eq!(f.done(), ImeDoneAction::DeleteText);
+    }
+
+    #[test]
+    fn preedit_done_sets_marked_text_and_clears_empty_commit() {
+        let mut f = Fields::default();
+        f.commit(Some(""));
+        f.pre_edit = Some("かな".to_string());
+        assert_eq!(f.done(), ImeDoneAction::SetMarkedText("かな".to_string()));
+        assert!(!f.empty_commit);
+        assert_eq!(f.done(), ImeDoneAction::DeleteText);
+    }
+
+    #[test]
+    fn commit_without_text_leaves_flag_untouched() {
+        let mut f = Fields::default();
+        assert_eq!(f.commit(None), None);
+        assert_eq!(f.done(), ImeDoneAction::DeleteText);
     }
 }
 
