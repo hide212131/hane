@@ -883,6 +883,11 @@ pub struct EditorView {
     sidebar_keyboard_focus: bool,
     /// The row-local inline rename field, if one is active.
     inline_rename: Option<InlineRename>,
+    /// Set once a text callback arrived while the rename was pending. The
+    /// platform may still hold that text (an IME composition) and deliver it
+    /// after the rename ended, so text callbacks are ignored until the next
+    /// keystroke clears this. Shared with the keystroke interceptor.
+    inline_rename_swallowed_input: std::rc::Rc<std::cell::Cell<bool>>,
     /// User-adjustable width of the work-folder sidebar.
     sidebar_width: f32,
     /// Active drag of the vertical divider between sidebar and editor.
@@ -1603,8 +1608,33 @@ impl EditorView {
         // just before this Enter, the same reasoning as the Escape
         // interceptor above (see `note_document_find_enter_keystroke`).
         let enter_interceptor_view = cx.entity().downgrade();
+        let inline_rename_swallowed_input = std::rc::Rc::new(std::cell::Cell::new(false));
+        // A new keystroke ends the window in which text the platform already
+        // received during a pending rename could still be delivered late (see
+        // `drop_input_after_pending_rename`). A shared cell avoids updating the
+        // view from inside key dispatch.
+        let swallowed_input_for_interceptor = inline_rename_swallowed_input.clone();
         let document_find_enter_interceptor = cx.intercept_keystrokes(move |event, window, app| {
-            if event.keystroke.key != "enter" {
+            // A key pressed while the rename is pending arms the guard right
+            // away: its text callback may only arrive after the rename ended,
+            // so waiting for a callback during the pending window is not enough.
+            let rename_pending = enter_interceptor_view
+                .read_with(&*app, |view, _| {
+                    view.inline_rename
+                        .as_ref()
+                        .is_some_and(|rename| rename.pending)
+                })
+                .unwrap_or(false);
+            // An Enter may only confirm an IME composition whose text callback
+            // is still in flight, so it neither arms nor clears the guard; any
+            // other key is new input and ends the guarded window.
+            let is_enter = event.keystroke.key == "enter";
+            if rename_pending {
+                swallowed_input_for_interceptor.set(true);
+            } else if !is_enter {
+                swallowed_input_for_interceptor.set(false);
+            }
+            if !is_enter {
                 return;
             }
             let _ = enter_interceptor_view.update(app, |view, cx| {
@@ -1662,6 +1692,7 @@ impl EditorView {
             sidebar_filter_input_bounds: None,
             sidebar_keyboard_focus: false,
             inline_rename: None,
+            inline_rename_swallowed_input,
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),

@@ -228,6 +228,7 @@ command_actions! {
             }
             InputTarget::Body => {
                 if view.editor().ime().is_none()
+                    && !view.late_input_guard_armed()
                     && !view.apply_list_edit_intent(ListEditIntent::Enter, cx)
                 {
                     view.insert_newline(cx);
