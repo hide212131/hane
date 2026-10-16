@@ -203,6 +203,7 @@ pub(crate) struct WaylandClientState {
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
     ime_pre_edit: Option<String>,
+    ime_empty_commit: bool,
     composing: bool,
     // Surface to Window mapping
     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
@@ -563,6 +564,7 @@ impl WaylandClient {
             text_input: None,
             pre_edit_text: None,
             ime_pre_edit: None,
+            ime_empty_commit: false,
             composing: false,
             outputs: HashMap::default(),
             in_progress_outputs,
@@ -1436,6 +1438,12 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 };
 
                 if let Some(commit_text) = text {
+                    // An explicit empty commit is not a composition cancel. Remember it so the
+                    // matching `Done` does not turn it into `DeleteText`.
+                    state.ime_empty_commit = commit_text.is_empty();
+                    if commit_text.is_empty() {
+                        return;
+                    }
                     drop(state);
                     // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
                     // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
@@ -1465,6 +1473,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 };
 
                 if let Some(text) = state.ime_pre_edit.take() {
+                    state.ime_empty_commit = false;
                     drop(state);
                     window.handle_ime(ImeInput::SetMarkedText(text));
                     if let Some(area) = window.get_ime_area() {
@@ -1480,12 +1489,41 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     }
                 } else {
                     state.composing = false;
+                    let skip_delete = take_empty_commit_flag(&mut state.ime_empty_commit);
                     drop(state);
-                    window.handle_ime(ImeInput::DeleteText);
+                    if !skip_delete {
+                        window.handle_ime(ImeInput::DeleteText);
+                    }
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Consumes the "explicit empty commit" marker at `Done`. Returns true when the
+/// `DeleteText` (composition cancel) must be skipped.
+fn take_empty_commit_flag(flag: &mut bool) -> bool {
+    std::mem::take(flag)
+}
+
+#[cfg(test)]
+mod text_input_tests {
+    use super::take_empty_commit_flag;
+
+    #[test]
+    fn empty_commit_done_skips_delete_once() {
+        let mut flag = true;
+        assert!(take_empty_commit_flag(&mut flag));
+        assert!(!flag);
+        // A later ordinary Done still cancels.
+        assert!(!take_empty_commit_flag(&mut flag));
+    }
+
+    #[test]
+    fn ordinary_done_does_not_skip_delete() {
+        let mut flag = false;
+        assert!(!take_empty_commit_flag(&mut flag));
     }
 }
 
