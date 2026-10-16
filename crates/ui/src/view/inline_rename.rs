@@ -113,6 +113,13 @@ impl EditorView {
         self.inline_rename_swallowed_input.get()
     }
 
+    /// Whether the late-text guard is armed without arming it. An Enter seen
+    /// while armed can only confirm a composition whose text was held back
+    /// during the pending rename, so it must not edit the body.
+    pub(crate) fn late_input_guard_armed(&self) -> bool {
+        self.inline_rename_swallowed_input.get()
+    }
+
     pub(crate) fn replace_inline_rename_text(
         &mut self,
         range_utf16: Option<Range<usize>>,
