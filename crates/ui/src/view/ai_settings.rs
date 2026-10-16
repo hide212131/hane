@@ -1535,10 +1535,18 @@ impl AiSettingsPage {
             .border_t_1()
             .border_color(rgb(theme.table_border))
             .flex()
-            .items_center()
+            .flex_col()
             .gap_2()
-            .child(toggle)
-            .child("接続できないときに確認します。");
+            .child(
+                div()
+                    .id("ai-diagnostics-toggle-row")
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(toggle)
+                    .child("接続できないときに確認します。"),
+            );
         if self.diagnostics_open {
             section = section.child(self.diagnostics_section(theme));
         }
@@ -3763,6 +3771,56 @@ mod tests {
         cx.run_until_parked();
         eprintln!("stack-budget scenario: custom details rendered");
         assert!(cx.debug_bounds("ai-custom-provider-details").is_some());
+    }
+
+    #[gpui::test]
+    fn expanded_diagnostics_card_sits_below_toggle_row_within_settings_width(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for width in [962.0_f32, 700.0] {
+            let (view, cx) =
+                cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+            cx.simulate_resize(gpui::size(px(width), px(790.0)));
+            view.update(cx, |view, cx| {
+                view.settings_open = true;
+                view.settings_category = SettingsCategory::Connection;
+                view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+                view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+                view.ai_settings.snapshot.runtime_install =
+                    RuntimeInstallState::Failed(RuntimeInstallErrorCode::UnsupportedTarget);
+                view.ai_settings.diagnostics_open = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let toggle_section = cx
+                .debug_bounds("ai-diagnostics-toggle-section")
+                .expect("diagnostics toggle section is rendered");
+            let toggle_row = cx
+                .debug_bounds("ai-diagnostics-toggle-row")
+                .expect("diagnostics toggle row is rendered");
+            let card = cx
+                .debug_bounds("ai-diagnostics-section")
+                .expect("expanded diagnostics card is rendered");
+            let window_right = px(width);
+
+            assert!(
+                card.origin.y >= toggle_row.origin.y + toggle_row.size.height,
+                "card must be below the toggle row at width {width}"
+            );
+            assert!(
+                card.origin.x >= toggle_section.origin.x,
+                "card must not start left of the settings column at width {width}"
+            );
+            assert!(
+                card.origin.x + card.size.width <= toggle_section.origin.x + toggle_section.size.width + px(1.0),
+                "card must fit inside the settings column at width {width}"
+            );
+            assert!(
+                card.origin.x + card.size.width <= window_right,
+                "card must not overflow the window at width {width}"
+            );
+        }
     }
 
     #[test]
