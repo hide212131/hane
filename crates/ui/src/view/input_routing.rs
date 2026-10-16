@@ -1480,4 +1480,49 @@ mod tests {
         assert_eq!((filter.as_str(), rename), ("", None));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[gpui::test]
+    fn ime_confirming_enter_after_rename_keeps_the_late_text_guard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("flow-pending-late-enter");
+        let (view, cx) = open_routing_view(cx, "body\n", &root);
+
+        begin_rename(&view, cx, &rename_path(&root));
+        replace(&view, cx, None, "Renamed");
+        cx.update(|_, app| {
+            view.update(app, |view, cx| view.confirm_inline_rename(cx));
+        });
+
+        // IME key-down while the rename is pending; its text callback is held.
+        cx.update(|window, app| {
+            window.dispatch_keystroke(gpui::Keystroke::parse("q").unwrap(), app);
+        });
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.inline_rename_active()));
+
+        // The Enter that confirms the composition arrives after the rename.
+        cx.update(|window, app| {
+            window.dispatch_keystroke(gpui::Keystroke::parse("enter").unwrap(), app);
+        });
+
+        // The delayed platform text callbacks still must not reach anything.
+        replace(&view, cx, None, "q");
+        mark(&view, cx, None, "q", None);
+        unmark(&view, cx);
+        assert_eq!(
+            snapshot(&view, cx),
+            ("body\n".to_owned(), String::new(), None),
+            "late text after the confirming Enter must not reach the body"
+        );
+
+        // A new non-Enter keystroke ends the guard and typing works again.
+        click_body(cx);
+        cx.simulate_input("y");
+        let (body, filter, rename) = snapshot(&view, cx);
+        assert!(body.contains('y'));
+        assert!(!body.contains('q'));
+        assert_eq!((filter.as_str(), rename), ("", None));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

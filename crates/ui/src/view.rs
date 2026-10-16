@@ -1625,8 +1625,16 @@ impl EditorView {
                         .is_some_and(|rename| rename.pending)
                 })
                 .unwrap_or(false);
-            swallowed_input_for_interceptor.set(rename_pending);
-            if event.keystroke.key != "enter" {
+            // An Enter may only confirm an IME composition whose text callback
+            // is still in flight, so it neither arms nor clears the guard; any
+            // other key is new input and ends the guarded window.
+            let is_enter = event.keystroke.key == "enter";
+            if rename_pending {
+                swallowed_input_for_interceptor.set(true);
+            } else if !is_enter {
+                swallowed_input_for_interceptor.set(false);
+            }
+            if !is_enter {
                 return;
             }
             let _ = enter_interceptor_view.update(app, |view, cx| {
