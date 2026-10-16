@@ -204,6 +204,8 @@ pub(crate) struct WaylandClientState {
     pre_edit_text: Option<String>,
     ime_pre_edit: Option<String>,
     ime_empty_commit: bool,
+    /// A previous `Done` already applied a preedit as marked text that is still active.
+    ime_marked_active: bool,
     composing: bool,
     // Surface to Window mapping
     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
@@ -319,6 +321,7 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         state.composing = false;
+        state.ime_marked_active = false;
         if let Some(text_input) = &state.text_input {
             text_input.disable();
             text_input.commit();
@@ -565,6 +568,7 @@ impl WaylandClient {
             pre_edit_text: None,
             ime_pre_edit: None,
             ime_empty_commit: false,
+            ime_marked_active: false,
             composing: false,
             outputs: HashMap::default(),
             in_progress_outputs,
@@ -1470,6 +1474,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     &mut state.ime_pre_edit,
                     &mut state.composing,
                     &mut state.ime_empty_commit,
+                    &mut state.ime_marked_active,
                 );
                 if let ImeDoneAction::SetMarkedText(text) = action {
                     drop(state);
@@ -1519,18 +1524,23 @@ fn commit_string_text(empty_commit: &mut bool, text: Option<String>) -> Option<S
 }
 
 /// `Done` transition. A pending preedit becomes `SetMarkedText`; otherwise the composition is
-/// cancelled with `DeleteText` unless an explicit empty commit was just seen (consumed here).
+/// cancelled with `DeleteText`. An explicit empty commit (consumed here) only cancels when a
+/// previous `Done` left marked text active, because the protocol removes the preedit before
+/// applying the commit; without marked text it must not delete the selection.
 fn done_action(
     pre_edit: &mut Option<String>,
     composing: &mut bool,
     empty_commit: &mut bool,
+    marked_active: &mut bool,
 ) -> ImeDoneAction {
     if let Some(text) = pre_edit.take() {
         *empty_commit = false;
+        *marked_active = true;
         ImeDoneAction::SetMarkedText(text)
     } else {
         *composing = false;
-        if std::mem::take(empty_commit) {
+        let was_marked = std::mem::take(marked_active);
+        if std::mem::take(empty_commit) && !was_marked {
             ImeDoneAction::Nothing
         } else {
             ImeDoneAction::DeleteText
@@ -1547,6 +1557,7 @@ mod text_input_tests {
         composing: bool,
         pre_edit: Option<String>,
         empty_commit: bool,
+        marked_active: bool,
     }
 
     impl Fields {
@@ -1556,8 +1567,43 @@ mod text_input_tests {
         }
 
         fn done(&mut self) -> ImeDoneAction {
-            done_action(&mut self.pre_edit, &mut self.composing, &mut self.empty_commit)
+            done_action(
+                &mut self.pre_edit,
+                &mut self.composing,
+                &mut self.empty_commit,
+                &mut self.marked_active,
+            )
         }
+
+        fn preedit(&mut self, text: &str) {
+            self.composing = true;
+            self.pre_edit = Some(text.to_string());
+        }
+    }
+
+    #[test]
+    fn empty_commit_after_applied_preedit_deletes_marked_text() {
+        let mut f = Fields::default();
+        f.preedit("かな");
+        assert_eq!(f.done(), ImeDoneAction::SetMarkedText("かな".to_string()));
+        assert!(f.marked_active);
+        // Next batch: the compositor cancels the preedit with an empty commit.
+        assert_eq!(f.commit(Some("")), None);
+        assert_eq!(f.done(), ImeDoneAction::DeleteText);
+        assert!(!f.marked_active);
+        assert!(!f.empty_commit);
+        // The empty commit flag was consumed; marked text is gone.
+        assert_eq!(f.commit(Some("")), None);
+        assert_eq!(f.done(), ImeDoneAction::Nothing);
+    }
+
+    #[test]
+    fn empty_commit_without_marked_text_is_consumed_once() {
+        let mut f = Fields::default();
+        assert_eq!(f.commit(Some("")), None);
+        assert_eq!(f.done(), ImeDoneAction::Nothing);
+        assert!(!f.empty_commit);
+        assert_eq!(f.done(), ImeDoneAction::DeleteText);
     }
 
     #[test]
