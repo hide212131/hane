@@ -3518,11 +3518,14 @@ mod tests {
     #[test]
     fn runtime_access_denied_maps_to_install_permission_without_changing_generic_failures() {
         assert_eq!(
-            map_distribution_code_to_install_code(RuntimeDistributionErrorCode::AccessDenied),
+            map_distribution_code_to_install_code(RuntimeDistributionErrorCode::AccessDenied, None),
             RuntimeInstallErrorCode::PermissionDenied
         );
         assert_eq!(
-            map_distribution_code_to_install_code(RuntimeDistributionErrorCode::InvalidExecutable),
+            map_distribution_code_to_install_code(
+                RuntimeDistributionErrorCode::InvalidExecutable,
+                None
+            ),
             RuntimeInstallErrorCode::VerificationFailed
         );
     }
