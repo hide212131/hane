@@ -1481,6 +1481,86 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A body composition that outlives the start of a rename must still be
+    /// cancellable by the platform's late cancel callback, while the late-text
+    /// guard keeps dropping every other delayed callback.
+    fn late_body_cancel_after_pending_rename(cx: &mut gpui::TestAppContext, via_mark: bool) {
+        let label = if via_mark { "late-cancel-mark" } else { "late-cancel-replace" };
+        let root = fixture_root(label);
+        let (view, cx) = open_routing_view(cx, "body\n", &root);
+        click_body(cx);
+
+        let before_selection = view.read_with(cx, |view, _| view.editor().selection());
+        mark(&view, cx, None, "k", None);
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+
+        begin_rename(&view, cx, &rename_path(&root));
+        replace(&view, cx, None, "Renamed");
+        cx.update(|_, app| {
+            view.update(app, |view, cx| view.confirm_inline_rename(cx));
+        });
+        assert!(view.read_with(cx, |view, _| {
+            view.inline_rename.as_ref().is_some_and(|rename| rename.pending)
+        }));
+        // The key pressed while pending arms the late-text guard.
+        cx.update(|window, app| {
+            window.dispatch_keystroke(gpui::Keystroke::parse("q").unwrap(), app);
+        });
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.inline_rename_active()));
+        assert!(view.read_with(cx, |view, _| view.late_input_guard_armed()));
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+
+        // A delayed non-cancel text callback is still dropped.
+        replace(&view, cx, None, "q");
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+        assert!(!snapshot(&view, cx).0.contains('q'));
+
+        // The delayed empty platform cancel reaches the body composition.
+        if via_mark {
+            mark(&view, cx, None, "", None);
+        } else {
+            replace(&view, cx, None, "");
+        }
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_none()));
+        assert_eq!(
+            snapshot(&view, cx),
+            ("body\n".to_owned(), String::new(), None),
+            "the body returns to the pre-composition text"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            before_selection
+        );
+
+        // The guard is kept after the cancel, then ends with a new key.
+        assert!(view.read_with(cx, |view, _| view.late_input_guard_armed()));
+        replace(&view, cx, None, "q");
+        mark(&view, cx, None, "q", None);
+        assert_eq!(
+            snapshot(&view, cx),
+            ("body\n".to_owned(), String::new(), None)
+        );
+        click_body(cx);
+        cx.simulate_input("y");
+        let (body, _, _) = snapshot(&view, cx);
+        assert!(body.contains('y'));
+        assert!(!body.contains('q'));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn late_body_cancel_via_replace_text_reaches_the_composition(cx: &mut gpui::TestAppContext) {
+        late_body_cancel_after_pending_rename(cx, false);
+    }
+
+    #[gpui::test]
+    fn late_body_cancel_via_replace_and_mark_reaches_the_composition(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        late_body_cancel_after_pending_rename(cx, true);
+    }
+
     #[gpui::test]
     fn ime_confirming_enter_after_rename_keeps_the_late_text_guard(
         cx: &mut gpui::TestAppContext,

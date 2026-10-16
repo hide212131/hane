@@ -282,9 +282,6 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.drop_input_after_pending_rename() {
-            return;
-        }
         // An empty replacement during composition is the platform's cancel: a
         // rangeless one on Windows IME, or one covering exactly the marked text
         // on macOS. It restores the pre-composition snapshot.
@@ -293,6 +290,16 @@ impl EntityInputHandler for EditorView {
                 None => true,
                 Some(range) => self.composition_marked_range() == Some(range.clone()),
             };
+        // The guard still arms, but a cancel for an existing body composition
+        // must reach it: dropping it would leave the marked text behind.
+        let guarded = self.drop_input_after_pending_rename();
+        if guarded
+            && !(platform_cancel
+                && matches!(self.input_target_for_text_callback(), InputTarget::Body)
+                && self.editor().ime().is_some())
+        {
+            return;
+        }
         match self.input_target_for_text_callback() {
             InputTarget::InlineRename => {
                 if platform_cancel && self.inline_rename_has_composition() {
@@ -338,7 +345,13 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.drop_input_after_pending_rename() {
+        // The guard still arms, but an empty mark that cancels an existing
+        // body composition must reach the cancel below.
+        if self.drop_input_after_pending_rename()
+            && !(new_text.is_empty()
+                && matches!(self.input_target_for_text_callback(), InputTarget::Body)
+                && self.editor().ime().is_some())
+        {
             return;
         }
         // macOS cancels a composition (second Escape) by marking empty text
