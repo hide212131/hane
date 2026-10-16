@@ -96,6 +96,23 @@ impl EditorView {
             .map(|range| range_to_utf16(&rename.text, range))
     }
 
+    /// Whether a platform text callback (`replace_text_in_range`,
+    /// `replace_and_mark_text_in_range`) must be ignored. Text received while
+    /// the rename is pending is never applied, and the platform may still
+    /// hold it and commit it after the rename ended (to the body or back into
+    /// the rename field). So the first such callback arms a guard that drops
+    /// text callbacks until the next keystroke.
+    pub(crate) fn drop_input_after_pending_rename(&self) -> bool {
+        if self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|rename| rename.pending)
+        {
+            self.inline_rename_swallowed_input.set(true);
+        }
+        self.inline_rename_swallowed_input.get()
+    }
+
     pub(crate) fn replace_inline_rename_text(
         &mut self,
         range_utf16: Option<Range<usize>>,

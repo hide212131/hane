@@ -282,6 +282,9 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.drop_input_after_pending_rename() {
+            return;
+        }
         // An empty replacement during composition is the platform's cancel: a
         // rangeless one on Windows IME, or one covering exactly the marked text
         // on macOS. It restores the pre-composition snapshot.
@@ -335,6 +338,9 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.drop_input_after_pending_rename() {
+            return;
+        }
         // macOS cancels a composition (second Escape) by marking empty text
         // before or instead of unmarking. Marking nothing over an active
         // composition restores the pre-composition snapshot rather than
