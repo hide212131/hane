@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-この文書は、Hane の AADW で ChatGPT が司令塔として Jev の判断を運用するときのルールを定める。工程管理は v2 の `Observe → Decide → Act → Observe` を保ち、意味判断には Jev を標準で使う。
+この文書は、Hane の AADW で ChatGPT が司令塔として Jev の判断を運用するときのルールを定める。工程は `Observe → Decide → Act → Observe` の反復で進め、意味判断には Jev を標準で使う。
 
 AADW v3 は独立した workflow / state machine を増やさず、次の反復で運用する。
 
