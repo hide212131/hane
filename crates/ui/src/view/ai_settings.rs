@@ -1530,6 +1530,7 @@ impl AiSettingsPage {
             });
         let mut section = div()
             .id("ai-diagnostics-toggle-section")
+            .debug_selector(|| "ai-diagnostics-toggle-section".to_owned())
             .w_full()
             .pt(px(10.0))
             .border_t_1()
@@ -1540,6 +1541,7 @@ impl AiSettingsPage {
             .child(
                 div()
                     .id("ai-diagnostics-toggle-row")
+                    .debug_selector(|| "ai-diagnostics-toggle-row".to_owned())
                     .w_full()
                     .flex()
                     .items_center()
@@ -1793,6 +1795,7 @@ impl AiSettingsPage {
         };
         div()
             .id("ai-diagnostics-section")
+            .debug_selector(|| "ai-diagnostics-section".to_owned())
             .w_full()
             .px(px(16.0))
             .py(px(14.0))
