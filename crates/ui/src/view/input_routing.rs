@@ -864,6 +864,117 @@ mod tests {
         mac_cancel_over_selection_contract(cx, Surface::Rename, "cancel-mac-rep-rename", true);
     }
 
+    /// Selects the whole original text, starts a composition over it through
+    /// the real callback, and returns the pre-composition `(text, selection)`.
+    fn start_composition_over_full_selection(
+        view: &TestView,
+        cx: &mut TestCx,
+        surface: Surface,
+    ) -> (String, Range<usize>) {
+        cx.simulate_keystrokes("home shift-end");
+        cx.run_until_parked();
+        let text = surface_text(view, cx, surface);
+        let selection = surface_selection(view, cx, surface);
+        assert_eq!(text, TEXT);
+        assert_eq!(selection, 0..TEXT.len());
+
+        mark(view, cx, None, "か", None);
+        assert!(
+            query_marked(view, cx).is_some(),
+            "the composition replaced the whole selection and is marked"
+        );
+        assert_ne!(surface_text(view, cx, surface), TEXT);
+        (text, selection)
+    }
+
+    /// Same macOS cancellation callback order as
+    /// `mac_cancel_over_selection_contract`, with the whole text selected.
+    fn mac_cancel_over_full_selection_contract(
+        cx: &mut gpui::TestAppContext,
+        surface: Surface,
+        label: &str,
+        replace_marked_range: bool,
+    ) {
+        let root = fixture_root(label);
+        let (view, cx) = prepare_surface(cx, surface, &root, TEXT);
+        let original = start_composition_over_full_selection(&view, cx, surface);
+
+        // First Escape: the composition reverts to the reading.
+        mark(&view, cx, None, "にほんご", None);
+        assert!(query_marked(&view, cx).is_some());
+
+        // Second Escape: the composition is cancelled.
+        let marked = query_marked(&view, cx);
+        if replace_marked_range {
+            replace(&view, cx, marked, "");
+        } else {
+            mark(&view, cx, marked, "", None);
+        }
+        unmark(&view, cx);
+        cx.run_until_parked();
+        assert_cancel_restored(&view, cx, surface, &original);
+        if surface == Surface::Rename {
+            assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn body_mac_empty_mark_cancel_keeps_the_fully_selected_text(cx: &mut gpui::TestAppContext) {
+        mac_cancel_over_full_selection_contract(cx, Surface::Body, "cancel-full-mark-body", false);
+    }
+
+    #[gpui::test]
+    fn filter_mac_empty_mark_cancel_keeps_the_fully_selected_text(cx: &mut gpui::TestAppContext) {
+        mac_cancel_over_full_selection_contract(
+            cx,
+            Surface::Filter,
+            "cancel-full-mark-filter",
+            false,
+        );
+    }
+
+    #[gpui::test]
+    fn rename_mac_empty_mark_cancel_keeps_the_fully_selected_text(cx: &mut gpui::TestAppContext) {
+        mac_cancel_over_full_selection_contract(
+            cx,
+            Surface::Rename,
+            "cancel-full-mark-rename",
+            false,
+        );
+    }
+
+    #[gpui::test]
+    fn body_mac_marked_range_replace_cancel_keeps_the_fully_selected_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        mac_cancel_over_full_selection_contract(cx, Surface::Body, "cancel-full-rep-body", true);
+    }
+
+    #[gpui::test]
+    fn filter_mac_marked_range_replace_cancel_keeps_the_fully_selected_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        mac_cancel_over_full_selection_contract(
+            cx,
+            Surface::Filter,
+            "cancel-full-rep-filter",
+            true,
+        );
+    }
+
+    #[gpui::test]
+    fn rename_mac_marked_range_replace_cancel_keeps_the_fully_selected_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        mac_cancel_over_full_selection_contract(
+            cx,
+            Surface::Rename,
+            "cancel-full-rep-rename",
+            true,
+        );
+    }
+
     #[gpui::test]
     fn body_escape_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
         escape_cancel_over_selection_contract(cx, Surface::Body, "cancel-esc-body");
