@@ -1,4 +1,15 @@
-# Windows P3 実画面確認
+# Windows P3 実画面確認 — 記録一覧
+
+## 最新の再確認
+
+[2026-10-17 のWindows P3実画面結果（対象 `0a9bc16ae2bdef04ec0dbe2f4f72ecad0af61aa7`）](2026-10-17-0a9bc16/README.md)
+
+- PR headを再取得したところ、再開手順コメントが示す `e6c6e3e26fea621bafcb60cc3b04d656c33a2194` から進んでいたため、実画面確認は最新head `0a9bc16ae2bdef04ec0dbe2f4f72ecad0af61aa7` のビルドで実施。
+- 待機保護を除くWindows確認項目は合格。rename処理待ち中の入力保護は `Renaming…` を捕捉できず未検証。
+- macOS必須確認が揃うまで、PR #491とIssue #304は未完了のまま。
+
+---
+## 過去の実画面記録（旧対象 e6c6e3e26fea621bafcb60cc3b04d656c33a2194）
 
 - PR: [#491](https://github.com/hide212131/hane/pull/491)
 - 実画面確認の対象コードcommit: `e6c6e3e26fea621bafcb60cc3b04d656c33a2194`
