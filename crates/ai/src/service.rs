@@ -2452,18 +2452,31 @@ fn resolve_runtime_binary_at_startup(
         Err(RuntimeDistributionErrorCode::Missing) => RuntimeInstallState::NotInstalled,
         Err(code) => {
             state.runtime_binary_error = Some(code);
-            RuntimeInstallState::Failed(map_distribution_code_to_install_code(code))
+            RuntimeInstallState::Failed(map_distribution_code_to_install_code(
+                code,
+                runtime_distribution::current_target(),
+            ))
         }
     };
     mutate(shared, |snapshot| snapshot.runtime_install = install_state);
 }
 
+/// `detected_target` is the host target `current_target()` reports. A
+/// resolution `UnsupportedTarget` on a host with no detected target is a
+/// genuinely unsupported host (non-retryable). With a detected target it means
+/// the stored `manifest.target` differs from the host, which a reinstall
+/// repairs, so it maps to the retryable `VerificationFailed`.
 fn map_distribution_code_to_install_code(
     code: RuntimeDistributionErrorCode,
+    detected_target: Option<&str>,
 ) -> RuntimeInstallErrorCode {
     match code {
         RuntimeDistributionErrorCode::UnsupportedTarget => {
-            RuntimeInstallErrorCode::UnsupportedTarget
+            if detected_target.is_some() {
+                RuntimeInstallErrorCode::VerificationFailed
+            } else {
+                RuntimeInstallErrorCode::UnsupportedTarget
+            }
         }
         RuntimeDistributionErrorCode::IntegrityMismatch => {
             RuntimeInstallErrorCode::IntegrityMismatch
@@ -3232,6 +3245,48 @@ fn current_model(settings: &AiSettings) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::runtime::RuntimeConfig;
+
+    #[test]
+    fn startup_unsupported_target_without_detected_target_is_not_retryable() {
+        let code = map_distribution_code_to_install_code(
+            RuntimeDistributionErrorCode::UnsupportedTarget,
+            None,
+        );
+        assert_eq!(code, RuntimeInstallErrorCode::UnsupportedTarget);
+        assert!(!code.is_retryable());
+    }
+
+    #[test]
+    fn startup_unsupported_target_with_detected_target_is_retryable() {
+        let code = map_distribution_code_to_install_code(
+            RuntimeDistributionErrorCode::UnsupportedTarget,
+            Some("aarch64-apple-darwin"),
+        );
+        assert_eq!(code, RuntimeInstallErrorCode::VerificationFailed);
+        assert!(code.is_retryable());
+    }
+
+    #[test]
+    fn startup_integrity_mismatch_keeps_stable_code_and_is_retryable() {
+        for target in [None, Some("aarch64-apple-darwin")] {
+            let code = map_distribution_code_to_install_code(
+                RuntimeDistributionErrorCode::IntegrityMismatch,
+                target,
+            );
+            assert_eq!(code, RuntimeInstallErrorCode::IntegrityMismatch);
+            assert_eq!(code.stable_code(), "runtime_install_integrity_mismatch");
+            assert!(code.is_retryable());
+        }
+    }
+
+    #[test]
+    fn startup_access_denied_maps_to_permission_denied() {
+        let code = map_distribution_code_to_install_code(
+            RuntimeDistributionErrorCode::AccessDenied,
+            None,
+        );
+        assert_eq!(code, RuntimeInstallErrorCode::PermissionDenied);
+    }
 
     fn test_handle(snapshot: AiSnapshot) -> AiServiceHandle {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);
