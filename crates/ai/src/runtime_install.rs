@@ -276,6 +276,27 @@ impl RuntimeInstallErrorCode {
             Self::Canceled => "runtime_install_canceled",
         }
     }
+
+    /// Whether repeating the same explicit install can plausibly succeed.
+    /// Deterministic failures (an unsupported host, an archive whose layout
+    /// the pinned lock cannot resolve) return `false` so the UI does not
+    /// offer a retry that cannot change the outcome.
+    pub fn is_retryable(self) -> bool {
+        !matches!(self, Self::UnsupportedTarget | Self::AmbiguousEntrypoint)
+    }
+
+    /// The pipeline stage that failed, as a short user-facing label.
+    pub fn failure_stage(self) -> &'static str {
+        match self {
+            Self::UnsupportedTarget => "対応環境の判定",
+            Self::DisallowedRedirectHost | Self::NetworkDownloadFailed => "ダウンロード",
+            Self::SizeMismatch | Self::IntegrityMismatch => "取得物の検証",
+            Self::ExtractionFailed | Self::AmbiguousEntrypoint => "展開と内容検査",
+            Self::VerificationFailed => "導入候補の起動確認",
+            Self::StagingFailed | Self::PermissionDenied => "Hane専用領域への公開",
+            Self::Canceled => "利用者による取り消し",
+        }
+    }
 }
 
 pub(crate) fn map_io_error(

@@ -59,6 +59,9 @@ const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const WINDOWS_X64_TARGET: &str = "x86_64-pc-windows-msvc";
 pub const MACOS_ARM64_TARGET: &str = "aarch64-apple-darwin";
 
+/// Every target the installed package contract supports, for diagnostics.
+pub const SUPPORTED_TARGETS: [&str; 2] = [WINDOWS_X64_TARGET, MACOS_ARM64_TARGET];
+
 /// The only recognized `files` entry `type`. Any other value is treated as
 /// an unknown-schema inventory entry and rejected fail-closed.
 const RUNTIME_MANIFEST_FILE_TYPE_FILE: &str = "file";

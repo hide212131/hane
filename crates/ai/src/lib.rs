@@ -62,7 +62,7 @@ pub use runtime::{
 };
 pub use runtime_distribution::{
     EXPLICIT_OVERRIDE_ENV_VAR, ResolvedRuntimeBinary, RuntimeBinarySource,
-    RuntimeDistributionErrorCode, RuntimeManifest, classify_handshake_failure,
+    RuntimeDistributionErrorCode, RuntimeManifest, SUPPORTED_TARGETS, classify_handshake_failure,
     classify_spawn_error, resolve_runtime_binary,
 };
 pub use runtime_install::{

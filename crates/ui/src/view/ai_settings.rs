@@ -152,6 +152,74 @@ fn runtime_install_action_label(state: RuntimeInstallState) -> &'static str {
     }
 }
 
+/// The explicit install button is hidden after a failure that a repeat
+/// attempt cannot resolve (for example an unsupported host).
+fn runtime_install_action_visible(state: RuntimeInstallState) -> bool {
+    match state {
+        RuntimeInstallState::Failed(code) => code.is_retryable(),
+        _ => true,
+    }
+}
+
+fn runtime_install_next_step(code: RuntimeInstallErrorCode) -> &'static str {
+    match code {
+        RuntimeInstallErrorCode::UnsupportedTarget => {
+            "この環境ではインストールできません。対応環境のHaneを使うか、HANE_CODEX_APP_SERVERに絶対パスで実行ファイルを指定してください。再試行しても解消しません"
+        }
+        RuntimeInstallErrorCode::AmbiguousEntrypoint => {
+            "再試行しても解消しません。Haneを更新するか、HANE_CODEX_APP_SERVERに絶対パスで実行ファイルを指定してください"
+        }
+        RuntimeInstallErrorCode::DisallowedRedirectHost
+        | RuntimeInstallErrorCode::NetworkDownloadFailed => {
+            "ネットワーク接続やプロキシ設定を確認してから「再試行」を押してください"
+        }
+        RuntimeInstallErrorCode::SizeMismatch | RuntimeInstallErrorCode::IntegrityMismatch => {
+            "取得が不完全だった可能性があります。「再試行」を押してください。繰り返す場合はネットワークを確認してください"
+        }
+        RuntimeInstallErrorCode::ExtractionFailed | RuntimeInstallErrorCode::VerificationFailed => {
+            "「再試行」を押してください。繰り返す場合はHaneを更新してください"
+        }
+        RuntimeInstallErrorCode::StagingFailed => {
+            "空き容量とHane専用領域の状態を確認してから「再試行」を押してください"
+        }
+        RuntimeInstallErrorCode::PermissionDenied => {
+            "Hane専用領域への書き込み権限を確認してから「再試行」を押してください"
+        }
+        RuntimeInstallErrorCode::Canceled => "必要になったら「再試行」を押してください",
+    }
+}
+
+/// Diagnostic lines for a failed install. Built only from the stable error
+/// code, the detected OS/architecture, and the fixed supported-target list, so
+/// no settings, API key, token, or auth URL can reach it.
+fn runtime_install_failure_diagnostics(
+    code: RuntimeInstallErrorCode,
+    os: &str,
+    arch: &str,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "導入失敗: 段階={} / 分類={} / エラーコード={}",
+            code.failure_stage(),
+            runtime_install_error_label(code),
+            code.stable_code()
+        ),
+        format!(
+            "再試行: {}",
+            if code.is_retryable() { "可能" } else { "不可（再試行では解消しません）" }
+        ),
+    ];
+    if code == RuntimeInstallErrorCode::UnsupportedTarget {
+        lines.push(format!("検出した環境: {os} / {arch}"));
+        lines.push(format!(
+            "対応target: {}",
+            hane_ai::SUPPORTED_TARGETS.join(", ")
+        ));
+    }
+    lines.push(format!("次の手順: {}", runtime_install_next_step(code)));
+    lines
+}
+
 fn runtime_install_not_installed_probe_guidance() -> String {
     format!(
         "先にCodex App Serverの「{}」を押してください。",
@@ -1052,10 +1120,16 @@ impl AiSettingsPage {
                 })
                 .into_any_element()
         };
-        let action = div()
-            .id(format!("{action_selector}-wrapper"))
-            .debug_selector(move || action_selector.to_owned())
-            .child(action);
+        let installing = matches!(
+            self.snapshot.busy,
+            Some((_, ServiceBusyReason::InstallingRuntime))
+        );
+        let action = (installing || runtime_install_action_visible(self.snapshot.runtime_install)).then(|| {
+            div()
+                .id(format!("{action_selector}-wrapper"))
+                .debug_selector(move || action_selector.to_owned())
+                .child(action)
+        });
         div()
             .id("ai-runtime-install-section")
             .debug_selector(|| "ai-runtime-install-section".to_owned())
@@ -1104,7 +1178,7 @@ impl AiSettingsPage {
                             .child(state_note),
                     ),
             )
-            .child(action)
+            .children(action)
     }
 
     fn current_connection_section(
@@ -1701,6 +1775,14 @@ impl AiSettingsPage {
                 runtime_distribution_error_label(code)
             ),
         };
+        let install_failure = match self.snapshot.runtime_install {
+            RuntimeInstallState::Failed(code) => runtime_install_failure_diagnostics(
+                code,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ),
+            _ => Vec::new(),
+        };
         div()
             .id("ai-diagnostics-section")
             .w_full()
@@ -1721,6 +1803,7 @@ impl AiSettingsPage {
                 self.snapshot.runtime_generation
             ))
             .child(distribution)
+            .children(install_failure)
             .child("秘密のAPI key、token、auth URLは表示・記録しません")
     }
 
@@ -3560,6 +3643,55 @@ mod tests {
             RuntimeInstallErrorCode::PermissionDenied.stable_code(),
             "runtime_install_permission_denied"
         );
+    }
+
+    #[test]
+    fn unsupported_target_diagnostics_show_target_code_and_supported_list_without_retry() {
+        let failed = RuntimeInstallState::Failed(RuntimeInstallErrorCode::UnsupportedTarget);
+        assert!(!runtime_install_action_visible(failed));
+        assert!(runtime_install_action_visible(RuntimeInstallState::Failed(
+            RuntimeInstallErrorCode::NetworkDownloadFailed
+        )));
+        assert!(runtime_install_action_visible(RuntimeInstallState::NotInstalled));
+
+        let text = runtime_install_failure_diagnostics(
+            RuntimeInstallErrorCode::UnsupportedTarget,
+            "windows",
+            "aarch64",
+        )
+        .join("\n");
+        assert!(text.contains("windows / aarch64"));
+        assert!(text.contains("runtime_install_unsupported_target"));
+        assert!(text.contains(hane_ai::SUPPORTED_TARGETS[0]));
+        assert!(text.contains(hane_ai::SUPPORTED_TARGETS[1]));
+        assert!(text.contains("段階="));
+        assert!(text.contains("次の手順"));
+        assert!(text.contains("再試行しても解消しません"));
+    }
+
+    #[test]
+    fn install_failure_diagnostics_never_contain_secret_markers() {
+        for code in [
+            RuntimeInstallErrorCode::UnsupportedTarget,
+            RuntimeInstallErrorCode::DisallowedRedirectHost,
+            RuntimeInstallErrorCode::NetworkDownloadFailed,
+            RuntimeInstallErrorCode::SizeMismatch,
+            RuntimeInstallErrorCode::IntegrityMismatch,
+            RuntimeInstallErrorCode::ExtractionFailed,
+            RuntimeInstallErrorCode::AmbiguousEntrypoint,
+            RuntimeInstallErrorCode::VerificationFailed,
+            RuntimeInstallErrorCode::StagingFailed,
+            RuntimeInstallErrorCode::PermissionDenied,
+            RuntimeInstallErrorCode::Canceled,
+        ] {
+            let text = runtime_install_failure_diagnostics(code, "linux", "x86_64").join("\n");
+            assert!(text.contains(code.stable_code()));
+            assert!(text.contains("次の手順"));
+            let lower = text.to_lowercase();
+            for marker in ["sk-", "bearer", "token=", "http://", "https://", "api_key="] {
+                assert!(!lower.contains(marker), "{code:?} leaked {marker}");
+            }
+        }
     }
 
     #[test]
