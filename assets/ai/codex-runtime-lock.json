@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "upstream_tag": "rust-v0.157.1",
+  "codex_version": "0.157.1",
+  "source_commit": "36650394c5b38c2990ccf2a3457165ca3e9d9726",
+  "allowed_hosts": ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"],
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-app-server-package-x86_64-pc-windows-msvc.tar.gz",
+      "archive_size": 122840599,
+      "archive_sha256": "7ca926f4fc443c0ead83109314e9a97bf43d2da276be147f1919a4b5e62dfa8b",
+      "entrypoint_name": "codex-app-server.exe",
+      "inventory": "inventory/x86_64-pc-windows-msvc-0.157.1.json",
+      "runtime_profile": { "name": "default" },
+      "config_profile": { "name": "default" },
+      "state_profile": { "name": "default" }
+    },
+    "aarch64-pc-windows-msvc": {
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-app-server-package-aarch64-pc-windows-msvc.tar.gz",
+      "archive_size": 113873506,
+      "archive_sha256": "e94f89d28bc81eb4a98110c4513d7713e7985a9d91c9d9d5627de92e030e9d73",
+      "entrypoint_name": "codex-app-server.exe",
+      "inventory": "inventory/aarch64-pc-windows-msvc-0.157.1.json",
+      "runtime_profile": { "name": "default" },
+      "config_profile": { "name": "default" },
+      "state_profile": { "name": "default" }
+    },
+    "aarch64-apple-darwin": {
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-app-server-package-aarch64-apple-darwin.tar.gz",
+      "archive_size": 98491706,
+      "archive_sha256": "9a6033c9fe30260e71d784d003ad1e2de2a55c93e24a24856e8433029a3f811a",
+      "entrypoint_name": "codex-app-server",
+      "inventory": "inventory/aarch64-apple-darwin-0.157.1.json",
+      "runtime_profile": { "name": "default" },
+      "config_profile": { "name": "default" },
+      "state_profile": { "name": "default" }
+    }
+  }
+}

@@ -28,7 +28,16 @@ use crate::paths::AiPaths;
 use crate::probe::{ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
-use crate::runtime::{AiRuntime, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime::{AiRuntime, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime_distribution;
+use crate::runtime_distribution::{
+    EXPLICIT_OVERRIDE_ENV_VAR, RuntimeDistributionErrorCode, classify_handshake_failure,
+    classify_spawn_error, resolve_runtime_binary,
+};
+use crate::runtime_install::{
+    CurlArchiveDownloader, RuntimeInstallErrorCode, RuntimeInstallState, TarArchiveExtractor,
+    install_runtime, install_spec_for_current_target, map_distribution_error, map_io_error,
+};
 use crate::secrets::{CredentialRef, CredentialStore};
 use crate::settings::{ActiveConnection, AiSettings, AiSettingsStore, SaveError};
 use crate::text_transform::{
@@ -42,6 +51,7 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const EVENT_POLL: Duration = Duration::from_millis(40);
 const MAX_EARLY_LOGIN_EVENTS: usize = 64;
 const MAX_EARLY_LOGIN_BYTES: usize = 256 * 1024;
+static RUNTIME_PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OperationId(pub u64);
@@ -57,6 +67,10 @@ pub enum ServiceBusyReason {
     /// One selection AI text transform turn (Issue #449). Mutually exclusive
     /// with every other AI operation via the same admission gate Probe uses.
     TextTransform,
+    /// One first-use runtime download/install attempt
+    /// (`AiCommand::InstallRuntime`). Cancelable, like `Login`/`Probe`/
+    /// `TextTransform`.
+    InstallingRuntime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +142,20 @@ pub struct AiSnapshot {
     /// text-transform-triggered isolation never mutates the fixed Probe's
     /// own `probe_status`/`probe_result`.
     pub runtime_isolated: bool,
+    /// The most recent runtime binary resolution or spawn/`initialize`
+    /// handshake failure (see `crate::runtime_distribution`), distinct from
+    /// every other `RuntimeError`. Cleared as soon as the runtime next
+    /// reaches `RuntimeState::Ready`. `None` means resolution/startup has
+    /// not (yet, or currently) failed in a way this module classifies.
+    pub runtime_distribution_error: Option<RuntimeDistributionErrorCode>,
+    /// First-use download/install pipeline status (`crate::runtime_install`).
+    /// Resolved from `AiPaths::runtime_install_dir` once at service startup,
+    /// independent of `runtime_distribution_error`: this is the primary
+    /// signal the AI settings screen's install section shows, while
+    /// `runtime_distribution_error` remains a lower-level diagnostic only
+    /// ever surfaced once an actual AI operation attempts to use the
+    /// runtime.
+    pub runtime_install: RuntimeInstallState,
 }
 
 impl Default for AiSnapshot {
@@ -151,6 +179,8 @@ impl Default for AiSnapshot {
             probe_status: ProbeStatus::NotRun,
             probe_result: None,
             runtime_isolated: false,
+            runtime_distribution_error: None,
+            runtime_install: RuntimeInstallState::NotInstalled,
         }
     }
 }
@@ -181,6 +211,11 @@ pub enum AiCommand {
     /// Probe cancellation/timeout. Other AI operations remain unavailable
     /// until this operation confirms the child is gone.
     RetryProbeStop,
+    /// Starts (or retries, after a prior failure) the first-use runtime
+    /// download/install pipeline (`crate::runtime_install`). Only ever
+    /// downloads anything because the user explicitly chose "install" in
+    /// the AI settings screen; never run automatically.
+    InstallRuntime,
 }
 
 #[derive(Clone)]
@@ -281,6 +316,7 @@ impl AiServiceHandle {
             AiCommand::Restart => ServiceBusyReason::Recovering,
             AiCommand::Probe => ServiceBusyReason::Probe,
             AiCommand::RetryProbeStop => ServiceBusyReason::Recovering,
+            AiCommand::InstallRuntime => ServiceBusyReason::InstallingRuntime,
         };
         self.enqueue(WorkerCommand::Action(command), reason)
     }
@@ -416,6 +452,7 @@ impl AiServiceHandle {
                 ServiceBusyReason::Login
                     | ServiceBusyReason::Probe
                     | ServiceBusyReason::TextTransform
+                    | ServiceBusyReason::InstallingRuntime
             )) if id == target
         ) {
             return Err(AdmissionError::WrongOperation);
@@ -474,6 +511,15 @@ impl BrowserOpener for SystemBrowserOpener {
 pub struct AiServiceConfig {
     pub app_data_root: PathBuf,
     pub binary_path: PathBuf,
+    /// Set by the caller (see `crates/app/src/main.rs::start_ai_service`)
+    /// when resolving an explicit Codex App Server override already
+    /// failed (see
+    /// `crate::runtime_distribution::resolve_runtime_binary`), e.g. a
+    /// missing override or an unsupported target. When `Some`, `binary_path`
+    /// is a meaningless placeholder: every runtime start is short-circuited
+    /// before it is ever used, and this code is surfaced directly as
+    /// `AiSnapshot::runtime_distribution_error`.
+    pub binary_resolution_error: Option<RuntimeDistributionErrorCode>,
     pub credential_store: Arc<dyn CredentialStore>,
     pub browser_opener: Arc<dyn BrowserOpener>,
     pub shell_env_format: ShellEnvironmentPolicyFormat,
@@ -537,6 +583,19 @@ struct WorkerState {
     early_login_events: VecDeque<(u64, Option<Value>, usize)>,
     early_login_bytes: usize,
     deferred_runtime_events: VecDeque<RuntimeEvent>,
+    /// The runtime binary resolved from `AiPaths::runtime_install_dir`
+    /// (`None` if no install has ever completed, or a prior one was
+    /// subsequently found to be corrupted -- see `runtime_binary_error`),
+    /// refreshed once at worker startup and again right after a successful
+    /// `AiCommand::InstallRuntime`. Takes priority over `config.binary_path`
+    /// (which exists only so tests can point directly at a fixture
+    /// `fake_app_server` binary, bypassing this install flow entirely).
+    runtime_binary: Option<PathBuf>,
+    /// Set at worker startup only when `AiPaths::runtime_install_dir`
+    /// resolution fails for a reason *other* than "nothing installed yet"
+    /// (e.g. a corrupted or tampered prior install); surfaced the same way
+    /// `AiServiceConfig::binary_resolution_error` already is.
+    runtime_binary_error: Option<RuntimeDistributionErrorCode>,
 }
 
 fn service_worker(
@@ -561,7 +620,10 @@ fn service_worker(
         early_login_events: VecDeque::new(),
         early_login_bytes: 0,
         deferred_runtime_events: VecDeque::new(),
+        runtime_binary: None,
+        runtime_binary_error: None,
     };
+    resolve_runtime_binary_at_startup(&paths, &mut state, &shared);
     let mut settings = AiSettings::default();
     let mut shutdown = false;
 
@@ -951,6 +1013,17 @@ fn handle_command(
         }
         WorkerCommand::Action(AiCommand::RetryProbeStop) => {
             retry_probe_stop(queued.id, paths, shared, state);
+        }
+        WorkerCommand::Action(AiCommand::InstallRuntime) => {
+            run_install_runtime_command(
+                queued.id,
+                paths,
+                shared,
+                state,
+                cancel_rx,
+                shutdown_rx,
+                shutdown,
+            );
         }
         WorkerCommand::SaveSettings {
             expected_revision,
@@ -1507,6 +1580,240 @@ fn attempt_isolation_recovery(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_install_runtime_command(
+    id: OperationId,
+    paths: &AiPaths,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    cancel_rx: &Receiver<OperationId>,
+    shutdown_rx: &Receiver<()>,
+    shutdown: &mut bool,
+) {
+    let Some(spec) = install_spec_for_current_target() else {
+        finish_install_runtime_error(
+            id,
+            RuntimeInstallErrorCode::UnsupportedTarget,
+            shared,
+        );
+        return;
+    };
+
+    // The first-use path is serialized with the same runtime-owner lock used
+    // by settings and runtime lifecycle operations. An active coordinator
+    // already owns that lock through another handle; don't try to open a
+    // second independent lock while it is running.
+    if state.runtime.is_some() {
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed("runtime_in_use"),
+            LoginState::Idle,
+        );
+        return;
+    }
+    if state.owner_guard.is_none() {
+        match OwnerLock::new(paths.runtime_owner_lock_path()).try_acquire() {
+            Ok(Some(owner)) => {
+                state.owner_guard = Some(owner);
+                mutate(shared, |snapshot| snapshot.ownership = OwnershipState::Owned);
+            }
+            Ok(None) => {
+                mutate(shared, |snapshot| {
+                    snapshot.ownership = OwnershipState::OwnedElsewhere
+                });
+                finish(
+                    shared,
+                    id,
+                    SafeOperationResult::Failed("runtime_owned_elsewhere"),
+                    LoginState::Idle,
+                );
+                return;
+            }
+            Err(_) => {
+                mutate(shared, |snapshot| {
+                    snapshot.ownership = OwnershipState::Unavailable
+                });
+                finish(
+                    shared,
+                    id,
+                    SafeOperationResult::Failed("runtime_owner_unavailable"),
+                    LoginState::Idle,
+                );
+                return;
+            }
+        }
+    }
+
+    let staging_dir = match paths.create_runtime_install_staging() {
+        Ok(path) => path,
+        Err(error) => {
+            finish_install_runtime_error(
+                id,
+                map_io_error(&error, RuntimeInstallErrorCode::StagingFailed),
+                shared,
+            );
+            return;
+        }
+    };
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_requested_for_check = shutdown_requested.clone();
+    let is_canceled = || {
+        if cancel_rx.try_recv().is_ok() {
+            return true;
+        }
+        if shutdown_rx.try_recv().is_ok() {
+            shutdown_requested_for_check.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    };
+    let downloader = CurlArchiveDownloader;
+    let extractor = TarArchiveExtractor;
+    let install_result = install_runtime(
+        &spec,
+        &staging_dir,
+        &downloader,
+        &extractor,
+        &is_canceled,
+        |install_state| mutate(shared, |snapshot| snapshot.runtime_install = install_state),
+    );
+    if shutdown_requested.load(Ordering::Acquire) {
+        *shutdown = true;
+    }
+
+    let payload_dir = match install_result {
+        Ok(payload_dir) => payload_dir,
+        Err(code) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            finish_install_runtime_error(id, code, shared);
+            return;
+        }
+    };
+
+    // Validate the generated manifest with the same resolver that all later
+    // AI operations use before making the candidate visible in app-data.
+    if let Err(code) = resolve_runtime_binary(None, &payload_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        finish_install_runtime_error(
+            id,
+            map_distribution_error(code, RuntimeInstallErrorCode::ExtractionFailed),
+            shared,
+        );
+        return;
+    }
+    if let Err(code) = publish_runtime_install(paths, &payload_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        finish_install_runtime_error(id, code, shared);
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    let install_dir = paths.runtime_install_dir();
+    let explicit_override = std::env::var_os(EXPLICIT_OVERRIDE_ENV_VAR);
+    match resolve_runtime_binary(explicit_override.as_deref(), &install_dir) {
+        Ok(resolved) => {
+            state.runtime_binary = Some(resolved.binary_path);
+            state.runtime_binary_error = None;
+            mutate(shared, |snapshot| {
+                snapshot.runtime_install = RuntimeInstallState::Installed;
+                snapshot.runtime_distribution_error = None;
+            });
+            finish(shared, id, SafeOperationResult::Succeeded, LoginState::Idle);
+        }
+        Err(code) => {
+            state.runtime_binary = None;
+            state.runtime_binary_error = Some(code);
+            mutate(shared, |snapshot| {
+                snapshot.runtime_install = RuntimeInstallState::Installed;
+                snapshot.runtime_distribution_error = Some(code);
+            });
+            finish(
+                shared,
+                id,
+                SafeOperationResult::Failed("runtime_unavailable"),
+                LoginState::Idle,
+            );
+        }
+    }
+}
+
+fn finish_install_runtime_error(
+    id: OperationId,
+    code: RuntimeInstallErrorCode,
+    shared: &Arc<SharedServiceState>,
+) {
+    mutate(shared, |snapshot| snapshot.runtime_install = RuntimeInstallState::Failed(code));
+    finish(
+        shared,
+        id,
+        SafeOperationResult::Failed(code.stable_code()),
+        LoginState::Idle,
+    );
+}
+
+fn publish_runtime_install(
+    paths: &AiPaths,
+    payload_dir: &std::path::Path,
+) -> Result<(), RuntimeInstallErrorCode> {
+    let install_dir = paths.runtime_install_dir();
+    let Some(parent) = install_dir.parent() else {
+        return Err(RuntimeInstallErrorCode::StagingFailed);
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?;
+    let payload_not_symlink = runtime_distribution::check_not_symlink(payload_dir).map_err(
+        |error| map_distribution_error(error, RuntimeInstallErrorCode::StagingFailed),
+    )?;
+    if !payload_not_symlink {
+        return Err(RuntimeInstallErrorCode::StagingFailed);
+    }
+    let payload_metadata = std::fs::metadata(payload_dir)
+        .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?;
+    if !payload_metadata.is_dir() {
+        return Err(RuntimeInstallErrorCode::StagingFailed);
+    }
+
+    let final_exists = runtime_distribution::check_not_symlink(&install_dir).map_err(|error| {
+        map_distribution_error(error, RuntimeInstallErrorCode::StagingFailed)
+    })?;
+    if final_exists
+        && !std::fs::metadata(&install_dir)
+            .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?
+            .is_dir()
+    {
+        return Err(RuntimeInstallErrorCode::StagingFailed);
+    }
+    let backup = if final_exists {
+        let sequence = RUNTIME_PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Some(parent.join(format!(
+            ".runtime-previous-{}-{sequence}",
+            std::process::id()
+        )))
+    } else {
+        None
+    };
+    if let Some(backup) = &backup {
+        std::fs::rename(&install_dir, backup)
+            .map_err(|error| map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))?;
+    }
+
+    match std::fs::rename(payload_dir, &install_dir) {
+        Ok(()) => {
+            if let Some(backup) = backup {
+                let _ = std::fs::remove_dir_all(backup);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(backup) = backup {
+                let _ = std::fs::rename(backup, &install_dir);
+            }
+            Err(map_io_error(&error, RuntimeInstallErrorCode::StagingFailed))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // One serialized worker operation spans persistence and runtime application.
 fn save_settings_command(
     id: OperationId,
@@ -1919,14 +2226,18 @@ fn finish_persisted_save(
         && let Some(runtime) = state.runtime.as_ref()
         && runtime.snapshot().state == RuntimeState::Ready
     {
-        let new_config = build_runtime_config_for_active_connection(
-            &saved,
-            config.credential_store.as_ref(),
-            paths,
-            config.binary_path.clone(),
-            paths.runtime_owner_lock_path(),
-            config.shell_env_format,
-        );
+        let new_config = match resolve_active_binary_path(config, state) {
+            Ok(binary_path) => build_runtime_config_for_active_connection(
+                &saved,
+                config.credential_store.as_ref(),
+                paths,
+                binary_path,
+                paths.runtime_owner_lock_path(),
+                config.shell_env_format,
+            )
+            .map_err(|_| ()),
+            Err(_) => Err(()),
+        };
         match new_config {
             Ok(configured) => {
                 if runtime
@@ -2017,6 +2328,9 @@ fn sync_runtime_snapshot(shared: &Arc<SharedServiceState>, runtime: &AiRuntime) 
         snapshot.runtime_state = status.state;
         snapshot.runtime_generation = status.generation;
         snapshot.configured_settings_generation = configured;
+        if status.state == RuntimeState::Ready {
+            snapshot.runtime_distribution_error = None;
+        }
     });
 }
 
@@ -2105,6 +2419,108 @@ fn open_settings(
     }
 }
 
+fn classify_runtime_start_error(error: &RuntimeError) -> Option<RuntimeDistributionErrorCode> {
+    match error {
+        RuntimeError::Spawn(io_error) => Some(classify_spawn_error(io_error)),
+        RuntimeError::Handshake(_) => Some(classify_handshake_failure()),
+        _ => None,
+    }
+}
+
+/// Resolves, once at worker startup, whether a previously installed and
+/// still-valid runtime binary already exists under
+/// `AiPaths::runtime_install_dir`, populating `state.runtime_binary`/
+/// `state.runtime_binary_error` and the snapshot's `runtime_install` the
+/// same way a fresh `AiCommand::InstallRuntime` success/failure would.
+/// `Missing` (nothing has ever been installed, the ordinary first-run case)
+/// is reported as `RuntimeInstallState::NotInstalled`, not as a
+/// `runtime_distribution_error`: that diagnostic is reserved for a
+/// resolution failure an install actually completed, then later turned out
+/// to have broken (see the module docs on `AiSnapshot::runtime_install`).
+fn resolve_runtime_binary_at_startup(
+    paths: &AiPaths,
+    state: &mut WorkerState,
+    shared: &Arc<SharedServiceState>,
+) {
+    let explicit_override = std::env::var_os(EXPLICIT_OVERRIDE_ENV_VAR);
+    let install_dir = paths.runtime_install_dir();
+    let install_state = match resolve_runtime_binary(explicit_override.as_deref(), &install_dir) {
+        Ok(resolved) => {
+            state.runtime_binary = Some(resolved.binary_path);
+            RuntimeInstallState::Installed
+        }
+        Err(RuntimeDistributionErrorCode::Missing) => RuntimeInstallState::NotInstalled,
+        Err(code) => {
+            state.runtime_binary_error = Some(code);
+            RuntimeInstallState::Failed(map_distribution_code_to_install_code(
+                code,
+                runtime_distribution::current_target(),
+            ))
+        }
+    };
+    mutate(shared, |snapshot| snapshot.runtime_install = install_state);
+}
+
+/// `detected_target` is the host target `current_target()` reports. A
+/// resolution `UnsupportedTarget` on a host with no detected target is a
+/// genuinely unsupported host (non-retryable). With a detected target it means
+/// the stored `manifest.target` differs from the host, which a reinstall
+/// repairs, so it maps to the retryable `VerificationFailed`.
+///
+/// A startup `IntegrityMismatch` is a check of an already-installed runtime,
+/// not of an archive downloaded now, so it also maps to `VerificationFailed`
+/// (the archive-SHA `RuntimeInstallErrorCode::IntegrityMismatch` stays
+/// reserved for the download path). The detailed distribution code is kept in
+/// `runtime_binary_error` / `runtime_distribution_error`.
+fn map_distribution_code_to_install_code(
+    code: RuntimeDistributionErrorCode,
+    detected_target: Option<&str>,
+) -> RuntimeInstallErrorCode {
+    match code {
+        RuntimeDistributionErrorCode::UnsupportedTarget => {
+            if detected_target.is_some() {
+                RuntimeInstallErrorCode::VerificationFailed
+            } else {
+                RuntimeInstallErrorCode::UnsupportedTarget
+            }
+        }
+        RuntimeDistributionErrorCode::AccessDenied => RuntimeInstallErrorCode::PermissionDenied,
+        RuntimeDistributionErrorCode::Missing
+        | RuntimeDistributionErrorCode::IntegrityMismatch
+        | RuntimeDistributionErrorCode::ExplicitPathNotAbsolute
+        | RuntimeDistributionErrorCode::InvalidExecutable
+        | RuntimeDistributionErrorCode::InitializeFailed => {
+            RuntimeInstallErrorCode::VerificationFailed
+        }
+    }
+}
+
+/// Resolves which binary path an AI operation should spawn: an
+/// already-installed runtime from this session (`state.runtime_binary`,
+/// refreshed at startup and after a successful `AiCommand::InstallRuntime`),
+/// the test-only `config.binary_path` override (always a meaningless empty
+/// placeholder in production -- see `crates/app/src/main.rs::start_ai_service`),
+/// or an error: `Some(code)` for a resolution failure worth surfacing as
+/// `AiSnapshot::runtime_distribution_error`, `None` when nothing is
+/// installed yet and there is no test override either (the ordinary,
+/// non-alarming "not installed" case the AI settings screen's install
+/// section already explains).
+fn resolve_active_binary_path(
+    config: &AiServiceConfig,
+    state: &WorkerState,
+) -> Result<PathBuf, Option<RuntimeDistributionErrorCode>> {
+    if let Some(code) = state.runtime_binary_error.or(config.binary_resolution_error) {
+        return Err(Some(code));
+    }
+    if let Some(path) = &state.runtime_binary {
+        return Ok(path.clone());
+    }
+    if !config.binary_path.as_os_str().is_empty() {
+        return Ok(config.binary_path.clone());
+    }
+    Err(None)
+}
+
 fn ensure_runtime<'a>(
     config: &AiServiceConfig,
     paths: &AiPaths,
@@ -2112,6 +2528,22 @@ fn ensure_runtime<'a>(
     shared: &Arc<SharedServiceState>,
     state: &'a mut WorkerState,
 ) -> Result<&'a AiRuntime, ()> {
+    // Every AI operation goes through this one gate, so this alone surfaces
+    // the resolution diagnostic (or "nothing installed yet") for all of
+    // them, and never reaches a spawn attempt with a meaningless binary
+    // path.
+    let binary_path = match resolve_active_binary_path(config, state) {
+        Ok(path) => path,
+        Err(Some(code)) => {
+            mutate(shared, |snapshot| {
+                snapshot.runtime_distribution_error = Some(code);
+            });
+            return Err(());
+        }
+        Err(None) => {
+            return Err(());
+        }
+    };
     let needs_config = state.runtime.as_ref().is_none_or(|runtime| {
         runtime.configured_settings_generation() != settings.settings_generation
     });
@@ -2120,7 +2552,7 @@ fn ensure_runtime<'a>(
             settings,
             config.credential_store.as_ref(),
             paths,
-            config.binary_path.clone(),
+            binary_path.clone(),
             paths.runtime_owner_lock_path(),
             config.shell_env_format,
         );
@@ -2152,7 +2584,12 @@ fn ensure_runtime<'a>(
                 );
                 state.runtime_events = Some(event_rx);
                 let owner = state.owner_guard.take().ok_or(())?;
-                if runtime.start_with_owner_lock(owner).is_err() {
+                if let Err(error) = runtime.start_with_owner_lock(owner) {
+                    if let Some(code) = classify_runtime_start_error(&error) {
+                        mutate(shared, |snapshot| {
+                            snapshot.runtime_distribution_error = Some(code)
+                        });
+                    }
                     mutate(shared, |snapshot| {
                         snapshot.ownership = OwnershipState::Unknown
                     });
@@ -2183,13 +2620,21 @@ fn ensure_runtime<'a>(
         } else {
             runtime.start()
         };
-        if result.is_err() {
+        if let Err(error) = &result {
+            if let Some(code) = classify_runtime_start_error(error) {
+                mutate(shared, |snapshot| {
+                    snapshot.runtime_distribution_error = Some(code)
+                });
+            }
             mutate(shared, |snapshot| {
                 snapshot.ownership = OwnershipState::Unknown
             });
             return Err(());
         }
     }
+    mutate(shared, |snapshot| {
+        snapshot.runtime_distribution_error = None;
+    });
     state.runtime.as_ref().ok_or(())
 }
 
@@ -2805,6 +3250,48 @@ mod tests {
     use super::*;
     use crate::runtime::RuntimeConfig;
 
+    #[test]
+    fn startup_unsupported_target_without_detected_target_is_not_retryable() {
+        let code = map_distribution_code_to_install_code(
+            RuntimeDistributionErrorCode::UnsupportedTarget,
+            None,
+        );
+        assert_eq!(code, RuntimeInstallErrorCode::UnsupportedTarget);
+        assert!(!code.is_retryable());
+    }
+
+    #[test]
+    fn startup_unsupported_target_with_detected_target_is_retryable() {
+        let code = map_distribution_code_to_install_code(
+            RuntimeDistributionErrorCode::UnsupportedTarget,
+            Some("aarch64-apple-darwin"),
+        );
+        assert_eq!(code, RuntimeInstallErrorCode::VerificationFailed);
+        assert!(code.is_retryable());
+    }
+
+    #[test]
+    fn startup_integrity_mismatch_is_verification_failed_not_archive_mismatch() {
+        for target in [None, Some("aarch64-apple-darwin")] {
+            let code = map_distribution_code_to_install_code(
+                RuntimeDistributionErrorCode::IntegrityMismatch,
+                target,
+            );
+            assert_eq!(code, RuntimeInstallErrorCode::VerificationFailed);
+            assert_ne!(code, RuntimeInstallErrorCode::IntegrityMismatch);
+            assert!(code.is_retryable());
+        }
+    }
+
+    #[test]
+    fn startup_access_denied_maps_to_permission_denied() {
+        let code = map_distribution_code_to_install_code(
+            RuntimeDistributionErrorCode::AccessDenied,
+            None,
+        );
+        assert_eq!(code, RuntimeInstallErrorCode::PermissionDenied);
+    }
+
     fn test_handle(snapshot: AiSnapshot) -> AiServiceHandle {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);
         let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
@@ -2849,6 +3336,8 @@ mod tests {
             early_login_events: VecDeque::from([(1, None, 17)]),
             early_login_bytes: MAX_EARLY_LOGIN_BYTES + 1,
             deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
         };
 
         reset_early_login_buffer(&mut state);
@@ -2968,6 +3457,157 @@ mod tests {
         assert!(handle.snapshot().busy.is_none());
     }
 
+    #[test]
+    fn runtime_resolution_diagnostic_preserves_owned_settings() {
+        let data_root = next_isolation_test_root("runtime-resolution-ownership");
+        let paths = AiPaths::new(&data_root);
+        std::fs::create_dir_all(paths.root()).unwrap();
+        let owner_guard = OwnerLock::new(paths.runtime_owner_lock_path())
+            .try_acquire()
+            .unwrap()
+            .expect("the test must own the runtime lock");
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot {
+                ownership: OwnershipState::Owned,
+                ..AiSnapshot::default()
+            }),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let mut state = WorkerState {
+            runtime: None,
+            runtime_events: None,
+            owner_guard: Some(owner_guard),
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
+        };
+        let config = AiServiceConfig {
+            app_data_root: data_root.clone(),
+            binary_path: PathBuf::new(),
+            binary_resolution_error: Some(RuntimeDistributionErrorCode::UnsupportedTarget),
+            credential_store: Arc::new(crate::secrets::FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        };
+
+        assert!(ensure_runtime(
+            &config,
+            &paths,
+            &AiSettings::default(),
+            &shared,
+            &mut state,
+        )
+        .is_err());
+
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(snapshot.ownership, OwnershipState::Owned);
+        assert_eq!(
+            snapshot.runtime_distribution_error,
+            Some(RuntimeDistributionErrorCode::UnsupportedTarget)
+        );
+        assert!(state.owner_guard.is_some());
+        drop(snapshot);
+        assert!(settings_actions_allowed(&shared));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn runtime_access_denied_maps_to_install_permission_without_changing_generic_failures() {
+        assert_eq!(
+            map_distribution_code_to_install_code(RuntimeDistributionErrorCode::AccessDenied, None),
+            RuntimeInstallErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            map_distribution_code_to_install_code(
+                RuntimeDistributionErrorCode::InvalidExecutable,
+                None
+            ),
+            RuntimeInstallErrorCode::VerificationFailed
+        );
+    }
+
+    #[test]
+    fn missing_runtime_preserves_owned_settings_without_a_distribution_diagnostic() {
+        let data_root = next_isolation_test_root("missing-runtime-ownership");
+        let paths = AiPaths::new(&data_root);
+        std::fs::create_dir_all(paths.root()).unwrap();
+        let owner_guard = OwnerLock::new(paths.runtime_owner_lock_path())
+            .try_acquire()
+            .unwrap()
+            .expect("the test must own the runtime lock");
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot {
+                ownership: OwnershipState::Owned,
+                ..AiSnapshot::default()
+            }),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let mut state = WorkerState {
+            runtime: None,
+            runtime_events: None,
+            owner_guard: Some(owner_guard),
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
+        };
+        let config = AiServiceConfig {
+            app_data_root: data_root.clone(),
+            binary_path: PathBuf::new(),
+            binary_resolution_error: None,
+            credential_store: Arc::new(crate::secrets::FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        };
+
+        assert!(ensure_runtime(
+            &config,
+            &paths,
+            &AiSettings::default(),
+            &shared,
+            &mut state,
+        )
+        .is_err());
+
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(snapshot.ownership, OwnershipState::Owned);
+        assert_eq!(snapshot.runtime_distribution_error, None);
+        assert_eq!(snapshot.runtime_install, RuntimeInstallState::NotInstalled);
+        assert!(state.owner_guard.is_some());
+
+        drop(snapshot);
+        assert!(settings_actions_allowed(&shared));
+
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared: shared.clone(),
+        };
+        assert!(handle.try_submit(AiCommand::InstallRuntime).is_ok());
+        assert!(matches!(
+            command_rx.try_recv().unwrap().command,
+            WorkerCommand::Action(AiCommand::InstallRuntime)
+        ));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_root);
+    }
+
     fn next_isolation_test_root(label: &str) -> PathBuf {
         static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
@@ -2999,6 +3639,8 @@ mod tests {
             early_login_events: VecDeque::new(),
             early_login_bytes: 0,
             deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -3054,6 +3696,8 @@ mod tests {
             early_login_events: VecDeque::new(),
             early_login_bytes: 0,
             deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -3098,6 +3742,8 @@ mod tests {
             early_login_events: VecDeque::new(),
             early_login_bytes: 0,
             deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {

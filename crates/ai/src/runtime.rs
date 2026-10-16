@@ -179,8 +179,8 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-/// Configuration for one embedded App Server runtime. `binary_path` must be
-/// an absolute, explicit path to the bundled standalone executable; it is
+/// Configuration for one Hane-owned App Server runtime. `binary_path` must be
+/// an absolute, explicit path to the installed standalone executable; it is
 /// never resolved via `PATH` (`spawn_child` rejects a non-absolute path
 /// outright rather than letting `std::process::Command` fall back to a
 /// `PATH` lookup). The standalone App Server binary is invoked directly with
@@ -196,6 +196,10 @@ pub struct RuntimeConfig {
     pub binary_path: PathBuf,
     pub args: Vec<String>,
     pub codex_home: Option<PathBuf>,
+    /// Whether the child may inherit the parent's normal home-directory
+    /// variables. First-use runtime verification disables this so a candidate
+    /// cannot discover the user's existing Codex state or credentials.
+    pub inherit_parent_home: bool,
     /// The child process starts in a Hane-owned, empty AI workspace. This is
     /// intentionally independent of the Editor's current document/worktree.
     pub working_directory: Option<PathBuf>,
@@ -217,6 +221,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("binary_path", &self.binary_path)
             .field("args", &self.args)
             .field("codex_home", &self.codex_home)
+            .field("inherit_parent_home", &self.inherit_parent_home)
             .field("working_directory", &self.working_directory)
             .field("extra_env", &redacted_env)
             .field("owner_lock_path", &self.owner_lock_path)
@@ -233,6 +238,7 @@ impl RuntimeConfig {
             binary_path: binary_path.into(),
             args: vec!["--listen".to_string(), "stdio://".to_string()],
             codex_home: None,
+            inherit_parent_home: true,
             working_directory: None,
             extra_env: Vec::new(),
             owner_lock_path: owner_lock_path.into(),
@@ -268,13 +274,24 @@ impl RuntimeConfig {
         let mut cmd = StdCommand::new(&self.binary_path);
         cmd.args(&self.args);
         cmd.env_clear();
-        cmd.envs(filtered_parent_environment(std::env::vars_os()));
+        cmd.envs(filtered_parent_environment(std::env::vars_os()).filter(|(key, _)| {
+            self.inherit_parent_home || !is_parent_home_variable(key)
+        }));
         cmd.env("CODEX_HOME", codex_home);
         cmd.envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         cmd.current_dir(working_directory);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Suppress the console window Windows would otherwise flash for
+            // this console subsystem binary; stdin/stdout/stderr stay piped
+            // above regardless, so the JSON-RPC transport is unaffected.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.spawn()
     }
 }
@@ -323,6 +340,11 @@ fn filtered_parent_environment(
             .iter()
             .any(|allowed| key.eq_ignore_ascii_case(allowed))
     })
+}
+
+fn is_parent_home_variable(key: &OsString) -> bool {
+    key.to_string_lossy().eq_ignore_ascii_case("HOME")
+        || key.to_string_lossy().eq_ignore_ascii_case("USERPROFILE")
 }
 
 struct SharedState {
@@ -1887,6 +1909,24 @@ mod tests {
                 "unexpected inherited variable: {blocked}"
             );
         }
+    }
+
+    #[test]
+    fn isolated_runtime_environment_drops_normal_home_variables() {
+        let input = vec![
+            (OsString::from("HOME"), OsString::from("/Users/test")),
+            (OsString::from("USERPROFILE"), OsString::from("C:\\Users\\test")),
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+        ];
+        let filtered: std::collections::HashMap<_, _> = filtered_parent_environment(input)
+            .filter(|(key, _)| !is_parent_home_variable(key))
+            .collect();
+        assert!(!filtered.contains_key(OsStr::new("HOME")));
+        assert!(!filtered.contains_key(OsStr::new("USERPROFILE")));
+        assert_eq!(
+            filtered.get(OsStr::new("PATH")),
+            Some(&OsString::from("/usr/bin"))
+        );
     }
 
     #[test]

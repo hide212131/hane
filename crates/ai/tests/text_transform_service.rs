@@ -110,6 +110,7 @@ fn spawn_service(root: PathBuf, browser_opener: Arc<dyn BrowserOpener>) -> AiSer
     AiService::spawn(AiServiceConfig {
         app_data_root: root,
         binary_path: PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server")),
+        binary_resolution_error: None,
         credential_store: Arc::new(FakeCredentialStore::new()),
         browser_opener,
         shell_env_format: ShellEnvironmentPolicyFormat::Filters,

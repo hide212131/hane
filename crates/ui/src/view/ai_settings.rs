@@ -14,6 +14,7 @@ use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiServiceHandle, AiSettings,
     AiSnapshot, ChatGptConnectionSettings, CustomConnectionSettings, LoginState, ModelListState,
     OperationId, OwnershipState, PersistenceState, ProbeErrorCode, ProbeStatus,
+    RuntimeDistributionErrorCode, RuntimeInstallErrorCode, RuntimeInstallState,
     SafeOperationResult, ServiceBusyReason,
 };
 use std::sync::{Arc, Mutex, mpsc};
@@ -76,6 +77,154 @@ fn custom_key_guidance(edit: CredentialEdit, registered: bool) -> &'static str {
             "削除は「保存して適用」を押した後に確定します。保存前なら「元に戻す」で取り消せます。"
         }
     }
+}
+
+/// Distinct, user-facing Japanese labels for every
+/// `RuntimeDistributionErrorCode`, so a missing installed package, an unsupported
+/// target, a corrupted/tampered file, a permissions problem, an invalid
+/// executable, and a failed `initialize` handshake are never collapsed into
+/// one generic "AI is unavailable" message.
+fn runtime_distribution_error_label(code: RuntimeDistributionErrorCode) -> &'static str {
+    match code {
+        RuntimeDistributionErrorCode::ExplicitPathNotAbsolute => {
+            "HANE_CODEX_APP_SERVERには絶対パスを指定してください"
+        }
+        RuntimeDistributionErrorCode::Missing => "Codex App Serverの実行ファイルが見つかりません",
+        RuntimeDistributionErrorCode::UnsupportedTarget => {
+            "この環境向けのCodex App Serverに対応していません"
+        }
+        RuntimeDistributionErrorCode::IntegrityMismatch => {
+            "Codex App Serverの内容が導入時の記録と一致しません"
+        }
+        RuntimeDistributionErrorCode::AccessDenied => {
+            "Codex App Serverへのアクセスが拒否されました"
+        }
+        RuntimeDistributionErrorCode::InvalidExecutable => {
+            "Codex App Serverの実行ファイルが不正です"
+        }
+        RuntimeDistributionErrorCode::InitializeFailed => {
+            "Codex App Serverの初期化に失敗しました"
+        }
+    }
+}
+
+fn runtime_install_error_label(code: RuntimeInstallErrorCode) -> &'static str {
+    match code {
+        RuntimeInstallErrorCode::UnsupportedTarget => {
+            "この環境向けの固定版Codex App Serverに対応していません"
+        }
+        RuntimeInstallErrorCode::DisallowedRedirectHost => {
+            "ダウンロード先のHTTPSホストが許可された範囲外です"
+        }
+        RuntimeInstallErrorCode::NetworkDownloadFailed => {
+            "固定版Codex App Serverを取得できませんでした"
+        }
+        RuntimeInstallErrorCode::SizeMismatch => "取得したアーカイブのサイズが一致しません",
+        RuntimeInstallErrorCode::IntegrityMismatch => {
+            "取得したアーカイブのSHA-256が一致しません"
+        }
+        RuntimeInstallErrorCode::ExtractionFailed => {
+            "アーカイブの安全な展開または内容検査に失敗しました"
+        }
+        RuntimeInstallErrorCode::AmbiguousEntrypoint => {
+            "実行入口を一意に特定できませんでした"
+        }
+        RuntimeInstallErrorCode::VerificationFailed => {
+            "導入候補の初期化・停止確認に失敗しました"
+        }
+        RuntimeInstallErrorCode::StagingFailed => {
+            "導入候補をHane専用領域へ安全に公開できませんでした"
+        }
+        RuntimeInstallErrorCode::PermissionDenied => {
+            "導入先のHane専用領域へのアクセス権限がありません"
+        }
+        RuntimeInstallErrorCode::Canceled => "導入を取り消しました",
+    }
+}
+
+fn runtime_install_action_label(state: RuntimeInstallState) -> &'static str {
+    match state {
+        RuntimeInstallState::NotInstalled => "ダウンロードしてインストール",
+        RuntimeInstallState::Failed(_) => "再試行",
+        RuntimeInstallState::Downloading
+        | RuntimeInstallState::Verifying
+        | RuntimeInstallState::Installed => "インストール",
+    }
+}
+
+/// The explicit install button is hidden after a failure that a repeat
+/// attempt cannot resolve (for example an unsupported host).
+fn runtime_install_action_visible(state: RuntimeInstallState) -> bool {
+    match state {
+        RuntimeInstallState::Failed(code) => code.is_retryable(),
+        _ => true,
+    }
+}
+
+fn runtime_install_next_step(code: RuntimeInstallErrorCode) -> &'static str {
+    match code {
+        RuntimeInstallErrorCode::UnsupportedTarget => {
+            "この環境ではインストールできません。対応環境のHaneを使うか、HANE_CODEX_APP_SERVERに絶対パスで実行ファイルを指定してください。再試行しても解消しません"
+        }
+        RuntimeInstallErrorCode::AmbiguousEntrypoint => {
+            "再試行しても解消しません。Haneを更新するか、HANE_CODEX_APP_SERVERに絶対パスで実行ファイルを指定してください"
+        }
+        RuntimeInstallErrorCode::DisallowedRedirectHost
+        | RuntimeInstallErrorCode::NetworkDownloadFailed => {
+            "ネットワーク接続やプロキシ設定を確認してから「再試行」を押してください"
+        }
+        RuntimeInstallErrorCode::SizeMismatch | RuntimeInstallErrorCode::IntegrityMismatch => {
+            "取得が不完全だった可能性があります。「再試行」を押してください。繰り返す場合はネットワークを確認してください"
+        }
+        RuntimeInstallErrorCode::ExtractionFailed | RuntimeInstallErrorCode::VerificationFailed => {
+            "「再試行」を押してください。繰り返す場合はHaneを更新してください"
+        }
+        RuntimeInstallErrorCode::StagingFailed => {
+            "空き容量とHane専用領域の状態を確認してから「再試行」を押してください"
+        }
+        RuntimeInstallErrorCode::PermissionDenied => {
+            "Hane専用領域への書き込み権限を確認してから「再試行」を押してください"
+        }
+        RuntimeInstallErrorCode::Canceled => "必要になったら「再試行」を押してください",
+    }
+}
+
+/// Diagnostic lines for a failed install. Built only from the stable error
+/// code, the detected OS/architecture, and the fixed supported-target list, so
+/// no settings, API key, token, or auth URL can reach it.
+fn runtime_install_failure_diagnostics(
+    code: RuntimeInstallErrorCode,
+    os: &str,
+    arch: &str,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "導入失敗: 段階={} / 分類={} / エラーコード={}",
+            code.failure_stage(),
+            runtime_install_error_label(code),
+            code.stable_code()
+        ),
+        format!(
+            "再試行: {}",
+            if code.is_retryable() { "可能" } else { "不可（再試行では解消しません）" }
+        ),
+    ];
+    if code == RuntimeInstallErrorCode::UnsupportedTarget {
+        lines.push(format!("検出した環境: {os} / {arch}"));
+        lines.push(format!(
+            "対応target: {}",
+            hane_ai::SUPPORTED_TARGETS.join(", ")
+        ));
+    }
+    lines.push(format!("次の手順: {}", runtime_install_next_step(code)));
+    lines
+}
+
+fn runtime_install_not_installed_probe_guidance() -> String {
+    format!(
+        "先にCodex App Serverの「{}」を押してください。",
+        runtime_install_action_label(RuntimeInstallState::NotInstalled)
+    )
 }
 
 fn custom_settings_match_openai(name: &str, base_url: &str) -> bool {
@@ -803,7 +952,8 @@ impl AiSettingsPage {
                     )
                     .mb(px(6.0)),
             )
-            .child(self.current_connection_section(theme, cx));
+            .child(self.current_connection_section(theme, cx))
+            .child(self.runtime_install_section(theme, cx));
         if matches!(
             self.snapshot.ownership,
             OwnershipState::Unknown | OwnershipState::OwnedElsewhere | OwnershipState::Unavailable
@@ -895,6 +1045,140 @@ impl AiSettingsPage {
             .overflow_hidden()
             .child(scroll)
             .children(savebar)
+    }
+
+    fn runtime_install_section(
+        &self,
+        theme: Theme,
+        cx: &mut Context<EditorView>,
+    ) -> impl IntoElement {
+        let (state_label, state_note) = match self.snapshot.runtime_install {
+            RuntimeInstallState::NotInstalled => (
+                "未導入",
+                "初回AI利用時に必要な固定版を、明示的な操作でHane専用領域へ導入します。",
+            ),
+            RuntimeInstallState::Downloading => (
+                "取得中",
+                "公式の固定版アーカイブを取得しています。完了するまで画面を閉じても処理は続きます。",
+            ),
+            RuntimeInstallState::Verifying => (
+                "検証中",
+                "サイズ、SHA-256、ファイル一覧、実行入口、安全な展開を検証しています。",
+            ),
+            RuntimeInstallState::Installed => (
+                "導入済み",
+                "検証済みのCodex App ServerをHane専用領域から使用します。",
+            ),
+            RuntimeInstallState::Failed(code) => ("導入に失敗", runtime_install_error_label(code)),
+        };
+        let service = self.service.clone();
+        let view = cx.entity();
+        let action_selector = if matches!(
+            self.snapshot.busy,
+            Some((_, ServiceBusyReason::InstallingRuntime))
+        ) {
+            "ai-runtime-install-cancel"
+        } else {
+            "ai-runtime-install"
+        };
+        let action = if let Some((operation, ServiceBusyReason::InstallingRuntime)) = self.snapshot.busy
+        {
+            let service_for_cancel = service.clone();
+            Button::new("ai-runtime-install-cancel")
+                .label("導入を取り消す")
+                .on_click(move |_, _, app| {
+                    if let Some(service) = &service_for_cancel
+                        && let Err(error) = service.cancel(operation)
+                    {
+                        view.update(app, |view, cx| {
+                            view.ai_settings.message = Some(admission_message(error));
+                            cx.notify();
+                        });
+                    }
+                })
+                .into_any_element()
+        } else {
+            Button::new("ai-runtime-install")
+                .label(runtime_install_action_label(self.snapshot.runtime_install))
+                .primary()
+                .disabled(
+                    service.is_none()
+                        || self.snapshot.ownership != OwnershipState::Owned
+                        || self.snapshot.recovery_required
+                        || matches!(self.snapshot.runtime_install, RuntimeInstallState::Installed)
+                        || self.snapshot.busy.is_some(),
+                )
+                .on_click(move |_, _, app| {
+                    if let Some(service) = &service
+                        && let Err(error) = service.try_submit(AiCommand::InstallRuntime)
+                    {
+                        view.update(app, |view, cx| {
+                            view.ai_settings.message = Some(admission_message(error));
+                            cx.notify();
+                        });
+                    }
+                })
+                .into_any_element()
+        };
+        let installing = matches!(
+            self.snapshot.busy,
+            Some((_, ServiceBusyReason::InstallingRuntime))
+        );
+        let action = (installing || runtime_install_action_visible(self.snapshot.runtime_install)).then(|| {
+            div()
+                .id(format!("{action_selector}-wrapper"))
+                .debug_selector(move || action_selector.to_owned())
+                .child(action)
+        });
+        div()
+            .id("ai-runtime-install-section")
+            .debug_selector(|| "ai-runtime-install-section".to_owned())
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(if theme.editor_background < 0x888888 {
+                0x373b43
+            } else {
+                theme.table_border
+            }))
+            .bg(rgb(if theme.editor_background < 0x888888 {
+                0x1e2126
+            } else {
+                theme.code_background
+            }))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(gpui_kit_assets::IconName::Sparkles)
+                                    .size(px(14.0))
+                                    .text_color(rgb(theme.link_foreground)),
+                            )
+                            .child(div().font_weight(gpui::FontWeight::MEDIUM).child("Codex App Server")),
+                    )
+                    .child(div().text_size(px(11.0)).child(state_label))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.quote_foreground))
+                            .child(state_note),
+                    ),
+            )
+            .children(action)
     }
 
     fn current_connection_section(
@@ -1246,15 +1530,25 @@ impl AiSettingsPage {
             });
         let mut section = div()
             .id("ai-diagnostics-toggle-section")
+            .debug_selector(|| "ai-diagnostics-toggle-section".to_owned())
             .w_full()
             .pt(px(10.0))
             .border_t_1()
             .border_color(rgb(theme.table_border))
             .flex()
-            .items_center()
+            .flex_col()
             .gap_2()
-            .child(toggle)
-            .child("接続できないときに確認します。");
+            .child(
+                div()
+                    .id("ai-diagnostics-toggle-row")
+                    .debug_selector(|| "ai-diagnostics-toggle-row".to_owned())
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(toggle)
+                    .child("接続できないときに確認します。"),
+            );
         if self.diagnostics_open {
             section = section.child(self.diagnostics_section(theme));
         }
@@ -1484,8 +1778,24 @@ impl AiSettingsPage {
             OwnershipState::OwnedElsewhere => "別のHaneが管理中",
             OwnershipState::Unavailable => "利用不可",
         };
+        let distribution = match self.snapshot.runtime_distribution_error {
+            None => "Codex App Serverの導入状態: 上の導入欄に表示しています".to_owned(),
+            Some(code) => format!(
+                "Codex App Serverの検出に失敗しました: {}",
+                runtime_distribution_error_label(code)
+            ),
+        };
+        let install_failure = match self.snapshot.runtime_install {
+            RuntimeInstallState::Failed(code) => runtime_install_failure_diagnostics(
+                code,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ),
+            _ => Vec::new(),
+        };
         div()
             .id("ai-diagnostics-section")
+            .debug_selector(|| "ai-diagnostics-section".to_owned())
             .w_full()
             .px(px(16.0))
             .py(px(14.0))
@@ -1503,7 +1813,8 @@ impl AiSettingsPage {
                 self.snapshot.configured_settings_generation,
                 self.snapshot.runtime_generation
             ))
-            .child("Codex App Server同梱版と実行中バージョン: 画面からは確認できません")
+            .child(distribution)
+            .children(install_failure)
             .child("秘密のAPI key、token、auth URLは表示・記録しません")
     }
 
@@ -2867,6 +3178,10 @@ impl AiSettingsPage {
             Some("安全プロファイルの確認が終わるまで応答確認は使えません。".to_owned())
         } else if self.service.is_none() {
             Some("AIサービスを利用できません。Markdown編集は引き続き利用できます。".to_owned())
+        } else if matches!(self.snapshot.runtime_install, RuntimeInstallState::NotInstalled) {
+            Some(runtime_install_not_installed_probe_guidance())
+        } else if let RuntimeInstallState::Failed(code) = self.snapshot.runtime_install {
+            Some(format!("Codex App Serverを導入できません: {}", runtime_install_error_label(code)))
         } else if dirty {
             Some(
                 "未保存の変更があります。先に「保存して適用」するか、「変更を破棄」してください。"
@@ -3017,6 +3332,10 @@ impl AiSettingsPage {
                 ServiceBusyReason::TextTransform => (
                     "選択範囲をAIで処理中です",
                     "結果を確認できるまで、ほかのAI操作は実行できません。",
+                ),
+                ServiceBusyReason::InstallingRuntime => (
+                    "Codex App Serverを導入中です",
+                    "取得と検証が終わるまで、ほかのAI操作は実行できません。",
                 ),
             }
         } else if self.snapshot.persistence == PersistenceState::NotCommitted {
@@ -3315,6 +3634,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_install_action_labels_explain_first_download_and_preserve_retry() {
+        assert_eq!(
+            runtime_install_action_label(RuntimeInstallState::NotInstalled),
+            "ダウンロードしてインストール"
+        );
+        assert_eq!(
+            runtime_install_action_label(RuntimeInstallState::Failed(
+                RuntimeInstallErrorCode::NetworkDownloadFailed
+            )),
+            "再試行"
+        );
+        assert!(
+            runtime_install_error_label(RuntimeInstallErrorCode::PermissionDenied)
+                .contains("権限")
+        );
+        assert_eq!(
+            RuntimeInstallErrorCode::PermissionDenied.stable_code(),
+            "runtime_install_permission_denied"
+        );
+    }
+
+    #[test]
+    fn unsupported_target_diagnostics_show_target_code_and_supported_list_without_retry() {
+        let failed = RuntimeInstallState::Failed(RuntimeInstallErrorCode::UnsupportedTarget);
+        assert!(!runtime_install_action_visible(failed));
+        assert!(runtime_install_action_visible(RuntimeInstallState::Failed(
+            RuntimeInstallErrorCode::NetworkDownloadFailed
+        )));
+        assert!(runtime_install_action_visible(RuntimeInstallState::NotInstalled));
+
+        let text = runtime_install_failure_diagnostics(
+            RuntimeInstallErrorCode::UnsupportedTarget,
+            "linux",
+            "aarch64",
+        )
+        .join("\n");
+        assert!(text.contains("linux / aarch64"));
+        assert!(text.contains("runtime_install_unsupported_target"));
+        for target in hane_ai::SUPPORTED_TARGETS {
+            assert!(text.contains(target));
+        }
+        assert!(text.contains("段階="));
+        assert!(text.contains("次の手順"));
+        assert!(text.contains("再試行しても解消しません"));
+    }
+
+    #[test]
+    fn install_failure_diagnostics_never_contain_secret_markers() {
+        for code in [
+            RuntimeInstallErrorCode::UnsupportedTarget,
+            RuntimeInstallErrorCode::DisallowedRedirectHost,
+            RuntimeInstallErrorCode::NetworkDownloadFailed,
+            RuntimeInstallErrorCode::SizeMismatch,
+            RuntimeInstallErrorCode::IntegrityMismatch,
+            RuntimeInstallErrorCode::ExtractionFailed,
+            RuntimeInstallErrorCode::AmbiguousEntrypoint,
+            RuntimeInstallErrorCode::VerificationFailed,
+            RuntimeInstallErrorCode::StagingFailed,
+            RuntimeInstallErrorCode::PermissionDenied,
+            RuntimeInstallErrorCode::Canceled,
+        ] {
+            let text = runtime_install_failure_diagnostics(code, "linux", "x86_64").join("\n");
+            assert!(text.contains(code.stable_code()));
+            assert!(text.contains("次の手順"));
+            let lower = text.to_lowercase();
+            for marker in ["sk-", "bearer", "token=", "http://", "https://", "api_key="] {
+                assert!(!lower.contains(marker), "{code:?} leaked {marker}");
+            }
+        }
+    }
+
+    #[test]
+    fn not_installed_probe_guidance_matches_the_install_button_label() {
+        assert_eq!(
+            runtime_install_not_installed_probe_guidance(),
+            "先にCodex App Serverの「ダウンロードしてインストール」を押してください。"
+        );
+    }
+
     #[gpui::test]
     fn ai_settings_show_only_the_selected_connection_and_keep_savebar_visible(
         cx: &mut gpui::TestAppContext,
@@ -3346,6 +3745,16 @@ mod tests {
         assert!(cx.debug_bounds("ai-chatgpt-model-lock").is_some());
         assert!(cx.debug_bounds("ai-chatgpt-model-section").is_none());
         assert!(cx.debug_bounds("ai-settings-savebar").is_some());
+        let runtime_install_section = cx
+            .debug_bounds("ai-runtime-install-section")
+            .expect("runtime install section is rendered");
+        assert!(runtime_install_section.size.width > px(0.0));
+        assert!(runtime_install_section.size.height > px(0.0));
+        let runtime_install_button = cx
+            .debug_bounds("ai-runtime-install")
+            .expect("runtime install button is rendered");
+        assert!(runtime_install_button.size.width > px(0.0));
+        assert!(runtime_install_button.size.height > px(0.0));
 
         let api_key_connection = cx
             .debug_bounds("ai-connection-custom")
@@ -3366,6 +3775,56 @@ mod tests {
         cx.run_until_parked();
         eprintln!("stack-budget scenario: custom details rendered");
         assert!(cx.debug_bounds("ai-custom-provider-details").is_some());
+    }
+
+    #[gpui::test]
+    fn expanded_diagnostics_card_sits_below_toggle_row_within_settings_width(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for width in [962.0_f32, 700.0] {
+            let (view, cx) =
+                cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+            cx.simulate_resize(gpui::size(px(width), px(790.0)));
+            view.update(cx, |view, cx| {
+                view.settings_open = true;
+                view.settings_category = SettingsCategory::Connection;
+                view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+                view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+                view.ai_settings.snapshot.runtime_install =
+                    RuntimeInstallState::Failed(RuntimeInstallErrorCode::UnsupportedTarget);
+                view.ai_settings.diagnostics_open = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let toggle_section = cx
+                .debug_bounds("ai-diagnostics-toggle-section")
+                .expect("diagnostics toggle section is rendered");
+            let toggle_row = cx
+                .debug_bounds("ai-diagnostics-toggle-row")
+                .expect("diagnostics toggle row is rendered");
+            let card = cx
+                .debug_bounds("ai-diagnostics-section")
+                .expect("expanded diagnostics card is rendered");
+            let window_right = px(width);
+
+            assert!(
+                card.origin.y >= toggle_row.origin.y + toggle_row.size.height,
+                "card must be below the toggle row at width {width}"
+            );
+            assert!(
+                card.origin.x >= toggle_section.origin.x,
+                "card must not start left of the settings column at width {width}"
+            );
+            assert!(
+                card.origin.x + card.size.width <= toggle_section.origin.x + toggle_section.size.width + px(1.0),
+                "card must fit inside the settings column at width {width}"
+            );
+            assert!(
+                card.origin.x + card.size.width <= window_right,
+                "card must not overflow the window at width {width}"
+            );
+        }
     }
 
     #[test]
@@ -3451,6 +3910,7 @@ mod tests {
         let service = AiService::spawn(AiServiceConfig {
             app_data_root: app_data_root.clone(),
             binary_path: app_data_root.join("missing-codex-app-server"),
+            binary_resolution_error: None,
             credential_store: Arc::new(FakeCredentialStore::new()),
             browser_opener: Arc::new(SystemBrowserOpener),
             shell_env_format: ShellEnvironmentPolicyFormat::Filters,
@@ -3479,6 +3939,7 @@ mod tests {
             view.ai_settings.snapshot.runtime_state = hane_ai::RuntimeState::Ready;
             view.ai_settings.snapshot.runtime_generation = 1;
             view.ai_settings.snapshot.configured_settings_generation = 1;
+            view.ai_settings.snapshot.runtime_install = RuntimeInstallState::Installed;
             cx.notify();
         });
         cx.run_until_parked();

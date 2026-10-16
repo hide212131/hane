@@ -3177,6 +3177,7 @@ mod tests {
         let service = AiService::spawn(AiServiceConfig {
             app_data_root: app_data_root.clone(),
             binary_path: app_data_root.join("missing-codex-app-server"),
+            binary_resolution_error: None,
             credential_store: Arc::new(FakeCredentialStore::new()),
             browser_opener: Arc::new(SystemBrowserOpener),
             shell_env_format: ShellEnvironmentPolicyFormat::Filters,

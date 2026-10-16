@@ -71,11 +71,34 @@
 //! - Test-only files in the dedicated `CODEX_HOME` can select
 //!   `hold_login` or `complete_on_cancel` and persist the fake account across
 //!   fake process restarts. They are never read by the shipped runtime.
+//! - `test/hasConsoleWindow`: replies with whether Windows gave this process
+//!   a console window (always `false` on other platforms), to verify
+//!   `RuntimeConfig::spawn_child`'s `CREATE_NO_WINDOW` flag from inside the
+//!   spawned child itself.
 
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::thread;
 use std::time::Duration;
+
+/// Used only by `test/hasConsoleWindow` to let a test confirm, from inside
+/// this child process, whether Windows gave it a console window — the
+/// regression check for `RuntimeConfig::spawn_child`'s `CREATE_NO_WINDOW`
+/// flag. Not meaningful on other platforms.
+#[cfg(windows)]
+fn has_console_window() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleWindow() -> *mut core::ffi::c_void;
+    }
+    let hwnd = unsafe { GetConsoleWindow() };
+    !hwnd.is_null()
+}
+
+#[cfg(not(windows))]
+fn has_console_window() -> bool {
+    false
+}
 
 fn main() {
     if let Ok(path) = env::var("FAKE_SERVER_OWNER_LOCK_TRY_PATH") {
@@ -264,6 +287,13 @@ fn main() {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
                 let response = serde_json::json!({"id": id, "result": params});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "test/hasConsoleWindow" => {
+                let response =
+                    serde_json::json!({"id": id, "result": {"hasConsoleWindow": has_console_window()}});
                 if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
                     break;
                 }
