@@ -63,6 +63,19 @@ impl EditorView {
         }
     }
 
+    /// RF3-A P3 (Issue #304): the marked range, in UTF-16, of the surface the
+    /// text callbacks currently reach (the same answer as `marked_text_range`).
+    pub(crate) fn composition_marked_range(&self) -> Option<Range<usize>> {
+        match self.input_target_for_text_callback() {
+            InputTarget::InlineRename => self.inline_rename_marked_range(),
+            InputTarget::SidebarFilter => self.sidebar_filter_marked_range(),
+            InputTarget::Body => self
+                .editor()
+                .ime()
+                .and_then(|ime| self.editor().source_range_to_utf16(ime.marked_range).ok()),
+        }
+    }
+
     /// RF3-A P3 (Issue #304): destination of `selected_text_range`. Rename
     /// first, then only the raw sidebar filter flag (not the content-search
     /// flags), then the body.
@@ -778,6 +791,77 @@ mod tests {
             assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// macOS reverts the composition to its reading with the first Escape and
+    /// cancels it with the next: an empty mark (or an empty replacement of
+    /// exactly the marked range) followed by `unmark_text`. The selected text
+    /// that the composition replaced must survive.
+    fn mac_cancel_over_selection_contract(
+        cx: &mut gpui::TestAppContext,
+        surface: Surface,
+        label: &str,
+        replace_marked_range: bool,
+    ) {
+        let root = fixture_root(label);
+        let (view, cx) = prepare_surface(cx, surface, &root, TEXT);
+        let original = start_composition_over_selected_emoji(&view, cx, surface);
+
+        // First Escape: the composition reverts to the reading.
+        mark(&view, cx, None, "にほんご", None);
+        assert!(query_marked(&view, cx).is_some());
+
+        // Second Escape: the composition is cancelled.
+        if replace_marked_range {
+            let marked = query_marked(&view, cx);
+            replace(&view, cx, marked, "");
+        } else {
+            let marked = query_marked(&view, cx);
+            mark(&view, cx, marked, "", None);
+        }
+        unmark(&view, cx);
+        cx.run_until_parked();
+        assert_cancel_restored(&view, cx, surface, &original);
+        if surface == Surface::Rename {
+            assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn body_mac_empty_mark_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        mac_cancel_over_selection_contract(cx, Surface::Body, "cancel-mac-mark-body", false);
+    }
+
+    #[gpui::test]
+    fn filter_mac_empty_mark_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        mac_cancel_over_selection_contract(cx, Surface::Filter, "cancel-mac-mark-filter", false);
+    }
+
+    #[gpui::test]
+    fn rename_mac_empty_mark_cancel_keeps_the_selected_text(cx: &mut gpui::TestAppContext) {
+        mac_cancel_over_selection_contract(cx, Surface::Rename, "cancel-mac-mark-rename", false);
+    }
+
+    #[gpui::test]
+    fn body_mac_marked_range_replace_cancel_keeps_the_selected_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        mac_cancel_over_selection_contract(cx, Surface::Body, "cancel-mac-rep-body", true);
+    }
+
+    #[gpui::test]
+    fn filter_mac_marked_range_replace_cancel_keeps_the_selected_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        mac_cancel_over_selection_contract(cx, Surface::Filter, "cancel-mac-rep-filter", true);
+    }
+
+    #[gpui::test]
+    fn rename_mac_marked_range_replace_cancel_keeps_the_selected_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        mac_cancel_over_selection_contract(cx, Surface::Rename, "cancel-mac-rep-rename", true);
     }
 
     #[gpui::test]

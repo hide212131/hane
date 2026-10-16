@@ -282,9 +282,14 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // An empty, rangeless replacement during composition is the platform's
-        // cancel (Windows IME); it restores the pre-composition snapshot.
-        let platform_cancel = range_utf16.is_none() && new_text.is_empty();
+        // An empty replacement during composition is the platform's cancel: a
+        // rangeless one on Windows IME, or one covering exactly the marked text
+        // on macOS. It restores the pre-composition snapshot.
+        let platform_cancel = new_text.is_empty()
+            && match range_utf16.as_ref() {
+                None => true,
+                Some(range) => self.composition_marked_range() == Some(range.clone()),
+            };
         match self.input_target_for_text_callback() {
             InputTarget::InlineRename => {
                 if platform_cancel && self.inline_rename_has_composition() {
@@ -330,6 +335,27 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // macOS cancels a composition (second Escape) by marking empty text
+        // before or instead of unmarking. Marking nothing over an active
+        // composition restores the pre-composition snapshot rather than
+        // deleting the text the composition replaced.
+        if new_text.is_empty() {
+            match self.input_target_for_text_callback() {
+                InputTarget::InlineRename if self.inline_rename_has_composition() => {
+                    self.cancel_inline_rename_composition_unless_pending(cx);
+                    return;
+                }
+                InputTarget::SidebarFilter if self.sidebar_filter_has_composition() => {
+                    self.cancel_sidebar_filter_composition(cx);
+                    return;
+                }
+                InputTarget::Body if self.editor().ime().is_some() => {
+                    self.perform_cancel_composition(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match self.input_target_for_text_callback() {
             InputTarget::InlineRename => {
                 self.replace_and_mark_inline_rename_text(
