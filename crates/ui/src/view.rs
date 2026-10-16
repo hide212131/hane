@@ -1615,7 +1615,17 @@ impl EditorView {
         // view from inside key dispatch.
         let swallowed_input_for_interceptor = inline_rename_swallowed_input.clone();
         let document_find_enter_interceptor = cx.intercept_keystrokes(move |event, window, app| {
-            swallowed_input_for_interceptor.set(false);
+            // A key pressed while the rename is pending arms the guard right
+            // away: its text callback may only arrive after the rename ended,
+            // so waiting for a callback during the pending window is not enough.
+            let rename_pending = enter_interceptor_view
+                .read_with(&*app, |view, _| {
+                    view.inline_rename
+                        .as_ref()
+                        .is_some_and(|rename| rename.pending)
+                })
+                .unwrap_or(false);
+            swallowed_input_for_interceptor.set(rename_pending);
             if event.keystroke.key != "enter" {
                 return;
             }

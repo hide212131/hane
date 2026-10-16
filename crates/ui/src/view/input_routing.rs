@@ -1442,8 +1442,16 @@ mod tests {
             view.inline_rename.as_ref().is_some_and(|rename| rename.pending)
         }));
 
-        // A real key and its text while the background rename is in flight.
-        cx.simulate_input("q");
+        // A real key-down while the background rename is in flight. Dispatch
+        // it directly: `simulate_input` parks the executors, which would
+        // finish the rename before the pending state could be asserted. The
+        // platform's text callback for it is still held back.
+        cx.update(|window, app| {
+            window.dispatch_keystroke(gpui::Keystroke::parse("q").unwrap(), app);
+        });
+        assert!(view.read_with(cx, |view, _| {
+            view.inline_rename.as_ref().is_some_and(|rename| rename.pending)
+        }));
         assert_eq!(
             snapshot(&view, cx),
             ("body\n".to_owned(), String::new(), Some("Renamed".to_owned()))
