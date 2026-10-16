@@ -3667,14 +3667,15 @@ mod tests {
 
         let text = runtime_install_failure_diagnostics(
             RuntimeInstallErrorCode::UnsupportedTarget,
-            "windows",
+            "linux",
             "aarch64",
         )
         .join("\n");
-        assert!(text.contains("windows / aarch64"));
+        assert!(text.contains("linux / aarch64"));
         assert!(text.contains("runtime_install_unsupported_target"));
-        assert!(text.contains(hane_ai::SUPPORTED_TARGETS[0]));
-        assert!(text.contains(hane_ai::SUPPORTED_TARGETS[1]));
+        for target in hane_ai::SUPPORTED_TARGETS {
+            assert!(text.contains(target));
+        }
         assert!(text.contains("段階="));
         assert!(text.contains("次の手順"));
         assert!(text.contains("再試行しても解消しません"));

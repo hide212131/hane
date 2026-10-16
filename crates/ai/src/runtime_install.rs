@@ -15,7 +15,7 @@
 //!
 //! # Where the pinned target/URL/size/hash data comes from
 //!
-//! The exact upstream URL, archive size, and SHA-256 for each of the two P0
+//! The exact upstream URL, archive size, and SHA-256 for each of the three P0
 //! targets are the single source of truth already checked into this
 //! repository at `assets/ai/codex-runtime-lock.json`, together with a
 //! per-target pinned file-level inventory under `assets/ai/inventory/`.
@@ -33,7 +33,7 @@
 //! size/hash/executable-bit) and rejects any symlink/reparse point found on
 //! disk (reusing `crate::runtime_distribution::check_not_symlink`), but it
 //! does not reimplement a tar/gzip entry-level parser in Rust: both P0
-//! targets (Windows 10 1803+/11, macOS) ship a `tar` capable of `-xzf` out of
+//! target platforms (Windows and macOS) ship a `tar` capable of `-xzf` out of
 //! the box, and reusing it keeps this module free of new third-party
 //! dependencies.
 
@@ -51,7 +51,7 @@ use crate::rpc::RejectAllServerRequests;
 use crate::runtime::{AiRuntime, RuntimeConfig, RuntimeError, RuntimeState};
 use crate::runtime_distribution::{
     self, MACOS_ARM64_TARGET, RuntimeManifest, RuntimeManifestFile, RuntimeManifestProfile,
-    WINDOWS_X64_TARGET, current_target,
+    WINDOWS_ARM64_TARGET, WINDOWS_X64_TARGET, current_target,
 };
 
 const LOCK_JSON: &str = include_str!(concat!(
@@ -61,6 +61,10 @@ const LOCK_JSON: &str = include_str!(concat!(
 const WINDOWS_X64_INVENTORY_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/ai/inventory/x86_64-pc-windows-msvc-0.157.1.json"
+));
+const WINDOWS_ARM64_INVENTORY_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/ai/inventory/aarch64-pc-windows-msvc-0.157.1.json"
 ));
 const MACOS_ARM64_INVENTORY_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -79,6 +83,9 @@ const SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WINDOWS_X64_ARCHIVE_SIZE: u64 = 122_840_599;
 const WINDOWS_X64_ARCHIVE_SHA256: &str =
     "7ca926f4fc443c0ead83109314e9a97bf43d2da276be147f1919a4b5e62dfa8b";
+const WINDOWS_ARM64_ARCHIVE_SIZE: u64 = 113_873_506;
+const WINDOWS_ARM64_ARCHIVE_SHA256: &str =
+    "e94f89d28bc81eb4a98110c4513d7713e7985a9d91c9d9d5627de92e030e9d73";
 const MACOS_ARM64_ARCHIVE_SIZE: u64 = 98_491_706;
 const MACOS_ARM64_ARCHIVE_SHA256: &str =
     "9a6033c9fe30260e71d784d003ad1e2de2a55c93e24a24856e8433029a3f811a";
@@ -161,6 +168,7 @@ fn install_spec_for_target(target: &str) -> Option<RuntimeInstallSpec> {
     let entry = lock.targets.get(target)?;
     let (expected_size, expected_sha256) = match target {
         WINDOWS_X64_TARGET => (WINDOWS_X64_ARCHIVE_SIZE, WINDOWS_X64_ARCHIVE_SHA256),
+        WINDOWS_ARM64_TARGET => (WINDOWS_ARM64_ARCHIVE_SIZE, WINDOWS_ARM64_ARCHIVE_SHA256),
         MACOS_ARM64_TARGET => (MACOS_ARM64_ARCHIVE_SIZE, MACOS_ARM64_ARCHIVE_SHA256),
         _ => return None,
     };
@@ -179,6 +187,7 @@ fn install_spec_for_target(target: &str) -> Option<RuntimeInstallSpec> {
     }
     let inventory_json = match target {
         WINDOWS_X64_TARGET => WINDOWS_X64_INVENTORY_JSON,
+        WINDOWS_ARM64_TARGET => WINDOWS_ARM64_INVENTORY_JSON,
         MACOS_ARM64_TARGET => MACOS_ARM64_INVENTORY_JSON,
         _ => return None,
     };
@@ -990,14 +999,31 @@ mod tests {
     }
 
     #[test]
-    fn lock_keeps_the_two_fixed_archive_sizes_and_hashes() {
+    fn lock_keeps_all_fixed_archive_sizes_and_hashes() {
         let lock: LockFile = serde_json::from_str(LOCK_JSON).unwrap();
         let windows = lock.targets.get(WINDOWS_X64_TARGET).unwrap();
         assert_eq!(windows.archive_size, WINDOWS_X64_ARCHIVE_SIZE);
         assert_eq!(windows.archive_sha256, WINDOWS_X64_ARCHIVE_SHA256);
+        let windows_arm64 = lock.targets.get(WINDOWS_ARM64_TARGET).unwrap();
+        assert_eq!(windows_arm64.archive_size, WINDOWS_ARM64_ARCHIVE_SIZE);
+        assert_eq!(windows_arm64.archive_sha256, WINDOWS_ARM64_ARCHIVE_SHA256);
         let macos = lock.targets.get(MACOS_ARM64_TARGET).unwrap();
         assert_eq!(macos.archive_size, MACOS_ARM64_ARCHIVE_SIZE);
         assert_eq!(macos.archive_sha256, MACOS_ARM64_ARCHIVE_SHA256);
+    }
+
+    #[test]
+    fn windows_arm64_install_spec_uses_the_pinned_native_package() {
+        let spec = install_spec_for_target(WINDOWS_ARM64_TARGET).unwrap();
+        assert_eq!(spec.target, WINDOWS_ARM64_TARGET);
+        assert_eq!(spec.archive_size, WINDOWS_ARM64_ARCHIVE_SIZE);
+        assert_eq!(spec.archive_sha256, WINDOWS_ARM64_ARCHIVE_SHA256);
+        assert!(spec.url.ends_with("codex-app-server-package-aarch64-pc-windows-msvc.tar.gz"));
+        assert_eq!(spec.entrypoint_name, "codex-app-server.exe");
+        assert_eq!(spec.pinned_inventory.len(), 6);
+        assert!(spec.pinned_inventory.iter().any(|file| {
+            file.path == "bin/codex-app-server.exe" && file.executable
+        }));
     }
 
     #[test]

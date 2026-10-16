@@ -24,9 +24,9 @@
 //!
 //! The installed package's `manifest.json` is a `schema_version = 1` document
 //! naming a `bundle_id`, the exact target triple (one of
-//! [`WINDOWS_X64_TARGET`]/[`MACOS_ARM64_TARGET`]) it was built for, the
-//! upstream `codex_version` and `source_commit` it came from, the
-//! `archive_sha256` of the upstream archive it was extracted from, a `files`
+//! [`WINDOWS_X64_TARGET`]/[`WINDOWS_ARM64_TARGET`]/[`MACOS_ARM64_TARGET`])
+//! it was built for, its upstream `codex_version` and `source_commit`, the
+//! `archive_sha256` of its upstream archive, a `files`
 //! inventory, an explicit `licenses` list (empty for Hane's direct-install
 //! contract), and the `runtime_profile`/`config_profile`/`state_profile` the
 //! package was created for. Every
@@ -57,21 +57,28 @@ const MANIFEST_FILE_NAME: &str = "manifest.json";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 pub const WINDOWS_X64_TARGET: &str = "x86_64-pc-windows-msvc";
+pub const WINDOWS_ARM64_TARGET: &str = "aarch64-pc-windows-msvc";
 pub const MACOS_ARM64_TARGET: &str = "aarch64-apple-darwin";
 
 /// Every target the installed package contract supports, for diagnostics.
-pub const SUPPORTED_TARGETS: [&str; 2] = [WINDOWS_X64_TARGET, MACOS_ARM64_TARGET];
+pub const SUPPORTED_TARGETS: [&str; 3] = [
+    WINDOWS_X64_TARGET,
+    WINDOWS_ARM64_TARGET,
+    MACOS_ARM64_TARGET,
+];
 
 /// The only recognized `files` entry `type`. Any other value is treated as
 /// an unknown-schema inventory entry and rejected fail-closed.
 const RUNTIME_MANIFEST_FILE_TYPE_FILE: &str = "file";
 
 /// The current platform's manifest `target` identifier, or `None` when this
-/// host is neither of the two P0 targets the installed package's manifest
+/// host is neither of the three P0 targets the installed package's manifest
 /// contract supports.
 pub fn current_target() -> Option<&'static str> {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         Some(WINDOWS_X64_TARGET)
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some(WINDOWS_ARM64_TARGET)
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some(MACOS_ARM64_TARGET)
     } else {
@@ -92,7 +99,7 @@ pub enum RuntimeDistributionErrorCode {
     /// file the manifest names) does not exist.
     Missing,
     /// The installed manifest's `target` does not match this host, or this
-    /// host is neither of the two P0 targets at all.
+    /// host is neither of the three P0 targets at all.
     UnsupportedTarget,
     /// A `files` inventory entry's computed `sha256` does not match the
     /// manifest's recorded value, or its actual size does not match the
@@ -682,6 +689,22 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn current_target_matches_this_build_platform() {
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        assert_eq!(current_target(), Some(WINDOWS_X64_TARGET));
+        #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+        assert_eq!(current_target(), Some(WINDOWS_ARM64_TARGET));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(current_target(), Some(MACOS_ARM64_TARGET));
+        #[cfg(not(any(
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "windows", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )))]
+        assert_eq!(current_target(), None);
     }
 
     fn next_fixture_dir(label: &str) -> PathBuf {

@@ -1,0 +1,44 @@
+[
+  {
+    "path": "bin/codex-app-server.exe",
+    "type": "file",
+    "size": 207626544,
+    "sha256": "b2c87c52be4a6e6b5e1b0ca4b1c7e5a368e6b486a453ddd0bd9cd6ef530eaaaa",
+    "executable": true
+  },
+  {
+    "path": "bin/codex-code-mode-host.exe",
+    "type": "file",
+    "size": 69680944,
+    "sha256": "bc2cee247a3542537e9fb6898e9c70bd4426c2b0c036404ac79dcba684747247",
+    "executable": true
+  },
+  {
+    "path": "codex-package.json",
+    "type": "file",
+    "size": 238,
+    "sha256": "3924fa679f4f878e240571a0500d8c85bde66b7809bb5ce417ea1234e99a43d2",
+    "executable": false
+  },
+  {
+    "path": "codex-path/rg.exe",
+    "type": "file",
+    "size": 3859456,
+    "sha256": "d33a29a9ef03c9f4c03be9e8d88498e6e2d2e566d64cdbdef97f9afc8f13120c",
+    "executable": true
+  },
+  {
+    "path": "codex-resources/codex-command-runner.exe",
+    "type": "file",
+    "size": 7343920,
+    "sha256": "1c8be0945789c8cc2f5dcc7decf4fe751222a7fc23c4670831503d93939da225",
+    "executable": true
+  },
+  {
+    "path": "codex-resources/codex-windows-sandbox-setup.exe",
+    "type": "file",
+    "size": 15749936,
+    "sha256": "a48085f81ea6443c1c16b329045032031683294770abd22519a99d96e482d63a",
+    "executable": true
+  }
+]
