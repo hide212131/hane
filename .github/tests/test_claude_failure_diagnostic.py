@@ -320,7 +320,7 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
         self.assertLess(build_index, checkpoint_index)
         self.assertLess(diagnose_index, checkpoint_index)
         self.assertIn(
-            "always() && !cancelled() && steps.claude.outcome != 'skipped'",
+            "always() && !cancelled() && (steps.claude.outcome == 'failure' || steps.model_verify.outcome == 'success')",
             WORKFLOW,
         )
         self.assertIn(

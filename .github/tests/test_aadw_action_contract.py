@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -26,6 +28,16 @@ class RequestTests(unittest.TestCase):
 
     def test_current_product_request(self):
         self.assertEqual(self.validate()["action"], "implement")
+
+    def test_legacy_mixed_and_duplicate_implementation_markers_fail_closed(self):
+        current = request()
+        legacy = current.replace("AADW_COMMANDER_HANDOFF_V3", "AADW_COMMANDER_HANDOFF_V2")
+        mixed = current + "AADW_COMMANDER_HANDOFF_V2\n"
+        duplicate = current + "AADW_COMMANDER_HANDOFF_V3\n"
+        unknown = current + "AADW_COMMANDER_HANDOFF_V3-BETA\n"
+        for body in (legacy, mixed, duplicate, unknown):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.validate(body)
 
     def test_unknown_measurement_environment_cannot_trigger_fix(self):
         for category in ("measurement", "environment", "unknown"):
@@ -81,6 +93,32 @@ class RequestTests(unittest.TestCase):
             self.validate(history=history)
         self.validate(request(evidence="https://github.com/o/r/actions/runs/2"), history=history)
         self.validate(request("diagnose", "unknown"), history=history)
+
+    def test_fallback_requires_current_exact_implementation_handoff(self):
+        self.assertEqual(contract.validate_source_handoff(request(), HEAD)["action"], "implement")
+        for body, target_sha in (
+            (request().replace("AADW_COMMANDER_HANDOFF_V3", "AADW_COMMANDER_HANDOFF_V2"), HEAD),
+            (request() + "AADW_COMMANDER_HANDOFF_V2\n", HEAD),
+            (request() + "AADW_COMMANDER_HANDOFF_V3-BETA\n", HEAD),
+            (request("diagnose", "unknown"), HEAD),
+            (request(), "b" * 40),
+        ):
+            with self.subTest(body=body, target_sha=target_sha), self.assertRaises(ValueError):
+                contract.validate_source_handoff(body, target_sha)
+
+    def test_source_handoff_cli_writes_validated_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            handoff = root / "handoff.txt"
+            output = root / "validated.json"
+            handoff.write_text(request(), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/aadw_action_contract.py"),
+                 "source-handoff", str(handoff), HEAD, str(output)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["target_sha"], HEAD)
 
     def test_other_users_and_current_comment_do_not_count(self):
         self.validate(history=[{"id": 1, "user": {"login": "outsider"}, "body": request()},

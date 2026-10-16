@@ -1283,6 +1283,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn escape_closes_content_search_first_and_leaves_the_find_bar_as_the_next_escape_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        // Open Content Search first, then the find bar on top of it: opening
+        // the find bar only blurs Content Search's own focus flags (see
+        // `opening_the_find_bar_clears_content_search_input_focus` above), it
+        // never closes the sidebar, so both can report a leave-on-escape
+        // candidate for the same Escape at once — a real state reachable
+        // through the existing public open paths, not a synthetic one.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.content_search_sidebar_visible());
+            assert!(view.document_find.open);
+            // Both overlays are simultaneously willing to leave on the same
+            // Escape: this is the ambiguous-priority state this test guards.
+            assert!(view.content_search_should_leave_on_escape());
+            assert!(view.document_find_should_leave_on_escape());
+        });
+
+        // `CancelComposition`'s handler in `actions.rs` checks Content
+        // Search's `content_search_should_leave_on_escape` before the find
+        // bar's `document_find_should_leave_on_escape`, so only Content
+        // Search must close on this Escape.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.content_search_sidebar_visible());
+            // The find bar is untouched: it is the next Escape's candidate,
+            // not closed alongside Content Search on this one.
+            assert!(view.document_find.open);
+            assert!(view.document_find_should_leave_on_escape());
+        });
+
+        // A second, separate Escape then reaches the find bar and closes it,
+        // confirming it really was next in line rather than coincidentally
+        // still open.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.open);
+        });
+    }
+
+    #[gpui::test]
     fn an_empty_query_reports_no_result_without_scanning(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("aa aa aa\n", "Untitled", cx));
@@ -1948,6 +2007,110 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.document_find.current, Some(1));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+        });
+    }
+
+    // Issue #304 (RF3-A, P2): F3/Shift+F3 の契約テスト。現行のP2経路では、
+    // content-search専用guardの後で `input_target()` に振り分けられ、
+    // document-findのIME composition guardはBody側に残っている。
+    // `open_document_find` の後にfilter / renameの状態を設定する
+    // （実UIではrename中は検索を閉じ、検索バー表示中にfilterへfocusしない
+    // ため同時には成立しない）ことで、filter / rename時に検索位置と本文を
+    // 変えない契約を直接固定する。`view.rs` の他の通常キー・特殊キーの
+    // テストと同じ方針。
+    #[gpui::test]
+    fn f3_and_shift_f3_are_no_ops_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+            assert!(view.sidebar_filter_is_focused());
+        });
+
+        cx.simulate_keystrokes("shift-f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+        });
+    }
+
+    #[gpui::test]
+    fn f3_and_shift_f3_are_no_ops_while_inline_rename_is_active(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("needle needle\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "needle".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+        });
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.editor().document().full_text(), "needle needle\n");
+            assert!(view.inline_rename_active());
+        });
+
+        cx.simulate_keystrokes("shift-f3");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
             assert_eq!(view.editor().document().full_text(), "needle needle\n");
         });
     }

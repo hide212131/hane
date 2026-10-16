@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > この文書は AADW v1 の履歴資料であり、現行の運用ルールではない。
 >
-> AADW v1 の GitHub Actions workflow は PR #150 で停止した。v2で状態機械を廃止し、その原則を引き継いだ現行 AADW v3 は Jev の意味判断と CodeRabbit の通常レビューを採用する。
+> AADW v1 の GitHub Actions workflow は PR #150 で停止した。過去の状態機械契約も現行運用には含めない。現行 AADW v3 は Jev の意味判断と CodeRabbit の通常レビューを採用する。
 
 現行の正本は次を参照する。
 

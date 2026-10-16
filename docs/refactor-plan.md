@@ -224,7 +224,7 @@ geometryの正本、cache無効化、stale結果の扱いが一貫し、局所�
 
 **現行GUI検証の重複を確認して統合する。** 日付バッジ、sidebar chrome、汎用GUI validationなどのworkflowについて、共通のcheckout、build、scenario実行、artifact収集を比較する。共通部分が実際に重複している場合だけ、既存runnerや小さな共通部品へ寄せる。scenario固有の再現操作・期待値は残す。[S17]
 
-**権限と判断を統合しない。** trustedなorchestrationとPRコード、reviewとimplementation、GUI観測とmerge判断を分けたままにする。exact-head guard、必要なbase context、認証情報の分離、`unknown` を成功にしない扱いを維持する。AADW v2の判断をworkerやworkflowへコピーしない。[S18]
+**権限と判断を統合しない。** trustedなorchestrationとPRコード、reviewとimplementation、GUI観測とmerge判断を分けたままにする。exact-head guard、必要なbase context、認証情報の分離、`unknown` を成功にしない扱いを維持する。Commander Policyの意味判断をworkerやworkflowへコピーしない。[S18]
 
 **CIを整理し、弱めない。** 現行のmacOS/Windowsのworkspace testsとclippy、必要なvendor/GPUIテストを保つ。Python/ShellとRustの変更範囲に対する検証対応を明確にし、path filterの判定失敗を安全側に倒す動作を維持する。通常buildとinstrument buildのどちらも、必要な確認範囲に含める。[S19]
 

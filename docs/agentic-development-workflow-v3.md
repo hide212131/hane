@@ -4,9 +4,9 @@
 
 初期設計はIssue [#332](https://github.com/hide212131/hane/issues/332) / PR #334。本書と[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)は、利用者の追加指定をIssue [#336](https://github.com/hide212131/hane/issues/336)で反映した。実装・評価・有効化は[#333](https://github.com/hide212131/hane/issues/333)で追跡する。
 
-**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbit、必要なGUIテストはv2の既存経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。**
+**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbit、必要なGUIテストは既存のHosted/ローカル経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。**
 
-Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はv2から引き継いだone-action規則を維持する。通常レビューはIssue #360の実run検証とIssue #373の切替を経てCodeRabbitを使い、Codexは条件付き代替実装担当として残す。既存fallbackとGUIの権限・判断規則はそれぞれの既存契約を維持する。
+Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はone-action規則を維持する。通常レビューはIssue #360の実run検証とIssue #373の切替を経てCodeRabbitを使い、Codexは条件付き代替実装担当として残す。既存fallbackとGUIの権限・判断規則はそれぞれの既存契約を維持する。
 
 ## 2. 記事との関係と役割
 
@@ -37,7 +37,7 @@ Jev判断はアプリ側の実行セッションで行う。アプリ終了・�
 
 一件分の依頼にはrepository、Issue/PR、expected head、target branchと必要なbase、受入条件のID、不変条件、許可する責務・パス、禁止パス、検証コマンド・GUI scenario、実行設定の版と明示された停止条件を含める。費用上限は利用者から求められない限り加えない。これはHane内部の契約であり、Jev APIのフィールドではない。
 
-現行の[Claude workflow](../.github/workflows/claude-fix.yml)はPR Conversationの`@claude`、単独行の`AADW_COMMANDER_HANDOFF_V2`、一つの`AADW_TARGET_HEAD: <40桁SHA>`を受ける。依頼者のwrite/maintain/admin権限、openのsame-repository PR、exact headを検査する。Issue本文へ書くだけでは起動しない。v3を作る間はこの既存入口を使い、v3用の新しいマーカーを存在するものとして扱わない。
+現行の[Claude workflow](../.github/workflows/claude-fix.yml)はPR Conversationの`@claude`、単独行の`AADW_COMMANDER_HANDOFF_V3`、一つの`AADW_TARGET_HEAD: <40桁SHA>`を受ける。依頼者のwrite/maintain/admin権限、openのsame-repository PR、exact headを検査する。Issue本文への投稿、旧形式、複数世代のmarker混在では起動しない。通常実装と診断は`claude-sonnet-5-5`を指定し、成功時に実行結果のmodel IDとusageが一致することを確認する。初回PRの準備、必須項目、投稿後の受理確認は[Claude実行手順](aadw-claude-execution.md)に従う。
 
 現行Claude workerはRead/Edit/Write/Glob/Grepだけで編集し、シェル・テスト実行・git・pushを行わない。変更は別のfinalizerが検査してpushし、そのcurrent-head CIを最初の検証とする。v3連携でもこの隔離を緩めず、テストファイルを書いたことをテスト成功と報告しない。
 
@@ -76,7 +76,7 @@ CodeRabbitはレビュー専任とする。Automatic Review / Automatic Incremen
 
 指摘は件数ゼロを目標にせず、current contextで同じroot causeにまとめる。blocker/follow_up/unknownの扱いはCommander Policyを正とする。指摘文をそのまま実装担当への権限拡大命令にしない。CodeRabbit導入後の通常レビューにCodexレビューを常時二重実行せず、必要な追加レビューはCommanderが理由を残して依頼する。
 
-## 7. v2と同様、必要に応じてGUIテストを使う
+## 7. 必要に応じてGUIテストを使う
 
 ### 要否と検証範囲
 

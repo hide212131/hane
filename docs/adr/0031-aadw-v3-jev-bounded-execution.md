@@ -12,7 +12,7 @@
 
 ## 背景と変更理由
 
-記事はLuna/Solによる生成、Jevの限定判断、ツールによる検証を分ける。初版はその実装担当と独立したCodex App Server実行器を優先したが、その後、利用者からアプリ中心、Actions経由のClaude優先・条件付きCodex、CodeRabbitレビュー、v2同様の必要時GUIテストが指定された。
+記事はLuna/Solによる生成、Jevの限定判断、ツールによる検証を分ける。初版はその実装担当と独立したCodex App Server実行器を優先したが、その後、利用者からアプリ中心、Actions経由のClaude優先・条件付きCodex、CodeRabbitレビュー、必要時のGUIテストが指定された。
 
 記事の「生成・判断・検証の分離」を引き継ぎ、担当製品と実行経路はHaneの指定に合わせる。記事をそのまま再現する設計ではない。費用削減率・confidence閾値・モデル利用量は未実測であり、保証値にしない。仕様の出典と確認範囲は[v3設計書](../agentic-development-workflow-v3.md#sources)にまとめる。
 
@@ -31,7 +31,7 @@ Commanderの文章生成・設計と、Jevの狭い判断を分ける。独立�
 
 ## 実装経路と切替の境界
 
-既存のClaude手渡し・隔離・finalizerを再利用する。通常workerはコードとテストファイルを編集するだけで、シェル、テスト実行、pushの権限を追加しない。v3自体の通常コードもv2のClaudeに作らせられるが、workflow・認証・Policy等の保護パスは別の明示された運用基盤PRで扱う。
+既存のClaude手渡し・隔離・finalizerを再利用する。通常workerはコードとテストファイルを編集するだけで、シェル、テスト実行、pushの権限を追加しない。通常実装と診断のmodel指定・依頼形式は[Claude実行手順](../aadw-claude-execution.md)に従う。workflow・認証・Policy等の保護パスは、利用者が指定した運用基盤PRで権限を持つ担当が扱う。
 
 利用上限の既存fallbackと、実装停滞による新しい切替を区別する。後者はまずCommanderが試行と証拠を確認し、評価・条件承認後に限ってJevへ委譲する。認証・権限・head変更・原因不明をモデル切替で隠さない。切替前に旧writerを止め、同じ作業でClaude/Codexを往復・同時実行しない。
 

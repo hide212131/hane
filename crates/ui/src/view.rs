@@ -883,6 +883,11 @@ pub struct EditorView {
     sidebar_keyboard_focus: bool,
     /// The row-local inline rename field, if one is active.
     inline_rename: Option<InlineRename>,
+    /// Set once a text callback arrived while the rename was pending. The
+    /// platform may still hold that text (an IME composition) and deliver it
+    /// after the rename ended, so text callbacks are ignored until the next
+    /// keystroke clears this. Shared with the keystroke interceptor.
+    inline_rename_swallowed_input: std::rc::Rc<std::cell::Cell<bool>>,
     /// User-adjustable width of the work-folder sidebar.
     sidebar_width: f32,
     /// Active drag of the vertical divider between sidebar and editor.
@@ -1603,8 +1608,33 @@ impl EditorView {
         // just before this Enter, the same reasoning as the Escape
         // interceptor above (see `note_document_find_enter_keystroke`).
         let enter_interceptor_view = cx.entity().downgrade();
+        let inline_rename_swallowed_input = std::rc::Rc::new(std::cell::Cell::new(false));
+        // A new keystroke ends the window in which text the platform already
+        // received during a pending rename could still be delivered late (see
+        // `drop_input_after_pending_rename`). A shared cell avoids updating the
+        // view from inside key dispatch.
+        let swallowed_input_for_interceptor = inline_rename_swallowed_input.clone();
         let document_find_enter_interceptor = cx.intercept_keystrokes(move |event, window, app| {
-            if event.keystroke.key != "enter" {
+            // A key pressed while the rename is pending arms the guard right
+            // away: its text callback may only arrive after the rename ended,
+            // so waiting for a callback during the pending window is not enough.
+            let rename_pending = enter_interceptor_view
+                .read_with(&*app, |view, _| {
+                    view.inline_rename
+                        .as_ref()
+                        .is_some_and(|rename| rename.pending)
+                })
+                .unwrap_or(false);
+            // An Enter may only confirm an IME composition whose text callback
+            // is still in flight, so it neither arms nor clears the guard; any
+            // other key is new input and ends the guarded window.
+            let is_enter = event.keystroke.key == "enter";
+            if rename_pending {
+                swallowed_input_for_interceptor.set(true);
+            } else if !is_enter {
+                swallowed_input_for_interceptor.set(false);
+            }
+            if !is_enter {
                 return;
             }
             let _ = enter_interceptor_view.update(app, |view, cx| {
@@ -1662,6 +1692,7 @@ impl EditorView {
             sidebar_filter_input_bounds: None,
             sidebar_keyboard_focus: false,
             inline_rename: None,
+            inline_rename_swallowed_input,
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
@@ -19866,6 +19897,122 @@ mod tests {
         });
     }
 
+    // RF3-A P2 contract test (Issue #304, design spec §9 R07): pins
+    // `actions.rs`'s existing `Newline`/`ShiftNewline` short-circuit for the
+    // sidebar filter — while it is focused and mid-composition, Enter must
+    // only call `commit_sidebar_filter_composition` and then `return`,
+    // before ever reaching `insert_newline`/`apply_list_edit_intent`, and
+    // without blurring the filter or falling through to the body or an
+    // inline rename.
+    #[gpui::test]
+    fn sidebar_filter_enter_during_composition_only_commits_and_leaves_focus_and_the_body_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("untouched body text\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_keyboard_focus = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 3..3;
+            view.sidebar_filter_selection_reversed = false;
+            // Mirrors a real in-progress Japanese conversion: marks "abc" +
+            // the composing kana rather than committing it outright.
+            view.replace_and_mark_sidebar_filter_text(None, "か", None, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_filter_has_composition());
+            assert_eq!(view.sidebar_filter, "abcか");
+        });
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sidebar_filter_has_composition(),
+                "Enter must commit the in-progress composition"
+            );
+            assert_eq!(
+                view.sidebar_filter, "abcか",
+                "committing must keep the composed text, not discard or extend it"
+            );
+            assert!(
+                view.sidebar_filter_focused,
+                "confirming a composition must not blur the filter"
+            );
+            assert!(!view.inline_rename_active());
+            assert_eq!(
+                view.editor().document().full_text(),
+                "untouched body text\n",
+                "the commit-only Enter must never fall through to inserting a newline in the body"
+            );
+        });
+    }
+
+    // RF3-A P2 contract test (Issue #304, design spec §9 R09): pins
+    // `actions.rs`'s existing `CancelComposition` short-circuit for the
+    // sidebar filter — the first Escape while composing must only call
+    // `cancel_sidebar_filter_composition` (reverting to the pre-composition
+    // snapshot) and keep the filter focused; only a second, separate Escape
+    // with no composition left may call `blur_sidebar_filter`.
+    #[gpui::test]
+    fn sidebar_filter_escape_cancels_composition_before_a_second_escape_blurs_the_filter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("untouched body text\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_keyboard_focus = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 3..3;
+            view.sidebar_filter_selection_reversed = false;
+            view.replace_and_mark_sidebar_filter_text(None, "か", None, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_filter_has_composition());
+            assert_eq!(view.sidebar_filter, "abcか");
+        });
+
+        // The first Escape must cancel the composition only, reverting to
+        // the pre-composition text and keeping the filter focused — never
+        // also blurring it on the same keystroke.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_has_composition());
+            assert_eq!(
+                view.sidebar_filter, "abc",
+                "cancelling must restore the pre-composition snapshot"
+            );
+            assert!(
+                view.sidebar_filter_focused,
+                "the first, composition-cancelling Escape must not blur the filter"
+            );
+        });
+
+        // With no composition left, a second, separate Escape blurs the
+        // filter normally.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_focused);
+        });
+    }
+
     #[gpui::test]
     fn inline_rename_active_normal_editing_keys_route_only_to_the_rename_field_and_leave_the_body_and_sidebar_filter_untouched(
         cx: &mut gpui::TestAppContext,
@@ -20343,5 +20490,638 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), "placeholder\n");
             assert_eq!(view.sidebar_filter, "");
         });
+    }
+
+    // Issue #304 (RF3-A, P2): `Indent`/`Outdent`, `Up`/`Down`, and
+    // `PrevFileTab` は現在、共通の `input_target()` resolver に接続されている。
+    // ここでは、sidebar filter / inline rename では no-op になり、body では
+    // list planner を一度だけ実行して編集履歴へ記録する、という契約を
+    // 実キー dispatch で固定する。`content-search`、`document-find`、AI
+    // 専用のガードは resolver より前に残り、それらが入力を消費する場合も
+    // この入力先判定の契約を変更しない。`F3`/`Shift+F3` の filter / rename
+    // ガードは `document_find.rs` の関連テストで、`Enter`/`Shift+Enter` の
+    // filter / rename と list / history の契約はこのモジュールの既存の
+    // 実キー dispatch テストで固定している。
+
+    #[gpui::test]
+    fn tab_and_shift_tab_run_the_list_planner_through_real_key_dispatch_and_record_undo_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("- A\n- B", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(7)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
+            assert!(view.editor().can_undo());
+        });
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n- B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B");
+        });
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "- A\n- B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+        });
+    }
+
+    #[gpui::test]
+    fn tab_and_shift_tab_are_no_ops_outside_a_list_context_and_never_insert_a_literal_tab_character(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("plain\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "plain\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+            assert!(!view.editor().can_undo());
+        });
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "plain\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+            assert!(!view.editor().can_undo());
+        });
+    }
+
+    #[gpui::test]
+    fn up_and_down_move_the_body_caret_vertically_through_real_key_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(0))
+        );
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(6))
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_filter_focused_up_and_down_do_not_move_the_body_caret(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.sidebar_filter_focused = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 1..1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert!(view.sidebar_filter_is_focused());
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+        });
+    }
+
+    #[gpui::test]
+    fn inline_rename_active_up_and_down_do_not_move_the_body_caret(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "abcdef".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 3..3,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+        });
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+        });
+    }
+
+    // Issue #304 (RF3-A, P2): `Shift+Up`/`Shift+Down` は現在、共通の
+    // `input_target()` resolver に接続されている。body では selection を
+    // 垂直方向へ拡張し、sidebar filter / inline rename では body の selection
+    // を変更しない、という契約を実キー dispatch で固定する。
+    // `content-search`、`document-find`、AI 専用のガードは resolver より前に
+    // 維持される。
+    #[gpui::test]
+    fn shift_up_and_shift_down_extend_the_body_selection_vertically_through_real_key_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection {
+                anchor: SourceOffset(6),
+                active: SourceOffset(0),
+            }
+        );
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(6))
+        );
+    }
+
+    #[gpui::test]
+    fn sidebar_filter_focused_shift_up_and_shift_down_do_not_change_the_body_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.sidebar_filter_focused = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 1..1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter, "abc");
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert!(view.sidebar_filter_is_focused());
+        });
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert_eq!(view.sidebar_filter, "abc");
+            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert!(view.sidebar_filter_is_focused());
+        });
+    }
+
+    #[gpui::test]
+    fn inline_rename_active_shift_up_and_shift_down_do_not_change_the_body_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "abcdef".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 3..3,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            let rename = view.inline_rename.as_ref().unwrap();
+            assert_eq!(rename.text, "abcdef");
+            assert_eq!(rename.selected_range, 3..3);
+        });
+
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            let rename = view.inline_rename.as_ref().unwrap();
+            assert_eq!(rename.text, "abcdef");
+            assert_eq!(rename.selected_range, 3..3);
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_tab_does_not_switch_tabs_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_is_focused()));
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_tab_does_not_switch_tabs_while_inline_rename_is_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+    }
+
+    // Issue #304 (RF3-A, P2 design §6): `DocumentStart`/`DocumentEnd` と
+    // Select variants、`Undo`/`Redo` の6つの本文専用 action は現在、共通の
+    // `input_target()` resolver に接続されている。sidebar filter / inline
+    // rename ではキーを消費して body の text・selection・undo/redo stack
+    // を変更しない、という契約をここで固定する。`content-search`、
+    // `document-find`、AI 専用のガードは resolver より前に維持される。
+
+    #[gpui::test]
+    fn sidebar_filter_focused_document_navigation_and_undo_redo_are_no_ops_for_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        // Two edits separated by an unrelated caret move land in separate
+        // undo transactions (adjacent same-kind inserts otherwise coalesce);
+        // undoing the second once leaves both a pending undo (the first
+        // insert) and a pending redo (the second), so the loop below proves
+        // Undo/Redo are really no-ops, not merely idempotent.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.editor_mut().insert_text("A").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.editor_mut().insert_text("B").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::Undo, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().can_undo());
+            assert!(view.editor().can_redo());
+        });
+
+        let body_text = view.read_with(cx, |view, _| view.editor().document().full_text());
+        let body_selection = view.read_with(cx, |view, _| view.editor().selection());
+
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            view.sidebar_filter = "abc".to_owned();
+            view.sidebar_filter_selected_range = 1..1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let undo_key = if cfg!(target_os = "macos") { "cmd-z" } else { "ctrl-z" };
+        let redo_key = if cfg!(target_os = "macos") {
+            "cmd-shift-z"
+        } else {
+            "ctrl-shift-z"
+        };
+        for keystroke in [
+            "secondary-up",
+            "secondary-down",
+            "secondary-shift-up",
+            "secondary-shift-down",
+            undo_key,
+            redo_key,
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().document().full_text(),
+                    body_text,
+                    "{keystroke} must not edit the body while the sidebar filter is focused"
+                );
+                assert_eq!(
+                    view.editor().selection(),
+                    body_selection,
+                    "{keystroke} must not move the body caret while the sidebar filter is focused"
+                );
+                assert!(
+                    view.editor().can_undo(),
+                    "{keystroke} must not consume undo history while the sidebar filter is focused"
+                );
+                assert!(
+                    view.editor().can_redo(),
+                    "{keystroke} must not consume redo history while the sidebar filter is focused"
+                );
+                assert_eq!(view.sidebar_filter, "abc");
+                assert_eq!(view.sidebar_filter_selected_range, 1..1);
+                assert!(view.sidebar_filter_is_focused());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn inline_rename_active_document_navigation_and_undo_redo_are_no_ops_for_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("first\nsecond\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        // See the sidebar-filter variant above for why these two edits must
+        // land in separate undo transactions.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(6)))
+                .unwrap();
+            view.editor_mut().insert_text("A").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.editor_mut().insert_text("B").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::Undo, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().can_undo());
+            assert!(view.editor().can_redo());
+        });
+
+        let body_text = view.read_with(cx, |view, _| view.editor().document().full_text());
+        let body_selection = view.read_with(cx, |view, _| view.editor().selection());
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "abcdef".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 3..3,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let undo_key = if cfg!(target_os = "macos") { "cmd-z" } else { "ctrl-z" };
+        let redo_key = if cfg!(target_os = "macos") {
+            "cmd-shift-z"
+        } else {
+            "ctrl-shift-z"
+        };
+        for keystroke in [
+            "secondary-up",
+            "secondary-down",
+            "secondary-shift-up",
+            "secondary-shift-down",
+            undo_key,
+            redo_key,
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().document().full_text(),
+                    body_text,
+                    "{keystroke} must not edit the body while an inline rename is active"
+                );
+                assert_eq!(
+                    view.editor().selection(),
+                    body_selection,
+                    "{keystroke} must not move the body caret while an inline rename is active"
+                );
+                assert!(
+                    view.editor().can_undo(),
+                    "{keystroke} must not consume undo history while an inline rename is active"
+                );
+                assert!(
+                    view.editor().can_redo(),
+                    "{keystroke} must not consume redo history while an inline rename is active"
+                );
+                assert_eq!(view.inline_rename.as_ref().unwrap().text, "abcdef");
+                assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+                assert!(view.inline_rename_active());
+            });
+        }
     }
 }

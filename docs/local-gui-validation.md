@@ -2,7 +2,7 @@
 
 ## 位置づけ
 
-GUI validation は AADW v2 の stage や judge ではない。ChatGPT Commander が Issue の acceptance criteria と変更内容から必要だと判断した場合に使う観測手段である。
+GUI validation はAADW内のstageやjudgeではない。ChatGPT Commander が Issue の acceptance criteria と変更内容から必要だと判断した場合に使う観測手段である。
 
 全体の判断ルールは [AADW Commander Policy](aadw-command-policy.md)、採用理由と trust boundary は [ADR-0024](adr/0024-local-gui-validation.md) を参照する。
 
@@ -124,7 +124,7 @@ GitHub に自然な置き場所がない画像などだけ、必要最小限の 
 
 ## v1 からの変更
 
-AADW v1 では GUI requirement、GUI validation、Copilot judge、merge gate を workflow の状態遷移として接続していた。v2 ではその orchestration を使わず、GUI validation を必要なときだけ選ぶ独立した観測 action とする。
+AADW v1 では GUI requirement、GUI validation、Copilot judge、merge gate を workflow の状態遷移として接続していた。現行の AADW v3 では Commander Policyに従い、GUI validationを必要なときだけ選ぶ独立した観測actionとして扱う。
 
 Hosted GUI Validation も v1 の state machine を復活させるものではない。comment router は authorization と current request construction、GUI workflow は execution-time validation と観測に限定する。結果から fix / review / merge を自動連鎖させない。
 

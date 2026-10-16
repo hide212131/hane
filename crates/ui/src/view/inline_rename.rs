@@ -96,6 +96,30 @@ impl EditorView {
             .map(|range| range_to_utf16(&rename.text, range))
     }
 
+    /// Whether a platform text callback (`replace_text_in_range`,
+    /// `replace_and_mark_text_in_range`) must be ignored. Text received while
+    /// the rename is pending is never applied, and the platform may still
+    /// hold it and commit it after the rename ended (to the body or back into
+    /// the rename field). So the first such callback arms a guard that drops
+    /// text callbacks until the next keystroke.
+    pub(crate) fn drop_input_after_pending_rename(&self) -> bool {
+        if self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|rename| rename.pending)
+        {
+            self.inline_rename_swallowed_input.set(true);
+        }
+        self.inline_rename_swallowed_input.get()
+    }
+
+    /// Whether the late-text guard is armed without arming it. An Enter seen
+    /// while armed can only confirm a composition whose text was held back
+    /// during the pending rename, so it must not edit the body.
+    pub(crate) fn late_input_guard_armed(&self) -> bool {
+        self.inline_rename_swallowed_input.get()
+    }
+
     pub(crate) fn replace_inline_rename_text(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -192,6 +216,18 @@ impl EditorView {
         rename.selection_reversed = composition.selection_reversed;
         rename.marked_range = None;
         cx.notify();
+    }
+
+    /// Platform cancel (an empty, rangeless replacement during composition).
+    /// While a rename is pending the field is protected, so it is left as is.
+    pub(crate) fn cancel_inline_rename_composition_unless_pending(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_rename.as_ref().is_some_and(|rename| rename.pending) {
+            return;
+        }
+        self.cancel_inline_rename_composition(cx);
     }
 
     pub(crate) fn selected_inline_rename_text(&self) -> Option<String> {

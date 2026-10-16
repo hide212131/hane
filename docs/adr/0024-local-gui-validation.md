@@ -6,13 +6,13 @@
 
 ## 日付
 
-2026-09-07（2026-09-09 hosted macOS 経路を検証、2026-09-16 AADW v2 と evidence freshness に合わせて改訂、2026-09-17 Hosted GUI Validation の comment command 入口を追加）
+2026-09-07（2026-09-09 hosted macOS 経路を検証、2026-09-16 evidence freshness に合わせて改訂、2026-09-17 Hosted GUI Validation の comment command 入口を追加）
 
 ## 背景
 
 Hane の GUI acceptance criteria は、コードレビューや内部テストだけでは確認できない場合がある。一方、Computer Use の承認や self-hosted runner を必須条件にすると、GUI 検証そのものと実行基盤の問題が結び付きすぎる。
 
-AADW v1 では GitHub-hosted macOS で Hane の build / launch / window discovery / capture / cleanup を実証した。ローカル Mac 用には `scripts/gui_validate.py` も実装した。その後 PR #150 で v1 の GUI validation workflow を停止・削除したが、Phase 3 の実運用で hosted runner が必要になったため、Issue #162 で AADW v2 用の薄い `AADW Hosted GUI Validation` を再導入した。これは v1 の状態機械を戻すものではなく、current PR context に対する観測 action だけを提供する。
+AADW v1 では GitHub-hosted macOS で Hane の build / launch / window discovery / capture / cleanup を実証した。ローカル Mac 用には `scripts/gui_validate.py` も実装した。その後 PR #150 で v1 の GUI validation workflow を停止・削除したが、Phase 3 の実運用で hosted runner が必要になったため、Issue #162 で `AADW Hosted GUI Validation` を再導入した。これは v1 の状態機械を戻すものではなく、current PR context に対する観測 action だけを提供する。
 
 Phase 3 の実運用では、同じ PR head でも target branch が進むと GUI scenario の前提が変わり得ることを確認した。そのため GUI evidence も、scenario が base-sensitive な場合は current target branch / merge context と対応付けて扱う。
 
@@ -65,7 +65,7 @@ comment router にだけ dispatch と PR Conversation への通知に必要な�
 - head と、必要な場合は current base / merge context に対応する focused evidence を使いながら、GUI worker の観測と Commander の意味判断を分離できる。
 - workflow run / artifact / current GitHub facts を正本とし、AADW 専用の persistent state を追加しない。
 
-## AADW v2 以降で置き換えた部分
+## v3で引き継いだ部分
 
 v1 の GUI requirement workflow、Copilot final judge、merge gate、receipt / state transition の契約は現行では使わない。v3でもこの判断を引き継ぐ。これらを含む旧全文は [`docs/history/aadw-v1/adr/0024-local-gui-validation.md`](../history/aadw-v1/adr/0024-local-gui-validation.md) に保存する。
 
