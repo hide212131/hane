@@ -2466,6 +2466,12 @@ fn resolve_runtime_binary_at_startup(
 /// genuinely unsupported host (non-retryable). With a detected target it means
 /// the stored `manifest.target` differs from the host, which a reinstall
 /// repairs, so it maps to the retryable `VerificationFailed`.
+///
+/// A startup `IntegrityMismatch` is a check of an already-installed runtime,
+/// not of an archive downloaded now, so it also maps to `VerificationFailed`
+/// (the archive-SHA `RuntimeInstallErrorCode::IntegrityMismatch` stays
+/// reserved for the download path). The detailed distribution code is kept in
+/// `runtime_binary_error` / `runtime_distribution_error`.
 fn map_distribution_code_to_install_code(
     code: RuntimeDistributionErrorCode,
     detected_target: Option<&str>,
@@ -2478,11 +2484,9 @@ fn map_distribution_code_to_install_code(
                 RuntimeInstallErrorCode::UnsupportedTarget
             }
         }
-        RuntimeDistributionErrorCode::IntegrityMismatch => {
-            RuntimeInstallErrorCode::IntegrityMismatch
-        }
         RuntimeDistributionErrorCode::AccessDenied => RuntimeInstallErrorCode::PermissionDenied,
         RuntimeDistributionErrorCode::Missing
+        | RuntimeDistributionErrorCode::IntegrityMismatch
         | RuntimeDistributionErrorCode::ExplicitPathNotAbsolute
         | RuntimeDistributionErrorCode::InvalidExecutable
         | RuntimeDistributionErrorCode::InitializeFailed => {
@@ -3267,14 +3271,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_integrity_mismatch_keeps_stable_code_and_is_retryable() {
+    fn startup_integrity_mismatch_is_verification_failed_not_archive_mismatch() {
         for target in [None, Some("aarch64-apple-darwin")] {
             let code = map_distribution_code_to_install_code(
                 RuntimeDistributionErrorCode::IntegrityMismatch,
                 target,
             );
-            assert_eq!(code, RuntimeInstallErrorCode::IntegrityMismatch);
-            assert_eq!(code.stable_code(), "runtime_install_integrity_mismatch");
+            assert_eq!(code, RuntimeInstallErrorCode::VerificationFailed);
+            assert_ne!(code, RuntimeInstallErrorCode::IntegrityMismatch);
             assert!(code.is_retryable());
         }
     }
