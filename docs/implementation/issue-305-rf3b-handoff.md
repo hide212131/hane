@@ -1,44 +1,47 @@
-# Issue #305 implementation handoff
+# Issue #305 実装引き継ぎ
 
-Updated 2026-10-17 from current GitHub state. This commit refreshes handoff evidence only; this document is the only file changed by the refresh. Values below are snapshots at that time and must be distinguished from the live head and status, which the Commander re-reads before each request.
+更新日: 2026-10-17（日本時間）
+対象: hide212131/hane Issue #305
+本書は下記時点のGitHub状態を記録します。実装依頼を出す直前に、main、Issue、PR、head、checks、active AADW runを必ず再取得してください。
 
-## Current state
+## 設計とIssueの状態
 
-- Issue #305 remains open. All five acceptance criteria are unmet.
-- Design PR [#496](https://github.com/hide212131/hane/pull/496) is merged. Its final design head was 14def973e496c39b503c006db21fd187718ad683. CodeRabbit full review completed with no actionable findings. CI run [39002710437](https://github.com/hide212131/hane/actions/runs/39002710437) succeeded; macOS and Windows Rust jobs were skipped because the change was documentation-only.
-- Current main (confirmed 2026-10-17) is 777689ae02d78c90aabbd1af1a9619aea6f89035, five commits ahead of the design reading baseline 2164b895e849eef4de8c80c3696c0fd8e00c496b. The difference is `.github/scripts/verify_claude_model.py` and documentation only (including #509, which is docs-only); there is no product Rust source or test change, so the product source used by the design is unchanged.
-- Implementation PR [#497](https://github.com/hide212131/hane/pull/497) is open/Draft. The head targeted by this refresh is cf4f5e7238622915efd8dcd8085b0febb5decb11 (a point-in-time observation, not a guarantee about the live head). Compared with current main it is ahead 10 / behind 1 with merge base e82b9a9fe42280bfa78497746bcd7e21c73430c5; the one behind commit is the docs-only #509. Its diff is two files: the C01-C08 baseline tests in `crates/ui/src/view/input_routing.rs` and this handoff document. No production implementation has started. The live head and checks must be re-read before each request.
-- Document-refresh run [39022873785](https://github.com/hide212131/hane/actions/runs/39022873785) succeeded for Sonnet 5.5 confirmation, the trusted finalizer, current-head workspace regression tests, and clippy. Earlier exact-head CI (for example run [39020139079](https://github.com/hide212131/hane/actions/runs/39020139079) on the older head 1e7843a) is a past snapshot and is not evidence for the current head. Main's #509 is documentation-only and does not overlap source, tests, or workflows.
-- Review record: [Codex review](https://github.com/hide212131/hane/pull/497#pullrequestreview-5557278651) is a user-designated substitute review. It found no code issues in C01-C08; the stale state in this handoff was its only finding. CodeRabbit hit its rate limit twice and did not perform a full review. Do not confuse the user-designated substitute review with a CodeRabbit review.
-- The earlier production implementation request for PR #497 (run [39020761594](https://github.com/hide212131/hane/actions/runs/39020761594)) was cancelled when a concurrent writer was detected. Patch, finalizer, and verification made no product change. Run [39017012794](https://github.com/hide212131/hane/actions/runs/39017012794) was a diagnostic of the current Claude measurement path that confirmed Sonnet 5.5; it does not retroactively prove the model of older runs.
+Issue #305はopenです。5つの受入条件はすべて未達です。設計PR [#496](https://github.com/hide212131/hane/pull/496) はmerge済み、最終headは `14def973e496c39b503c006db21fd187718ad683`。正本は `docs/refactor-rf3b-short-text-input-implementation-spec.md`。設計を作り直さず、特に§3、§5〜§10を実装契約として使います。
 
-## Parallel PR #495
+current mainは `efb38c2a0167bac8d0dfa512bacd0f85ba21817b`。設計読解基準 `2164b895e849eef4de8c80c3696c0fd8e00c496b` から7 commit進みましたが、変更はAADW用Python verifier/testsと設計・運用文書で、製品Rust source/testの変更はありません。
 
-PR [#495](https://github.com/hide212131/hane/pull/495) is open/ready and unmerged. At the time of this refresh its head is `76d53cbf5b33a51ed91dfa259ced76403064872a`. Compared with current main it is ahead 18 / behind 5 with merge base 2164b895e849eef4de8c80c3696c0fd8e00c496b and changes 13 files. Its diff overlaps this work in `crates/ui/src/actions.rs`, `crates/ui/src/view.rs`, and `crates/ui/src/view/input_routing.rs`. Earlier handoff versions recorded older heads (`c38b9d2...`, `89e2f9d...`); those are superseded.
+## 計測修正と前回の失敗
 
-The normal CI run [39022930215](https://github.com/hide212131/hane/actions/runs/39022930215) for the current head succeeded for the macOS and Windows workspace tests and clippy. Two review threads are resolved, and the older README thread is resolved/outdated. The latest CodeRabbit review submission was made at an earlier head, so do not assume a current-head CodeRabbit review has completed.
+前回の実装run [39024106716](https://github.com/hide212131/hane/actions/runs/39024106716) はClaude workerが成功した後、trusted model verifierが52,504,659 byteの通常ファイルを旧16 MiB上限で拒否しました。modelUsageの正のSonnet 5.5 usageは確認できず、patch/finalizer/verifyは実行されていません。これは製品実装の失敗ではなく計測上限の問題です。旧runのusageは現在も遡及証明できません。
 
-#495 is not merged, so its code is not accepted. Do not import it, do not depend on it, and do not add C09. Until it is accepted, base any implementation on current main only. Re-check its head and merge state before starting implementation. If it is accepted before the #305 cutover is complete, re-read its accepted head and diff, then reassess the overlap before continuing.
+専用運用PR [#514](https://github.com/hide212131/hane/pull/514) は64 MiBの有限上限と実読込上限+1 byteを追加し、symlink/non-regular/missing/malformed/oversized拒否と正のusage確認を維持しました。既存テストを含むcurrent-head CI [39025192853](https://github.com/hide212131/hane/actions/runs/39025192853) と利用者指定Codexレビュー [5557402407](https://github.com/hide212131/hane/pull/514#pullrequestreview-5557402407) の成功後、merge済みです。workerの保護パスguardは変更していません。
 
-## Next implementation entry
+## 実装PR #497
 
-After this document update, the Commander re-reads the PR head, current main, Issue #305, #495, CI/review, and active AADW runs, then decides whether to start the implementation request. The next implementation is a separate AADW request against the new current head of the same PR #497. The adopted spec `docs/refactor-rf3b-short-text-input-implementation-spec.md` is authoritative. Keep C01-C08 passing and proceed with the ShortTextInput model (M01-M15) and the complete filter/rename cutover. If #495 remains unaccepted, use current-main code only and do not carry in its changes; if it has been accepted, re-check it and stop.
+実装先は既存の [PR #497](https://github.com/hide212131/hane/pull/497) を再利用し、新しい製品PRや設計PRを作らないでください。更新前のheadは `6e18caa2eeccb2d69fa2d3c128cbfe5569df053d`、current main比較はahead 11 / behind 3、merge baseは `e82b9a9fe42280bfa78497746bcd7e21c73430c5`。差分は `crates/ui/src/view/input_routing.rs` のC01〜C08基準テストと本書の2 filesだけで、製品実装はありません。handoff更新後のheadは、この値と区別してGitHubから取得してください。
 
-The tests-only step (C01-C08 baseline) is already on the PR branch. The implementation request must not add a synchronized old/new state period. Keep input routing, focus, pending rename, file operations, clipboard integration, rendering bounds, notifications, and list updates with their existing owners. The implementation must remove the duplicate state and helpers.
+head `6e18caa` の通常PR CI [39023602717](https://github.com/hide212131/hane/actions/runs/39023602717) は `action_required` でsuccessではありません。C01〜C08のテストは以前のexact-head AADW検証でsuccessしましたが、現在のhead・新しいmainを検証するものではありません。前述のfailed runも製品patchの検証にはなりません。
 
-The C01-C08 baseline checks, for reference:
+前headの利用者指定Codex review [5557349961](https://github.com/hide212131/hane/pull/497#pullrequestreview-5557349961) はC01〜C08を仕様§6.2・§10.2と照合し、コード指摘なしでした。CodeRabbit full reviewはrate limitで未実施です。今回のhandoff更新後は新headの状態を記録し、実装後の最終候補でcurrent-head reviewを行います。
 
-- C01: same-string replacement and empty deletion preserve the filter scroll reset and rename notification side effects; body content, revision, and history stay unchanged.
-- C02: pending-rename Copy, Cut, Shift-arrows, SelectAll, Home/End, document-edge navigation/selection, Backspace/Delete, and Paste retain the entry-specific behavior in spec section 6.2.
-- C03: both callbacks receiving CRLF are not treated as an empty OS cancel; verify the ordinary result after CR/LF removal.
-- C04: a reversed selection followed by multiple mark updates and Windows-style or macOS-style cancel restores the original text, range, and direction without changing focus or the other input target.
-- C05: filter and rename re-click behavior during composition, plus filter blur, remains unchanged.
-- C06: deletion before a combining sequence or emoji is correct through the rename action route, with body text and file extension unchanged.
-- C07: non-focused filter rendering hides only the painted selection, while the model selection remains; forward and reversed candidate-position queries use the moving end.
-- C08: the late-body-cancel guard covers replace_text_in_range(Some(marked_range), "") and continues to block later non-empty callbacks.
+## 並行PRの扱い
 
-C09 (document-start/end actions on short fields) applies only if #495 is accepted first; do not add it based on the unaccepted branch.
+- [PR #495](https://github.com/hide212131/hane/pull/495) はopen/ready・未merge、head `76d53cbf5b33a51ed91dfa259ced76403064872a`。current main比較はahead 18 / behind 7、merge base `2164b895e849eef4de8c80c3696c0fd8e00c496b`、13 files。変更は `actions.rs`、`view.rs`、`input_routing.rs` 等で重なります。CI [39022930215](https://github.com/hide212131/hane/actions/runs/39022930215) はmacOS/Windows workspace testsとClippyがsuccess。既知のCodeRabbit review threadsはresolvedですが、latest full reviewは現headより古く、current-head review済みとは扱いません。未受入コードを取り込まず、C09を追加せず、#495のmergeを一律の前提にしません。着手直前にも状態を読み直します。受け入れが先行した場合だけ文書端選択のOS別挙動を仕様§6.2で再確認します。
+- [PR #503](https://github.com/hide212131/hane/pull/503) はopen/ready。worker/finalizer後のhead `a3b793f049372c3cc1ec02534e29f520935da86e` のverificationとCIが進行中です。前head `38d6373` に対するCodex reviewには未解決findingがありました。新headでのreview結果を確認し、未mergeコードを#305へ持ち込みません。
+- [PR #501](https://github.com/hide212131/hane/pull/501) はopen/ready。worker/finalizer後のhead `dc577aa9fb569197e86a3a269ab4eda981061c9f` のverificationとCIが進行中です。 `view.rs` / `sidebar.rs` 等が重なるため、未mergeコードを持ち込みません。
 
-## Completion evidence and Issue state
+#495、#501、#503が未mergeのままなら、#305はcurrent mainを基準に実装します。共通化の対象と実際に重なるaction/state/callbackだけを再確認し、無関係なPRを待ったりその変更を取り込んだりしません。
 
-The spec's M01-M15 unit tests, C01-C09 action/callback checks, and G01-G06 native GUI checks are plans, not completed evidence, except that the C01-C08 baseline tests are present and passed in the exact-head CI above. The final implementation must meet the Issue acceptance criteria with current-head CI, review, and focused macOS/Windows GUI evidence. This handoff and the merged design do not close Issue #305.
+## 実装の依頼と境界
+
+現在のworker/finalizerが終了したこととactive writerがないことを、依頼投稿の直前に確認してください。PR #497のcurrent 40桁headを取得し、同じheadに対する重複runがない場合に限り、ConversationへAADW v3の実装依頼を一度投稿します。markerは全て必要です: `@claude`、`AADW_COMMANDER_HANDOFF_V3`、`AADW_ACTION: implement`、current `AADW_TARGET_HEAD`、`AADW_FAILURE_CLASS: initial`、安定したroot cause `issue-305-rf3b-short-text-input-cutover`、原因を示すGitHub evidence。分類を診断目的で流用したり、再送を通すためにroot cause/evidenceを付け替えたりしません。
+
+採用仕様に従い、C01〜C08を維持し、M01〜M15と不足するC回帰を追加しながら一括切替を行います。同期用の新旧状態は作りません。新しい `crates/ui/src/short_text_input.rs` と§8.1の追従範囲を確認し、旧helper/状態の二重管理を撤去します。focus、入力先判定、rename pending・ファイル操作、clipboard、通知、一覧更新、描画boundsは既存所有者に残します。OS取消通知と空文字置換、filter blur、pending中操作、遅延入力guardを一律化しません。永続形式を変更せず、必要性を説明せずに `actions.rs`、`input.rs`、`capture.rs`、session、vendor、Cargo、workflowへ範囲を広げません。
+
+workerはClaude Sonnet 5.5を使い、Read/Edit/Write/Glob/Grepのみで差分を作ります。workerにshell、git、test/build/lint、commit、pushをさせません。Commanderはprepare、Sonnet 5.5とpositive usage確認、patch、trusted finalizer、exact result検証を別々に確認します。失敗・skipped・unknownを成功扱いしません。
+
+## 検証と完了
+
+現headの実装で仕様§10のM01〜M15、C01〜C08（#495受入が先なら条件付きC09）、macOS/WindowsのG01〜G06を確認します。最終候補では `cargo test -p hane-ui --all-features`、`cargo test --workspace --all-features)、`cargo clippy --workspace --all-targets --all-features -- -D warnings)、通常feature/実画面用build、current-head CI/reviewを区別して記録します。G06用の一時差分は隔離検証checkoutだけに置きます。native GUIはIME、候補位置、selection/clipboard、取消、focus、rename待ち中/完了後の入力を両OSで記録し、片OSやunit testを代用にしません。Windowsでshortcutを試す前にKeyhac hookをOFFにし、終わったらONへ戻します。終了時は不要なHaneプロセスだけを閉じます。
+
+Issue #305は、5つの受入条件すべてとrevert手順を確認するまでopenのままです。設計merge、文書更新、AADWの成功だけでIssueを閉じません。
