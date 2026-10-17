@@ -983,48 +983,171 @@ impl EditorView {
 
 /// Asks the OS to move `path` to its Trash / Recycle Bin. Never falls back to
 /// a permanent delete: a failure is reported and the file is left in place.
+///
+/// Success is returned only when the OS operation reports success and the
+/// original path is confirmed gone; the caller emits `FileEvent::Deleted` on
+/// `Ok` only.
 fn move_path_to_trash(path: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("osascript");
-        command
-            .args([
-                "-e",
-                "on run argv",
-                "-e",
-                "tell application \"Finder\" to delete (POSIX file (item 1 of argv) as alias)",
-                "-e",
-                "end run",
-            ])
-            .arg(path);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        use std::os::windows::process::CommandExt;
+    move_path_to_trash_with(path, native_move_to_trash)
+}
 
-        let mut command = Command::new("powershell.exe");
-        command
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$ErrorActionPreference = 'Stop'; \
-                 Add-Type -AssemblyName Microsoft.VisualBasic; \
-                 [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(\
-                 $env:HANE_TRASH_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')",
-            ])
-            .env("HANE_TRASH_PATH", path)
-            .creation_flags(0x0800_0000);
-        command
+/// Runs `operation` and confirms the move: an error, or an `Ok` while the
+/// original path still exists, is reported as a failure.
+fn move_path_to_trash_with(
+    path: &Path,
+    operation: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    operation(path)?;
+    if path.symlink_metadata().is_ok() {
+        return Err(std::io::Error::other(
+            "ゴミ箱への移動を確認できませんでした（元のファイルが残っています）",
+        ));
+    }
+    Ok(())
+}
+
+/// macOS: `NSFileManager trashItemAtURL:resultingItemURL:error:`, without
+/// Finder / Apple Events. `NO` or a missing resulting URL is an error.
+#[cfg(target_os = "macos")]
+fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
+    use objc::runtime::{BOOL, NO, Object};
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {}
+
+    const NS_UTF8_STRING_ENCODING: usize = 4;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: plain Objective-C message sends to Foundation classes with
+    // correctly typed arguments; every object created here is released (or
+    // owned by the pool drained) before returning.
+    unsafe {
+        let pool: *mut Object = msg_send![class!(NSAutoreleasePool), new];
+        let result = (|| {
+            let string: *mut Object = msg_send![class!(NSString), alloc];
+            let string: *mut Object = msg_send![
+                string,
+                initWithBytes: bytes.as_ptr()
+                length: bytes.len()
+                encoding: NS_UTF8_STRING_ENCODING
+            ];
+            if string.is_null() {
+                return Err(std::io::Error::other("パスをNSStringに変換できません"));
+            }
+            let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: string];
+            let _: () = msg_send![string, release];
+            if url.is_null() {
+                return Err(std::io::Error::other("パスをNSURLに変換できません"));
+            }
+            let manager: *mut Object = msg_send![class!(NSFileManager), defaultManager];
+            let mut resulting: *mut Object = std::ptr::null_mut();
+            let mut error: *mut Object = std::ptr::null_mut();
+            let moved: BOOL = msg_send![
+                manager,
+                trashItemAtURL: url
+                resultingItemURL: &mut resulting as *mut *mut Object
+                error: &mut error as *mut *mut Object
+            ];
+            if moved == NO || resulting.is_null() {
+                let message = if error.is_null() {
+                    "ゴミ箱への移動に失敗しました".to_owned()
+                } else {
+                    let description: *mut Object = msg_send![error, localizedDescription];
+                    let utf8: *const std::os::raw::c_char = if description.is_null() {
+                        std::ptr::null()
+                    } else {
+                        msg_send![description, UTF8String]
+                    };
+                    if utf8.is_null() {
+                        "ゴミ箱への移動に失敗しました".to_owned()
+                    } else {
+                        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(std::io::Error::other(message));
+            }
+            Ok(())
+        })();
+        let _: () = msg_send![pool, drain];
+        result
+    }
+}
+
+/// Windows: `IFileOperation` with `FOFX_RECYCLEONDELETE`. API errors and an
+/// aborted operation are errors; there is no permanent-delete fallback.
+#[cfg(target_os = "windows")]
+fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+        CoInitializeEx, CoUninitialize,
     };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = {
-        let mut command = Command::new("gio");
-        command.arg("trash").arg("--").arg(path);
-        command
+    use windows::Win32::UI::Shell::{
+        FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
+        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
     };
-    let output = command.output()?;
+    use windows::core::HSTRING;
+
+    fn to_io(error: windows::core::Error) -> std::io::Error {
+        std::io::Error::other(error.to_string())
+    }
+
+    fn recycle(path: &Path) -> std::io::Result<()> {
+        // SAFETY: COM calls on an initialized apartment; all interface
+        // pointers are owned by the `windows` crate wrappers.
+        unsafe {
+            let operation: IFileOperation =
+                CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(to_io)?;
+            operation
+                .SetOperationFlags(
+                    FOF_ALLOWUNDO
+                        | FOF_NOERRORUI
+                        | FOF_SILENT
+                        | FOFX_EARLYFAILURE
+                        | FOFX_RECYCLEONDELETE,
+                )
+                .map_err(to_io)?;
+            let item: IShellItem =
+                SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)
+                    .map_err(to_io)?;
+            operation.DeleteItem(&item, None).map_err(to_io)?;
+            operation.PerformOperations().map_err(to_io)?;
+            if operation.GetAnyOperationsAborted().map_err(to_io)?.as_bool() {
+                return Err(std::io::Error::other(
+                    "ごみ箱への移動が中断されました",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    // SAFETY: balanced with `CoUninitialize` below when initialization
+    // succeeded; a mode conflict means COM is already usable on this thread.
+    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    let initialized = if init.is_ok() {
+        true
+    } else if init == RPC_E_CHANGED_MODE {
+        false
+    } else {
+        return Err(std::io::Error::other(init.message()));
+    };
+    let result = recycle(path);
+    if initialized {
+        // SAFETY: matches the successful `CoInitializeEx` above.
+        unsafe { CoUninitialize() };
+    }
+    result
+}
+
+/// Linux and others: `gio trash`.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
+    let output = Command::new("gio")
+        .arg("trash")
+        .arg("--")
+        .arg(path)
+        .output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1149,6 +1272,33 @@ fn draft_preview(session: &DocumentSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trash_reports_os_operation_error() {
+        let path = std::env::temp_dir();
+        let result = move_path_to_trash_with(&path, |_| Err(std::io::Error::other("denied")));
+        assert!(result.is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn trash_rejects_ok_when_original_path_remains() {
+        let path = std::env::temp_dir();
+        let result = move_path_to_trash_with(&path, |_| Ok(()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trash_succeeds_only_when_original_path_is_gone() {
+        let path = std::env::temp_dir().join("hane-trash-confirm-never-created");
+        assert!(move_path_to_trash_with(&path, |_| Ok(())).is_ok());
+    }
+
+    #[test]
+    fn trash_of_missing_path_is_an_error() {
+        let path = std::env::temp_dir().join("hane-trash-missing-never-created");
+        assert!(move_path_to_trash(&path).is_err());
+    }
 
     fn relative_luminance(color: u32) -> f32 {
         fn linear_channel(channel: u32) -> f32 {
