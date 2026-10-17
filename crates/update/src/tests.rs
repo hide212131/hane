@@ -1624,6 +1624,29 @@ fn preconditions_stop_on_modified_or_foreign_files() {
     );
 }
 
+#[test]
+fn preconditions_verify_owned_files_that_the_update_does_not_replace() {
+    let world = world();
+    assert!(
+        world.plan.unchanged.iter().any(|f| f.rel_path == "README.md"),
+        "README.md is owned and unchanged"
+    );
+    check_plan_preconditions(&world.plan, &world.old_disk()).unwrap();
+
+    let mut modified = world.old_disk();
+    modified.set("README.md", b"edited by someone");
+    assert_eq!(
+        code(check_plan_preconditions(&world.plan, &modified)),
+        ErrorCode::InstallModified
+    );
+    let mut missing = world.old_disk();
+    missing.remove("README.md");
+    assert_eq!(
+        code(check_plan_preconditions(&world.plan, &missing)),
+        ErrorCode::InstallModified
+    );
+}
+
 // ------------------------------------------------------ U-12 journal
 
 fn journal(world: &World) -> UpdateJournal {

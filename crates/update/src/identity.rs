@@ -339,6 +339,17 @@ pub struct ApplyPlan {
     pub source: ReleaseIdentity,
     pub destination: ReleaseIdentity,
     pub steps: Vec<PlanStep>,
+    /// Old-inventory-owned files the update does not touch. They are only
+    /// verified (hash and size) before the update starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchanged: Vec<UnchangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnchangedFile {
+    pub rel_path: String,
+    pub identity: FileIdentity,
 }
 
 impl ApplyPlan {
@@ -445,12 +456,22 @@ impl ApplyPlan {
         steps.sort_by(|a, b| {
             (a.rel_path == "hane.exe", &a.rel_path).cmp(&(b.rel_path == "hane.exe", &b.rel_path))
         });
+        let stepped: BTreeSet<&str> = steps.iter().map(|s| s.rel_path.as_str()).collect();
+        let unchanged = old_files
+            .iter()
+            .filter(|(path, _)| !stepped.contains(path.as_str()))
+            .map(|(path, identity)| UnchangedFile {
+                rel_path: path.clone(),
+                identity: identity.clone(),
+            })
+            .collect();
         Ok(Self {
             install_id,
             transaction_id,
             source: ReleaseIdentity::from_inventory(old),
             destination: ReleaseIdentity::from_candidate(candidate),
             steps,
+            unchanged,
         })
     }
 

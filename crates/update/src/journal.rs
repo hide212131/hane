@@ -397,6 +397,15 @@ pub fn check_plan_preconditions(plan: &ApplyPlan, disk: &dyn DiskView) -> Result
             ));
         }
     }
+    for file in &plan.unchanged {
+        let observed = disk.observe(&file.rel_path)?;
+        if !identity_matches(&observed, &Some(file.identity.clone())) {
+            return Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} is not in its installed state", file.rel_path),
+            ));
+        }
+    }
     Ok(())
 }
 
