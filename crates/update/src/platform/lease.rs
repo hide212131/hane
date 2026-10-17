@@ -370,6 +370,7 @@ mod tests {
             let err = coord.try_acquire(kind, &[&runtime]).unwrap_err();
             assert_eq!(err.code, ErrorCode::TransitionInvalid);
         }
+        drop(runtime);
         let txn = coord.try_acquire(LeaseKind::Transaction, &[]).unwrap().unwrap();
         let startup = coord.try_acquire(LeaseKind::Startup, &[&txn]).unwrap().unwrap();
         assert!(coord.try_acquire(LeaseKind::Startup, &[&startup]).is_err());
@@ -427,7 +428,8 @@ mod tests {
             .try_acquire(LeaseKind::RuntimeShared, &[])
             .unwrap()
             .expect("child lease");
-        println!("HELD");
+        // The test harness may have written its own prefix on this line.
+        println!("\nHELD");
         let _ = io::stdout().flush();
         let mut sink = Vec::new();
         let _ = io::stdin().read_to_end(&mut sink);
@@ -445,12 +447,21 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        loop {
-            let line = lines.next().expect("child output").unwrap();
-            if line.trim() == "HELD" {
-                break;
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if line.trim() == "HELD" {
+                    let _ = tx.send(());
+                    break;
+                }
             }
+        });
+        if rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child never reported that it holds the lease");
         }
         assert!(
             coord
