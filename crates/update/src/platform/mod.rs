@@ -135,8 +135,7 @@ pub fn installed_helper(
     placement: &Placement,
     policy: &crate::trust::TrustPolicy,
 ) -> Result<HelperSource> {
-    let _ = policy;
-    macos::installed_helper(placement)
+    macos::installed_helper(placement, policy)
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]

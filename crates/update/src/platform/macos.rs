@@ -21,6 +21,7 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{hash_regular_file, read_limited};
 use crate::identity::{FileIdentity, InstallFacts, InstallId};
 use crate::model::{MACOS_BUNDLE_ID, Target};
+use crate::trust::TrustPolicy;
 
 const CODESIGN: &str = "/usr/bin/codesign";
 const MAIN_EXECUTABLE: &str = "hane";
@@ -124,21 +125,31 @@ fn valid_team_id(team_id: &str) -> bool {
     team_id.len() == 10 && team_id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-/// Asks the OS to verify the bundle against the Developer ID requirement (and
-/// the Team ID when one is known).
-pub fn verify_developer_id(bundle: &Path, team_id: Option<&str>) -> Result<()> {
-    let mut requirement = String::from(
-        "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
-         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
-    );
-    if let Some(team_id) = team_id {
-        if !valid_team_id(team_id) {
-            return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed Team ID"));
-        }
-        requirement.push_str(&format!(" and certificate leaf[subject.OU] = \"{team_id}\""));
+/// The pinned Team ID, or `TrustUnconfigured` when this build embeds none.
+/// There is deliberately no fallback to "any Developer ID".
+fn required_team_id(policy: &TrustPolicy) -> Result<&str> {
+    policy.macos_team_id().ok_or_else(|| {
+        UpdateError::new(
+            ErrorCode::TrustUnconfigured,
+            "no macOS Team ID is embedded in this build",
+        )
+    })
+}
+
+/// Asks the OS to verify the complete bundle against the Developer ID
+/// requirement pinned to exactly `team_id` (leaf certificate OU).
+pub fn verify_developer_id(bundle: &Path, team_id: &str) -> Result<()> {
+    if !valid_team_id(team_id) {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed Team ID"));
     }
+    let requirement = format!(
+        "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU] = \"{team_id}\""
+    );
     let status = Command::new(CODESIGN)
         .arg("--verify")
+        .arg("--deep")
         .arg("--strict")
         .arg(format!("--test-requirement={requirement}"))
         .arg(bundle)
@@ -156,9 +167,12 @@ pub fn verify_developer_id(bundle: &Path, team_id: Option<&str>) -> Result<()> {
     }
 }
 
-/// The helper inside the sealed bundle, accepted only if the bundle verifies.
-pub fn installed_helper(placement: &Placement) -> Result<HelperSource> {
-    verify_developer_id(&placement.install_root, None)?;
+/// The helper inside the sealed bundle, accepted only if the bundle verifies
+/// against the pinned Team ID. A build without one provides no helper recovery
+/// (intended fail-closed behavior).
+pub fn installed_helper(placement: &Placement, policy: &TrustPolicy) -> Result<HelperSource> {
+    let team_id = required_team_id(policy)?;
+    verify_developer_id(&placement.install_root, team_id)?;
     let path = placement
         .install_root
         .join("Contents")
@@ -192,7 +206,17 @@ mod tests {
         assert!(valid_team_id("ABCDE12345"));
         assert!(!valid_team_id("abcde12345"));
         assert!(!valid_team_id("ABCDE\"1234"));
-        assert!(verify_developer_id(Path::new("/nonexistent"), Some("bad")).is_err());
+        let err = verify_developer_id(Path::new("/nonexistent"), "bad").unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+    }
+
+    #[test]
+    fn a_missing_team_id_is_rejected_before_any_os_command() {
+        let policy = TrustPolicy::new(Vec::new(), None);
+        let err = required_team_id(&policy).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TrustUnconfigured);
+        let policy = TrustPolicy::new(Vec::new(), Some("ABCDE12345".to_owned()));
+        assert_eq!(required_team_id(&policy).unwrap(), "ABCDE12345");
     }
 
     #[test]
