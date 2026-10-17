@@ -1973,6 +1973,31 @@ fn fs_disk_view_observes_identity_without_following_links() {
     }
 }
 
+/// Needs permission to create directory symlinks: always available on Unix;
+/// on Windows it requires Developer Mode or elevation, so the test is skipped
+/// there when creation fails (junction/reparse handling is then unverified).
+#[test]
+fn fs_disk_view_rejects_linked_ancestor_directories() {
+    let dir = TempDir::new("disk-link-root");
+    let outside = TempDir::new("disk-link-outside");
+    fs::create_dir(outside.path().join("shell-integration")).unwrap();
+    fs::write(outside.path().join("shell-integration").join("file.bin"), b"content").unwrap();
+    let link = dir.path().join("linked");
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(outside.path().join("shell-integration"), &link).is_ok();
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_dir(outside.path().join("shell-integration"), &link).is_ok();
+    #[cfg(not(any(unix, windows)))]
+    let created = false;
+    if !created {
+        eprintln!("skipped: directory symlinks cannot be created in this environment");
+        return;
+    }
+    let view = FsDiskView::new(dir.path());
+    assert!(view.observe("linked/file.bin").is_err());
+    assert_eq!(code(view.observe("linked/file.bin")), ErrorCode::InstallModified);
+}
+
 // ------------------------------------------------------ U-12 recovery
 
 fn decide(world: &World, journal: &UpdateJournal, disk: &dyn DiskView) -> RecoveryDecision {

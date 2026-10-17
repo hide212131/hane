@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::fsutil::{durable_write, hash_regular_file, read_limited};
+use crate::fsutil::{durable_write, hash_regular_file_under, read_limited};
 use crate::identity::{ApplyPlan, FileIdentity, InstallId, ReleaseIdentity, TransactionId};
 use crate::limits::{MAX_ENTRIES, MAX_JOURNAL_BYTES};
 use crate::paths::validate_rel_path;
@@ -366,11 +366,8 @@ impl FsDiskView {
 impl DiskView for FsDiskView {
     fn observe(&self, rel_path: &str) -> Result<Observed> {
         validate_rel_path(rel_path)?;
-        let mut path = self.root.clone();
-        for part in rel_path.split('/') {
-            path.push(part);
-        }
-        Ok(match hash_regular_file(&path)? {
+        let components: Vec<&str> = rel_path.split('/').collect();
+        Ok(match hash_regular_file_under(&self.root, &components)? {
             None => Observed::Missing,
             Some((size, sha256)) => Observed::File(FileIdentity { size, sha256 }),
         })

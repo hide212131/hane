@@ -88,6 +88,51 @@ pub fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
     Ok(Some(data))
 }
 
+/// True for symlinks and, on Windows, any reparse point (junctions included).
+fn is_link_like(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Hashes the regular file at `root/<components>`. Every component below
+/// `root` must be a real directory (the last one a regular file); a symlink or
+/// reparse point anywhere on the way is rejected without being followed.
+/// `root` itself is the configured install root and is used as given.
+pub fn hash_regular_file_under(root: &Path, components: &[&str]) -> Result<Option<(u64, String)>> {
+    let mut path = root.to_path_buf();
+    for (index, part) in components.iter().enumerate() {
+        path.push(part);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        if is_link_like(&meta) {
+            return Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} is a link", path.display()),
+            ));
+        }
+        if index + 1 < components.len() && !meta.is_dir() {
+            return Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} is not a directory", path.display()),
+            ));
+        }
+    }
+    hash_regular_file(&path)
+}
+
 /// SHA-256 and size of a regular file, never following a symlink.
 pub fn hash_regular_file(path: &Path) -> Result<Option<(u64, String)>> {
     let meta = match fs::symlink_metadata(path) {
@@ -95,7 +140,7 @@ pub fn hash_regular_file(path: &Path) -> Result<Option<(u64, String)>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    if !meta.is_file() {
+    if is_link_like(&meta) || !meta.is_file() {
         return Err(UpdateError::new(
             ErrorCode::InstallModified,
             format!("{} is not a regular file", path.display()),
