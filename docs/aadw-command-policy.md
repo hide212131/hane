@@ -178,7 +178,7 @@ infrastructure failure など product code の問題と判断できない場合�
 
 対象は最終候補のcurrent-head full reviewだけとする。CodeRabbitが明示的にskip/errorを返した場合、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または `@coderabbitai full review` の依頼から20分以内に対象headの完了を確認できない場合、Commanderは同じPR・current headに対して `@codex review` を一度だけ要求できる。CodeRabbitのレビューにfindingがあること自体はfallback理由にしない。レビュー前にopen・non-draft・same-repositoryのPR、current head、current-head CI成功を再確認し、対象repositoryがCodex Code Reviewに接続・有効化され、依頼するGitHubアカウントから使えることを確認する。Actionsや別のbotから代行コメントを投稿しない。
 
-Codexの👀 reactionだけでは完了としない。GitHub上にCodexのsubmitted reviewがあり、そのreviewのcommitが依頼対象のcurrent headと一致し、レビュー完了を確認できることを要求する。結果を読む直前にheadとbase contextを再取得する。headが変わった結果は使わず、baseが主張へ影響する場合はcurrent baseに対するfresh evidenceを取り直す。Codexレビューが完了しない、投稿者・対象head・範囲が確認できない場合はレビュー不足のまま停止する。同じheadでfallbackを繰り返さない。
+Codexの👀 reactionだけでは完了としない。GitHub上のCodex Review Summaryで `status=completed` と対象commit SHAを確認し、そのSHAが依頼対象のcurrent headと一致することを要求する。指摘がある場合は対応するsubmitted reviewとreview commentsを取得する。指摘なしの場合はSummaryのno-findings状態を確認する。結果を読む直前にheadとbase contextを再取得する。headが変わった結果は使わず、baseが主張へ影響する場合はcurrent baseに対するfresh evidenceを取り直す。Codexレビューが完了しない、投稿者・対象head・範囲が確認できない場合はレビュー不足のまま停止する。同じheadでfallbackを繰り返さない。
 
 CodexのGitHub Code ReviewはP0/P1の重大な問題に絞って指摘する。したがってCodexの完了は「CodeRabbitと同範囲の全指摘なし」を意味しない。CodeRabbitが後から同じcurrent contextのfull reviewを完了した場合、その結果も別のevidenceとして確認する。Codex fallbackはCI、必要なGUI、未解決review、Issueの受入条件を免除せず、修正や次工程の判断、mergeも行わない。
 

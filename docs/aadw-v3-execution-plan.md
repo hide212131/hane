@@ -36,7 +36,7 @@ App導入、対象repository、契約、投稿actorの受理、レビュー専�
 
 依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。最終候補では、current headを対象にしたfull reviewが完了していること、reviewed rangeがcurrent headを含むこと、non-outdated unresolved findingsが受入を妨げないこと、current-head CIが成功していることを確認する。`Full review triggered`だけでは合格にしない。対象不明や無応答を合格にしない。Automatic Review / Automatic Incremental Review以外の自動修正、CI修正、競合修正、テスト生成、merge委譲は通常経路にしない。V3-3 / Issue #360でfull/incremental reviewの実runを確認済みであり、Issue #373でAutomatic + Incrementalを有効化した。Codexレビューを常時二重実行しない。
 
-最終CodeRabbit reviewがterminal skip/errorとなる、対象head・範囲・重要ファイルの網羅を確認できない、または明示依頼から20分以内にcurrent-headの完了を確認できない場合は、同じPR・headに `@codex review` を一度要求できる。Codex reviewはsubmitted reviewと対象commit IDを確認し、current head/baseと一致した結果だけを採用する。CodexのGitHub reviewはP0/P1の重大指摘を対象とするため、CodeRabbitと同じ範囲のfindingがない証明とは扱わない。Codexも完了しない場合はレビュー不足として停止する。通常レビューの役割はCodeRabbitに維持し、追加workflow・status・tokenは作らない。
+最終CodeRabbit reviewがterminal skip/errorとなる、対象head・範囲・重要ファイルの網羅を確認できない、または明示依頼から20分以内にcurrent-headの完了を確認できない場合は、同じPR・headに `@codex review` を一度要求できる。Codex Review Summaryの完了状態と対象commit SHAを確認し、指摘がある場合はsubmitted reviewとreview commentsも取得する。current head/baseと一致した結果だけを採用する。CodexのGitHub reviewはP0/P1の重大指摘を対象とするため、CodeRabbitと同じ範囲のfindingがない証明とは扱わない。Codexも完了しない場合はレビュー不足として停止する。通常レビューの役割はCodeRabbitに維持し、追加workflow・status・tokenは作らない。
 
 ### GUI
 
@@ -73,7 +73,7 @@ Actions内から次のActionsへ送る場合は`GITHUB_TOKEN`のイベント制�
 | T09 | head/base/candidate/受入条件/設定版の変更 | 応答待ち中の変化を含め、古い判断と証拠を適用しない |
 | T10 | 禁止パス、ログ中の誘導、テスト弱体化 | 許可範囲と秘密情報の分離を維持し、弱い検証で成功を作らない |
 | T11 | CodeRabbitのfull/incremental | 実際の対象head・範囲・完了を確認し、増分を全体と偽らない |
-| T12 | CodeRabbit未導入/無応答/除外/エラー/対象範囲不明 | 指摘ゼロと区別し、skip/error、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または20分無応答時に同じcurrent headへ一度だけ `@codex review` を依頼する。submitted reviewとcommit ID、CodexのP0/P1限定範囲を確認し、Codexも完了しなければ停止する |
+| T12 | CodeRabbit未導入/無応答/除外/エラー/対象範囲不明 | 指摘ゼロと区別し、skip/error、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または20分無応答時に同じcurrent headへ一度だけ `@codex review` を依頼する。Review Summaryの完了状態とcommit IDを確認し、指摘がある場合はsubmitted reviewも取得する。CodexのP0/P1限定範囲を確認し、Codexも完了しなければ停止する |
 | T13 | GUI head/mergeの起動 | 権限・current context・merge parents・procedure・run/artifactを確認する |
 | T14 | GUI scenario未対応/OS違い/起動撮影だけ | 未検証の操作・OSを合格へ拡張せず、適切な別経路を選ぶ |
 | T15 | GUI fail/blocked/unknown/古い証拠/画像欠落 | 製品・環境・証拠不足を分け、必要な証拠がなければmergeしない |
