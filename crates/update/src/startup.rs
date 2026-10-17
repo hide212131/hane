@@ -625,11 +625,11 @@ mod tests {
         let dir = TempDir::new("gate-multi-version");
         let placement = placement(&dir);
         let coord = placement.coordination().unwrap();
-        // v1 -> v2 committed, then v2 -> v3 committed; the disk is at v3.
-        write_versioned(&coord, &TransactionId::generate().unwrap(), ("v1", "v2"), Phase::Committed, 0);
+        // 1.0.0 -> 2.0.0 committed, then 2.0.0 -> 3.0.0 committed; the disk is at 3.0.0.
+        write_versioned(&coord, &TransactionId::generate().unwrap(), ("1.0.0", "2.0.0"), Phase::Committed, 0);
         let newest = TransactionId::generate().unwrap();
-        write_versioned(&coord, &newest, ("v2", "v3"), Phase::Committed, 10);
-        fs::write(placement.install_root.join("a.dll"), b"v3").unwrap();
+        write_versioned(&coord, &newest, ("2.0.0", "3.0.0"), Phase::Committed, 10);
+        fs::write(placement.install_root.join("a.dll"), b"3.0.0").unwrap();
         let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
         assert!(matches!(
             startup_gate(&placement, &runner, Duration::from_millis(50)),
@@ -637,8 +637,8 @@ mod tests {
         ));
         assert_eq!(runner.calls.get(), 0);
 
-        // The newest receipt still gates: a disk that is not at v3 stops.
-        fs::write(placement.install_root.join("a.dll"), b"v2").unwrap();
+        // The newest receipt still gates: a disk that is not at 3.0.0 stops.
+        fs::write(placement.install_root.join("a.dll"), b"2.0.0").unwrap();
         assert!(matches!(
             startup_gate(&placement, &runner, Duration::from_millis(50)),
             GateOutcome::RecoveryRequired(_)
@@ -651,9 +651,9 @@ mod tests {
         let dir = TempDir::new("gate-unordered");
         let placement = placement(&dir);
         let coord = placement.coordination().unwrap();
-        write_versioned(&coord, &TransactionId::generate().unwrap(), ("v1", "v2"), Phase::Committed, 5);
-        write_versioned(&coord, &TransactionId::generate().unwrap(), ("v2", "v3"), Phase::Committed, 5);
-        fs::write(placement.install_root.join("a.dll"), b"v3").unwrap();
+        write_versioned(&coord, &TransactionId::generate().unwrap(), ("1.0.0", "2.0.0"), Phase::Committed, 5);
+        write_versioned(&coord, &TransactionId::generate().unwrap(), ("2.0.0", "3.0.0"), Phase::Committed, 5);
+        fs::write(placement.install_root.join("a.dll"), b"3.0.0").unwrap();
         let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
         assert!(matches!(
             startup_gate(&placement, &runner, Duration::from_millis(50)),
@@ -663,21 +663,21 @@ mod tests {
 
     #[test]
     fn a_pending_transaction_beside_an_older_receipt_is_recovered_first() {
-        // v1 -> v2 committed (disk at v2), then v2 -> v3 was cut short while
+        // 1.0.0 -> 2.0.0 committed (disk at 2.0.0), then 2.0.0 -> 3.0.0 was cut short while
         // applying: the older receipt must not hide or pre-empt the recovery.
         for settle in [true, false] {
             let dir = TempDir::new("gate-pending-after-commit");
             let placement = placement(&dir);
             let coord = placement.coordination().unwrap();
-            write_versioned(&coord, &TransactionId::generate().unwrap(), ("v1", "v2"), Phase::Committed, 0);
+            write_versioned(&coord, &TransactionId::generate().unwrap(), ("1.0.0", "2.0.0"), Phase::Committed, 0);
             let pending = TransactionId::generate().unwrap();
-            write_versioned(&coord, &pending, ("v2", "v3"), Phase::Applying, 10);
+            write_versioned(&coord, &pending, ("2.0.0", "3.0.0"), Phase::Applying, 10);
             // Mid-apply the disk matches neither receipt's committed state.
-            fs::write(placement.install_root.join("a.dll"), b"v3").unwrap();
+            fs::write(placement.install_root.join("a.dll"), b"3.0.0").unwrap();
             let runner = Runner::new(settle, Ok(RecoveryReport::RolledBack));
             if settle {
-                // The rollback restores v2, the older receipt's version.
-                fs::write(placement.install_root.join("a.dll"), b"v2").unwrap();
+                // The rollback restores 2.0.0, the older receipt's version.
+                fs::write(placement.install_root.join("a.dll"), b"2.0.0").unwrap();
             }
             let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
             assert_eq!(runner.calls.get(), 1, "settle={settle}: pending journal reached recovery");
@@ -695,11 +695,11 @@ mod tests {
         let placement = placement(&dir);
         let coord = placement.coordination().unwrap();
         let old_committed = TransactionId::generate().unwrap();
-        write_versioned(&coord, &old_committed, ("v1", "v2"), Phase::Committed, 0);
+        write_versioned(&coord, &old_committed, ("1.0.0", "2.0.0"), Phase::Committed, 0);
         let other_pending = TransactionId::generate().unwrap();
-        write_versioned(&coord, &other_pending, ("v2", "v3"), Phase::Applying, 5);
+        write_versioned(&coord, &other_pending, ("2.0.0", "3.0.0"), Phase::Applying, 5);
         let current = TransactionId::generate().unwrap();
-        write_versioned(&coord, &current, ("v2", "v3"), Phase::Applying, 10);
+        write_versioned(&coord, &current, ("2.0.0", "3.0.0"), Phase::Applying, 10);
 
         prune_superseded_receipts(&coord, &current);
         assert!(!coord.transaction_dir(&old_committed).exists());
