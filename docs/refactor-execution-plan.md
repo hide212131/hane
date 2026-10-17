@@ -32,7 +32,7 @@
 | RF2-B | [#302](https://github.com/hide212131/hane/issues/302) | presentationの機械的分割 | #298と#300の当該領域。公開APIを維持。 |
 | RF2-C | [#303](https://github.com/hide212131/hane/issues/303) | Markdownの機械的分割 | #298と#300の当該領域。公開APIを維持。 |
 | RF3-A | [#304](https://github.com/hide212131/hane/issues/304) | 本文/filter/renameの入力先判定 | #301の入力境界と#298の操作契約 |
-| RF3-B | [#305](https://github.com/hide212131/hane/issues/305) | 短い入力欄の文字列・selection操作 | #301/#304の受入済み境界 |
+| RF3-B | [#305](https://github.com/hide212131/hane/issues/305) | 短い入力欄の文字列・selection操作（[実装仕様](refactor-rf3b-short-text-input-implementation-spec.md)） | #301/#304の受入済み境界 |
 | RF4 | [#306](https://github.com/hide212131/hane/issues/306) | snapshot、解析/projection経路、引数、fallback | #301/#302/#303の該当分割、第3節の競合確認 |
 | RF5-A | [#307](https://github.com/hide212131/hane/issues/307) | BlockLayoutを正とするgeometry接続 | #306、関連するRF3/RF6の接続、第3節 |
 | RF5-B | [#368](https://github.com/hide212131/hane/issues/368) | cache/高さ索引/background jobの所有者と寿命 | #301/#302/#306、#309の文書切替境界、#23の基準。#307と競合させない。 |
