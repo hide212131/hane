@@ -1266,7 +1266,8 @@ mod tests {
         fixture.service.download(&id);
         assert_eq!(fixture.queue.lock().unwrap().len(), 1);
         assert_eq!(fixture.requests(), requests);
-        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+        // The removal is queued, so the UI sees the busy Discarding phase.
+        assert_eq!(fixture.phase(), AppUpdatePhase::Discarding);
 
         run_queued(&fixture.queue);
         assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
