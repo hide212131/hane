@@ -3998,7 +3998,7 @@ impl EditorView {
         let shaper = WindowShaper::new(window, self.zoom);
         let page = (self.viewport_height - self.line_height()).max(self.line_height());
         let start_top = self
-            .source_offset_row_bounds(self.editor().selection().active)
+            .resolved_row_bounds(self.editor().selection().active, &shaper)
             .map(|(top, _)| top);
         let mut moved = false;
         for _ in 0..MAX_PAGE_ROWS {
@@ -4023,10 +4023,19 @@ impl EditorView {
             }
             moved = true;
             let travelled = start_top
-                .zip(self.source_offset_row_bounds(after))
+                .zip(self.resolved_row_bounds(after, &shaper))
                 .map(|(start, (top, _))| (top - start).abs());
             if travelled.is_some_and(|travelled| travelled >= page) {
                 break;
+            }
+        }
+        // A plain page move never leaves a selection behind, also when the
+        // document edge left nowhere to go: the next input must not replace it.
+        let selection = self.editor().selection();
+        if !extend && selection.anchor != selection.active {
+            let caret = Selection::caret(selection.active);
+            if let Err(error) = self.editor_mut().set_selection(caret) {
+                self.report_error("page move", error);
             }
         }
         self.after_input(cx);
@@ -4043,7 +4052,11 @@ impl EditorView {
             self.viewport_height,
         );
         self.scroll_inertia = None;
+        // The explicit scroll owns the position. A reveal or zoom anchor armed
+        // earlier would otherwise overwrite it on the next layout pass.
         self.pending_caret_visibility_after_layout = false;
+        self.pending_find_visibility_after_layout = false;
+        self.pending_zoom_anchor = None;
         cx.notify();
     }
 
@@ -4066,8 +4079,9 @@ impl EditorView {
 
     /// Scrolls so the caret's row sits in the vertical middle of the viewport,
     /// clamped to the document's scroll range. Caret and selection unchanged.
-    pub(crate) fn center_cursor_line(&mut self, cx: &mut Context<Self>) {
-        let Some((top, height)) = self.source_offset_row_bounds(self.editor().selection().active)
+    pub(crate) fn center_cursor_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shaper = WindowShaper::new(window, self.zoom);
+        let Some((top, height)) = self.resolved_row_bounds(self.editor().selection().active, &shaper)
         else {
             return;
         };
@@ -4260,9 +4274,52 @@ impl EditorView {
         );
     }
 
+    /// Content-space `(top, height)` of the row holding `offset` from the real
+    /// layout: the cached one when current, otherwise one resolved now with
+    /// `layout_around` (a temporary value, not stored). Wrapped paragraphs whose
+    /// layout was evicted therefore still give the true wrapped row, which the
+    /// physical-line estimate of `source_offset_row_bounds` cannot. Falls back to
+    /// that estimate only when no layout can be resolved.
+    fn resolved_row_bounds(
+        &self,
+        offset: SourceOffset,
+        shaper: &dyn LineShaper,
+    ) -> Option<(f32, f32)> {
+        self.layout_row_bounds(offset, shaper)
+            .or_else(|| self.source_offset_row_bounds(offset))
+    }
+
+    fn layout_row_bounds(
+        &self,
+        offset: SourceOffset,
+        shaper: &dyn LineShaper,
+    ) -> Option<(f32, f32)> {
+        let (_, layout) = self.layout_around(offset, shaper)?;
+        match self.granularity {
+            Granularity::Lines => {
+                let line = self.editor().document().line_for_offset(offset).ok()?;
+                let line_top = self.heights.prefix_sum(line.0);
+                let row = layout.lines.get(layout.row_for_source(offset)?)?;
+                let line_row_top = layout
+                    .lines
+                    .iter()
+                    .find(|candidate| candidate.line == row.line)
+                    .map(|candidate| candidate.y)?;
+                Some((line_top + row.y - line_row_top, row.height))
+            }
+            Granularity::Blocks => {
+                let block = self.current_index()?.block_at(offset)?;
+                let block_top = self.heights.prefix_sum(block.ordinal);
+                let (y, height) = layout.row_bounds_for_source(offset)?;
+                Some((block_top + y, height))
+            }
+        }
+    }
+
     /// Content-space `(top, height)` of the row holding `offset`, from the
     /// drawn layout when it is current and from the physical line otherwise.
-    /// Shared by caret-follow, page moves and centering the caret line.
+    /// Shared by caret-follow; page moves and centering use
+    /// `resolved_row_bounds`.
     fn source_offset_row_bounds(&self, offset: SourceOffset) -> Option<(f32, f32)> {
         let editor = self.sessions.active().editor();
         let line = editor.document().line_for_offset(offset).ok()?;

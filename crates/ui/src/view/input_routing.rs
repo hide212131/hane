@@ -24,9 +24,10 @@ impl EditorView {
     /// (content search, document find, AI selection, settings, menus, ...)
     /// have already run. Every one of those actions calls this once per
     /// dispatch and routes to exactly one of the existing body `Editor`,
-    /// sidebar filter, or inline rename handlers below; the document
-    /// navigation and Undo/Redo actions are body-only and no-op for
-    /// `SidebarFilter`/`InlineRename`.
+    /// sidebar filter, or inline rename handlers below; DocumentStart/End
+    /// and Undo/Redo are body-only and no-op for `SidebarFilter`/
+    /// `InlineRename`, while SelectDocumentStart/End select to the start or
+    /// end of the filter or rename field.
     pub(crate) fn input_target(&self) -> InputTarget {
         if self.sidebar_filter_is_focused() {
             InputTarget::SidebarFilter

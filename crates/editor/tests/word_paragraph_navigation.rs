@@ -319,6 +319,61 @@ fn word_delete_with_a_selection_deletes_only_the_selection_and_undo_restores_it(
 }
 
 #[test]
+fn a_cursor_inside_a_word_keeps_the_context_around_an_apostrophe() {
+    // byte 3 sits between "n" and the apostrophe of "can't".
+    let text = "can't next";
+    let mut editor = editor_at(text, 3);
+    word(&mut editor, true, ForwardStop::NextStart, false);
+    assert_eq!(active(&editor), 6, "Windows Ctrl+Right");
+
+    let mut editor = editor_at(text, 3);
+    word(&mut editor, true, ForwardStop::NextStart, true);
+    assert_eq!(
+        editor.selection(),
+        Selection {
+            anchor: SourceOffset(3),
+            active: SourceOffset(6)
+        },
+        "Windows Ctrl+Shift+Right"
+    );
+
+    let mut editor = editor_at(text, 3);
+    word(&mut editor, true, ForwardStop::End, false);
+    assert_eq!(active(&editor), 5, "Mac Option+Right ends the word");
+
+    // Backward from inside the word reaches its start on both platforms.
+    for stop in [ForwardStop::End, ForwardStop::NextStart] {
+        let mut editor = editor_at(text, 4);
+        word(&mut editor, false, stop, false);
+        assert_eq!(active(&editor), 0);
+    }
+
+    // CRLF and combining marks are still never split from mid-word.
+    let mut editor = editor_at("ab\r\ncd", 1);
+    word(&mut editor, true, ForwardStop::NextStart, false);
+    assert_eq!(active(&editor), 4);
+    let mut editor = editor_at("e\u{301}x y", 0);
+    word(&mut editor, true, ForwardStop::NextStart, false);
+    assert_eq!(active(&editor), 5);
+}
+
+#[test]
+fn word_delete_forward_from_inside_a_word_with_an_apostrophe() {
+    let mut editor = editor_at("can't next", 3);
+    editor
+        .dispatch(EditorCommand::DeleteWord {
+            forward: true,
+            stop: ForwardStop::NextStart,
+        })
+        .unwrap();
+    assert_eq!(editor.document().full_text(), "cannext");
+    assert_eq!(editor.selection(), Selection::caret(SourceOffset(3)));
+    editor.dispatch(EditorCommand::Undo).unwrap();
+    assert_eq!(editor.document().full_text(), "can't next");
+    assert_eq!(editor.selection(), Selection::caret(SourceOffset(3)));
+}
+
+#[test]
 fn word_delete_does_not_merge_with_following_character_deletes() {
     let mut editor = editor_at("one two", 7);
     editor

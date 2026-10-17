@@ -107,7 +107,7 @@ cargo run --release -p hane
 | 保存 / 名前を付けて保存 | Command + S / Command + Shift + S | Ctrl + S / Ctrl + Shift + S |
 | 自動保存の切り替え | Command + Option + A | Ctrl + Alt + A |
 
-行・段落は、画面幅による折り返しではなく、改行で区切られた原文の行を単位にします（Markdown の空行で区切るブロックではありません）。単語は Unicode の単語境界に従い、日本語の辞書による分かち書きはしません。OS 標準のテキスト欄との完全な互換は目指していません。Windows の単語移動は次の単語の先頭、macOS は単語の末尾に止まります。
+行・段落は、画面幅による折り返しではなく、改行で区切られた原文の行を単位にします（Markdown の空行で区切るブロックではありません）。単語は Unicode の単語境界に従い、日本語の辞書による分かち書きはしません。OS 標準のテキスト欄との完全な互換は目指していません。前方への単語移動は、Windows では次の単語の先頭、macOS では単語の末尾に止まります。後方への単語移動は、どちらの OS でも語頭へ進みます。
 
 Emacs 風の Control + 英字（Control + A / E / B / F / K / Y など）は割り当てていません。必要な場合は Karabiner-Elements（macOS）や Keyhac（Windows）などでキー配列を変更してください。
 

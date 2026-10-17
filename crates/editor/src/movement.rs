@@ -166,30 +166,45 @@ impl Editor {
         let mut pos = from.0;
         let mut phase = 0;
         loop {
-            let (start, end) = if forward {
+            // The whole line is segmented, not just the part on one side of
+            // `pos`: a cursor inside a word ("can|'t") must keep the word's
+            // context, or the half it cuts off is classified on its own.
+            let range = if forward {
                 if pos >= len {
                     return Ok(SourceOffset(pos));
                 }
                 let line = self.document.line_for_offset(SourceOffset(pos))?;
-                (pos, self.document.line_range(line)?.end.0)
+                self.document.line_range(line)?
             } else {
                 if pos == 0 {
                     return Ok(SourceOffset(pos));
                 }
                 let mut line = self.document.line_for_offset(SourceOffset(pos))?;
-                let mut line_start = self.document.line_range(line)?.start.0;
-                if pos == line_start {
+                if pos == self.document.line_range(line)?.start.0 {
                     line = LineId(line.0 - 1);
-                    line_start = self.document.line_range(line)?.start.0;
                 }
-                (line_start, pos)
+                self.document.line_range(line)?
             };
-            let text = self.document.text(SourceRange::new(start, end))?;
-            let mut segments: Vec<&str> = text.split_word_bounds().collect();
+            let start = range.start.0;
+            let relative = pos - start;
+            let text = self.document.text(range)?;
+            // Each segment with the number of its bytes on the walk's side of
+            // `pos`; only the segment holding `pos` is partial.
+            let mut segments: Vec<(&str, usize)> = Vec::new();
+            for (index, segment) in text.split_word_bound_indices() {
+                let segment_end = index + segment.len();
+                if forward {
+                    if segment_end > relative {
+                        segments.push((segment, segment_end - index.max(relative)));
+                    }
+                } else if index < relative {
+                    segments.push((segment, segment_end.min(relative) - index));
+                }
+            }
             if !forward {
                 segments.reverse();
             }
-            for segment in segments {
+            for (segment, walked) in segments {
                 let class = WordClass::of(segment);
                 if class != phases[phase] {
                     if phase == 0 {
@@ -200,9 +215,9 @@ impl Editor {
                     }
                 }
                 if forward {
-                    pos += segment.len();
+                    pos += walked;
                 } else {
-                    pos -= segment.len();
+                    pos -= walked;
                 }
             }
         }

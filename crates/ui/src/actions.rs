@@ -22,6 +22,15 @@ fn body_key_ready(view: &EditorView) -> bool {
         && view.editor().ime().is_none()
 }
 
+/// Runs a body line/document move or selection unless an IME composition is
+/// running: `Editor::dispatch` would commit it, so the composition, selection
+/// and text are left as they are until the IME ends it.
+fn dispatch_body_move(view: &mut EditorView, command: EditorCommand, cx: &mut Context<EditorView>) {
+    if view.editor().ime().is_none() {
+        view.dispatch(command, cx);
+    }
+}
+
 /// The search input/results, the document-find input and the AI popup own the
 /// keyboard before the body, filter or rename do.
 fn keys_claimed_elsewhere(view: &EditorView) -> bool {
@@ -517,7 +526,7 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter => view.move_sidebar_filter_home(cx),
             InputTarget::InlineRename => view.move_inline_rename_home(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineStart { extend: false }, cx),
         }
     },
     End ("") => end |view, _window, cx| {
@@ -525,7 +534,7 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter => view.move_sidebar_filter_end(cx),
             InputTarget::InlineRename => view.move_inline_rename_end(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineEnd { extend: false }, cx),
         }
     },
     SelectHome ("") => select_home |view, _window, cx| {
@@ -533,7 +542,7 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter => view.select_sidebar_filter_home(cx),
             InputTarget::InlineRename => view.select_inline_rename_home(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineStart { extend: true }, cx),
         }
     },
     SelectEnd ("") => select_end |view, _window, cx| {
@@ -541,21 +550,21 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter => view.select_sidebar_filter_end(cx),
             InputTarget::InlineRename => view.select_inline_rename_end(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineEnd { extend: true }, cx),
         }
     },
     DocumentStart ("") => document_start |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter | InputTarget::InlineRename => {}
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToStart { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToStart { extend: false }, cx),
         }
     },
     DocumentEnd ("") => document_end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter | InputTarget::InlineRename => {}
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToEnd { extend: false }, cx),
         }
     },
     // macOS Shift+Home/End also lands here; a one-line filter/rename field has
@@ -565,7 +574,7 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter => view.select_sidebar_filter_home(cx),
             InputTarget::InlineRename => view.select_inline_rename_home(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToStart { extend: true }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToStart { extend: true }, cx),
         }
     },
     SelectDocumentEnd ("") => select_document_end |view, _window, cx| {
@@ -573,7 +582,7 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter => view.select_sidebar_filter_end(cx),
             InputTarget::InlineRename => view.select_inline_rename_end(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToEnd { extend: true }, cx),
         }
     },
     MoveWordLeft ("") => move_word_left |view, _window, cx| {
@@ -666,9 +675,9 @@ command_actions! {
             view.scroll_page(true, cx);
         }
     },
-    CenterCursorLine ("") => center_cursor_line_action |view, _window, cx| {
+    CenterCursorLine ("") => center_cursor_line_action |view, window, cx| {
         if !keys_claimed_elsewhere(view) && matches!(view.input_target(), InputTarget::Body) {
-            view.center_cursor_line(cx);
+            view.center_cursor_line(window, cx);
         }
     },
     Undo ("secondary-z") => undo |view, _window, cx| {

@@ -391,8 +391,10 @@ mod tests {
         let (view, cx) = open_view(cx, &long_document());
         let caret = long_document().find("line 100").unwrap();
         set_selection(&view, cx, caret, caret);
-        view.update(cx, |view, cx| {
-            view.center_cursor_line(cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.center_cursor_line(window, cx));
+        });
+        view.update(cx, |view, _| {
             let (top, height) = view
                 .source_offset_row_bounds(SourceOffset(caret))
                 .expect("row bounds");
@@ -434,6 +436,225 @@ mod tests {
         );
     }
 
+    const PAGE_MOVE_UP: &str = if MAC { "alt-pageup" } else { "pageup" };
+    const PAGE_SELECT_DOWN: &str = if MAC {
+        "alt-shift-pagedown"
+    } else {
+        "shift-pagedown"
+    };
+    const SELECT_LINE_END: &str = if MAC { "cmd-shift-right" } else { "shift-end" };
+    const SELECT_LINE_START: &str = if MAC { "cmd-shift-left" } else { "shift-home" };
+    const SELECT_DOCUMENT_START: &str = if MAC { "shift-home" } else { "ctrl-shift-home" };
+    const SELECT_DOCUMENT_END: &str = if MAC { "shift-end" } else { "ctrl-shift-end" };
+
+    /// One paragraph that wraps into dozens of rows at a narrow width, followed
+    /// by a tail so the document is much taller than the viewport.
+    fn wrapped_document() -> String {
+        let words: String = (0..600).map(|index| format!("w{index:03} ")).collect();
+        let tail: String = (0..80).map(|index| format!("tail {index}\n")).collect();
+        format!("{}\n\n{tail}", words.trim_end())
+    }
+
+    fn open_wrapped<'a>(cx: &'a mut gpui::TestAppContext) -> (TestView, &'a mut TestCx) {
+        let (view, cx) = open_view(cx, &wrapped_document());
+        cx.simulate_resize(gpui::size(px(320.0), px(400.0)));
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// Content-space top of the caret as the settled frame drew it.
+    fn drawn_caret_top(view: &TestView, cx: &mut TestCx) -> f32 {
+        view.read_with(cx, |view, _| {
+            let caret = view.caret_geometry().expect("the caret is painted");
+            caret.y + view.scroll_y
+        })
+    }
+
+    /// Scrolls away without moving the caret and drops the layouts, the state
+    /// in which only a freshly resolved layout knows the wrapped rows.
+    fn scroll_away_and_evict_layouts(view: &TestView, cx: &mut TestCx) {
+        view.update(cx, |view, cx| view.scroll_to_document_edge(true, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, _| view.layout_cache.clear());
+    }
+
+    #[gpui::test]
+    fn center_cursor_line_centers_the_real_row_of_a_wrapped_paragraph_without_a_cached_layout(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_wrapped(cx);
+        let caret = wrapped_document().find("w550 ").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_layouts(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.center_cursor_line(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let caret = view.caret_geometry().expect("the caret is painted");
+            let middle = caret.y + caret.height / 2.0;
+            assert!(caret.y >= 0.0 && caret.y + caret.height <= view.viewport_height);
+            assert!(
+                (middle - view.viewport_height / 2.0).abs() <= view.viewport_height / 4.0,
+                "caret centre {middle} in a viewport of {}",
+                view.viewport_height
+            );
+        });
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+    }
+
+    #[gpui::test]
+    fn page_move_stops_about_one_viewport_into_a_wrapped_paragraph(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_wrapped(cx);
+        let caret = wrapped_document().find("w100 ").unwrap();
+        set_selection(&view, cx, caret, caret);
+        let before = drawn_caret_top(&view, cx);
+        scroll_away_and_evict_layouts(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.move_page(true, false, window, cx));
+        });
+        cx.run_until_parked();
+        let after = drawn_caret_top(&view, cx);
+        view.read_with(cx, |view, _| {
+            let page = (view.viewport_height - view.line_height()).max(view.line_height());
+            let travelled = after - before;
+            assert!(travelled >= page * 0.8, "moved {travelled} for a page of {page}");
+            assert!(
+                travelled <= page + view.line_height() * 3.0,
+                "moved {travelled} for a page of {page}"
+            );
+            // Still inside the wrapped paragraph, not past it.
+            let text = view.editor().document().full_text();
+            let paragraph_end = text.find("\n\n").unwrap();
+            assert!(view.editor().selection().active.0 < paragraph_end);
+        });
+    }
+
+    #[gpui::test]
+    fn registered_page_keys_move_a_viewport_and_collapse_or_extend(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_wrapped(cx);
+        let caret = wrapped_document().find("w100 ").unwrap();
+        set_selection(&view, cx, caret, caret);
+        press(cx, PAGE_MOVE_DOWN);
+        let down = selection(&view, cx);
+        assert_eq!(down.anchor, down.active);
+        assert!(down.active.0 > caret);
+        press(cx, PAGE_MOVE_UP);
+        assert!(selection(&view, cx).active.0 < down.active.0);
+
+        set_selection(&view, cx, caret, caret);
+        press(cx, PAGE_SELECT_DOWN);
+        let selected = selection(&view, cx);
+        assert_eq!(selected.anchor, SourceOffset(caret));
+        assert!(selected.active.0 > caret);
+    }
+
+    #[gpui::test]
+    fn page_move_at_the_document_edge_drops_the_selection(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "abc");
+        set_selection(&view, cx, 0, 3);
+        press(cx, PAGE_MOVE_DOWN);
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(3)));
+        view.update(cx, |view, cx| view.insert_text("Z", cx));
+        assert_eq!(text(&view, cx), "abcZ");
+        view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
+        assert_eq!(text(&view, cx), "abc");
+
+        set_selection(&view, cx, 3, 0);
+        press(cx, PAGE_MOVE_UP);
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(0)));
+        view.update(cx, |view, cx| view.insert_text("Z", cx));
+        assert_eq!(text(&view, cx), "Zabc");
+        view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
+        assert_eq!(text(&view, cx), "abc");
+
+        // Shift keeps the anchor and stops at the edge.
+        set_selection(&view, cx, 0, 3);
+        press(cx, PAGE_SELECT_DOWN);
+        assert_eq!(
+            selection(&view, cx),
+            Selection {
+                anchor: SourceOffset(0),
+                active: SourceOffset(3)
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn scroll_only_operation_drops_pending_find_and_zoom_so_the_next_frame_keeps_its_position(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, &long_document());
+        view.update(cx, |view, cx| {
+            view.scroll_to_document_edge(true, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.pending_find_visibility_after_layout = true;
+            view.scroll_to_document_edge(false, cx);
+            assert!(!view.pending_find_visibility_after_layout);
+            assert!(view.pending_zoom_anchor.is_none());
+        });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.scroll_y), 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn mac_control_l_centers_the_wrapped_caret_row_and_does_not_open_ai(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_wrapped(cx);
+        let caret = wrapped_document().find("w550 ").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_layouts(&view, cx);
+        press(cx, "ctrl-l");
+        view.read_with(cx, |view, _| {
+            assert!(!view.ai_selection_blocks_editor_keys());
+            let caret = view.caret_geometry().expect("the caret is painted");
+            let middle = caret.y + caret.height / 2.0;
+            assert!((middle - view.viewport_height / 2.0).abs() <= view.viewport_height / 4.0);
+        });
+    }
+
+    #[gpui::test]
+    fn line_and_document_keys_do_not_commit_an_ime_composition(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "abc\ndef");
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(1)))
+                .unwrap();
+            view.editor_mut()
+                .replace_and_mark_text(None, "に", Some(1..1))
+                .unwrap();
+            cx.notify();
+        });
+        let before_text = text(&view, cx);
+        let before_selection = selection(&view, cx);
+        let before_marked = view.read_with(cx, |view, _| view.editor().ime().map(|ime| ime.marked_range));
+        for key in [
+            LINE_START,
+            LINE_END,
+            DOCUMENT_START,
+            DOCUMENT_END,
+            SELECT_LINE_START,
+            SELECT_LINE_END,
+            SELECT_DOCUMENT_START,
+            SELECT_DOCUMENT_END,
+        ] {
+            press(cx, key);
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().ime().map(|ime| ime.marked_range),
+                    before_marked,
+                    "{key} changed the composition"
+                );
+                assert_eq!(view.editor().document().full_text(), before_text, "{key}");
+            });
+            assert_eq!(selection(&view, cx), before_selection, "{key}");
+        }
+    }
+
     #[gpui::test]
     fn footer_ai_button_opens_the_popup_over_the_existing_selection(
         cx: &mut gpui::TestAppContext,
@@ -449,8 +670,8 @@ mod tests {
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
-            assert!(view.ai_selection.open);
-            assert_eq!(view.ai_selection.original_text, "two");
+            assert!(view.ai_selection_blocks_editor_keys());
+            assert_eq!(view.ai_selection_original_text_for_test(), "two");
             assert_eq!(view.editor().document().full_text(), "one two three\n");
         });
         assert_eq!(
@@ -473,7 +694,7 @@ mod tests {
         cx.simulate_mouse_down(button, MouseButton::Left, gpui::Modifiers::none());
         cx.simulate_mouse_up(button, MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
-        view.read_with(cx, |view, _| assert!(!view.ai_selection.open));
+        view.read_with(cx, |view, _| assert!(!view.ai_selection_blocks_editor_keys()));
         assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(2)));
     }
 }
