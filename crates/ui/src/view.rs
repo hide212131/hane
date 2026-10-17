@@ -580,6 +580,21 @@ struct FileTabContextMenu {
     instance: DocumentInstance,
 }
 
+/// The row a sidebar context menu was opened for.
+#[derive(Clone, Debug)]
+enum SidebarContextTarget {
+    File(PathBuf),
+    Folder(PathBuf),
+    /// An unnamed note row; it has no path yet, so only Save As applies.
+    Draft(SessionId, DocumentInstance),
+}
+
+#[derive(Clone, Debug)]
+struct SidebarContextMenu {
+    position: gpui::Point<Pixels>,
+    target: SidebarContextTarget,
+}
+
 /// A pending "close this tab" request whose session has unsaved changes, so
 /// the user is asked whether to save before it closes rather than losing the
 /// edits silently.
@@ -907,6 +922,9 @@ pub struct EditorView {
     /// every render instead of being snapshotted, so a rename that lands
     /// while the menu is open is reflected rather than shown stale.
     file_tab_context_menu: Option<FileTabContextMenu>,
+    /// The sidebar row context menu, if open. It names the row that was
+    /// right-clicked, never the active session or the sidebar selection.
+    sidebar_context_menu: Option<SidebarContextMenu>,
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
@@ -1723,6 +1741,7 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             file_tabs_scroll: ScrollHandle::new(),
             file_tab_context_menu: None,
+            sidebar_context_menu: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
             footer_scroll: ScrollHandle::new(),
@@ -2344,6 +2363,7 @@ impl EditorView {
         let Some(instance) = self.document_instance(id) else {
             return;
         };
+        self.sidebar_context_menu = None;
         self.file_tab_context_menu = Some(FileTabContextMenu {
             position,
             id,
@@ -2452,6 +2472,23 @@ impl EditorView {
         match Self::reveal_launch_command(&path).spawn() {
             Ok(_) => self.status = Some("保存場所を開きました".to_owned()),
             Err(error) => self.status = Some(format!("保存場所を開けません: {error}")),
+        }
+        cx.notify();
+    }
+
+    /// Save As for the tab whose menu was opened, not the active tab. The
+    /// instance the menu captured must still be current: a tab that was
+    /// replaced or reused since the menu opened must not get a dialog (and
+    /// so a write) it never asked for.
+    fn save_file_tab_as(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tab_context_menu = None;
+        if self.document_instance(id) == Some(instance) {
+            self.prompt_save_as_for(id, cx);
         }
         cx.notify();
     }
@@ -2989,6 +3026,7 @@ impl EditorView {
         // comparisons elsewhere are what keep that dialog's eventual answer
         // from acting on the replacement document.
         self.file_tab_context_menu = None;
+        self.sidebar_context_menu = None;
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
         // Any background read still in flight for the old folder (or for
@@ -7091,6 +7129,16 @@ impl Render for EditorView {
         } else {
             rendered
         };
+        let rendered = if let Some(menu) = self.sidebar_context_menu.as_ref() {
+            rendered.child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window()
+                    .child(self.sidebar_context_menu_element(menu, cx)),
+            )
+        } else {
+            rendered
+        };
         let rendered = if let Some(confirm) = self.tab_close_confirm.as_ref() {
             rendered.child(self.tab_close_confirm_element(confirm, cx))
         } else {
@@ -7189,6 +7237,15 @@ impl EditorView {
             move |view, _, _, cx| view.copy_file_tab_full_path(copy_path.clone(), cx),
         );
 
+        let (save_as_id, save_as_instance) = (menu.id, menu.instance);
+        let save_as_item = self.file_tab_context_menu_item(
+            "file-tab-context-save-as",
+            "名前を付けて保存…",
+            true,
+            cx,
+            move |view, _, _, cx| view.save_file_tab_as(save_as_id, save_as_instance, cx),
+        );
+
         let menu_element = div()
             .id("file-tab-context-menu")
             .debug_selector(|| "file-tab-context-menu".to_owned())
@@ -7213,7 +7270,7 @@ impl EditorView {
             .child(vscode_item);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let menu_element = menu_element.child(reveal_item);
-        menu_element.child(copy_item)
+        menu_element.child(copy_item).child(save_as_item)
     }
 
     fn tab_close_confirm_element(
@@ -13466,6 +13523,86 @@ mod tests {
             assert_eq!(menu_target_path, Some(expected_clicked_path.as_path()));
         });
         assert!(cx.debug_bounds("file-tab-context-menu").is_some());
+        assert!(
+            cx.debug_bounds("file-tab-context-save-as").is_some(),
+            "the tab menu must expose Save As for the clicked tab"
+        );
+    }
+
+    #[gpui::test]
+    fn file_tab_save_as_ignores_a_menu_whose_document_instance_is_stale(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let stale = view.document_instance(id).expect("open session");
+            let stale = DocumentInstance {
+                generation: stale.generation + 1,
+                ..stale
+            };
+            view.open_file_tab_context_menu(id, gpui::Point::default(), cx);
+            view.save_file_tab_as(id, stale, cx);
+            assert!(view.file_tab_context_menu.is_none());
+            assert_eq!(view.status, None);
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_response_for_a_background_tab_saves_that_tab_only(cx: &mut gpui::TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-tab-save-as-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("Saved.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("first\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("second\n"),
+                    identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let background = SessionId(1);
+            let instance = view.document_instance(background);
+            view.handle_save_as_response(
+                background,
+                instance,
+                SaveAsResponse::Chosen(target.clone()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second\n");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), SessionId(0));
+            assert_eq!(
+                view.sessions.get(SessionId(1)).and_then(DocumentSession::path),
+                Some(target.as_path())
+            );
+            assert_eq!(
+                view.sessions.get(SessionId(0)).and_then(DocumentSession::path),
+                Some(Path::new("first.md"))
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
