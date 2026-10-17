@@ -1158,7 +1158,7 @@ fn present_markdown_from_parse(
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
     // Openable links carry the parser's destination with the part of their text
     // on this physical line; the UI matches a click's source offset against it.
-    let links = if formal_code_block == Some(true) {
+    let mut links = if formal_code_block == Some(true) {
         Vec::new()
     } else {
         links_intersecting(&parsed.links, range)
@@ -1176,6 +1176,30 @@ fn present_markdown_from_parse(
             })
             .collect::<Vec<_>>()
     };
+    // A line parsed on its own cannot see a reference definition on another
+    // line. The formal projection resolved every link against the whole
+    // document, so restore the ones the local parse could not.
+    if formal_code_block != Some(true)
+        && let Some(projection) = shared.list_projection
+    {
+        for link in projection.links_in(range) {
+            let clipped = SourceRange {
+                start: link.text_range.start.max(range.start),
+                end: link.text_range.end.min(range.end),
+            };
+            if clipped.start < clipped.end
+                && !links
+                    .iter()
+                    .any(|existing| existing.source_range.intersects(clipped))
+            {
+                links.push(LinkTarget {
+                    source_range: clipped,
+                    destination: link.destination.clone(),
+                });
+            }
+        }
+        links.sort_by_key(|link| (link.source_range.start, link.source_range.end));
+    }
     let (quote_marker_visual_ranges, quote_marker_source_ranges) =
         quote_marker_ranges(markers_on_line, &source_map.segments);
     let list = list_row_metadata(

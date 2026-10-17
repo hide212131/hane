@@ -598,6 +598,103 @@ fn external_link_target_carries_destination_and_absolute_text_range() {
 }
 
 #[test]
+fn heading_reference_link_keeps_destination_defined_on_another_line() {
+    let source = "# [docs][ref]\n\n[ref]: https://example.com\n";
+    let index = BlockIndex::build(Revision(1), source);
+    let block = index.block(0).expect("heading block");
+    let projection = index.list_projection(&block).expect("formal link projection");
+    let line_range = SourceRange::new(0, "# [docs][ref]\n".len());
+    let lines = [BlockLine {
+        line: 0,
+        range: line_range,
+        text: &source[..line_range.end.0],
+        disclosure: None,
+    }];
+    let visual = present_block_with_list_projection(
+        &block,
+        Revision(1),
+        &BlockWindow {
+            span: 0..2,
+            trailing_blank_lines: 1,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
+            render: 0..1,
+            joined: None,
+            block_disclosure: None,
+        },
+        26.0,
+        Some(projection),
+    );
+
+    let links = &visual.lines[0].links;
+    assert_eq!(links.len(), 1);
+    assert_eq!(&*links[0].destination, "https://example.com");
+    let text_start = source.find("docs").expect("link text");
+    assert_eq!(
+        links[0].source_range,
+        SourceRange::new(text_start, text_start + "docs".len())
+    );
+}
+
+#[test]
+fn table_row_reference_link_keeps_destination_defined_on_another_line() {
+    let source = "| a | b |\n| --- | --- |\n| [docs][ref] | x |\n\n[ref]: https://example.com\n";
+    let index = BlockIndex::build(Revision(1), source);
+    let block = index.block(0).expect("table block");
+    let list_projection = index.list_projection(&block);
+    let table_projection = index.table_projection(&block).expect("table projection");
+    let header_end = "| a | b |\n".len();
+    let delimiter_end = header_end + "| --- | --- |\n".len();
+    let row_end = delimiter_end + "| [docs][ref] | x |\n".len();
+    let ranges = [
+        SourceRange::new(0, header_end),
+        SourceRange::new(header_end, delimiter_end),
+        SourceRange::new(delimiter_end, row_end),
+    ];
+    let lines = ranges
+        .iter()
+        .enumerate()
+        .map(|(line, range)| BlockLine {
+            line,
+            range: *range,
+            text: &source[range.start.0..range.end.0],
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    let visual = present_block_with_table_projection(
+        &block,
+        Revision(1),
+        &BlockWindow {
+            span: 0..4,
+            trailing_blank_lines: 1,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: Some(1),
+            render: 2..3,
+            joined: None,
+            block_disclosure: None,
+        },
+        26.0,
+        list_projection,
+        Some(table_projection),
+    );
+
+    let links = &visual.lines[0].links;
+    assert_eq!(links.len(), 1);
+    assert_eq!(&*links[0].destination, "https://example.com");
+    let text_start = source.find("docs").expect("link text");
+    assert_eq!(
+        links[0].source_range,
+        SourceRange::new(text_start, text_start + "docs".len())
+    );
+}
+
+#[test]
 fn rebase_moves_link_targets_with_the_source_map() {
     let source = "go [docs](https://example.com/)";
     let mut line = present_markdown(

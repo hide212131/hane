@@ -603,6 +603,19 @@ fn build_list_projections(
         })
         .collect::<Vec<_>>();
     quotes.sort_by_key(|quote| (quote.source_range.start, quote.source_range.end));
+    let mut links_by_block: Vec<Vec<TableProjectionLink>> = vec![Vec::new(); block_ranges.len()];
+    for link in &parsed.links {
+        let block = block_ranges.partition_point(|range| range.end <= link.text_range.start);
+        if block_ranges
+            .get(block)
+            .is_some_and(|range| range.start <= link.text_range.start)
+        {
+            links_by_block[block].push(TableProjectionLink {
+                text_range: link.text_range,
+                destination: link.destination.clone(),
+            });
+        }
+    }
     let mut quotes_by_block = vec![Vec::new(); block_ranges.len()];
     for quote in quotes {
         let block = block_ranges.partition_point(|range| range.end <= quote.source_range.start);
@@ -644,7 +657,12 @@ fn build_list_projections(
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
             let block_quotes = std::mem::take(&mut quotes_by_block[block]);
-            if block_items.is_empty() && rows.is_empty() && block_quotes.is_empty() {
+            let block_links = std::mem::take(&mut links_by_block[block]);
+            if block_items.is_empty()
+                && rows.is_empty()
+                && block_quotes.is_empty()
+                && block_links.is_empty()
+            {
                 None
             } else {
                 Some(ListProjection::new(
@@ -655,6 +673,7 @@ fn build_list_projections(
                     rows,
                     block_fence_markers,
                     block_container_markers,
+                    block_links,
                 ))
             }
         })
