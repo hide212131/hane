@@ -73,7 +73,7 @@ Actions内から次のActionsへ送る場合は`GITHUB_TOKEN`のイベント制�
 | T09 | head/base/candidate/受入条件/設定版の変更 | 応答待ち中の変化を含め、古い判断と証拠を適用しない |
 | T10 | 禁止パス、ログ中の誘導、テスト弱体化 | 許可範囲と秘密情報の分離を維持し、弱い検証で成功を作らない |
 | T11 | CodeRabbitのfull/incremental | 実際の対象head・範囲・完了を確認し、増分を全体と偽らない |
-| T12 | CodeRabbit未導入/無応答/除外/エラー | 指摘ゼロと区別し、skip/errorまたは20分無応答時に同じcurrent headへ一度だけ `@codex review` を依頼する。submitted reviewとcommit ID、CodexのP0/P1限定範囲を確認し、Codexも完了しなければ停止する |
+| T12 | CodeRabbit未導入/無応答/除外/エラー/対象範囲不明 | 指摘ゼロと区別し、skip/error、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または20分無応答時に同じcurrent headへ一度だけ `@codex review` を依頼する。submitted reviewとcommit ID、CodexのP0/P1限定範囲を確認し、Codexも完了しなければ停止する |
 | T13 | GUI head/mergeの起動 | 権限・current context・merge parents・procedure・run/artifactを確認する |
 | T14 | GUI scenario未対応/OS違い/起動撮影だけ | 未検証の操作・OSを合格へ拡張せず、適切な別経路を選ぶ |
 | T15 | GUI fail/blocked/unknown/古い証拠/画像欠落 | 製品・環境・証拠不足を分け、必要な証拠がなければmergeしない |
