@@ -43,11 +43,6 @@ impl<F> HealthGate<F> {
     pub fn first_frame_drawn(&mut self) -> Option<F> {
         self.report.take()
     }
-
-    /// The window could not be created or drawn: the report never runs.
-    pub fn abandon(&mut self) {
-        self.report = None;
-    }
 }
 
 /// Runs `normal` only when the helper's commit was confirmed.
@@ -149,7 +144,7 @@ pub fn run(verified: Box<VerifiedChild>) {
                         }
                     };
                     let state_root = state_root.clone();
-                    let _ = cx.update(|cx| {
+                    cx.update(|cx| {
                         let started = start_after_commit(result, |guard| {
                             cx.set_global(HeldRuntimeLease(guard));
                             // Only now, with the commit confirmed, is the
@@ -197,9 +192,9 @@ mod tests {
 
     #[test]
     fn a_window_that_failed_never_reports_healthy() {
-        let mut gate = HealthGate::new(|| panic!("Healthy must not be sent"));
-        gate.abandon();
-        assert!(gate.first_frame_drawn().is_none());
+        // A window that never drew drops the gate without releasing the report.
+        let gate = HealthGate::new(|| panic!("Healthy must not be sent"));
+        drop(gate);
     }
 
     #[test]
