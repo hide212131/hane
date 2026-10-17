@@ -76,11 +76,22 @@ pub(crate) fn owner_name() -> Result<String> {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
-fn owner_from(principal: Result<String>) -> Result<String> {
-    principal
-        .ok()
-        .filter(|owner| !owner.is_empty())
-        .ok_or_else(|| unsupported("the OS principal is unavailable"))
+pub(crate) fn owner_from(principal: Result<String>) -> Result<String> {
+    // A failed or empty principal is never `UnsupportedInstall`: startup treats
+    // that as `Unmanaged` and would skip the recovery gate of a managed install
+    // that has a pending journal. It is reported as `Io` (keeping the original
+    // cause), which the gate turns into `RecoveryRequired`.
+    match principal {
+        Ok(owner) if !owner.is_empty() => Ok(owner),
+        Ok(_) => Err(UpdateError::new(
+            ErrorCode::Io,
+            "the OS principal is empty",
+        )),
+        Err(err) => Err(UpdateError::new(
+            ErrorCode::Io,
+            format!("the OS principal is unavailable: {err}"),
+        )),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -100,11 +111,12 @@ mod owner_tests {
     }
 
     #[test]
-    fn an_unavailable_principal_is_unsupported() {
+    fn an_unavailable_principal_is_not_unsupported() {
         let err = owner_from(Err(unsupported("no token"))).unwrap_err();
-        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.detail.contains("no token"));
         let err = owner_from(Ok(String::new())).unwrap_err();
-        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+        assert_eq!(err.code, ErrorCode::Io);
     }
 }
 

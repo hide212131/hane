@@ -896,6 +896,29 @@ mod tests {
         assert_eq!(runner.calls.get(), 0);
     }
 
+    #[test]
+    fn a_failed_or_empty_principal_fails_closed_not_unmanaged() {
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        let failures = [
+            platform::owner_from(Err(UpdateError::new(
+                ErrorCode::UnsupportedInstall,
+                "token query failed",
+            ))),
+            platform::owner_from(Ok(String::new())),
+        ];
+        for failure in failures {
+            let err = failure.unwrap_err();
+            assert!(
+                matches!(
+                    gate_for_located(Err(err), &runner),
+                    GateOutcome::RecoveryRequired(_)
+                ),
+                "principal failure must not start normal editing"
+            );
+        }
+        assert_eq!(runner.calls.get(), 0);
+    }
+
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn an_unsupported_placement_starts_unmanaged() {
