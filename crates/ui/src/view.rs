@@ -7648,7 +7648,10 @@ mod tests {
             // Pin the caret (and thus block disclosure) to the other block
             // before the link block is first presented, so the edit below
             // changes neither the link block's disclosure nor its source.
-            let at = SourceOffset(text.find("other").unwrap());
+            // The insertion point is strictly inside the next block's body:
+            // an insertion at its first offset would touch the link block's
+            // `source_range.end` and count as intersecting it.
+            let at = SourceOffset(text.find("other").unwrap() + 1);
             view.editor_mut()
                 .set_selection(Selection {
                     anchor: at,
