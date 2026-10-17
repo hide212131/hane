@@ -1102,6 +1102,15 @@ pub struct EditorView {
     /// dropped only by [`EditorView::cancel_center_caret`] (input, any other
     /// scroll or zoom, document switch).
     center_window_line: Option<usize>,
+    /// The pinned line and `scroll_y` handed over by a manual wheel scroll
+    /// that took the viewport from a "center the caret row" request. Dropping
+    /// the pin at once would present the block through the inverted viewport
+    /// window, whose partial layout measures a very different (much shorter)
+    /// block height, so the content height would shrink and clamp the position
+    /// the user just chose. The same window is kept while `scroll_y` stays
+    /// within the overscan of that position; [`EditorView::cancel_center_caret`]
+    /// clears it.
+    retained_center_window: Option<(usize, f32)>,
     /// Set after document-find navigation moves the current match. Mirrors
     /// `pending_caret_visibility_after_layout`: forcing a hidden match's
     /// block open can change its row height only on the next render, so this
@@ -1767,6 +1776,7 @@ impl EditorView {
             pending_caret_visibility_after_layout: false,
             pending_center_caret_frames: 0,
             center_window_line: None,
+            retained_center_window: None,
             pending_find_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
@@ -4115,6 +4125,7 @@ impl EditorView {
     pub(super) fn cancel_center_caret(&mut self) {
         self.pending_center_caret_frames = 0;
         self.center_window_line = None;
+        self.retained_center_window = None;
     }
 
     /// Scrolls to the top or bottom of the document without moving the caret.
@@ -5360,7 +5371,11 @@ impl EditorView {
     /// if every line took a single row; nothing between the run and the
     /// previous window is shaped.
     fn render_window_for(&self, block: &IndexedBlock, lines: &Range<usize>) -> Range<usize> {
-        let Some(line) = self.center_window_line else {
+        let retained = self
+            .retained_center_window
+            .filter(|(_, anchor)| (self.scroll_y - anchor).abs() <= self.theme.overscan)
+            .map(|(line, _)| line);
+        let Some(line) = self.center_window_line.or(retained) else {
             return lines.clone();
         };
         if self.granularity != Granularity::Blocks {

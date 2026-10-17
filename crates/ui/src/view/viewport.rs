@@ -206,6 +206,11 @@ impl EditorView {
     pub(super) fn on_scroll_at(&mut self, event: &ScrollWheelEvent, now: Instant, cx: &mut Context<Self>) {
         // A wheel or trackpad event (scroll or wheel zoom) owns the viewport
         // from here on; an earlier "centre the caret row" must not pull it back.
+        let scroll_y = self.scroll_y;
+        let pinned = self
+            .center_window_line
+            .map(|line| (line, scroll_y))
+            .or(self.retained_center_window);
         self.cancel_center_caret();
         if event.modifiers.secondary() {
             // A still-coasting scroll inertia must not keep advancing
@@ -221,6 +226,10 @@ impl EditorView {
             self.queue_wheel_zoom_factor(factor, window_offset, cx);
             return;
         }
+        // Keep presenting the centred block through the same window while the
+        // user scrolls near it, so its measured height (and with it the
+        // scrollable range) does not collapse under the chosen position.
+        self.retained_center_window = pinned;
         let delta = event.delta.pixel_delta(px(self.line_height()));
         let scroll_delta = -f32::from(delta.y);
         match event.delta {
