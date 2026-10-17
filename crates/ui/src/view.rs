@@ -41,7 +41,7 @@ use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme, sync_component_theme};
 use gpui::{
     Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Edges,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ExternalPaths, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, PinchEvent, Pixels, Render,
     ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
     Task, Window, anchored, div, point, prelude::FluentBuilder, px, rgb, rgba,
@@ -2980,6 +2980,26 @@ impl EditorView {
             self.switch_to_work_folder(path.to_path_buf(), cx);
         } else {
             self.open_path(path, cx);
+        }
+    }
+
+    /// Handles files dropped from Finder / Explorer onto the window. Only a
+    /// single path is opened, through `open_path`, so the dirty-session
+    /// refusal still applies. No filesystem metadata is read here, so a
+    /// dropped folder is never taken as a Work folder.
+    fn on_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match external_drop_target(paths.paths()) {
+            ExternalDropTarget::Open(path) => self.open_path(&path, cx),
+            ExternalDropTarget::TooMany => {
+                self.status = Some("Drop one item at a time".to_owned());
+                cx.notify();
+            }
+            ExternalDropTarget::Ignore => {}
         }
     }
 
@@ -6236,6 +6256,47 @@ mod panel_layout_tests {
     }
 }
 
+/// What an OS file drop asks Hane to do.
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalDropTarget {
+    Open(PathBuf),
+    TooMany,
+    Ignore,
+}
+
+fn external_drop_target(paths: &[PathBuf]) -> ExternalDropTarget {
+    match paths {
+        [] => ExternalDropTarget::Ignore,
+        [path] => ExternalDropTarget::Open(path.clone()),
+        _ => ExternalDropTarget::TooMany,
+    }
+}
+
+#[cfg(test)]
+mod external_drop_tests {
+    use super::*;
+
+    #[test]
+    fn single_path_is_opened() {
+        let path = PathBuf::from("/tmp/note.md");
+        assert_eq!(
+            external_drop_target(std::slice::from_ref(&path)),
+            ExternalDropTarget::Open(path)
+        );
+    }
+
+    #[test]
+    fn multiple_paths_are_refused() {
+        let paths = [PathBuf::from("/tmp/a.md"), PathBuf::from("/tmp/b.md")];
+        assert_eq!(external_drop_target(&paths), ExternalDropTarget::TooMany);
+    }
+
+    #[test]
+    fn empty_drop_is_ignored() {
+        assert_eq!(external_drop_target(&[]), ExternalDropTarget::Ignore);
+    }
+}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
@@ -6601,7 +6662,10 @@ impl Render for EditorView {
             .children(resizer)
             .on_mouse_move(cx.listener(Self::on_panel_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_panel_drag))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_drag));
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_drag))
+            // The drop listener stops the mouse-up it rides on, so a drop is
+            // never read as a body click or a selection.
+            .on_drop(cx.listener(Self::on_external_paths_drop));
         let main_column = div()
             .flex_1()
             .min_w(px(0.0))
