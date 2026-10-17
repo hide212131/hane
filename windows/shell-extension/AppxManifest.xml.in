@@ -30,8 +30,8 @@
         <com:Extension Category="windows.comServer">
           <com:ComServer>
             <com:SurrogateServer DisplayName="Hane Explorer command">
-              <com:Class Id="92b8fc05-dc63-44ed-9afc-fb10a36bee8a" Path="hane_shell_extension.dll" ThreadingModel="STA" />
-              <com:Class Id="a6aab9f1-298b-4a9b-9419-81938c993571" Path="hane_shell_extension.dll" ThreadingModel="STA" />
+              <com:Class Id="92b8fc05-dc63-44ed-9afc-fb10a36bee8a" Path="shell-integration\@CARGO_VERSION@\hane_shell_extension.dll" ThreadingModel="STA" />
+              <com:Class Id="a6aab9f1-298b-4a9b-9419-81938c993571" Path="shell-integration\@CARGO_VERSION@\hane_shell_extension.dll" ThreadingModel="STA" />
             </com:SurrogateServer>
           </com:ComServer>
         </com:Extension>
