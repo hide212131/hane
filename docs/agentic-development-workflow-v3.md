@@ -4,7 +4,7 @@
 
 初期設計はIssue [#332](https://github.com/hide212131/hane/issues/332) / PR #334。本書と[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)は、利用者の追加指定をIssue [#336](https://github.com/hide212131/hane/issues/336)で反映した。実装・評価・有効化は[#333](https://github.com/hide212131/hane/issues/333)で追跡する。
 
-**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbitとし、最終レビューが得られない場合だけcurrent-headのCodexレビューへ一度切り替える。必要なGUIテストは既存のHosted/ローカル経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。
+**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbitとし、最終レビューが得られない場合だけcurrent-headのCodexレビューへ一度切り替える。必要なGUIテストは既存のHosted/ローカル経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。**
 
 Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はone-action規則を維持する。通常レビューはIssue #360の実run検証とIssue #373の切替を経てCodeRabbitを使う。Codexは条件付き代替実装担当であり、CodeRabbitの最終レビューが完了しない場合に限るreview fallbackでもある。既存fallbackとGUIの権限・判断規則はそれぞれの既存契約を維持する。
 
@@ -23,7 +23,7 @@ Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.
 | Jev | 依頼解釈、受入条件、範囲、原因分類、作業分解、検証計画、次のaction、継続・切替・完了候補を判断する。Choice / Noul / Scoreと、利用可能な場合は既存handlerを選ぶfunction callingを使う |
 | CI / GUI Validator | 実際の検査・画面操作を行い、対象contextと観測事実を残す。結果の免除やmergeを決めない |
 
-通常は「アプリで依頼 → Jevが判断・既存handler・閉じた引数を選択 → Commanderがガードを確認して実行 → CI → CodeRabbit → 必要なGUI → 最終受入」と進める。最終CodeRabbit reviewがskip/errorまたは依頼後20分以内に完了しないときだけ、Commanderは同じcurrent headに対する `@codex review` を一度要求できる。失敗や証拠不足があれば最新事実をJevに渡し、次の一actionを選ばせる。全工程は条件なしで連鎖させない。Jevの結果を採用できる通常判断をChatGPTに毎回やり直させない。
+通常は「アプリで依頼 → Jevが判断・既存handler・閉じた引数を選択 → Commanderがガードを確認して実行 → CI → CodeRabbit → 必要なGUI → 最終受入」と進める。最終CodeRabbit reviewがskip/errorとなった場合、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または依頼後20分以内に完了しない場合、Commanderは同じPR・current headに対するGitHub上の `@codex review` を一度だけ要求できる。失敗や証拠不足があれば最新事実をJevに渡し、次の一actionを選ばせる。全工程は条件なしで連鎖させない。Jevの結果を採用できる通常判断をChatGPTに毎回やり直させない。
 
 ## 3. アプリ中心の実行と継続範囲
 
