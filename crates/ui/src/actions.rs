@@ -1,12 +1,54 @@
 use crate::view::EditorView;
 use crate::view::input_routing::InputTarget;
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
-use hane_editor::EditorCommand;
+use hane_editor::{EditorCommand, ForwardStop};
 use hane_markdown::ListEditIntent;
+
+/// Where a forward word/paragraph move stops: the end of the word on macOS and
+/// the start of the next one elsewhere, matching each OS's own text fields.
+const FORWARD_STOP: ForwardStop = if cfg!(target_os = "macos") {
+    ForwardStop::End
+} else {
+    ForwardStop::NextStart
+};
+
+/// Whether a body-only key added for Issue #494 may act on the document now.
+/// It must not leak into the search/find/AI surfaces or the sidebar filter and
+/// rename, and must not commit a running IME composition (every
+/// `Editor::dispatch` commits it).
+fn body_key_ready(view: &EditorView) -> bool {
+    !keys_claimed_elsewhere(view)
+        && matches!(view.input_target(), InputTarget::Body)
+        && view.editor().ime().is_none()
+}
+
+/// Runs a body line/document move or selection unless an IME composition is
+/// running: `Editor::dispatch` would commit it, so the composition, selection
+/// and text are left as they are until the IME ends it.
+fn dispatch_body_move(view: &mut EditorView, command: EditorCommand, cx: &mut Context<EditorView>) {
+    if view.editor().ime().is_none() {
+        view.dispatch(command, cx);
+    }
+}
+
+/// The search input/results, the document-find input and the AI popup own the
+/// keyboard before the body, filter or rename do.
+fn keys_claimed_elsewhere(view: &EditorView) -> bool {
+    view.content_search_input_is_focused()
+        || view.content_search_results_focused()
+        || view.document_find_input_is_focused()
+        || view.ai_selection_blocks_editor_keys()
+}
+
+/// `command_actions!` leaves an action's key empty when each platform binds it
+/// itself; this is the named test for that convention.
+fn defers_to_platform_bindings(key: &str) -> bool {
+    key.is_empty()
+}
 
 macro_rules! command_actions {
     ($(
-        $action:ident ($key:literal) => $handler:ident |$view:ident, $window:ident, $cx:ident| $body:block
+        $action:ident ($key:expr) => $handler:ident |$view:ident, $window:ident, $cx:ident| $body:block
     ),+ $(,)?) => {
         actions!(hane_editor, [$($action),+]);
 
@@ -39,18 +81,24 @@ macro_rules! command_actions {
         }
 
         fn register_core_key_bindings(cx: &mut App) {
-            cx.bind_keys([
-                $(KeyBinding::new($key, $action, Some("HaneEditor"))),+
-            ]);
+            // An empty key means the action is bound per platform by
+            // `register_platform_key_bindings`.
+            $(
+                if !defers_to_platform_bindings($key) {
+                    cx.bind_keys([KeyBinding::new($key, $action, Some("HaneEditor"))]);
+                }
+            )+
         }
     };
 }
 
 /// Registers this platform's key bindings. Most bindings use `secondary-`,
 /// which gpui resolves to `cmd` on macOS and `ctrl` elsewhere, so one binding
-/// list covers both without touching macOS behavior. A few Windows/Linux
-/// conventions (`ctrl-y` for redo, `ctrl-home`/`ctrl-end` for document
-/// bounds) have no macOS equivalent and are layered on top instead.
+/// list covers both without touching macOS behavior. The line, document, word,
+/// paragraph and page keys differ per OS (Issue #494) and follow each OS's own
+/// text-editing conventions; they are bound in
+/// `register_secondary_platform_key_bindings`. Emacs-style Control+letter
+/// aliases are intentionally absent (use Karabiner/Keyhac for those).
 pub fn register_key_bindings(cx: &mut App) {
     register_core_key_bindings(cx);
     register_secondary_platform_key_bindings(cx);
@@ -60,17 +108,78 @@ pub fn register_key_bindings(cx: &mut App) {
 
 #[cfg(not(target_os = "macos"))]
 fn register_secondary_platform_key_bindings(cx: &mut App) {
+    let ctx = Some("HaneEditor");
     cx.bind_keys([
-        KeyBinding::new("ctrl-y", Redo, Some("HaneEditor")),
-        KeyBinding::new("ctrl-home", DocumentStart, Some("HaneEditor")),
-        KeyBinding::new("ctrl-end", DocumentEnd, Some("HaneEditor")),
-        KeyBinding::new("ctrl-shift-home", SelectDocumentStart, Some("HaneEditor")),
-        KeyBinding::new("ctrl-shift-end", SelectDocumentEnd, Some("HaneEditor")),
+        KeyBinding::new("ctrl-y", Redo, ctx),
+        // Line edges.
+        KeyBinding::new("home", Home, ctx),
+        KeyBinding::new("end", End, ctx),
+        KeyBinding::new("shift-home", SelectHome, ctx),
+        KeyBinding::new("shift-end", SelectEnd, ctx),
+        // Document edges.
+        KeyBinding::new("ctrl-home", DocumentStart, ctx),
+        KeyBinding::new("ctrl-end", DocumentEnd, ctx),
+        KeyBinding::new("ctrl-shift-home", SelectDocumentStart, ctx),
+        KeyBinding::new("ctrl-shift-end", SelectDocumentEnd, ctx),
+        // Words.
+        KeyBinding::new("ctrl-left", MoveWordLeft, ctx),
+        KeyBinding::new("ctrl-right", MoveWordRight, ctx),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
+        KeyBinding::new("ctrl-backspace", DeleteWordBackward, ctx),
+        KeyBinding::new("ctrl-delete", DeleteWordForward, ctx),
+        // Paragraphs (source lines).
+        KeyBinding::new("ctrl-up", MoveParagraphUp, ctx),
+        KeyBinding::new("ctrl-down", MoveParagraphDown, ctx),
+        KeyBinding::new("ctrl-shift-up", SelectParagraphUp, ctx),
+        KeyBinding::new("ctrl-shift-down", SelectParagraphDown, ctx),
+        // Pages move the caret.
+        KeyBinding::new("pageup", MovePageUp, ctx),
+        KeyBinding::new("pagedown", MovePageDown, ctx),
+        KeyBinding::new("shift-pageup", SelectPageUp, ctx),
+        KeyBinding::new("shift-pagedown", SelectPageDown, ctx),
     ]);
 }
 
 #[cfg(target_os = "macos")]
-fn register_secondary_platform_key_bindings(_cx: &mut App) {}
+fn register_secondary_platform_key_bindings(cx: &mut App) {
+    let ctx = Some("HaneEditor");
+    cx.bind_keys([
+        // Line edges.
+        KeyBinding::new("cmd-left", Home, ctx),
+        KeyBinding::new("cmd-right", End, ctx),
+        KeyBinding::new("cmd-shift-left", SelectHome, ctx),
+        KeyBinding::new("cmd-shift-right", SelectEnd, ctx),
+        // Document edges.
+        KeyBinding::new("cmd-up", DocumentStart, ctx),
+        KeyBinding::new("cmd-down", DocumentEnd, ctx),
+        KeyBinding::new("cmd-shift-up", SelectDocumentStart, ctx),
+        KeyBinding::new("cmd-shift-down", SelectDocumentEnd, ctx),
+        KeyBinding::new("shift-home", SelectDocumentStart, ctx),
+        KeyBinding::new("shift-end", SelectDocumentEnd, ctx),
+        // Words.
+        KeyBinding::new("alt-left", MoveWordLeft, ctx),
+        KeyBinding::new("alt-right", MoveWordRight, ctx),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
+        KeyBinding::new("alt-backspace", DeleteWordBackward, ctx),
+        KeyBinding::new("alt-delete", DeleteWordForward, ctx),
+        // Paragraphs (source lines).
+        KeyBinding::new("alt-up", MoveParagraphUp, ctx),
+        KeyBinding::new("alt-down", MoveParagraphDown, ctx),
+        KeyBinding::new("alt-shift-up", SelectParagraphUp, ctx),
+        KeyBinding::new("alt-shift-down", SelectParagraphDown, ctx),
+        // Option+PageUp/Down moves the caret; plain Home/End/PageUp/PageDown
+        // and Control+L only scroll.
+        KeyBinding::new("alt-pageup", MovePageUp, ctx),
+        KeyBinding::new("alt-pagedown", MovePageDown, ctx),
+        KeyBinding::new("home", ScrollDocumentStart, ctx),
+        KeyBinding::new("end", ScrollDocumentEnd, ctx),
+        KeyBinding::new("pageup", ScrollPageUp, ctx),
+        KeyBinding::new("pagedown", ScrollPageDown, ctx),
+        KeyBinding::new("ctrl-l", CenterCursorLine, ctx),
+    ]);
+}
 
 /// `DocumentFindNext`/`DocumentFindPrevious` already get `f3`/`shift-f3` from
 /// `command_actions!` below, the same on every platform. macOS additionally
@@ -92,16 +201,14 @@ fn register_document_find_macos_key_bindings(_cx: &mut App) {}
 
 actions!(hane_editor, [OpenAiSelection]);
 
-/// Windows Rewrite uses Alt+I; macOS Rewrite uses Control+L (not Command),
-/// per Word's own keyboard/screen-reader docs (see
-/// `docs/ai-selection-actions-implementation-spec.md` section 3.1/10). Bound
-/// only to "HaneEditor", like every other body-editing action, so the
-/// shortcut never fires while a settings field, the sidebar filter, or an
-/// inline rename has focus.
+/// Windows Rewrite uses Alt+I, an app-specific key. macOS has no AI key:
+/// Control+L now centers the caret line (Issue #494), so the footer "AIに指示"
+/// button is the macOS entry (and is shown on both platforms). Bound only to
+/// "HaneEditor", like every other body-editing action, so the shortcut never
+/// fires while a settings field, the sidebar filter, or an inline rename has
+/// focus.
 #[cfg(target_os = "macos")]
-fn register_ai_selection_key_binding(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("ctrl-l", OpenAiSelection, Some("HaneEditor"))]);
-}
+fn register_ai_selection_key_binding(_cx: &mut App) {}
 
 #[cfg(not(target_os = "macos"))]
 fn register_ai_selection_key_binding(cx: &mut App) {
@@ -411,64 +518,166 @@ command_actions! {
             InputTarget::Body => view.dispatch(EditorCommand::SelectAll, cx),
         }
     },
-    Home ("home") => home |view, _window, cx| {
+    // Line, document and the Issue #494 word/paragraph/page actions below have
+    // an empty key: they are bound per platform in
+    // `register_secondary_platform_key_bindings`.
+    Home ("") => home |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter => view.move_sidebar_filter_home(cx),
             InputTarget::InlineRename => view.move_inline_rename_home(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineStart { extend: false }, cx),
         }
     },
-    End ("end") => end |view, _window, cx| {
+    End ("") => end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter => view.move_sidebar_filter_end(cx),
             InputTarget::InlineRename => view.move_inline_rename_end(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineEnd { extend: false }, cx),
         }
     },
-    SelectHome ("shift-home") => select_home |view, _window, cx| {
+    SelectHome ("") => select_home |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter => view.select_sidebar_filter_home(cx),
             InputTarget::InlineRename => view.select_inline_rename_home(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineStart { extend: true }, cx),
         }
     },
-    SelectEnd ("shift-end") => select_end |view, _window, cx| {
+    SelectEnd ("") => select_end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter => view.select_sidebar_filter_end(cx),
             InputTarget::InlineRename => view.select_inline_rename_end(cx),
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToLineEnd { extend: true }, cx),
         }
     },
-    DocumentStart ("secondary-up") => document_start |view, _window, cx| {
+    DocumentStart ("") => document_start |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter | InputTarget::InlineRename => {}
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToStart { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToStart { extend: false }, cx),
         }
     },
-    DocumentEnd ("secondary-down") => document_end |view, _window, cx| {
+    DocumentEnd ("") => document_end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
             InputTarget::SidebarFilter | InputTarget::InlineRename => {}
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToEnd { extend: false }, cx),
         }
     },
-    SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| {
+    // macOS Shift+Home/End also lands here; a one-line filter/rename field has
+    // only one "document", so its start/end is the field's start/end.
+    SelectDocumentStart ("") => select_document_start |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
-            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToStart { extend: true }, cx),
+            InputTarget::SidebarFilter => view.select_sidebar_filter_home(cx),
+            InputTarget::InlineRename => view.select_inline_rename_home(cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToStart { extend: true }, cx),
         }
     },
-    SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| {
+    SelectDocumentEnd ("") => select_document_end |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         match view.input_target() {
-            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
-            InputTarget::Body => view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx),
+            InputTarget::SidebarFilter => view.select_sidebar_filter_end(cx),
+            InputTarget::InlineRename => view.select_inline_rename_end(cx),
+            InputTarget::Body => dispatch_body_move(view, EditorCommand::MoveToEnd { extend: true }, cx),
+        }
+    },
+    MoveWordLeft ("") => move_word_left |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveWord { forward: false, stop: FORWARD_STOP, extend: false }, cx);
+        }
+    },
+    MoveWordRight ("") => move_word_right |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveWord { forward: true, stop: FORWARD_STOP, extend: false }, cx);
+        }
+    },
+    SelectWordLeft ("") => select_word_left |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveWord { forward: false, stop: FORWARD_STOP, extend: true }, cx);
+        }
+    },
+    SelectWordRight ("") => select_word_right |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveWord { forward: true, stop: FORWARD_STOP, extend: true }, cx);
+        }
+    },
+    DeleteWordBackward ("") => delete_word_backward |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::DeleteWord { forward: false, stop: FORWARD_STOP }, cx);
+        }
+    },
+    DeleteWordForward ("") => delete_word_forward |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::DeleteWord { forward: true, stop: FORWARD_STOP }, cx);
+        }
+    },
+    MoveParagraphUp ("") => move_paragraph_up |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveParagraph { forward: false, stop: FORWARD_STOP, extend: false }, cx);
+        }
+    },
+    MoveParagraphDown ("") => move_paragraph_down |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveParagraph { forward: true, stop: FORWARD_STOP, extend: false }, cx);
+        }
+    },
+    SelectParagraphUp ("") => select_paragraph_up |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveParagraph { forward: false, stop: FORWARD_STOP, extend: true }, cx);
+        }
+    },
+    SelectParagraphDown ("") => select_paragraph_down |view, _window, cx| {
+        if body_key_ready(view) {
+            view.dispatch(EditorCommand::MoveParagraph { forward: true, stop: FORWARD_STOP, extend: true }, cx);
+        }
+    },
+    MovePageUp ("") => move_page_up |view, window, cx| {
+        if body_key_ready(view) { view.move_page(false, false, window, cx); }
+    },
+    MovePageDown ("") => move_page_down |view, window, cx| {
+        if body_key_ready(view) { view.move_page(true, false, window, cx); }
+    },
+    SelectPageUp ("") => select_page_up |view, window, cx| {
+        if body_key_ready(view) { view.move_page(false, true, window, cx); }
+    },
+    SelectPageDown ("") => select_page_down |view, window, cx| {
+        if body_key_ready(view) { view.move_page(true, true, window, cx); }
+    },
+    // macOS Home/End/PageUp/PageDown/Control+L only scroll. Home/End keep
+    // moving within a filter or rename field, which has nothing to scroll.
+    ScrollDocumentStart ("") => scroll_document_start |view, _window, cx| {
+        if keys_claimed_elsewhere(view) { return; }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.move_sidebar_filter_home(cx),
+            InputTarget::InlineRename => view.move_inline_rename_home(cx),
+            InputTarget::Body => view.scroll_to_document_edge(false, cx),
+        }
+    },
+    ScrollDocumentEnd ("") => scroll_document_end |view, _window, cx| {
+        if keys_claimed_elsewhere(view) { return; }
+        match view.input_target() {
+            InputTarget::SidebarFilter => view.move_sidebar_filter_end(cx),
+            InputTarget::InlineRename => view.move_inline_rename_end(cx),
+            InputTarget::Body => view.scroll_to_document_edge(true, cx),
+        }
+    },
+    ScrollPageUp ("") => scroll_page_up |view, _window, cx| {
+        if !keys_claimed_elsewhere(view) && matches!(view.input_target(), InputTarget::Body) {
+            view.scroll_page(false, cx);
+        }
+    },
+    ScrollPageDown ("") => scroll_page_down |view, _window, cx| {
+        if !keys_claimed_elsewhere(view) && matches!(view.input_target(), InputTarget::Body) {
+            view.scroll_page(true, cx);
+        }
+    },
+    CenterCursorLine ("") => center_cursor_line_action |view, window, cx| {
+        if !keys_claimed_elsewhere(view) && matches!(view.input_target(), InputTarget::Body) {
+            view.center_cursor_line(window, cx);
         }
     },
     Undo ("secondary-z") => undo |view, _window, cx| {

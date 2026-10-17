@@ -172,7 +172,15 @@ infrastructure failure など product code の問題と判断できない場合�
 
 ### 4.2 Review
 
-通常レビューはCodeRabbitを使う。`.coderabbit.yaml` でnon-draft PRのAutomatic Reviewとpush後のAutomatic Incremental Reviewを有効にし、`auto_pause_after_reviewed_commits: 2` で過剰な再レビューを抑える。自動レビューはCommanderが発行するactionではなく、GitHubに現れたreview evidenceとして観測する。最終候補ではcurrent-head CI成功後に `@coderabbitai full review` を明示的に実行してPR全体を取り直す。途中で自動pauseした場合や追加確認が必要な場合だけ `@coderabbitai review` / `resume` を使う。対象head・reviewed range・完了状態をGitHub上の実結果で確認し、Codex Reviewは通常経路として要求せず、外部設定で投稿されてもCodeRabbit reviewの代替証拠にはしない。
+通常レビューはCodeRabbitを使う。`.coderabbit.yaml` でnon-draft PRのAutomatic Reviewとpush後のAutomatic Incremental Reviewを有効にし、`auto_pause_after_reviewed_commits: 2` で過剰な再レビューを抑える。自動レビューはCommanderが発行するactionではなく、GitHubに現れたreview evidenceとして観測する。最終候補ではcurrent-head CI成功後に `@coderabbitai full review` を明示的に実行してPR全体を取り直す。途中で自動pauseした場合や追加確認が必要な場合だけ `@coderabbitai review` / `resume` を使う。対象head・reviewed range・完了状態をGitHub上の実結果で確認する。
+
+#### CodeRabbit最終レビューのCodexフォールバック
+
+対象は最終候補のcurrent-head full reviewだけとする。CodeRabbitが明示的にskip/errorを返した場合、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または `@coderabbitai full review` の依頼から20分以内に対象headの完了を確認できない場合、Commanderは同じPR・current headに対して `@codex review` を一度だけ要求できる。CodeRabbitのレビューにfindingがあること自体はfallback理由にしない。レビュー前にopen・non-draft・same-repositoryのPR、current head、current-head CI成功を再確認し、対象repositoryがCodex Code Reviewに接続・有効化され、依頼するGitHubアカウントから使えることを確認する。Actionsや別のbotから代行コメントを投稿しない。
+
+Codexの👀 reactionだけでは完了としない。findingがある場合は、GitHub RESTのsubmitted reviewでCodex botの投稿者、`state`（`PENDING`ではないこと）、`submitted_at`、`commit_id`、review本文とreview commentsを確認し、`commit_id` が依頼対象のcurrent headと一致することを要求する。findingなしの実行ではformal review objectが作られない場合があるため、Codex botのreview receiptがno-findingsを明示し、本文の `Reviewed commit` が対象headのSHA prefixと一致すること、Codex Review Summaryの `status=completed` とfull `commit_sha` が同じcurrent headであること、current SHAを指すreview comment/threadがないことを合わせて確認する。Summaryの内部statusは公開review APIの代替ではなく、明示receiptとSHAを補う観測値としてのみ使う。Summaryのfinding flagsは古いreviewも含む集計のため、current headのfinding判定には使わず、reviewごとの`commit_id`とoutdated状態で絞る。結果を読む直前にheadとbase contextを再取得する。headが変わった結果は使わず、baseが主張へ影響する場合はcurrent baseに対するfresh evidenceを取り直す。Codexレビューが完了しない、投稿者・対象head・範囲が確認できない場合はレビュー不足のまま停止する。同じheadでfallbackを繰り返さない。
+
+CodexのGitHub Code ReviewはP0/P1の重大な問題に絞って指摘する。したがってCodexの完了は「CodeRabbitと同範囲の全指摘なし」を意味しない。CodeRabbitが後から同じcurrent contextのfull reviewを完了した場合、その結果も別のevidenceとして確認する。Codex fallbackはCI、必要なGUI、未解決review、Issueの受入条件を免除せず、修正や次工程の判断、mergeも行わない。
 
 current PR head の unresolved findings を一度に確認する。
 
@@ -360,7 +368,7 @@ action の結果が GitHub に残ったら、過去の判断をそのまま継�
 
 Claude、Codex、CodeRabbit、GUI runner などが provider / infrastructure 理由で失敗した場合、その失敗を product failure とみなさない。
 
-必要な evidence が得られなければ停止する。
+CodeRabbitの最終レビューがprovider / infrastructure理由で得られない場合は、§4.2の一度限りのCodex fallbackを使える。Codexレビューも取得できない、またはcurrent head / 必要なbase contextに結び付けられない場合は、必要なevidenceが不足したまま停止する。
 
 Claude の failure diagnostic が `usage_or_rate_limit` の場合だけ、既存の Claude checkpoint artifact と trusted `workflow_run` を使った Codex CLI fallback を許可する。この fallback は利用上限からの実装継続に限定し、一般的な provider routing や retry state machine にはしない。
 
