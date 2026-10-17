@@ -18,7 +18,7 @@ use hane_markdown::{
     BlockIndex, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection, ListProjectionItem,
     ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
     TableAlignment, TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
-    has_delimiter_markers, is_table_delimiter, parse_document,
+    has_delimiter_markers, is_table_delimiter, links_intersecting, parse_document,
 };
 #[cfg(test)]
 use hane_markdown::{BlockId, Confidence};
@@ -1161,8 +1161,7 @@ fn present_markdown_from_parse(
     let links = if formal_code_block == Some(true) {
         Vec::new()
     } else {
-        parsed
-            .links
+        links_intersecting(&parsed.links, range)
             .iter()
             .filter(|link| nodes.iter().any(|id| **id == link.node))
             .filter_map(|link| {

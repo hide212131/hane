@@ -1,5 +1,41 @@
 use hane_document::{Revision, SourceRange};
-use hane_markdown::{LinkParse, NodeKind, parse_document};
+use hane_markdown::{LinkParse, NodeKind, links_intersecting, parse_document};
+
+#[test]
+fn links_intersecting_bounds_the_run_at_range_edges() {
+    let source = "[a](https://a.com/) [b\nc](https://b.com/) [d](https://d.com/)";
+    let found = links(source);
+    assert_eq!(found.len(), 3);
+    let destinations = |range: SourceRange| -> Vec<String> {
+        links_intersecting(&found, range)
+            .iter()
+            .map(|link| link.destination.to_string())
+            .collect()
+    };
+    let (a, b, d) = (found[0].text_range, found[1].text_range, found[2].text_range);
+
+    // A range ending exactly at a link's start, or starting exactly at its end,
+    // does not intersect it.
+    assert!(destinations(SourceRange::new(0, a.start.0)).is_empty());
+    assert!(destinations(SourceRange::new(a.end.0, b.start.0)).is_empty());
+    assert!(destinations(SourceRange::new(d.end.0, source.len())).is_empty());
+    // A single byte inside the text intersects.
+    assert_eq!(
+        destinations(SourceRange::new(a.start.0, a.start.0 + 1)),
+        ["https://a.com/"]
+    );
+    // Either physical line of the multi-line link finds it, once, in order.
+    let newline = source.find('\n').expect("newline");
+    assert_eq!(
+        destinations(SourceRange::new(0, newline + 1)),
+        ["https://a.com/", "https://b.com/"]
+    );
+    assert_eq!(
+        destinations(SourceRange::new(newline + 1, source.len())),
+        ["https://b.com/", "https://d.com/"]
+    );
+    assert_eq!(destinations(SourceRange::new(0, source.len())).len(), 3);
+}
 
 fn links(source: &str) -> Vec<LinkParse> {
     parse_document(Revision(1), SourceRange::new(0, source.len()), source).links

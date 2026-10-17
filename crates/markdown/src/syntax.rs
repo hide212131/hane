@@ -240,6 +240,22 @@ impl MarkdownTree {
     }
 }
 
+/// The contiguous run of `links` whose text range intersects `range`.
+///
+/// `links` is in document order and link text never nests or overlaps, so
+/// both starts and ends are sorted; two binary searches bound the run without
+/// visiting links outside it. A link ending exactly at `range.start` or
+/// starting exactly at `range.end` does not intersect.
+pub fn links_intersecting(links: &[LinkParse], range: SourceRange) -> &[LinkParse] {
+    let first = links.partition_point(|link| link.text_range.end <= range.start);
+    let last = links.partition_point(|link| link.text_range.start < range.end);
+    if first < last {
+        &links[first..last]
+    } else {
+        &[]
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownParse {
     pub revision: Revision,

@@ -61,7 +61,7 @@ pub use markers::{
 pub use parser::parse_document;
 pub use syntax::{
     LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,
-    TableParse,
+    TableParse, links_intersecting,
 };
 
 #[cfg(test)]

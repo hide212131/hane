@@ -727,8 +727,7 @@ fn build_table_projections(
                         })
                         .collect::<Vec<_>>()
                         .into();
-                    let links = parsed
-                        .links
+                    let links = crate::links_intersecting(&parsed.links, row.source_range)
                         .iter()
                         .filter(|link| {
                             row.source_range.start <= link.text_range.start
