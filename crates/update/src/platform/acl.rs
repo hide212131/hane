@@ -34,6 +34,17 @@ pub(crate) fn verify(path: &Path, is_dir: bool) -> Result<()> {
     imp::verify(path, is_dir)
 }
 
+/// A stable text form of the current OS principal (effective UID, or the
+/// process token's user SID). It cannot be changed by the launching
+/// environment and is the same principal `verify` compares ownership with.
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", test)),
+    allow(dead_code, reason = "only supported placements derive an InstallId owner")
+)]
+pub(crate) fn principal_id() -> Result<String> {
+    imp::principal_id()
+}
+
 #[cfg(unix)]
 mod imp {
     use std::fs;
@@ -42,6 +53,12 @@ mod imp {
 
     use super::refuse;
     use crate::error::Result;
+
+    pub fn principal_id() -> Result<String> {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        Ok(format!("uid:{euid}"))
+    }
 
     pub fn secure_new(path: &Path, _is_dir: bool, mode: u32) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
@@ -202,6 +219,17 @@ mod imp {
         unsafe { IsWellKnownSid(sid, kind) != 0 }
     }
 
+    pub fn principal_id() -> Result<String> {
+        let sid = token_sid(TOKEN_USER_CLASS)?;
+        // SAFETY: `token_sid` returned a valid, validated SID copy.
+        let len = unsafe { GetLengthSid(sid_ptr(&sid)) } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(sid.as_ptr().cast::<u8>(), len) };
+        Ok(format!(
+            "sid:{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ))
+    }
+
     pub fn secure_new(path: &Path, is_dir: bool, _mode: u32) -> Result<()> {
         let user = token_sid(TOKEN_USER_CLASS)?;
         let mut acl = vec![0_u32; 128];
@@ -330,6 +358,10 @@ mod imp {
 
     use super::refuse;
     use crate::error::Result;
+
+    pub fn principal_id() -> Result<String> {
+        Err(refuse("the OS principal is unavailable on this OS"))
+    }
 
     pub fn secure_new(_path: &Path, _is_dir: bool, _mode: u32) -> Result<()> {
         Err(refuse("ownership cannot be checked on this OS"))

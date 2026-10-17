@@ -68,14 +68,44 @@ pub(crate) fn unsupported(detail: impl Into<String>) -> UpdateError {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn owner_name() -> Result<String> {
-    // The application hands this exact value to the helper (see
-    // `helper::spawn_helper`), whose environment is otherwise empty. A missing
-    // owner is a refusal, never a placeholder that derives another InstallId.
-    std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
+    // The OS principal, never `USERNAME`/`USER`: the launching environment
+    // cannot change it, and the helper (whose environment is empty) re-derives
+    // the same value itself. An unavailable principal is a refusal, never a
+    // placeholder that derives another InstallId.
+    owner_from(acl::principal_id())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+fn owner_from(principal: Result<String>) -> Result<String> {
+    principal
         .ok()
         .filter(|owner| !owner.is_empty())
-        .ok_or_else(|| unsupported("the OS user name is unavailable"))
+        .ok_or_else(|| unsupported("the OS principal is unavailable"))
+}
+
+#[cfg(all(test, unix))]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn the_owner_is_the_os_principal_not_the_environment() {
+        let owner = owner_from(acl::principal_id()).unwrap();
+        assert_eq!(owner, acl::principal_id().unwrap());
+        assert!(owner.starts_with("uid:"));
+        for name in ["USERNAME", "USER"] {
+            if let Ok(value) = std::env::var(name) {
+                assert_ne!(owner, value);
+            }
+        }
+    }
+
+    #[test]
+    fn an_unavailable_principal_is_unsupported() {
+        let err = owner_from(Err(unsupported("no token"))).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+        let err = owner_from(Ok(String::new())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+    }
 }
 
 /// Confirms that `exe` is the running application of a supported install.

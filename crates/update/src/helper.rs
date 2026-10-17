@@ -626,10 +626,9 @@ pub struct SpawnedHelper {
 }
 
 /// The helper's command: piped stdio, no arguments and an empty environment
-/// except for the one OS user name its placement lookup derives the
-/// `InstallId` from. That value is the parent's own resolved owner, so the
-/// helper reaches the same `InstallId`; when the parent has none, nothing is
-/// spawned. Apply and startup recovery both spawn through here.
+/// (the helper derives the owner of its `InstallId` from the OS principal it
+/// runs as, the same one as the parent). Apply and startup recovery both spawn
+/// through here.
 fn helper_command(exe: &Path) -> Result<Command> {
     let mut command = Command::new(exe);
     command
@@ -640,8 +639,6 @@ fn helper_command(exe: &Path) -> Result<Command> {
     if let Some(dir) = exe.parent() {
         command.current_dir(dir);
     }
-    #[cfg(any(windows, target_os = "macos"))]
-    command.env("USERNAME", crate::platform::owner_name()?);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -776,22 +773,18 @@ mod tests {
         .unwrap()
     }
 
-    /// The helper starts with an empty environment, so the owner its placement
-    /// lookup derives the `InstallId` from must be passed explicitly and equal
-    /// the parent's. `spawn_helper` (apply) and startup recovery both build
-    /// their command here.
-    #[cfg(any(windows, target_os = "macos"))]
+    /// The helper re-derives the owner from its own OS principal, so no owner
+    /// is passed through the environment. `spawn_helper` (apply) and startup
+    /// recovery both build their command here.
     #[test]
-    fn the_helper_environment_carries_only_the_parents_owner() {
-        let owner = crate::platform::owner_name().unwrap();
+    fn the_helper_environment_carries_no_owner() {
         let command = helper_command(Path::new("hane-updater")).unwrap();
         let envs: std::collections::BTreeMap<_, _> = command
             .get_envs()
             .filter_map(|(key, value)| Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned())))
             .collect();
-        assert_eq!(envs.get("USERNAME"), Some(&owner));
         assert!(
-            envs.keys().all(|key| key == "USERNAME" || key == "SystemRoot"),
+            envs.keys().all(|key| key == "SystemRoot"),
             "no ambient environment is restored: {envs:?}"
         );
     }
