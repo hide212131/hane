@@ -135,7 +135,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
         os: "windows",
         volume_id: &format!("{}:{:08x}", letter.to_ascii_uppercase(), volume.serial),
         install_path: &path_text,
-        owner: &owner_name(),
+        owner: &owner_name()?,
     })?;
     Ok(Placement {
         target: Target::WindowsX64,

@@ -67,12 +67,15 @@ pub(crate) fn unsupported(detail: impl Into<String>) -> UpdateError {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-pub(crate) fn owner_name() -> String {
+pub(crate) fn owner_name() -> Result<String> {
+    // The application hands this exact value to the helper (see
+    // `helper::spawn_helper`), whose environment is otherwise empty. A missing
+    // owner is a refusal, never a placeholder that derives another InstallId.
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .ok()
         .filter(|owner| !owner.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .ok_or_else(|| unsupported("the OS user name is unavailable"))
 }
 
 /// Confirms that `exe` is the running application of a supported install.

@@ -119,7 +119,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
         os: "macos",
         volume_id: &format!("apfs:{}", volume.id),
         install_path: &bundle.to_string_lossy(),
-        owner: &owner_name(),
+        owner: &owner_name()?,
     })?;
     Ok(Placement {
         target: Target::MacosArm64,

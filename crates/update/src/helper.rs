@@ -625,10 +625,12 @@ pub struct SpawnedHelper {
     pub child: Child,
 }
 
-/// Spawns `exe` (a verified helper copy) with piped stdio, no arguments and a
-/// minimal environment, and completes the `Hello`/`Prepared` handshake. A
-/// helper that does not prepare in time is stopped; it has changed nothing.
-pub fn spawn_helper(exe: &Path, request: &HelloRequest, timeout: Duration) -> Result<SpawnedHelper> {
+/// The helper's command: piped stdio, no arguments and an empty environment
+/// except for the one OS user name its placement lookup derives the
+/// `InstallId` from. That value is the parent's own resolved owner, so the
+/// helper reaches the same `InstallId`; when the parent has none, nothing is
+/// spawned. Apply and startup recovery both spawn through here.
+fn helper_command(exe: &Path) -> Result<Command> {
     let mut command = Command::new(exe);
     command
         .env_clear()
@@ -638,6 +640,8 @@ pub fn spawn_helper(exe: &Path, request: &HelloRequest, timeout: Duration) -> Re
     if let Some(dir) = exe.parent() {
         command.current_dir(dir);
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    command.env("USERNAME", crate::platform::owner_name()?);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -647,7 +651,14 @@ pub fn spawn_helper(exe: &Path, request: &HelloRequest, timeout: Duration) -> Re
         // CREATE_NO_WINDOW
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command.spawn()?;
+    Ok(command)
+}
+
+/// Spawns `exe` (a verified helper copy) with piped stdio, no arguments and a
+/// minimal environment, and completes the `Hello`/`Prepared` handshake. A
+/// helper that does not prepare in time is stopped; it has changed nothing.
+pub fn spawn_helper(exe: &Path, request: &HelloRequest, timeout: Duration) -> Result<SpawnedHelper> {
+    let mut child = helper_command(exe)?.spawn()?;
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = child.kill();
         let _ = child.wait();
@@ -763,6 +774,26 @@ mod tests {
             owner: "u",
         })
         .unwrap()
+    }
+
+    /// The helper starts with an empty environment, so the owner its placement
+    /// lookup derives the `InstallId` from must be passed explicitly and equal
+    /// the parent's. `spawn_helper` (apply) and startup recovery both build
+    /// their command here.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn the_helper_environment_carries_only_the_parents_owner() {
+        let owner = crate::platform::owner_name().unwrap();
+        let command = helper_command(Path::new("hane-updater")).unwrap();
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned())))
+            .collect();
+        assert_eq!(envs.get("USERNAME"), Some(&owner));
+        assert!(
+            envs.keys().all(|key| key == "USERNAME" || key == "SystemRoot"),
+            "no ambient environment is restored: {envs:?}"
+        );
     }
 
     struct Fixture {
