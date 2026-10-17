@@ -2158,4 +2158,145 @@ mod tests {
         });
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    // ----- C09 -----
+    //
+    // SelectDocumentStart/End reach the filter and a non-pending rename as
+    // "select to the field's start/end" (Issue #495, spec §6.2), the pending
+    // rename's guard makes them a no-op, and the body keeps its document-edge
+    // selection. The keys are the platform's own bindings for the actions.
+
+    const SELECT_DOCUMENT_START_KEY: &str = if cfg!(target_os = "macos") {
+        "cmd-shift-up"
+    } else {
+        "ctrl-shift-home"
+    };
+    const SELECT_DOCUMENT_END_KEY: &str = if cfg!(target_os = "macos") {
+        "cmd-shift-down"
+    } else {
+        "ctrl-shift-end"
+    };
+
+    /// Puts the caret after the emoji (byte 5 of `TEXT`, 9 bytes long) of the
+    /// focused filter or rename field.
+    fn caret_after_emoji(cx: &mut TestCx) {
+        cx.simulate_keystrokes(&format!("{LINE_START_KEY} right right"));
+        cx.run_until_parked();
+    }
+
+    fn surface_reversed(view: &TestView, cx: &mut TestCx, surface: Surface) -> bool {
+        view.read_with(cx, |view, _| match surface {
+            Surface::Filter => view.sidebar_filter.selection_reversed(),
+            Surface::Rename => view
+                .inline_rename
+                .as_ref()
+                .expect("rename is active")
+                .input
+                .selection_reversed(),
+            Surface::Body => {
+                let selection = view.editor().selection();
+                selection.anchor.0 > selection.active.0
+            }
+        })
+    }
+
+    fn select_document_edges_select_to_the_field_edges(
+        cx: &mut gpui::TestAppContext,
+        surface: Surface,
+        label: &str,
+    ) {
+        let root = fixture_root(label);
+        let (view, cx) = prepare_surface(cx, surface, &root, TEXT);
+        assert_eq!(TEXT.len(), 9);
+
+        caret_after_emoji(cx);
+        assert_eq!(surface_selection(&view, cx, surface), 5..5);
+        cx.simulate_keystrokes(SELECT_DOCUMENT_START_KEY);
+        cx.run_until_parked();
+        assert_eq!(surface_text(&view, cx, surface), TEXT);
+        assert_eq!(surface_selection(&view, cx, surface), 0..5);
+        assert!(surface_reversed(&view, cx, surface), "the active end is the start");
+
+        caret_after_emoji(cx);
+        cx.simulate_keystrokes(SELECT_DOCUMENT_END_KEY);
+        cx.run_until_parked();
+        assert_eq!(surface_text(&view, cx, surface), TEXT);
+        assert_eq!(surface_selection(&view, cx, surface), 5..9);
+        assert!(!surface_reversed(&view, cx, surface), "the active end is the end");
+
+        assert_other_surfaces_untouched(&view, cx, surface);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn select_document_edges_select_to_the_filter_edges(cx: &mut gpui::TestAppContext) {
+        select_document_edges_select_to_the_field_edges(cx, Surface::Filter, "c09-filter");
+    }
+
+    #[gpui::test]
+    fn select_document_edges_select_to_the_rename_edges(cx: &mut gpui::TestAppContext) {
+        select_document_edges_select_to_the_field_edges(cx, Surface::Rename, "c09-rename");
+    }
+
+    #[gpui::test]
+    fn select_document_edges_are_a_no_op_for_a_pending_rename(cx: &mut gpui::TestAppContext) {
+        let root = fixture_root("c09-pending");
+        let (view, cx) = prepare_surface(cx, Surface::Rename, &root, TEXT);
+        caret_after_emoji(cx);
+        let expected = (TEXT.to_owned(), 5..5, false, None);
+        assert_eq!(rename_state(&view, cx), expected);
+        set_rename_pending(&view, cx, true);
+
+        for key in [SELECT_DOCUMENT_START_KEY, SELECT_DOCUMENT_END_KEY] {
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            assert_eq!(
+                rename_state(&view, cx),
+                expected,
+                "{key} must not change a pending rename"
+            );
+            assert_eq!(
+                snapshot(&view, cx),
+                (String::new(), String::new(), Some(TEXT.to_owned())),
+                "{key} must not reach the body or the filter"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn select_document_edges_keep_selecting_to_the_body_document_edges(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("c09-body");
+        let (view, cx) = open_routing_view(cx, "one\ntwo", &root);
+        click_body(cx);
+        let set_caret = |view: &TestView, cx: &mut TestCx| {
+            view.update(cx, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(4)))
+                    .unwrap();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+
+        set_caret(&view, cx);
+        cx.simulate_keystrokes(SELECT_DOCUMENT_START_KEY);
+        cx.run_until_parked();
+        assert_eq!(surface_selection(&view, cx, Surface::Body), 0..4);
+        assert!(surface_reversed(&view, cx, Surface::Body));
+
+        set_caret(&view, cx);
+        cx.simulate_keystrokes(SELECT_DOCUMENT_END_KEY);
+        cx.run_until_parked();
+        assert_eq!(surface_selection(&view, cx, Surface::Body), 4..7);
+        assert!(!surface_reversed(&view, cx, Surface::Body));
+        assert_eq!(surface_text(&view, cx, Surface::Body), "one\ntwo");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter.text(), "", "filter leaked");
+            assert!(view.inline_rename.is_none(), "rename leaked");
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
