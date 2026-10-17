@@ -2039,6 +2039,113 @@ fn file_journal_store_round_trips_and_rejects_bad_files() {
     assert_eq!(code(store.load()), ErrorCode::LimitExceeded);
 }
 
+/// Index of a step that replaces an existing file (so it owns a backup path).
+fn replacing_step(world: &World) -> usize {
+    world
+        .plan
+        .steps
+        .iter()
+        .position(|s| s.old.is_some() && s.backup_rel.is_some())
+        .expect("plan has a replacing step")
+}
+
+#[test]
+fn journal_begin_pins_the_backup_path_to_the_step_namespace() {
+    let world = world();
+    let index = replacing_step(&world);
+    let step = &world.plan.steps[index];
+    assert_eq!(step.backup_rel.as_deref(), Some(format!("backup/{}", step.rel_path).as_str()));
+    // The canonical `backup/<rel_path>` is accepted.
+    UpdateJournal::begin(&world.plan, None).unwrap();
+
+    let other = format!("backup/{}-other", step.rel_path);
+    for bad in ["user.md", "backup/other.bin", other.as_str(), "backup", "backup/"] {
+        let mut plan = world.plan.clone();
+        plan.steps[index].backup_rel = Some(bad.to_string());
+        let result = UpdateJournal::begin(&plan, None);
+        let error = result.err().unwrap_or_else(|| panic!("backup {bad:?} was accepted"));
+        assert!(
+            matches!(error.code, ErrorCode::JournalInvalid | ErrorCode::ArchiveRejected),
+            "{bad:?}: {error}"
+        );
+    }
+    // Rejection is exact for a well-formed path outside the step's namespace.
+    let mut plan = world.plan.clone();
+    plan.steps[index].backup_rel = Some("user.md".to_string());
+    assert_eq!(code(UpdateJournal::begin(&plan, None)), ErrorCode::JournalInvalid);
+    plan.steps[index].backup_rel = Some("backup/other.bin".to_string());
+    assert_eq!(code(UpdateJournal::begin(&plan, None)), ErrorCode::JournalInvalid);
+
+    // A step without an old file must not carry a backup path.
+    let mut plan = world.plan.clone();
+    plan.steps[index].old = None;
+    assert_eq!(code(UpdateJournal::begin(&plan, None)), ErrorCode::JournalInvalid);
+}
+
+#[test]
+fn durable_journal_create_rejects_a_foreign_backup_path_and_stores_nothing() {
+    let world = world();
+    let index = replacing_step(&world);
+    let mut tampered = journal(&world);
+    tampered.steps[index].backup_rel = Some("user.md".to_string());
+
+    let store = FaultyJournalStore::default();
+    assert_eq!(
+        code(DurableJournal::create(store.clone(), tampered.clone())),
+        ErrorCode::JournalInvalid
+    );
+    assert!(store.stored().is_none());
+
+    let dir = TempDir::new("journal-backup-create");
+    let user_file = dir.path().join("user.md");
+    fs::write(&user_file, b"user data").unwrap();
+    let path = dir.path().join("journal.json");
+    assert_eq!(
+        code(DurableJournal::create(FileJournalStore::new(path.clone()), tampered)),
+        ErrorCode::JournalInvalid
+    );
+    assert!(!path.exists());
+    assert_eq!(fs::read(&user_file).unwrap(), b"user data");
+}
+
+#[test]
+fn reopening_a_journal_with_a_tampered_backup_path_is_rejected() {
+    let world = world();
+    let index = replacing_step(&world);
+    let dir = TempDir::new("journal-backup-open");
+    let user_file = dir.path().join("user.md");
+    fs::write(&user_file, b"user data").unwrap();
+    let path = dir.path().join("journal.json");
+
+    let good = journal(&world);
+    let mut store = FileJournalStore::new(path.clone());
+    store.store(&good).unwrap();
+    assert_eq!(
+        DurableJournal::open(FileJournalStore::new(path.clone())).unwrap().unwrap().journal(),
+        &good
+    );
+
+    let mut foreign = good.clone();
+    foreign.steps[index].backup_rel = Some("user.md".to_string());
+    let mut other_namespace = good.clone();
+    other_namespace.steps[index].backup_rel = Some("backup/other.bin".to_string());
+    let mut no_old = good.clone();
+    no_old.steps[index].old = None;
+    for (name, tampered) in [
+        ("foreign path", foreign),
+        ("other namespace", other_namespace),
+        ("backup without old", no_old),
+    ] {
+        // Write the bytes directly: `store` would refuse an invalid journal.
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let loaded = FileJournalStore::new(path.clone()).load();
+        assert_eq!(code(loaded), ErrorCode::JournalInvalid, "{name}");
+        let opened = DurableJournal::open(FileJournalStore::new(path.clone()));
+        assert_eq!(code(opened), ErrorCode::JournalInvalid, "{name}");
+        assert_eq!(fs::read(&user_file).unwrap(), b"user data", "{name}");
+    }
+}
+
 #[test]
 fn fs_disk_view_observes_identity_without_following_links() {
     let dir = TempDir::new("disk");
