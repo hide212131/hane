@@ -1,10 +1,12 @@
 # Issue #479 実装担当への引継ぎ
 
-作成日: 2026-10-13 JST。**この文書群は設計だけであり、Hane/Codexの実装・ビルド・実機試験はまだ行っていない。**
+作成日: 2026-10-13 JST。**この文書は設計時の引継ぎと、段階ごとの実装・確認手順を記録する。**
 
-## 1. 最初の作業
+2026-10-17追記: P0は[PR #485](https://github.com/hide212131/hane/pull/485)で実装され、[#480](https://github.com/hide212131/hane/issues/480)は完了した。以下のP0契約は同Issueの確定内容を反映する。設計時の記録を現在の未実装状態と読み替えず、以後の作業では未完了の各Issueと現在のmainを確認する。
 
-**最初は[#480](https://github.com/hide212131/hane/issues/480)だけを実装する。** 目的は、Codexを別途導入していないWindows/macOSで、設定画面のボタンから固定版をダウンロードし、Hane専用領域へ安全に初回導入できるようにすること。初回AI利用はネット接続必須とする。Haneの配布物にはruntime実行ファイルを入れず、修復・署名カタログ更新・Skills・汎用Pluginを同じ実装PRへ入れない。
+## 1. 設計時の最初の作業
+
+**設計時は[#480](https://github.com/hide212131/hane/issues/480)だけを先行して実装する方針とした。現在のP0実装・受入記録は同IssueとPR #485を参照する。** 目的は、Codexを別途導入していないWindows/macOSで、設定画面のボタンから固定版をダウンロードし、Hane専用領域へ安全に初回導入できるようにすること。初回AI利用はネット接続必須とする。Haneの配布物にはruntime実行ファイルを入れず、修復・署名カタログ更新・Skills・汎用Pluginを同じ実装PRへ入れない。
 
 設計ブランチは`docs/479-managed-codex-runtime-design`。親は[#479](https://github.com/hide212131/hane/issues/479)。資料は次の順に読む。
 
@@ -26,17 +28,20 @@
 | [#483 / P3](https://github.com/hide212131/hane/issues/483) | SkillsのみのローカルPackage | P2の一覧/registry/snapshotが確定 | 複数スキルの導入/更新/削除 |
 
 個人開発ではP0→P1→P2→P3を推奨する。P1署名鍵の準備や将来のネイティブPlugin仕様が未整備でも、P0の初回導入は止めない。
-## 3. P0の具体的な実装順
 
-### A. 固定した公式完全パッケージと再配布条件を確認する
+## 3. P0の実装・確認手順
 
-詳細設計第2節の2 targetについて固定assetを取得し、source tag/commit、archive size/SHA-256、内容inventory、entrypoint、必要なライセンス表示を確認する。macOS bare serverでの過去試験は完全パッケージやWindowsの証拠にしない。ライセンス監査で未確認の第三者物が残る場合、解決まで配布物の受入を止め、確認済みのように扱わない。
+### A. 固定した公式完全パッケージを確認する
 
-`assets/ai/codex-runtime-lock.json`、`assets/ai/inventory/<target>-0.157.1.json`、レビュー済みLICENSE/NOTICE資料を作る。これらは小さな固定メタデータと表示資料であり、runtime executableをHaneの配布物へ追加しない。実際の上流内容とライセンス範囲が確定する前に、想定の補助プログラム名や文書をでっち上げない。
+詳細設計第2節の2 targetについて固定assetを取得し、source tag/commit、archive size/SHA-256、内容inventory、entrypointを確認する。macOS bare serverでの過去試験は完全パッケージやWindowsの証拠にしない。
+
+#480の確定契約に従い、Haneによるruntimeの同梱・再配布は行わず、利用者の明示操作で公式GitHub Releaseから直接取得する。第三者ライセンス監査とLICENSE/NOTICEの収集・同梱はP0の受入条件に含めない。これはIssueの対象範囲の記録であり、ライセンス上の義務の有無を判断する記述ではない。P1の検証・ライセンス条件は#481に従い、この変更を適用しない。
+
+`assets/ai/codex-runtime-lock.json`、`assets/ai/inventory/<target>-0.157.1.json`に固定メタデータを記録する。runtime executableをHaneの配布物へ追加しない。補助プログラム名やinventoryは実際の上流archiveで確認した内容を使う。
 
 ### B. 初回ダウンロード・導入・診断を実装する
 
-起動時の自動通信やPATH探索を追加せず、AI設定画面の「インストール」操作を入口にする。lockに固定したGitHub Release assetだけをHTTPS取得し、source/redirect host、サイズ、SHA-256、展開inventory、target、entrypointを検査する。失敗はnetwork/hash/size/content/license/target/access/initializeなど原因別に表示する。
+起動時の自動通信やPATH探索を追加せず、AI設定画面の「インストール」操作を入口にする。lockに固定したGitHub Release assetだけをHTTPS取得し、source/redirect host、サイズ、SHA-256、展開inventory、target、entrypointを検査する。失敗はnetwork/hash/size/content/target/access/initializeなど原因別に表示する。
 
 payloadはHane app-data内の新しいstagingへ展開し、絶対パス・traversal・symlink/reparse・衝突・容量超過を拒否する。専用の一時CODEX_HOMEと空cwdでversion/initialize/停止を確認し、認証情報や通常HOMEを渡さない。成功後のみ不変のinstallationとして公開してactive pointerを更新する。処理中キャンセル、途中失敗、次回起動時の中断状態もIssue #480の契約に合わせる。
 
@@ -44,7 +49,7 @@ payloadはHane app-data内の新しいstagingへ展開し、絶対パス・trave
 
 ### C. Hane配布物をruntimeなしで検証する
 
-Windows ZIPとmacOS `.app`は小さなlock/inventoryと必要な表示資料だけを含み、runtime実行ファイルを含まないことを確認する。完成配布物を新しい場所へ展開し、Codex/Node/PATH上のCodexがないオンライン環境から「インストール」を操作して導入・初期化できることを2 OSそれぞれで記録する。Haneの既存Explorer連携用ファイルは維持する。
+Windows ZIPとmacOS `.app`のruntime向け資産は小さなlock/inventoryとし、runtime実行ファイルを含まないことを確認する。完成配布物を新しい場所へ展開し、Codex/Node/PATH上のCodexがないオンライン環境から「インストール」を操作して導入・初期化できることを2 OSそれぞれで記録する。Haneの既存Explorer連携用ファイルは維持する。
 
 配布工程の変更は必要最小限にし、`.github/**`またはworkflow保護ルールを変える必要がある場合は、Haneの専用ops手順に従う。権限やレビュー条件を弱めて通さない。runtime未配置をskip扱いにするCIは合格根拠にしない。
 
@@ -54,8 +59,11 @@ R01〜R13をpass/fail/not-runに分ける。`cargo test -p hane-ai --locked`、`
 
 fixtureで破損archive、hash/size不一致、悪意あるpath、リンク/reparse、容量超過、redirect拒否、ネットワーク失敗、キャンセル、activation中断を再現する。成功コマンド・終了コードは実際に実行した値だけを記録する。
 
-WindowsとmacOSで、完成配布物からの初回導入、実ChatGPTログイン、実Custom接続、通常Codexとの非干渉、no-consoleを分けて記録する。実アカウント/資格情報が与えられていなければ該当試験だけ未実施とし、実装や模擬試験結果を捨てない。ユーザーのauth.jsonをコピーして試験を通さない。
+WindowsとmacOSで、完成配布物からの初回導入、実ChatGPTログイン、実Custom接続、通常Codexとの非干渉、no-consoleを分けて記録する。P0の実接続が実行環境上不可能な場合は、可能な範囲の確認と未確認の境界を記録する。実画面確認は利用者の完了報告を採用し、スクリーンショット添付は受入条件にしない。P0の最終記録は#480とPR #485を参照する。ユーザーのauth.jsonをコピーして試験を通さない。
+
 ## 4. P1実装時の補足契約
+
+P1のライセンス検証とWindows/macOSの実画面証拠を含む受入条件は#481に従う。P0のライセンス監査・画像添付に関する受入変更をP1へ適用しない。配布詳細の第7.2節は共通の取得・展開、第7.4節はP1bカタログ、第7.5節はP1のhealthと適用を定める。
 
 候補healthで既存coordinatorを再利用するときも、通常runtimeを起動したまま候補をspawnしない。AIがidleであることを確認し、既存の所有guard・設定ロック順序を維持して通常childを停止する。health用CODEX_HOMEを使った検査・停止後、適用しない場合/失敗した場合は同じguardのもとで旧configへ戻す。restoreに失敗したら失敗を可視化する。ネットワークダウンロード中はこの所有権の切替を行わない。
 
@@ -81,7 +89,7 @@ catalog署名ファイルの形式は`{"schema_version":1,"key_id":"…","algori
 | macOS arm64 | runtimeなしの完成.app、設定画面からの導入、実行属性/配布保護、GUI、実認証、通常Codexとの同時利用 |
 | CI/ローカル自動試験 | manifest/展開/署名/状態遷移/競合/模擬provider/入力payload/回帰 |
 
-一方のOSでの成功をもう一方へ転記しない。既存のテストに合格しても、追加した機能の実画面や完成配布物を未確認ならそのまま残す。
+一方のOSでの成功をもう一方へ転記しない。既存のテストに合格しても、追加した機能の実画面や完成配布物を未確認ならそのまま残す。P0の実接続・実画面の記録方法は第3節Dと#480に従い、P1〜P3は各Issueの受入条件を維持する。
 
 ## 7. 報告・PR・完了条件
 
@@ -89,4 +97,4 @@ catalog署名ファイルの形式は`{"schema_version":1,"key_id":"…","algori
 
 実装PRの現在head/base、CI、current-head review、non-outdated unresolved thread、必要なGUI証拠を現在のリポジトリ手順に従って確認する。試験したcommitと後続commitを取り違えず、未実行のheadに結果を付け替えない。
 
-設計PRは`Refs #479`とし、`Closes #479`や実装子Issueの自動close指定を付けない。P0/P1/P2/P3の各実装・検証が完了するまではIssueをopenに保つ。リリース番号変更・配布は既存の仕組みで別途行い、今回の設計作成をリリース済みと表現しない。
+設計PRは`Refs #479`とし、`Closes #479`や実装子Issueの自動close指定を付けない。各実装Issueは、それぞれの確定した受入条件を満たすまでopenに保つ。2026-10-17時点ではP0の#480は完了しており、P1〜P3の#481〜#483はopenで追跡する。リリース番号変更・配布は既存の仕組みで別途行い、今回の設計作成をリリース済みと表現しない。

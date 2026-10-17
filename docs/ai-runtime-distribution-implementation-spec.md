@@ -1,12 +1,14 @@
 # Hane専用Codexの配布・導入・更新 詳細設計
 
-状態: **設計。製品コード・配布物・実機検証は未変更/未実施。** 作成日: 2026-10-13 JST。
+状態: **設計。2026-10-13時点の調査記録と、段階ごとの実装契約。** 作成日: 2026-10-13 JST。
 
 親: [#479](https://github.com/hide212131/hane/issues/479)。P0: [#480](https://github.com/hide212131/hane/issues/480)。P1: [#481](https://github.com/hide212131/hane/issues/481)。判断理由: [ADR-0033](adr/0033-managed-codex-runtime-and-extensions.md)。調査基準main: `af981629011f04f68b25c8b58e476eb3eeffa624`。
 
+2026-10-17追記: P0は[PR #485](https://github.com/hide212131/hane/pull/485)で実装され、#480は完了した。P0の受入条件は同Issueの確定契約に合わせて第2節・第10節へ反映した。P1は#481で未完了のまま追跡する。固定archiveの取得情報と限定smokeは、設計時点の確認記録として保持する。
+
 ## 1. 実装前提と対象
 
-現在の`main.rs::start_ai_service`は実行ファイルの位置を決めて`AiService`へ渡す。`AiService`が設定・認証・モデル・接続確認・選択文処理を管理し、`AiRuntime`が子プロセスの開始/終了を直列化する。これらを置換する第二のAIサービスは作らない。[C1][C2]
+調査基準mainの`main.rs::start_ai_service`は実行ファイルの位置を決めて`AiService`へ渡す。`AiService`が設定・認証・モデル・接続確認・選択文処理を管理し、`AiRuntime`が子プロセスの開始/終了を直列化する。これらを置換する第二のAIサービスは作らない。[C1][C2]
 
 P0では、AI設定画面の明示操作を入口に、固定版の完全App Server packageを取得・検査し、Hane専用領域へ初回導入する。初回のAI利用にはインターネット接続を必須とする。Hane ZIP / .appへruntime実行ファイルは同梱しない。P1では専用領域の修復、署名済みカタログからの更新、旧版復旧を加える。対象はWindows x64、macOS arm64。Linux/Windows arm64/macOS Intelの追加、文書モデル、汎用Pluginは対象外。
 
@@ -33,17 +35,19 @@ P0では、AI設定画面の明示操作を入口に、固定版の完全App Ser
 
 ### 2.2 配布lockと内容一覧
 
-実装時に`assets/ai/codex-runtime-lock.json`を追加し、schema、version、source commit、target、asset URL/ID/size/SHA、entrypoint、runtime/config/state profile、ライセンス一覧を固定する。ビルド中にlatestへ置換しない。
+P0では`assets/ai/codex-runtime-lock.json`にschema、version、source commit、target、asset URL/ID/size/SHA、entrypoint、runtime/config/state profileを固定する。ビルド中にlatestへ置換しない。
 
 最初の取得で、全アーカイブ項目の相対パス・種別・サイズ・ファイルSHA-256を`assets/ai/inventory/<target>-0.157.1.json`へ記録してレビューする。実際に含まれる補助プログラムを一覧化し、毎回の配布で項目の欠落/増加/変化を検査する。bare serverだけの試験結果をコピーしない。
 
-LICENSE/NOTICEは採用タグと配布依存物に対応するものを保存する。各表示の取得元・適用対象・内容SHAを一覧へ記録する。必要な表示の所在が不明な場合はその点をP0の阻害要因として報告し、配布を成功にしない。Hane本体のライセンスがあってもCodexの表示の代わりにはしない。[O3]
+P0ではHaneによるruntimeの同梱・再配布を行わず、公式GitHub Releaseから利用者の端末へ直接取得する。#480の確定契約に従い、第三者ライセンス監査、LICENSE/NOTICEの収集・同梱、license一覧・資料の検査はP0の受入条件に含めない。これはIssueの対象範囲の記録であり、ライセンス上の義務の有無を判断する記述ではない。
+
+P1のライセンス検証は#481の契約を維持する。採用タグと配布依存物に対応するLICENSE/NOTICEを保存し、各表示の取得元・適用対象・内容SHAを一覧へ記録する。必要な表示の所在が不明なら、その点をP1の阻害要因として報告し、確認済みと扱わない。Hane本体のライセンスがあってもCodexの表示の代わりにはしない。[O3]
 
 ## 3. 配置と解決順序
 
 ### 3.1 配置
 
-HaneのZIP / .appにはruntimeの実行ファイルを置かず、小さな固定lock、inventory、検査済みLICENSE/NOTICE資料だけをアプリ資産として含める。利用者の明示的な操作で取得したpayloadとmanifestはHane app-dataへ置く。
+HaneのZIP / .appにはruntimeの実行ファイルを置かず、P0のruntime向け資産は小さな固定lockとinventoryとする。利用者の明示的な操作で取得したpayloadとmanifestはHane app-dataへ置く。P1のライセンス資料は第2.2節と#481の契約に従う。
 
 ```text
 <Hane app data>/ai/
@@ -54,7 +58,7 @@ HaneのZIP / .appにはruntimeの実行ファイルを置かず、小さな固�
   runtime-activation.json             # 切替途中だけ存在するjournal
   runtimes/<target>/<bundle-id>/<installation-id>/
     manifest.json
-    licenses/...
+    licenses/...                      # P1の検証資料。P0では要求しない
     payload/...
   runtime-staging/<operation-id>/
   runtime-health/<operation-id>/
@@ -74,7 +78,9 @@ app-dataは既存の`FileStateStore::from_environment()`を使う。Windows標�
 
 ### 3.3 manifestとポインター
 
-固定lockは`assets/ai/codex-runtime-lock.json`に置き、schema、version、source commit、target、asset URL/ID/size/SHA、entrypoint、runtime/config/state profile、全license sourceを固定する。実行時にlatestを解決しない。`manifest.json`は`schema_version=1`、`bundle_id`、`target`、`codex_version`、`source_commit`、`entrypoint`、`archive_sha256`、`files`、`licenses`、`runtime_profile`、`config_profile`、`state_profile`を持つ。未知schemaは拒否する。各`files` entryは相対path/type/size/sha256/実行属性を持ち、全payloadファイルを覆う。
+固定lockは`assets/ai/codex-runtime-lock.json`に置き、schema、version、source commit、target、asset URL/ID/size/SHA、entrypoint、runtime/config/state profileを固定する。実行時にlatestを解決しない。`manifest.json`は`schema_version=1`、`bundle_id`、`target`、`codex_version`、`source_commit`、`entrypoint`、`archive_sha256`、`files`、`runtime_profile`、`config_profile`、`state_profile`を持つ。未知schemaは拒否する。各`files` entryは相対path/type/size/sha256/実行属性を持ち、全payloadファイルを覆う。
+
+P0ではlicense sourceや`licenses`を必須にしない。P1では#481のライセンス検証のため、固定lockに全license source、manifestに`licenses`を保持する。
 
 `active-runtime.json`は`schema_version=1`、単調増加`revision`、`current`、`previous_successful`を持つ。各参照はtarget/bundle-id/installation-idだけを持ち、任意の絶対パス、URL、キー、CODEX_HOMEを保存しない。P0初回導入時はcurrentのみを設定し、既存の`ai-settings.json`と`user-prompts.json`は移行しない。
 
@@ -135,25 +141,21 @@ AI設定の先頭に「AI用プログラム」を追加する。現在の版、�
 
 ## 6. P0: 初回ダウンロード
 
-Haneの製品配布工程にCodex実行ファイルを追加しない。固定lock、inventory、検査済みlicense資料だけを小さなアプリ資産として配布する。利用者のPCでは実行時にPython/Node.js/npmを要求せず、Rust側のruntime installerが固定HTTPS URLから取得する。Haneのビルド時にlatestへ置換しない。
+Haneの製品配布工程にCodex実行ファイルを追加しない。P0のruntime向け資産は小さな固定lockとinventoryとし、ライセンス監査・表示資料の収集や同梱は第2.2節のとおり受入条件に含めない。利用者のPCでは実行時にPython/Node.js/npmを要求せず、Rust側のruntime installerが固定HTTPS URLから取得する。Haneのビルド時にlatestへ置換しない。
 
-完成したWindows ZIPおよびmacOS .appから起動し、Codex/Node/PATH上のCodex/開発用overrideを見せない試験環境で、設定画面の「インストール」操作を行う。実際の固定archiveを取得し、archive hash、inventory、license文書、展開先、initialize/stopを確認する。Hane配布物を展開し直して試験し、開発ツリーのfixtureのみで受入済みにしない。初回取得にはインターネット接続が必要であり、ネットワークなしではAIのみ利用不可、文書編集は継続できる。
+完成したWindows ZIPおよびmacOS .appから起動し、Codex/Node/PATH上のCodex/開発用overrideを見せない試験環境で、設定画面の「インストール」操作を行う。実際の固定archiveを取得し、archive hash、inventory、展開先、initialize/stopを確認する。Hane配布物を展開し直して試験し、開発ツリーのfixtureのみで受入済みにしない。初回取得にはインターネット接続が必要であり、ネットワークなしではAIのみ利用不可、文書編集は継続できる。
 
-CI path filterはruntime code、固定lock/inventory/licenses、対応するtestsを対象にする。runtime binaryを各OS release assetへ同梱するためのworkflow変更は行わない。ライセンスまたは固定inventoryに不足があれば、installerと検査処理はfail closedにする。テストのskipは成功扱いにしない。
+P0のCI path filterはruntime code、固定lock/inventory、対応するtestsを対象にする。runtime binaryを各OS release assetへ同梱するためのworkflow変更は行わない。固定inventoryに不足があれば、installerと検査処理はfail closedにする。テストのskipは成功扱いにしない。
 
-## 7. P0: 固定版の取得・展開・初回導入
+## 7. 取得・展開と段階ごとの導入手順
 
-### 7.1 P0固定lockとP1署名カタログ
+### 7.1 P0: 固定lock
 
 P0はHane本体に含むレビュー済みlockだけからCodex 0.157.1を取得する。ユーザー指定URL、latest、無署名catalog、通常Codexのコピーは使わない。公式GitHub release assetのURLはIssue #480と本節2.1で固定する。HTTPSを必須にし、redirectは実測・レビュー済みのGitHub資産配信hostだけを許可する。取得元URL、各redirect host、status、サイズを秘密のqueryを除いて記録する。
 
-P1独立更新はGitHub Releases上の固定入口`ai-runtime-catalog-v1/catalog.json`と`catalog.sig`を使う。このtag/資産は新規実装する公開物で、現在存在するとは扱わない。P1 catalogは最大256 KiB。Ed25519のdetached signatureを取得したJSONの生bytesに対して検証してからparseする。JSON再整形や独自canonicalizationを署名入力にしない。署名はbase64の64 bytes、key IDを持ち、公開鍵はHane本体に埋め込む。暗号実装を自作せず既存ライブラリを使う。
+P1bの署名カタログは第7.4節を正とする。
 
-P1 catalogにはschema、channel=stable、単調増加sequence、issued_at、expires_at、entriesを置く。entryはtarget、Hane version range、bundle/manifest URL・size・hash、runtime/config/state profile、許可する更新元bundle IDとrollback先ID、検証証拠URLを持つ。署名済みでもHaneが知らないschema/profileや不明な更新元には適用しない。最高受理sequenceより古いもの、期限切れ、未来時刻が5分を超えるもの、未知key ID、署名不一致は更新不可。catalog有効期限は最大30日とし、時計異常なら説明付きで停止する。既存版での編集/AI起動は止めない。
-
-P1秘密鍵はmaintainerが生成・管理し、リポジトリへ置かず保護されたrelease環境だけで使う。catalog検証/対象OS試験後に明示公開する。鍵未設定中はP0の固定版初回導入を利用可能とし、P1独立更新のみ利用不可と表示する。常駐サービスや複数チャンネルは作らない。
-
-### 7.2 展開と有限処理
+### 7.2 P0/P1共通: 展開と有限処理
 
 ダウンロード上限512 MiB、総展開上限2 GiB、最大10,000項目、manifestのファイル数/サイズ以内とする。HTTP接続20秒、無進捗60秒、全体15分を上限とし、有限の失敗をUIへ返す。これは内部timeoutであり利用者への完了予測ではない。ネットワーク再試行は利用者操作にし、永久retryをしない。
 
@@ -163,16 +165,16 @@ P1秘密鍵はmaintainerが生成・管理し、リポジトリへ置かず保�
 
 cancelではダウンロードと新規ファイル作成を止め、自分のstagingだけを消す。検査済みcandidateは保存しても自動適用しない。解凍器が指定外の場所へ書かないことを攻撃fixtureで確認する。
 
-### 7.3 healthと初回確定
+### 7.3 P0: healthと初回確定
 
-1. stagingへ取得し、圧縮hash、内容一覧、ライセンス、target/entrypointを検査する。
+1. stagingへ取得し、圧縮hash、内容一覧、target/entrypointを検査する。
 2. 専用health CODEX_HOMEと空cwdで候補の`--version`、initialize/initialized/停止を確認する。既存runtimeの起動/停止機構を再利用し、同時に2つのサーバーを起動しない。通常の認証HOMEへ触れない。
 3. 検査中はOPENAI_API_KEY/既存認証/host session変数を渡さず、model/turn/account-loginを呼ばない。実AI接続確認はこのhealth checkに含めない。
 4. 全検査に成功したpayloadだけを不変installationとして保存し、`active-runtime.json`をatomic更新する。既存版がない初回導入でpointer更新が失敗したら、AI runtimeは未導入のままとしcandidateだけを掃除する。
 5. `runtime-install.lock`はstaging/final公開を守る。設定/owner lockと同時保持しない。通常AIがbusy、別Hane所有、終了未確認ならpointerを変えない。
 6. 適用直前にpointer revision、settings generation、candidate digestを再検査する。callbackはoperation IDとruntime generationが一致するものだけ反映する。
 
-### 7.4 P1独立更新
+### 7.4 P1b: 署名カタログによる独立更新
 
 P1bの独立更新はGitHub Releases上の固定入口`ai-runtime-catalog-v1/catalog.json`と`catalog.sig`を使う。このtag/資産は**新規実装する公開物で、現在存在するとは扱わない**。
 
@@ -186,17 +188,9 @@ P1bの独立更新はGitHub Releases上の固定入口`ai-runtime-catalog-v1/cat
 
 元URLはHTTPSかつ`github.com/openai/codex/releases/download/`または`github.com/hide212131/hane/releases/download/`の承認資産に限定する。GitHubの資産配信先へのHTTPS redirectは既知のGitHub資産ホストだけ許し、最大5回、認証header/cookieは送らない。signed URLのqueryをログに残さない。loopback/private IPへのredirectや任意hostは拒否する。
 
-### 7.2 展開と有限処理
+### 7.5 P1: healthと修復・更新の適用
 
-ダウンロード上限512 MiB、総展開上限2 GiB、最大10,000項目、manifestのファイル数/サイズ以内とする。HTTP接続20秒、無進捗60秒、全体15分を上限とし、有限の失敗をUIへ返す。これは内部timeoutであり利用者への完了予測ではない。ネットワーク再試行は利用者操作にし、永久retryをしない。
-
-展開は新しい同一ボリュームのstagingだけへ行う。絶対パス、`..`、drive prefix、Windows ADS、予約名、末尾dot/space、正規化/case-insensitive衝突、特殊デバイス項目を拒否する。既存root/親に予期しないsymlink/reparseがあれば停止する。
-
-通常はregular file/directoryのみを許可する。上流の承認inventoryに内部相対symlinkが実在する場合だけ、その正確なlink項目を許可できる。リンク先が同一payload内の検査済み通常ファイルであること、循環/連鎖がないこと、展開中にリンクを辿らないことを検査し、通常ファイル展開後に作成する。Windowsではreparseを作る必要のない公式Windows内容を前提に試験し、未知のlinkを追加承認しない。任意Packageにこの例外を流用しない。
-
-cancelではダウンロードと新規ファイル作成を止め、自分のstagingだけを消す。検査済みcandidateは保存しても自動適用しない。解凍器が指定外の場所へ書かないことを攻撃fixtureで確認する。
-
-### 7.3 healthと適用の順序
+P1aの同版修復はP0と同じ固定manifest・公式URL・hashを使い、P1bの更新は第7.4節の署名カタログを使う。ライセンス検証を含むP1の受入条件は#481に従う。取得・展開の共通条件は第7.2節を参照する。
 
 1. stagingへ取得し、圧縮hash、内容一覧、ライセンス、target/entrypointを検査する。
 2. 通常AIがidleで自分がruntimeを所有できるときに、専用health CODEX_HOMEと空cwdで候補の`--version`およびinitialize/initialized/停止を検査する。候補検査も既存runtimeの起動/停止機構を再利用し、同時に2つのサーバーを起動しない。通常の認証HOMEへ触れない。
@@ -243,7 +237,7 @@ Windows補助プログラムのサービス/pipe/一時ファイル等に共有�
 | ID | 必須試験 |
 |---|---|
 | R01 | 2 targetの公式archive size/hash/source commit/content inventory/entrypoint一致 |
-| R02 | Hane製品配布物にruntime binaryを含めず、固定lock/inventory/license資料だけが含まれる |
+| R02 | Hane製品配布物にruntime binaryを含めず、runtime向け資産は固定lock/inventoryとする。ライセンス監査・表示資料の収集と同梱はP0の受入条件に含めない |
 | R03 | 完成ZIP/.app、Codex/Node/PATH上Codexなし、オンライン環境から「インストール」を操作し、固定版を取得・検証・導入してinitialize/停止 |
 | R04 | 明示path、相対path拒否、無言fallbackなし、allowlist外redirect拒否 |
 | R05 | 欠損・破損・target相違・network失敗・hash不一致・アクセス拒否・不正exe・初期化失敗を分類 |
@@ -254,7 +248,7 @@ Windows補助プログラムのサービス/pipe/一時ファイル等に共有�
 | R10 | Windows/macOSで実ChatGPTログインと固定接続確認。模擬と別記録 |
 | R11 | Windows/macOSで実Custom接続確認。利用者がキーを画面へ直接入力 |
 | R12 | Windows no-console、pipe transport、停止を完成Hane配布物から確認 |
-| R13 | exact-head CI/レビュー、2 OS GUI、完成Hane配布物の再検証 |
+| R13 | exact-head CI/レビュー、2 OSの実画面確認、完成Hane配布物の再検証。実画面は利用者の完了報告で確認し、画像添付は不要 |
 
 ### P1
 
@@ -274,13 +268,17 @@ Windows補助プログラムのサービス/pipe/一時ファイル等に共有�
 | U12 | P0/P1修復は署名鍵なしで使え、独立catalog更新だけ鍵なしで無効 |
 | U13 | 2 OS実画面、exact-head CI/レビュー、公開catalogと取得物の一致 |
 
-各IDはpass/fail/not-runを区別する。CIの模擬試験は実アカウント試験の代替にしない。実アカウント試験に必要なログイン・keyがなければ、そのIDを未実施と明記しIssueを閉じない。模擬試験までの実装やPRを放棄する理由にはしない。
+各IDはpass/fail/not-runを区別し、模擬試験と実アカウント試験の結果を分けて記録する。
 
-証拠は`docs/ai-runtime-evidence/<phase>-<head>/README.md`へ、OS/CPU、Hane exact head、固定archive hash、Codex version、操作/終了結果、対象/対象外を保存する。本文・key・token・生認証headerは含めない。
+P0では#480の確定契約に従い、実ChatGPT/Custom接続が実行環境上不可能な場合は、可能な範囲の確認と未確認の境界を記録する。Windows/macOSの実画面確認は利用者の完了報告を採用し、スクリーンショット添付は受入条件にしない。P0の最終的な実装・検証記録は[#480](https://github.com/hide212131/hane/issues/480)と[PR #485](https://github.com/hide212131/hane/pull/485)を参照する。
+
+P1は#481の受入条件を維持する。実アカウント試験に必要なログイン・keyがなければ、その試験を未実施と明記し、未確認の受入項目があるまま#481を閉じない。模擬試験までの実装やPRを放棄する理由にはしない。
+
+P1の証拠は`docs/ai-runtime-evidence/<phase>-<head>/README.md`へ、OS/CPU、Hane exact head、固定archive hash、Codex version、操作/終了結果、対象/対象外を保存する。本文・key・token・生認証headerは含めない。
 
 ## 11. 実装順序と完了の境界
 
-P0は(a)固定lock/inventory/license資料、(b)resolver/診断、(c)明示的な固定版download/安全な初回導入、(d)完成Hane配布物からの2 OS試験の順。P1は(a)専用保存/repair fixture、(b)署名catalog検証・更新とrollback、(c)画面、(d)競合/復旧の順。
+P0は(a)固定lock/inventory、(b)resolver/診断、(c)明示的な固定版download/安全な初回導入、(d)完成Hane配布物からの2 OS試験の順。P0の実接続・実画面の記録方法は第10節に従う。P1は(a)専用保存/repair fixture、(b)署名catalog検証・更新とrollback、(c)画面、(d)競合/復旧の順。
 
 設計PRには製品コード、runtime binary、秘密鍵、CI成功の捏造、release操作を含めない。実装PRが開発運用policyの変更を必要とすると判断した場合は、配布修正へ混ぜず理由を別途提示する。
 
