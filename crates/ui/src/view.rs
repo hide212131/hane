@@ -3846,8 +3846,7 @@ impl EditorView {
         let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
         let offset = layout.source_at_xy_with_bias(visual, row_index, x, local_y, shaper, bias)?;
         let glyph_offset = layout
-            .glyph_source_at_xy(visual, row_index, x, local_y, shaper)
-            .unwrap_or(offset);
+            .glyph_source_at_xy(visual, row_index, x, local_y, shaper);
         Some(RowHit {
             offset,
             glyph_offset,
@@ -3956,7 +3955,8 @@ impl EditorView {
     ) -> RowClick {
         let offset = hit.offset;
         if is_link_open_modifier(modifiers, macos)
-            && let Some(destination) = self.link_destination_at(line, hit.glyph_offset)
+            && let Some(glyph_offset) = hit.glyph_offset
+            && let Some(destination) = self.link_destination_at(line, glyph_offset)
         {
             return RowClick::OpenLink(destination);
         }
@@ -5470,7 +5470,8 @@ struct RowHit {
     /// The nearest caret boundary, used for ordinary selection editing.
     offset: SourceOffset,
     /// Where the glyph under the pointer starts, used to hit-test link text.
-    glyph_offset: SourceOffset,
+    /// `None` when the pointer is in blank space outside any drawn glyph.
+    glyph_offset: Option<SourceOffset>,
 }
 
 /// What a left click on a text row resolved to.

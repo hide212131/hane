@@ -1261,6 +1261,36 @@ fn a_caret_at_a_wrap_point_renders_at_the_start_of_the_next_row() {
 }
 
 #[test]
+fn glyph_hit_test_ignores_blank_space_around_a_wrapped_row() {
+    let (block, layout) = laid_out(WRAPPED).into_iter().next().expect("one block");
+    let shaper = shaper();
+    let row = &layout.lines[0];
+    let start = row.source_range.start.0;
+    let end = row.source_range.end.0;
+    let width = (end - start) as f32 * 8.0;
+    let glyph = |x: f32| layout.glyph_source_at_xy(&block, 0, x, 1.0, &shaper);
+
+    // Left of the first glyph is margin, not the glyph at the row start.
+    assert_eq!(glyph(-4.0), None);
+    // Both halves of the first, a middle, and the last glyph resolve to it.
+    assert_eq!(glyph(1.0), Some(SourceOffset(start)));
+    assert_eq!(glyph(7.0), Some(SourceOffset(start)));
+    assert_eq!(glyph(3.0 * 8.0 + 1.0), Some(SourceOffset(start + 3)));
+    assert_eq!(glyph(3.0 * 8.0 + 7.0), Some(SourceOffset(start + 3)));
+    assert_eq!(glyph(width - 7.0), Some(SourceOffset(end - 1)));
+    assert_eq!(glyph(width - 1.0), Some(SourceOffset(end - 1)));
+    // Right of the last glyph the soft break's boundary belongs to the next
+    // row, so the blank space must not resolve to it.
+    assert_eq!(glyph(width), None);
+    assert_eq!(glyph(width + 12.0), None);
+    // The caret hit-test is unchanged and still snaps to the boundary.
+    assert_eq!(
+        layout.source_at_xy(&block, 0, width + 12.0, 1.0, &shaper),
+        Some(SourceOffset(end))
+    );
+}
+
+#[test]
 fn multi_line_constructs_lay_out_one_row_per_source_line_when_they_fit() {
     let source = "> one\n> two\n\n- a\n- b\n\n```rs\nlet x=1;\n```\n\n| a | b |\n| - | - |\n";
     for (block, layout) in laid_out(source) {
