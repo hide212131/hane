@@ -4,7 +4,19 @@
 採用済み設計: `docs/adr/0034-zip-application-updates.md`、`docs/application-update-implementation-spec.md`、`docs/application-update-implementation-handoff.md`
 前段の実装: [#512 U0/U1/U3](https://github.com/hide212131/hane/pull/512)
 準備時の基点: `f9da614d93158fba95b5939ffdb44c67f06b8657`（#512 head）
-状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）、increment 2（Windows x64 所有ファイル適用のhelper接続）、increment 3（限定health起動とdurable commit/rollback）をコードに追加済み。macOS bundle swap、実OSでの二版適用は未実施で、「再起動して更新」は有効化していない。
+状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）、increment 2（Windows x64 所有ファイル適用のhelper接続）、increment 3（限定health起動とdurable commit/rollback）、increment 4（macOS bundle swapとjournal/recovery）をコードに追加済み。実macOS・実Developer ID署名・実Gatekeeperでの二版適用は未実施で、「再起動して更新」は有効化していない。
+
+### Increment 4: macOS bundle適用と復旧（`crates/update/src/macos_apply.rs`、`platform/macos.rs`）
+
+- OS固有の操作は `BundleHost` trait（volume照会、swap対応のprobe、`RENAME_SWAP`相当の交換、Developer ID署名のstrict検証、Gatekeeper評価）に閉じる。実装 `platform::macos::MacHost` は macOS ビルドだけに存在し、他OSでは `PlatformBackend` が `NotApplicable` で拒否する。journal / 復旧は `Placement::target` で選ぶ `DiskView`（macOSは `BundleView`）を使い、Windows の所有ファイル用 view と混ざらない。
+- helperは親終了後（排他runtime lease保持後）に、現在の `Hane.app` と候補の両方について、固定Bundle ID、Info.plistの版・source SHA（catalogの `source_sha`）・updater protocol、固定Team IDのDeveloper ID署名（`codesign --verify --deep --strict` と要件指定）、Gatekeeper評価（`spctl --assess`）を検査する。Team ID未設定は `TrustUnconfigured`、署名不一致は `SignatureInvalid`で、mutation前に停止する。任意のDeveloper ID、ad-hoc再署名、quarantine除去、Translocation回避はしない。
+- 候補はアプリが `transaction_dir/candidate/` へcopyしたcatalog/署名/archiveをhelperが再検証して `transaction_dir/stage/` へ展開したものだけを使う。`transaction_dir` はinstallと同じ親（coordination directory）の下にあるため、候補はもともと同じvolumeのprivate領域にある。それでもinstallとstaged candidateのvolume idが同一で、両方がローカルの書込可能なAPFSであることを確認し、さらにinstallの親とstageの親にそれぞれ作った一時directoryを実際に交換して swap-renaming 対応を確かめる。条件を満たさなければ journal 作成前に `UnsupportedInstall` で拒否する。
+- bundle identity は `Info.plist`、`Contents/MacOS/hane`、`Contents/Helpers/hane-updater`、`Contents/_CodeSignature/CodeResources` のsize/SHA-256を一つの `FileIdentity` にまとめたもの。`CodeResources` が他資源のhashを封印するため、署名後の変更はidentityを変える。journalは `Hane.app` という一つのstepを持ち、旧identity、新identity、backup（`backup/Hane.app` = swap後に旧bundleが置かれるstaged slot）を記録する。
+- 手順は ExitAuthorized → Applying → step Intent（durable）→ 旧/新identityを再観測 → 一回の交換 → 交換後の両identityを観測 → step Applied（durable）→ AwaitingHealth。先に既存bundleを消す二段階renameは使わない。
+- health起動は既存の `ProcessLauncher` / `conclude_with_child` を使い、正規配置の `Contents/MacOS/hane` を限定childとして起動する。起動前に生きたbundleがjournalの新identityと一致し、Team IDで再検証できることを確認する。`Committed` がdurableになるまで `Commit` は送らず、成功の戻りは `settled_result`（Windowsと共通）を通る。
+- health失敗・timeout・crash・不一致では、childの終了とlease解放を確認してから、同じ交換（`BundleOps::restore`）で旧bundleへ戻す。復旧は journal だけでなく実diskのlive/slot identityで方向を決める（live=旧なら交換しない、live=新かつslot=旧なら一回交換、それ以外は未知として `RecoveryRequired`）。この判定は既存の `apply::recover` / `decide_recovery` をそのまま使うため、各中断点（intent前、交換後・Applied前、AwaitingHealth、RollingBack途中、rollback交換後・journal更新前）で二重に交換しない。未知identity、損傷したbundle、消えたbackup、intentなしの交換は何も上書きせず `RecoveryRequired` にする。
+- 検証範囲: fake `BundleHost` と一時directoryによる決定的なunit testのみ（成功commitで新bundleが残る、health失敗で旧bundleへ戻る、intentがswap前にdurable、各境界のrecovery、unknown identityで交換しない、非APFS・非ローカル・読取専用・swap非対応・別volume・署名不一致・Gatekeeper拒否・Team ID未設定の拒否）。`MacHost` の `renamex_np` は macOS CI の一時volume上で「交換するか何も変えない」ことを確認するtestだけを持つ。**実macOS上の実Developer ID署名候補・実`codesign`/`spctl`評価・実二版適用・電源断耐性は未検証**で、U2/U5のevidenceとして別に行う。
+- 本番信頼鍵・Team IDは埋め込んでいない。`TrustPolicy::production()` は引き続き未設定で、production buildはmacOSでも適用不能のまま。U2のrelease workflow/secrets、再起動UI、state-root/ticket復元、実二版配布証拠はこの増分に含めない。
 
 ### Increment 3: 限定health起動とdurable commit（`crates/update/src/health.rs`）
 
@@ -13,7 +25,7 @@
 - childは通常editor・AI・autosave・migration・open requestを開始せず（`update_gate::enter`内で待機）、read-onlyの確認後に`Healthy`（InstallId、TransactionId、候補ID、版、自身のpid）をprivate pipeへ送り、`Commit`を待つ。
 - helperは45秒以内に、そのtransactionのspawnした実child（nonce、全識別子、OSが返したpid）からの`Healthy`だけを受理する。受理後に`Committed`をdurableに書き、成功した場合だけ`Commit`を送る。書込失敗ならchildへ通知せずrollbackへ進む。helperが`Commit`送信前に死んだ場合、childは同じtransactionの`Committed`がjournalにdurableに残っているときだけ続行する。
 - 起動失敗、timeout、crash、wrong/stale identity、malformed/cut IPC、health拒否ではchildのpipeを閉じ、猶予後にhelper自身のchild handleで終了させ、OSの終了確認と排他runtime leaseの再取得（解放確認）を待ってから旧fileへrollbackする。終了またはlease解放を確認できなければrollbackを始めず`RecoveryRequired`にし、更新成功として返さない。
-- macOSは`PlatformBackend::apply`が引き続き`NotApplicable`で拒否し、新しい成功経路へ接続されない。
+- この増分時点ではmacOSは`PlatformBackend::apply`が`NotApplicable`で拒否していた。increment 4でbundle swapに接続した（上記）。
 - 未実施・既知の制約: 成功後に続行するchildは空環境で起動されるため、`HANE_STATE_DIR`等の検証済みstate rootの明示的な引き渡しは別増分で扱う（再起動UIは未接続）。read-onlyの設定/ticket検査は`ChildSession::run`のcheck closureに接続する余地を残しており、現時点では検査内容を持たない。実Windowsでの二版適用証拠（U5）、設定画面の再起動UI、macOSは対象外。
 
 ### Increment 2: Windows所有ファイル適用（`crates/update/src/windows_apply.rs`）

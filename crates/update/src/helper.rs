@@ -13,10 +13,13 @@
 //! and requires `Prepared` from that very child before it reports success.
 //!
 //! [`PlatformBackend`] applies the Windows owned-file set through
-//! [`crate::windows_apply`] and holds the `transaction` and `startup` leases
+//! [`crate::windows_apply`], or exchanges the macOS bundle through
+//! [`crate::macos_apply`], and holds the `transaction` and `startup` leases
 //! through the limited-health child ([`crate::health`]) up to the durable commit
 //! or the rollback. It reports an applied update only after `Committed` is
-//! durable. The macOS bundle swap is not connected, so macOS never applies.
+//! durable. The macOS path is chosen only by a verified macOS placement and
+//! needs a [`BundleHost`], which exists on macOS builds only; everywhere else
+//! it is refused as `NotApplicable`.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -31,6 +34,7 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::health::{ProcessLauncher, StopTiming};
 use crate::identity::{InstallId, TransactionId};
 use crate::journal::{DurableJournal, FileJournalStore};
+use crate::macos_apply::{self, BundleApplyInputs, BundleHost};
 use crate::model::Target;
 use crate::platform::acl;
 use crate::platform::lease::{Coordination, Lease, LeaseKind};
@@ -385,11 +389,35 @@ fn wait_for_parent_exit(
 pub struct PlatformBackend {
     policy: TrustPolicy,
     clock: Arc<dyn Clock>,
+    /// The OS seam of the macOS bundle exchange; `None` where there is none.
+    bundle_host: Option<Box<dyn BundleHost>>,
+}
+
+/// The real macOS host on macOS builds; nothing anywhere else, so a macOS
+/// journal or placement can never be acted on by another OS.
+#[cfg(target_os = "macos")]
+fn system_bundle_host() -> Option<Box<dyn BundleHost>> {
+    Some(Box::new(crate::platform::macos::MacHost))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_bundle_host() -> Option<Box<dyn BundleHost>> {
+    None
 }
 
 impl PlatformBackend {
     pub fn new(policy: TrustPolicy, clock: Arc<dyn Clock>) -> Self {
-        Self { policy, clock }
+        Self {
+            policy,
+            clock,
+            bundle_host: system_bundle_host(),
+        }
+    }
+
+    /// Replaces the OS seam of the bundle exchange (deterministic tests).
+    pub fn with_bundle_host(mut self, host: Box<dyn BundleHost>) -> Self {
+        self.bundle_host = Some(host);
+        self
     }
 
     pub fn production() -> Self {
@@ -408,42 +436,78 @@ impl HelperBackend for PlatformBackend {
             })?;
         let coordination = &env.coordination;
         let placement = crate::platform::find_install(coordination)?;
-        // Only the Windows file set is connected to the limited-health commit;
-        // the macOS bundle swap stays unsupported and fail-closed.
-        if placement.target != Target::WindowsX64 {
-            return Err(UpdateError::new(
-                ErrorCode::NotApplicable,
-                "the macOS bundle swap is not connected yet",
-            ));
-        }
         let runtime_held = ctx.leases.runtime.is_some();
-        let mut launcher = ProcessLauncher {
-            runtime: &mut ctx.leases.runtime,
-            timing: StopTiming::default(),
-        };
-        apply_and_settle(
-            &ApplyInputs {
-                coordination,
-                transaction: &env.transaction,
-                candidate_id,
-                placement: &placement,
-                policy: &self.policy,
-                clock: &*self.clock,
-                runtime_held,
-            },
-            &mut launcher,
-        )
+        match placement.target {
+            Target::WindowsX64 => {
+                let mut launcher = ProcessLauncher {
+                    runtime: &mut ctx.leases.runtime,
+                    timing: StopTiming::default(),
+                };
+                apply_and_settle(
+                    &ApplyInputs {
+                        coordination,
+                        transaction: &env.transaction,
+                        candidate_id,
+                        placement: &placement,
+                        policy: &self.policy,
+                        clock: &*self.clock,
+                        runtime_held,
+                    },
+                    &mut launcher,
+                )
+            }
+            Target::MacosArm64 => {
+                let host = self.bundle_host.as_deref().ok_or_else(|| {
+                    UpdateError::new(
+                        ErrorCode::NotApplicable,
+                        "this OS has no macOS bundle adapter",
+                    )
+                })?;
+                let mut launcher = ProcessLauncher {
+                    runtime: &mut ctx.leases.runtime,
+                    timing: StopTiming::default(),
+                };
+                macos_apply::apply_and_settle(
+                    &BundleApplyInputs {
+                        coordination,
+                        transaction: &env.transaction,
+                        candidate_id,
+                        placement: &placement,
+                        policy: &self.policy,
+                        clock: &*self.clock,
+                        host,
+                        runtime_held,
+                    },
+                    &mut launcher,
+                )
+            }
+        }
     }
 
     fn recover(&mut self, ctx: &RecoverContext<'_>) -> Result<RecoveryReport> {
-        recover_pending(&ctx.env.coordination, &ctx.env.transaction)
+        recover_pending_with(
+            &ctx.env.coordination,
+            &ctx.env.transaction,
+            self.bundle_host.as_deref(),
+        )
     }
 }
 
-/// Settles the transaction's journal. Mutation is attempted only for the
-/// Windows file-set layout; on macOS a journal that needs rollback stays
-/// `RecoveryRequired` until the bundle-swap adapter exists.
+/// Settles the transaction's journal with the OS seam of this build.
 pub fn recover_pending(coord: &Coordination, transaction: &TransactionId) -> Result<RecoveryReport> {
+    let host = system_bundle_host();
+    recover_pending_with(coord, transaction, host.as_deref())
+}
+
+/// Settles the transaction's journal. A Windows file-set journal is rolled back
+/// file by file; a macOS bundle journal by exchanging the bundles back, decided
+/// from the bundle identities on disk. Without the matching adapter a journal
+/// that needs a rollback stays `RecoveryRequired` and nothing is changed.
+pub fn recover_pending_with(
+    coord: &Coordination,
+    transaction: &TransactionId,
+    bundle_host: Option<&dyn BundleHost>,
+) -> Result<RecoveryReport> {
     let txn_dir = coord.transaction_dir(transaction);
     let store = FileJournalStore::new(coord.journal_path(transaction));
     let Some(mut journal) = DurableJournal::open(store)? else {
@@ -457,16 +521,28 @@ pub fn recover_pending(coord: &Coordination, transaction: &TransactionId) -> Res
         ));
     }
     let placement = crate::platform::find_install(coord)?;
-    let ops = FsFileOps::new(
-        placement.install_root.clone(),
-        txn_dir.join("backup"),
-        txn_dir.join("stage"),
-    );
-    let mut ops = GuardedOps {
-        inner: ops,
-        may_mutate: cfg!(windows),
+    let recovered = if placement.target == Target::MacosArm64 {
+        match bundle_host {
+            Some(host) => {
+                macos_apply::recover_bundle(coord, transaction, &placement, host, &mut journal)
+            }
+            None => Ok(RecoveryOutcome::RecoveryRequired(
+                "this OS has no macOS bundle adapter".to_owned(),
+            )),
+        }
+    } else {
+        let ops = FsFileOps::new(
+            placement.install_root.clone(),
+            txn_dir.join("backup"),
+            txn_dir.join("stage"),
+        );
+        let mut ops = GuardedOps {
+            inner: ops,
+            may_mutate: cfg!(windows),
+        };
+        apply::recover(&mut journal, &mut ops, &mut NoChild)
     };
-    let outcome = match apply::recover(&mut journal, &mut ops, &mut NoChild) {
+    let outcome = match recovered {
         Ok(outcome) => outcome,
         Err(err) => RecoveryOutcome::RecoveryRequired(err.to_string()),
     };

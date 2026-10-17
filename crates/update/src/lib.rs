@@ -15,18 +15,24 @@
 //! (`platform`, `protocol`, `helper`, `startup`). Increment 2 connects the
 //! Windows owned-file apply path to the helper (`windows_apply`): the helper
 //! re-verifies a transaction-local candidate and replaces only the files of the
-//! signed inventories, journal first. Without the limited-health child and the
-//! durable commit it restores the old files again instead of reporting success.
+//! signed inventories, journal first. Increment 3 adds the limited-health child
+//! and the durable commit (`health`). Increment 4 connects the macOS bundle
+//! exchange (`macos_apply`): the pinned Team ID's Developer ID signature, the
+//! bundle identity and a same-volume `RENAME_SWAP` of the live bundle and the
+//! staged candidate, journaled intent first, with the same health and commit
+//! boundary and a rollback by the same exchange.
 //!
 //! Deliberately **not** here: UI, GPUI, document or AI credential access, real
-//! HTTP transport, bundle swapping, the limited-health child, durable commit,
-//! and any production signing key. [`trust::TrustPolicy::production`] carries
-//! no key material until a maintainer embeds one, so no candidate can become
-//! applicable from a production build today. OS-specific locking and crash
-//! durability are not claimed to be verified by this crate.
+//! HTTP transport, the restart UI, and any production signing key or Team ID.
+//! [`trust::TrustPolicy::production`] carries no key material until a
+//! maintainer embeds one, so no candidate can become applicable from a
+//! production build today. OS-specific locking, crash durability, the real
+//! `renamex_np` / `codesign` / `spctl` behavior and Gatekeeper are not claimed
+//! to be verified by this crate.
 
-// Everything is safe Rust except the two read-only volume queries in
-// `platform::{windows,macos}`, which opt in locally with a stated reason.
+// Everything is safe Rust except the volume queries in `platform::windows` and
+// `platform::macos` (and the macOS `renamex_np` exchange), which opt in locally
+// with a stated reason.
 #![deny(unsafe_code)]
 
 pub mod apply;
@@ -41,6 +47,7 @@ pub mod helper;
 pub mod identity;
 pub mod journal;
 pub mod limits;
+pub mod macos_apply;
 pub mod model;
 pub mod paths;
 pub mod platform;

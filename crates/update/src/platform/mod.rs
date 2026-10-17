@@ -7,9 +7,9 @@
 //! other placement is `UnsupportedInstall` (fail closed); ordinary editing
 //! still works there, it just never offers an update.
 //!
-//! The Windows file-set replacement lives in `windows_apply` and is driven by
-//! the helper, and the limited-health child and durable commit in `health`.
-//! Not here yet: macOS `RENAME_SWAP`.
+//! The Windows file-set replacement lives in `windows_apply` and the macOS
+//! bundle exchange in `macos_apply`; both are driven by the helper, and the
+//! limited-health child and durable commit are in `health`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{durable_write, hash_regular_file, read_limited};
 use crate::identity::{FileIdentity, InstallId, TransactionId};
+use crate::journal::{DiskView, FsDiskView};
 use crate::limits::MAX_ENTRY_BYTES;
 use crate::model::Target;
 
@@ -60,6 +61,18 @@ impl Placement {
 pub struct HelperSource {
     pub path: PathBuf,
     pub identity: FileIdentity,
+}
+
+impl Placement {
+    /// How the journal's relative paths are compared with this install's disk:
+    /// owned files for Windows, the whole bundle (`Hane.app`) for macOS. A
+    /// receipt of one layout is never read through the other's view.
+    pub fn disk_view(&self) -> Box<dyn DiskView> {
+        match self.target {
+            Target::MacosArm64 => Box::new(crate::macos_apply::BundleView::new(&self.install_root)),
+            Target::WindowsX64 => Box::new(FsDiskView::new(&self.install_root)),
+        }
+    }
 }
 
 pub(crate) fn unsupported(detail: impl Into<String>) -> UpdateError {

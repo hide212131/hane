@@ -1,0 +1,1627 @@
+//! macOS bundle apply path of the helper (Issue #510, U4 increment 4).
+//!
+//! Everything here is OS-neutral so it can be tested anywhere. Each OS fact the
+//! swap depends on (volume kind, `RENAME_SWAP` support and call, the Developer
+//! ID signature check and the Gatekeeper assessment) comes from a
+//! [`BundleHost`]; `platform::macos::MacHost` is the only real one and it is
+//! compiled on macOS only.
+//!
+//! The helper accepts no path, command or environment. Like the Windows path it
+//! reads only `Coordination::transaction_dir(<its own transaction>)/candidate/`
+//! and derives everything else itself:
+//!
+//! 1. the current bundle: fixed Bundle ID, Info.plist version / source SHA /
+//!    updater protocol, the pinned Team ID's Developer ID signature under
+//!    strict verification, and the Gatekeeper assessment,
+//! 2. the candidate catalog and signature (verified again, bound to the
+//!    requested candidate id) and the archive hash, inspection and extraction
+//!    into the transaction's own `stage/`,
+//! 3. the staged candidate bundle: the same Info.plist facts, now also bound to
+//!    the signed catalog, and the same signature and Gatekeeper checks,
+//! 4. that the install bundle and the staged candidate are on the same local,
+//!    writable APFS volume and that this volume really swaps (a probe swap of
+//!    two scratch directories between the two parents).
+//!
+//! Only then is the journal created. It has one step, `Hane.app`, whose old and
+//! new identities are the bundle identities ([`bundle_identity`]); the staged
+//! candidate's location doubles as the backup slot (`backup/Hane.app`). The
+//! intent is durable before the single `RENAME_SWAP`-style exchange, and the
+//! result is observed and made durable afterwards. The old bundle is never
+//! deleted first and never overwritten: after the exchange it simply sits in
+//! the slot, which is what a rollback exchanges back.
+//!
+//! Recovery reuses the journal-versus-disk engine of [`crate::apply`] through
+//! [`BundleOps`]: the direction is decided from the bundle identities actually
+//! on disk (live and slot), never from the journal alone, so an interruption at
+//! any boundary can neither swap twice nor guess. A bundle that is neither the
+//! recorded old nor new identity, a damaged or missing backup, or a journal that
+//! does not match ends as `RecoveryRequired` with nothing written.
+//!
+//! Not verified here: the real `renamex_np`, `codesign` and `spctl` calls and
+//! the power-loss durability of APFS. They need a real macOS volume and a real
+//! Developer ID signed candidate (U2 / U5 evidence).
+
+use std::fs::{self, File};
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::apply::{self, FileOps, RecoveryOutcome};
+use crate::archive::{ArchiveLimits, stage_archive};
+use crate::catalog::{VerifyContext, verify_catalog};
+use crate::clock::Clock;
+use crate::error::{ErrorCode, Result, UpdateError};
+use crate::fsutil::{FileSeenStore, hash_regular_file, hash_regular_file_under, read_limited};
+use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, conclude_with_child};
+use crate::identity::{ApplyPlan, FileIdentity, PlanStep, ReleaseIdentity, TransactionId};
+use crate::journal::{
+    DiskView, DurableJournal, FileJournalStore, Observed, Phase, StepState, UpdateJournal,
+    identity_matches,
+};
+use crate::limits::{MAX_CATALOG_BYTES, MAX_SIGNATURE_BYTES};
+use crate::model::{MACOS_BUNDLE_ID, Target, UPDATER_PROTOCOL};
+use crate::platform::Placement;
+use crate::platform::lease::Coordination;
+use crate::trust::{SeenStore, TrustPolicy};
+use crate::util::is_lower_hex;
+use crate::windows_apply::{
+    CANDIDATE_ARCHIVE, CANDIDATE_CATALOG, CANDIDATE_DIR, CANDIDATE_SIGNATURE, NoChild,
+    settled_result, valid_candidate_id,
+};
+
+/// The journal's one step and its backup path. They are names inside the
+/// journal, not paths: the live bundle is `Placement::install_root` and the
+/// backup is [`slot_path`].
+pub const BUNDLE_REL: &str = "Hane.app";
+pub const BACKUP_REL: &str = "backup/Hane.app";
+
+const MAX_PLIST_BYTES: u64 = 256 << 10;
+const STAGE_DIR: &str = "stage";
+const STAGED_APP: [&str; 2] = ["hane-macos-arm64", "Hane.app"];
+const MAIN_EXE: &str = "Contents/MacOS/hane";
+/// The files that stand for the whole sealed bundle. `CodeResources` lists the
+/// hash of every other resource and nested code, so a change anywhere else
+/// changes it; the executable, the helper and the Info.plist are hashed directly.
+const IDENTITY_FILES: [&str; 4] = [
+    "Contents/Info.plist",
+    MAIN_EXE,
+    "Contents/Helpers/hane-updater",
+    "Contents/_CodeSignature/CodeResources",
+];
+
+// ------------------------------------------------------------- the OS seam
+
+/// What the volume query reports about a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeFacts {
+    /// Equal ids mean the same volume.
+    pub id: String,
+    pub apfs: bool,
+    pub local: bool,
+    pub read_only: bool,
+}
+
+/// OS-specific operations behind the bundle swap. Implementations must not
+/// follow a fallback: no two-step rename, no quarantine removal, no ad-hoc
+/// re-signing, no Gatekeeper bypass.
+pub trait BundleHost {
+    fn volume(&self, path: &Path) -> Result<VolumeFacts>;
+    /// True only if an exchange of two scratch directories created in
+    /// `first_dir` and `second_dir` really worked. They are the parents the
+    /// real exchange will touch. The scratch directories are removed again.
+    fn supports_swap(&self, first_dir: &Path, second_dir: &Path) -> Result<bool>;
+    /// Atomically exchanges two existing paths on one volume. It either did
+    /// exchange them or changed nothing.
+    fn swap(&self, first: &Path, second: &Path) -> Result<()>;
+    /// Strict verification of the complete bundle against the Developer ID
+    /// requirement pinned to exactly `team_id`.
+    fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()>;
+    /// The Gatekeeper assessment of the bundle, as the OS makes it.
+    fn assess_gatekeeper(&self, bundle: &Path) -> Result<()>;
+}
+
+pub fn valid_team_id(team_id: &str) -> bool {
+    team_id.len() == 10 && team_id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// The pinned Team ID, or `TrustUnconfigured` when this build embeds none.
+/// There is deliberately no fallback to "any Developer ID".
+pub fn required_team_id(policy: &TrustPolicy) -> Result<&str> {
+    policy.macos_team_id().ok_or_else(|| {
+        UpdateError::new(
+            ErrorCode::TrustUnconfigured,
+            "no macOS Team ID is embedded in this build",
+        )
+    })
+}
+
+// -------------------------------------------------------------- the bundle
+
+fn value_after<'a>(plist: &'a str, key: &str, tag: &str) -> Option<&'a str> {
+    let marker = format!("<key>{key}</key>");
+    let rest = plist[plist.find(&marker)? + marker.len()..].trim_start();
+    let body = rest.strip_prefix(format!("<{tag}>").as_str())?;
+    let end = body.find(format!("</{tag}>").as_str())?;
+    Some(body[..end].trim())
+}
+
+/// Reads a string value of an XML Info.plist; anything else fails closed.
+pub fn plist_string(plist: &str, key: &str) -> Option<String> {
+    value_after(plist, key, "string").map(str::to_owned)
+}
+
+/// Reads an integer value of an XML Info.plist; anything else fails closed.
+pub fn plist_integer(plist: &str, key: &str) -> Option<u64> {
+    value_after(plist, key, "integer")?.parse().ok()
+}
+
+/// What the Info.plist of a Hane bundle declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleFacts {
+    pub bundle_id: String,
+    pub short_version: String,
+    pub build_version: String,
+    pub source_commit: String,
+    pub updater_protocol: u64,
+}
+
+fn ensure_real_dir(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{} is not a real directory", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+pub fn read_bundle_facts(bundle: &Path) -> Result<BundleFacts> {
+    let damaged = |what: &str| {
+        UpdateError::new(ErrorCode::InstallModified, format!("the bundle Info.plist {what}"))
+    };
+    ensure_real_dir(bundle)?;
+    hash_regular_file_under(bundle, &["Contents", "Info.plist"])?
+        .ok_or_else(|| damaged("is missing"))?;
+    let raw = read_limited(&bundle.join("Contents").join("Info.plist"), MAX_PLIST_BYTES)?
+        .ok_or_else(|| damaged("is missing"))?;
+    let plist = String::from_utf8(raw).map_err(|_| damaged("is not XML"))?;
+    let text = |key: &str| plist_string(&plist, key).ok_or_else(|| damaged("lacks a required key"));
+    Ok(BundleFacts {
+        bundle_id: text("CFBundleIdentifier")?,
+        short_version: text("CFBundleShortVersionString")?,
+        build_version: text("CFBundleVersion")?,
+        source_commit: text("HaneSourceCommit")?,
+        updater_protocol: plist_integer(&plist, "HaneUpdaterProtocol")
+            .ok_or_else(|| damaged("lacks a required key"))?,
+    })
+}
+
+/// The facts both sides of an update must have, independent of any catalog.
+fn check_bundle_facts(facts: &BundleFacts, what: &str) -> Result<()> {
+    if facts.bundle_id != MACOS_BUNDLE_ID {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            format!("{what} does not have Hane's bundle identifier"),
+        ));
+    }
+    if facts.updater_protocol != UPDATER_PROTOCOL {
+        return Err(UpdateError::new(
+            ErrorCode::ProtocolUnsupported,
+            format!("{what} does not speak the supported updater protocol"),
+        ));
+    }
+    if !is_lower_hex(&facts.source_commit, 40) || facts.short_version != facts.build_version {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            format!("{what} has inconsistent version facts"),
+        ));
+    }
+    Ok(())
+}
+
+/// Identity of a whole bundle: the size and hash of its seal files, folded into
+/// one [`FileIdentity`]. `Missing` only when nothing is at `bundle`; a link, a
+/// non-directory or an incomplete bundle is an error, never a guess.
+pub fn bundle_identity(bundle: &Path) -> Result<Observed> {
+    match fs::symlink_metadata(bundle) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} is not a real bundle directory", bundle.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Observed::Missing),
+        Err(err) => return Err(err.into()),
+    }
+    let mut lines = Vec::with_capacity(IDENTITY_FILES.len());
+    for rel in IDENTITY_FILES {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let (size, sha256) = hash_regular_file_under(bundle, &parts)?.ok_or_else(|| {
+            UpdateError::new(ErrorCode::InstallModified, format!("the bundle lacks {rel}"))
+        })?;
+        lines.push(format!("{rel}\n{size}\n{sha256}\n"));
+    }
+    Ok(Observed::File(FileIdentity::of(lines.concat().as_bytes())))
+}
+
+/// Where the candidate bundle is staged, and so where the old bundle rests
+/// after the exchange.
+pub fn slot_path(transaction_dir: &Path) -> PathBuf {
+    let mut path = transaction_dir.join(STAGE_DIR);
+    for part in STAGED_APP {
+        path.push(part);
+    }
+    path
+}
+
+/// The journal's view of the live bundle only (terminal receipts compare the
+/// disk with `Hane.app`; nothing else is asked of it).
+pub struct BundleView {
+    live: PathBuf,
+}
+
+impl BundleView {
+    pub fn new(live: &Path) -> Self {
+        Self {
+            live: live.to_path_buf(),
+        }
+    }
+}
+
+impl DiskView for BundleView {
+    fn observe(&self, rel_path: &str) -> Result<Observed> {
+        if rel_path == BUNDLE_REL {
+            bundle_identity(&self.live)
+        } else {
+            Err(unknown_rel(rel_path))
+        }
+    }
+}
+
+fn unknown_rel(rel_path: &str) -> UpdateError {
+    UpdateError::new(
+        ErrorCode::JournalInvalid,
+        format!("{rel_path} is not part of a bundle update"),
+    )
+}
+
+/// The only mutation a bundle update has: exchanging the live bundle and the
+/// slot. `restore` is the rollback exchange; nothing is ever copied, written or
+/// removed.
+pub struct BundleOps<'a> {
+    host: &'a dyn BundleHost,
+    live: PathBuf,
+    slot: PathBuf,
+}
+
+impl<'a> BundleOps<'a> {
+    pub fn new(host: &'a dyn BundleHost, live: &Path, slot: &Path) -> Self {
+        Self {
+            host,
+            live: live.to_path_buf(),
+            slot: slot.to_path_buf(),
+        }
+    }
+
+    fn exchange(&self) -> Result<()> {
+        self.host.swap(&self.live, &self.slot)
+    }
+}
+
+impl DiskView for BundleOps<'_> {
+    fn observe(&self, rel_path: &str) -> Result<Observed> {
+        match rel_path {
+            BUNDLE_REL => bundle_identity(&self.live),
+            BACKUP_REL => bundle_identity(&self.slot),
+            other => Err(unknown_rel(other)),
+        }
+    }
+}
+
+fn no_file_ops() -> UpdateError {
+    UpdateError::new(
+        ErrorCode::NotApplicable,
+        "a bundle update only exchanges the bundle; it never writes files",
+    )
+}
+
+impl FileOps for BundleOps<'_> {
+    fn backup(&mut self, _rel_path: &str, _backup_rel: &str) -> Result<()> {
+        Err(no_file_ops())
+    }
+
+    fn install_new(&mut self, _rel_path: &str, _expected: &FileIdentity) -> Result<()> {
+        Err(no_file_ops())
+    }
+
+    fn remove(&mut self, _rel_path: &str) -> Result<()> {
+        Err(no_file_ops())
+    }
+
+    /// Rolls back by exchanging again. The slot must still hold exactly the
+    /// recorded old bundle, and afterwards the live path must hold it.
+    fn restore(&mut self, rel_path: &str, backup_rel: &str, expected: &FileIdentity) -> Result<()> {
+        if rel_path != BUNDLE_REL || backup_rel != BACKUP_REL {
+            return Err(unknown_rel(rel_path));
+        }
+        if bundle_identity(&self.slot)? != Observed::File(expected.clone()) {
+            return Err(UpdateError::new(
+                ErrorCode::HashMismatch,
+                "the backup bundle is missing or damaged",
+            ));
+        }
+        self.exchange()?;
+        if bundle_identity(&self.live)? != Observed::File(expected.clone()) {
+            return Err(UpdateError::new(
+                ErrorCode::HashMismatch,
+                "the live bundle is not the old bundle after the rollback exchange",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------ verification
+
+/// Everything the helper derives or holds when it applies a bundle.
+pub struct BundleApplyInputs<'a> {
+    pub coordination: &'a Coordination,
+    pub transaction: &'a TransactionId,
+    pub candidate_id: &'a str,
+    pub placement: &'a Placement,
+    pub policy: &'a TrustPolicy,
+    pub clock: &'a dyn Clock,
+    pub host: &'a dyn BundleHost,
+    /// True only while the helper holds the exclusive `runtime` lease, which
+    /// is the OS-observed proof that the parent process is gone.
+    pub runtime_held: bool,
+}
+
+struct Verified {
+    plan: ApplyPlan,
+    slot: PathBuf,
+}
+
+fn require_local_apfs(host: &dyn BundleHost, path: &Path, what: &str) -> Result<VolumeFacts> {
+    let volume = host.volume(path)?;
+    if !volume.apfs || !volume.local {
+        return Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            format!("{what} is not on a local APFS volume"),
+        ));
+    }
+    if volume.read_only {
+        return Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            format!("{what} is on a read-only volume"),
+        ));
+    }
+    Ok(volume)
+}
+
+fn require_signed(host: &dyn BundleHost, bundle: &Path, team_id: &str) -> Result<()> {
+    host.verify_developer_id(bundle, team_id)?;
+    host.assess_gatekeeper(bundle)
+}
+
+/// Independently re-verifies placement, both bundles, the candidate and the
+/// archive, stages the archive and builds the one-step plan. Nothing in the
+/// install is changed.
+fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
+    let coordination = inputs.coordination;
+    let placement = inputs.placement;
+    let host = inputs.host;
+    if placement.target != Target::MacosArm64 {
+        return Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "only the macOS arm64 bundle layout can be swapped",
+        ));
+    }
+    if &placement.install_id != coordination.install_id() {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the install is not the one this coordination directory belongs to",
+        ));
+    }
+    if !valid_candidate_id(inputs.candidate_id) {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed candidate id"));
+    }
+    // No pinned Team ID: nothing below can be trusted, so nothing is read.
+    let team_id = required_team_id(inputs.policy)?.to_owned();
+    if !valid_team_id(&team_id) {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed Team ID"));
+    }
+
+    let live = &placement.install_root;
+    let install_volume = require_local_apfs(host, live, "the installed bundle")?;
+    let current = read_bundle_facts(live)?;
+    check_bundle_facts(&current, "the installed bundle")?;
+    require_signed(host, live, &team_id)?;
+
+    let txn_dir = coordination.transaction_dir(inputs.transaction);
+    let candidate_dir = txn_dir.join(CANDIDATE_DIR);
+    let missing = |what: &str| UpdateError::new(ErrorCode::NotFound, format!("{what} is missing"));
+    let catalog = read_limited(&candidate_dir.join(CANDIDATE_CATALOG), MAX_CATALOG_BYTES)?
+        .ok_or_else(|| missing("the candidate catalog"))?;
+    let signature = read_limited(&candidate_dir.join(CANDIDATE_SIGNATURE), MAX_SIGNATURE_BYTES)?
+        .ok_or_else(|| missing("the candidate signature"))?;
+    // The floor is re-read now, after the runtime lease is held: a missing,
+    // corrupt or unreadable receipt is a refusal, never "no floor".
+    let seen = FileSeenStore::new(coordination.seen_catalog_path())
+        .load()
+        .map_err(|err| {
+            UpdateError::new(
+                ErrorCode::ReceiptUnwritable,
+                format!("the catalog sequence receipt cannot be read: {err}"),
+            )
+        })?
+        .ok_or_else(|| missing("the catalog sequence receipt"))?;
+    let candidate = verify_catalog(
+        &catalog,
+        &signature,
+        &VerifyContext {
+            policy: inputs.policy,
+            clock: inputs.clock,
+            current_version: &current.short_version,
+            target: Target::MacosArm64,
+            seen: Some(&seen),
+            expected_tag: None,
+        },
+    )?;
+    if candidate.candidate_id().as_str() != inputs.candidate_id {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the staged candidate is not the requested one",
+        ));
+    }
+    if !candidate.is_applicable() {
+        return Err(UpdateError::new(
+            ErrorCode::NotApplicable,
+            "the candidate is not newer than the installed version",
+        ));
+    }
+
+    let archive_path = candidate_dir.join(CANDIDATE_ARCHIVE);
+    let entry = candidate.target_entry();
+    let (size, sha256) =
+        hash_regular_file(&archive_path)?.ok_or_else(|| missing("the candidate archive"))?;
+    if size != entry.archive_size || sha256 != entry.archive_sha256 {
+        return Err(UpdateError::new(
+            ErrorCode::HashMismatch,
+            "the staged archive differs from the signed catalog",
+        ));
+    }
+    let stage = txn_dir.join(STAGE_DIR);
+    match fs::create_dir(&stage) {
+        Ok(()) => {}
+        // An existing stage is accepted only if it is empty; the extractor
+        // refuses anything else.
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err.into()),
+    }
+    let mut archive = File::open(&archive_path)?;
+    stage_archive(&mut archive, &candidate, inputs.policy, &ArchiveLimits::default(), &stage)?;
+    drop(archive);
+
+    // The candidate is judged where it will be swapped in from, after it was
+    // extracted by this process, never in the application's download area.
+    let slot = slot_path(&txn_dir);
+    let next = read_bundle_facts(&slot)?;
+    check_bundle_facts(&next, "the candidate bundle")?;
+    let version = candidate.version().to_string();
+    if next.short_version != version || entry.bundle_version.as_deref() != Some(version.as_str()) {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the candidate bundle version differs from the signed catalog",
+        ));
+    }
+    if next.source_commit != candidate.catalog().source_sha {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the candidate bundle was not built from the cataloged source",
+        ));
+    }
+    require_signed(host, &slot, &team_id)?;
+
+    // Same volume, and a volume that really swaps. A candidate somewhere else
+    // is refused before anything is changed.
+    let staged_volume = require_local_apfs(host, &slot, "the staged candidate")?;
+    if staged_volume.id != install_volume.id {
+        return Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the staged candidate is not on the install volume",
+        ));
+    }
+    let install_parent = live.parent().ok_or_else(|| {
+        UpdateError::new(ErrorCode::UnsupportedInstall, "the bundle has no parent directory")
+    })?;
+    let slot_parent = slot.parent().ok_or_else(|| {
+        UpdateError::new(ErrorCode::UnsupportedInstall, "the staged candidate has no parent")
+    })?;
+    if !host.supports_swap(install_parent, slot_parent)? {
+        return Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the install volume does not support swap renaming",
+        ));
+    }
+
+    let (Observed::File(old), Observed::File(new)) =
+        (bundle_identity(live)?, bundle_identity(&slot)?)
+    else {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            "a bundle to swap is missing",
+        ));
+    };
+    if old == new {
+        return Err(UpdateError::new(
+            ErrorCode::NotApplicable,
+            "the candidate bundle is the installed bundle",
+        ));
+    }
+    let plan = ApplyPlan {
+        install_id: coordination.install_id().clone(),
+        transaction_id: inputs.transaction.clone(),
+        source: ReleaseIdentity {
+            target: Target::MacosArm64.triple().to_owned(),
+            version: current.short_version,
+            catalog_sha256: None,
+            inventory_sha256: None,
+            bundle_id: Some(MACOS_BUNDLE_ID.to_owned()),
+            team_id: Some(team_id),
+        },
+        destination: ReleaseIdentity::from_candidate(&candidate),
+        steps: vec![PlanStep {
+            rel_path: BUNDLE_REL.to_owned(),
+            old: Some(old),
+            new: Some(new),
+            backup_rel: Some(BACKUP_REL.to_owned()),
+        }],
+        unchanged: Vec::new(),
+    };
+    Ok(Verified { plan, slot })
+}
+
+// ---------------------------------------------------------------- the swap
+
+/// The bundle is exchanged and awaiting a health verdict.
+pub struct AppliedBundle<'a> {
+    journal: DurableJournal<FileJournalStore>,
+    ops: BundleOps<'a>,
+}
+
+impl AppliedBundle<'_> {
+    pub fn journal(&self) -> &UpdateJournal {
+        self.journal.journal()
+    }
+}
+
+fn holds(ops: &BundleOps<'_>, rel_path: &str, wanted: &Option<FileIdentity>) -> Result<bool> {
+    Ok(identity_matches(&ops.observe(rel_path)?, wanted))
+}
+
+/// Journal intent, exchange, observation, journal result. Any error leaves the
+/// caller to recover from the disk.
+fn swap_bundle(
+    journal: &mut DurableJournal<FileJournalStore>,
+    ops: &mut BundleOps<'_>,
+) -> Result<()> {
+    let step = journal.journal().steps.first().cloned().ok_or_else(|| {
+        UpdateError::new(ErrorCode::JournalInvalid, "the bundle journal has no step")
+    })?;
+    journal.advance_phase(Phase::ExitAuthorized)?;
+    journal.advance_phase(Phase::Applying)?;
+    // The intent, with both identities, is durable before the exchange.
+    journal.advance_step(0, StepState::Intent)?;
+    if !holds(ops, BUNDLE_REL, &step.old)? || !holds(ops, BACKUP_REL, &step.new)? {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            "a bundle changed during the update",
+        ));
+    }
+    ops.exchange()?;
+    // The result is observed, not assumed, and only then made durable.
+    if !holds(ops, BUNDLE_REL, &step.new)? || !holds(ops, BACKUP_REL, &step.old)? {
+        return Err(UpdateError::new(
+            ErrorCode::HashMismatch,
+            "the bundles are not exchanged after the swap",
+        ));
+    }
+    journal.advance_step(0, StepState::Applied)?;
+    journal.advance_phase(Phase::AwaitingHealth)
+}
+
+/// Verifies, plans, writes the journal and exchanges the bundle. On success the
+/// journal is `AwaitingHealth`. A failure after the first journal write has
+/// already been rolled back (or stopped as `RecoveryRequired`).
+pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<'a>> {
+    if !inputs.runtime_held {
+        return Err(UpdateError::new(
+            ErrorCode::NotApplicable,
+            "the application process is still running",
+        ));
+    }
+    let verified = verify_and_plan(inputs)?;
+    let live = &inputs.placement.install_root;
+    // The previous terminal receipt must still describe this install before
+    // anything is mutated; otherwise it could not be retired safely.
+    crate::startup::ensure_prior_receipts_current(inputs.coordination, &BundleView::new(live))?;
+
+    let journal = UpdateJournal::begin(&verified.plan, None)?;
+    let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
+    let mut journal = DurableJournal::create(store, journal)?;
+    // The new journal is durable and pending, so an interruption from here on
+    // is recovered through it. Only now are superseded receipts retired.
+    crate::startup::prune_superseded_receipts(inputs.coordination, inputs.transaction);
+    let mut ops = BundleOps::new(inputs.host, live, &verified.slot);
+    match swap_bundle(&mut journal, &mut ops) {
+        Ok(()) => Ok(AppliedBundle { journal, ops }),
+        Err(err) => match apply::recover(&mut journal, &mut ops, &mut NoChild) {
+            Ok(RecoveryOutcome::Nothing | RecoveryOutcome::KeptOld | RecoveryOutcome::RolledBack) => {
+                Err(err)
+            }
+            Ok(RecoveryOutcome::RecoveryRequired(why)) => Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("recovery is required: {why}"),
+            )),
+            Ok(RecoveryOutcome::KeptNew) => Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                "recovery is required: the new bundle is live without a commit",
+            )),
+            Err(recover_err) => Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("recovery is required: {recover_err}"),
+            )),
+        },
+    }
+}
+
+/// The executable the limited-health child starts from: the live bundle, which
+/// must still be exactly the journaled new bundle and still verify against the
+/// pinned Team ID after the exchange.
+fn verified_child(inputs: &BundleApplyInputs<'_>, applied: &AppliedBundle<'_>) -> Result<(PathBuf, String)> {
+    let live = &inputs.placement.install_root;
+    let journal = applied.journal();
+    let step = journal.steps.first().ok_or_else(|| {
+        UpdateError::new(ErrorCode::JournalInvalid, "the bundle journal has no step")
+    })?;
+    if !identity_matches(&bundle_identity(live)?, &step.new) {
+        return Err(UpdateError::new(
+            ErrorCode::HashMismatch,
+            "the live bundle differs from the journaled new bundle",
+        ));
+    }
+    let team_id = required_team_id(inputs.policy)?;
+    require_signed(inputs.host, live, team_id)?;
+    let exe = live.join(MAIN_EXE);
+    hash_regular_file(&exe)?
+        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the bundle executable is missing"))?;
+    Ok((exe, journal.destination.version.clone()))
+}
+
+/// The helper's whole apply step for a bundle. After the exchange the limited
+/// child is started from the live bundle and judged: only a verified `Healthy`
+/// from this transaction's own child lets the journal reach a durable
+/// `Committed` (`Ok`). Every other end has stopped the child and exchanged the
+/// old bundle back, or has stopped as `RecoveryRequired`; none of them is
+/// reported as applied.
+pub fn apply_and_settle(
+    inputs: &BundleApplyInputs<'_>,
+    launcher: &mut dyn HealthLauncher,
+) -> Result<()> {
+    let mut applied = apply_bundle(inputs)?;
+    let verified = verified_child(inputs, &applied);
+    let mut child = match &verified {
+        Ok((exe, version)) => launcher.launch(&LaunchRequest {
+            exe,
+            version,
+            candidate_id: inputs.candidate_id,
+            coordination: inputs.coordination,
+            transaction: inputs.transaction,
+        }),
+        Err(err) => launcher.failed(
+            err.clone(),
+            &LaunchFailure {
+                candidate_id: inputs.candidate_id,
+                coordination: inputs.coordination,
+                transaction: inputs.transaction,
+            },
+        ),
+    };
+    let settled = conclude_with_child(
+        &mut applied.journal,
+        &mut applied.ops,
+        &mut *child,
+        launcher.health_timeout(),
+    )?;
+    settled_result(settled)
+}
+
+/// Settles a pending bundle journal from the disk (startup / helper recovery).
+/// The caller has already checked that the journal is this install's and this
+/// transaction's. The helper holds the exclusive `runtime` lease, so no Hane
+/// process is alive and no child needs stopping.
+pub fn recover_bundle(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    placement: &Placement,
+    host: &dyn BundleHost,
+    journal: &mut DurableJournal<FileJournalStore>,
+) -> Result<RecoveryOutcome> {
+    if placement.target != Target::MacosArm64 {
+        return Ok(RecoveryOutcome::RecoveryRequired(
+            "the journal is not for a macOS bundle".to_owned(),
+        ));
+    }
+    let slot = slot_path(&coordination.transaction_dir(transaction));
+    let mut ops = BundleOps::new(host, &placement.install_root, &slot);
+    apply::recover(journal, &mut ops, &mut NoChild)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::catalog::record_seen;
+    use crate::health::LimitedChild;
+    use crate::apply::HealthChild;
+    use crate::identity::{InstallFacts, InstallId};
+    use crate::journal::JournalStore;
+    use crate::testing::{
+        FixedClock, TEST_SOURCE_SHA, TempDir, ZipEntry, build_zip, catalog_doc, macos_entry,
+        sign_catalog, test_now, test_policy,
+    };
+    use crate::windows_apply::{CandidateSource, stage_candidate};
+
+    const OLD: &str = "0.25.0";
+    const NEW: &str = "0.26.0";
+
+    fn plist(version: &str, commit: &str, bundle_id: &str, protocol: u64) -> String {
+        format!(
+            "<?xml version=\"1.0\"?>\n<plist version=\"1.0\"><dict>\n\
+             <key>CFBundleIdentifier</key>\n<string>{bundle_id}</string>\n\
+             <key>CFBundleShortVersionString</key>\n<string>{version}</string>\n\
+             <key>CFBundleVersion</key>\n<string>{version}</string>\n\
+             <key>HaneSourceCommit</key>\n<string>{commit}</string>\n\
+             <key>HaneUpdaterProtocol</key>\n<integer>{protocol}</integer>\n\
+             </dict></plist>\n"
+        )
+    }
+
+    fn good_plist(version: &str) -> String {
+        plist(version, TEST_SOURCE_SHA, MACOS_BUNDLE_ID, 1)
+    }
+
+    fn bundle_files(version: &str, info: &str) -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("Contents/Info.plist", info.as_bytes().to_vec()),
+            ("Contents/MacOS/hane", format!("hane {version}").into_bytes()),
+            ("Contents/Helpers/hane-updater", format!("updater {version}").into_bytes()),
+            ("Contents/_CodeSignature/CodeResources", format!("seal {version}").into_bytes()),
+        ]
+    }
+
+    fn write_bundle(root: &Path, files: &[(&'static str, Vec<u8>)]) {
+        for (rel, data) in files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        }
+    }
+
+    fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    let rel = path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+                    out.insert(rel, fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    fn files_tree(files: &[(&'static str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
+        files.iter().map(|(rel, data)| ((*rel).to_owned(), data.clone())).collect()
+    }
+
+    fn io_error(what: &str) -> UpdateError {
+        UpdateError::new(ErrorCode::Io, what)
+    }
+
+    /// Exchanges two directories by renames. The test double of `RENAME_SWAP`.
+    fn rename_swap(first: &Path, second: &Path) {
+        let parked = first.with_extension("parked");
+        fs::rename(first, &parked).unwrap();
+        fs::rename(second, first).unwrap();
+        fs::rename(&parked, second).unwrap();
+    }
+
+    struct FakeHost {
+        swaps: Cell<usize>,
+        fail_swap: Cell<bool>,
+        /// The call "succeeds" but exchanges nothing.
+        noop_swap: Cell<bool>,
+        swap_supported: Cell<bool>,
+        apfs: Cell<bool>,
+        local: Cell<bool>,
+        read_only: Cell<bool>,
+        slot_on_other_volume: Cell<bool>,
+        bad_signature: RefCell<Vec<PathBuf>>,
+        bad_gatekeeper: RefCell<Vec<PathBuf>>,
+        journal_path: RefCell<Option<PathBuf>>,
+        /// Journal phase and step state seen at each exchange.
+        at_swap: RefCell<Vec<(Phase, StepState)>>,
+    }
+
+    impl FakeHost {
+        fn new() -> Self {
+            Self {
+                swaps: Cell::new(0),
+                fail_swap: Cell::new(false),
+                noop_swap: Cell::new(false),
+                swap_supported: Cell::new(true),
+                apfs: Cell::new(true),
+                local: Cell::new(true),
+                read_only: Cell::new(false),
+                slot_on_other_volume: Cell::new(false),
+                bad_signature: RefCell::new(Vec::new()),
+                bad_gatekeeper: RefCell::new(Vec::new()),
+                journal_path: RefCell::new(None),
+                at_swap: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BundleHost for FakeHost {
+        fn volume(&self, path: &Path) -> Result<VolumeFacts> {
+            let other = self.slot_on_other_volume.get()
+                && path.components().any(|c| c.as_os_str() == STAGE_DIR);
+            Ok(VolumeFacts {
+                id: if other { "2" } else { "1" }.to_owned(),
+                apfs: self.apfs.get(),
+                local: self.local.get(),
+                read_only: self.read_only.get(),
+            })
+        }
+
+        fn supports_swap(&self, _first_dir: &Path, _second_dir: &Path) -> Result<bool> {
+            Ok(self.swap_supported.get())
+        }
+
+        fn swap(&self, first: &Path, second: &Path) -> Result<()> {
+            if let Some(path) = self.journal_path.borrow().as_ref()
+                && let Some(journal) = FileJournalStore::new(path.clone()).load().unwrap()
+            {
+                self.at_swap.borrow_mut().push((journal.phase, journal.steps[0].state));
+            }
+            if self.fail_swap.get() {
+                return Err(io_error("injected swap failure"));
+            }
+            self.swaps.set(self.swaps.get() + 1);
+            if !self.noop_swap.get() {
+                rename_swap(first, second);
+            }
+            Ok(())
+        }
+
+        fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()> {
+            assert_eq!(team_id, crate::testing::TEST_TEAM_ID);
+            if self.bad_signature.borrow().iter().any(|bad| bundle.starts_with(bad)) {
+                return Err(UpdateError::new(ErrorCode::SignatureInvalid, "bad signature"));
+            }
+            Ok(())
+        }
+
+        fn assess_gatekeeper(&self, bundle: &Path) -> Result<()> {
+            if self.bad_gatekeeper.borrow().iter().any(|bad| bundle.starts_with(bad)) {
+                return Err(UpdateError::new(ErrorCode::SignatureInvalid, "Gatekeeper rejected"));
+            }
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        _dir: TempDir,
+        coordination: Coordination,
+        transaction: TransactionId,
+        placement: Placement,
+        candidate_id: String,
+        policy: TrustPolicy,
+        clock: FixedClock,
+        host: FakeHost,
+        old_files: Vec<(&'static str, Vec<u8>)>,
+        new_files: Vec<(&'static str, Vec<u8>)>,
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with(&good_plist(NEW))
+    }
+
+    /// `candidate_info` is the Info.plist inside the candidate archive.
+    fn fixture_with(candidate_info: &str) -> Fixture {
+        let dir = TempDir::new("macos-apply");
+        let live = dir.path().join("Hane.app");
+        let old_files = bundle_files(OLD, &good_plist(OLD));
+        write_bundle(&live, &old_files);
+
+        let install_id = InstallId::derive(&InstallFacts {
+            os: "test",
+            volume_id: "v",
+            install_path: "/x",
+            owner: "u",
+        })
+        .unwrap();
+        let coordination = Coordination::create(dir.path(), &install_id).unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        coordination.ensure_helper_dir(&transaction).unwrap();
+
+        let new_files = bundle_files(NEW, candidate_info);
+        let mut entries = vec![
+            ZipEntry::dir("hane-macos-arm64/"),
+            ZipEntry::dir("hane-macos-arm64/Hane.app/"),
+        ];
+        for (rel, data) in &new_files {
+            let name = format!("hane-macos-arm64/Hane.app/{rel}");
+            let entry = ZipEntry::file(&name, data);
+            entries.push(if rel.starts_with("Contents/MacOS/") || rel.starts_with("Contents/Helpers/") {
+                entry.executable()
+            } else {
+                entry
+            });
+        }
+        entries.push(ZipEntry::file("hane-macos-arm64/README.md", b"readme"));
+        let unpacked: u64 = entries.iter().map(ZipEntry::declared).sum();
+        let zip = build_zip(&entries);
+        let doc = catalog_doc(NEW, 2, Target::MacosArm64, macos_entry(NEW, &zip, unpacked));
+        let (catalog, catalog_sig) = sign_catalog(&doc);
+
+        let ready = dir.path().join("ready");
+        fs::create_dir_all(&ready).unwrap();
+        fs::write(ready.join("c"), &catalog).unwrap();
+        fs::write(ready.join("s"), &catalog_sig).unwrap();
+        fs::write(ready.join("a"), &zip).unwrap();
+        stage_candidate(
+            &coordination,
+            &transaction,
+            &CandidateSource {
+                catalog: &ready.join("c"),
+                signature: &ready.join("s"),
+                archive: &ready.join("a"),
+            },
+        )
+        .unwrap();
+        let verified = verify_catalog(
+            &catalog,
+            &catalog_sig,
+            &VerifyContext {
+                policy: &test_policy(),
+                clock: &FixedClock::new(test_now()),
+                current_version: OLD,
+                target: Target::MacosArm64,
+                seen: None,
+                expected_tag: None,
+            },
+        )
+        .unwrap();
+        let candidate_id = verified.candidate_id().as_str().to_owned();
+        fs::create_dir_all(coordination.dir().join(crate::platform::lease::RECEIPTS_DIR)).unwrap();
+        record_seen(&mut FileSeenStore::new(coordination.seen_catalog_path()), &verified).unwrap();
+
+        let placement = Placement {
+            target: Target::MacosArm64,
+            install_root: live,
+            coordination_parent: dir.path().to_path_buf(),
+            install_id,
+        };
+        let host = FakeHost::new();
+        *host.journal_path.borrow_mut() = Some(coordination.journal_path(&transaction));
+        Fixture {
+            _dir: dir,
+            coordination,
+            transaction,
+            placement,
+            candidate_id,
+            policy: test_policy(),
+            clock: FixedClock::new(test_now()),
+            host,
+            old_files,
+            new_files,
+        }
+    }
+
+    impl Fixture {
+        fn inputs(&self) -> BundleApplyInputs<'_> {
+            BundleApplyInputs {
+                coordination: &self.coordination,
+                transaction: &self.transaction,
+                candidate_id: &self.candidate_id,
+                placement: &self.placement,
+                policy: &self.policy,
+                clock: &self.clock,
+                host: &self.host,
+                runtime_held: true,
+            }
+        }
+
+        fn live(&self) -> &Path {
+            &self.placement.install_root
+        }
+
+        fn slot(&self) -> PathBuf {
+            slot_path(&self.coordination.transaction_dir(&self.transaction))
+        }
+
+        fn journal_path(&self) -> PathBuf {
+            self.coordination.journal_path(&self.transaction)
+        }
+
+        fn stored(&self) -> UpdateJournal {
+            FileJournalStore::new(self.journal_path()).load().unwrap().unwrap()
+        }
+
+        fn live_is_old(&self) -> bool {
+            tree(self.live()) == files_tree(&self.old_files)
+        }
+
+        fn live_is_new(&self) -> bool {
+            tree(self.live()) == files_tree(&self.new_files)
+        }
+
+        /// Nothing was changed: no journal, no exchange, the old bundle live.
+        fn untouched(&self) -> bool {
+            self.host.swaps.get() == 0 && !self.journal_path().exists() && self.live_is_old()
+        }
+    }
+
+    // ------------------------------------------------------ fake child
+
+    #[derive(Default)]
+    struct Probe {
+        stops: Cell<usize>,
+        commits: Cell<usize>,
+        phase_at_commit: RefCell<Option<Phase>>,
+        launched: RefCell<Option<(PathBuf, String)>>,
+    }
+
+    struct FakeChild {
+        health: Result<()>,
+        stop: Result<()>,
+        journal_path: PathBuf,
+        probe: Rc<Probe>,
+    }
+
+    impl LimitedChild for FakeChild {
+        fn await_healthy(&mut self, _timeout: Duration) -> Result<()> {
+            self.health.clone()
+        }
+
+        fn send_commit(&mut self) -> Result<()> {
+            self.probe.commits.set(self.probe.commits.get() + 1);
+            let stored = FileJournalStore::new(self.journal_path.clone()).load().unwrap().unwrap();
+            *self.probe.phase_at_commit.borrow_mut() = Some(stored.phase);
+            Ok(())
+        }
+
+        fn detach(&mut self) {}
+
+        fn as_health_child(&mut self) -> &mut dyn HealthChild {
+            self
+        }
+    }
+
+    impl HealthChild for FakeChild {
+        fn stop_and_release_lease(&mut self) -> Result<()> {
+            self.probe.stops.set(self.probe.stops.get() + 1);
+            self.stop.clone()
+        }
+    }
+
+    struct FakeLauncher {
+        health: Result<()>,
+        stop: Result<()>,
+        journal_path: PathBuf,
+        probe: Rc<Probe>,
+    }
+
+    impl FakeLauncher {
+        fn new(fx: &Fixture, health: Result<()>) -> Self {
+            Self {
+                health,
+                stop: Ok(()),
+                journal_path: fx.journal_path(),
+                probe: Rc::new(Probe::default()),
+            }
+        }
+
+        fn child(&self, health: Result<()>) -> Box<dyn LimitedChild> {
+            Box::new(FakeChild {
+                health,
+                stop: self.stop.clone(),
+                journal_path: self.journal_path.clone(),
+                probe: Rc::clone(&self.probe),
+            })
+        }
+    }
+
+    impl HealthLauncher for FakeLauncher {
+        fn launch(&mut self, request: &LaunchRequest<'_>) -> Box<dyn LimitedChild> {
+            *self.probe.launched.borrow_mut() =
+                Some((request.exe.to_path_buf(), request.version.to_owned()));
+            self.child(self.health.clone())
+        }
+
+        fn failed(&mut self, error: UpdateError, _request: &LaunchFailure<'_>) -> Box<dyn LimitedChild> {
+            self.child(Err(error))
+        }
+
+        fn health_timeout(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+    }
+
+    // ----------------------------------------------- identity and parsing
+
+    #[test]
+    fn plist_values_are_read_from_xml_only_and_only_for_their_own_key() {
+        let info = good_plist(NEW);
+        assert_eq!(plist_string(&info, "CFBundleIdentifier").as_deref(), Some(MACOS_BUNDLE_ID));
+        assert_eq!(plist_integer(&info, "HaneUpdaterProtocol"), Some(1));
+        // An integer is not a string and a string is not an integer.
+        assert_eq!(plist_string(&info, "HaneUpdaterProtocol"), None);
+        assert_eq!(plist_integer(&info, "CFBundleIdentifier"), None);
+        // The next key's value is never borrowed.
+        assert_eq!(plist_string("<key>A</key><true/><key>B</key><string>x</string>", "A"), None);
+        assert_eq!(plist_string("bplist00\u{1}", "CFBundleIdentifier"), None);
+    }
+
+    #[test]
+    fn the_bundle_identity_follows_the_executable_the_seal_and_the_plist() {
+        let dir = TempDir::new("macos-identity");
+        let bundle = dir.path().join("Hane.app");
+        assert_eq!(bundle_identity(&bundle).unwrap(), Observed::Missing);
+        write_bundle(&bundle, &bundle_files(OLD, &good_plist(OLD)));
+        let base = bundle_identity(&bundle).unwrap();
+        assert!(matches!(base, Observed::File(_)));
+        assert_eq!(bundle_identity(&bundle).unwrap(), base);
+        for rel in IDENTITY_FILES {
+            let path = bundle.join(rel);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, b"changed").unwrap();
+            assert_ne!(bundle_identity(&bundle).unwrap(), base, "{rel}");
+            fs::write(&path, original).unwrap();
+        }
+        // An incomplete bundle is an error, not an identity.
+        fs::remove_file(bundle.join("Contents/_CodeSignature/CodeResources")).unwrap();
+        assert!(bundle_identity(&bundle).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_bundle_is_never_an_identity() {
+        let dir = TempDir::new("macos-link");
+        let real = dir.path().join("real.app");
+        write_bundle(&real, &bundle_files(OLD, &good_plist(OLD)));
+        let link = dir.path().join("Hane.app");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(bundle_identity(&link).is_err());
+        assert!(read_bundle_facts(&link).is_err());
+    }
+
+    // --------------------------------------------------------- apply
+
+    #[test]
+    fn a_healthy_child_commits_and_the_new_bundle_stays() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+
+        assert!(fx.live_is_new());
+        assert_eq!(fx.stored().phase, Phase::Committed);
+        assert_eq!(fx.stored().steps[0].state, StepState::Applied);
+        assert_eq!(fx.host.swaps.get(), 1, "exactly one exchange");
+        assert_eq!(launcher.probe.commits.get(), 1);
+        assert_eq!(
+            *launcher.probe.phase_at_commit.borrow(),
+            Some(Phase::Committed),
+            "Commit is sent only after the journal is durably Committed"
+        );
+        assert_eq!(launcher.probe.stops.get(), 0);
+        let launched = launcher.probe.launched.borrow().clone().unwrap();
+        assert_eq!(launched.0, fx.live().join("Contents/MacOS/hane"));
+        assert_eq!(launched.1, NEW);
+        // The old bundle rests in the slot as the backup.
+        assert_eq!(tree(&fx.slot()), files_tree(&fx.old_files));
+    }
+
+    #[test]
+    fn the_intent_is_durable_before_the_exchange_and_the_result_after_it() {
+        let fx = fixture();
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        assert_eq!(*fx.host.at_swap.borrow(), vec![(Phase::Applying, StepState::Intent)]);
+        let journal = applied.journal();
+        assert_eq!(journal.phase, Phase::AwaitingHealth);
+        assert_eq!(journal.steps.len(), 1);
+        let step = &journal.steps[0];
+        assert_eq!(step.state, StepState::Applied);
+        assert_eq!(step.rel_path, BUNDLE_REL);
+        assert_eq!(step.backup_rel.as_deref(), Some(BACKUP_REL));
+        assert_eq!(Some(Observed::File(step.new.clone().unwrap())), Some(bundle_identity(fx.live()).unwrap()));
+        assert_eq!(Observed::File(step.old.clone().unwrap()), bundle_identity(&fx.slot()).unwrap());
+        assert_eq!(journal.source.team_id.as_deref(), Some(crate::testing::TEST_TEAM_ID));
+        assert_eq!(journal.destination.team_id.as_deref(), Some(crate::testing::TEST_TEAM_ID));
+        assert_eq!(journal.source.version, OLD);
+        assert_eq!(journal.destination.version, NEW);
+    }
+
+    #[test]
+    fn an_unhealthy_child_is_stopped_and_the_old_bundle_comes_back_by_the_same_exchange() {
+        for code in [ErrorCode::Timeout, ErrorCode::Truncated, ErrorCode::IdentityMismatch] {
+            let fx = fixture();
+            let mut launcher = FakeLauncher::new(&fx, Err(UpdateError::new(code, "no health")));
+            let err = apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+            assert_eq!(err.code, code);
+            assert!(fx.live_is_old(), "{code:?}: the old bundle must be back byte for byte");
+            assert_eq!(tree(&fx.slot()), files_tree(&fx.new_files), "{code:?}");
+            assert_eq!(fx.stored().phase, Phase::RolledBack, "{code:?}");
+            assert_eq!(fx.host.swaps.get(), 2, "{code:?}: one exchange and one rollback exchange");
+            assert_eq!(launcher.probe.stops.get(), 1, "{code:?}");
+            assert_eq!(launcher.probe.commits.get(), 0, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_stopped_blocks_the_rollback_exchange() {
+        let fx = fixture();
+        let mut launcher =
+            FakeLauncher::new(&fx, Err(UpdateError::new(ErrorCode::Timeout, "no health")));
+        launcher.stop = Err(UpdateError::new(ErrorCode::Timeout, "the runtime lease is still held"));
+        let err = apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(fx.stored().phase, Phase::RecoveryRequired);
+        assert_eq!(fx.host.swaps.get(), 1, "no second exchange while the child may run");
+        assert!(fx.live_is_new());
+        assert_eq!(launcher.probe.commits.get(), 0);
+    }
+
+    #[test]
+    fn a_failed_exchange_leaves_the_old_bundle_and_settles_the_journal() {
+        let fx = fixture();
+        fx.host.fail_swap.set(true);
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(fx.live_is_old());
+        assert_eq!(fx.host.swaps.get(), 0);
+        assert_eq!(fx.stored().phase, Phase::RolledBack);
+    }
+
+    #[test]
+    fn an_exchange_that_did_not_take_effect_is_never_reported_as_applied() {
+        let fx = fixture();
+        fx.host.noop_swap.set(true);
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::HashMismatch);
+        assert!(fx.live_is_old());
+        assert_eq!(fx.stored().phase, Phase::RolledBack);
+    }
+
+    #[test]
+    fn a_running_application_prevents_every_change() {
+        let fx = fixture();
+        let mut inputs = fx.inputs();
+        inputs.runtime_held = false;
+        assert_eq!(apply_bundle(&inputs).err().unwrap().code, ErrorCode::NotApplicable);
+        assert!(fx.untouched());
+        assert!(!fx.slot().exists(), "nothing was even staged");
+    }
+
+    // ------------------------------------------------- refused before mutation
+
+    #[test]
+    fn a_build_without_a_team_id_cannot_apply() {
+        let mut fx = fixture();
+        fx.policy = TrustPolicy::new(Vec::new(), None);
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::TrustUnconfigured);
+        assert!(fx.untouched());
+    }
+
+    #[test]
+    fn a_candidate_with_an_invalid_signature_is_refused_before_any_journal_or_exchange() {
+        let fx = fixture();
+        fx.host.bad_signature.borrow_mut().push(fx.slot());
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::SignatureInvalid);
+        assert!(fx.untouched());
+    }
+
+    #[test]
+    fn an_installed_bundle_with_an_invalid_signature_is_not_replaced() {
+        let fx = fixture();
+        fx.host.bad_signature.borrow_mut().push(fx.live().to_path_buf());
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::SignatureInvalid);
+        assert!(fx.untouched());
+    }
+
+    #[test]
+    fn a_gatekeeper_rejection_of_either_bundle_is_refused() {
+        for rejected in [true, false] {
+            let fx = fixture();
+            let path = if rejected { fx.slot() } else { fx.live().to_path_buf() };
+            fx.host.bad_gatekeeper.borrow_mut().push(path);
+            let err = apply_bundle(&fx.inputs()).err().unwrap();
+            assert_eq!(err.code, ErrorCode::SignatureInvalid, "candidate rejected: {rejected}");
+            assert!(fx.untouched(), "candidate rejected: {rejected}");
+        }
+    }
+
+    #[test]
+    fn a_candidate_that_disagrees_with_the_catalog_is_refused() {
+        let wrong_id = plist(NEW, TEST_SOURCE_SHA, "com.example.other", 1);
+        let wrong_version = plist("0.27.0", TEST_SOURCE_SHA, MACOS_BUNDLE_ID, 1);
+        let wrong_commit = plist(NEW, &"b".repeat(40), MACOS_BUNDLE_ID, 1);
+        let wrong_protocol = plist(NEW, TEST_SOURCE_SHA, MACOS_BUNDLE_ID, 2);
+        for (info, code) in [
+            (wrong_id, ErrorCode::IdentityMismatch),
+            (wrong_version, ErrorCode::IdentityMismatch),
+            (wrong_commit, ErrorCode::IdentityMismatch),
+            (wrong_protocol, ErrorCode::ProtocolUnsupported),
+        ] {
+            let fx = fixture_with(&info);
+            let err = apply_bundle(&fx.inputs()).err().unwrap();
+            assert_eq!(err.code, code, "{info}");
+            assert!(fx.untouched(), "{info}");
+        }
+    }
+
+    #[test]
+    fn a_placement_that_cannot_swap_is_refused_before_any_change() {
+        let cases: [(&str, fn(&FakeHost)); 5] = [
+            ("not APFS", |h| h.apfs.set(false)),
+            ("not local", |h| h.local.set(false)),
+            ("read only", |h| h.read_only.set(true)),
+            ("no swap renaming", |h| h.swap_supported.set(false)),
+            ("candidate on another volume", |h| h.slot_on_other_volume.set(true)),
+        ];
+        for (name, arrange) in cases {
+            let fx = fixture();
+            arrange(&fx.host);
+            let err = apply_bundle(&fx.inputs()).err().unwrap();
+            assert_eq!(err.code, ErrorCode::UnsupportedInstall, "{name}");
+            assert!(fx.untouched(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_bundle_path_is_closed_to_other_targets() {
+        let mut fx = fixture();
+        fx.placement.target = Target::WindowsX64;
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+        assert!(fx.untouched());
+
+        // Recovery of a bundle journal is refused for any other layout too.
+        let mut fx = fixture();
+        let mut journal = journal_at(&fx, Reached::Prepared);
+        fx.placement.target = Target::WindowsX64;
+        let outcome = recover(&fx, &mut journal);
+        assert!(matches!(outcome, RecoveryOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(fx.host.swaps.get(), 0);
+        assert!(fx.live_is_old());
+    }
+
+    // -------------------------------------------------------- recovery
+
+    /// How far the journal got before the simulated interruption.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Reached {
+        Prepared,
+        /// `Applying`, step still `Planned`.
+        Applying,
+        /// `Applying`, intent durable.
+        Intent,
+        /// Exchange observed, `Applied` durable, still `Applying`.
+        Applied,
+        AwaitingHealth,
+        Committed,
+        RollingBack,
+    }
+
+    /// Stages the candidate through the real verification, then builds a
+    /// journal that reached `reached`. The disk is left unswapped.
+    fn journal_at(fx: &Fixture, reached: Reached) -> DurableJournal<FileJournalStore> {
+        let verified = verify_and_plan(&fx.inputs()).unwrap();
+        let journal = UpdateJournal::begin(&verified.plan, None).unwrap();
+        let mut journal =
+            DurableJournal::create(FileJournalStore::new(fx.journal_path()), journal).unwrap();
+        if reached == Reached::Prepared {
+            return journal;
+        }
+        journal.advance_phase(Phase::ExitAuthorized).unwrap();
+        journal.advance_phase(Phase::Applying).unwrap();
+        if reached == Reached::Applying {
+            return journal;
+        }
+        journal.advance_step(0, StepState::Intent).unwrap();
+        if reached == Reached::Intent {
+            return journal;
+        }
+        journal.advance_step(0, StepState::Applied).unwrap();
+        if reached == Reached::Applied {
+            return journal;
+        }
+        journal.advance_phase(Phase::AwaitingHealth).unwrap();
+        match reached {
+            Reached::Committed => journal.advance_phase(Phase::Committed).unwrap(),
+            Reached::RollingBack => journal.advance_phase(Phase::RollingBack).unwrap(),
+            _ => {}
+        }
+        journal
+    }
+
+    fn recover(fx: &Fixture, journal: &mut DurableJournal<FileJournalStore>) -> RecoveryOutcome {
+        recover_bundle(&fx.coordination, &fx.transaction, &fx.placement, &fx.host, journal).unwrap()
+    }
+
+    /// Exchanges live and slot directly, as an interrupted run would have.
+    fn exchanged_before_the_interruption(fx: &Fixture) {
+        rename_swap(fx.live(), &fx.slot());
+    }
+
+    #[test]
+    fn an_interruption_before_the_exchange_keeps_the_old_bundle_without_exchanging() {
+        for reached in [Reached::Prepared, Reached::Applying, Reached::Intent] {
+            let fx = fixture();
+            let mut journal = journal_at(&fx, reached);
+            let outcome = recover(&fx, &mut journal);
+            assert!(
+                matches!(outcome, RecoveryOutcome::KeptOld | RecoveryOutcome::RolledBack),
+                "{reached:?}: {outcome:?}"
+            );
+            assert!(fx.live_is_old(), "{reached:?}");
+            assert_eq!(fx.host.swaps.get(), 0, "{reached:?}");
+            assert_eq!(fx.stored().phase, Phase::RolledBack, "{reached:?}");
+        }
+    }
+
+    #[test]
+    fn an_interruption_after_the_exchange_exchanges_back_exactly_once() {
+        // The journal may not have caught up with the disk at any of these points.
+        for reached in [Reached::Intent, Reached::Applied, Reached::AwaitingHealth, Reached::RollingBack] {
+            let fx = fixture();
+            let mut journal = journal_at(&fx, reached);
+            exchanged_before_the_interruption(&fx);
+            assert_eq!(recover(&fx, &mut journal), RecoveryOutcome::RolledBack, "{reached:?}");
+            assert!(fx.live_is_old(), "{reached:?}");
+            assert_eq!(tree(&fx.slot()), files_tree(&fx.new_files), "{reached:?}");
+            assert_eq!(fx.host.swaps.get(), 1, "{reached:?}: one rollback exchange");
+            assert_eq!(fx.stored().phase, Phase::RolledBack, "{reached:?}");
+            // A second recovery finds a settled journal and exchanges nothing.
+            let mut again = DurableJournal::open(FileJournalStore::new(fx.journal_path())).unwrap().unwrap();
+            let outcome = recover(&fx, &mut again);
+            assert!(!matches!(outcome, RecoveryOutcome::RecoveryRequired(_)), "{reached:?}: {outcome:?}");
+            assert_eq!(fx.host.swaps.get(), 1, "{reached:?}: never a double exchange");
+        }
+    }
+
+    #[test]
+    fn a_rollback_interrupted_after_its_exchange_does_not_exchange_again() {
+        let fx = fixture();
+        let mut journal = journal_at(&fx, Reached::RollingBack);
+        // The disk is already back at the old bundle: only the journal lags.
+        let outcome = recover(&fx, &mut journal);
+        assert!(
+            matches!(outcome, RecoveryOutcome::KeptOld | RecoveryOutcome::RolledBack),
+            "{outcome:?}"
+        );
+        assert_eq!(fx.host.swaps.get(), 0);
+        assert!(fx.live_is_old());
+        assert_eq!(fx.stored().phase, Phase::RolledBack);
+    }
+
+    #[test]
+    fn a_durable_commit_keeps_the_new_bundle_and_a_disk_that_disagrees_stops() {
+        let fx = fixture();
+        let mut journal = journal_at(&fx, Reached::Committed);
+        exchanged_before_the_interruption(&fx);
+        assert_eq!(recover(&fx, &mut journal), RecoveryOutcome::KeptNew);
+        assert!(fx.live_is_new());
+        assert_eq!(fx.host.swaps.get(), 0);
+
+        // Committed, yet the old bundle is live: nothing is guessed or swapped.
+        let fx = fixture();
+        let mut journal = journal_at(&fx, Reached::Committed);
+        assert!(matches!(recover(&fx, &mut journal), RecoveryOutcome::RecoveryRequired(_)));
+        assert_eq!(fx.host.swaps.get(), 0);
+        assert!(fx.live_is_old());
+    }
+
+    #[test]
+    fn an_unknown_live_bundle_is_never_touched() {
+        for reached in [Reached::Intent, Reached::AwaitingHealth] {
+            for swapped in [false, true] {
+                let fx = fixture();
+                let mut journal = journal_at(&fx, reached);
+                if swapped {
+                    exchanged_before_the_interruption(&fx);
+                }
+                let seal = fx.live().join("Contents/_CodeSignature/CodeResources");
+                fs::write(&seal, b"tampered").unwrap();
+                let outcome = recover(&fx, &mut journal);
+                assert!(
+                    matches!(outcome, RecoveryOutcome::RecoveryRequired(_)),
+                    "{reached:?} swapped={swapped}: {outcome:?}"
+                );
+                assert_eq!(fx.host.swaps.get(), 0, "{reached:?} swapped={swapped}");
+                assert_eq!(fs::read(&seal).unwrap(), b"tampered", "{reached:?} swapped={swapped}");
+                assert_eq!(fx.stored().phase, Phase::RecoveryRequired);
+            }
+        }
+    }
+
+    #[test]
+    fn a_damaged_or_missing_backup_stops_the_rollback_without_an_exchange() {
+        for remove in [false, true] {
+            let fx = fixture();
+            let mut journal = journal_at(&fx, Reached::AwaitingHealth);
+            exchanged_before_the_interruption(&fx);
+            if remove {
+                fs::remove_dir_all(fx.slot()).unwrap();
+            } else {
+                fs::write(fx.slot().join("Contents/MacOS/hane"), b"damaged").unwrap();
+            }
+            let outcome = recover(&fx, &mut journal);
+            assert!(matches!(outcome, RecoveryOutcome::RecoveryRequired(_)), "remove={remove}: {outcome:?}");
+            assert_eq!(fx.host.swaps.get(), 0, "remove={remove}");
+            assert!(fx.live_is_new(), "remove={remove}");
+        }
+    }
+
+    #[test]
+    fn an_exchange_without_a_recorded_intent_is_not_rolled_back_on_a_guess() {
+        let fx = fixture();
+        let mut journal = journal_at(&fx, Reached::Applying);
+        exchanged_before_the_interruption(&fx);
+        let outcome = recover(&fx, &mut journal);
+        assert!(matches!(outcome, RecoveryOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(fx.host.swaps.get(), 0);
+        assert!(fx.live_is_new());
+    }
+
+    #[test]
+    fn a_journal_for_other_paths_is_rejected_by_the_adapter() {
+        let fx = fixture();
+        let mut ops = BundleOps::new(&fx.host, fx.live(), &fx.slot());
+        assert!(ops.observe("other.app").is_err());
+        assert!(ops.observe("backup/other.app").is_err());
+        assert!(ops.remove(BUNDLE_REL).is_err());
+        assert!(ops.backup(BUNDLE_REL, BACKUP_REL).is_err());
+        assert!(ops.install_new(BUNDLE_REL, &FileIdentity::of(b"x")).is_err());
+        assert!(ops.restore("other.app", BACKUP_REL, &FileIdentity::of(b"x")).is_err());
+        assert_eq!(fx.host.swaps.get(), 0);
+    }
+
+    #[test]
+    fn a_later_update_waits_for_the_terminal_receipt_to_match_the_live_bundle() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+        // Committed, but the live bundle changed afterwards: no new mutation may
+        // build on a receipt that no longer describes the install.
+        let view = BundleView::new(fx.live());
+        assert!(crate::startup::ensure_prior_receipts_current(&fx.coordination, &view).is_ok());
+        fs::write(fx.live().join("Contents/MacOS/hane"), b"changed later").unwrap();
+        assert!(crate::startup::ensure_prior_receipts_current(&fx.coordination, &view).is_err());
+    }
+}

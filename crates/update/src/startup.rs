@@ -21,7 +21,7 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::helper::{HelloRequest, PREPARE_TIMEOUT, spawn_helper};
 use crate::identity::TransactionId;
 use crate::journal::{
-    DiskView, FileJournalStore, FsDiskView, JournalStore, Phase, RecoveryDecision, UpdateJournal,
+    DiskView, FileJournalStore, JournalStore, Phase, RecoveryDecision, UpdateJournal,
     decide_recovery,
 };
 use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
@@ -322,7 +322,7 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
         },
         Err(err) => return stop(&err),
     };
-    let disk = FsDiskView::new(&placement.install_root);
+    let disk = placement.disk_view();
     // One recovery attempt: the second look must find nothing pending.
     for attempt in 0..2 {
         let startup = match coordination.acquire_within(LeaseKind::Startup, &[], wait) {
@@ -330,7 +330,7 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
             Err(err) if err.code == ErrorCode::Timeout => return GateOutcome::UpdateInProgress,
             Err(err) => return stop(&err),
         };
-        match scan_pending(&coordination, &disk) {
+        match scan_pending(&coordination, &*disk) {
             Err(err) => return stop(&UpdateError::from(err)),
             Ok(Some(Pending::Stop(why))) => return GateOutcome::RecoveryRequired(why),
             Ok(None) => {

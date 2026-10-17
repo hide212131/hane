@@ -1,13 +1,19 @@
 //! macOS placement checks: a Developer ID signed `Hane.app` on a local,
 //! writable APFS volume, running from its normal location.
 //!
-//! The volume file-system query is the only `unsafe` here. Signature checking
-//! is delegated to the OS `codesign` tool with fixed arguments (no shell); the
-//! catalog signature and Apple's signature are separate checks and neither
-//! replaces the other. `renamex_np(RENAME_SWAP)` capability is checked by the
-//! bundle-swap increment, not here.
+//! Two `unsafe` spots live here: the read-only volume file-system query and
+//! the `renamex_np(RENAME_SWAP)` exchange of the bundle-swap increment.
+//! Signature checking and the Gatekeeper assessment are delegated to the OS
+//! `codesign` and `spctl` tools with fixed arguments (no shell); the catalog
+//! signature and Apple's signature are separate checks and neither replaces the
+//! other. [`MacHost`] is the real [`BundleHost`] behind the
+//! `crate::macos_apply` bundle swap; it never falls back to a two-step rename.
+//! None of this has run against a real signed candidate yet (U2 / U5).
 
-#![allow(unsafe_code, reason = "one read-only statfs query through libc")]
+#![allow(
+    unsafe_code,
+    reason = "read-only statfs query and renamex_np(RENAME_SWAP) through libc"
+)]
 
 use std::ffi::CString;
 use std::fs;
@@ -15,26 +21,34 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{HELPER_FILE_NAME, HelperSource, Placement, owner_name, unsupported};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{hash_regular_file, read_limited};
 use crate::identity::{FileIdentity, InstallFacts, InstallId};
+use crate::macos_apply::{
+    BundleHost, VolumeFacts, plist_string, required_team_id, valid_team_id,
+};
 use crate::model::{MACOS_BUNDLE_ID, Target};
 use crate::trust::TrustPolicy;
 
 const CODESIGN: &str = "/usr/bin/codesign";
+const SPCTL: &str = "/usr/sbin/spctl";
 const MAIN_EXECUTABLE: &str = "hane";
 const MAX_PLIST_BYTES: u64 = 256 << 10;
+/// `RENAME_SWAP` of `<sys/stdio.h>`: exchange the two names atomically.
+const RENAME_SWAP: libc::c_uint = 0x2;
 
-struct Volume {
-    id: String,
-    apfs: bool,
-    local: bool,
-    read_only: bool,
+unsafe extern "C" {
+    fn renamex_np(
+        from: *const libc::c_char,
+        to: *const libc::c_char,
+        flags: libc::c_uint,
+    ) -> libc::c_int;
 }
 
-fn query_volume(path: &Path) -> Result<Volume> {
+fn query_volume(path: &Path) -> Result<VolumeFacts> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| unsupported("the install path contains a NUL byte"))?;
     // SAFETY: `statfs` is plain data, so the zeroed value is valid storage; the
@@ -57,21 +71,12 @@ fn query_volume(path: &Path) -> Result<Volume> {
         .map(|c| *c as u8)
         .collect();
     let flags = i64::from(stat.f_flags);
-    Ok(Volume {
+    Ok(VolumeFacts {
         id: format!("{:x}", fs::metadata(path)?.dev()),
         apfs: name_bytes == b"apfs",
         local: flags & i64::from(libc::MNT_LOCAL) != 0,
         read_only: flags & i64::from(libc::MNT_RDONLY) != 0,
     })
-}
-
-/// Reads `CFBundleIdentifier` from an XML Info.plist; anything else fails closed.
-fn plist_string(plist: &str, key: &str) -> Option<String> {
-    let marker = format!("<key>{key}</key>");
-    let rest = &plist[plist.find(&marker)? + marker.len()..];
-    let start = rest.find("<string>")? + "<string>".len();
-    let end = rest[start..].find("</string>")? + start;
-    Some(rest[start..end].trim().to_owned())
 }
 
 pub fn locate(exe: &Path) -> Result<Placement> {
@@ -129,21 +134,6 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     })
 }
 
-fn valid_team_id(team_id: &str) -> bool {
-    team_id.len() == 10 && team_id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-}
-
-/// The pinned Team ID, or `TrustUnconfigured` when this build embeds none.
-/// There is deliberately no fallback to "any Developer ID".
-fn required_team_id(policy: &TrustPolicy) -> Result<&str> {
-    policy.macos_team_id().ok_or_else(|| {
-        UpdateError::new(
-            ErrorCode::TrustUnconfigured,
-            "no macOS Team ID is embedded in this build",
-        )
-    })
-}
-
 /// Asks the OS to verify the complete bundle against the Developer ID
 /// requirement pinned to exactly `team_id` (leaf certificate OU).
 pub fn verify_developer_id(bundle: &Path, team_id: &str) -> Result<()> {
@@ -195,9 +185,91 @@ pub fn installed_helper(placement: &Placement, policy: &TrustPolicy) -> Result<H
     })
 }
 
+fn c_path(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| unsupported("a bundle path contains a NUL byte"))
+}
+
+/// Atomically exchanges two existing paths on one volume. There is no
+/// fallback: if the call fails, nothing has changed.
+fn exchange(first: &Path, second: &Path) -> Result<()> {
+    let (first, second) = (c_path(first)?, c_path(second)?);
+    // SAFETY: both pointers refer to NUL-terminated C strings that outlive the
+    // call, and `renamex_np` keeps neither.
+    let rc = unsafe { renamex_np(first.as_ptr(), second.as_ptr(), RENAME_SWAP) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+/// The real [`BundleHost`]: `statfs`, `renamex_np(RENAME_SWAP)`, `codesign`
+/// and `spctl`, each with fixed arguments and no shell.
+pub struct MacHost;
+
+impl BundleHost for MacHost {
+    fn volume(&self, path: &Path) -> Result<VolumeFacts> {
+        query_volume(path)
+    }
+
+    /// Proves the exchange between the two parents with scratch directories
+    /// of their own, so the bundle itself is never used as a test subject.
+    fn supports_swap(&self, first_dir: &Path, second_dir: &Path) -> Result<bool> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let name = |side: &str| format!(".hane-swap-probe-{}-{stamp:x}-{side}", std::process::id());
+        let first = first_dir.join(name("a"));
+        let second = second_dir.join(name("b"));
+        fs::create_dir(&first)?;
+        if let Err(err) = fs::create_dir(&second) {
+            let _ = fs::remove_dir(&first);
+            return Err(err.into());
+        }
+        let swapped = fs::write(first.join("marker"), b"probe").is_ok()
+            && exchange(&first, &second).is_ok()
+            && second.join("marker").exists()
+            && !first.join("marker").exists();
+        for dir in [&first, &second] {
+            let _ = fs::remove_file(dir.join("marker"));
+            let _ = fs::remove_dir(dir);
+        }
+        Ok(swapped)
+    }
+
+    fn swap(&self, first: &Path, second: &Path) -> Result<()> {
+        exchange(first, second)
+    }
+
+    fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()> {
+        verify_developer_id(bundle, team_id)
+    }
+
+    fn assess_gatekeeper(&self, bundle: &Path) -> Result<()> {
+        let status = Command::new(SPCTL)
+            .args(["--assess", "--type", "execute"])
+            .arg(bundle)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(UpdateError::new(
+                ErrorCode::SignatureInvalid,
+                "Gatekeeper does not accept the bundle",
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
 
     #[test]
     fn the_bundle_identifier_is_read_from_an_xml_plist_only() {
@@ -225,6 +297,36 @@ mod tests {
         assert_eq!(err.code, ErrorCode::TrustUnconfigured);
         let policy = TrustPolicy::new(Vec::new(), Some("ABCDE12345".to_owned()));
         assert_eq!(required_team_id(&policy).unwrap(), "ABCDE12345");
+    }
+
+    /// Runs the real `renamex_np` on the test volume. On APFS the names are
+    /// exchanged; where the volume cannot, the contract is that nothing moved.
+    /// Either way no scratch directory is left behind.
+    #[test]
+    fn the_real_exchange_either_swaps_or_changes_nothing() {
+        let dir = TempDir::new("macos-real-swap");
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("which"), b"first").unwrap();
+        fs::write(second.join("which"), b"second").unwrap();
+        let supported = MacHost.supports_swap(dir.path(), dir.path()).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".hane-swap-probe"))
+            .collect();
+        assert!(leftovers.is_empty(), "the probe cleaned up after itself");
+        let swapped = MacHost.swap(&first, &second).is_ok();
+        assert_eq!(swapped, supported, "the probe predicts the real exchange");
+        let (a, b) = (fs::read(first.join("which")).unwrap(), fs::read(second.join("which")).unwrap());
+        if swapped {
+            assert_eq!((a.as_slice(), b.as_slice()), (&b"second"[..], &b"first"[..]));
+        } else {
+            assert_eq!((a.as_slice(), b.as_slice()), (&b"first"[..], &b"second"[..]));
+        }
+        // A missing side is an error and moves nothing.
+        assert!(MacHost.swap(&first, &dir.path().join("absent")).is_err());
     }
 
     #[test]

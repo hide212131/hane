@@ -26,7 +26,8 @@
 //! applied update only once the journal is durably `Committed`; every other end
 //! has restored the old version or stopped as `RecoveryRequired`.
 //!
-//! Not here: the macOS bundle swap. It is never connected to this path.
+//! Not here: the macOS bundle swap, which lives in `macos_apply` and is never
+//! reached from this path.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -38,7 +39,7 @@ use crate::catalog::{VerifyContext, verify_catalog};
 use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{FileSeenStore, hash_regular_file, read_limited};
-use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, conclude_with_child};
+use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, Settled, conclude_with_child};
 use crate::identity::{ApplyPlan, SignedInventory, TransactionId};
 use crate::journal::{
     DurableJournal, FileJournalStore, FsDiskView, UpdateJournal, check_plan_preconditions,
@@ -404,6 +405,13 @@ pub fn apply_and_settle(inputs: &ApplyInputs<'_>, launcher: &mut dyn HealthLaunc
         &mut *child,
         launcher.health_timeout(),
     )?;
+    settled_result(settled)
+}
+
+/// `Ok` only for a durable `Committed`; every other verdict is an error that
+/// says the old version was restored or recovery is required. Shared with the
+/// macOS bundle path so both report success on exactly the same condition.
+pub(crate) fn settled_result(settled: Settled) -> Result<()> {
     match settled.outcome {
         HealthOutcome::Committed => Ok(()),
         HealthOutcome::RolledBack => Err(settled.reason.unwrap_or_else(|| {
