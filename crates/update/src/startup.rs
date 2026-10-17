@@ -15,7 +15,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::helper::{HelloRequest, PREPARE_TIMEOUT, spawn_helper};
@@ -175,13 +175,7 @@ fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<
         }
         match journal.phase {
             Phase::Committed | Phase::RolledBack => {
-                let modified = fs::symlink_metadata(coordination.journal_path(&transaction))
-                    .and_then(|meta| meta.modified())?;
-                terminal.push(Terminal {
-                    name,
-                    journal,
-                    modified,
-                });
+                terminal.push(Terminal { name, journal });
             }
             Phase::RecoveryRequired => {
                 return Ok(Some(journal_problem(&name, "an earlier recovery did not complete")));
@@ -199,26 +193,26 @@ fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<
     Ok(check_latest_terminal(coordination, terminal, disk))
 }
 
-/// A `Committed` / `RolledBack` journal and when it last changed.
+/// A `Committed` / `RolledBack` journal.
 struct Terminal {
     name: String,
     journal: UpdateJournal,
-    modified: SystemTime,
 }
 
-/// Only the newest terminal receipt describes the current install; older ones
-/// were superseded by it and are not compared with the disk. Two receipts that
-/// cannot be ordered stop instead of guessing.
+/// The current-receipt contract: at most one terminal receipt exists. An apply
+/// retires the previous receipt (and must succeed in doing so) before it
+/// creates its own journal, so no clock or file time is ever used to order
+/// receipts. More than one terminal receipt means a retire did not happen or
+/// the directory was tampered with; the gate stops instead of guessing.
 fn check_latest_terminal(
     coordination: &Coordination,
     mut terminal: Vec<Terminal>,
     disk: &dyn DiskView,
 ) -> Option<Pending> {
-    let newest = terminal.iter().map(|entry| entry.modified).max()?;
-    terminal.retain(|entry| entry.modified == newest);
     if terminal.len() > 1 {
         return Some(Pending::Stop(
-            "the latest terminal journal cannot be determined".to_owned(),
+            "more than one terminal journal exists; the current one cannot be determined"
+                .to_owned(),
         ));
     }
     let latest = terminal.pop()?;
@@ -264,16 +258,22 @@ pub(crate) fn ensure_prior_receipts_current(
     }
 }
 
-/// Retires the terminal receipts of earlier transactions. Call only after the
-/// new transaction's journal is durable: an interruption then leaves a pending
-/// journal, which the gate recovers before it looks at any receipt. Removal is
-/// best effort; a leftover receipt is ignored because the newest one wins.
-pub(crate) fn prune_superseded_receipts(coordination: &Coordination, current: &TransactionId) {
+/// Retires the terminal receipts of earlier transactions. Call after
+/// [`ensure_prior_receipts_current`] and *before* the new transaction's journal
+/// is created, so the new receipt is always the only terminal one. Any failure
+/// to read or remove an earlier receipt is an error: the caller must refuse the
+/// apply before it changes the install root. An interruption after this point
+/// leaves no receipt, which is safe because the install was just verified
+/// against the receipt that was retired.
+pub(crate) fn retire_prior_receipts(coordination: &Coordination, current: &TransactionId) -> Result<()> {
     let private = coordination.dir().join(PRIVATE_DIR);
-    let Ok(entries) = fs::read_dir(&private) else {
-        return;
+    let entries = match fs::read_dir(&private) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -283,23 +283,30 @@ pub(crate) fn prune_superseded_receipts(coordination: &Coordination, current: &T
         if &transaction == current {
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
+        let meta = fs::symlink_metadata(entry.path())?;
         if meta.file_type().is_symlink() || !meta.is_dir() {
             continue;
         }
+        let journal = FileJournalStore::new(coordination.journal_path(&transaction)).load()?;
         let terminal = matches!(
-            FileJournalStore::new(coordination.journal_path(&transaction)).load(),
-            Ok(Some(journal))
+            journal,
+            Some(ref journal)
                 if journal.transaction_id == transaction
                     && &journal.install_id == coordination.install_id()
                     && matches!(journal.phase, Phase::Committed | Phase::RolledBack)
         );
         if terminal {
-            let _ = fs::remove_dir_all(entry.path());
+            fs::remove_dir_all(entry.path()).map_err(|err| {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    bounded_reason(&format!("the previous receipt {name} cannot be retired: {err}")),
+                )
+            })?;
         }
     }
+    #[cfg(unix)]
+    fs::File::open(&private)?.sync_all()?;
+    Ok(())
 }
 
 /// Runs the gate for a verified placement.
@@ -575,14 +582,12 @@ mod tests {
         assert_eq!(runner.calls.get(), 0);
     }
 
-    /// Journals `a.dll` from `from` to `to`, advanced to `phase`, with its file
-    /// time set `age_secs` after a fixed origin so receipts are ordered.
+    /// Journals `a.dll` from `from` to `to`, advanced to `phase`.
     fn write_versioned(
         coord: &Coordination,
         transaction: &TransactionId,
         (from, to): (&str, &str),
         phase: Phase,
-        age_secs: u64,
     ) {
         let plan = ApplyPlan {
             install_id: install_id(),
@@ -616,27 +621,31 @@ mod tests {
         for next in path {
             durable.advance_phase(*next).unwrap();
         }
-        set_age(coord, transaction, age_secs);
-    }
-
-    fn set_age(coord: &Coordination, transaction: &TransactionId, age_secs: u64) {
+    fn set_modified(coord: &Coordination, transaction: &TransactionId, secs: u64) {
         let file = fs::OpenOptions::new()
             .write(true)
             .open(coord.journal_path(transaction))
             .unwrap();
-        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + age_secs))
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
             .unwrap();
     }
 
     #[test]
-    fn a_later_update_is_not_blocked_by_an_older_committed_receipt() {
+    fn two_consecutive_updates_leave_one_receipt_whatever_the_clock_did() {
         let dir = TempDir::new("gate-multi-version");
         let placement = placement(&dir);
         let coord = placement.coordination().unwrap();
-        // 1.0.0 -> 2.0.0 committed, then 2.0.0 -> 3.0.0 committed; the disk is at 3.0.0.
-        write_versioned(&coord, &TransactionId::generate().unwrap(), ("1.0.0", "2.0.0"), Phase::Committed, 0);
-        let newest = TransactionId::generate().unwrap();
-        write_versioned(&coord, &newest, ("2.0.0", "3.0.0"), Phase::Committed, 10);
+        // 1.0.0 -> 2.0.0 committed; its journal time is far in the future.
+        let first = TransactionId::generate().unwrap();
+        write_versioned(&coord, &first, ("1.0.0", "2.0.0"), Phase::Committed);
+        set_modified(&coord, &first, 9_000_000);
+        // The next apply retires it before its own journal exists; the clock
+        // then runs backwards, so the new journal is older than the old one was.
+        let second = TransactionId::generate().unwrap();
+        retire_prior_receipts(&coord, &second).unwrap();
+        assert!(!coord.transaction_dir(&first).exists());
+        write_versioned(&coord, &second, ("2.0.0", "3.0.0"), Phase::Committed);
+        set_modified(&coord, &second, 1_000);
         fs::write(placement.install_root.join("a.dll"), b"3.0.0").unwrap();
         let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
         assert!(matches!(
@@ -645,7 +654,7 @@ mod tests {
         ));
         assert_eq!(runner.calls.get(), 0);
 
-        // The newest receipt still gates: a disk that is not at 3.0.0 stops.
+        // The only receipt still gates: a disk that is not at 3.0.0 stops.
         fs::write(placement.install_root.join("a.dll"), b"2.0.0").unwrap();
         assert!(matches!(
             startup_gate(&placement, &runner, Duration::from_millis(50)),
@@ -655,18 +664,43 @@ mod tests {
     }
 
     #[test]
-    fn receipts_that_cannot_be_ordered_stop() {
-        let dir = TempDir::new("gate-unordered");
+    fn two_terminal_receipts_stop_in_either_time_order_and_refuse_an_apply() {
+        // A retire that did not happen must never be resolved by file times.
+        for (first_secs, second_secs) in [(5, 10), (10, 5), (5, 5)] {
+            let dir = TempDir::new("gate-unordered");
+            let placement = placement(&dir);
+            let coord = placement.coordination().unwrap();
+            let first = TransactionId::generate().unwrap();
+            write_versioned(&coord, &first, ("1.0.0", "2.0.0"), Phase::Committed);
+            set_modified(&coord, &first, first_secs);
+            let second = TransactionId::generate().unwrap();
+            write_versioned(&coord, &second, ("2.0.0", "3.0.0"), Phase::Committed);
+            set_modified(&coord, &second, second_secs);
+            fs::write(placement.install_root.join("a.dll"), b"3.0.0").unwrap();
+            let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+            assert!(matches!(
+                startup_gate(&placement, &runner, Duration::from_millis(50)),
+                GateOutcome::RecoveryRequired(_)
+            ));
+            let disk = placement.disk_view();
+            assert!(ensure_prior_receipts_current(&coord, &*disk).is_err());
+            assert_eq!(runner.calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_prior_receipt_is_not_retired_and_the_apply_is_refused() {
+        let dir = TempDir::new("gate-retire-corrupt");
         let placement = placement(&dir);
         let coord = placement.coordination().unwrap();
-        write_versioned(&coord, &TransactionId::generate().unwrap(), ("1.0.0", "2.0.0"), Phase::Committed, 5);
-        write_versioned(&coord, &TransactionId::generate().unwrap(), ("2.0.0", "3.0.0"), Phase::Committed, 5);
-        fs::write(placement.install_root.join("a.dll"), b"3.0.0").unwrap();
-        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
-        assert!(matches!(
-            startup_gate(&placement, &runner, Duration::from_millis(50)),
-            GateOutcome::RecoveryRequired(_)
-        ));
+        let prior = TransactionId::generate().unwrap();
+        coord.ensure_helper_dir(&prior).unwrap();
+        fs::write(coord.journal_path(&prior), b"{ not a journal").unwrap();
+        let next = TransactionId::generate().unwrap();
+        assert!(retire_prior_receipts(&coord, &next).is_err());
+        assert!(coord.journal_path(&prior).exists(), "nothing is guessed or deleted");
+        assert!(!coord.transaction_dir(&next).exists());
+        assert_eq!(fs::read(placement.install_root.join("a.dll")).unwrap(), b"old");
     }
 
     #[test]
@@ -677,9 +711,9 @@ mod tests {
             let dir = TempDir::new("gate-pending-after-commit");
             let placement = placement(&dir);
             let coord = placement.coordination().unwrap();
-            write_versioned(&coord, &TransactionId::generate().unwrap(), ("1.0.0", "2.0.0"), Phase::Committed, 0);
+            write_versioned(&coord, &TransactionId::generate().unwrap(), ("1.0.0", "2.0.0"), Phase::Committed);
             let pending = TransactionId::generate().unwrap();
-            write_versioned(&coord, &pending, ("2.0.0", "3.0.0"), Phase::Applying, 10);
+            write_versioned(&coord, &pending, ("2.0.0", "3.0.0"), Phase::Applying);
             // Mid-apply the disk matches neither receipt's committed state.
             fs::write(placement.install_root.join("a.dll"), b"3.0.0").unwrap();
             let runner = Runner::new(settle, Ok(RecoveryReport::RolledBack));
@@ -698,18 +732,18 @@ mod tests {
     }
 
     #[test]
-    fn pruning_retires_only_earlier_terminal_receipts() {
+    fn retiring_removes_only_earlier_terminal_receipts() {
         let dir = TempDir::new("gate-prune");
         let placement = placement(&dir);
         let coord = placement.coordination().unwrap();
         let old_committed = TransactionId::generate().unwrap();
-        write_versioned(&coord, &old_committed, ("1.0.0", "2.0.0"), Phase::Committed, 0);
+        write_versioned(&coord, &old_committed, ("1.0.0", "2.0.0"), Phase::Committed);
         let other_pending = TransactionId::generate().unwrap();
-        write_versioned(&coord, &other_pending, ("2.0.0", "3.0.0"), Phase::Applying, 5);
+        write_versioned(&coord, &other_pending, ("2.0.0", "3.0.0"), Phase::Applying);
         let current = TransactionId::generate().unwrap();
-        write_versioned(&coord, &current, ("2.0.0", "3.0.0"), Phase::Applying, 10);
+        write_versioned(&coord, &current, ("2.0.0", "3.0.0"), Phase::Applying);
 
-        prune_superseded_receipts(&coord, &current);
+        retire_prior_receipts(&coord, &current).unwrap();
         assert!(!coord.transaction_dir(&old_committed).exists());
         assert!(coord.journal_path(&other_pending).exists(), "unfinished work is never pruned");
         assert!(coord.journal_path(&current).exists());

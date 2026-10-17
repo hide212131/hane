@@ -313,6 +313,10 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
         inputs.coordination,
         &FsDiskView::new(&inputs.placement.install_root),
     )?;
+    // The previous receipt is retired (durably, or the apply is refused) before
+    // the new journal exists, so the new receipt is the only terminal one and
+    // no file time is needed to order them.
+    crate::startup::retire_prior_receipts(inputs.coordination, inputs.transaction)?;
     let txn_dir = inputs.coordination.transaction_dir(inputs.transaction);
     let backup = txn_dir.join(BACKUP_DIR);
     fs::create_dir_all(&backup)?;
@@ -320,9 +324,6 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     let journal = UpdateJournal::begin(&plan, None)?;
     let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
     let mut journal = DurableJournal::create(store, journal)?;
-    // The new journal is durable and pending, so an interruption from here on
-    // is recovered through it. Only now are superseded receipts retired.
-    crate::startup::prune_superseded_receipts(inputs.coordination, inputs.transaction);
     let mut ops = FsFileOps::new(
         inputs.placement.install_root.clone(),
         backup,

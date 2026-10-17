@@ -648,12 +648,14 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     // anything is mutated; otherwise it could not be retired safely.
     crate::startup::ensure_prior_receipts_current(inputs.coordination, &BundleView::new(live))?;
 
+    // The previous receipt is retired (durably, or the apply is refused) before
+    // the new journal exists, so the new receipt is the only terminal one and
+    // no file time is needed to order them.
+    crate::startup::retire_prior_receipts(inputs.coordination, inputs.transaction)?;
+
     let journal = UpdateJournal::begin(&verified.plan, None)?;
     let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
     let mut journal = DurableJournal::create(store, journal)?;
-    // The new journal is durable and pending, so an interruption from here on
-    // is recovered through it. Only now are superseded receipts retired.
-    crate::startup::prune_superseded_receipts(inputs.coordination, inputs.transaction);
     let mut ops = BundleOps::new(inputs.host, live, &verified.slot);
     match swap_bundle(&mut journal, &mut ops) {
         Ok(()) => Ok(AppliedBundle { journal, ops }),
