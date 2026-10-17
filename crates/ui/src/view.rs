@@ -3792,8 +3792,21 @@ impl EditorView {
         window_y: f32,
         window: &Window,
     ) -> Option<SourceOffset> {
+        let shaper = WindowShaper::new(window, self.zoom);
+        self.row_hit_at_window_point(line, fragment, window_x, window_y, &shaper)
+            .map(|hit| hit.offset)
+    }
+
+    /// Resolves a window-space point on one row into a [`RowHit`].
+    fn row_hit_at_window_point(
+        &self,
+        line: usize,
+        fragment: Range<usize>,
+        window_x: f32,
+        window_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<RowHit> {
         let (block_id, visual_line) = *self.line_owners.get(&line)?;
-        let visual = self.block_cache.get(&block_id)?;
         let layout = &self.layout_cache.get(&block_id)?.layout;
         let row_index = layout
             .lines
@@ -3804,12 +3817,56 @@ impl EditorView {
         let content_y = self.scroll_y + window_y
             - self.theme.header_height
             - self.document_find_reserved_height();
-        let local_y = content_y - row_top;
-        let shaper = WindowShaper::new(window, self.zoom);
-        let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, &shaper)?;
+        self.row_hit_at_point(line, fragment, x, content_y - row_top, shaper)
+    }
+
+    /// Resolves a point on one row, in the row's text column (`x`) and relative
+    /// to the row's top (`local_y`). `offset` is the nearest caret boundary, which
+    /// is where an editing click lands. `glyph_offset` is where the glyph under
+    /// the point starts, which is what link hit-testing needs: the nearest caret
+    /// of a click on the right half of a link's last glyph is the link's
+    /// exclusive end, outside the half-open link range.
+    fn row_hit_at_point(
+        &self,
+        line: usize,
+        fragment: Range<usize>,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<RowHit> {
+        let (block_id, visual_line) = *self.line_owners.get(&line)?;
+        let visual = self.block_cache.get(&block_id)?;
+        let layout = &self.layout_cache.get(&block_id)?.layout;
+        let row_index = layout
+            .lines
+            .iter()
+            .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
+        let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, shaper)?;
         let line = visual.lines.get(visual_line)?;
         let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
-        layout.source_at_xy_with_bias(visual, row_index, x, local_y, &shaper, bias)
+        let offset = layout.source_at_xy_with_bias(visual, row_index, x, local_y, shaper, bias)?;
+        let glyph_offset = layout
+            .glyph_source_at_xy(visual, row_index, x, local_y, shaper);
+        Some(RowHit {
+            offset,
+            glyph_offset,
+        })
+    }
+
+    /// The external link destination under a click that resolved to `offset`
+    /// on presented `line`, from the link targets the presentation recorded.
+    fn link_destination_at(
+        &self,
+        line: usize,
+        offset: SourceOffset,
+    ) -> Option<std::sync::Arc<str>> {
+        let (block_id, visual_line) = *self.line_owners.get(&line)?;
+        let visual = self.block_cache.get(&block_id)?.lines.get(visual_line)?;
+        visual
+            .links
+            .iter()
+            .find(|link| link.contains(offset))
+            .map(|link| link.destination.clone())
     }
 
     /// Absolute document-content y for one rendered row. The input event is in
@@ -3862,16 +3919,48 @@ impl EditorView {
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
-        let Some(offset) = self.offset_at_row_x(
+        let shaper = WindowShaper::new(window, self.zoom);
+        let Some(hit) = self.row_hit_at_window_point(
             line,
             fragment,
             f32::from(event.position.x),
             f32::from(event.position.y),
-            window,
+            &shaper,
         ) else {
             return;
         };
-        let selection = if event.modifiers.shift {
+        if let RowClick::OpenLink(destination) = self.apply_row_click(
+            line,
+            hit,
+            &event.modifiers,
+            cfg!(target_os = "macos"),
+            cx,
+        ) {
+            cx.open_url(&destination);
+        }
+    }
+
+    /// Decides and applies a left click that resolved to `hit` on `line`.
+    ///
+    /// An OS-standard modifier click on link text only reports the destination
+    /// to open and leaves caret, selection and document alone. Any other click
+    /// is ordinary selection editing at the nearest caret boundary.
+    fn apply_row_click(
+        &mut self,
+        line: usize,
+        hit: RowHit,
+        modifiers: &gpui::Modifiers,
+        macos: bool,
+        cx: &mut Context<Self>,
+    ) -> RowClick {
+        let offset = hit.offset;
+        if is_link_open_modifier(modifiers, macos)
+            && let Some(glyph_offset) = hit.glyph_offset
+            && let Some(destination) = self.link_destination_at(line, glyph_offset)
+        {
+            return RowClick::OpenLink(destination);
+        }
+        let selection = if modifiers.shift {
             Selection {
                 anchor: self.editor().selection().anchor,
                 active: offset,
@@ -3886,6 +3975,7 @@ impl EditorView {
             self.status = None;
             self.after_input(cx);
         }
+        RowClick::Edit
     }
 
     fn on_row_mouse_move(
@@ -5152,6 +5242,16 @@ impl EditorView {
                 !deltas
                     .iter()
                     .any(|delta| edit_affects_range(*delta, cached.source_range))
+                    // A reference link's destination comes from a definition
+                    // that an edit outside this block's range can change.
+                    // Rebasing would keep the old destination, so present
+                    // blocks with reference links again. Inline links carry
+                    // their own destination and still rebase.
+                    && !(cached
+                        .lines
+                        .iter()
+                        .any(|line| line.links.iter().any(|link| link.uses_reference))
+                        && !deltas.is_empty())
                     && cached.rebase(&deltas, revision)
                     // The rows describe the same text at shifted offsets, so
                     // they move with the block rather than being rebuilt.
@@ -5372,6 +5472,38 @@ fn target_in_neighbor(
         layout.lines.len().checked_sub(1)?
     };
     layout.source_at_x(&visual, row, x, shaper)
+}
+
+/// Where a left click on a text row landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowHit {
+    /// The nearest caret boundary, used for ordinary selection editing.
+    offset: SourceOffset,
+    /// Where the glyph under the pointer starts, used to hit-test link text.
+    /// `None` when the pointer is in blank space outside any drawn glyph.
+    glyph_offset: Option<SourceOffset>,
+}
+
+/// What a left click on a text row resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowClick {
+    /// Hand this external destination to the default browser.
+    OpenLink(std::sync::Arc<str>),
+    /// Ordinary caret / selection editing was applied.
+    Edit,
+}
+
+/// Whether a left click carries exactly the OS-standard "open link" modifier:
+/// Command on macOS, Ctrl elsewhere. Shift or Alt on top keep the click an
+/// ordinary selection click, as does the other platform's key (Ctrl on macOS,
+/// Command on Windows/Linux).
+fn is_link_open_modifier(modifiers: &gpui::Modifiers, macos: bool) -> bool {
+    let (wanted, other) = if macos {
+        (modifiers.platform, modifiers.control)
+    } else {
+        (modifiers.control, modifiers.platform)
+    };
+    wanted && !other && !modifiers.shift && !modifiers.alt
 }
 
 /// The caret target one row into the next or previous block, aiming at `x`.
@@ -7290,6 +7422,261 @@ mod tests {
         {
             ()
         }
+    }
+
+    #[test]
+    fn link_open_modifier_is_command_on_macos_and_ctrl_elsewhere() {
+        let command = gpui::Modifiers {
+            platform: true,
+            ..gpui::Modifiers::none()
+        };
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..gpui::Modifiers::none()
+        };
+        assert!(is_link_open_modifier(&command, true));
+        assert!(!is_link_open_modifier(&ctrl, true));
+        assert!(is_link_open_modifier(&ctrl, false));
+        assert!(!is_link_open_modifier(&command, false));
+        assert!(!is_link_open_modifier(&gpui::Modifiers::none(), true));
+        assert!(!is_link_open_modifier(&gpui::Modifiers::none(), false));
+        let shifted = gpui::Modifiers {
+            shift: true,
+            ..command
+        };
+        assert!(!is_link_open_modifier(&shifted, true));
+        let alt = gpui::Modifiers { alt: true, ..ctrl };
+        assert!(!is_link_open_modifier(&alt, false));
+    }
+
+    #[test]
+    fn link_target_matches_only_offsets_inside_the_link_text() {
+        let target = hane_presentation::LinkTarget {
+            source_range: SourceRange::new(1, 5),
+            destination: std::sync::Arc::from("https://example.com/"),
+            uses_reference: false,
+        };
+        assert!(!target.contains(SourceOffset(0)));
+        assert!(target.contains(SourceOffset(1)));
+        assert!(target.contains(SourceOffset(4)));
+        assert!(!target.contains(SourceOffset(5)));
+    }
+
+    /// Issue #502: drives the same `apply_row_click` the row mouse-down handler
+    /// uses, over presentation built by the real `cached_block` path.
+    #[gpui::test]
+    fn link_open_click_leaves_editor_state_untouched_and_other_clicks_edit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = format!("see [Hane]({DESTINATION}) end\n");
+        let inside_link = SourceOffset(text.find("Hane").unwrap() + 1);
+        let command = gpui::Modifiers {
+            platform: true,
+            ..gpui::Modifiers::none()
+        };
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..gpui::Modifiers::none()
+        };
+
+        for undone in [false, true] {
+            // Click x in 8px columns of the presented line, relative to the
+            // first column of the link text "Hane": inside the glyph "a", the
+            // right half of the last glyph "e" (whose nearest caret is the
+            // link's exclusive end), the left and right halves of the glyph
+            // right after the link, and the text before the link.
+            const INSIDE: f32 = 1.25;
+            const LAST_GLYPH_RIGHT_HALF: f32 = 3.75;
+            const AFTER_LEFT_HALF: f32 = 4.125;
+            const AFTER_RIGHT_HALF: f32 = 4.75;
+            const BEFORE_LINK: f32 = -3.5;
+            // (modifiers, macos, click column, opens DESTINATION)
+            let cases = [
+                (command, true, INSIDE, true),
+                (ctrl, false, INSIDE, true),
+                (ctrl, true, INSIDE, false),
+                (command, false, INSIDE, false),
+                (gpui::Modifiers::none(), true, INSIDE, false),
+                (command, true, LAST_GLYPH_RIGHT_HALF, true),
+                (ctrl, false, LAST_GLYPH_RIGHT_HALF, true),
+                (gpui::Modifiers::none(), true, LAST_GLYPH_RIGHT_HALF, false),
+                (command, true, AFTER_LEFT_HALF, false),
+                (command, true, AFTER_RIGHT_HALF, false),
+                (ctrl, false, AFTER_RIGHT_HALF, false),
+                (command, true, BEFORE_LINK, false),
+                (ctrl, false, BEFORE_LINK, false),
+            ];
+            for (modifiers, macos, column, opens) in cases {
+                let view = gpui::AppContext::new(cx, |cx| {
+                    EditorView::new(text.as_str(), "Untitled", cx)
+                });
+                view.update(cx, |view, cx| {
+                    let end = SourceOffset(view.editor().document().len_bytes().0);
+                    view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+                    view.dispatch(EditorCommand::Insert("!"), cx);
+                    if undone {
+                        view.dispatch(EditorCommand::Undo, cx);
+                    }
+                    let end = SourceOffset(view.editor().document().len_bytes().0);
+                    view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+
+                    // Present the paragraph the way the render loop does and
+                    // record which presented line belongs to which block.
+                    let indexed = view.block_at_offset(inside_link).unwrap();
+                    let span = block_line_span(view.editor().document(), &indexed).unwrap();
+                    let (visual, _) = view.cached_block(&indexed, &span).unwrap();
+                    view.line_owners.clear();
+                    for (at, line) in visual.lines.iter().enumerate() {
+                        view.line_owners
+                            .insert(line.line_id as usize, (visual.id, at));
+                    }
+                    let presented_at = visual
+                        .lines
+                        .iter()
+                        .position(|line| line.links.iter().any(|link| link.contains(inside_link)))
+                        .expect("the presentation records the link target");
+                    let presented = &visual.lines[presented_at];
+                    let line = presented.line_id as usize;
+                    let link_column = presented
+                        .visual_text
+                        .find("Hane")
+                        .map(|byte| presented.visual_text[..byte].chars().count())
+                        .expect("the link text is presented");
+
+                    // Lay the block out as the render loop does so the click
+                    // goes through the production row hit-test.
+                    let shaper = FixedAdvanceShaper::new(8.0);
+                    let layout = layout_block(&visual, 800.0, &shaper);
+                    let fragment = layout
+                        .lines
+                        .iter()
+                        .find(|row| row.line == presented_at)
+                        .map(|row| row.line_visual_range.clone())
+                        .expect("the link line has a laid-out row");
+                    let block_id = visual.id;
+                    view.block_cache.insert(block_id, visual.clone());
+                    view.layout_cache.insert(
+                        block_id,
+                        LayoutCacheEntry {
+                            layout,
+                            font_revision: view.layout_font_revision,
+                        },
+                    );
+                    let x = (link_column as f32 + column) * 8.0;
+                    let hit = view
+                        .row_hit_at_point(line, fragment, x, 1.0, &shaper)
+                        .expect("the click resolves on the link row");
+                    let offset = hit.offset;
+
+                    let text_before = view.editor().document().full_text();
+                    let selection_before = view.editor().selection();
+                    let revision_before = view.editor().document().revision();
+                    let can_undo_before = view.editor().can_undo();
+                    let can_redo_before = view.editor().can_redo();
+
+                    let outcome = view.apply_row_click(line, hit, &modifiers, macos, cx);
+
+                    if opens {
+                        assert_eq!(outcome, RowClick::OpenLink(DESTINATION.into()));
+                        assert_eq!(view.editor().document().full_text(), text_before);
+                        assert_eq!(view.editor().selection(), selection_before);
+                        assert_eq!(view.editor().document().revision(), revision_before);
+                        assert_eq!(view.editor().can_undo(), can_undo_before);
+                        assert_eq!(view.editor().can_redo(), can_redo_before);
+                    } else {
+                        assert_eq!(outcome, RowClick::Edit);
+                        assert_eq!(view.editor().selection(), Selection::caret(offset));
+                        assert_eq!(view.editor().document().full_text(), text_before);
+                        assert_eq!(view.editor().document().revision(), revision_before);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Issue #502: editing a reference definition in another block must not
+    /// leave a cached link presentation that still opens the old destination.
+    #[gpui::test]
+    fn editing_a_reference_definition_elsewhere_does_not_reuse_stale_link_destination(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const OLD: &str = "https://old.example/";
+        let text = format!("see [Hane][r] end\n\n[r]: {OLD}\n");
+        let inside_link = SourceOffset(text.find("Hane").unwrap() + 1);
+        let view =
+            gpui::AppContext::new(cx, |cx| EditorView::new(text.as_str(), "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            view.cached_block(&indexed, &span).unwrap();
+
+            let at = SourceOffset(text.find("old").unwrap());
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: at,
+                    active: SourceOffset(at.0 + 3),
+                })
+                .unwrap();
+            view.dispatch(EditorCommand::Insert("new"), cx);
+
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let (visual, reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(!reused, "a link-bearing block is presented again");
+            assert!(
+                visual
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.links)
+                    .all(|link| &*link.destination != OLD),
+                "the stale destination must not remain openable"
+            );
+        });
+    }
+
+    /// Issue #502: an inline link carries its own destination, so an unrelated
+    /// edit in another block keeps its cached presentation.
+    #[gpui::test]
+    fn unrelated_edit_reuses_cached_inline_link_presentation(cx: &mut gpui::TestAppContext) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = format!("see [Hane]({DESTINATION}) end\n\nother\n");
+        let inside_link = SourceOffset(text.find("Hane").unwrap() + 1);
+        let view =
+            gpui::AppContext::new(cx, |cx| EditorView::new(text.as_str(), "Untitled", cx));
+        view.update(cx, |view, cx| {
+            // Pin the caret (and thus block disclosure) to the other block
+            // before the link block is first presented, so the edit below
+            // changes neither the link block's disclosure nor its source.
+            // The insertion point is strictly inside the next block's body:
+            // an insertion at its first offset would touch the link block's
+            // `source_range.end` and count as intersecting it.
+            let at = SourceOffset(text.find("other").unwrap() + 1);
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: at,
+                    active: at,
+                })
+                .unwrap();
+
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            view.cached_block(&indexed, &span).unwrap();
+
+            view.dispatch(EditorCommand::Insert("x"), cx);
+
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let (visual, reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(reused, "an inline-link block is not presented again");
+            assert!(
+                visual
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.links)
+                    .any(|link| &*link.destination == DESTINATION)
+            );
+        });
     }
 
     fn relative_luminance(color: u32) -> f32 {

@@ -602,6 +602,30 @@ fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
 }
 
 #[test]
+fn inactive_table_row_keeps_inline_and_reference_link_targets() {
+    let source = "| h | k |\n| --- | --- |\n| [a](https://e.com/) | [r][x] | `c` |\n\n[x]: https://r.com/\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let row = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::TableRow && !line.links.is_empty())
+        .expect("body row keeps its links");
+    let a = source.find("a]").expect("inline link text");
+    let r = source.find("r]").expect("reference link text");
+    assert_eq!(row.links.len(), 2);
+    assert_eq!(&*row.links[0].destination, "https://e.com/");
+    assert_eq!(row.links[0].source_range, SourceRange::new(a, a + 1));
+    assert_eq!(&*row.links[1].destination, "https://r.com/");
+    assert_eq!(row.links[1].source_range, SourceRange::new(r, r + 1));
+    // Pipes and brackets are not part of any target.
+    let pipe = source.find(") | [").expect("cell boundary") + 2;
+    assert!(row.links.iter().all(|link| !link.contains(SourceOffset(pipe))));
+}
+
+#[test]
 fn table_layout_does_not_restore_cells_for_hidden_delimiter_rows() {
     let source = "| h | short |\n| --- | --- |\n| a | x |";
     let block = present(source, None)
@@ -1234,6 +1258,36 @@ fn a_caret_at_a_wrap_point_renders_at_the_start_of_the_next_row() {
         .expect("the wrap boundary has a position");
     assert_eq!(point.row, 1, "the caret continues on the next row");
     assert_eq!(point.x, 0.0);
+}
+
+#[test]
+fn glyph_hit_test_ignores_blank_space_around_a_wrapped_row() {
+    let (block, layout) = laid_out(WRAPPED).into_iter().next().expect("one block");
+    let shaper = shaper();
+    let row = &layout.lines[0];
+    let start = row.source_range.start.0;
+    let end = row.source_range.end.0;
+    let width = (end - start) as f32 * 8.0;
+    let glyph = |x: f32| layout.glyph_source_at_xy(&block, 0, x, 1.0, &shaper);
+
+    // Left of the first glyph is margin, not the glyph at the row start.
+    assert_eq!(glyph(-4.0), None);
+    // Both halves of the first, a middle, and the last glyph resolve to it.
+    assert_eq!(glyph(1.0), Some(SourceOffset(start)));
+    assert_eq!(glyph(7.0), Some(SourceOffset(start)));
+    assert_eq!(glyph(3.0 * 8.0 + 1.0), Some(SourceOffset(start + 3)));
+    assert_eq!(glyph(3.0 * 8.0 + 7.0), Some(SourceOffset(start + 3)));
+    assert_eq!(glyph(width - 7.0), Some(SourceOffset(end - 1)));
+    assert_eq!(glyph(width - 1.0), Some(SourceOffset(end - 1)));
+    // Right of the last glyph the soft break's boundary belongs to the next
+    // row, so the blank space must not resolve to it.
+    assert_eq!(glyph(width), None);
+    assert_eq!(glyph(width + 12.0), None);
+    // The caret hit-test is unchanged and still snaps to the boundary.
+    assert_eq!(
+        layout.source_at_xy(&block, 0, width + 12.0, 1.0, &shaper),
+        Some(SourceOffset(end))
+    );
 }
 
 #[test]
