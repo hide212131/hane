@@ -180,6 +180,12 @@ pub fn stage_helper_copy(
     }
     let copied = hash_regular_file(&dest)?.map(|(size, sha256)| FileIdentity { size, sha256 });
     if copied.as_ref() == Some(&source.identity) {
+        // Recovery after a crash must not trust the live install, which may be
+        // half replaced. It runs this copy, bound to the identity recorded here.
+        if let Err(err) = write_helper_record(coordination, transaction, &source.identity, &dest) {
+            let _ = fs::remove_file(&dest);
+            return Err(err);
+        }
         Ok(dest)
     } else {
         let _ = fs::remove_file(&dest);
@@ -188,6 +194,93 @@ pub fn stage_helper_copy(
             "the helper copy differs from the verified helper",
         ))
     }
+}
+
+const HELPER_RECORD_FILE: &str = "helper.identity";
+const HELPER_RECORD_LIMIT: u64 = 512;
+
+fn helper_record_path(coordination: &Coordination, transaction: &TransactionId) -> PathBuf {
+    coordination.transaction_dir(transaction).join(HELPER_RECORD_FILE)
+}
+
+fn record_text(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    identity: &FileIdentity,
+) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n",
+        coordination.install_id().as_str(),
+        transaction.as_str(),
+        identity.size,
+        identity.sha256
+    )
+}
+
+/// Records which install, transaction and bytes the staged helper copy was
+/// verified as, in the owner-only transaction directory.
+fn write_helper_record(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    identity: &FileIdentity,
+    staged: &Path,
+) -> Result<()> {
+    let record = helper_record_path(coordination, transaction);
+    // The copy must still be exactly what was verified before it is vouched for.
+    if hash_regular_file(staged)?.map(|(size, sha256)| FileIdentity { size, sha256 }).as_ref()
+        != Some(identity)
+    {
+        return Err(UpdateError::new(
+            ErrorCode::HashMismatch,
+            "the helper copy changed before it was recorded",
+        ));
+    }
+    durable_write(&record, record_text(coordination, transaction, identity).as_bytes())?;
+    if let Err(err) = acl::secure_new(&record, false, 0o600).and_then(|()| acl::verify(&record, false)) {
+        let _ = fs::remove_file(&record);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// The helper copy staged for `transaction` before any mutation, re-verified
+/// against the identity recorded then. It is the only helper pending-transaction
+/// recovery may run: the live install may be half replaced after a power loss.
+/// A missing, altered or foreign copy or record is an error, never a fallback.
+pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -> Result<PathBuf> {
+    let refuse = |detail: &str| UpdateError::new(ErrorCode::IdentityMismatch, detail.to_owned());
+    let record = helper_record_path(coordination, transaction);
+    let raw = read_limited(&record, HELPER_RECORD_LIMIT)?
+        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the staged helper record is missing"))?;
+    acl::verify(&record, false)?;
+    let text = String::from_utf8(raw).map_err(|_| refuse("the staged helper record is malformed"))?;
+    let mut lines = text.lines();
+    let (Some(install), Some(txn), Some(size), Some(sha256), None) =
+        (lines.next(), lines.next(), lines.next(), lines.next(), lines.next())
+    else {
+        return Err(refuse("the staged helper record is malformed"));
+    };
+    if install != coordination.install_id().as_str() || txn != transaction.as_str() {
+        return Err(refuse("the staged helper record belongs to another install or transaction"));
+    }
+    let identity = FileIdentity {
+        size: size.parse().map_err(|_| refuse("the staged helper record is malformed"))?,
+        sha256: sha256.to_owned(),
+    };
+    let staged = coordination
+        .transaction_dir(transaction)
+        .join(lease::HELPER_DIR)
+        .join(HELPER_FILE_NAME);
+    let present = hash_regular_file(&staged)?
+        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"))?;
+    if FileIdentity { size: present.0, sha256: present.1 } != identity {
+        return Err(UpdateError::new(
+            ErrorCode::HashMismatch,
+            "the staged helper differs from its recorded identity",
+        ));
+    }
+    acl::verify(&staged, false)?;
+    Ok(staged)
 }
 
 #[cfg(test)]

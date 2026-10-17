@@ -71,24 +71,48 @@ impl RecoveryRunner for HelperRecoveryRunner {
         coordination: &Coordination,
         transaction: &TransactionId,
     ) -> Result<RecoveryReport> {
-        let source = platform::installed_helper(placement, &self.policy)?;
-        let copy = platform::stage_helper_copy(coordination, transaction, &source)?;
-        let mut spawned = spawn_helper(
-            &copy,
-            &HelloRequest {
-                mode: Mode::Recover,
-                install_id: placement.install_id.clone(),
-                transaction_id: transaction.clone(),
-                candidate_id: None,
-            },
-            PREPARE_TIMEOUT,
-        )?;
-        // A helper that is slow is left alone: it may be mid-rollback, and the
-        // next start settles whatever it leaves from the journal.
-        let report = spawned.link.await_recovered(RECOVERY_TIMEOUT)?;
-        let _ = spawned.child.wait();
-        Ok(report)
+        // The live install may be half replaced after a power loss, so its
+        // helper is neither re-verified nor run; the copy staged before the
+        // first mutation is.
+        recover_with_staged_helper(coordination, transaction, |copy| {
+            let mut spawned = spawn_helper(
+                copy,
+                &HelloRequest {
+                    mode: Mode::Recover,
+                    install_id: placement.install_id.clone(),
+                    transaction_id: transaction.clone(),
+                    candidate_id: None,
+                },
+                PREPARE_TIMEOUT,
+            )?;
+            // A helper that is slow is left alone: it may be mid-rollback, and
+            // the next start settles whatever it leaves from the journal.
+            let report = spawned.link.await_recovered(RECOVERY_TIMEOUT)?;
+            let _ = spawned.child.wait();
+            Ok(report)
+        })
     }
+}
+
+/// Runs `run` with the transaction's staged helper copy, only after it is bound
+/// to this install, transaction and the pending journal. Any missing, altered
+/// or foreign piece is an error: recovery never falls back to the live install.
+fn recover_with_staged_helper(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    run: impl FnOnce(&Path) -> Result<RecoveryReport>,
+) -> Result<RecoveryReport> {
+    let journal = FileJournalStore::new(coordination.journal_path(transaction))
+        .load()?
+        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the pending journal is missing"))?;
+    if &journal.transaction_id != transaction || &journal.install_id != coordination.install_id() {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the journal belongs to another transaction or install",
+        ));
+    }
+    let staged = platform::staged_helper(coordination, transaction)?;
+    run(&staged)
 }
 
 enum Pending {
@@ -231,8 +255,7 @@ mod tests {
     use super::*;
     use crate::identity::{
         ApplyPlan, FileIdentity, InstallFacts, InstallId, PlanStep, ReleaseIdentity,
-    };
-    use crate::journal::{DurableJournal, UpdateJournal};
+    };    use crate::journal::{DurableJournal, UpdateJournal};
     use crate::model::Target;
     use crate::testing::TempDir;
 
@@ -554,6 +577,149 @@ mod tests {
         let report =
             crate::helper::recover_pending(&coord, &TransactionId::generate().unwrap()).unwrap();
         assert_eq!(report, RecoveryReport::Nothing);
+    }
+
+    /// Recovers like `HelperRecoveryRunner`, with the process spawn replaced by
+    /// a rollback that records which helper bytes it was given.
+    struct StagedRunner {
+        ran_with: RefCell<Option<Vec<u8>>>,
+    }
+
+    impl RecoveryRunner for StagedRunner {
+        fn recover(
+            &self,
+            _placement: &Placement,
+            coordination: &Coordination,
+            transaction: &TransactionId,
+        ) -> Result<RecoveryReport> {
+            recover_with_staged_helper(coordination, transaction, |copy| {
+                *self.ran_with.borrow_mut() = Some(fs::read(copy).unwrap());
+                let mut journal =
+                    DurableJournal::open(FileJournalStore::new(coordination.journal_path(transaction)))
+                        .unwrap()
+                        .unwrap();
+                let _ = journal.advance_phase(Phase::RollingBack);
+                journal.advance_phase(Phase::RolledBack).unwrap();
+                Ok(RecoveryReport::RolledBack)
+            })
+        }
+    }
+
+    /// An interrupted update: the helper was staged and verified against the
+    /// old version, the journal is mid-apply, and then the live helper was
+    /// replaced (or lost) by the update that the power loss cut short.
+    fn interrupted(dir: &TempDir, phase: Phase) -> (Placement, Coordination, TransactionId) {
+        let placement = placement(dir);
+        let coord = placement.coordination().unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        let live = dir.path().join(format!("live-helper-{}", transaction.as_str()));
+        fs::write(&live, b"old-helper").unwrap();
+        let source = crate::platform::HelperSource {
+            path: live.clone(),
+            identity: FileIdentity::of(b"old-helper"),
+        };
+        crate::platform::stage_helper_copy(&coord, &transaction, &source).unwrap();
+        write_journal(&coord, &transaction, phase);
+        fs::write(&live, b"half-written-new-helper").unwrap();
+        (placement, coord, transaction)
+    }
+
+    fn staged_path(coord: &Coordination, transaction: &TransactionId) -> std::path::PathBuf {
+        coord
+            .transaction_dir(transaction)
+            .join(crate::platform::lease::HELPER_DIR)
+            .join(crate::platform::HELPER_FILE_NAME)
+    }
+
+    #[test]
+    fn a_mixed_live_install_is_rolled_back_by_the_staged_helper() {
+        for phase in [Phase::ExitAuthorized, Phase::Applying] {
+            let dir = TempDir::new("gate-staged");
+            let (placement, coord, _transaction) = interrupted(&dir, phase);
+            let runner = StagedRunner {
+                ran_with: RefCell::new(None),
+            };
+            let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+            assert!(matches!(outcome, GateOutcome::Proceed(_)), "{phase:?}: {outcome:?}");
+            assert_eq!(
+                runner.ran_with.borrow().as_deref(),
+                Some(&b"old-helper"[..]),
+                "{phase:?}: the verified pre-mutation copy ran, not the live file"
+            );
+            drop(outcome);
+            drop(coord);
+        }
+    }
+
+    #[test]
+    fn a_missing_altered_or_foreign_staged_helper_is_recovery_required() {
+        type Tamper = fn(&Coordination, &TransactionId);
+        let cases: [(&str, Tamper); 6] = [
+            ("helper missing", |coord, txn| {
+                fs::remove_file(staged_path(coord, txn)).unwrap();
+            }),
+            ("helper altered", |coord, txn| {
+                fs::write(staged_path(coord, txn), b"evil-helper").unwrap();
+            }),
+            ("record missing", |coord, txn| {
+                fs::remove_file(coord.transaction_dir(txn).join("helper.identity")).unwrap();
+            }),
+            ("record garbled", |coord, txn| {
+                fs::write(coord.transaction_dir(txn).join("helper.identity"), b"garbage").unwrap();
+            }),
+            ("record for another transaction", |coord, txn| {
+                let other = TransactionId::generate().unwrap();
+                let text = format!(
+                    "{}\n{}\n{}\n{}\n",
+                    coord.install_id().as_str(),
+                    other.as_str(),
+                    FileIdentity::of(b"old-helper").size,
+                    FileIdentity::of(b"old-helper").sha256
+                );
+                fs::write(coord.transaction_dir(txn).join("helper.identity"), text).unwrap();
+            }),
+            ("record for another helper", |coord, txn| {
+                let text = format!(
+                    "{}\n{}\n{}\n{}\n",
+                    coord.install_id().as_str(),
+                    txn.as_str(),
+                    FileIdentity::of(b"evil-helper").size,
+                    FileIdentity::of(b"evil-helper").sha256
+                );
+                fs::write(coord.transaction_dir(txn).join("helper.identity"), text).unwrap();
+            }),
+        ];
+        for (name, tamper) in cases {
+            let dir = TempDir::new("gate-staged-bad");
+            let (placement, coord, transaction) = interrupted(&dir, Phase::Applying);
+            tamper(&coord, &transaction);
+            let runner = StagedRunner {
+                ran_with: RefCell::new(None),
+            };
+            let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+            assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{name}: {outcome:?}");
+            assert!(runner.ran_with.borrow().is_none(), "{name}: no helper may run");
+            assert!(
+                coord
+                    .try_acquire(LeaseKind::RuntimeExclusive, &[])
+                    .unwrap()
+                    .is_some(),
+                "{name}: normal editing never started"
+            );
+        }
+    }
+
+    #[test]
+    fn a_staged_helper_is_not_used_without_its_journal() {
+        let dir = TempDir::new("gate-staged-journal");
+        let (_placement, coord, transaction) = interrupted(&dir, Phase::Applying);
+        // The journal is gone: nothing ties the staged copy to a transaction.
+        fs::remove_file(coord.journal_path(&transaction)).unwrap();
+        let err = recover_with_staged_helper(&coord, &transaction, |_| {
+            panic!("no helper may run without its journal")
+        })
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
     }
 
     #[test]
