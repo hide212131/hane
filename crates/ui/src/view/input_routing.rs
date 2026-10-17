@@ -390,13 +390,14 @@ mod tests {
     fn surface_text(view: &TestView, cx: &mut TestCx, surface: Surface) -> String {
         view.read_with(cx, |view, _| match surface {
             Surface::Body => view.editor().document().full_text(),
-            Surface::Filter => view.sidebar_filter.clone(),
+            Surface::Filter => view.sidebar_filter.text().to_owned(),
             Surface::Rename => view
                 .inline_rename
                 .as_ref()
                 .expect("rename is active")
-                .text
-                .clone(),
+                .input
+                .text()
+                .to_owned(),
         })
     }
 
@@ -407,13 +408,13 @@ mod tests {
                 let range = view.editor().selection().range();
                 range.start.0..range.end.0
             }
-            Surface::Filter => view.sidebar_filter_selected_range.clone(),
+            Surface::Filter => view.sidebar_filter.selected_range(),
             Surface::Rename => view
                 .inline_rename
                 .as_ref()
                 .expect("rename is active")
-                .selected_range
-                .clone(),
+                .input
+                .selected_range(),
         })
     }
 
@@ -423,7 +424,7 @@ mod tests {
                 assert_eq!(view.editor().document().full_text(), "", "body leaked");
             }
             if surface != Surface::Filter {
-                assert_eq!(view.sidebar_filter, "", "filter leaked");
+                assert_eq!(view.sidebar_filter.text(), "", "filter leaked");
             }
             if surface != Surface::Rename {
                 assert!(view.inline_rename.is_none(), "rename leaked");
@@ -1034,7 +1035,10 @@ mod tests {
         assert!(!capture_enabled(&view, cx));
         cx.simulate_input("e");
         assert_eq!(body_text(&view, cx), body_after_typing);
-        assert_eq!(view.read_with(cx, |view, _| view.sidebar_filter.clone()), "e");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter.text().to_owned()),
+            "e"
+        );
 
         // Inline rename: not registered; text goes to the rename field.
         click_body(cx);
@@ -1183,8 +1187,10 @@ mod tests {
         view.read_with(cx, |view, _| {
             (
                 view.editor().document().full_text(),
-                view.sidebar_filter.clone(),
-                view.inline_rename.as_ref().map(|rename| rename.text.clone()),
+                view.sidebar_filter.text().to_owned(),
+                view.inline_rename
+                    .as_ref()
+                    .map(|rename| rename.input.text().to_owned()),
             )
         })
     }
@@ -1484,8 +1490,22 @@ mod tests {
     /// A body composition that outlives the start of a rename must still be
     /// cancellable by the platform's late cancel callback, while the late-text
     /// guard keeps dropping every other delayed callback.
-    fn late_body_cancel_after_pending_rename(cx: &mut gpui::TestAppContext, via_mark: bool) {
-        let label = if via_mark { "late-cancel-mark" } else { "late-cancel-replace" };
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LateCancel {
+        /// `replace_and_mark_text_in_range(None, "")`.
+        Mark,
+        /// `replace_text_in_range(None, "")` (the Windows IME cancel).
+        Replace,
+        /// `replace_text_in_range(Some(marked_range), "")` (the macOS cancel).
+        ReplaceMarkedRange,
+    }
+
+    fn late_body_cancel_after_pending_rename(cx: &mut gpui::TestAppContext, cancel: LateCancel) {
+        let label = match cancel {
+            LateCancel::Mark => "late-cancel-mark",
+            LateCancel::Replace => "late-cancel-replace",
+            LateCancel::ReplaceMarkedRange => "late-cancel-replace-marked",
+        };
         let root = fixture_root(label);
         let (view, cx) = open_routing_view(cx, "body\n", &root);
         click_body(cx);
@@ -1517,10 +1537,14 @@ mod tests {
         assert!(!snapshot(&view, cx).0.contains('q'));
 
         // The delayed empty platform cancel reaches the body composition.
-        if via_mark {
-            mark(&view, cx, None, "", None);
-        } else {
-            replace(&view, cx, None, "");
+        match cancel {
+            LateCancel::Mark => mark(&view, cx, None, "", None),
+            LateCancel::Replace => replace(&view, cx, None, ""),
+            LateCancel::ReplaceMarkedRange => {
+                let marked = query_marked(&view, cx);
+                assert!(marked.is_some(), "the body composition is still marked");
+                replace(&view, cx, marked, "");
+            }
         }
         assert!(view.read_with(cx, |view, _| view.editor().ime().is_none()));
         assert_eq!(
@@ -1551,14 +1575,21 @@ mod tests {
 
     #[gpui::test]
     fn late_body_cancel_via_replace_text_reaches_the_composition(cx: &mut gpui::TestAppContext) {
-        late_body_cancel_after_pending_rename(cx, false);
+        late_body_cancel_after_pending_rename(cx, LateCancel::Replace);
     }
 
     #[gpui::test]
     fn late_body_cancel_via_replace_and_mark_reaches_the_composition(
         cx: &mut gpui::TestAppContext,
     ) {
-        late_body_cancel_after_pending_rename(cx, true);
+        late_body_cancel_after_pending_rename(cx, LateCancel::Mark);
+    }
+
+    #[gpui::test]
+    fn late_body_cancel_via_replace_of_the_marked_range_reaches_the_composition(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        late_body_cancel_after_pending_rename(cx, LateCancel::ReplaceMarkedRange);
     }
 
     #[gpui::test]
@@ -1603,6 +1634,513 @@ mod tests {
         assert!(body.contains('y'));
         assert!(!body.contains('q'));
         assert_eq!((filter.as_str(), rename), ("", None));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ----- Issue #305 (RF3-B) baseline regression tests, spec §10.2 C01-C08 -----
+    //
+    // These fix the behaviour of the filter and rename entry points before
+    // the shared model replaces their duplicated state. Expectations are
+    // written out literally, not derived from the code under test.
+
+    fn rename_state(
+        view: &TestView,
+        cx: &mut TestCx,
+    ) -> (String, Range<usize>, bool, Option<Range<usize>>) {
+        view.read_with(cx, |view, _| {
+            let rename = view.inline_rename.as_ref().expect("rename is active");
+            (
+                rename.input.text().to_owned(),
+                rename.input.selected_range(),
+                rename.input.selection_reversed(),
+                rename.input.marked_range(),
+            )
+        })
+    }
+
+    /// Marks the active rename as having its file operation in flight without
+    /// starting one, so key actions can be dispatched without the executors
+    /// finishing the rename.
+    fn set_rename_pending(view: &TestView, cx: &mut TestCx, pending: bool) {
+        view.update(cx, |view, cx| {
+            view.inline_rename
+                .as_mut()
+                .expect("rename is active")
+                .pending = pending;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn focus_flags(view: &TestView, cx: &mut TestCx) -> (bool, bool, bool) {
+        view.read_with(cx, |view, _| {
+            (
+                view.sidebar_filter_focused,
+                view.inline_rename_active(),
+                view.sidebar_keyboard_focus,
+            )
+        })
+    }
+
+    /// Body text, revision and undo/redo availability.
+    fn body_state(view: &TestView, cx: &mut TestCx) -> (String, u64, bool, bool) {
+        view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.active_session().revision().0,
+                view.editor().can_undo(),
+                view.editor().can_redo(),
+            )
+        })
+    }
+
+    fn count_notifications(
+        view: &TestView,
+        cx: &mut TestCx,
+    ) -> std::rc::Rc<std::cell::Cell<usize>> {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = std::rc::Rc::clone(&count);
+        cx.update(|_, app| {
+            app.observe(view, move |_, _| observed.set(observed.get() + 1))
+                .detach();
+        });
+        count
+    }
+
+    /// Moves the sidebar list away from the top without any redraw in
+    /// between, so only the action under test can bring it back.
+    fn scroll_sidebar_away(view: &TestView, cx: &mut TestCx) {
+        view.read_with(cx, |view, _| {
+            view.sidebar_scroll.set_offset(point(px(0.0), px(-120.0)));
+            assert_eq!(view.sidebar_scroll.offset().y, px(-120.0));
+        });
+    }
+
+    fn assert_sidebar_scrolled_to_top(view: &TestView, cx: &mut TestCx, context: &str) {
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_scroll.offset().y, px(0.0), "{context}");
+        });
+    }
+
+    // ----- C01 -----
+
+    #[gpui::test]
+    fn filter_same_string_replacement_and_empty_deletion_still_reset_the_list_and_notify(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("c01-filter");
+        let (view, cx) = open_routing_view(cx, "body\n", &root);
+        click_filter(cx);
+        replace(&view, cx, None, "abc");
+        let body_before = body_state(&view, cx);
+        let notifications = count_notifications(&view, cx);
+
+        // The replacement leaves the string exactly as it was.
+        scroll_sidebar_away(&view, cx);
+        let before = notifications.get();
+        replace(&view, cx, Some(0..3), "abc");
+        assert_eq!(surface_text(&view, cx, Surface::Filter), "abc");
+        assert_eq!(surface_selection(&view, cx, Surface::Filter), 3..3);
+        assert_sidebar_scrolled_to_top(&view, cx, "same-string replacement");
+        assert!(notifications.get() > before, "same-string replacement notifies");
+
+        // Delete at the end of the string removes nothing.
+        scroll_sidebar_away(&view, cx);
+        let before = notifications.get();
+        cx.simulate_keystrokes("delete");
+        assert_eq!(surface_text(&view, cx, Surface::Filter), "abc");
+        assert_eq!(surface_selection(&view, cx, Surface::Filter), 3..3);
+        assert_sidebar_scrolled_to_top(&view, cx, "empty Delete");
+        assert!(notifications.get() > before, "empty Delete notifies");
+
+        // Backspace at the start removes nothing either.
+        cx.simulate_keystrokes("home");
+        scroll_sidebar_away(&view, cx);
+        let before = notifications.get();
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(surface_text(&view, cx, Surface::Filter), "abc");
+        assert_eq!(surface_selection(&view, cx, Surface::Filter), 0..0);
+        assert_sidebar_scrolled_to_top(&view, cx, "empty Backspace");
+        assert!(notifications.get() > before, "empty Backspace notifies");
+
+        assert_eq!(body_state(&view, cx), body_before);
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_focused));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn rename_same_string_replacement_and_empty_deletion_still_notify(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("c01-rename");
+        let (view, cx) = open_routing_view(cx, "body\n", &root);
+        begin_rename(&view, cx, &rename_path(&root));
+        replace(&view, cx, None, "abc");
+        let body_before = body_state(&view, cx);
+        let notifications = count_notifications(&view, cx);
+
+        let before = notifications.get();
+        replace(&view, cx, Some(0..3), "abc");
+        assert_eq!(rename_state(&view, cx), ("abc".to_owned(), 3..3, false, None));
+        assert!(notifications.get() > before, "same-string replacement notifies");
+
+        let before = notifications.get();
+        cx.simulate_keystrokes("delete");
+        assert_eq!(rename_state(&view, cx), ("abc".to_owned(), 3..3, false, None));
+        assert!(notifications.get() > before, "empty Delete notifies");
+
+        cx.simulate_keystrokes("home");
+        let before = notifications.get();
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(rename_state(&view, cx), ("abc".to_owned(), 0..0, false, None));
+        assert!(notifications.get() > before, "empty Backspace notifies");
+
+        assert_eq!(body_state(&view, cx), body_before);
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ----- C02 -----
+
+    /// While the rename's file operation is in flight each entry point keeps
+    /// its own guard (spec §6.2): Copy and Shift+Left/Right still act, Cut
+    /// (covered by `cut_during_a_pending_inline_rename_...` in `view.rs`)
+    /// writes the clipboard but does not delete, and everything else is
+    /// refused.
+    #[gpui::test]
+    fn pending_rename_keeps_the_guard_of_each_entry_point(cx: &mut gpui::TestAppContext) {
+        let root = fixture_root("c02-pending");
+        let (view, cx) = prepare_surface(cx, Surface::Rename, &root, TEXT);
+        select_emoji_forward(cx);
+        assert_eq!(
+            rename_state(&view, cx),
+            (TEXT.to_owned(), 1..5, false, None)
+        );
+        set_rename_pending(&view, cx, true);
+
+        // Copy hands the selected text to the clipboard and changes nothing.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("😀".to_owned())
+        );
+        assert_eq!(
+            rename_state(&view, cx),
+            (TEXT.to_owned(), 1..5, false, None)
+        );
+
+        // Shift+Left / Shift+Right reach `select_inline_rename_left/right`,
+        // which have no pending check, and keep extending the selection.
+        for (keystroke, range, reversed) in [
+            ("shift-left", 1..1, false),
+            ("shift-left", 0..1, true),
+            ("shift-right", 1..1, true),
+            ("shift-right", 1..5, false),
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            assert_eq!(
+                rename_state(&view, cx),
+                (TEXT.to_owned(), range, reversed, None),
+                "{keystroke} still extends the selection while pending"
+            );
+        }
+
+        // Every other entry point is refused and leaves the field as it is.
+        let expected = (TEXT.to_owned(), 1..5, false, None);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasted".to_owned()));
+        for keystroke in [
+            "left",
+            "right",
+            "home",
+            "end",
+            "secondary-a",
+            "shift-home",
+            "shift-end",
+            "secondary-up",
+            "secondary-down",
+            "secondary-shift-up",
+            "secondary-shift-down",
+            "backspace",
+            "delete",
+            "secondary-v",
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            assert_eq!(
+                rename_state(&view, cx),
+                expected,
+                "{keystroke} must not change a pending rename"
+            );
+            assert_eq!(
+                snapshot(&view, cx),
+                (String::new(), String::new(), Some(TEXT.to_owned())),
+                "{keystroke} must not reach the body or the filter"
+            );
+            assert!(view.read_with(cx, |view, _| {
+                view.inline_rename.as_ref().is_some_and(|rename| rename.pending)
+            }));
+        }
+
+        // The same entry points act again once the rename is not pending.
+        set_rename_pending(&view, cx, false);
+        cx.simulate_keystrokes("home");
+        assert_eq!(
+            rename_state(&view, cx),
+            (TEXT.to_owned(), 0..0, false, None)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ----- C03 -----
+
+    /// `"\r\n"` is not an empty string: neither callback may treat it as the
+    /// platform's cancel, and the ordinary CR/LF removal applies instead.
+    fn crlf_is_not_a_platform_cancel(cx: &mut gpui::TestAppContext, surface: Surface, label: &str) {
+        let root = fixture_root(label);
+        let (view, cx) = prepare_surface(cx, surface, &root, "ab");
+
+        // `replace_text_in_range` replaces the marked text with nothing; a
+        // cancel would have restored "ab".
+        cx.simulate_keystrokes("home shift-end");
+        assert_eq!(surface_selection(&view, cx, surface), 0..2);
+        mark(&view, cx, None, "か", None);
+        assert_eq!(surface_text(&view, cx, surface), "か");
+        assert_eq!(query_marked(&view, cx), Some(0..1));
+        replace(&view, cx, None, "\r\n");
+        assert_eq!(surface_text(&view, cx, surface), "");
+        assert_eq!(surface_selection(&view, cx, surface), 0..0);
+        assert_eq!(query_marked(&view, cx), None);
+
+        // `replace_and_mark_text_in_range` starts a composition whose marked
+        // text is empty after CR/LF removal. The composition exists, so the
+        // following real cancel restores the original selection.
+        replace(&view, cx, None, "ab");
+        cx.simulate_keystrokes("home shift-end");
+        assert_eq!(surface_selection(&view, cx, surface), 0..2);
+        mark(&view, cx, None, "\r\n", None);
+        assert_eq!(surface_text(&view, cx, surface), "");
+        assert_eq!(query_marked(&view, cx), None);
+        replace(&view, cx, None, "");
+        assert_eq!(surface_text(&view, cx, surface), "ab");
+        assert_eq!(surface_selection(&view, cx, surface), 0..2);
+        assert_eq!(query_marked(&view, cx), None);
+        assert_other_surfaces_untouched(&view, cx, surface);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn filter_crlf_callbacks_are_not_a_platform_cancel(cx: &mut gpui::TestAppContext) {
+        crlf_is_not_a_platform_cancel(cx, Surface::Filter, "c03-filter");
+    }
+
+    #[gpui::test]
+    fn rename_crlf_callbacks_are_not_a_platform_cancel(cx: &mut gpui::TestAppContext) {
+        crlf_is_not_a_platform_cancel(cx, Surface::Rename, "c03-rename");
+    }
+
+    // ----- C04 -----
+
+    /// A reversed selection, several mark updates and then a Windows-style
+    /// (`replace(None, "")`) or macOS-style (empty mark of the marked range
+    /// followed by `unmark_text`) cancel restore the very first state.
+    fn reversed_selection_cancel_contract(
+        cx: &mut gpui::TestAppContext,
+        surface: Surface,
+        label: &str,
+        mac_style: bool,
+    ) {
+        let root = fixture_root(label);
+        let (view, cx) = prepare_surface(cx, surface, &root, TEXT);
+        select_emoji_reversed(cx);
+        assert_eq!(surface_selection(&view, cx, surface), 1..5);
+        assert_eq!(query_selection(&view, cx), Some((1..3, true)));
+        let focus_before = focus_flags(&view, cx);
+
+        mark(&view, cx, None, "か", None);
+        mark(&view, cx, None, "かん", None);
+        mark(&view, cx, None, "かんじ", None);
+        assert_eq!(surface_text(&view, cx, surface), "Aかんじe\u{301}Z");
+        assert!(query_marked(&view, cx).is_some());
+
+        if mac_style {
+            let marked = query_marked(&view, cx);
+            mark(&view, cx, marked, "", None);
+            unmark(&view, cx);
+        } else {
+            replace(&view, cx, None, "");
+        }
+        cx.run_until_parked();
+
+        assert_eq!(surface_text(&view, cx, surface), TEXT);
+        assert_eq!(surface_selection(&view, cx, surface), 1..5);
+        assert_eq!(query_selection(&view, cx), Some((1..3, true)));
+        assert_eq!(query_marked(&view, cx), None);
+        assert_eq!(focus_flags(&view, cx), focus_before);
+        assert_other_surfaces_untouched(&view, cx, surface);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn filter_windows_cancel_restores_a_reversed_selection_after_several_marks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        reversed_selection_cancel_contract(cx, Surface::Filter, "c04-filter-win", false);
+    }
+
+    #[gpui::test]
+    fn filter_mac_cancel_restores_a_reversed_selection_after_several_marks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        reversed_selection_cancel_contract(cx, Surface::Filter, "c04-filter-mac", true);
+    }
+
+    #[gpui::test]
+    fn rename_windows_cancel_restores_a_reversed_selection_after_several_marks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        reversed_selection_cancel_contract(cx, Surface::Rename, "c04-rename-win", false);
+    }
+
+    #[gpui::test]
+    fn rename_mac_cancel_restores_a_reversed_selection_after_several_marks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        reversed_selection_cancel_contract(cx, Surface::Rename, "c04-rename-mac", true);
+    }
+
+    // ----- C05 -----
+
+    #[gpui::test]
+    fn filter_reclick_during_composition_moves_the_caret_and_blur_keeps_the_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("c05-filter");
+        let (view, cx) = open_routing_view(cx, "body\n", &root);
+        click_filter(cx);
+        replace(&view, cx, None, "abc");
+
+        // Without a composition a re-click moves the caret to the click.
+        focus_filter(&view, cx);
+        assert_eq!(surface_selection(&view, cx, Surface::Filter), 0..0);
+
+        cx.simulate_keystrokes("end");
+        mark(&view, cx, None, "か", None);
+        assert_eq!(surface_text(&view, cx, Surface::Filter), "abcか");
+        assert_eq!(surface_selection(&view, cx, Surface::Filter), 6..6);
+        assert_eq!(query_marked(&view, cx), Some(3..4));
+
+        // During the composition the re-click still moves the caret and keeps
+        // the composition and the text.
+        focus_filter(&view, cx);
+        assert_eq!(surface_selection(&view, cx, Surface::Filter), 0..0);
+        assert_eq!(surface_text(&view, cx, Surface::Filter), "abcか");
+        assert_eq!(query_marked(&view, cx), Some(3..4));
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_has_composition()));
+
+        // Blur keeps what is shown; it does not roll the text back to "abc".
+        view.update(cx, |view, cx| view.blur_sidebar_filter(cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter.text(), "abcか");
+            assert_eq!(view.sidebar_filter.marked_range(), None);
+            assert!(!view.sidebar_filter_has_composition());
+            assert!(!view.sidebar_filter_focused);
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn rename_reclick_during_composition_is_refused(cx: &mut gpui::TestAppContext) {
+        let root = fixture_root("c05-rename");
+        let (view, cx) = open_routing_view(cx, "body\n", &root);
+        begin_rename(&view, cx, &rename_path(&root));
+        replace(&view, cx, None, "abc");
+        let bounds = view.read_with(cx, |view, _| {
+            view.inline_rename_input_bounds
+                .expect("the rename input has been painted")
+        });
+        let click = point(bounds.left() + px(1.0), bounds.center().y);
+
+        // Without a composition a click moves the caret to the click.
+        cx.simulate_click(click, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(rename_state(&view, cx).1, 0..0);
+
+        cx.simulate_keystrokes("end");
+        mark(&view, cx, None, "か", None);
+        let before = rename_state(&view, cx);
+        assert_eq!(before, ("abcか".to_owned(), 6..6, false, Some(3..6)));
+
+        cx.simulate_click(click, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(rename_state(&view, cx), before);
+        assert!(view.read_with(cx, |view, _| view.inline_rename_has_composition()));
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ----- C06 -----
+
+    #[gpui::test]
+    fn rename_delete_action_removes_an_emoji_and_a_combining_sequence_whole(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("c06-rename");
+        let (view, cx) = prepare_surface(cx, Surface::Rename, &root, TEXT);
+        cx.simulate_keystrokes("home right");
+        assert_eq!(rename_state(&view, cx).1, 1..1);
+
+        // Before the surrogate-pair emoji.
+        cx.simulate_keystrokes("delete");
+        assert_eq!(
+            rename_state(&view, cx),
+            ("Ae\u{301}Z".to_owned(), 1..1, false, None)
+        );
+
+        // Before the base letter and its combining accent.
+        cx.simulate_keystrokes("delete");
+        assert_eq!(rename_state(&view, cx), ("AZ".to_owned(), 1..1, false, None));
+        assert_eq!(query_selection(&view, cx), Some((1..1, false)));
+
+        view.read_with(cx, |view, _| {
+            let rename = view.inline_rename.as_ref().expect("rename is active");
+            assert_eq!(rename.fixed_extension.as_deref(), Some(".md"));
+            assert_eq!(view.editor().document().full_text(), "");
+            assert_eq!(view.sidebar_filter.text(), "");
+        });
+        assert!(rename_path(&root).exists(), "the file name is unchanged");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ----- C07 -----
+    //
+    // The candidate-position query for forward and reversed selections is
+    // already fixed by `short_field_caret_bounds_follow_the_reversed_flag`.
+
+    #[gpui::test]
+    fn unfocused_filter_hides_the_painted_selection_but_keeps_the_real_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("c07-filter");
+        let (view, cx) = prepare_surface(cx, Surface::Filter, &root, TEXT);
+        select_emoji_reversed(cx);
+        view.read_with(cx, |view, _| {
+            let state = view.text_input_render_state().expect("render state");
+            assert_eq!(state.selected_range, 1..5);
+            assert!(state.selection_reversed);
+        });
+
+        click_body(cx);
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_focused);
+            let state = view.text_input_render_state().expect("render state");
+            assert_eq!(state.text, TEXT);
+            assert_eq!(state.selected_range, 0..0, "nothing is painted selected");
+            assert_eq!(state.marked_range, None);
+            // The model keeps the real selection and its direction.
+            assert_eq!(view.sidebar_filter.text(), TEXT);
+            assert_eq!(view.sidebar_filter.selected_range(), 1..5);
+            assert!(view.sidebar_filter.selection_reversed());
+        });
         std::fs::remove_dir_all(root).unwrap();
     }
 }

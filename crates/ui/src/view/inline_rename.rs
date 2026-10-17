@@ -9,10 +9,10 @@ impl EditorView {
         self.inline_rename
             .as_ref()
             .map(|rename| InlineRenameRenderState {
-                text: rename.text.clone(),
-                selected_range: rename.selected_range.clone(),
-                selection_reversed: rename.selection_reversed,
-                marked_range: rename.marked_range.clone(),
+                text: rename.input.text().to_owned(),
+                selected_range: rename.input.selected_range(),
+                selection_reversed: rename.input.selection_reversed(),
+                marked_range: rename.input.marked_range(),
             })
     }
 
@@ -52,19 +52,17 @@ impl EditorView {
         let Some(rename) = self.inline_rename.as_mut() else {
             return;
         };
-        if rename.pending || rename.composition.is_some() {
+        if rename.pending || rename.input.has_composition() {
             return;
         }
-        let byte = byte_offset_from_utf16(&rename.text, index);
-        rename.selected_range = byte..byte;
-        rename.selection_reversed = false;
+        rename.input.set_caret_utf16(index);
         cx.notify();
     }
 
     pub(crate) fn inline_rename_has_composition(&self) -> bool {
         self.inline_rename
             .as_ref()
-            .is_some_and(|rename| rename.composition.is_some())
+            .is_some_and(|rename| rename.input.has_composition())
     }
 
     pub(crate) fn inline_rename_text_for_range(
@@ -72,28 +70,17 @@ impl EditorView {
         range_utf16: Range<usize>,
     ) -> Option<(String, Range<usize>)> {
         let rename = self.inline_rename.as_ref()?;
-        let range = byte_range_from_utf16(&rename.text, &range_utf16);
-        Some((
-            rename.text[range.clone()].to_owned(),
-            range_to_utf16(&rename.text, &range),
-        ))
+        Some(rename.input.text_for_utf16_range(range_utf16))
     }
 
     pub(crate) fn inline_rename_selection(&self) -> Option<(Range<usize>, bool)> {
-        self.inline_rename.as_ref().map(|rename| {
-            (
-                range_to_utf16(&rename.text, &rename.selected_range),
-                rename.selection_reversed,
-            )
-        })
+        self.inline_rename
+            .as_ref()
+            .map(|rename| rename.input.selection_utf16())
     }
 
     pub(crate) fn inline_rename_marked_range(&self) -> Option<Range<usize>> {
-        let rename = self.inline_rename.as_ref()?;
-        rename
-            .marked_range
-            .as_ref()
-            .map(|range| range_to_utf16(&rename.text, range))
+        self.inline_rename.as_ref()?.input.marked_range_utf16()
     }
 
     /// Whether a platform text callback (`replace_text_in_range`,
@@ -132,21 +119,7 @@ impl EditorView {
         if rename.pending {
             return true;
         }
-        let range = range_utf16
-            .as_ref()
-            .map(|range| byte_range_from_utf16(&rename.text, range))
-            .or_else(|| rename.marked_range.clone())
-            .unwrap_or_else(|| rename.selected_range.clone());
-        let replacement: String = new_text
-            .chars()
-            .filter(|character| *character != '\n' && *character != '\r')
-            .collect();
-        rename.text.replace_range(range.clone(), &replacement);
-        let next = range.start + replacement.len();
-        rename.selected_range = next..next;
-        rename.selection_reversed = false;
-        rename.marked_range = None;
-        rename.composition = None;
+        rename.input.replace(range_utf16, new_text);
         cx.notify();
         true
     }
@@ -164,32 +137,9 @@ impl EditorView {
         if rename.pending {
             return true;
         }
-        if rename.composition.is_none() {
-            rename.composition = Some(InlineRenameComposition {
-                text: rename.text.clone(),
-                selected_range: rename.selected_range.clone(),
-                selection_reversed: rename.selection_reversed,
-            });
-        }
-        let range = range_utf16
-            .as_ref()
-            .map(|range| byte_range_from_utf16(&rename.text, range))
-            .or_else(|| rename.marked_range.clone())
-            .unwrap_or_else(|| rename.selected_range.clone());
-        let replacement: String = new_text
-            .chars()
-            .filter(|character| *character != '\n' && *character != '\r')
-            .collect();
-        rename.text.replace_range(range.clone(), &replacement);
-        let marked_end = range.start + replacement.len();
-        rename.marked_range = (!replacement.is_empty()).then_some(range.start..marked_end);
-        rename.selected_range = inline_rename_selected_range(
-            range.start,
-            &replacement,
-            new_selected_range_utf16,
-            marked_end..marked_end,
-        );
-        rename.selection_reversed = false;
+        rename
+            .input
+            .replace_and_mark(range_utf16, new_text, new_selected_range_utf16);
         cx.notify();
         true
     }
@@ -198,8 +148,7 @@ impl EditorView {
         let Some(rename) = self.inline_rename.as_mut() else {
             return;
         };
-        if rename.composition.take().is_some() {
-            rename.marked_range = None;
+        if rename.input.commit_composition() {
             cx.notify();
         }
     }
@@ -208,14 +157,9 @@ impl EditorView {
         let Some(rename) = self.inline_rename.as_mut() else {
             return;
         };
-        let Some(composition) = rename.composition.take() else {
-            return;
-        };
-        rename.text = composition.text;
-        rename.selected_range = composition.selected_range;
-        rename.selection_reversed = composition.selection_reversed;
-        rename.marked_range = None;
-        cx.notify();
+        if rename.input.cancel_composition() {
+            cx.notify();
+        }
     }
 
     /// Platform cancel (an empty, rangeless replacement during composition).
@@ -232,8 +176,7 @@ impl EditorView {
 
     pub(crate) fn selected_inline_rename_text(&self) -> Option<String> {
         let rename = self.inline_rename.as_ref()?;
-        (!rename.selected_range.is_empty())
-            .then(|| rename.text[rename.selected_range.clone()].to_owned())
+        rename.input.selected_text().map(str::to_owned)
     }
 
     pub(crate) fn move_inline_rename_left(&mut self, extend: bool, cx: &mut Context<Self>) {
@@ -251,54 +194,22 @@ impl EditorView {
         if rename.pending {
             return;
         }
-        let cursor = if rename.selection_reversed {
-            rename.selected_range.start
-        } else {
-            rename.selected_range.end
-        };
-        let target = if right {
-            next_inline_rename_boundary(&rename.text, cursor)
-        } else {
-            previous_inline_rename_boundary(&rename.text, cursor)
-        };
-        if extend {
-            select_inline_rename_to(rename, target);
-        } else if rename.selected_range.is_empty() {
-            rename.selected_range = target..target;
-            rename.selection_reversed = false;
-        } else {
-            let target = if right {
-                rename.selected_range.end
-            } else {
-                rename.selected_range.start
-            };
-            rename.selected_range = target..target;
-            rename.selection_reversed = false;
-        }
+        rename.input.move_horizontal(right, extend);
         cx.notify();
     }
 
+    /// Shift+Left / Shift+Right entry. Unlike `move_inline_rename_left` with
+    /// `extend`, this entry has never checked `pending`; keep that difference.
     pub(crate) fn select_inline_rename_left(&mut self, cx: &mut Context<Self>) {
-        let target = self.inline_rename.as_ref().map(|rename| {
-            previous_inline_rename_boundary(&rename.text, inline_rename_cursor(rename))
-        });
-        if let Some(target) = target {
-            if let Some(rename) = self.inline_rename.as_mut() {
-                select_inline_rename_to(rename, target);
-            }
+        if let Some(rename) = self.inline_rename.as_mut() {
+            rename.input.move_horizontal(false, true);
             cx.notify();
         }
     }
 
     pub(crate) fn select_inline_rename_right(&mut self, cx: &mut Context<Self>) {
-        let target = self
-            .inline_rename
-            .as_ref()
-            .map(|rename| next_inline_rename_boundary(&rename.text, inline_rename_cursor(rename)));
-        if let Some(target) = target {
-            if let Some(rename) = self.inline_rename.as_mut() {
-                select_inline_rename_to(rename, target);
-            }
+        if let Some(rename) = self.inline_rename.as_mut() {
+            rename.input.move_horizontal(true, true);
             cx.notify();
         }
     }
@@ -307,8 +218,7 @@ impl EditorView {
         if let Some(rename) = self.inline_rename.as_mut()
             && !rename.pending
         {
-            rename.selected_range = 0..rename.text.len();
-            rename.selection_reversed = false;
+            rename.input.select_all();
             cx.notify();
         }
     }
@@ -317,42 +227,34 @@ impl EditorView {
         if let Some(rename) = self.inline_rename.as_mut()
             && !rename.pending
         {
-            select_inline_rename_to(rename, 0);
+            rename.input.move_home(true);
             cx.notify();
         }
     }
 
     pub(crate) fn select_inline_rename_end(&mut self, cx: &mut Context<Self>) {
-        let target = self
-            .inline_rename
-            .as_ref()
-            .map_or(0, |rename| rename.text.len());
         if let Some(rename) = self.inline_rename.as_mut()
             && !rename.pending
         {
-            select_inline_rename_to(rename, target);
+            rename.input.move_end(true);
             cx.notify();
         }
     }
 
     pub(crate) fn move_inline_rename_home(&mut self, cx: &mut Context<Self>) {
-        self.move_inline_rename_to(0, cx);
-    }
-
-    pub(crate) fn move_inline_rename_end(&mut self, cx: &mut Context<Self>) {
-        let target = self
-            .inline_rename
-            .as_ref()
-            .map_or(0, |rename| rename.text.len());
-        self.move_inline_rename_to(target, cx);
-    }
-
-    fn move_inline_rename_to(&mut self, target: usize, cx: &mut Context<Self>) {
         if let Some(rename) = self.inline_rename.as_mut()
             && !rename.pending
         {
-            rename.selected_range = target..target;
-            rename.selection_reversed = false;
+            rename.input.move_home(false);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn move_inline_rename_end(&mut self, cx: &mut Context<Self>) {
+        if let Some(rename) = self.inline_rename.as_mut()
+            && !rename.pending
+        {
+            rename.input.move_end(false);
             cx.notify();
         }
     }
@@ -372,21 +274,7 @@ impl EditorView {
         if rename.pending {
             return;
         }
-        let range = if rename.selected_range.is_empty() {
-            let cursor = inline_rename_cursor(rename);
-            if backwards {
-                previous_inline_rename_boundary(&rename.text, cursor)..cursor
-            } else {
-                cursor..next_inline_rename_boundary(&rename.text, cursor)
-            }
-        } else {
-            rename.selected_range.clone()
-        };
-        rename.text.replace_range(range.clone(), "");
-        rename.selected_range = range.start..range.start;
-        rename.selection_reversed = false;
-        rename.marked_range = None;
-        rename.composition = None;
+        rename.input.delete(backwards);
         cx.notify();
     }
 
@@ -442,16 +330,13 @@ impl EditorView {
             cx.notify();
             return;
         };
-        let text_len = text.len();
+        let mut input = ShortTextInput::new(text);
+        input.select_all();
         self.inline_rename = Some(InlineRename {
             kind,
             from: path,
-            text,
+            input,
             fixed_extension,
-            selected_range: 0..text_len,
-            selection_reversed: false,
-            marked_range: None,
-            composition: None,
             pending: false,
         });
         window.focus(&self.focus_handle, cx);
@@ -537,7 +422,7 @@ impl EditorView {
         }
         let from = rename.from.clone();
         let kind = rename.kind;
-        let name = rename.text.clone();
+        let name = rename.input.text().to_owned();
         let fixed_extension = rename.fixed_extension.clone();
         if !valid_inline_rename_name(&name) {
             self.status = Some("Rename failed: invalid file or folder name".to_owned());
