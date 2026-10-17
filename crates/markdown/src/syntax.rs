@@ -137,6 +137,19 @@ pub struct TableParse {
     pub alignments: Arc<[TableAlignment]>,
 }
 
+/// An openable Markdown link: an inline or reference link whose destination is
+/// an absolute HTTP(S) URL. Only these are kept, so a consumer never has to
+/// re-judge the scheme; images, relative paths, `file:` and other schemes never
+/// appear here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkParse {
+    pub node: NodeId,
+    /// Source range of the link text (first to last child), excluding the
+    /// brackets and the destination part.
+    pub text_range: SourceRange,
+    pub destination: Arc<str>,
+}
+
 /// Block/inline node tree for one parsed source slice: parent/child structure,
 /// document order, and a source range on every node.
 ///
@@ -234,6 +247,8 @@ pub struct MarkdownParse {
     pub tree: MarkdownTree,
     /// Alignment metadata for each parsed table node, keyed by its tree node.
     pub table_parses: Vec<TableParse>,
+    /// Openable external links in document order, keyed by their tree node.
+    pub links: Vec<LinkParse>,
     /// Sorted, non-overlapping source ranges of the syntactic markers (heading
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.

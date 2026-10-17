@@ -1,5 +1,5 @@
 use crate::display::{
-    BlockKind, ImagePresentation, LineContext, ListAlignment, ListId, ListItemId, ListMarkerKind,
+    BlockKind, ImagePresentation, LineContext, LinkTarget, ListAlignment, ListId, ListItemId, ListMarkerKind,
     ListMarkerMetadata, ListOwnerMetadata, ListRowMetadata, ListRowRole,
     ListStructuralPrefixMetadata, QuoteRowMetadata, StyleKind, StyleRun, TableCellDisplay,
     TableRowDisplay, VisualBlock, VisualLine, code_line_height, estimated_height, syntax_display,
@@ -38,6 +38,7 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
         revision,
         visual_text: source.to_owned(),
         style_runs: Vec::new(),
+        links: Vec::new(),
         kind: BlockKind::Paragraph,
         source_map: SourceMap {
             segments: vec![MappingSegment {
@@ -203,6 +204,7 @@ fn present_rule_line(
         revision,
         visual_text: visual,
         style_runs: Vec::new(),
+        links: Vec::new(),
         kind: BlockKind::Rule,
         source_map: SourceMap { segments },
         estimated_height: estimated_height(BlockKind::Rule, line_height),
@@ -1154,6 +1156,27 @@ fn present_markdown_from_parse(
         }
     }
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
+    // Openable links carry the parser's destination with the part of their text
+    // on this physical line; the UI matches a click's source offset against it.
+    let links = if formal_code_block == Some(true) {
+        Vec::new()
+    } else {
+        parsed
+            .links
+            .iter()
+            .filter(|link| nodes.iter().any(|id| **id == link.node))
+            .filter_map(|link| {
+                let clipped = SourceRange {
+                    start: link.text_range.start.max(range.start),
+                    end: link.text_range.end.min(range.end),
+                };
+                (clipped.start < clipped.end).then(|| LinkTarget {
+                    source_range: clipped,
+                    destination: link.destination.clone(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
     let (quote_marker_visual_ranges, quote_marker_source_ranges) =
         quote_marker_ranges(markers_on_line, &source_map.segments);
     let list = list_row_metadata(
@@ -1192,6 +1215,7 @@ fn present_markdown_from_parse(
         revision,
         visual_text: visual,
         style_runs,
+        links,
         source_map,
         estimated_height: line_estimated_height,
         measured_height: None,
@@ -2220,6 +2244,7 @@ fn present_fenced_code_opening_line(
         revision,
         visual_text: visual,
         style_runs,
+        links: Vec::new(),
         kind: BlockKind::CodeBlock,
         source_map: SourceMap { segments },
         estimated_height: line_estimated_height,
@@ -2281,6 +2306,7 @@ fn present_fenced_code_closing_line(
         revision,
         visual_text,
         style_runs,
+        links: Vec::new(),
         kind: BlockKind::CodeBlock,
         source_map: SourceMap {
             segments: vec![MappingSegment {
@@ -2398,6 +2424,7 @@ fn present_image(
             visual_range: VisualRange::new(visual_prefix, visual_end),
             kind: StyleKind::Image,
         }],
+        links: Vec::new(),
         kind: BlockKind::Image,
         source_map: SourceMap { segments },
         estimated_height: estimated_height(BlockKind::Image, line_height),
@@ -2663,6 +2690,7 @@ pub(crate) fn present_table_line(
             revision,
             visual_text: String::new(),
             style_runs: Vec::new(),
+            links: Vec::new(),
             kind: BlockKind::TableDelimiter,
             source_map: SourceMap {
                 segments: vec![MappingSegment {
@@ -2818,6 +2846,7 @@ pub(crate) fn present_table_line(
             visual_range: VisualRange::new(0, visual_len),
             kind: StyleKind::Table,
         }],
+        links: Vec::new(),
         kind: BlockKind::TableRow,
         source_map: SourceMap { segments },
         estimated_height: line_height * 1.2,

@@ -580,6 +580,24 @@ fn stale_non_overlapping_block_rebases() {
 }
 
 #[test]
+fn external_link_target_carries_destination_and_absolute_text_range() {
+    let source = "go [docs](https://example.com/) or [rel](./a.md)";
+    let line = present_markdown(
+        1,
+        Revision(1),
+        SourceRange::new(10, 10 + source.len()),
+        source,
+        26.0,
+    );
+    assert_eq!(line.links.len(), 1);
+    let target = &line.links[0];
+    assert_eq!(&*target.destination, "https://example.com/");
+    assert_eq!(target.source_range, SourceRange::new(14, 18));
+    assert!(target.contains(SourceOffset(14)));
+    assert!(!target.contains(SourceOffset(18)));
+}
+
+#[test]
 fn phase3_presentation_hides_markers_without_changing_source() {
     let source = "## Hello **太字** and _italic_ with `code`";
     let block = present_markdown(

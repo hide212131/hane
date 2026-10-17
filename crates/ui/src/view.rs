@@ -3812,6 +3812,22 @@ impl EditorView {
         layout.source_at_xy_with_bias(visual, row_index, x, local_y, &shaper, bias)
     }
 
+    /// The external link destination under a click that resolved to `offset`
+    /// on presented `line`, from the link targets the presentation recorded.
+    fn link_destination_at(
+        &self,
+        line: usize,
+        offset: SourceOffset,
+    ) -> Option<std::sync::Arc<str>> {
+        let (block_id, visual_line) = *self.line_owners.get(&line)?;
+        let visual = self.block_cache.get(&block_id)?.lines.get(visual_line)?;
+        visual
+            .links
+            .iter()
+            .find(|link| link.contains(offset))
+            .map(|link| link.destination.clone())
+    }
+
     /// Absolute document-content y for one rendered row. The input event is in
     /// window coordinates, while a table row's wrapped fragments are laid out
     /// in block-local coordinates. Keeping this conversion here makes mouse
@@ -3871,6 +3887,14 @@ impl EditorView {
         ) else {
             return;
         };
+        // An OS-standard modifier click on link text hands the destination to
+        // the default browser and leaves caret, selection and document alone.
+        if is_link_open_modifier(&event.modifiers, cfg!(target_os = "macos"))
+            && let Some(destination) = self.link_destination_at(line, offset)
+        {
+            cx.open_url(&destination);
+            return;
+        }
         let selection = if event.modifiers.shift {
             Selection {
                 anchor: self.editor().selection().anchor,
@@ -5372,6 +5396,19 @@ fn target_in_neighbor(
         layout.lines.len().checked_sub(1)?
     };
     layout.source_at_x(&visual, row, x, shaper)
+}
+
+/// Whether a left click carries exactly the OS-standard "open link" modifier:
+/// Command on macOS, Ctrl elsewhere. Shift or Alt on top keep the click an
+/// ordinary selection click, as does the other platform's key (Ctrl on macOS,
+/// Command on Windows/Linux).
+fn is_link_open_modifier(modifiers: &gpui::Modifiers, macos: bool) -> bool {
+    let (wanted, other) = if macos {
+        (modifiers.platform, modifiers.control)
+    } else {
+        (modifiers.control, modifiers.platform)
+    };
+    wanted && !other && !modifiers.shift && !modifiers.alt
 }
 
 /// The caret target one row into the next or previous block, aiming at `x`.
@@ -7290,6 +7327,43 @@ mod tests {
         {
             ()
         }
+    }
+
+    #[test]
+    fn link_open_modifier_is_command_on_macos_and_ctrl_elsewhere() {
+        let command = gpui::Modifiers {
+            platform: true,
+            ..gpui::Modifiers::none()
+        };
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..gpui::Modifiers::none()
+        };
+        assert!(is_link_open_modifier(&command, true));
+        assert!(!is_link_open_modifier(&ctrl, true));
+        assert!(is_link_open_modifier(&ctrl, false));
+        assert!(!is_link_open_modifier(&command, false));
+        assert!(!is_link_open_modifier(&gpui::Modifiers::none(), true));
+        assert!(!is_link_open_modifier(&gpui::Modifiers::none(), false));
+        let shifted = gpui::Modifiers {
+            shift: true,
+            ..command
+        };
+        assert!(!is_link_open_modifier(&shifted, true));
+        let alt = gpui::Modifiers { alt: true, ..ctrl };
+        assert!(!is_link_open_modifier(&alt, false));
+    }
+
+    #[test]
+    fn link_target_matches_only_offsets_inside_the_link_text() {
+        let target = hane_presentation::LinkTarget {
+            source_range: SourceRange::new(1, 5),
+            destination: std::sync::Arc::from("https://example.com/"),
+        };
+        assert!(!target.contains(SourceOffset(0)));
+        assert!(target.contains(SourceOffset(1)));
+        assert!(target.contains(SourceOffset(4)));
+        assert!(!target.contains(SourceOffset(5)));
     }
 
     fn relative_luminance(color: u32) -> f32 {

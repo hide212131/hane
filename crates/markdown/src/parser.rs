@@ -3,10 +3,12 @@ use crate::markers::{
     list_structural_prefixes,
 };
 use crate::syntax::{
-    MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment, TableParse,
+    LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,
+    TableParse,
 };
 use hane_document::{Revision, SourceRange};
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
+use pulldown_cmark::{Event, HeadingLevel, LinkType, Options, Parser, Tag};
+use std::sync::Arc;
 
 fn heading_level(level: HeadingLevel) -> u8 {
     match level {
@@ -55,9 +57,15 @@ fn node_kind_for_tag(tag: &Tag) -> NodeKind {
 fn build_tree(
     source_range: SourceRange,
     source: &str,
-) -> (MarkdownTree, Vec<ParsedCodeSpan>, Vec<TableParse>) {
+) -> (
+    MarkdownTree,
+    Vec<ParsedCodeSpan>,
+    Vec<TableParse>,
+    Vec<LinkParse>,
+) {
     let mut codes = Vec::new();
     let mut tables = Vec::new();
+    let mut pending_links: Vec<(NodeId, Arc<str>)> = Vec::new();
     let mut nodes = vec![MarkdownNode {
         kind: NodeKind::Document,
         source_range,
@@ -90,6 +98,22 @@ fn build_tree(
         match event {
             Event::Start(tag) => {
                 let id = push(&mut nodes, &open, node_kind_for_tag(&tag), range);
+                if let Tag::Link {
+                    link_type,
+                    dest_url,
+                    ..
+                } = &tag
+                    && matches!(
+                        link_type,
+                        LinkType::Inline
+                            | LinkType::Reference
+                            | LinkType::Collapsed
+                            | LinkType::Shortcut
+                    )
+                    && is_external_http_url(dest_url)
+                {
+                    pending_links.push((id, Arc::from(&**dest_url)));
+                }
                 if let Tag::Table(alignments) = &tag {
                     tables.push(TableParse {
                         node: id,
@@ -153,7 +177,44 @@ fn build_tree(
             }
         }
     }
-    (MarkdownTree { nodes }, codes, tables)
+    let links = pending_links
+        .into_iter()
+        .filter_map(|(node, destination)| {
+            let children = &nodes[node.0].children;
+            let start = nodes[children.first()?.0].source_range.start;
+            let end = nodes[children.last()?.0].source_range.end;
+            (start < end).then_some(LinkParse {
+                node,
+                text_range: SourceRange { start, end },
+                destination,
+            })
+        })
+        .collect();
+    (MarkdownTree { nodes }, codes, tables, links)
+}
+
+/// True for an absolute `http://` or `https://` URL with a host and no
+/// whitespace or control characters. Everything else (relative paths, `file:`,
+/// other schemes) is not opened.
+fn is_external_http_url(url: &str) -> bool {
+    let Some(scheme_len) = ["https://", "http://"]
+        .iter()
+        .find(|scheme| {
+            url.get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })
+        .map(|scheme| scheme.len())
+    else {
+        return false;
+    };
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return false;
+    }
+    let authority = url[scheme_len..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    !authority.is_empty() && !authority.starts_with('@') && !authority.starts_with(':')
 }
 
 /// Parses a source slice into a node tree and retains the byte range of every
@@ -165,7 +226,7 @@ pub fn parse_document(
     source: &str,
 ) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
-    let (tree, codes, table_parses) = build_tree(source_range, source);
+    let (tree, codes, table_parses, links) = build_tree(source_range, source);
     let markers = derive_markers(&tree, source_range, source);
     let code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);
@@ -175,6 +236,7 @@ pub fn parse_document(
         source_range,
         tree,
         table_parses,
+        links,
         markers: markers.markers,
         fence_markers: markers.fence_markers,
         fence_marker_edges: markers.fence_marker_edges,
