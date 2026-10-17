@@ -53,6 +53,21 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Markdown Document</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>net.daringfireball.markdown</string>
+      </array>
+    </dict>
+  </array>
   <key>CFBundleDisplayName</key>
   <string>Hane</string>
   <key>CFBundleExecutable</key>
@@ -65,12 +80,53 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
   <string>Hane</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
 </plist>
 PLIST
 /usr/bin/plutil -lint "$bundle/Contents/Info.plist" >/dev/null
+
+# Finder lists Hane under "Open With" only for the document types declared
+# here. Hane must offer exactly the system Markdown UTI (not generic text) and
+# must stay an alternate handler so the user, not the bundle, chooses the
+# default app. macOS 11+ declares net.daringfireball.markdown with the md
+# extension, so the bundle requires 11.0 and does not redeclare the UTI.
+plist_buddy=/usr/libexec/PlistBuddy
+info_plist="$bundle/Contents/Info.plist"
+plist_value() {
+  "$plist_buddy" -c "Print :$1" "$info_plist" 2>/dev/null
+}
+if [[ "$(plist_value CFBundleDocumentTypes:0:LSItemContentTypes:0)" != "net.daringfireball.markdown" ]]; then
+  echo "Info.plist must declare the net.daringfireball.markdown content type" >&2
+  exit 1
+fi
+if plist_value CFBundleDocumentTypes:0:LSItemContentTypes:1 >/dev/null; then
+  echo "Info.plist must declare only the Markdown content type" >&2
+  exit 1
+fi
+if plist_value CFBundleDocumentTypes:1 >/dev/null; then
+  echo "Info.plist must declare only one document type" >&2
+  exit 1
+fi
+if plist_value CFBundleDocumentTypes:0:CFBundleTypeExtensions >/dev/null; then
+  echo "Info.plist must not use the deprecated CFBundleTypeExtensions" >&2
+  exit 1
+fi
+if plist_value UTImportedTypeDeclarations >/dev/null || plist_value UTExportedTypeDeclarations >/dev/null; then
+  echo "Info.plist must not redeclare the Markdown UTI" >&2
+  exit 1
+fi
+if [[ "$(plist_value LSMinimumSystemVersion)" != "11.0" ]]; then
+  echo "Info.plist must require macOS 11.0 for the system Markdown UTI" >&2
+  exit 1
+fi
+if [[ "$(plist_value CFBundleDocumentTypes:0:LSHandlerRank)" != "Alternate" ]]; then
+  echo "Info.plist document type must use LSHandlerRank Alternate" >&2
+  exit 1
+fi
 
 touch "$bundle"
 echo "Built: $bundle"

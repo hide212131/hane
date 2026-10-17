@@ -3,7 +3,11 @@
     windows_subsystem = "windows"
 )]
 
-#[cfg(any(target_os = "windows", not(feature = "instrument")))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "macos",
+    not(feature = "instrument")
+))]
 use gpui::Focusable;
 use gpui::{App, AppContext, Bounds, Global, WindowBounds, WindowOptions, px, size};
 use hane_ai::{
@@ -14,6 +18,9 @@ use hane_session::{FileStateStore, StateStores};
 use hane_ui::{AppAssets, EditorView, register_key_bindings};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod finder_open;
 
 #[cfg(target_os = "windows")]
 mod open_request;
@@ -53,6 +60,32 @@ fn start_ai_service() -> Option<AiService> {
         shell_env_format: ShellEnvironmentPolicyFormat::Filters,
     })
     .ok()
+}
+
+#[cfg(target_os = "macos")]
+type FinderSender = std::sync::mpsc::Sender<PathBuf>;
+#[cfg(not(target_os = "macos"))]
+type FinderSender = ();
+
+/// Creates the application and, on macOS, routes Finder's "Open With" /
+/// double-click file URLs (delivered at launch and to a running instance)
+/// into `sender`. The platform callback has no `App` access, so the paths are
+/// queued for a polling task that opens them through the editor's normal
+/// open path. Other platforms ignore `sender`.
+fn application_with_finder_open(
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] sender: FinderSender,
+) -> gpui::Application {
+    let application = gpui_platform::application();
+    #[cfg(target_os = "macos")]
+    application.on_open_urls(move |urls| {
+        for path in urls
+            .iter()
+            .filter_map(|url| finder_open::markdown_path_from_url(url))
+        {
+            let _ = sender.send(path);
+        }
+    });
+    application
 }
 
 #[cfg(target_os = "windows")]
@@ -155,7 +188,11 @@ fn main() {
     };
     #[cfg(not(feature = "instrument"))]
     let untitled_source: &str = DEFAULT_DOCUMENT;
-    gpui_platform::application()
+    #[cfg(target_os = "macos")]
+    let (finder_sender, finder_requests) = std::sync::mpsc::channel::<PathBuf>();
+    #[cfg(not(target_os = "macos"))]
+    let finder_sender = ();
+    application_with_finder_open(finder_sender)
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             if let Some(service) = ai_service {
@@ -215,6 +252,10 @@ fn main() {
                             view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
                             true
                         });
+                        // On macOS the prompt is deferred to the Finder poller
+                        // below so a document delivered by Finder at launch
+                        // is not blocked by the folder picker.
+                        #[cfg(not(target_os = "macos"))]
                         if needs_default_prompt {
                             view.prompt_default_work_folder(cx);
                         }
@@ -222,6 +263,52 @@ fn main() {
                     .expect("focus editor");
                 cx.activate(true);
             }
+            #[cfg(target_os = "macos")]
+            cx.spawn(async move |cx| {
+                // Finder usually delivers the launch document right after
+                // startup; give it a moment before asking for a default
+                // folder, and skip the prompt when a document arrived.
+                let mut prompt_pending =
+                    needs_default_prompt && cfg!(not(feature = "instrument"));
+                let started = std::time::Instant::now();
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(40))
+                        .await;
+                    while let Ok(path) = finder_requests.try_recv() {
+                        prompt_pending = false;
+                        // A folder is never opened from Finder: that would
+                        // replace the sessions without the dirty-file guard
+                        // `open_path` applies to documents.
+                        if path.is_dir() {
+                            continue;
+                        }
+                        if window
+                            .update(cx, |view, window, cx| {
+                                view.open_external_path(&path, cx);
+                                window.activate_window();
+                                if !view.settings_is_open() {
+                                    window.focus(&view.focus_handle(cx), cx);
+                                }
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if prompt_pending && started.elapsed() >= std::time::Duration::from_millis(500)
+                    {
+                        prompt_pending = false;
+                        if window
+                            .update(cx, |view, _window, cx| view.prompt_default_work_folder(cx))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            })
+            .detach();
             #[cfg(target_os = "windows")]
             cx.spawn(async move |cx| {
                 loop {
