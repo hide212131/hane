@@ -18,7 +18,7 @@ current mainは `efb38c2a0167bac8d0dfa512bacd0f85ba21817b`。設計読解基準 
 
 ## 実装PR #497
 
-このfollow-up handoff更新直前のPR headは `a202c0a12677a93f9d6e44781a63ee8f3546e464`。PRはopen/Draftです。製品コード・exact AADW verification対象は `2c659e2723fd4f99f7c58b31227758dd6b03ebd5`。製品commit後のPR commit `a9324af`、`3994e39`、`7352af0`、`a202c0a` はすべてhandoff文書のみです。current main `efb38c2` との比較はこの更新前でahead 17 / behind 3、merge base `e82b9a9fe42280bfa78497746bcd7e21c73430c5`。このfollow-upも文書のみで、commit後はahead 18 / behind 3になります。製品コードと10 filesの内訳は変わりません。
+このfollow-up handoff更新直前のPR headは `e9be7f1c920e6066cfcabd3f13fbaedf691d9099`。PRはopen/Draftです。製品コード・exact AADW verification対象は `2c659e2723fd4f99f7c58b31227758dd6b03ebd5`。製品commit後のPR commit `a9324af`、`3994e39`、`7352af0`、`a202c0a`、`e9be7f1` はすべてhandoff文書のみです。current main `efb38c2` との比較はこの更新前でahead 18 / behind 3、merge base `e82b9a9fe42280bfa78497746bcd7e21c73430c5`。このfollow-upも文書のみで、commit後はahead 19 / behind 3になります。製品コードと10 filesの内訳は変わりません。
 
 `crates/ui/src/short_text_input.rs` に共通型とM01〜M15を追加し、filter/renameの文字列・selection・marked/composition状態、編集helper、初期化/reset、描画読み出し、test fixtureを一括切替しました。既存のC01〜C08を維持し、未mergeの#495に依存するC09は加えていません。filterとrenameは別々のモデル値です。focus、入力先判定、clipboard順、通知・一覧更新、pending時の操作差、描画bounds、OS取消通知と遅延入力guardは既存所有者に残しました。#495/#501/#503の未mergeコードは取り込んでいません。
 
@@ -26,23 +26,23 @@ current mainは `efb38c2a0167bac8d0dfa512bacd0f85ba21817b`。設計読解基準 
 
 AADW run [39025772438](https://github.com/hide212131/hane/actions/runs/39025772438) はprepare、worker、Sonnet 5.5 positive usage確認、patch upload、trusted finalizerが成功しました。trusted verifyはexact product head `2c659e2723fd4f99f7c58b31227758dd6b03ebd5` で `cargo test --workspace --all-features --locked` と `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` を実行し、両方successしました。依存 `block v0.1.6` の将来Rust互換性warningはありましたが、tests/lintは成功です。独立した `cargo test -p hane-ui --all-features` の実行記録はありません。
 
-直前のhandoff head `a202c0a` の通常PR CI [39028759793](https://github.com/hide212131/hane/actions/runs/39028759793) はmacOSとWindowsのworkspace tests、OS別チェック、Clippyがsuccessしました。release-only jobは対象外でskipです。このfollow-up文書commit後のPR headはahead 18 / behind 3となり、CI結果は別途確認します。CI successはnative GUI受け入れの代わりにはなりません。
+直前のhandoff head `e9be7f1` の通常PR CI [39029177481](https://github.com/hide212131/hane/actions/runs/39029177481) はmacOSとWindowsのworkspace tests、OS別チェック、Clippyがsuccessしました。release-only jobは対象外でskipです。このfollow-up文書commit後のPR headはahead 19 / behind 3となり、CI結果は別途確認します。CI successはnative GUI受け入れの代わりにはなりません。
 
-Codex代替レビュー [5557564198](https://github.com/hide212131/hane/pull/497#pullrequestreview-5557564198) はhead `a202c0a` で追加指摘なしでした。状態snapshotとMarkdown code spanの指摘は修正済みで、3つのreview threadをresolve済みです。このfollow-upも文書のみで、製品コード差分を変えません。CodeRabbitのstatus successはfull reviewの証拠とは扱いません。
+Codex代替レビュー [5557581322](https://github.com/hide212131/hane/pull/497#pullrequestreview-5557581322) はhead `e9be7f1` で追加指摘なしでした。状態snapshotとMarkdown code spanの指摘は修正済みで、3つのreview threadをresolve済みです。このfollow-upも文書のみで、製品コード差分を変えません。CodeRabbitのstatus successはfull reviewの証拠とは扱いません。
 
 ローカルmacOS debug buildはsource checkout `a9324faf9aa934a52c65af9eb654c3f1fc4e1324` から作成し、binary SHA-256は `d46bbb88ef9558beec9cd501307b0894af0b8800489f75d56de461ff9f8accc3` です。これはbuild確認のみで、focused GUIシナリオの証拠ではありません。仕様§10のnative GUI G01〜G06はmacOS/Windowsとも未実施です。CUAでは候補アプリ画面へのクリックが失敗し、VMware FusionのWindows VMにも入力できませんでした。IME候補位置、取消、clipboard/focus、rename待ちと完了後の遅延入力は両OSで未確認です。画面確認できたbuild/head、操作、期待/観測値、画像または動画がそろうまでpassにしません。
 
 ## 並行PR
 
 - [#495](https://github.com/hide212131/hane/pull/495): open/ready・未merge、current head `76d53cbf5b33a51ed91dfa259ced76403064872a`。`actions.rs` / `view.rs` / `input_routing.rs`が重なります。current-head CI [39022930215](https://github.com/hide212131/hane/actions/runs/39022930215) のmacOS/Windows workspace tests・Clippyはsuccessです。full review実施の証拠は未確認で、CodeRabbit statusはpendingです。未受入コード・条件付きC09を取り込みません。
-- [#501](https://github.com/hide212131/hane/pull/501): open/ready・未merge、current head `1ba71efb6518ce475bbefc10be3629940fc5888c`。`view.rs` / `sidebar.rs`が重なります。current-head CI [39027698405](https://github.com/hide212131/hane/actions/runs/39027698405) はmacOS job success、Windows workspace tests/IME check/Clippyが進行中です。未mergeコードを持ち込みません。
-- [#503](https://github.com/hide212131/hane/pull/503): open/ready・未merge、current head `18ab9dc3c3aed1efefa11258f1daeb4c5bf540db`。`view.rs`が重なります。current-head CI [39028398842](https://github.com/hide212131/hane/actions/runs/39028398842) のmacOS/Windows workspace tests・Clippyはsuccessです。current-head full reviewの状態は未確認です。未mergeコードを持ち込みません。
+- [#501](https://github.com/hide212131/hane/pull/501): open/ready・未merge、current head `1ba71efb6518ce475bbefc10be3629940fc5888c`。`view.rs` / `sidebar.rs`が重なります。current-head CI [39027698405](https://github.com/hide212131/hane/actions/runs/39027698405) のmacOS/Windows workspace tests・OS別チェック・Clippyはsuccessです。未mergeコードを持ち込みません。
+- [#503](https://github.com/hide212131/hane/pull/503): open/ready・未merge、current head `1ce4f06368b5045fcd0301a0171e4b7613d243b2`。`view.rs`が重なります。current-head CI [39029224160](https://github.com/hide212131/hane/actions/runs/39029224160) はmacOS/Windowsともworkspace tests後のClippyがfailureでした。変更は未mergeのままです。
 
 #495/#501/#503の受入は#305の一律先行条件にしません。mainへ入った変更が短い入力欄と実際に重なる場合だけ仕様§6.2で再評価します。
 
 ## 残作業
 
-1. 次の書込み前にmain、Issue、PR head/checks/reviews、active AADW runを再取得する。本書のsnapshotはhandoff head `a202c0a` 時点で、このfollow-up文書commitの後にPR headが進みます。
+1. 次の書込み前にmain、Issue、PR head/checks/reviews、active AADW runを再取得する。本書のsnapshotはhandoff head `e9be7f1` 時点で、このfollow-up文書commitの後にPR headが進みます。
 2. 仕様§10のG01〜G06をmacOSとWindowsで実施し、OS/build/head、操作、期待/観測値、画像または動画を記録する。Windows shortcut確認前にKeyhac hookをOFF、終了後必ずONへ戻す。
 3. 5つのIssue受入条件、旧helper/state撤去、最終SHA、結果、revert手順を確認する。Issue #305は全条件が実際に満たされるまでopenのままにする。
 
