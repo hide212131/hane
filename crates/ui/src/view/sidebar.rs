@@ -1314,7 +1314,7 @@ mod tests {
         let dir = trash_test_dir("removed");
         let path = dir.join("note.md");
         std::fs::write(&path, "x").unwrap();
-        let result = move_path_to_trash_with(&path, std::fs::remove_file);
+        let result = move_path_to_trash_with(&path, |path| std::fs::remove_file(path));
         assert!(result.is_ok());
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
