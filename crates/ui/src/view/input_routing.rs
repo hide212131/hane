@@ -1487,18 +1487,18 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum LateCancel {
         /// `replace_and_mark_text_in_range(None, "")`.
-        EmptyMark,
+        Mark,
         /// `replace_text_in_range(None, "")` (the Windows IME cancel).
-        EmptyReplace,
+        Replace,
         /// `replace_text_in_range(Some(marked_range), "")` (the macOS cancel).
-        EmptyReplaceOfMarkedRange,
+        ReplaceMarkedRange,
     }
 
     fn late_body_cancel_after_pending_rename(cx: &mut gpui::TestAppContext, cancel: LateCancel) {
         let label = match cancel {
-            LateCancel::EmptyMark => "late-cancel-mark",
-            LateCancel::EmptyReplace => "late-cancel-replace",
-            LateCancel::EmptyReplaceOfMarkedRange => "late-cancel-replace-marked",
+            LateCancel::Mark => "late-cancel-mark",
+            LateCancel::Replace => "late-cancel-replace",
+            LateCancel::ReplaceMarkedRange => "late-cancel-replace-marked",
         };
         let root = fixture_root(label);
         let (view, cx) = open_routing_view(cx, "body\n", &root);
@@ -1532,9 +1532,9 @@ mod tests {
 
         // The delayed empty platform cancel reaches the body composition.
         match cancel {
-            LateCancel::EmptyMark => mark(&view, cx, None, "", None),
-            LateCancel::EmptyReplace => replace(&view, cx, None, ""),
-            LateCancel::EmptyReplaceOfMarkedRange => {
+            LateCancel::Mark => mark(&view, cx, None, "", None),
+            LateCancel::Replace => replace(&view, cx, None, ""),
+            LateCancel::ReplaceMarkedRange => {
                 let marked = query_marked(&view, cx);
                 assert!(marked.is_some(), "the body composition is still marked");
                 replace(&view, cx, marked, "");
@@ -1569,21 +1569,21 @@ mod tests {
 
     #[gpui::test]
     fn late_body_cancel_via_replace_text_reaches_the_composition(cx: &mut gpui::TestAppContext) {
-        late_body_cancel_after_pending_rename(cx, LateCancel::EmptyReplace);
+        late_body_cancel_after_pending_rename(cx, LateCancel::Replace);
     }
 
     #[gpui::test]
     fn late_body_cancel_via_replace_and_mark_reaches_the_composition(
         cx: &mut gpui::TestAppContext,
     ) {
-        late_body_cancel_after_pending_rename(cx, LateCancel::EmptyMark);
+        late_body_cancel_after_pending_rename(cx, LateCancel::Mark);
     }
 
     #[gpui::test]
     fn late_body_cancel_via_replace_of_the_marked_range_reaches_the_composition(
         cx: &mut gpui::TestAppContext,
     ) {
-        late_body_cancel_after_pending_rename(cx, LateCancel::EmptyReplaceOfMarkedRange);
+        late_body_cancel_after_pending_rename(cx, LateCancel::ReplaceMarkedRange);
     }
 
     #[gpui::test]
