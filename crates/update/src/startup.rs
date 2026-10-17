@@ -194,16 +194,23 @@ fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<
 
 /// Runs the gate for a verified placement.
 pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Duration) -> GateOutcome {
-    // An existing directory we cannot trust (link, foreign file) is not used
-    // and cannot hold our journals; a directory that cannot be created means
-    // updates are unavailable, not that editing is.
+    // Only a definite absence may start unmanaged. An existing entry that
+    // cannot be verified (ACL, owner, link, I/O) may hold a journal or a live
+    // helper, so it stops instead of skipping the gate.
     let coordination = match placement.existing_coordination() {
         Ok(Some(coordination)) => coordination,
         Ok(None) => match placement.coordination() {
             Ok(coordination) => coordination,
-            Err(_) => return GateOutcome::Unmanaged,
+            // Creation failed: unmanaged only while the entry is still
+            // definitely absent; anything that appeared meanwhile is unverified.
+            Err(err) => {
+                return match placement.existing_coordination() {
+                    Ok(None) => GateOutcome::Unmanaged,
+                    _ => stop(&err),
+                };
+            }
         },
-        Err(_) => return GateOutcome::Unmanaged,
+        Err(err) => return stop(&err),
     };
     let disk = FsDiskView::new(&placement.install_root);
     // One recovery attempt: the second look must find nothing pending.
@@ -654,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn an_untrusted_coordination_entry_is_not_adopted() {
+    fn an_untrusted_coordination_entry_is_not_adopted_and_stops() {
         let dir = TempDir::new("gate-foreign-dir");
         let placement = placement(&dir);
         fs::write(
@@ -665,8 +672,50 @@ mod tests {
         let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
         assert!(matches!(
             startup_gate(&placement, &runner, Duration::from_millis(50)),
-            GateOutcome::Unmanaged
+            GateOutcome::RecoveryRequired(_)
         ));
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn an_absent_coordination_directory_is_created_and_proceeds() {
+        let dir = TempDir::new("gate-absent");
+        let placement = placement(&dir);
+        assert!(placement.existing_coordination().unwrap().is_none());
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        assert!(matches!(
+            startup_gate(&placement, &runner, Duration::from_millis(50)),
+            GateOutcome::Proceed(_)
+        ));
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_coordination_directory_that_fails_verification_with_a_pending_journal_stops() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("gate-unverifiable");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        write_journal(&coord, &TransactionId::generate().unwrap(), Phase::Applying);
+        // Group/other-writable: the owner-only verification must reject it.
+        fs::set_permissions(coord.dir(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        let runner = Runner::new(true, Ok(RecoveryReport::RolledBack));
+        let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(runner.calls.get(), 0, "no helper may run on an unverified directory");
+
+        // No runtime lease was taken, so no editing session exists.
+        fs::set_permissions(coord.dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            coord
+                .try_acquire(LeaseKind::RuntimeExclusive, &[])
+                .unwrap()
+                .is_some(),
+            "normal editing never started"
+        );
     }
 
     #[test]
