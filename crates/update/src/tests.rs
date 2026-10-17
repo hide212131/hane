@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 use semver::Version;
 
@@ -24,7 +25,7 @@ use crate::journal::{
     RecoveryDecision, RollbackAction, StepState, UpdateJournal, check_plan_preconditions,
     decide_recovery,
 };
-use crate::limits::DOWNLOAD_TOTAL_MS;
+use crate::limits::{CONNECT_TIMEOUT_MS, DOWNLOAD_TOTAL_MS, METADATA_TOTAL_MS, READ_STALL_MS};
 use crate::model::{
     CATALOG_ASSET_NAME, CATALOG_DOMAIN, INVENTORY_DOMAIN, INVENTORY_FILE_NAME,
     INVENTORY_SIGNATURE_FILE_NAME, SIGNATURE_ASSET_NAME, Target,
@@ -814,6 +815,206 @@ fn download_total_deadline_is_enforced_by_the_clock() {
     let result = run_download(&transport, &clock, &mut store, &CancelToken::new());
     assert_eq!(code(result), ErrorCode::Timeout);
     assert!(store.was_discarded());
+}
+
+/// A scripted response that first spends `ms` of monotonic time.
+fn after_ms(clock: &Arc<FixedClock>, ms: u64, response: Scripted) -> Scripted {
+    let clock = Arc::clone(clock);
+    Scripted::Custom(Box::new(move || {
+        clock.advance(ms);
+        match response {
+            Scripted::Respond(r) => Ok(r),
+            Scripted::Fail(e) => Err(e),
+            Scripted::Custom(make) => make(),
+        }
+    }))
+}
+
+#[test]
+fn download_deadline_covers_redirect_and_open() {
+    let entry = asset_url(TAG, ARCHIVE_NAME);
+    let target = "https://objects.githubusercontent.com/blob/1";
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    // The first hop alone uses most of the budget; the second uses the rest.
+    transport.push(
+        &entry,
+        after_ms(&clock, DOWNLOAD_TOTAL_MS - 1000, Scripted::redirect(302, target)),
+    );
+    transport.push(target, after_ms(&clock, 1000, Scripted::body(200, payload_bytes())));
+    let mut store = MemoryPartStore::default();
+    let result = run_download(&transport, &clock, &mut store, &CancelToken::new());
+    assert_eq!(code(result), ErrorCode::Timeout);
+    assert!(store.was_discarded());
+    assert!(store.committed().is_none());
+
+    // Once the budget is gone before a hop, that hop is never requested.
+    let transport = ScriptedTransport::new();
+    let clock = Arc::new(FixedClock::new(0));
+    transport.push(
+        &entry,
+        after_ms(&clock, DOWNLOAD_TOTAL_MS, Scripted::redirect(302, target)),
+    );
+    transport.push(target, Scripted::body(200, payload_bytes()));
+    let mut store = MemoryPartStore::default();
+    let result = run_download(&transport, &clock, &mut store, &CancelToken::new());
+    assert_eq!(code(result), ErrorCode::Timeout);
+    assert_eq!(transport.requests().len(), 1);
+}
+
+#[test]
+fn transport_timeouts_never_exceed_the_remaining_budget() {
+    let entry = asset_url(TAG, ARCHIVE_NAME);
+    let target = "https://objects.githubusercontent.com/blob/1";
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(&entry, after_ms(&clock, 20, Scripted::redirect(302, target)));
+    transport.push(target, Scripted::body(200, payload_bytes()));
+    let mut store = MemoryPartStore::default();
+    run_download(&transport, &clock, &mut store, &CancelToken::new()).unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests[0].connect_timeout_ms, CONNECT_TIMEOUT_MS);
+    assert_eq!(requests[0].read_timeout_ms, READ_STALL_MS);
+
+    // Near the end of the metadata budget the per-request timeouts shrink.
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &latest_release_url(),
+        Scripted::body(200, release_json("v0.27.0", &full_assets(), false, false)),
+    );
+    let fetcher = Fetcher {
+        transport: &transport,
+        clock: &*clock,
+    };
+    let deadline = fetcher.metadata_deadline();
+    clock.advance(METADATA_TOTAL_MS - 500);
+    fetcher
+        .check_latest_within(
+            &Version::new(0, 26, 0),
+            Target::WindowsX64,
+            &deadline,
+            &CancelToken::new(),
+        )
+        .unwrap();
+    let request = &transport.requests()[0];
+    assert_eq!(request.connect_timeout_ms, 500);
+    assert_eq!(request.read_timeout_ms, 500);
+}
+
+#[test]
+fn metadata_assets_share_one_deadline() {
+    let selection = select_release(
+        &release_json("v0.27.0", &full_assets(), false, false),
+        &Version::new(0, 26, 0),
+        Target::WindowsX64,
+    )
+    .unwrap();
+
+    // Catalog and signature each fit in 30s alone but not together.
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &selection.catalog_url,
+        after_ms(&clock, 20_000, Scripted::body(200, b"catalog".to_vec())),
+    );
+    transport.push(
+        &selection.signature_url,
+        after_ms(&clock, 20_000, Scripted::body(200, b"sig".to_vec())),
+    );
+    let fetcher = Fetcher {
+        transport: &transport,
+        clock: &*clock,
+    };
+    let result = fetcher.fetch_catalog(&selection, &CancelToken::new());
+    assert_eq!(code(result), ErrorCode::Timeout);
+
+    // latest-release JSON and catalog fetch share a caller-provided deadline.
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &latest_release_url(),
+        after_ms(
+            &clock,
+            METADATA_TOTAL_MS - 1000,
+            Scripted::body(200, release_json("v0.27.0", &full_assets(), false, false)),
+        ),
+    );
+    transport.push(
+        &selection.catalog_url,
+        after_ms(&clock, 2000, Scripted::body(200, b"catalog".to_vec())),
+    );
+    transport.push(&selection.signature_url, Scripted::body(200, b"sig".to_vec()));
+    let fetcher = Fetcher {
+        transport: &transport,
+        clock: &*clock,
+    };
+    let cancel = CancelToken::new();
+    let deadline = fetcher.metadata_deadline();
+    let picked = fetcher
+        .check_latest_within(&Version::new(0, 26, 0), Target::WindowsX64, &deadline, &cancel)
+        .unwrap();
+    let result = fetcher.fetch_catalog_within(&picked, &deadline, &cancel);
+    assert_eq!(code(result), ErrorCode::Timeout);
+}
+
+#[test]
+fn work_within_the_deadlines_succeeds() {
+    let selection = select_release(
+        &release_json("v0.27.0", &full_assets(), false, false),
+        &Version::new(0, 26, 0),
+        Target::WindowsX64,
+    )
+    .unwrap();
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &latest_release_url(),
+        after_ms(
+            &clock,
+            10_000,
+            Scripted::body(200, release_json("v0.27.0", &full_assets(), false, false)),
+        ),
+    );
+    transport.push(
+        &selection.catalog_url,
+        after_ms(&clock, 10_000, Scripted::body(200, b"catalog".to_vec())),
+    );
+    transport.push(
+        &selection.signature_url,
+        after_ms(&clock, 9_000, Scripted::body(200, b"sig".to_vec())),
+    );
+    let fetcher = Fetcher {
+        transport: &transport,
+        clock: &*clock,
+    };
+    let cancel = CancelToken::new();
+    let deadline = fetcher.metadata_deadline();
+    let picked = fetcher
+        .check_latest_within(&Version::new(0, 26, 0), Target::WindowsX64, &deadline, &cancel)
+        .unwrap();
+    let (catalog, signature) = fetcher
+        .fetch_catalog_within(&picked, &deadline, &cancel)
+        .unwrap();
+    assert_eq!(catalog, b"catalog");
+    assert_eq!(signature, b"sig");
+
+    // A slow but in-budget archive download succeeds across redirect + body.
+    let entry = asset_url(TAG, ARCHIVE_NAME);
+    let target = "https://objects.githubusercontent.com/blob/1";
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &entry,
+        after_ms(&clock, DOWNLOAD_TOTAL_MS / 3, Scripted::redirect(302, target)),
+    );
+    transport.push(
+        target,
+        after_ms(&clock, DOWNLOAD_TOTAL_MS / 3, Scripted::body(200, payload_bytes())),
+    );
+    let mut store = MemoryPartStore::default();
+    run_download(&transport, &clock, &mut store, &CancelToken::new()).unwrap();
+    assert_eq!(store.committed().unwrap(), payload_bytes());
 }
 
 struct CancelOnRead {

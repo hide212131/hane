@@ -201,10 +201,52 @@ pub struct Fetcher<'a> {
     pub clock: &'a dyn Clock,
 }
 
+/// A single monotonic deadline for one high-level operation. Every request,
+/// redirect hop and body read of that operation draws from the same budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadline {
+    started_ms: u64,
+    budget_ms: u64,
+}
+
+impl Deadline {
+    /// Milliseconds left, or a timeout error once the budget is used up.
+    fn remaining(&self, clock: &dyn Clock) -> Result<u64> {
+        let elapsed = clock.monotonic_ms().saturating_sub(self.started_ms);
+        match self.budget_ms.checked_sub(elapsed) {
+            Some(left) if left > 0 => Ok(left),
+            _ => Err(UpdateError::new(
+                ErrorCode::Timeout,
+                "total transfer time exceeded",
+            )),
+        }
+    }
+}
+
 impl Fetcher<'_> {
+    /// Starts the shared deadline for a metadata check ([`METADATA_TOTAL_MS`]).
+    /// Pass it to [`Fetcher::check_latest_within`] and
+    /// [`Fetcher::fetch_catalog_within`] so both share one budget.
+    pub fn metadata_deadline(&self) -> Deadline {
+        self.deadline(METADATA_TOTAL_MS)
+    }
+
+    fn deadline(&self, budget_ms: u64) -> Deadline {
+        Deadline {
+            started_ms: self.clock.monotonic_ms(),
+            budget_ms,
+        }
+    }
+
     /// Opens the endpoint, following at most [`MAX_REDIRECTS`] hops and
-    /// validating every hop's scheme, host and userinfo.
-    fn open(&self, endpoint: &Endpoint<'_>, cancel: &CancelToken) -> Result<Response> {
+    /// validating every hop's scheme, host and userinfo. Each request's
+    /// timeouts are capped by what is left of `deadline`.
+    fn open(
+        &self,
+        endpoint: &Endpoint<'_>,
+        deadline: &Deadline,
+        cancel: &CancelToken,
+    ) -> Result<Response> {
         let mut current = Url::parse(&endpoint.url()?).map_err(|err| {
             UpdateError::new(ErrorCode::EndpointRejected, format!("bad endpoint: {err}"))
         })?;
@@ -213,13 +255,14 @@ impl Fetcher<'_> {
             if cancel.is_cancelled() {
                 return Err(cancelled());
             }
+            let remaining = deadline.remaining(self.clock)?;
             let request = Request {
                 url: current.to_string(),
                 accept: endpoint.accept(),
                 user_agent: USER_AGENT,
                 api_version: if hops == 0 { endpoint.api_version() } else { None },
-                connect_timeout_ms: CONNECT_TIMEOUT_MS,
-                read_timeout_ms: READ_STALL_MS,
+                connect_timeout_ms: CONNECT_TIMEOUT_MS.min(remaining),
+                read_timeout_ms: READ_STALL_MS.min(remaining),
             };
             let response = self.transport.get(&request).map_err(transport_error)?;
             match response.status {
@@ -258,7 +301,7 @@ impl Fetcher<'_> {
         &self,
         mut response: Response,
         max_bytes: u64,
-        budget_ms: u64,
+        deadline: &Deadline,
         cancel: &CancelToken,
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<u64> {
@@ -270,19 +313,13 @@ impl Fetcher<'_> {
                 format!("declared length {declared} exceeds {max_bytes}"),
             ));
         }
-        let started = self.clock.monotonic_ms();
         let mut buffer = vec![0u8; 64 * 1024];
         let mut total = 0u64;
         loop {
             if cancel.is_cancelled() {
                 return Err(cancelled());
             }
-            if self.clock.monotonic_ms().saturating_sub(started) > budget_ms {
-                return Err(UpdateError::new(
-                    ErrorCode::Timeout,
-                    "total transfer time exceeded",
-                ));
-            }
+            deadline.remaining(self.clock)?;
             let read = match response.body.read(&mut buffer) {
                 Ok(n) => n,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -315,33 +352,64 @@ impl Fetcher<'_> {
         &self,
         endpoint: &Endpoint<'_>,
         max_bytes: u64,
+        deadline: &Deadline,
         cancel: &CancelToken,
     ) -> Result<Vec<u8>> {
-        let response = self.open(endpoint, cancel)?;
+        let response = self.open(endpoint, deadline, cancel)?;
         let mut data = Vec::new();
-        self.pump(response, max_bytes, METADATA_TOTAL_MS, cancel, &mut |chunk| {
+        self.pump(response, max_bytes, deadline, cancel, &mut |chunk| {
             data.extend_from_slice(chunk);
             Ok(())
         })?;
         Ok(data)
     }
 
-    /// Reads `releases/latest` and selects the release for `target`.
+    /// Reads `releases/latest` and selects the release for `target`, within
+    /// its own metadata budget.
     pub fn check_latest(
         &self,
         current: &Version,
         target: Target,
         cancel: &CancelToken,
     ) -> Result<ReleaseSelection> {
-        let body = self.fetch_bytes(&Endpoint::LatestRelease, MAX_API_JSON_BYTES, cancel)?;
+        self.check_latest_within(current, target, &self.metadata_deadline(), cancel)
+    }
+
+    /// Like [`Fetcher::check_latest`], drawing from a caller-provided
+    /// `deadline` so a whole metadata check shares one budget.
+    pub fn check_latest_within(
+        &self,
+        current: &Version,
+        target: Target,
+        deadline: &Deadline,
+        cancel: &CancelToken,
+    ) -> Result<ReleaseSelection> {
+        let body = self.fetch_bytes(
+            &Endpoint::LatestRelease,
+            MAX_API_JSON_BYTES,
+            deadline,
+            cancel,
+        )?;
         select_release(&body, current, target)
     }
 
-    /// Fetches the catalog and its signature for the pinned release. A 404
-    /// here is `metadata_missing` (old release), not "up to date".
+    /// Fetches the catalog and its signature for the pinned release within one
+    /// metadata budget. A 404 here is `metadata_missing` (old release), not
+    /// "up to date".
     pub fn fetch_catalog(
         &self,
         selection: &ReleaseSelection,
+        cancel: &CancelToken,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.fetch_catalog_within(selection, &self.metadata_deadline(), cancel)
+    }
+
+    /// Like [`Fetcher::fetch_catalog`], drawing from a caller-provided
+    /// `deadline`.
+    pub fn fetch_catalog_within(
+        &self,
+        selection: &ReleaseSelection,
+        deadline: &Deadline,
         cancel: &CancelToken,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let missing = |err: UpdateError| {
@@ -358,6 +426,7 @@ impl Fetcher<'_> {
                     name: CATALOG_ASSET_NAME,
                 },
                 MAX_CATALOG_BYTES,
+                deadline,
                 cancel,
             )
             .map_err(missing)?;
@@ -368,6 +437,7 @@ impl Fetcher<'_> {
                     name: SIGNATURE_ASSET_NAME,
                 },
                 MAX_SIGNATURE_BYTES,
+                deadline,
                 cancel,
             )
             .map_err(missing)?;
@@ -401,16 +471,18 @@ impl Fetcher<'_> {
         store: &mut dyn PartStore,
         cancel: &CancelToken,
     ) -> Result<DownloadedArchive> {
+        let deadline = self.deadline(DOWNLOAD_TOTAL_MS);
         let mut writer = store.begin_part().map_err(UpdateError::from)?;
         let response = self.open(
             &Endpoint::Asset {
                 tag: request.tag,
                 name: request.name,
             },
+            &deadline,
             cancel,
         )?;
         let mut hash = sha256_context();
-        let total = self.pump(response, request.size, DOWNLOAD_TOTAL_MS, cancel, &mut |chunk| {
+        let total = self.pump(response, request.size, &deadline, cancel, &mut |chunk| {
             hash.update(chunk);
             writer.write_all(chunk).map_err(UpdateError::from)
         })?;

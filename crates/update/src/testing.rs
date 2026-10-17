@@ -98,6 +98,12 @@ impl FixedClock {
         }
     }
 
+    /// Moves the monotonic clock forward, e.g. from inside a scripted
+    /// transport call to model time spent connecting or redirecting.
+    pub fn advance(&self, ms: u64) {
+        self.monotonic.fetch_add(ms, Ordering::SeqCst);
+    }
+
     pub fn set_now(&self, now: i64) {
         self.now.store(now, Ordering::SeqCst);
     }
