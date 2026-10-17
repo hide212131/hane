@@ -706,9 +706,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_transaction_beside_an_older_receipt_is_recovered_first() {
-        // 1.0.0 -> 2.0.0 committed (disk at 2.0.0), then 2.0.0 -> 3.0.0 was cut short while
-        // applying: the older receipt must not hide or pre-empt the recovery.
+    fn a_pending_transaction_beside_an_older_receipt_is_recovered_first_then_stops_as_ambiguous() {
+        // The contract allows at most one terminal receipt, and an apply retires the previous
+        // one before it creates a new journal. An older Committed receipt beside a pending
+        // journal is therefore not a supported state: the pending journal still reaches
+        // recovery first, but once it settles, the two terminal receipts are ambiguous and
+        // the gate stops without guessing by time or migrating.
         for settle in [true, false] {
             let dir = TempDir::new("gate-pending-after-commit");
             let placement = placement(&dir);
@@ -725,11 +728,16 @@ mod tests {
             }
             let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
             assert_eq!(runner.calls.get(), 1, "settle={settle}: pending journal reached recovery");
-            if settle {
-                assert!(matches!(outcome, GateOutcome::Proceed(_)), "{outcome:?}");
-            } else {
-                assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
-            }
+            // Settled or not, normal editing never starts.
+            assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "settle={settle}: {outcome:?}");
+            drop(outcome);
+            assert!(
+                coord
+                    .try_acquire(LeaseKind::RuntimeExclusive, &[])
+                    .unwrap()
+                    .is_some(),
+                "settle={settle}: no runtime lease is held by the gate"
+            );
         }
     }
 
