@@ -1767,7 +1767,7 @@ impl EditorView {
             pending_caret_visibility_after_layout: false,
             pending_center_caret_frames: 0,
             center_window_line: None,
-pending_find_visibility_after_layout: false,
+            pending_find_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),

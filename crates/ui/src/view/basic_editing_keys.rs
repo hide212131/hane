@@ -551,6 +551,40 @@ mod tests {
         let (view, cx) = open_view(cx, &multi_line_paragraph());
         cx.simulate_resize(gpui::size(px(320.0), px(400.0)));
         cx.run_until_parked();
+
+        // The view opens on the line-granularity fallback. Let the debounced
+        // formal parse publish the block index before any test relies on the
+        // paragraph being one block.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let text = multi_line_paragraph();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            let index = view
+                .current_index()
+                .expect("the formal parse published a current block index");
+            let probes = [
+                0,
+                text.find("l15w100").unwrap(),
+                text.find("l15w119").unwrap(),
+                text.len() - 1,
+            ];
+            let first = index
+                .block_at(SourceOffset(probes[0]))
+                .expect("the paragraph block");
+            for probe in probes {
+                let block = index
+                    .block_at(SourceOffset(probe))
+                    .unwrap_or_else(|| panic!("no block at {probe}"));
+                assert_eq!(
+                    block.ordinal, first.ordinal,
+                    "offset {probe} is outside the paragraph {:?}",
+                    first.source_range
+                );
+            }
+        });
         (view, cx)
     }
 
@@ -611,17 +645,25 @@ mod tests {
     /// Content-space y of `offset` in a layout of the whole paragraph, which
     /// shares one origin for every offset and so is independent of the
     /// partial layouts the view draws.
-    fn full_paragraph_y(
-        view: &TestView,
-        cx: &mut TestCx,
-        offsets: &[usize],
-    ) -> Vec<f32> {
+    fn full_paragraph_y(view: &TestView, cx: &mut TestCx, offsets: &[usize]) -> Vec<f32> {
         cx.update(|window, app| {
             view.update(app, |view, _| {
                 let shaper = WindowShaper::new(window, view.zoom);
-                let indexed = view
-                    .block_at_offset(SourceOffset(0))
+                let granularity = view.granularity;
+                let index = view
+                    .current_index()
+                    .expect("a current formal block index is required");
+                let indexed = index
+                    .block_at(SourceOffset(0))
                     .expect("the paragraph block");
+                for offset in offsets {
+                    let range = indexed.source_range;
+                    assert!(
+                        range.start.0 <= *offset && *offset <= range.end.0,
+                        "offset {offset} is outside the paragraph {range:?} \
+                         (granularity {granularity:?})"
+                    );
+                }
                 let span = block_line_span(view.editor().document(), &indexed)
                     .expect("the paragraph's lines");
                 let visual = presented_block_with_table_projection(
@@ -665,13 +707,12 @@ mod tests {
             });
             cx.run_until_parked();
             let end = selection(&view, cx).active.0;
-            let (page, line_height) =
-                view.read_with(cx, |view, _| {
-                    (
-                        (view.viewport_height - view.line_height()).max(view.line_height()),
-                        view.line_height(),
-                    )
-                });
+            let (page, line_height) = view.read_with(cx, |view, _| {
+                (
+                    (view.viewport_height - view.line_height()).max(view.line_height()),
+                    view.line_height(),
+                )
+            });
             let ys = full_paragraph_y(&view, cx, &[start, end]);
             let travelled = (ys[1] - ys[0]).abs();
             assert_eq!(ys[1] > ys[0], down, "direction of {start} -> {end}");
