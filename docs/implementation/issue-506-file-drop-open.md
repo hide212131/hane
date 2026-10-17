@@ -2,45 +2,38 @@
 
 ## 状態
 
-Claude Code に製品コードとテストの実装を依頼するための準備文書。現在の差分はこの文書だけで、製品実装・テスト・GUI確認は未実施。
+単一ファイルの外部ドロップを既存の open 経路へ接続する実装を、PR #507 に反映済み。Draft は macOS Finder と Windows Explorer の native GUI 確認待ち。
 
 - 基準 main: `e82b9a9fe42280bfa78497746bcd7e21c73430c5`
+- 自動検証対象の実装 commit: `5e7ebc47e064e4765a8558a5f8054f7c0d5f02b2`
+- 自動検証: [AADW verification run](https://github.com/hide212131/hane/actions/runs/39021003186) 成功。workspace regression tests と lint が成功。
+- native GUI確認: 未実施。Finder / Explorer からの実操作、dirty session時の表示、drop後の本文入力・選択への影響は確認待ち。
 - 受入条件の正本: [Issue #506](https://github.com/hide212131/hane/issues/506)
 
-## 調査した現行経路
+## 調査した現行経路と実装
 
 current main には OS からの外部ファイルドロップを受け取る GPUI 基盤がある。
 
 - `vendor/gpui/src/interactive.rs`: `ExternalPaths` と `FileDropEvent`
 - `vendor/gpui/src/elements/div.rs`: 型付き `on_drop`
 - `vendor/gpui/src/platform/mac/window.rs` と `vendor/gpui/src/platform/windows/window.rs`: native file-drop event
-- `crates/ui/src/view.rs`: `EditorView::open_path` が既存のファイル読込と未保存編集保護を担当する
+- `crates/ui/src/view.rs`: root view で `ExternalPaths` を受け、1件だけ `EditorView::open_path` に渡す。`open_path` の既存 dirty-session 保護を再利用する。
 
-Hane の view は `ExternalPaths` の `on_drop` をまだ登録していない。GPUI がドロップ完了を mouse-up に変換するため、root view の drop handler がイベントを処理し、通常の本文クリックや選択へ伝播させないようにする。
+複数パスは開かず、一度に1項目と案内する。空のdropは無視する。フォルダー判定のために filesystem metadata を同期取得せず、folder drop で Work folder に切り替えない。root の `on_drop` がdropイベントを処理し、本文への mouse-up として扱わせない。
 
-単一のドロップパスは `open_path` へ渡す。既存の `open_external_path` は `path.is_dir()` により Work folder へ切り替えるため、今回の file-only input では使わない。ドロップ処理中に filesystem metadata を同期取得せず、path の読込は既存の background open 経路へ任せる。複数パスは開かず、一度に1項目だけを落とすよう案内する。
-
-## 範囲
+## 範囲と関連作業
 
 - macOS Finder と Windows Explorer から Hane のウィンドウ全体へ単一ファイルをドロップして開く。
-- Hane の既存 `open_path` を再利用する。新しい読込・session・保存経路を作らない。
-- 現在の dirty session に対する拒否動作を維持する。
-- 複数項目を含むドロップは開かず、利用者へ一度に1項目と伝える。
-- フォルダーのドロップで Work folder へ切り替えない。
+- 新しい読込・session・保存経路は作らず、既存 `open_path` を再利用する。
 - GPUI vendor、OS file association、ファイル移動・コピーは変更しない。
-
-## 関連作業と依存
-
-- Issue #499 / Draft PR #500 は Finder の「このアプリケーションで開く」イベントを扱う。今回の画面内ドロップとは別の経路で、実装を混ぜない。
-- Issue #22 は Windows 全体の受け入れを扱うが、現行 GPUI の Windows drop handler は存在する。この狭い UI 接続は #22 全体に依存しない。今回の Windows acceptance には native GUI 確認を含める。
-- 別の責務整理は不要。current main の GPUI `on_drop` と Hane `open_path` を使う。
+- Issue #499 / Draft PR #500 の Finder「このアプリケーションで開く」とは別の画面内入力経路。
+- Issue #22 のWindows全体対応に依存しない。この機能のExplorer経路にはnative GUI確認が必要。
 
 ## 実装と受け入れ確認
 
-- [ ] root view が単一の `ExternalPaths` drop を受け取る。
-- [ ] Finder と Explorer の単一ファイル drop で、そのパスが既存の `open_path` 経由で開く。
-- [ ] dirty session があると既存ルールどおり拒否し、本文を失わない。
-- [ ] 複数項目は開かず、directory drop は Work folder に切り替えない。
-- [ ] drop したパスが本文への入力や編集選択にならない。
-- [ ] Open ダイアログ、CLI open、通常のテキストドラッグ選択に回帰がない。
-- [ ] 関連する自動検証と macOS / Windows native GUI の focused scenario を実施し、対象headと結果を記録する。
+- [x] root view が単一の `ExternalPaths` drop を受け、既存 `open_path` を呼ぶ。
+- [x] 複数項目を拒否し、1項目ずつと案内する。パス選別の自動テストを追加。
+- [x] folder drop で Work folder に切り替えず、drop handler 内で metadata を取得しない。
+- [x] root drop handler がdrop完了を本文の mouse-up / 選択として処理させない。
+- [x] workspace regression tests と lint が成功。
+- [ ] dirty session 保護、Finder / Explorer の単一ファイルdrop、Openダイアログ・CLI open・通常テキストドラッグ選択の回帰をnative GUIで確認し、結果を記録する。
