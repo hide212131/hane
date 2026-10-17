@@ -834,6 +834,93 @@ mod tests {
     }
 
     #[gpui::test]
+    fn scroll_only_after_center_cursor_line_carries_the_pinned_window_and_keeps_the_position(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_multi_line(cx);
+        let body = multi_line_paragraph();
+        let caret = body.find("l15w100").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_everything(&view, cx);
+        for page in [true, false] {
+            let manual = cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    view.center_cursor_line(window, cx);
+                    let centred = view.center_window_line.expect("centring pinned a line");
+                    view.scroll_page(page, cx);
+                    assert_eq!(view.pending_center_caret_frames, 0);
+                    assert!(view.center_window_line.is_none());
+                    let retained = view
+                        .retained_center_window
+                        .expect("the pinned window is carried over");
+                    assert_eq!(retained.0, centred);
+                    view.scroll_y
+                })
+            });
+            cx.run_until_parked();
+            let after = view.read_with(cx, |view, _| view.scroll_y);
+            assert!(
+                (after - manual).abs() <= 1.0,
+                "page={page}: scroll-only position {manual} was moved to {after}"
+            );
+            assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+            assert_eq!(text(&view, cx), body);
+            view.read_with(cx, |view, _| assert!(!view.editor().can_undo()));
+        }
+
+        let manual = cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.center_cursor_line(window, cx);
+                view.scroll_to_document_edge(true, cx);
+                assert!(view.retained_center_window.is_some());
+                view.scroll_y
+            })
+        });
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            (after - manual).abs() <= 1.0,
+            "edge position {manual} was moved to {after}"
+        );
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+
+        // A fresh centring request replaces the carried pin instead of keeping
+        // the old one.
+        let other = body.find("l02w050").unwrap();
+        set_selection(&view, cx, other, other);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.center_cursor_line(window, cx);
+                assert!(view.retained_center_window.is_none());
+                assert!(view.center_window_line.is_some());
+            });
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn mac_page_key_after_center_cursor_line_keeps_the_pinned_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_multi_line(cx);
+        let body = multi_line_paragraph();
+        let caret = body.find("l15w100").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_everything(&view, cx);
+        press(cx, "ctrl-l");
+        press(cx, "pagedown");
+        let (scroll, retained) = view.read_with(cx, |view, _| {
+            (view.scroll_y, view.retained_center_window.is_some())
+        });
+        assert!(retained);
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.scroll_y);
+        assert!((after - scroll).abs() <= 1.0, "{scroll} -> {after}");
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+        assert_eq!(text(&view, cx), body);
+    }
+
+    #[gpui::test]
     fn a_find_jump_after_center_cursor_line_releases_the_pinned_window(
         cx: &mut gpui::TestAppContext,
     ) {

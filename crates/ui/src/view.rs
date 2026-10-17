@@ -4103,6 +4103,13 @@ impl EditorView {
     /// nothing may pull the viewport back to the caret afterwards: the pending
     /// post-layout caret reveal and any wheel coast are dropped.
     fn finish_scroll_only(&mut self, scroll_y: f32, cx: &mut Context<Self>) {
+        // A centred caret row keeps its block window as a retained pin, the way
+        // a wheel scroll does, so the partial layout does not shrink under the
+        // chosen position and clamp it on the next pass.
+        let pinned = self
+            .center_window_line
+            .map(|line| (line, self.scroll_y))
+            .or(self.retained_center_window);
         self.scroll_y = clamp_scroll_y(
             scroll_y,
             self.scrollable_content_height(),
@@ -4115,6 +4122,7 @@ impl EditorView {
         self.pending_find_visibility_after_layout = false;
         self.pending_zoom_anchor = None;
         self.cancel_center_caret();
+        self.retained_center_window = pinned;
         cx.notify();
     }
 
@@ -4155,6 +4163,8 @@ impl EditorView {
         };
         let target = top + height / 2.0 - self.viewport_height / 2.0;
         self.finish_scroll_only(target, cx);
+        // A new request supersedes any pin carried over from an earlier one.
+        self.retained_center_window = None;
         // `top` comes from a partial layout whose omitted leading lines are
         // counted as single rows, so the row may not be centred once drawn.
         // Pin the caret line's block window around it so that row is drawn,
