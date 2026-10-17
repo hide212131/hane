@@ -133,8 +133,13 @@ fn run_steps<S: JournalStore, O: FileOps>(
     for (index, step) in steps.iter().enumerate() {
         // The intent is durable before the file is touched.
         journal.advance_step(index, StepState::Intent)?;
+        // The install directory can change between steps, so each path is
+        // re-observed against its journaled old identity (absent when the file
+        // is to be added) right before it is backed up, replaced or removed.
+        ensure_live_old(ops, step)?;
         if let (Some(_), Some(backup_rel)) = (&step.old, &step.backup_rel) {
             ops.backup(&step.rel_path, backup_rel)?;
+            ensure_live_old(ops, step)?;
         }
         match &step.new {
             Some(identity) => ops.install_new(&step.rel_path, identity)?,
@@ -151,6 +156,19 @@ fn run_steps<S: JournalStore, O: FileOps>(
         }
     }
     journal.advance_phase(Phase::AwaitingHealth)
+}
+
+/// Fails closed unless the live path still matches the journaled old identity.
+/// Observation errors propagate, so an unreadable path is never mutated.
+fn ensure_live_old<O: FileOps>(ops: &O, step: &crate::journal::JournalStep) -> Result<()> {
+    if identity_matches(&ops.observe(&step.rel_path)?, &step.old) {
+        Ok(())
+    } else {
+        Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{} changed during the update", step.rel_path),
+        ))
+    }
 }
 
 /// Concludes the limited-health run. Only a durable `Committed` returns
@@ -538,9 +556,19 @@ mod tests {
         break_at: Option<usize>,
         broken: bool,
         changed: Vec<String>,
+        /// External change made right after the 1-based mutation completes.
+        inject_after: Option<(usize, String, Vec<u8>)>,
     }
 
     impl FakeOps {
+        fn inject(&mut self) {
+            if let Some((at, path, bytes)) = self.inject_after.clone()
+                && at == self.mutations
+            {
+                self.files.insert(path, bytes);
+            }
+        }
+
         fn new() -> Self {
             let mut staged = BTreeMap::new();
             staged.insert("a.dll".to_string(), NEW_DLL.to_vec());
@@ -592,6 +620,7 @@ mod tests {
             self.tick()?;
             let bytes = self.files.get(rel_path).cloned().ok_or_else(io_error)?;
             self.files.insert(backup_rel.to_string(), bytes);
+            self.inject();
             Ok(())
         }
 
@@ -601,6 +630,7 @@ mod tests {
             assert_eq!(&FileIdentity::of(&bytes), expected);
             self.files.insert(rel_path.to_string(), bytes);
             self.changed.push(rel_path.to_string());
+            self.inject();
             Ok(())
         }
 
@@ -608,6 +638,7 @@ mod tests {
             self.tick()?;
             self.files.remove(rel_path);
             self.changed.push(rel_path.to_string());
+            self.inject();
             Ok(())
         }
 
@@ -752,6 +783,39 @@ mod tests {
         let err = apply(&mut journal, &mut ops, &Parent(true), &mut Child::default()).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
         assert_eq!(ops.mutations, 0);
+    }
+
+    #[test]
+    fn an_owned_file_changed_between_steps_is_kept_and_stops_later_mutations() {
+        let mut journal = new_journal(flaky());
+        let mut ops = FakeOps::new();
+        // After a.dll is installed (mutation 2), gone.txt is edited externally.
+        ops.inject_after = Some((2, "gone.txt".to_string(), b"edited".to_vec()));
+        let mut child = Child::default();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(ops.files["gone.txt"], b"edited");
+        assert!(!ops.files.contains_key("backup/gone.txt"));
+        assert_eq!(ops.files["hane.exe"], OLD_EXE);
+        assert_eq!(ops.mutations, 3);
+        assert_eq!(ops.changed, ["a.dll", "added.txt"]);
+        assert_eq!(journal.journal().phase, Phase::RecoveryRequired);
+    }
+
+    #[test]
+    fn an_unknown_file_at_a_planned_addition_is_never_overwritten() {
+        let mut journal = new_journal(flaky());
+        let mut ops = FakeOps::new();
+        // After a.dll is installed (mutation 2), someone creates added.txt.
+        ops.inject_after = Some((2, "added.txt".to_string(), b"user file".to_vec()));
+        let mut child = Child::default();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(ops.files["added.txt"], b"user file");
+        assert_eq!(ops.mutations, 2);
+        assert_eq!(ops.changed, ["a.dll"]);
+        assert_eq!(ops.files["hane.exe"], OLD_EXE);
+        assert_eq!(journal.journal().phase, Phase::RecoveryRequired);
     }
 
     #[test]
