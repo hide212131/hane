@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any
 
@@ -30,6 +31,107 @@ def _has_positive_token_usage(value: Any) -> bool:
     return any(
         type(value.get(field)) is int and value[field] > 0
         for field in USAGE_TOKEN_FIELDS
+    )
+
+
+
+
+def _log_execution_file_diagnostics(path: Path | None) -> None:
+    if path is None:
+        diagnostics = {
+            "argument_present": False,
+            "exists": False,
+            "file_type": "unavailable",
+            "is_symlink": None,
+            "is_regular_file": None,
+            "lstat_size_bytes": None,
+        }
+    else:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            diagnostics = {
+                "argument_present": True,
+                "exists": False,
+                "file_type": "missing",
+                "is_symlink": False,
+                "is_regular_file": False,
+                "lstat_size_bytes": None,
+            }
+        except OSError:
+            diagnostics = {
+                "argument_present": True,
+                "exists": None,
+                "file_type": "unavailable",
+                "is_symlink": None,
+                "is_regular_file": None,
+                "lstat_size_bytes": None,
+            }
+        else:
+            is_symlink = stat.S_ISLNK(metadata.st_mode)
+            is_regular_file = stat.S_ISREG(metadata.st_mode)
+            file_type = (
+                "symlink" if is_symlink else
+                "regular_file" if is_regular_file else
+                "directory" if stat.S_ISDIR(metadata.st_mode) else
+                "other"
+            )
+            diagnostics = {
+                "argument_present": True,
+                "exists": True,
+                "file_type": file_type,
+                "is_symlink": is_symlink,
+                "is_regular_file": is_regular_file,
+                "lstat_size_bytes": metadata.st_size,
+            }
+    print(
+        "Claude execution file diagnostics: "
+        + json.dumps(diagnostics, sort_keys=True, separators=(",", ":")),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _log_model_usage_diagnostics(payload: Any) -> None:
+    result_events = (
+        [
+            event
+            for event in payload
+            if isinstance(event, dict) and event.get("type") == "result"
+        ]
+        if isinstance(payload, list)
+        else []
+    )
+    model_usage_values = [
+        event["modelUsage"] for event in result_events if "modelUsage" in event
+    ]
+    model_usage_objects = [
+        value for value in model_usage_values if isinstance(value, dict)
+    ]
+    diagnostics = {
+        "event_list": isinstance(payload, list),
+        "result_event_count": len(result_events),
+        "model_usage_key_present": bool(model_usage_values),
+        "model_usage_object_count": len(model_usage_objects),
+        "model_usage_model_count": sum(
+            len(value) for value in model_usage_objects
+        ),
+        "expected_model_entry_present": any(
+            _is_expected_model(model)
+            for usage_by_model in model_usage_objects
+            for model in usage_by_model
+        ),
+        "expected_model_positive_usage": any(
+            _is_expected_model(model) and _has_positive_token_usage(usage)
+            for usage_by_model in model_usage_objects
+            for model, usage in usage_by_model.items()
+        ),
+    }
+    print(
+        "Claude modelUsage diagnostics: "
+        + json.dumps(diagnostics, sort_keys=True, separators=(",", ":")),
+        file=sys.stderr,
+        flush=True,
     )
 
 
@@ -72,10 +174,18 @@ def verify_execution(payload: Any) -> dict[str, Any]:
     }
 
 
-def read_execution(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_EXECUTION_BYTES:
-        raise ValueError("Claude execution log must be a bounded regular file")
-    return verify_execution(json.loads(path.read_text(encoding="utf-8")))
+def read_execution(path: Path | None) -> dict[str, Any]:
+    _log_execution_file_diagnostics(path)
+    if path is None:
+        raise ValueError("Claude execution log path is missing")
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_EXECUTION_BYTES:
+            raise ValueError("Claude execution log must be a bounded regular file")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError:
+        raise ValueError("Claude execution log could not be inspected or read") from None
+    _log_model_usage_diagnostics(payload)
+    return verify_execution(payload)
 
 
 def main() -> int:
@@ -83,7 +193,8 @@ def main() -> int:
         print("usage: verify_claude_model.py EXECUTION_FILE", file=sys.stderr)
         return 2
     try:
-        result = read_execution(Path(sys.argv[1]))
+        execution_path = Path(sys.argv[1]) if sys.argv[1] else None
+        result = read_execution(execution_path)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
