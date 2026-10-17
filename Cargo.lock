@@ -3045,6 +3045,9 @@ dependencies = [
  "hane-presentation",
  "hane-session",
  "hane-ui",
+ "hane-update",
+ "rustls",
+ "rustls-native-certs",
  "windows-sys 0.59.0",
 ]
 
@@ -3140,9 +3143,24 @@ dependencies = [
  "hane-metrics",
  "hane-presentation",
  "hane-session",
+ "objc",
  "unicode-segmentation",
+ "windows 0.61.3",
  "windows-sys 0.59.0",
  "winreg",
+]
+
+[[package]]
+name = "hane-update"
+version = "0.26.0"
+dependencies = [
+ "base64",
+ "flate2",
+ "ring",
+ "semver",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

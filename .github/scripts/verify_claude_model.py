@@ -12,7 +12,8 @@ from typing import Any
 EXPECTED_MODEL = "claude-sonnet-5-5"
 MODEL_ID = re.compile(r"claude-sonnet-5-5(?:-[0-9]{8})?")
 USAGE_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._:-]{0,127}")
-MAX_EXECUTION_BYTES = 16 * 1024 * 1024
+# Full Claude traces can exceed 16 MiB for longer bounded runs. Keep parsing capped.
+MAX_EXECUTION_BYTES = 64 * 1024 * 1024
 USAGE_TOKEN_FIELDS = (
     "inputTokens",
     "outputTokens",
@@ -181,7 +182,12 @@ def read_execution(path: Path | None) -> dict[str, Any]:
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_EXECUTION_BYTES:
             raise ValueError("Claude execution log must be a bounded regular file")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        # Bound the actual read as well as the metadata check in case the file grows.
+        with path.open("rb") as execution_file:
+            raw_payload = execution_file.read(MAX_EXECUTION_BYTES + 1)
+        if len(raw_payload) > MAX_EXECUTION_BYTES:
+            raise ValueError("Claude execution log must be a bounded regular file")
+        payload = json.loads(raw_payload.decode("utf-8"))
     except OSError:
         raise ValueError("Claude execution log could not be inspected or read") from None
     _log_model_usage_diagnostics(payload)

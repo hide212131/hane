@@ -24,9 +24,10 @@ impl EditorView {
     /// (content search, document find, AI selection, settings, menus, ...)
     /// have already run. Every one of those actions calls this once per
     /// dispatch and routes to exactly one of the existing body `Editor`,
-    /// sidebar filter, or inline rename handlers below; the document
-    /// navigation and Undo/Redo actions are body-only and no-op for
-    /// `SidebarFilter`/`InlineRename`.
+    /// sidebar filter, or inline rename handlers below; DocumentStart/End
+    /// and Undo/Redo are body-only and no-op for `SidebarFilter`/
+    /// `InlineRename`, while SelectDocumentStart/End select to the start or
+    /// end of the filter or rename field.
     pub(crate) fn input_target(&self) -> InputTarget {
         if self.sidebar_filter_is_focused() {
             InputTarget::SidebarFilter
@@ -452,15 +453,29 @@ mod tests {
 
     /// Selects `😀` (byte 1..5, UTF-16 1..3) with the caret after it.
     fn select_emoji_forward(cx: &mut TestCx) {
-        cx.simulate_keystrokes("home right shift-right");
+        cx.simulate_keystrokes(&format!("{LINE_START_KEY} right shift-right"));
         cx.run_until_parked();
     }
 
     /// Selects `😀` with the caret before it (a reversed selection).
     fn select_emoji_reversed(cx: &mut TestCx) {
-        cx.simulate_keystrokes("home right right shift-left");
+        cx.simulate_keystrokes(&format!("{LINE_START_KEY} right right shift-left"));
         cx.run_until_parked();
     }
+
+    /// The platform's move-to-line-start / select-to-line-end keys. macOS
+    /// Home/End scroll the body instead (Issue #494), so line edges use
+    /// Command+Left/Right there.
+    const LINE_START_KEY: &str = if cfg!(target_os = "macos") {
+        "cmd-left"
+    } else {
+        "home"
+    };
+    const SELECT_LINE_END_KEY: &str = if cfg!(target_os = "macos") {
+        "cmd-shift-right"
+    } else {
+        "shift-end"
+    };
 
     // ----- R02 -----
 
@@ -872,7 +887,7 @@ mod tests {
         cx: &mut TestCx,
         surface: Surface,
     ) -> (String, Range<usize>) {
-        cx.simulate_keystrokes("home shift-end");
+        cx.simulate_keystrokes(&format!("{LINE_START_KEY} {SELECT_LINE_END_KEY}"));
         cx.run_until_parked();
         let text = surface_text(view, cx, surface);
         let selection = surface_selection(view, cx, surface);

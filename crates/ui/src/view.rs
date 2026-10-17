@@ -93,8 +93,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 mod ai_prompts;
 mod ai_selection;
+mod app_update;
+pub use app_update::{
+    AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, ExternalOpenOutcome,
+    ExternalOpenQueue, RestartBlocker, RestartObservation, RestartPreparation,
+};
 mod ai_settings;
 mod background_parse;
+mod basic_editing_keys;
 mod content_search;
 mod document_find;
 mod inline_rename;
@@ -189,6 +195,8 @@ const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
 /// sums accumulate f32 rounding error; anything below half a device-independent
 /// pixel is not a visible clip and must not keep a pending scroll request alive.
 const CARET_VISIBILITY_TOLERANCE: f32 = 0.5;
+/// Frames a centre-the-caret request may spend correcting its estimate.
+const CENTER_CARET_SETTLE_FRAMES: u8 = 8;
 /// Width of the sidebar's overlay scrollbar thumb while it is briefly shown
 /// during a scroll. Kept well under half of `SCROLLBAR_THUMB_WIDTH` (the
 /// editor's always-visible thumb) so the sidebar's idle right edge reads as
@@ -566,6 +574,21 @@ struct FileTabContextMenu {
     instance: DocumentInstance,
 }
 
+/// The row a sidebar context menu was opened for.
+#[derive(Clone, Debug)]
+enum SidebarContextTarget {
+    File(PathBuf),
+    Folder(PathBuf),
+    /// An unnamed note row; it has no path yet, so only Save As applies.
+    Draft(SessionId, DocumentInstance),
+}
+
+#[derive(Clone, Debug)]
+struct SidebarContextMenu {
+    position: gpui::Point<Pixels>,
+    target: SidebarContextTarget,
+}
+
 /// A pending "close this tab" request whose session has unsaved changes, so
 /// the user is asked whether to save before it closes rather than losing the
 /// edits silently.
@@ -742,6 +765,21 @@ pub struct EditorView {
     ai_settings: ai_settings::AiSettingsPage,
     ai_prompts: ai_prompts::AiPromptsPage,
     ai_selection: ai_selection::AiSelectionState,
+    /// The app-owned update service handle, if one is attached. The service
+    /// outlives this view; the view only sends explicit user commands to it.
+    app_update: Option<Arc<dyn AppUpdateController>>,
+    /// A card refresh loop is running while the update service is busy.
+    app_update_polling: bool,
+    /// Held only for the synchronous restart check; while set, the shared
+    /// external-open entrance answers `Busy`.
+    restart_freeze: bool,
+    /// Counts paths accepted through the shared external-open entrance, so a
+    /// restart observation can tell an open arrived after it was taken.
+    external_open_generation: u64,
+    /// Save As dialogs currently open (they outlive any single UI turn).
+    save_as_dialogs_open: usize,
+    /// The AI service handle the restart check reads busy state from.
+    restart_ai_service: Option<hane_ai::AiServiceHandle>,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -813,6 +851,9 @@ pub struct EditorView {
     /// every render instead of being snapshotted, so a rename that lands
     /// while the menu is open is reflected rather than shown stale.
     file_tab_context_menu: Option<FileTabContextMenu>,
+    /// The sidebar row context menu, if open. It names the row that was
+    /// right-clicked, never the active session or the sidebar selection.
+    sidebar_context_menu: Option<SidebarContextMenu>,
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
@@ -995,6 +1036,28 @@ pub struct EditorView {
     /// changes a row height (for example, an inactive zero-height code fence
     /// becoming editable).
     pending_caret_visibility_after_layout: bool,
+    /// Frames left to settle a "center the caret row" request on the caret's
+    /// freshly measured row. The immediate scroll can only use the partial
+    /// layout estimate; this corrects it once the row is drawn. Cleared by any
+    /// other scroll-only operation, input, document switch and wheel inertia.
+    pending_center_caret_frames: u8,
+    /// Physical document line a "center the caret row" request pinned the
+    /// presentation window to. The window of the block holding it is chosen
+    /// around this line instead of being inverted from `scroll_y` and an
+    /// average row height, so the target row is always drawn and the next
+    /// frames present the same rows. It outlives the settle counter, and is
+    /// dropped only by [`EditorView::cancel_center_caret`] (input, any other
+    /// scroll or zoom, document switch).
+    center_window_line: Option<usize>,
+    /// The pinned line and `scroll_y` handed over by a manual wheel scroll
+    /// that took the viewport from a "center the caret row" request. Dropping
+    /// the pin at once would present the block through the inverted viewport
+    /// window, whose partial layout measures a very different (much shorter)
+    /// block height, so the content height would shrink and clamp the position
+    /// the user just chose. The same window is kept while `scroll_y` stays
+    /// within the overscan of that position; [`EditorView::cancel_center_caret`]
+    /// clears it.
+    retained_center_window: Option<(usize, f32)>,
     /// Set after document-find navigation moves the current match. Mirrors
     /// `pending_caret_visibility_after_layout`: forcing a hidden match's
     /// block open can change its row height only on the next render, so this
@@ -1579,6 +1642,12 @@ impl EditorView {
             ai_settings: ai_settings::AiSettingsPage::default(),
             ai_prompts: ai_prompts::AiPromptsPage::default(),
             ai_selection: ai_selection::AiSelectionState::default(),
+            app_update: None,
+            app_update_polling: false,
+            restart_freeze: false,
+            external_open_generation: 0,
+            save_as_dialogs_open: 0,
+            restart_ai_service: None,
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
@@ -1603,6 +1672,7 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             file_tabs_scroll: ScrollHandle::new(),
             file_tab_context_menu: None,
+            sidebar_context_menu: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
             footer_scroll: ScrollHandle::new(),
@@ -1654,6 +1724,9 @@ impl EditorView {
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
+            pending_center_caret_frames: 0,
+            center_window_line: None,
+            retained_center_window: None,
             pending_find_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
@@ -2083,6 +2156,7 @@ impl EditorView {
             workspace: self.work_folder_generation,
         };
         let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
+        self.save_as_dialogs_open += 1;
         cx.spawn(async move |view, cx| {
             // Collapsed to one small response type before the single entry
             // gate in `handle_save_as_for_close_response` runs, so every
@@ -2098,6 +2172,9 @@ impl EditorView {
                 Err(_) => SaveAsForCloseResponse::Canceled,
             };
             let _ = view.update(cx, |view, cx| {
+                // Released before the instance gate: the dialog is over even
+                // when its answer no longer belongs to any open document.
+                view.save_as_dialogs_open = view.save_as_dialogs_open.saturating_sub(1);
                 view.handle_save_as_for_close_response(id, instance, response, cx);
             });
         })
@@ -2221,6 +2298,7 @@ impl EditorView {
         let Some(instance) = self.document_instance(id) else {
             return;
         };
+        self.sidebar_context_menu = None;
         self.file_tab_context_menu = Some(FileTabContextMenu {
             position,
             id,
@@ -2333,6 +2411,23 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Save As for the tab whose menu was opened, not the active tab. The
+    /// instance the menu captured must still be current: a tab that was
+    /// replaced or reused since the menu opened must not get a dialog (and
+    /// so a write) it never asked for.
+    fn save_file_tab_as(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tab_context_menu = None;
+        if self.document_instance(id) == Some(instance) {
+            self.prompt_save_as_for(id, cx);
+        }
+        cx.notify();
+    }
+
     fn copy_file_tab_full_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         self.file_tab_context_menu = None;
         let Some(path) = path else {
@@ -2404,6 +2499,7 @@ impl EditorView {
         self.layout_cache.clear();
         self.caret_geometry = None;
         self.pending_caret_visibility_after_layout = false;
+        self.cancel_center_caret();
         self.block_index = BlockIndexState::new();
         self.last_background_height_disclosure = None;
         self.last_applied_height_disclosure = None;
@@ -2478,6 +2574,7 @@ impl EditorView {
         // the next render. Re-check once after that layout is installed so
         // the caret and its input-mode badge use current geometry.
         self.pending_caret_visibility_after_layout = true;
+        self.cancel_center_caret();
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
@@ -2860,6 +2957,7 @@ impl EditorView {
         // comparisons elsewhere are what keep that dialog's eventual answer
         // from acting on the replacement document.
         self.file_tab_context_menu = None;
+        self.sidebar_context_menu = None;
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
         // Any background read still in flight for the old folder (or for
@@ -3076,6 +3174,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.ai_selection.attach(service.clone());
+        self.restart_ai_service = service.clone();
         self.ai_settings.attach(service, cx);
     }
 
@@ -3120,6 +3219,9 @@ impl EditorView {
             });
         })
         .detach();
+        // Local re-validation of an already prepared update only; this never
+        // communicates, and a check or download still needs a button press.
+        self.restore_app_update_local(cx);
         window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
@@ -3433,6 +3535,7 @@ impl EditorView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("一般"),
             )
+            .children(self.app_update_card(cx))
             .child(
                 div()
                     .pt(px(16.0))
@@ -3852,21 +3955,50 @@ impl EditorView {
         extend: bool,
         shaper: &dyn LineShaper,
     ) -> bool {
+        self.step_vertical_by_layout(down, extend, shaper).is_some()
+    }
+
+    /// [`Self::move_vertical_by_layout`], also answering how far the caret row
+    /// moved in content-space pixels (`Some(0.0)` when it stayed put).
+    ///
+    /// The distance is measured inside layouts that share one origin: within
+    /// the caret's block, and for a block change from the shared edge into each
+    /// block. Absolute Ys of different partial layouts are never subtracted,
+    /// because each omits a different number of leading lines.
+    fn step_vertical_by_layout(
+        &mut self,
+        down: bool,
+        extend: bool,
+        shaper: &dyn LineShaper,
+    ) -> Option<f32> {
         let caret = self.editor().selection().active;
-        let Some((block, layout)) = self.layout_around(caret, shaper) else {
-            return false;
-        };
-        let Some(x) = self.editor().preferred_visual_x().or_else(|| {
-            layout
-                .point_for_source(&block, caret, shaper)
-                .map(|point| point.x)
-        }) else {
-            return false;
-        };
-        let target = match layout.vertical_target(&block, caret, down, x, shaper) {
-            VerticalMove::To(offset) => Some(offset),
-            VerticalMove::PastEdge => self.neighbor_row_target(&block, down, x, shaper),
-            VerticalMove::Unknown => return false,
+        let (block, layout) = self.layout_around(caret, shaper)?;
+        let from = layout.point_for_source(&block, caret, shaper);
+        let x = self
+            .editor()
+            .preferred_visual_x()
+            .or_else(|| from.map(|point| point.x))?;
+        let (target, distance) = match layout.vertical_target(&block, caret, down, x, shaper) {
+            VerticalMove::To(offset) => {
+                let distance = from
+                    .zip(layout.point_for_source(&block, offset, shaper))
+                    .map(|(from, to)| (to.y - from.y).abs());
+                (Some(offset), distance)
+            }
+            VerticalMove::PastEdge => match self.neighbor_row_target(&block, down, x, shaper) {
+                Some((offset, from_edge)) => {
+                    let to_edge = from.map(|from| {
+                        if down {
+                            layout.height() - from.y
+                        } else {
+                            from.y
+                        }
+                    });
+                    (Some(offset), to_edge.map(|to_edge| to_edge + from_edge))
+                }
+                None => (None, Some(0.0)),
+            },
+            VerticalMove::Unknown => return None,
         };
         // No neighbor means the caret is on the first or last row of the
         // document: staying put is the move.
@@ -3875,7 +4007,150 @@ impl EditorView {
         {
             self.report_error("vertical move", error);
         }
-        true
+        // An unmeasurable step counts as one line so a page still terminates.
+        Some(distance.unwrap_or_else(|| self.line_height()))
+    }
+
+    /// Moves the caret about one viewport up or down (Issue #494).
+    ///
+    /// Repeats the layout-driven row move — so wrapping, heading/table row
+    /// heights, hidden table delimiters and the remembered x all behave as for
+    /// the arrow keys — until the caret row has travelled a page, with one row
+    /// of overlap, or the document edge stops it. The loop is bounded by the
+    /// rows of one page; it never touches rows beyond them and runs
+    /// `after_input` once, at the end.
+    pub(crate) fn move_page(
+        &mut self,
+        down: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        /// Safety stop for a page made of pathologically short rows.
+        const MAX_PAGE_ROWS: usize = 4_096;
+        let shaper = WindowShaper::new(window, self.zoom);
+        let page = (self.viewport_height - self.line_height()).max(self.line_height());
+        // Distance is accumulated from each adjacent-row step: absolute Ys of
+        // separate partial layouts do not share an origin.
+        let mut travelled = 0.0_f32;
+        let mut moved = false;
+        for _ in 0..MAX_PAGE_ROWS {
+            let before = self.editor().selection().active;
+            let Some(step) = self.step_vertical_by_layout(down, extend, &shaper) else {
+                if !moved {
+                    // No layout to resolve against yet (first frames): the
+                    // source-line move stands in, as for the arrow keys.
+                    let command = if down {
+                        EditorCommand::MoveDown { extend }
+                    } else {
+                        EditorCommand::MoveUp { extend }
+                    };
+                    self.dispatch(command, cx);
+                    return;
+                }
+                break;
+            };
+            let after = self.editor().selection().active;
+            if after == before {
+                break;
+            }
+            moved = true;
+            travelled += step;
+            if travelled >= page {
+                break;
+            }
+        }
+        // A plain page move never leaves a selection behind, also when the
+        // document edge left nowhere to go: the next input must not replace it.
+        let selection = self.editor().selection();
+        if !extend && selection.anchor != selection.active {
+            let caret = Selection::caret(selection.active);
+            if let Err(error) = self.editor_mut().set_selection(caret) {
+                self.report_error("page move", error);
+            }
+        }
+        self.after_input(cx);
+    }
+
+    /// Ends a scroll-only operation (macOS Home/End/PageUp/PageDown and
+    /// Control+L). The caret, selection and undo history are untouched, so
+    /// nothing may pull the viewport back to the caret afterwards: the pending
+    /// post-layout caret reveal and any wheel coast are dropped.
+    fn finish_scroll_only(&mut self, scroll_y: f32, cx: &mut Context<Self>) {
+        // A centred caret row keeps its block window as a retained pin, the way
+        // a wheel scroll does, so the partial layout does not shrink under the
+        // chosen position and clamp it on the next pass.
+        let pinned = self
+            .center_window_line
+            .map(|line| (line, self.scroll_y))
+            .or(self.retained_center_window);
+        self.scroll_y = clamp_scroll_y(
+            scroll_y,
+            self.scrollable_content_height(),
+            self.viewport_height,
+        );
+        self.scroll_inertia = None;
+        // The explicit scroll owns the position. A reveal or zoom anchor armed
+        // earlier would otherwise overwrite it on the next layout pass.
+        self.pending_caret_visibility_after_layout = false;
+        self.pending_find_visibility_after_layout = false;
+        self.pending_zoom_anchor = None;
+        self.cancel_center_caret();
+        self.retained_center_window = pinned;
+        cx.notify();
+    }
+
+    /// Drops a pending "center the caret row" request and its pinned window.
+    /// Every later user-driven scroll or zoom (wheel, scrollbar drag, pinch),
+    /// input and document switch calls this, so an old centering never
+    /// overwrites a newer position.
+    pub(super) fn cancel_center_caret(&mut self) {
+        self.pending_center_caret_frames = 0;
+        self.center_window_line = None;
+        self.retained_center_window = None;
+    }
+
+    /// Scrolls to the top or bottom of the document without moving the caret.
+    pub(crate) fn scroll_to_document_edge(&mut self, end: bool, cx: &mut Context<Self>) {
+        let target = if end {
+            self.scrollable_content_height()
+        } else {
+            0.0
+        };
+        self.finish_scroll_only(target, cx);
+    }
+
+    /// Scrolls one viewport (with one row of overlap) without moving the caret.
+    pub(crate) fn scroll_page(&mut self, down: bool, cx: &mut Context<Self>) {
+        let page = (self.viewport_height - self.line_height()).max(self.line_height());
+        let delta = if down { page } else { -page };
+        self.finish_scroll_only(self.scroll_y + delta, cx);
+    }
+
+    /// Scrolls so the caret's row sits in the vertical middle of the viewport,
+    /// clamped to the document's scroll range. Caret and selection unchanged.
+    pub(crate) fn center_cursor_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shaper = WindowShaper::new(window, self.zoom);
+        let Some((top, height)) = self.resolved_row_bounds(self.editor().selection().active, &shaper)
+        else {
+            return;
+        };
+        let target = top + height / 2.0 - self.viewport_height / 2.0;
+        self.finish_scroll_only(target, cx);
+        // A new request supersedes any pin carried over from an earlier one.
+        self.retained_center_window = None;
+        // `top` comes from a partial layout whose omitted leading lines are
+        // counted as single rows, so the row may not be centred once drawn.
+        // Pin the caret line's block window around it so that row is drawn,
+        // and keeps being drawn the same way, while the next frames re-centre
+        // on its measured position.
+        self.center_window_line = self
+            .editor()
+            .document()
+            .line_for_offset(self.editor().selection().active)
+            .ok()
+            .map(|line| line.0);
+        self.pending_center_caret_frames = CENTER_CARET_SETTLE_FRAMES;
     }
 
     /// The block holding `offset`, laid out, with the line above and below it so
@@ -3988,7 +4263,7 @@ impl EditorView {
         down: bool,
         x: f32,
         shaper: &dyn LineShaper,
-    ) -> Option<SourceOffset> {
+    ) -> Option<(SourceOffset, f32)> {
         let (indexed, window) =
             neighbor_block_window(self.editor(), self.current_index(), block, down)?;
         let revision = self.editor().document().revision();
@@ -4052,10 +4327,66 @@ impl EditorView {
     /// at most a few extra pixels of margin — and keeps this one shared path
     /// instead of a second one with its own rounding.
     fn scroll_source_offset_into_view(&mut self, offset: SourceOffset) {
-        let editor = self.sessions.active().editor();
-        let Ok(line) = editor.document().line_for_offset(offset) else {
+        let Some((top, height)) = self.source_offset_row_bounds(offset) else {
             return;
         };
+        self.scroll_y = scroll_y_for_cursor(
+            self.scroll_y,
+            top,
+            height + CARET_MODE_BADGE_HEIGHT,
+            self.viewport_height,
+        );
+    }
+
+    /// Content-space `(top, height)` of the row holding `offset` from the real
+    /// layout: the cached one when current, otherwise one resolved now with
+    /// `layout_around` (a temporary value, not stored). Wrapped paragraphs whose
+    /// layout was evicted therefore still give the true wrapped row, which the
+    /// physical-line estimate of `source_offset_row_bounds` cannot. Falls back to
+    /// that estimate only when no layout can be resolved.
+    fn resolved_row_bounds(
+        &self,
+        offset: SourceOffset,
+        shaper: &dyn LineShaper,
+    ) -> Option<(f32, f32)> {
+        self.layout_row_bounds(offset, shaper)
+            .or_else(|| self.source_offset_row_bounds(offset))
+    }
+
+    fn layout_row_bounds(
+        &self,
+        offset: SourceOffset,
+        shaper: &dyn LineShaper,
+    ) -> Option<(f32, f32)> {
+        let (_, layout) = self.layout_around(offset, shaper)?;
+        match self.granularity {
+            Granularity::Lines => {
+                let line = self.editor().document().line_for_offset(offset).ok()?;
+                let line_top = self.heights.prefix_sum(line.0);
+                let row = layout.lines.get(layout.row_for_source(offset)?)?;
+                let line_row_top = layout
+                    .lines
+                    .iter()
+                    .find(|candidate| candidate.line == row.line)
+                    .map(|candidate| candidate.y)?;
+                Some((line_top + row.y - line_row_top, row.height))
+            }
+            Granularity::Blocks => {
+                let block = self.current_index()?.block_at(offset)?;
+                let block_top = self.heights.prefix_sum(block.ordinal);
+                let (y, height) = layout.row_bounds_for_source(offset)?;
+                Some((block_top + y, height))
+            }
+        }
+    }
+
+    /// Content-space `(top, height)` of the row holding `offset`, from the
+    /// drawn layout when it is current and from the physical line otherwise.
+    /// Shared by caret-follow; page moves and centering use
+    /// `resolved_row_bounds`.
+    fn source_offset_row_bounds(&self, offset: SourceOffset) -> Option<(f32, f32)> {
+        let editor = self.sessions.active().editor();
+        let line = editor.document().line_for_offset(offset).ok()?;
         let (top, height) = match self.granularity {
             Granularity::Lines => {
                 let line_top = self.heights.prefix_sum(line.0);
@@ -4089,12 +4420,9 @@ impl EditorView {
                 visual_row.unwrap_or((line_top, self.line_height()))
             }
             Granularity::Blocks => {
-                let Some(block) = self
+                let block = self
                     .current_index()
-                    .and_then(|index| index.block_at(offset))
-                else {
-                    return;
-                };
+                    .and_then(|index| index.block_at(offset))?;
                 let block_top = self.heights.prefix_sum(block.ordinal);
                 let row = self
                     .layout_cache
@@ -4119,12 +4447,7 @@ impl EditorView {
                 }
             }
         };
-        self.scroll_y = scroll_y_for_cursor(
-            self.scroll_y,
-            top,
-            height + CARET_MODE_BADGE_HEIGHT,
-            self.viewport_height,
-        );
+        Some((top, height))
     }
 
     /// The window-local `(x, top, height)` the caret (`offset ==
@@ -5018,6 +5341,77 @@ impl EditorView {
         }
     }
 
+    /// The lines of `block` to present. Normally the viewport window; the block
+    /// holding a pinned "center the caret row" line instead presents a bounded
+    /// run around that line.
+    ///
+    /// The viewport window is inverted from `scroll_y` through the average
+    /// drawn row height, while a partial layout stands in for its clipped
+    /// lines at one row each. For a block whose lines wrap into many rows the
+    /// two disagree, and the inverted window can miss the line that was just
+    /// centred. Choosing the window around the line itself keeps the layout
+    /// the centring was measured on, so the row stays drawn and in place. The
+    /// run is sized to fill half a viewport plus overscan on either side even
+    /// if every line took a single row; nothing between the run and the
+    /// previous window is shaped.
+    fn render_window_for(&self, block: &IndexedBlock, lines: &Range<usize>) -> Range<usize> {
+        let retained = self
+            .retained_center_window
+            .filter(|(_, anchor)| (self.scroll_y - anchor).abs() <= self.theme.overscan)
+            .map(|(line, _)| line);
+        let Some(line) = self.center_window_line.or(retained) else {
+            return lines.clone();
+        };
+        if self.granularity != Granularity::Blocks {
+            return lines.clone();
+        }
+        let Some(span) = block_line_span(self.editor().document(), block) else {
+            return lines.clone();
+        };
+        if !span.contains(&line) {
+            return lines.clone();
+        }
+        let reach = ((self.viewport_height / 2.0 + self.theme.overscan) / self.line_height().max(1.0))
+            .ceil() as usize
+            + 2;
+        let start = line.saturating_sub(reach).max(span.start);
+        let end = line.saturating_add(reach + 1).min(span.end);
+        start..end.max(start + 1)
+    }
+
+    /// Moves the retained pin along with a manual scroll. Once `scroll_y` has
+    /// travelled half an overscan from where the pin was recorded, the pinned
+    /// line is advanced by the distance travelled (through the block's drawn
+    /// line height) and the anchor is reset to the current position. The block
+    /// is then still presented through a window around the position the user
+    /// chose, so its measured height stays consistent however far the manual
+    /// scroll goes, instead of the pin lapsing at the overscan edge and the
+    /// partial layout shrinking under the position.
+    fn follow_retained_center_window(&mut self, blocks: &[IndexedBlock]) {
+        let Some((line, anchor)) = self.retained_center_window else {
+            return;
+        };
+        if self.center_window_line.is_some() || self.granularity != Granularity::Blocks {
+            return;
+        }
+        let delta = self.scroll_y - anchor;
+        if delta.abs() <= self.theme.overscan / 2.0 {
+            return;
+        }
+        let document = self.sessions.active().editor().document();
+        let found = blocks.iter().find_map(|block| {
+            let span = block_line_span(document, block)?;
+            span.contains(&line).then_some((block, span))
+        });
+        let Some((block, span)) = found else {
+            return;
+        };
+        let moved = (delta / self.drawn_line_height(block)).round() as i64;
+        let next = (line as i64 + moved).clamp(span.start as i64, span.end.saturating_sub(1) as i64)
+            as usize;
+        self.retained_center_window = Some((next, self.scroll_y));
+    }
+
     /// How tall one line of a block draws, on average. A wrapped line occupies
     /// several rows, so the plain line height under-counts it; the block's own
     /// layout says by how much once it has been drawn once.
@@ -5252,7 +5646,7 @@ fn target_in_neighbor(
     list_projection: Option<&ListProjection>,
     table_projection: Option<&TableProjection>,
     line_height: f32,
-) -> Option<SourceOffset> {
+) -> Option<(SourceOffset, f32)> {
     let visual = presented_block_with_table_projection(
         editor,
         indexed,
@@ -5272,7 +5666,17 @@ fn target_in_neighbor(
     } else {
         layout.lines.len().checked_sub(1)?
     };
-    layout.source_at_x(&visual, row, x, shaper)
+    let target = layout.source_at_x(&visual, row, x, shaper)?;
+    // Distance from the edge shared with the block the caret leaves to the
+    // target row, measured inside this one layout so a partial window's
+    // omitted-line offset cancels out.
+    let target_y = layout.point_for_source(&visual, target, shaper)?.y;
+    let from_edge = if down {
+        target_y
+    } else {
+        layout.height() - target_y
+    };
+    Some((target, from_edge))
 }
 
 /// The caret target one row into the next or previous block, aiming at `x`.
@@ -5312,6 +5716,7 @@ fn neighbor_row_target(
         None,
         DEFAULT_LINE_HEIGHT,
     )
+    .map(|(target, _)| target)
 }
 
 /// The block holding one source offset: the formal index while it describes the
@@ -5727,6 +6132,7 @@ impl EditorView {
         // away from that value. Clearing it explicitly here stops the coast
         // from fighting the drag once it does resume (issue #389).
         self.scroll_inertia = None;
+        self.cancel_center_caret();
         cx.stop_propagation();
         cx.notify();
     }
@@ -6263,9 +6669,11 @@ impl Render for EditorView {
             .retain(|id, _| retained.contains(id));
 
         let lines = self.visible_line_window(&blocks, &visible);
+        self.follow_retained_center_window(&blocks);
         let mut rendered = Vec::with_capacity(blocks.len());
         for block in &blocks {
-            if let Some((visual, reused)) = self.cached_block(block, &lines) {
+            let window = self.render_window_for(block, &lines);
+            if let Some((visual, reused)) = self.cached_block(block, &window) {
                 let layout = self.block_layout(&visual, reused, &shaper);
                 rendered.push((block.ordinal, visual, layout));
             }
@@ -6386,6 +6794,44 @@ impl Render for EditorView {
                 // The fresh disclosed row has not been laid out yet. Keep the
                 // request alive for the next frame instead of consuming it
                 // against stale zero-height geometry.
+                cx.notify();
+            }
+        }
+        if self.pending_center_caret_frames > 0 {
+            // Re-centre on the drawn row. A row that was not laid out this
+            // frame keeps the request alive for a bounded number of frames.
+            self.pending_center_caret_frames -= 1;
+            if self.scroll_inertia.is_some() {
+                self.cancel_center_caret();
+            } else if let Some((_, top, height)) = fresh_caret
+                && height > 0.0
+            {
+                let desired = clamp_scroll_y(
+                    top + height / 2.0 - self.viewport_height / 2.0,
+                    self.scrollable_content_height(),
+                    self.viewport_height,
+                );
+                if (desired - self.scroll_y).abs() > CARET_VISIBILITY_TOLERANCE {
+                    self.scroll_y = desired;
+                    cx.notify();
+                } else {
+                    self.pending_center_caret_frames = 0;
+                }
+            } else {
+                // The caret row is not in this frame's drawn blocks (the first
+                // scroll target came from estimated heights). Aim at the
+                // height index's current answer so the next frame draws the
+                // block holding it; the pinned window then draws the row.
+                if let Some((top, height)) = self.source_offset_row_bounds(caret) {
+                    let desired = clamp_scroll_y(
+                        top + height / 2.0 - self.viewport_height / 2.0,
+                        self.scrollable_content_height(),
+                        self.viewport_height,
+                    );
+                    if (desired - self.scroll_y).abs() > CARET_VISIBILITY_TOLERANCE {
+                        self.scroll_y = desired;
+                    }
+                }
                 cx.notify();
             }
         }
@@ -6619,6 +7065,16 @@ impl Render for EditorView {
         } else {
             rendered
         };
+        let rendered = if let Some(menu) = self.sidebar_context_menu.as_ref() {
+            rendered.child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window()
+                    .child(self.sidebar_context_menu_element(menu, cx)),
+            )
+        } else {
+            rendered
+        };
         let rendered = if let Some(confirm) = self.tab_close_confirm.as_ref() {
             rendered.child(self.tab_close_confirm_element(confirm, cx))
         } else {
@@ -6717,6 +7173,15 @@ impl EditorView {
             move |view, _, _, cx| view.copy_file_tab_full_path(copy_path.clone(), cx),
         );
 
+        let (save_as_id, save_as_instance) = (menu.id, menu.instance);
+        let save_as_item = self.file_tab_context_menu_item(
+            "file-tab-context-save-as",
+            "名前を付けて保存…",
+            true,
+            cx,
+            move |view, _, _, cx| view.save_file_tab_as(save_as_id, save_as_instance, cx),
+        );
+
         let menu_element = div()
             .id("file-tab-context-menu")
             .debug_selector(|| "file-tab-context-menu".to_owned())
@@ -6741,7 +7206,7 @@ impl EditorView {
             .child(vscode_item);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let menu_element = menu_element.child(reveal_item);
-        menu_element.child(copy_item)
+        menu_element.child(copy_item).child(save_as_item)
     }
 
     fn tab_close_confirm_element(
@@ -7015,6 +7480,27 @@ impl EditorView {
         } else {
             None
         };
+        // The macOS entry to the selection AI (Control+L now centers the caret
+        // line, Issue #494) and a second entry on Windows next to Alt+I. It
+        // calls the same `open_ai_selection` the key does, so the body
+        // selection is read, not changed, and an open popup disables it.
+        let ai_button = {
+            let view = cx.entity();
+            div()
+                .debug_selector(|| "footer-ai-selection".to_owned())
+                .flex_none()
+                .child(
+                    Button::new("footer-ai-selection-button")
+                        .label("AIに指示")
+                        .xsmall()
+                        .ghost()
+                        .tooltip("選択した文章に指示する")
+                        .disabled(self.ai_selection_blocks_editor_keys())
+                        .on_click(move |_, window, app| {
+                            view.update(app, |view, cx| view.open_ai_selection(window, cx));
+                        }),
+                )
+        };
         let controls = div()
             .h_full()
             .flex_none()
@@ -7024,6 +7510,7 @@ impl EditorView {
             .px_3()
             .text_size(px(11.0))
             .children(settings_button)
+            .child(ai_button)
             .child(
                 div()
                     .id("footer-autosave")
@@ -12917,6 +13404,86 @@ mod tests {
             assert_eq!(menu_target_path, Some(expected_clicked_path.as_path()));
         });
         assert!(cx.debug_bounds("file-tab-context-menu").is_some());
+        assert!(
+            cx.debug_bounds("file-tab-context-save-as").is_some(),
+            "the tab menu must expose Save As for the clicked tab"
+        );
+    }
+
+    #[gpui::test]
+    fn file_tab_save_as_ignores_a_menu_whose_document_instance_is_stale(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let stale = view.document_instance(id).expect("open session");
+            let stale = DocumentInstance {
+                generation: stale.generation + 1,
+                ..stale
+            };
+            view.open_file_tab_context_menu(id, gpui::Point::default(), cx);
+            view.save_file_tab_as(id, stale, cx);
+            assert!(view.file_tab_context_menu.is_none());
+            assert_eq!(view.status, None);
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_response_for_a_background_tab_saves_that_tab_only(cx: &mut gpui::TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-tab-save-as-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("Saved.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("first\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("second\n"),
+                    identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let background = SessionId(1);
+            let instance = view.document_instance(background);
+            view.handle_save_as_response(
+                background,
+                instance,
+                SaveAsResponse::Chosen(target.clone()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second\n");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), SessionId(0));
+            assert_eq!(
+                view.sessions.get(SessionId(1)).and_then(DocumentSession::path),
+                Some(target.as_path())
+            );
+            assert_eq!(
+                view.sessions.get(SessionId(0)).and_then(DocumentSession::path),
+                Some(Path::new("first.md"))
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
@@ -18198,16 +18765,17 @@ mod tests {
     /// column geometry, read from the same `BlockLayout` the renderer paints
     /// from (see `table_row_element`'s `first.x`/`last.x + last.width`),
     /// plus the row's own painted height.
-    fn header_row_grid_span(
+    fn table_row_grid_span(
         view: &gpui::Entity<EditorView>,
         cx: &mut gpui::VisualTestContext,
+        line_id: usize,
     ) -> (f32, f32, f32, f32) {
         cx.update(|_, app| {
             view.read_with(app, |editor_view, _| {
                 let (block_id, visual_line) = *editor_view
                     .line_owners
-                    .get(&0)
-                    .expect("header line owner recorded");
+                    .get(&line_id)
+                    .expect("table line owner recorded");
                 let layout = &editor_view
                     .layout_cache
                     .get(&block_id)
@@ -18217,9 +18785,9 @@ mod tests {
                     .lines
                     .iter()
                     .find(|row| row.line == visual_line)
-                    .expect("header row layout exists");
-                let first = row.table_cells.first().expect("header row has cells");
-                let last = row.table_cells.last().expect("header row has cells");
+                    .expect("table row layout exists");
+                let first = row.table_cells.first().expect("table row has cells");
+                let last = row.table_cells.last().expect("table row has cells");
                 (
                     editor_view.theme.line_horizontal_padding,
                     first.x,
@@ -18279,7 +18847,7 @@ mod tests {
         let background_bounds = cx
             .debug_bounds("table-header-background-0")
             .expect("header background painted");
-        let (padding, first_x, last_right, row_height) = header_row_grid_span(&view, cx);
+        let (padding, first_x, last_right, row_height) = table_row_grid_span(&view, cx, 0);
 
         let expected_left = f32::from(row_bounds.origin.x) + padding + first_x;
         let expected_right = f32::from(row_bounds.origin.x) + padding + last_right;
@@ -18300,6 +18868,95 @@ mod tests {
             (f32::from(background_bounds.size.height) - row_height).abs() < 0.5,
             "header background must span the row's full (possibly wrapped) height: \
              background={background_bounds:?} row_height={row_height}"
+        );
+
+        // Issue #513: the horizontal rule and the closing right border used
+        // to follow the body width, so a table narrower than the body drew
+        // them past its last column. Both must close at the same grid edges
+        // as the header tint, at the row's full (possibly wrapped) height.
+        let rule_bounds = cx
+            .debug_bounds("table-bottom-rule-0")
+            .expect("bottom rule painted");
+        let rule_left = f32::from(rule_bounds.origin.x);
+        let rule_right = rule_left + f32::from(rule_bounds.size.width);
+        assert!(
+            (rule_left - expected_left).abs() < 0.5,
+            "bottom rule must start at the first column's left border: \
+             rule={rule_bounds:?} expected_left={expected_left}"
+        );
+        assert!(
+            (rule_right - expected_right).abs() < 0.5,
+            "bottom rule must end at the last column's right border, not the \
+             body width: rule={rule_bounds:?} expected_right={expected_right}"
+        );
+        let expected_bottom = f32::from(background_bounds.origin.y) + row_height;
+        assert!(
+            (f32::from(rule_bounds.origin.y) + f32::from(rule_bounds.size.height)
+                - expected_bottom)
+                .abs()
+                < 0.5,
+            "bottom rule must sit on the row's bottom edge: \
+             rule={rule_bounds:?} expected_bottom={expected_bottom}"
+        );
+
+        let border_bounds = cx
+            .debug_bounds("table-right-border-0")
+            .expect("right border painted");
+        let border_right = f32::from(border_bounds.origin.x) + f32::from(border_bounds.size.width);
+        assert!(
+            (border_right - expected_right).abs() < 0.5,
+            "right border must close the grid at the last column's right edge: \
+             border={border_bounds:?} expected_right={expected_right}"
+        );
+        assert!(
+            (f32::from(border_bounds.origin.y) - f32::from(background_bounds.origin.y)).abs()
+                < 0.5
+                && (f32::from(border_bounds.size.height) - row_height).abs() < 0.5,
+            "right border must cover the row's full (possibly wrapped) height: \
+             border={border_bounds:?} row_height={row_height}"
+        );
+
+        // Issue #513: the table body background used to paint the whole
+        // `w_full()` row, reaching the body's left/right margins. It must
+        // cover exactly the grid, at the first data row's own position and
+        // height (line 0 is the header, line 1 the delimiter).
+        let body_line = 2;
+        let body_row_bounds = cx
+            .debug_bounds("row-2-2")
+            .expect("first data row painted");
+        let body_bounds = cx
+            .debug_bounds("table-body-background-2")
+            .expect("table body background painted");
+        let (body_padding, body_first_x, body_last_right, body_row_height) =
+            table_row_grid_span(&view, cx, body_line);
+        let body_expected_left = f32::from(body_row_bounds.origin.x) + body_padding + body_first_x;
+        let body_expected_right =
+            f32::from(body_row_bounds.origin.x) + body_padding + body_last_right;
+        let body_left = f32::from(body_bounds.origin.x);
+        let body_right = body_left + f32::from(body_bounds.size.width);
+        assert!(
+            (body_left - body_expected_left).abs() < 0.5,
+            "table body background must start at the first column's left border: \
+             body={body_bounds:?} expected_left={body_expected_left}"
+        );
+        assert!(
+            (body_right - body_expected_right).abs() < 0.5,
+            "table body background must end at the last column's right border, \
+             not the body width: body={body_bounds:?} expected_right={body_expected_right}"
+        );
+        assert!(
+            (f32::from(body_bounds.origin.y) - f32::from(body_row_bounds.origin.y)).abs() < 0.5
+                && (f32::from(body_bounds.size.height) - body_row_height).abs() < 0.5,
+            "table body background must cover the data row's own y position and \
+             full (possibly wrapped) height: body={body_bounds:?} \
+             row={body_row_bounds:?} row_height={body_row_height}"
+        );
+        assert!(
+            body_bounds.origin.x > body_row_bounds.origin.x
+                && body_bounds.origin.x + body_bounds.size.width
+                    < body_row_bounds.origin.x + body_row_bounds.size.width,
+            "table body background must not reach the row's own margins: \
+             body={body_bounds:?} row={body_row_bounds:?}"
         );
 
         if resize.is_some() {
@@ -18335,6 +18992,10 @@ mod tests {
 
     #[gpui::test]
     fn table_header_background_stays_inside_the_grid(cx: &mut gpui::TestAppContext) {
+        // A single column, so the first and last cell are the same cell and
+        // the grid is much narrower than the body.
+        assert_table_header_background_matches_grid(cx, "| a |\n| --- |\n| c |", None);
+
         // Two columns, single-line cells: the minimal grid.
         assert_table_header_background_matches_grid(
             cx,
@@ -19501,19 +20162,27 @@ mod tests {
             Selection::caret(SourceOffset(3))
         );
 
-        cx.simulate_keystrokes("home");
+        // macOS Home/End scroll and Shift+Home/End select to the document
+        // edges (Issue #494); its line edges are Command+Left/Right.
+        let (line_start, line_end, select_line_start, select_line_end) =
+            if cfg!(target_os = "macos") {
+                ("cmd-left", "cmd-right", "cmd-shift-left", "cmd-shift-right")
+            } else {
+                ("home", "end", "shift-home", "shift-end")
+            };
+        cx.simulate_keystrokes(line_start);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection::caret(SourceOffset(0))
         );
 
-        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes(line_end);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection::caret(SourceOffset(6))
         );
 
-        cx.simulate_keystrokes("shift-home");
+        cx.simulate_keystrokes(select_line_start);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection {
@@ -19522,7 +20191,7 @@ mod tests {
             }
         );
 
-        cx.simulate_keystrokes("shift-end");
+        cx.simulate_keystrokes(select_line_end);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection::caret(SourceOffset(6))
@@ -20792,14 +21461,29 @@ mod tests {
         } else {
             "ctrl-shift-z"
         };
-        for keystroke in [
-            "secondary-up",
-            "secondary-down",
-            "secondary-shift-up",
-            "secondary-shift-down",
-            undo_key,
-            redo_key,
-        ] {
+        // 短い欄では Shift 付きの文書端キーが欄の端まで選択を伸ばす。
+        // 非 Shift の文書端移動と Undo/Redo は欄でも no-op のまま。
+        // anchor は元の caret 位置 (1) を保持する。
+        let [doc_start, doc_end, select_doc_start, select_doc_end] =
+            if cfg!(target_os = "macos") {
+                ["cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down"]
+            } else {
+                ["ctrl-home", "ctrl-end", "ctrl-shift-home", "ctrl-shift-end"]
+            };
+        let mut steps: Vec<(&str, std::ops::Range<usize>, bool)> = vec![
+            (doc_start, 1..1, false),
+            (doc_end, 1..1, false),
+            (select_doc_start, 0..1, true),
+            (select_doc_end, 1..3, false),
+            (undo_key, 1..3, false),
+            (redo_key, 1..3, false),
+        ];
+        if cfg!(target_os = "macos") {
+            // Mac の shift-home/end は従来どおり欄内選択で、本文へ漏れない。
+            steps.push(("shift-home", 0..1, true));
+            steps.push(("shift-end", 1..3, false));
+        }
+        for (keystroke, expected_range, expected_reversed) in steps {
             cx.simulate_keystrokes(keystroke);
             cx.run_until_parked();
             view.read_with(cx, |view, _| {
@@ -20822,7 +21506,14 @@ mod tests {
                     "{keystroke} must not consume redo history while the sidebar filter is focused"
                 );
                 assert_eq!(view.sidebar_filter.text(), "abc");
-                assert_eq!(view.sidebar_filter.selected_range(), 1..1);
+                assert_eq!(
+                    view.sidebar_filter.selected_range(), expected_range,
+                    "{keystroke} sidebar filter selection range"
+                );
+                assert_eq!(
+                    view.sidebar_filter.selection_reversed(), expected_reversed,
+                    "{keystroke} sidebar filter selection direction"
+                );
                 assert!(view.sidebar_filter_is_focused());
             });
         }
@@ -20887,14 +21578,29 @@ mod tests {
         } else {
             "ctrl-shift-z"
         };
-        for keystroke in [
-            "secondary-up",
-            "secondary-down",
-            "secondary-shift-up",
-            "secondary-shift-down",
-            undo_key,
-            redo_key,
-        ] {
+        // 短い欄では Shift 付きの文書端キーが欄の端まで選択を伸ばす。
+        // 非 Shift の文書端移動と Undo/Redo は欄でも no-op のまま。
+        // anchor は元の caret 位置 (3) を保持する。
+        let [doc_start, doc_end, select_doc_start, select_doc_end] =
+            if cfg!(target_os = "macos") {
+                ["cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down"]
+            } else {
+                ["ctrl-home", "ctrl-end", "ctrl-shift-home", "ctrl-shift-end"]
+            };
+        let mut steps: Vec<(&str, std::ops::Range<usize>, bool)> = vec![
+            (doc_start, 3..3, false),
+            (doc_end, 3..3, false),
+            (select_doc_start, 0..3, true),
+            (select_doc_end, 3..6, false),
+            (undo_key, 3..6, false),
+            (redo_key, 3..6, false),
+        ];
+        if cfg!(target_os = "macos") {
+            // Mac の shift-home/end は従来どおり欄内選択で、本文へ漏れない。
+            steps.push(("shift-home", 0..3, true));
+            steps.push(("shift-end", 3..6, false));
+        }
+        for (keystroke, expected_range, expected_reversed) in steps {
             cx.simulate_keystrokes(keystroke);
             cx.run_until_parked();
             view.read_with(cx, |view, _| {
@@ -20917,9 +21623,14 @@ mod tests {
                     "{keystroke} must not consume redo history while an inline rename is active"
                 );
                 assert_eq!(view.inline_rename.as_ref().unwrap().input.text(), "abcdef");
+                let rename = view.inline_rename.as_ref().unwrap();
                 assert_eq!(
-                    view.inline_rename.as_ref().unwrap().input.selected_range(),
-                    3..3
+                    rename.input.selected_range(), expected_range,
+                    "{keystroke} inline rename selection range"
+                );
+                assert_eq!(
+                    rename.input.selection_reversed(), expected_reversed,
+                    "{keystroke} inline rename selection direction"
                 );
                 assert!(view.inline_rename_active());
             });

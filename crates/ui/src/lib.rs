@@ -27,7 +27,10 @@ pub use actions::register_key_bindings;
 pub use icons::{AppAssets, WorkFolderIcons};
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
-pub use view::EditorView;
+pub use view::{
+    AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView, ExternalOpenOutcome,
+    ExternalOpenQueue, RestartBlocker, RestartObservation, RestartPreparation,
+};
 
 /// Tracks the settings component setup once per GPUI application.
 pub(crate) struct ComponentsInitialized;

@@ -11,10 +11,16 @@ use hane_ai::{
     ShellEnvironmentPolicyFormat, SystemBrowserOpener, resolve_runtime_binary,
 };
 use hane_session::{FileStateStore, StateStores};
-use hane_ui::{AppAssets, EditorView, register_key_bindings};
+use hane_ui::{AppAssets, AppUpdateController, EditorView, register_key_bindings};
+use hane_update::clock::SystemClock;
+use hane_update::identity::{InstallFacts, InstallId};
+use hane_update::model::Target;
+use hane_update::trust::TrustPolicy;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod app_update;
+mod https_transport;
 #[cfg(target_os = "windows")]
 mod open_request;
 
@@ -26,6 +32,59 @@ const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、
 struct AppOwnedAiService(AiService);
 
 impl Global for AppOwnedAiService {}
+
+struct AppOwnedUpdateService(#[allow(dead_code, reason = "owns the service for the app lifetime")] Arc<app_update::AppUpdateService>);
+
+impl Global for AppOwnedUpdateService {}
+
+/// Builds the app-owned update service. Construction reads no network, ZIP or
+/// update state; the service communicates only after an explicit button press.
+/// `None` (no card) when the install location or state root cannot be named.
+fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
+    let state = FileStateStore::from_environment().ok()?;
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let install_dir = exe.parent()?.to_path_buf();
+    let volume = install_dir
+        .components()
+        .next()?
+        .as_os_str()
+        .to_string_lossy()
+        .into_owned();
+    let owner = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .ok()
+        .filter(|owner| !owner.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    // Interim identity until the OS adapter (a later stage) supplies the real
+    // volume and owner identity; nothing is applied from it in this stage.
+    let install_id = InstallId::derive(&InstallFacts {
+        os: std::env::consts::OS,
+        volume_id: &volume,
+        install_path: &install_dir.to_string_lossy(),
+        owner: &owner,
+    })
+    .ok()?;
+    let updates_root = state.root().join("updates").join(install_id.as_str());
+    let receipts_dir = install_dir
+        .join(install_id.coordination_dir_name())
+        .join("receipts");
+    Some(Arc::new(app_update::AppUpdateService::new(
+        app_update::UpdateServiceConfig {
+            current_version: env!("CARGO_PKG_VERSION").to_owned(),
+            target: Target::current().ok(),
+            // Carries no key material until a maintainer embeds one, so a
+            // production build reports `trust_unconfigured` and never offers
+            // an update.
+            policy: TrustPolicy::production(),
+            install_id,
+            updates_root,
+            receipts_dir,
+        },
+        Arc::new(https_transport::LazyHttpsTransport::default()),
+        Arc::new(SystemClock::new()),
+    )))
+}
 
 fn start_ai_service() -> Option<AiService> {
     let state = FileStateStore::from_environment().ok()?;
@@ -147,6 +206,7 @@ fn main() {
     // AI is an optional app-owned service. Failure to resolve its state or
     // start its worker must never prevent the Markdown editor from opening.
     let ai_service = start_ai_service();
+    let update_service = start_update_service();
     #[cfg(feature = "instrument")]
     let untitled_source: &str = if config.start_empty {
         ""
@@ -166,6 +226,12 @@ fn main() {
             let ai_service_handle = cx
                 .try_global::<AppOwnedAiService>()
                 .map(|owner| owner.0.handle());
+            let update_controller: Option<Arc<dyn AppUpdateController>> =
+                update_service.map(|service| {
+                    // The service belongs to the application, not to a window.
+                    cx.set_global(AppOwnedUpdateService(Arc::clone(&service)));
+                    service as Arc<dyn AppUpdateController>
+                });
             register_key_bindings(cx);
             let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
             let window = cx
@@ -191,6 +257,7 @@ fn main() {
                                 None => EditorView::new(untitled_source, "Untitled", cx),
                             };
                             view.attach_ai_service(ai_service_handle.clone(), cx);
+                            view.attach_app_update(update_controller.clone());
                             #[cfg(any(feature = "instrument", feature = "timing-probe"))]
                             view.arm_startup_timing(process_started);
                             view
@@ -224,23 +291,35 @@ fn main() {
             }
             #[cfg(target_os = "windows")]
             cx.spawn(async move |cx| {
+                // Paths wait here until the view accepts them; a request that
+                // arrives while the view is frozen for an update restart
+                // check stays queued and is retried on the next tick instead
+                // of being consumed.
+                let mut pending = hane_ui::ExternalOpenQueue::new();
                 loop {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(40))
                         .await;
                     while let Ok(path) = open_requests.try_recv() {
-                        if window
-                            .update(cx, |view, window, cx| {
-                                view.open_external_path(&path, cx);
+                        pending.push(path);
+                    }
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    if window
+                        .update(cx, |view, window, cx| {
+                            let accepted =
+                                pending.drain_into(|path| view.submit_external_open(path, cx));
+                            if accepted > 0 {
                                 window.activate_window();
                                 if !view.settings_is_open() {
                                     window.focus(&view.focus_handle(cx), cx);
                                 }
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
                     }
                 }
             })

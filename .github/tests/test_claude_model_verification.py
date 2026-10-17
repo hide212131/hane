@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,6 +31,12 @@ class ClaudeModelVerificationTests(unittest.TestCase):
         for model in ("claude-sonnet-5", "claude-opus-5-5", "claude-sonnet-5-5-beta"):
             with self.subTest(model=model), self.assertRaises(ValueError):
                 verify_claude_model.verify_execution(execution(model))
+
+    def test_rejects_missing_primary_session_model(self):
+        payload = execution()
+        payload[0] = {"type": "system", "subtype": "init", "parent_tool_use_id": None}
+        with self.assertRaisesRegex(ValueError, "did not report the configured"):
+            verify_claude_model.verify_execution(payload)
 
     def test_requires_result_usage_for_sonnet_55(self):
         with self.assertRaisesRegex(ValueError, "did not report positive Sonnet 5.5 token usage"):
@@ -72,15 +79,48 @@ class ClaudeModelVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not report the configured"):
             verify_claude_model.verify_execution(payload)
 
-    def test_reads_only_bounded_regular_execution_files(self):
+    def test_reads_a_valid_execution_file_larger_than_the_old_bound(self):
+        old_bound = 16 * 1024 * 1024
+        self.assertEqual(verify_claude_model.MAX_EXECUTION_BYTES, 64 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "execution.json"
+            payload = execution()
+            payload.insert(1, {"type": "user", "message": {"content": "x" * (old_bound + 1024)}})
+            encoded = json.dumps(payload, separators=(",", ":"))
+            size = len(encoded.encode("utf-8"))
+            self.assertGreater(size, old_bound)
+            self.assertLessEqual(size, verify_claude_model.MAX_EXECUTION_BYTES)
+            path.write_text(encoded, encoding="utf-8")
+
+            result = verify_claude_model.read_execution(path)
+            self.assertEqual(result["session_model"], "claude-sonnet-5-5")
+
+    def test_rejects_missing_non_regular_symlink_and_oversized_files(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            missing = root / "missing.json"
+            directory = root / "directory"
+            directory.mkdir()
             original = root / "execution.json"
-            original.write_text("[]", encoding="utf-8")
+            original.write_text(json.dumps(execution()), encoding="utf-8")
             link = root / "linked.json"
             link.symlink_to(original)
-            with self.assertRaisesRegex(ValueError, "bounded regular file"):
-                verify_claude_model.read_execution(link)
+            oversized = root / "oversized.json"
+            with oversized.open("wb") as file:
+                file.truncate(verify_claude_model.MAX_EXECUTION_BYTES + 1)
+
+            for path in (missing, directory, link, oversized):
+                with self.subTest(path=path.name), self.assertRaisesRegex(
+                    ValueError, "bounded regular file"
+                ):
+                    verify_claude_model.read_execution(path)
+
+    def test_rejects_malformed_execution_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "execution.json"
+            path.write_text("{", encoding="utf-8")
+            with self.assertRaises(json.JSONDecodeError):
+                verify_claude_model.read_execution(path)
 
 
 if __name__ == "__main__":

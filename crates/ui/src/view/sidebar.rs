@@ -389,8 +389,19 @@ impl EditorView {
                                 DateBadgePosition::Right,
                             )
                         };
+                        let menu_path = path.clone();
                         div()
                             .id(("work-folder-entry", index))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                                    view.open_sidebar_context_menu(
+                                        SidebarContextTarget::File(menu_path.clone()),
+                                        event.position,
+                                        cx,
+                                    );
+                                }),
+                            )
                             .debug_selector(|| "sidebar-file".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
@@ -460,8 +471,19 @@ impl EditorView {
                                 .min_w(px(0.0))
                                 .child(folder.name().to_owned())
                         };
+                        let menu_path = path.clone();
                         div()
                             .id(("work-folder-folder", index))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                                    view.open_sidebar_context_menu(
+                                        SidebarContextTarget::Folder(menu_path.clone()),
+                                        event.position,
+                                        cx,
+                                    );
+                                }),
+                            )
                             .debug_selector(|| "sidebar-folder".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
@@ -543,6 +565,18 @@ impl EditorView {
                     self.sidebar_focus == SidebarFocus::ActiveSession && active_id == id;
                 div()
                     .id(("work-folder-draft", id.0 as usize))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                            if let Some(instance) = view.document_instance(id) {
+                                view.open_sidebar_context_menu(
+                                    SidebarContextTarget::Draft(id, instance),
+                                    event.position,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
                     .debug_selector(|| "sidebar-draft".to_owned())
                     .h(px(SIDEBAR_ROW_HEIGHT))
                     .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
@@ -688,6 +722,470 @@ impl EditorView {
     }
 }
 
+impl EditorView {
+    fn open_sidebar_context_menu(
+        &mut self,
+        target: SidebarContextTarget,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tab_context_menu = None;
+        self.sidebar_context_menu = Some(SidebarContextMenu { position, target });
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_sidebar_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sidebar_context_menu.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn close_sidebar_context_menu(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_sidebar_context_menu(cx);
+    }
+
+    fn sidebar_context_rename(
+        &mut self,
+        path: PathBuf,
+        kind: InlineRenameKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_context_menu = None;
+        self.sidebar_keyboard_focus = true;
+        self.begin_inline_rename(path, kind, window, cx);
+        cx.notify();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn sidebar_context_reveal(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        self.reveal_file_tab_in_file_manager(Some(path), cx);
+    }
+
+    fn sidebar_context_copy_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        self.copy_file_tab_full_path(Some(path), cx);
+    }
+
+    /// The session a sidebar Save As acts on, resolved from the clicked row.
+    /// A file row that is not open has no document to save, so it yields
+    /// `None` rather than loading one on the pointer path.
+    fn sidebar_save_as_session(&self, target: &SidebarContextTarget) -> Option<SessionId> {
+        match target {
+            SidebarContextTarget::File(path) => self.sessions.session_for_path(path),
+            SidebarContextTarget::Draft(id, instance) => {
+                (self.document_instance(*id) == Some(*instance)).then_some(*id)
+            }
+            SidebarContextTarget::Folder(_) => None,
+        }
+    }
+
+    fn sidebar_context_save_as(&mut self, target: SidebarContextTarget, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        match self.sidebar_save_as_session(&target) {
+            Some(id) => self.prompt_save_as_for(id, cx),
+            None => {
+                self.status = Some("Save As するにはファイルを開いてください".to_owned());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Moves a file to the OS Trash / Recycle Bin on a background thread. A
+    /// session with unsaved changes (or a write in flight) blocks the move
+    /// instead of being discarded; if edits land while the move is running the
+    /// session stays open with its content, marked as missing from disk.
+    fn sidebar_context_trash(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        if let Some(session) = self
+            .sessions
+            .session_for_path(&path)
+            .and_then(|id| self.sessions.get(id))
+            && (session.is_dirty() || session.save_in_flight())
+        {
+            self.status =
+                Some("未保存の変更があるため、ゴミ箱へ移動できません。先に保存してください".to_owned());
+            cx.notify();
+            return;
+        }
+        self.status = Some("ゴミ箱へ移動しています…".to_owned());
+        let generation = self.work_folder_generation;
+        cx.spawn(async move |view, cx| {
+            let trash_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { move_path_to_trash(&trash_path) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.work_folder_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        view.sessions
+                            .apply_file_event(&FileEvent::Deleted(path.clone()));
+                        if let Some(folder) = view.work_folder.as_mut() {
+                            folder.remove(&path);
+                        }
+                        view.content_search_workspace_changed(cx);
+                        view.status = Some("ゴミ箱へ移動しました".to_owned());
+                    }
+                    Err(error) => {
+                        view.status = Some(format!("ゴミ箱へ移動できません: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn sidebar_context_menu_element(
+        &self,
+        menu: &SidebarContextMenu,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut items: Vec<gpui::Stateful<gpui::Div>> = Vec::new();
+        match &menu.target {
+            SidebarContextTarget::File(path) => {
+                let rename_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-rename",
+                    "名前を変更",
+                    true,
+                    cx,
+                    move |view, _, window, cx| {
+                        view.sidebar_context_rename(
+                            rename_path.clone(),
+                            InlineRenameKind::File,
+                            window,
+                            cx,
+                        );
+                    },
+                ));
+                let trash_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-trash",
+                    "ゴミ箱に移動",
+                    true,
+                    cx,
+                    move |view, _, _, cx| view.sidebar_context_trash(trash_path.clone(), cx),
+                ));
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    let reveal_path = path.clone();
+                    items.push(self.file_tab_context_menu_item(
+                        "sidebar-context-reveal",
+                        REVEAL_IN_FILE_MANAGER_LABEL,
+                        true,
+                        cx,
+                        move |view, _, _, cx| view.sidebar_context_reveal(reveal_path.clone(), cx),
+                    ));
+                }
+                let copy_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-copy-path",
+                    "フルパスをコピー",
+                    true,
+                    cx,
+                    move |view, _, _, cx| view.sidebar_context_copy_path(copy_path.clone(), cx),
+                ));
+                let save_as_target = menu.target.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-save-as",
+                    "名前を付けて保存…",
+                    self.sidebar_save_as_session(&menu.target).is_some(),
+                    cx,
+                    move |view, _, _, cx| {
+                        view.sidebar_context_save_as(save_as_target.clone(), cx)
+                    },
+                ));
+            }
+            SidebarContextTarget::Folder(path) => {
+                let rename_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-rename",
+                    "名前を変更",
+                    true,
+                    cx,
+                    move |view, _, window, cx| {
+                        view.sidebar_context_rename(
+                            rename_path.clone(),
+                            InlineRenameKind::Folder,
+                            window,
+                            cx,
+                        );
+                    },
+                ));
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    let reveal_path = path.clone();
+                    items.push(self.file_tab_context_menu_item(
+                        "sidebar-context-reveal",
+                        REVEAL_IN_FILE_MANAGER_LABEL,
+                        true,
+                        cx,
+                        move |view, _, _, cx| view.sidebar_context_reveal(reveal_path.clone(), cx),
+                    ));
+                }
+                let copy_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-copy-path",
+                    "フルパスをコピー",
+                    true,
+                    cx,
+                    move |view, _, _, cx| view.sidebar_context_copy_path(copy_path.clone(), cx),
+                ));
+            }
+            SidebarContextTarget::Draft(..) => {
+                let save_as_target = menu.target.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-save-as",
+                    "名前を付けて保存…",
+                    self.sidebar_save_as_session(&menu.target).is_some(),
+                    cx,
+                    move |view, _, _, cx| {
+                        view.sidebar_context_save_as(save_as_target.clone(), cx)
+                    },
+                ));
+            }
+        }
+        div()
+            .id("sidebar-context-menu")
+            .debug_selector(|| "sidebar-context-menu".to_owned())
+            .occlude()
+            .min_w(px(180.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(self.theme.header_foreground))
+            .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
+            .on_mouse_down_out(cx.listener(Self::close_sidebar_context_menu))
+            .children(items)
+    }
+}
+
+/// Asks the OS to move `path` to its Trash / Recycle Bin. Never falls back to
+/// a permanent delete: a failure is reported and the file is left in place.
+///
+/// Success is returned only when the OS operation reports success and the
+/// original path is confirmed gone; the caller emits `FileEvent::Deleted` on
+/// `Ok` only.
+fn move_path_to_trash(path: &Path) -> std::io::Result<()> {
+    move_path_to_trash_with(path, native_move_to_trash)
+}
+
+/// Confirms the source exists, runs `operation`, then confirms the source is
+/// gone. Only a `NotFound` after the operation counts as a confirmed move; a
+/// missing source beforehand, a failed operation, a remaining source, or any
+/// other I/O error while checking is reported as a failure.
+fn move_path_to_trash_with(
+    path: &Path,
+    operation: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    path.symlink_metadata()?;
+    operation(path)?;
+    match path.symlink_metadata() {
+        Ok(_) => Err(std::io::Error::other(
+            "ゴミ箱への移動を確認できませんでした（元のファイルが残っています）",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// macOS: `NSFileManager trashItemAtURL:resultingItemURL:error:`, without
+/// Finder / Apple Events. `NO` or a missing resulting URL is an error.
+#[cfg(target_os = "macos")]
+fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
+    use objc::runtime::{BOOL, NO};
+    use std::ffi::{CStr, c_char, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    type Id = *mut c_void;
+
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {}
+
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Id;
+        // Variadic in C; each call site casts it to the exact signature.
+        fn objc_msgSend();
+    }
+
+    /// Sends `selector` to `receiver` through `objc_msgSend` cast to the
+    /// exact C signature of the method (`$ret` result, `$ty` arguments).
+    macro_rules! send {
+        ($ret:ty; $receiver:expr, $selector:expr $(, $ty:ty = $arg:expr)*) => {{
+            let call = std::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "C" fn(Id, Id $(, $ty)*) -> $ret,
+            >(objc_msgSend as unsafe extern "C" fn());
+            call($receiver, sel_registerName($selector.as_ptr()) $(, $arg)*)
+        }};
+    }
+
+    const NS_UTF8_STRING_ENCODING: usize = 4;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: plain Objective-C message sends to Foundation classes with
+    // correctly typed arguments; every object created here is released (or
+    // owned by the pool drained) before returning.
+    unsafe {
+        let pool = send!(Id; objc_getClass(c"NSAutoreleasePool".as_ptr()), c"new");
+        let result = (|| {
+            let string = send!(Id; objc_getClass(c"NSString".as_ptr()), c"alloc");
+            let string = send!(
+                Id; string, c"initWithBytes:length:encoding:",
+                *const u8 = bytes.as_ptr(),
+                usize = bytes.len(),
+                usize = NS_UTF8_STRING_ENCODING
+            );
+            if string.is_null() {
+                return Err(std::io::Error::other("パスをNSStringに変換できません"));
+            }
+            let url = send!(
+                Id; objc_getClass(c"NSURL".as_ptr()), c"fileURLWithPath:",
+                Id = string
+            );
+            send!((); string, c"release");
+            if url.is_null() {
+                return Err(std::io::Error::other("パスをNSURLに変換できません"));
+            }
+            let manager = send!(Id; objc_getClass(c"NSFileManager".as_ptr()), c"defaultManager");
+            let mut resulting: Id = std::ptr::null_mut();
+            let mut error: Id = std::ptr::null_mut();
+            let moved = send!(
+                BOOL; manager, c"trashItemAtURL:resultingItemURL:error:",
+                Id = url,
+                *mut Id = &mut resulting,
+                *mut Id = &mut error
+            );
+            if moved == NO || resulting.is_null() {
+                let message = if error.is_null() {
+                    "ゴミ箱への移動に失敗しました".to_owned()
+                } else {
+                    let description = send!(Id; error, c"localizedDescription");
+                    let utf8: *const c_char = if description.is_null() {
+                        std::ptr::null()
+                    } else {
+                        send!(*const c_char; description, c"UTF8String")
+                    };
+                    if utf8.is_null() {
+                        "ゴミ箱への移動に失敗しました".to_owned()
+                    } else {
+                        CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(std::io::Error::other(message));
+            }
+            Ok(())
+        })();
+        send!((); pool, c"drain");
+        result
+    }
+}
+
+/// Windows: `IFileOperation` with `FOFX_RECYCLEONDELETE`. API errors and an
+/// aborted operation are errors; there is no permanent-delete fallback.
+#[cfg(target_os = "windows")]
+fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+        CoInitializeEx, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
+        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+    };
+    use windows::core::HSTRING;
+
+    fn to_io(error: windows::core::Error) -> std::io::Error {
+        std::io::Error::other(error.to_string())
+    }
+
+    fn recycle(path: &Path) -> std::io::Result<()> {
+        // SAFETY: COM calls on an initialized apartment; all interface
+        // pointers are owned by the `windows` crate wrappers.
+        unsafe {
+            let operation: IFileOperation =
+                CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(to_io)?;
+            operation
+                .SetOperationFlags(
+                    FOF_ALLOWUNDO
+                        | FOF_NOERRORUI
+                        | FOF_SILENT
+                        | FOFX_EARLYFAILURE
+                        | FOFX_RECYCLEONDELETE,
+                )
+                .map_err(to_io)?;
+            let item: IShellItem =
+                SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)
+                    .map_err(to_io)?;
+            operation.DeleteItem(&item, None).map_err(to_io)?;
+            operation.PerformOperations().map_err(to_io)?;
+            if operation.GetAnyOperationsAborted().map_err(to_io)?.as_bool() {
+                return Err(std::io::Error::other(
+                    "ごみ箱への移動が中断されました",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    // SAFETY: balanced with `CoUninitialize` below when initialization
+    // succeeded; a mode conflict means COM is already usable on this thread.
+    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    let initialized = if init.is_ok() {
+        true
+    } else if init == RPC_E_CHANGED_MODE {
+        false
+    } else {
+        return Err(std::io::Error::other(init.message()));
+    };
+    let result = recycle(path);
+    if initialized {
+        // SAFETY: matches the successful `CoInitializeEx` above.
+        unsafe { CoUninitialize() };
+    }
+    result
+}
+
+/// Linux and others: `gio trash`.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
+    let output = Command::new("gio")
+        .arg("trash")
+        .arg("--")
+        .arg(path)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    }
+}
+
 /// The sidebar label for the work folder root: its own directory name, or
 /// the full path if it has none (a filesystem root such as `/`).
 fn work_folder_root_display_name(root: &Path) -> String {
@@ -803,6 +1301,79 @@ fn draft_preview(session: &DocumentSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trash_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hane-trash-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn trash_succeeds_when_operation_removes_existing_path() {
+        let dir = trash_test_dir("removed");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        let result = move_path_to_trash_with(&path, |path| std::fs::remove_file(path));
+        assert!(result.is_ok());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trash_reports_os_operation_error() {
+        let dir = trash_test_dir("op-error");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        let result = move_path_to_trash_with(&path, |_| Err(std::io::Error::other("denied")));
+        assert!(result.is_err());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trash_rejects_ok_when_original_path_remains() {
+        let dir = trash_test_dir("remains");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        let result = move_path_to_trash_with(&path, |_| Ok(()));
+        assert!(result.is_err());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trash_of_initially_missing_path_is_an_error_without_running_operation() {
+        let dir = trash_test_dir("missing");
+        let path = dir.join("never-created.md");
+        let mut ran = false;
+        let result = move_path_to_trash_with(&path, |_| {
+            ran = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!ran);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_reports_io_error_while_confirming_removal() {
+        let dir = trash_test_dir("confirm-error");
+        let parent = dir.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        // Replacing the parent directory with a file makes the post-check fail
+        // with NotADirectory rather than NotFound.
+        let result = move_path_to_trash_with(&path, |_| {
+            std::fs::remove_dir_all(&parent)?;
+            std::fs::write(&parent, "file")
+        });
+        let error = result.unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn relative_luminance(color: u32) -> f32 {
         fn linear_channel(channel: u32) -> f32 {
