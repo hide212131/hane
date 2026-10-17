@@ -417,7 +417,7 @@ pub fn helper_main() -> i32 {
     let Ok(env) = HelperEnv::from_current_process() else {
         return 3;
     };
-    let mut backend = PlatformBackend::default();
+    let mut backend = PlatformBackend;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let result = run_session(&mut stdin.lock(), &mut stdout.lock(), &env, &mut backend);
