@@ -56,7 +56,10 @@ fn query_volume(root: &str) -> Result<Volume> {
         )
     };
     if ok == 0 {
-        return Err(unsupported("the install volume could not be queried"));
+        return Err(UpdateError::new(
+            ErrorCode::Io,
+            "the install volume could not be queried",
+        ));
     }
     let len = fs_name.iter().position(|unit| *unit == 0).unwrap_or(fs_name.len());
     // SAFETY: `root_w` is a NUL-terminated wide string.
@@ -106,10 +109,25 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     if !volume.file_system.eq_ignore_ascii_case("NTFS") {
         return Err(unsupported("only NTFS is supported"));
     }
-    for name in [HELPER_FILE_NAME, INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME] {
-        if !is_regular_file(&install_dir.join(name)) {
-            return Err(unsupported(format!("{name} is missing from the install")));
-        }
+    let managed_files = [HELPER_FILE_NAME, INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME];
+    let present = managed_files
+        .iter()
+        .filter(|name| is_regular_file(&install_dir.join(name)))
+        .count();
+    if present == 0 {
+        // Nothing of the managed layout exists (for example a development build).
+        return Err(unsupported("the install has no updater files"));
+    }
+    // Some but not all: a managed install that is incomplete or mid-update.
+    // That is not an unsupported placement and must not start normal editing.
+    if let Some(name) = managed_files
+        .iter()
+        .find(|name| !is_regular_file(&install_dir.join(name)))
+    {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{name} is missing from a managed install"),
+        ));
     }
     let path_text = install_dir.to_string_lossy().into_owned();
     let path_text = path_text.strip_prefix(r"\\?\").unwrap_or(&path_text).to_owned();

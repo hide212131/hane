@@ -21,8 +21,18 @@ pub enum Entry {
 }
 
 pub fn enter() -> Entry {
-    let Ok(exe) = std::env::current_exe() else {
-        return Entry::Start(None);
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            // The placement cannot be resolved, so it cannot be ruled out that
+            // an interrupted update is pending: do not start normal editing.
+            eprintln!(
+                "Hane could not finish or undo an interrupted update \
+                 (the running executable could not be located: {err}). \
+                 Install a signed Hane ZIP manually."
+            );
+            return Entry::Stop(EXIT_RECOVERY_REQUIRED);
+        }
     };
     let runner = HelperRecoveryRunner {
         policy: TrustPolicy::production(),

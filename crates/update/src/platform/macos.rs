@@ -45,7 +45,10 @@ fn query_volume(path: &Path) -> Result<Volume> {
         (rc, stat)
     };
     if rc != 0 {
-        return Err(unsupported("the install volume could not be queried"));
+        return Err(UpdateError::new(
+            ErrorCode::Io,
+            "the install volume could not be queried",
+        ));
     }
     let name_bytes: Vec<u8> = stat
         .f_fstypename
@@ -94,9 +97,14 @@ pub fn locate(exe: &Path) -> Result<Placement> {
         .parent()
         .ok_or_else(|| unsupported("the bundle has no parent for coordination"))?
         .to_path_buf();
-    let plist = read_limited(&contents.join("Info.plist"), MAX_PLIST_BYTES)?
-        .ok_or_else(|| unsupported("Info.plist is missing"))?;
-    let plist = String::from_utf8(plist).map_err(|_| unsupported("Info.plist is not XML"))?;
+    // The layout is Hane.app's, so a missing or unreadable Info.plist is a
+    // damaged bundle, not an unsupported placement.
+    let plist = read_limited(&contents.join("Info.plist"), MAX_PLIST_BYTES)?.ok_or_else(|| {
+        UpdateError::new(ErrorCode::InstallModified, "Info.plist is missing from the bundle")
+    })?;
+    let plist = String::from_utf8(plist).map_err(|_| {
+        UpdateError::new(ErrorCode::InstallModified, "Info.plist is not XML")
+    })?;
     if plist_string(&plist, "CFBundleIdentifier").as_deref() != Some(MACOS_BUNDLE_ID) {
         return Err(unsupported("the bundle identifier is not Hane's"));
     }

@@ -207,11 +207,20 @@ fn stop(err: &UpdateError) -> GateOutcome {
 }
 
 /// Convenience for the application: locate the running executable's placement,
-/// then run the gate. An unsupported placement is `Unmanaged`.
+/// then run the gate. Only a placement that is clearly unsupported is
+/// `Unmanaged`; any other failure to resolve it (I/O errors, a partly missing
+/// or inconsistent managed install) stops with `RecoveryRequired`.
 pub fn startup_gate_for_exe(exe: &Path, runner: &dyn RecoveryRunner) -> GateOutcome {
-    match platform::locate(exe) {
+    gate_for_located(platform::locate(exe), runner)
+}
+
+fn gate_for_located(located: Result<Placement>, runner: &dyn RecoveryRunner) -> GateOutcome {
+    match located {
         Ok(placement) => startup_gate(&placement, runner, STARTUP_WAIT),
-        Err(_) => GateOutcome::Unmanaged,
+        Err(err) if matches!(err.code, ErrorCode::UnsupportedInstall | ErrorCode::TargetUnsupported) => {
+            GateOutcome::Unmanaged
+        }
+        Err(err) => stop(&err),
     }
 }
 
@@ -545,6 +554,31 @@ mod tests {
         let report =
             crate::helper::recover_pending(&coord, &TransactionId::generate().unwrap()).unwrap();
         assert_eq!(report, RecoveryReport::Nothing);
+    }
+
+    #[test]
+    fn only_a_clearly_unsupported_placement_is_unmanaged() {
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        for code in [ErrorCode::UnsupportedInstall, ErrorCode::TargetUnsupported] {
+            assert!(
+                matches!(
+                    gate_for_located(Err(UpdateError::new(code, "no")), &runner),
+                    GateOutcome::Unmanaged
+                ),
+                "{code:?}"
+            );
+        }
+        for code in [ErrorCode::Io, ErrorCode::InstallModified, ErrorCode::IdentityMismatch] {
+            assert!(
+                matches!(
+                    gate_for_located(Err(UpdateError::new(code, "partial")), &runner),
+                    GateOutcome::RecoveryRequired(_)
+                ),
+                "{code:?}"
+            );
+        }
+        // Normal editing is never started: no helper ran and no lease is held.
+        assert_eq!(runner.calls.get(), 0);
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
