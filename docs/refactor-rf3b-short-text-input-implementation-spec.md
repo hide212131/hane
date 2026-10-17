@@ -30,6 +30,8 @@
 
 設計保存時に、本文のOS別編集キーを整備する [#494](https://github.com/hide212131/hane/issues/494) / [#495](https://github.com/hide212131/hane/pull/495) も進行している。#495のhead `e5c61881f44f650a6b5ff9a68d324b52bfbcd213` では準備文書だけで、製品変更はまだ差分にないことを確認した。この作業は `actions.rs`、`view.rs`、入力接続テストと重なる可能性がある。本書のHome/End等の操作表は基準mainのactionの意味を記録しており、将来の実キー割当を固定するものではない。#495が先に受け入れられたら、そのOS別割当と入力抑止を維持して本書の呼出元・試験手順を読み替え、旧割当へ戻さない。追加の本文専用操作を短い入力欄モデルへ取り込む必要もない。
 
+今回の再開確認（2026-10-17）では、並行PR [#495](https://github.com/hide212131/hane/pull/495) はhead `22edc0ed1ce77834eb9cb12474bba61e7451a0be` のDraft/open・未mergeで、準備文書だけから製品差分のある状態へ進んでいる。現差分の `actions.rs`、`view.rs`、`view/input_routing.rs` と関連テストは#305の呼出元・fixtureと重なる。特に `SelectDocumentStart` / `SelectDocumentEnd` は、filter/rename入力中に各欄の先頭/末尾を選択し、本文では文書端選択を行う。rename pending中は既存の選択メソッドのguardによりno-op。この挙動は#495の未受入headで確認したため、製品コードを本設計へ取り込まない。#495が先行して受け入れられた場合だけ、下記§6.2・§10.2の契約を維持し、実装開始時に現在のhead・差分・受入状態を再確認する。
+
 ### 1.2 今回決める範囲
 
 共通化するのは、既存の文字編集操作と、それに伴う範囲・変換状態の整合した更新である。検索機能の追加、名前の検証規則の変更、ショートカットの追加、Undo/Redoの導入は含めない。本文Editorを短い入力欄へ組み込まず、汎用trait、イベントバス、新しいcrate、別のGPUI Entityも追加しない。
@@ -246,7 +248,9 @@ raw filterは `sidebar_filter_focused` そのもの、broad filterは本文検�
 | Enter / Shift+Enter | 変換中なら確定だけ。変換中でなければ何もせずfocusを維持 | 変換中なら確定だけ。そうでなければ名前変更を確認する | 呼出元の分岐を維持。共通化はcomposition確定だけ |
 | Escape | 変換中なら復元だけ。次のEscapeでblurする | 変換中なら復元だけ。その後のEscapeはrename取消。pendingの扱いも維持 | 呼出元の分岐を維持。共通化はcomposition取消だけ |
 | マウスで位置指定 | 初回focusは全選択。再クリックは変換中でも位置を変更する | pendingまたは変換中なら位置を変更しない | 既存条件の後で `select_all` または `set_caret_utf16` |
-| Undo / Redo等の本文専用操作 | #304で定めた無操作を維持 | 同左 | モデルに履歴を追加しない |
+| 文書端へ移動 (`DocumentStart` / `DocumentEnd`) | filter/renameでは無操作 | #495の差分でも短い欄では無操作 | モデルに含めず、body-onlyの経路を維持 |
+| 文書端まで選択 (`SelectDocumentStart` / `SelectDocumentEnd`) | 基準mainではfilter/renameで無操作 | #495が先行受入済みなら欄の先頭/末尾を選択（rename pending中は無操作）。未受入なら現行の無操作を維持 | routingとpending確認は外側に残し、先行受入済みなら共通モデルの `move_home(true)` / `move_end(true)` に委譲 |
+| Undo / Redo等の本文履歴操作 | #304で定めた無操作を維持 | 同左 | モデルに履歴を追加しない |
 
 renameの `move_inline_rename_left/right(extend=true)` というメソッド自体にはpending確認がある。一方、Shift左右のactionが呼ぶ `select_inline_rename_left/right` にはない。同じ共通操作を呼ぶようになっても、入口ごとの既存確認を取り違えない。
 
@@ -386,13 +390,14 @@ M02〜M04は範囲端点がUTF-16の2単位文字の途中にある場合も含�
 | ID | action/callback経路の追加確認 | 期待値 |
 | --- | --- | --- |
 | C01 | filter/renameの文字列が同じままになる置換、空削除 | filterは一覧スクロールを `(0,0)` に戻す。renameは通常の通知経路を保つ。本文の内容・revision・履歴は変わらない |
-| C02 | rename pendingでCopy、Cut、Shift左右、SelectAll、Home/End、Backspace/Delete、Paste | 第6.2節の違いを固定する。pendingでShift左右が動くことを一律guardで消さない |
+| C02 | rename pendingでCopy、Cut、Shift左右、SelectAll、Home/End、文書端移動/選択、Backspace/Delete、Paste | 第6.2節の違いを固定する。pendingでShift左右が動くことを一律guardで消さず、pending対象外の文書端actionも勝手に編集入口へ再配送しない |
 | C03 | 両callbackへ `"\r\n"` を渡す | 生の空文字列ではないためOS取消扱いにしない。モデル内のCR/LF除去後の通常の結果を確認 |
 | C04 | 逆向き選択 → 複数mark更新 → Windows型の取消、macOS型の取消 | 元の文字列・範囲・向きへ戻り、focusともう一方の入力先を変更しない |
 | C05 | filter再クリック / rename再クリックを変換中に行う | filterは既存の位置更新、renameは拒否。blurでfilter文字列が巻き戻らない |
 | C06 | renameで結合文字・絵文字の直前にcaretを置き、actionのDeleteを送る | モデル直接呼出しだけでなく、前方削除の接続も正しい。本文と拡張子は変わらない |
 | C07 | filter非focusの描画と、順方向/逆方向selectionの候補位置query | 非focusの描画だけ選択を隠し、モデルselectionを保つ。候補位置は動く端に対応 |
 | C08 | 既存の `late_body_cancel_after_pending_rename` に、`replace_text_in_range(Some(marked_range), "")` の条件を追加 | 範囲を指定した本文取消もguard中に通る。取消後もguardを保ち、後続の非空callbackを捨てる |
+| C09 | #495が先行受入済みの場合、filter/renameの非pending状態で `SelectDocumentStart/End` actionを通す。rename pendingとBodyでも同じactionを確認 | 短い欄では欄の先頭/末尾を選択し、rename pendingでは既存guardで無操作、Bodyでは文書端選択を維持する。OS別bindingを旧割当へ戻さない |
 
 C07の逆向き候補位置は既存の `short_field_caret_bounds_follow_the_reversed_flag` を再利用し、同じ内容のテストを追加しない。
 
