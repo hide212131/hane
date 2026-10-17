@@ -1387,7 +1387,8 @@ mod tests {
 
     #[test]
     fn a_placement_that_cannot_swap_is_refused_before_any_change() {
-        let cases: [(&str, fn(&FakeHost)); 5] = [
+        type PlacementCase = (&'static str, fn(&FakeHost));
+        let cases: [PlacementCase; 5] = [
             ("not APFS", |h| h.apfs.set(false)),
             ("not local", |h| h.local.set(false)),
             ("read only", |h| h.read_only.set(true)),
