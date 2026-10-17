@@ -25,6 +25,8 @@ pub const RUNTIME_LOCK: &str = "runtime.lock";
 pub const PRIVATE_DIR: &str = "private";
 pub const JOURNAL_FILE: &str = "journal.json";
 pub const HELPER_DIR: &str = "helper";
+pub const RECEIPTS_DIR: &str = "receipts";
+pub const SEEN_CATALOG_FILE: &str = "seen-catalog.json";
 
 const POLL: Duration = Duration::from_millis(20);
 
@@ -190,6 +192,19 @@ impl Coordination {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Receipt directory of an install under `parent`. The application and the
+    /// helper both derive the sequence floor's location from this.
+    pub fn receipts_dir_for(parent: &Path, install_id: &InstallId) -> PathBuf {
+        parent
+            .join(install_id.coordination_dir_name())
+            .join(RECEIPTS_DIR)
+    }
+
+    /// The durable highest-seen catalog receipt of this placement.
+    pub fn seen_catalog_path(&self) -> PathBuf {
+        self.dir.join(RECEIPTS_DIR).join(SEEN_CATALOG_FILE)
     }
 
     pub fn install_id(&self) -> &InstallId {

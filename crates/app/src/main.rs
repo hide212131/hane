@@ -53,10 +53,10 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     // such a placement never becomes applicable.
     let (install_id, receipts_dir) = match hane_update::platform::locate(&exe) {
         Ok(placement) => {
-            let receipts = placement
-                .coordination_parent
-                .join(placement.install_id.coordination_dir_name())
-                .join("receipts");
+            let receipts = hane_update::platform::lease::Coordination::receipts_dir_for(
+                &placement.coordination_parent,
+                &placement.install_id,
+            );
             (placement.install_id, receipts)
         }
         Err(_) => {

@@ -39,7 +39,7 @@ pub(crate) const SIGNATURE_FILE: &str = "hane-update.json.sig";
 pub(crate) const ARCHIVE_FILE: &str = "archive.zip";
 const STAGE_DIR: &str = "stage";
 const READY_MARKER: &str = "ready";
-const SEEN_FILE: &str = "seen-catalog.json";
+const SEEN_FILE: &str = hane_update::platform::lease::SEEN_CATALOG_FILE;
 
 pub type Task = Box<dyn FnOnce() + Send>;
 /// Runs a task on a background thread. Returns false when it cannot be run.

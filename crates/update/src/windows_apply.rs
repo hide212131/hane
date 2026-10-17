@@ -35,7 +35,7 @@ use crate::archive::{ArchiveLimits, stage_archive};
 use crate::catalog::{VerifyContext, verify_catalog};
 use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::fsutil::{hash_regular_file, read_limited};
+use crate::fsutil::{FileSeenStore, hash_regular_file, read_limited};
 use crate::identity::{ApplyPlan, SignedInventory, TransactionId};
 use crate::journal::{
     DurableJournal, FileJournalStore, FsDiskView, UpdateJournal, check_plan_preconditions,
@@ -44,7 +44,7 @@ use crate::limits::{MAX_ARCHIVE_BYTES, MAX_CATALOG_BYTES, MAX_INVENTORY_BYTES, M
 use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target, UPDATER_PROTOCOL};
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
-use crate::trust::TrustPolicy;
+use crate::trust::{SeenStore, TrustPolicy};
 use crate::util::is_sha256_hex;
 
 /// Directory of the transaction that holds the copied candidate.
@@ -202,6 +202,21 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
         .ok_or_else(|| missing("the candidate catalog"))?;
     let signature = read_limited(&candidate_dir.join(CANDIDATE_SIGNATURE), MAX_SIGNATURE_BYTES)?
         .ok_or_else(|| missing("the candidate signature"))?;
+    // The floor is re-read now, after the runtime lease is held and before any
+    // install mutation: the application may have recorded a newer sequence
+    // since it made this candidate Ready. A missing, corrupt or unreadable
+    // receipt is a refusal, never "no floor".
+    let seen = FileSeenStore::new(coordination.seen_catalog_path())
+        .load()
+        .map_err(|err| {
+            UpdateError::new(
+                ErrorCode::ReceiptUnwritable,
+                format!("the catalog sequence receipt cannot be read: {err}"),
+            )
+        })?
+        .ok_or_else(|| {
+            UpdateError::new(ErrorCode::NotFound, "the catalog sequence receipt is missing")
+        })?;
     let candidate = verify_catalog(
         &catalog,
         &signature,
@@ -210,7 +225,7 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
             clock: inputs.clock,
             current_version: &facts.version,
             target: Target::WindowsX64,
-            seen: None,
+            seen: Some(&seen),
             expected_tag: None,
         },
     )?;
@@ -342,7 +357,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::catalog::record_seen;
     use crate::identity::{InstallFacts, InstallId};
+    use crate::trust::SeenCatalog;
     use crate::journal::{Phase, StepState};
     use crate::testing::{
         FixedClock, TempDir, WindowsRelease, default_payload, test_now, test_policy, windows_release,
@@ -439,7 +456,7 @@ mod tests {
             },
         )
         .unwrap();
-        let candidate_id = verify_catalog(
+        let verified = verify_catalog(
             &new.catalog,
             &new.catalog_sig,
             &VerifyContext {
@@ -451,10 +468,11 @@ mod tests {
                 expected_tag: None,
             },
         )
-        .unwrap()
-        .candidate_id()
-        .as_str()
-        .to_owned();
+        .unwrap();
+        let candidate_id = verified.candidate_id().as_str().to_owned();
+        // Ready is only reached once the application stored this floor.
+        fs::create_dir_all(coordination.dir().join(crate::platform::lease::RECEIPTS_DIR)).unwrap();
+        record_seen(&mut FileSeenStore::new(coordination.seen_catalog_path()), &verified).unwrap();
 
         let placement = Placement {
             target: Target::WindowsX64,
@@ -617,6 +635,67 @@ mod tests {
         let mut inputs = fx.inputs();
         inputs.placement = &placement;
         assert_eq!(apply_owned_files(&inputs).err().unwrap().code, ErrorCode::IdentityMismatch);
+        assert!(fx.unchanged());
+    }
+
+    fn store_floor(fx: &Fixture, seen: &SeenCatalog) {
+        FileSeenStore::new(fx.coordination.seen_catalog_path()).store(seen).unwrap();
+    }
+
+    #[test]
+    fn a_floor_recorded_after_ready_rejects_the_stale_candidate() {
+        let fx = fixture();
+        store_floor(&fx, &SeenCatalog::new(3, "b".repeat(64)));
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::SequenceRegression
+        );
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[test]
+    fn the_same_sequence_with_other_bytes_is_rejected_but_the_recorded_one_applies() {
+        let fx = fixture();
+        store_floor(&fx, &SeenCatalog::new(2, "b".repeat(64)));
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::SequenceConflict
+        );
+        assert!(fx.unchanged());
+
+        // The fixture's own receipt (same sequence, same bytes) is allowed.
+        let fx = fixture();
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+    }
+
+    #[test]
+    fn a_lower_floor_still_allows_the_candidate() {
+        let fx = fixture();
+        store_floor(&fx, &SeenCatalog::new(1, "b".repeat(64)));
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_receipt_fails_closed() {
+        let fx = fixture();
+        fs::remove_file(fx.coordination.seen_catalog_path()).unwrap();
+        assert_eq!(apply_owned_files(&fx.inputs()).err().unwrap().code, ErrorCode::NotFound);
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+
+        let fx = fixture();
+        fs::write(fx.coordination.seen_catalog_path(), b"{not json").unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+
+        // An unreadable receipt (a directory in its place) is not "no floor".
+        let fx = fixture();
+        let path = fx.coordination.seen_catalog_path();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
         assert!(fx.unchanged());
     }
 
