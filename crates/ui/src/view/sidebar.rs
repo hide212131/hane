@@ -389,8 +389,19 @@ impl EditorView {
                                 DateBadgePosition::Right,
                             )
                         };
+                        let menu_path = path.clone();
                         div()
                             .id(("work-folder-entry", index))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                                    view.open_sidebar_context_menu(
+                                        SidebarContextTarget::File(menu_path.clone()),
+                                        event.position,
+                                        cx,
+                                    );
+                                }),
+                            )
                             .debug_selector(|| "sidebar-file".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
@@ -460,8 +471,19 @@ impl EditorView {
                                 .min_w(px(0.0))
                                 .child(folder.name().to_owned())
                         };
+                        let menu_path = path.clone();
                         div()
                             .id(("work-folder-folder", index))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                                    view.open_sidebar_context_menu(
+                                        SidebarContextTarget::Folder(menu_path.clone()),
+                                        event.position,
+                                        cx,
+                                    );
+                                }),
+                            )
                             .debug_selector(|| "sidebar-folder".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
@@ -543,6 +565,18 @@ impl EditorView {
                     self.sidebar_focus == SidebarFocus::ActiveSession && active_id == id;
                 div()
                     .id(("work-folder-draft", id.0 as usize))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                            if let Some(instance) = view.document_instance(id) {
+                                view.open_sidebar_context_menu(
+                                    SidebarContextTarget::Draft(id, instance),
+                                    event.position,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
                     .debug_selector(|| "sidebar-draft".to_owned())
                     .h(px(SIDEBAR_ROW_HEIGHT))
                     .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
@@ -685,6 +719,318 @@ impl EditorView {
                     })
                 })
             })
+    }
+}
+
+impl EditorView {
+    fn open_sidebar_context_menu(
+        &mut self,
+        target: SidebarContextTarget,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tab_context_menu = None;
+        self.sidebar_context_menu = Some(SidebarContextMenu { position, target });
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_sidebar_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sidebar_context_menu.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn close_sidebar_context_menu(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_sidebar_context_menu(cx);
+    }
+
+    fn sidebar_context_rename(
+        &mut self,
+        path: PathBuf,
+        kind: InlineRenameKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_context_menu = None;
+        self.sidebar_keyboard_focus = true;
+        self.begin_inline_rename(path, kind, window, cx);
+        cx.notify();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn sidebar_context_reveal(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        self.reveal_file_tab_in_file_manager(Some(path), cx);
+    }
+
+    fn sidebar_context_copy_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        self.copy_file_tab_full_path(Some(path), cx);
+    }
+
+    /// The session a sidebar Save As acts on, resolved from the clicked row.
+    /// A file row that is not open has no document to save, so it yields
+    /// `None` rather than loading one on the pointer path.
+    fn sidebar_save_as_session(&self, target: &SidebarContextTarget) -> Option<SessionId> {
+        match target {
+            SidebarContextTarget::File(path) => self.sessions.session_for_path(path),
+            SidebarContextTarget::Draft(id, instance) => {
+                (self.document_instance(*id) == Some(*instance)).then_some(*id)
+            }
+            SidebarContextTarget::Folder(_) => None,
+        }
+    }
+
+    fn sidebar_context_save_as(&mut self, target: SidebarContextTarget, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        match self.sidebar_save_as_session(&target) {
+            Some(id) => self.prompt_save_as_for(id, cx),
+            None => {
+                self.status = Some("Save As するにはファイルを開いてください".to_owned());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Moves a file to the OS Trash / Recycle Bin on a background thread. A
+    /// session with unsaved changes (or a write in flight) blocks the move
+    /// instead of being discarded; if edits land while the move is running the
+    /// session stays open with its content, marked as missing from disk.
+    fn sidebar_context_trash(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        if let Some(session) = self
+            .sessions
+            .session_for_path(&path)
+            .and_then(|id| self.sessions.get(id))
+            && (session.is_dirty() || session.save_in_flight())
+        {
+            self.status =
+                Some("未保存の変更があるため、ゴミ箱へ移動できません。先に保存してください".to_owned());
+            cx.notify();
+            return;
+        }
+        self.status = Some("ゴミ箱へ移動しています…".to_owned());
+        let generation = self.work_folder_generation;
+        cx.spawn(async move |view, cx| {
+            let trash_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { move_path_to_trash(&trash_path) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.work_folder_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        view.sessions
+                            .apply_file_event(&FileEvent::Deleted(path.clone()));
+                        if let Some(folder) = view.work_folder.as_mut() {
+                            folder.remove(&path);
+                        }
+                        view.content_search_workspace_changed(cx);
+                        view.status = Some("ゴミ箱へ移動しました".to_owned());
+                    }
+                    Err(error) => {
+                        view.status = Some(format!("ゴミ箱へ移動できません: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn sidebar_context_menu_element(
+        &self,
+        menu: &SidebarContextMenu,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut items: Vec<gpui::Stateful<gpui::Div>> = Vec::new();
+        match &menu.target {
+            SidebarContextTarget::File(path) => {
+                let rename_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-rename",
+                    "名前を変更",
+                    true,
+                    cx,
+                    move |view, _, window, cx| {
+                        view.sidebar_context_rename(
+                            rename_path.clone(),
+                            InlineRenameKind::File,
+                            window,
+                            cx,
+                        );
+                    },
+                ));
+                let trash_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-trash",
+                    "ゴミ箱に移動",
+                    true,
+                    cx,
+                    move |view, _, _, cx| view.sidebar_context_trash(trash_path.clone(), cx),
+                ));
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    let reveal_path = path.clone();
+                    items.push(self.file_tab_context_menu_item(
+                        "sidebar-context-reveal",
+                        REVEAL_IN_FILE_MANAGER_LABEL,
+                        true,
+                        cx,
+                        move |view, _, _, cx| view.sidebar_context_reveal(reveal_path.clone(), cx),
+                    ));
+                }
+                let copy_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-copy-path",
+                    "フルパスをコピー",
+                    true,
+                    cx,
+                    move |view, _, _, cx| view.sidebar_context_copy_path(copy_path.clone(), cx),
+                ));
+                let save_as_target = menu.target.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-save-as",
+                    "名前を付けて保存…",
+                    self.sidebar_save_as_session(&menu.target).is_some(),
+                    cx,
+                    move |view, _, _, cx| {
+                        view.sidebar_context_save_as(save_as_target.clone(), cx)
+                    },
+                ));
+            }
+            SidebarContextTarget::Folder(path) => {
+                let rename_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-rename",
+                    "名前を変更",
+                    true,
+                    cx,
+                    move |view, _, window, cx| {
+                        view.sidebar_context_rename(
+                            rename_path.clone(),
+                            InlineRenameKind::Folder,
+                            window,
+                            cx,
+                        );
+                    },
+                ));
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    let reveal_path = path.clone();
+                    items.push(self.file_tab_context_menu_item(
+                        "sidebar-context-reveal",
+                        REVEAL_IN_FILE_MANAGER_LABEL,
+                        true,
+                        cx,
+                        move |view, _, _, cx| view.sidebar_context_reveal(reveal_path.clone(), cx),
+                    ));
+                }
+                let copy_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-copy-path",
+                    "フルパスをコピー",
+                    true,
+                    cx,
+                    move |view, _, _, cx| view.sidebar_context_copy_path(copy_path.clone(), cx),
+                ));
+            }
+            SidebarContextTarget::Draft(..) => {
+                let save_as_target = menu.target.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-save-as",
+                    "名前を付けて保存…",
+                    self.sidebar_save_as_session(&menu.target).is_some(),
+                    cx,
+                    move |view, _, _, cx| {
+                        view.sidebar_context_save_as(save_as_target.clone(), cx)
+                    },
+                ));
+            }
+        }
+        div()
+            .id("sidebar-context-menu")
+            .debug_selector(|| "sidebar-context-menu".to_owned())
+            .occlude()
+            .min_w(px(180.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(self.theme.header_foreground))
+            .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
+            .on_mouse_down_out(cx.listener(Self::close_sidebar_context_menu))
+            .children(items)
+    }
+}
+
+/// Asks the OS to move `path` to its Trash / Recycle Bin. Never falls back to
+/// a permanent delete: a failure is reported and the file is left in place.
+fn move_path_to_trash(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("osascript");
+        command
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "tell application \"Finder\" to delete (POSIX file (item 1 of argv) as alias)",
+                "-e",
+                "end run",
+            ])
+            .arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; \
+                 Add-Type -AssemblyName Microsoft.VisualBasic; \
+                 [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(\
+                 $env:HANE_TRASH_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')",
+            ])
+            .env("HANE_TRASH_PATH", path)
+            .creation_flags(0x0800_0000);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("gio");
+        command.arg("trash").arg("--").arg(path);
+        command
+    };
+    let output = command.output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
     }
 }
 

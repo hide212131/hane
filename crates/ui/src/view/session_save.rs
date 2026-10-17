@@ -760,8 +760,17 @@ impl EditorView {
     }
 
     pub(crate) fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
-        let session = self.sessions.active();
-        let id = session.id();
+        self.prompt_save_as_for(self.sessions.active_id(), cx);
+    }
+
+    /// Opens the native Save As dialog for the session `id`, which need not be
+    /// the active one (a sidebar row's menu targets the row, not the tab). The
+    /// answer is applied through `handle_save_as_response`, bound to this
+    /// session's instance.
+    pub(super) fn prompt_save_as_for(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
         let directory = session
             .file()
             .directory()
