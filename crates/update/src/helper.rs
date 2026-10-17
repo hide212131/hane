@@ -13,9 +13,10 @@
 //! and requires `Prepared` from that very child before it reports success.
 //!
 //! [`PlatformBackend`] applies the Windows owned-file set through
-//! [`crate::windows_apply`]. The macOS bundle swap, the limited-health child and
-//! the durable commit are not connected yet, so it never reports an applied
-//! update: the replaced files are restored before it answers.
+//! [`crate::windows_apply`] and holds the `transaction` and `startup` leases
+//! through the limited-health child ([`crate::health`]) up to the durable commit
+//! or the rollback. It reports an applied update only after `Committed` is
+//! durable. The macOS bundle swap is not connected, so macOS never applies.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant};
 use crate::apply::{self, FsFileOps, RecoveryOutcome};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{ErrorCode, Result, UpdateError};
+use crate::health::{ProcessLauncher, StopTiming};
 use crate::identity::{InstallId, TransactionId};
 use crate::journal::{DurableJournal, FileJournalStore};
 use crate::model::Target;
@@ -162,7 +164,9 @@ pub struct HeldLeases {
 pub struct ApplyContext<'a> {
     pub env: &'a HelperEnv,
     pub candidate_id: Option<&'a str>,
-    pub leases: &'a HeldLeases,
+    /// Mutable so the backend can hand the `runtime` lease to the limited
+    /// child; `transaction` and `startup` stay held until the call returns.
+    pub leases: &'a mut HeldLeases,
 }
 
 pub struct RecoverContext<'a> {
@@ -172,8 +176,10 @@ pub struct RecoverContext<'a> {
 
 /// The OS-specific work. Called only after every guard of the session passed.
 pub trait HelperBackend {
-    /// Runs with the parent gone and the runtime lease held exclusively.
-    fn apply(&mut self, ctx: &ApplyContext<'_>) -> Result<()>;
+    /// Runs with the parent gone and the runtime lease held exclusively. `Ok`
+    /// means the update is applied *and* durably committed; any other end has
+    /// restored the old version (or stopped as `RecoveryRequired`) first.
+    fn apply(&mut self, ctx: &mut ApplyContext<'_>) -> Result<()>;
     /// Runs with all three leases held; returns what it concluded.
     fn recover(&mut self, ctx: &RecoverContext<'_>) -> Result<RecoveryReport>;
 }
@@ -312,10 +318,10 @@ pub fn run_session<R: Read, W: Write>(
                 return Ok(SessionEnd::ParentStillRunning);
             };
             leases.runtime = Some(runtime);
-            backend.apply(&ApplyContext {
+            backend.apply(&mut ApplyContext {
                 env,
                 candidate_id: candidate_id.as_deref(),
-                leases: &leases,
+                leases: &mut leases,
             })?;
             Ok(SessionEnd::Applied)
         }
@@ -392,30 +398,41 @@ impl PlatformBackend {
 }
 
 impl HelperBackend for PlatformBackend {
-    fn apply(&mut self, ctx: &ApplyContext<'_>) -> Result<()> {
+    fn apply(&mut self, ctx: &mut ApplyContext<'_>) -> Result<()> {
+        let env = ctx.env;
         let candidate_id = ctx
             .candidate_id
             .filter(|id| valid_candidate_id(id))
             .ok_or_else(|| {
                 UpdateError::new(ErrorCode::IdentityMismatch, "the request names no valid candidate")
             })?;
-        let coordination = &ctx.env.coordination;
+        let coordination = &env.coordination;
         let placement = crate::platform::find_install(coordination)?;
+        // Only the Windows file set is connected to the limited-health commit;
+        // the macOS bundle swap stays unsupported and fail-closed.
         if placement.target != Target::WindowsX64 {
             return Err(UpdateError::new(
                 ErrorCode::NotApplicable,
                 "the macOS bundle swap is not connected yet",
             ));
         }
-        apply_and_settle(&ApplyInputs {
-            coordination,
-            transaction: &ctx.env.transaction,
-            candidate_id,
-            placement: &placement,
-            policy: &self.policy,
-            clock: &*self.clock,
-            runtime_held: ctx.leases.runtime.is_some(),
-        })
+        let runtime_held = ctx.leases.runtime.is_some();
+        let mut launcher = ProcessLauncher {
+            runtime: &mut ctx.leases.runtime,
+            timing: StopTiming::default(),
+        };
+        apply_and_settle(
+            &ApplyInputs {
+                coordination,
+                transaction: &env.transaction,
+                candidate_id,
+                placement: &placement,
+                policy: &self.policy,
+                clock: &*self.clock,
+                runtime_held,
+            },
+            &mut launcher,
+        )
     }
 
     fn recover(&mut self, ctx: &RecoverContext<'_>) -> Result<RecoveryReport> {
@@ -950,7 +967,7 @@ mod tests {
     }
 
     impl HelperBackend for Spy {
-        fn apply(&mut self, ctx: &ApplyContext<'_>) -> Result<()> {
+        fn apply(&mut self, ctx: &mut ApplyContext<'_>) -> Result<()> {
             assert!(ctx.leases.runtime.is_some(), "apply needs the runtime lease");
             assert_eq!(ctx.candidate_id, Some("cand"));
             self.applied += 1;
@@ -1182,7 +1199,7 @@ mod tests {
             .try_acquire(LeaseKind::Startup, &[&transaction])
             .unwrap()
             .unwrap();
-        let leases = HeldLeases {
+        let mut leases = HeldLeases {
             transaction,
             startup,
             runtime: None,
@@ -1194,10 +1211,10 @@ mod tests {
         // Neither a missing nor a path-like candidate id reaches the disk.
         for id in [None, Some("cand"), Some("../../escape")] {
             let err = backend
-                .apply(&ApplyContext {
+                .apply(&mut ApplyContext {
                     env: &env,
                     candidate_id: id,
-                    leases: &leases,
+                    leases: &mut leases,
                 })
                 .unwrap_err();
             assert_eq!(err.code, ErrorCode::IdentityMismatch, "{id:?}");
@@ -1206,10 +1223,10 @@ mod tests {
         // coordination directory; the temporary directory has none.
         let well_formed = "a".repeat(64);
         let err = backend
-            .apply(&ApplyContext {
+            .apply(&mut ApplyContext {
                 env: &env,
                 candidate_id: Some(well_formed.as_str()),
-                leases: &leases,
+                leases: &mut leases,
             })
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);

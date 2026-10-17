@@ -21,10 +21,12 @@
 //! [`crate::apply`] run. The engine writes each intent durably before touching
 //! a file and replaces `hane.exe` last.
 //!
-//! Not here: the macOS bundle swap, the limited-health child and the durable
-//! commit. Without them no update may be reported as applied, so
-//! [`apply_and_settle`] returns the install to the old version before it
-//! reports back.
+//! After the files are replaced, [`apply_and_settle`] starts the limited-health
+//! child through a [`HealthLauncher`] (see [`crate::health`]) and reports an
+//! applied update only once the journal is durably `Committed`; every other end
+//! has restored the old version or stopped as `RecoveryRequired`.
+//!
+//! Not here: the macOS bundle swap. It is never connected to this path.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -36,6 +38,7 @@ use crate::catalog::{VerifyContext, verify_catalog};
 use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{FileSeenStore, hash_regular_file, read_limited};
+use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, conclude_with_child};
 use crate::identity::{ApplyPlan, SignedInventory, TransactionId};
 use crate::journal::{
     DurableJournal, FileJournalStore, FsDiskView, UpdateJournal, check_plan_preconditions,
@@ -52,6 +55,7 @@ pub const CANDIDATE_DIR: &str = "candidate";
 pub const CANDIDATE_CATALOG: &str = "catalog.json";
 pub const CANDIDATE_SIGNATURE: &str = "catalog.sig";
 pub const CANDIDATE_ARCHIVE: &str = "archive.zip";
+const CHILD_EXE: &str = "hane.exe";
 const STAGE_DIR: &str = "stage";
 const BACKUP_DIR: &str = "backup";
 
@@ -137,8 +141,9 @@ impl ParentProcess for RuntimeHeld {
     }
 }
 
-/// No limited-health child exists in this increment. Holding the runtime
-/// lease exclusively already proves that no Hane process is alive.
+/// Stands in while no limited-health child exists (before one is started, and
+/// when a pending journal is recovered): holding the runtime lease exclusively
+/// already proves that no Hane process is alive.
 pub(crate) struct NoChild;
 
 impl HealthChild for NoChild {
@@ -339,37 +344,94 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     }
 }
 
-/// The helper's whole apply step for this increment. There is no limited-health
-/// child or durable commit yet, so the replaced files are rolled back at once
-/// and the call never reports an applied update.
-pub fn apply_and_settle(inputs: &ApplyInputs<'_>) -> Result<()> {
+/// The executable the limited-health child is started from, re-verified
+/// against the current signed inventory after the files were replaced.
+struct ChildTarget {
+    exe: PathBuf,
+    version: String,
+}
+
+fn verified_child(placement: &Placement, policy: &TrustPolicy) -> Result<ChildTarget> {
+    let installed = read_installed_inventory(&placement.install_root, policy)?;
+    let inventory = installed.inventory();
+    let owned = inventory
+        .files
+        .iter()
+        .find(|file| file.path == CHILD_EXE)
+        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the inventory does not own hane.exe"))?;
+    let exe = placement.install_root.join(CHILD_EXE);
+    let (size, sha256) = hash_regular_file(&exe)?
+        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "hane.exe is missing"))?;
+    if size != owned.size || sha256 != owned.sha256 {
+        return Err(UpdateError::new(
+            ErrorCode::HashMismatch,
+            "hane.exe differs from the signed inventory",
+        ));
+    }
+    Ok(ChildTarget {
+        exe,
+        version: inventory.version.clone(),
+    })
+}
+
+/// The helper's whole apply step. After the files are replaced the limited
+/// child is started and judged: only a verified `Healthy` from this
+/// transaction's own child lets the journal reach a durable `Committed`
+/// (`Ok`). Every other end has stopped the child and restored the old files,
+/// or has stopped as `RecoveryRequired`; none of them is reported as applied.
+pub fn apply_and_settle(inputs: &ApplyInputs<'_>, launcher: &mut dyn HealthLauncher) -> Result<()> {
     let mut applied = apply_owned_files(inputs)?;
-    let outcome = apply::conclude_health(&mut applied.journal, &mut applied.ops, &mut NoChild, false)?;
-    Err(match outcome {
-        HealthOutcome::RolledBack => UpdateError::new(
-            ErrorCode::NotApplicable,
-            "limited health and durable commit are not connected yet; the files were restored",
+    let mut child = match verified_child(inputs.placement, inputs.policy) {
+        Ok(target) => launcher.launch(&LaunchRequest {
+            exe: &target.exe,
+            version: &target.version,
+            candidate_id: inputs.candidate_id,
+            coordination: inputs.coordination,
+            transaction: inputs.transaction,
+        }),
+        Err(err) => launcher.failed(
+            err,
+            &LaunchFailure {
+                candidate_id: inputs.candidate_id,
+                coordination: inputs.coordination,
+                transaction: inputs.transaction,
+            },
         ),
-        HealthOutcome::RecoveryRequired(why) => UpdateError::new(
+    };
+    let settled = conclude_with_child(
+        &mut applied.journal,
+        &mut applied.ops,
+        &mut *child,
+        launcher.health_timeout(),
+    )?;
+    match settled.outcome {
+        HealthOutcome::Committed => Ok(()),
+        HealthOutcome::RolledBack => Err(settled.reason.unwrap_or_else(|| {
+            UpdateError::new(
+                ErrorCode::NotApplicable,
+                "the new version did not report healthy; the files were restored",
+            )
+        })),
+        HealthOutcome::RecoveryRequired(why) => Err(UpdateError::new(
             ErrorCode::InstallModified,
             format!("recovery is required: {why}"),
-        ),
-        HealthOutcome::Committed => UpdateError::new(
-            ErrorCode::TransitionInvalid,
-            "an unhealthy conclusion cannot commit",
-        ),
-    })
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
+    use std::rc::Rc;
+    use std::time::Duration;
 
     use super::*;
     use crate::catalog::record_seen;
+    use crate::health::LimitedChild;
     use crate::identity::{InstallFacts, InstallId};
     use crate::trust::SeenCatalog;
-    use crate::journal::{Phase, StepState};
+    use crate::journal::{JournalStore, Phase, StepState};
     use crate::testing::{
         FixedClock, TempDir, WindowsRelease, default_payload, test_now, test_policy, windows_release,
     };
@@ -558,15 +620,189 @@ mod tests {
         }
     }
 
+    /// What the fake limited child saw and was asked to do.
+    #[derive(Default)]
+    struct Probe {
+        stops: Cell<usize>,
+        commits: Cell<usize>,
+        phase_at_commit: RefCell<Option<Phase>>,
+        launched: RefCell<Option<(PathBuf, String, String)>>,
+    }
+
+    struct FakeChild {
+        health: Result<()>,
+        stop: Result<()>,
+        journal_path: PathBuf,
+        /// Created while the child is judged, so the next journal write fails.
+        sabotage: Option<PathBuf>,
+        probe: Rc<Probe>,
+    }
+
+    impl LimitedChild for FakeChild {
+        fn await_healthy(&mut self, _timeout: Duration) -> Result<()> {
+            if let Some(path) = &self.sabotage {
+                fs::create_dir(path).unwrap();
+            }
+            self.health.clone()
+        }
+
+        fn send_commit(&mut self) -> Result<()> {
+            self.probe.commits.set(self.probe.commits.get() + 1);
+            let stored = FileJournalStore::new(self.journal_path.clone()).load().unwrap().unwrap();
+            *self.probe.phase_at_commit.borrow_mut() = Some(stored.phase);
+            Ok(())
+        }
+
+        fn as_health_child(&mut self) -> &mut dyn HealthChild {
+            self
+        }
+    }
+
+    impl HealthChild for FakeChild {
+        fn stop_and_release_lease(&mut self) -> Result<()> {
+            self.probe.stops.set(self.probe.stops.get() + 1);
+            self.stop.clone()
+        }
+    }
+
+    struct FakeLauncher {
+        health: Result<()>,
+        stop: Result<()>,
+        sabotage: Option<PathBuf>,
+        journal_path: PathBuf,
+        probe: Rc<Probe>,
+    }
+
+    impl FakeLauncher {
+        fn new(fx: &Fixture, health: Result<()>) -> Self {
+            Self {
+                health,
+                stop: Ok(()),
+                sabotage: None,
+                journal_path: fx.journal_path(),
+                probe: Rc::new(Probe::default()),
+            }
+        }
+
+        fn child(&self, health: Result<()>) -> Box<dyn LimitedChild> {
+            Box::new(FakeChild {
+                health,
+                stop: self.stop.clone(),
+                journal_path: self.journal_path.clone(),
+                sabotage: self.sabotage.clone(),
+                probe: Rc::clone(&self.probe),
+            })
+        }
+    }
+
+    impl HealthLauncher for FakeLauncher {
+        fn launch(&mut self, request: &LaunchRequest<'_>) -> Box<dyn LimitedChild> {
+            *self.probe.launched.borrow_mut() = Some((
+                request.exe.to_path_buf(),
+                request.version.to_owned(),
+                request.candidate_id.to_owned(),
+            ));
+            self.child(self.health.clone())
+        }
+
+        fn failed(&mut self, error: UpdateError, _request: &LaunchFailure<'_>) -> Box<dyn LimitedChild> {
+            self.child(Err(error))
+        }
+
+        fn health_timeout(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+    }
+
+    fn stored_phase(fx: &Fixture) -> Phase {
+        FileJournalStore::new(fx.journal_path()).load().unwrap().unwrap().phase
+    }
+
     #[test]
-    fn applying_without_health_and_commit_restores_the_old_version() {
+    fn a_healthy_child_commits_durably_and_only_then_hears_commit() {
         let fx = fixture();
-        let err = apply_and_settle(&fx.inputs()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotApplicable);
-        assert!(fx.unchanged(), "the old files must be back byte for byte");
-        let journal = FileJournalStore::new(fx.journal_path());
-        let stored = crate::journal::JournalStore::load(&journal).unwrap().unwrap();
-        assert_eq!(stored.phase, Phase::RolledBack);
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+
+        assert_eq!(stored_phase(&fx), Phase::Committed);
+        let probe = &launcher.probe;
+        assert_eq!(probe.commits.get(), 1);
+        assert_eq!(
+            *probe.phase_at_commit.borrow(),
+            Some(Phase::Committed),
+            "Commit is sent only after the journal is durably Committed"
+        );
+        assert_eq!(probe.stops.get(), 0);
+        // The new version is kept, and the child came from the signed inventory.
+        let after = snapshot(&fx.placement.install_root);
+        assert_eq!(after["hane.exe"], format!("hane.exe {NEW}").into_bytes());
+        let launched = probe.launched.borrow().clone().unwrap();
+        assert_eq!(launched.0, fx.placement.install_root.join("hane.exe"));
+        assert_eq!(launched.1, NEW);
+        assert_eq!(launched.2, fx.candidate_id);
+    }
+
+    #[test]
+    fn a_timeout_crash_or_rejected_health_stops_the_child_and_restores_the_old_version() {
+        for code in [ErrorCode::Timeout, ErrorCode::Truncated, ErrorCode::IdentityMismatch] {
+            let fx = fixture();
+            let mut launcher = FakeLauncher::new(&fx, Err(UpdateError::new(code, "no health")));
+            let err = apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+            assert_eq!(err.code, code);
+            assert!(fx.unchanged(), "{code:?}: the old files must be back byte for byte");
+            assert_eq!(stored_phase(&fx), Phase::RolledBack, "{code:?}");
+            assert_eq!(launcher.probe.stops.get(), 1, "{code:?}");
+            assert_eq!(launcher.probe.commits.get(), 0, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_stopped_or_leaves_the_lease_blocks_rollback() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Err(UpdateError::new(ErrorCode::Timeout, "no health")));
+        launcher.stop = Err(UpdateError::new(ErrorCode::Timeout, "the runtime lease is still held"));
+        let err = apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(stored_phase(&fx), Phase::RecoveryRequired);
+        assert_eq!(launcher.probe.stops.get(), 1);
+        assert_eq!(launcher.probe.commits.get(), 0);
+        // Nothing was written over the install: the new files are still there.
+        let after = snapshot(&fx.placement.install_root);
+        assert_eq!(after["hane.exe"], format!("hane.exe {NEW}").into_bytes());
+        assert!(!fx.unchanged());
+    }
+
+    #[test]
+    fn a_commit_that_cannot_be_made_durable_never_reaches_the_child() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        // A directory where the journal's scratch file goes: every journal
+        // write fails from the moment the child is judged.
+        launcher.sabotage = Some(
+            fx.coordination
+                .transaction_dir(&fx.transaction)
+                .join(".journal.json.tmp"),
+        );
+        assert!(apply_and_settle(&fx.inputs(), &mut launcher).is_err());
+        assert_eq!(launcher.probe.commits.get(), 0, "no Commit, so no normal startup");
+        assert_eq!(launcher.probe.stops.get(), 1, "the child is stopped, not released");
+        assert_ne!(stored_phase(&fx), Phase::Committed);
+    }
+
+    #[test]
+    fn an_unverifiable_child_executable_is_never_started() {
+        let fx = fixture();
+        drop(apply_owned_files(&fx.inputs()).unwrap());
+        // The executable matches the signed inventory it was installed with.
+        let target = verified_child(&fx.placement, &fx.policy).unwrap();
+        assert_eq!(target.version, NEW);
+        assert_eq!(target.exe, fx.placement.install_root.join("hane.exe"));
+        // A policy that does not trust the inventory, or a swapped executable,
+        // is refused before anything is started.
+        assert!(verified_child(&fx.placement, &TrustPolicy::production()).is_err());
+        fs::write(fx.placement.install_root.join("hane.exe"), b"swapped").unwrap();
+        let err = verified_child(&fx.placement, &fx.policy).err().unwrap();
+        assert_eq!(err.code, ErrorCode::HashMismatch);
     }
 
     #[test]

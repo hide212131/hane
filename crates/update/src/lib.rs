@@ -36,6 +36,7 @@ pub mod clock;
 pub mod download;
 pub mod error;
 pub mod fsutil;
+pub mod health;
 pub mod helper;
 pub mod identity;
 pub mod journal;

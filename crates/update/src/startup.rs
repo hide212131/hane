@@ -39,6 +39,14 @@ pub struct RuntimeGuard {
     _lease: Lease,
 }
 
+impl RuntimeGuard {
+    /// Only the limited-health child, after the durable commit, builds one
+    /// without passing the gate (see [`crate::health`]).
+    pub(crate) fn new(lease: Lease) -> Self {
+        Self { _lease: lease }
+    }
+}
+
 #[derive(Debug)]
 pub enum GateOutcome {
     /// Start normally. The guard must be kept alive until the process ends.

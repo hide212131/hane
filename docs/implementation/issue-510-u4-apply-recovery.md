@@ -4,15 +4,25 @@
 採用済み設計: `docs/adr/0034-zip-application-updates.md`、`docs/application-update-implementation-spec.md`、`docs/application-update-implementation-handoff.md`
 前段の実装: [#512 U0/U1/U3](https://github.com/hide212131/hane/pull/512)
 準備時の基点: `f9da614d93158fba95b5939ffdb44c67f06b8657`（#512 head）
-状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）と increment 2（Windows x64 所有ファイル適用のhelper接続）をコードに追加済み。macOS bundle swap、限定health起動、durable commit、実OSでの二版適用は未実施で、「再起動して更新」は有効化していない。
+状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）、increment 2（Windows x64 所有ファイル適用のhelper接続）、increment 3（限定health起動とdurable commit/rollback）をコードに追加済み。macOS bundle swap、実OSでの二版適用は未実施で、「再起動して更新」は有効化していない。
+
+### Increment 3: 限定health起動とdurable commit（`crates/update/src/health.rs`）
+
+- helperは所有ファイル置換後に排他runtime leaseだけを解放し、`transaction`と`startup`はcommit/rollback完了まで保持する。新版`hane.exe`は現在の署名済みinventoryが所有するfileとして再検証（hash・版）してから、引数なし・空環境・pipe stdioのみで起動する。
+- 限定起動の入口は、所有者限定のtransaction directoryにhelperが置く一回限りのcapability file（nonce、helper pid、InstallId、TransactionId、候補ID、版）だけである。公開CLI flag、任意path/command、一般環境変数では入れない。childはOS上のparent pidがcapabilityのhelper pidと一致し、helperが`transaction` leaseを保持し、実行中の版がcapabilityの版と一致する場合だけcapabilityをrenameで一度だけ取得し、共有runtime leaseを取る。一致しない通常起動は従来どおりstartup gateを通る（gateを迂回できない）。
+- childは通常editor・AI・autosave・migration・open requestを開始せず（`update_gate::enter`内で待機）、read-onlyの確認後に`Healthy`（InstallId、TransactionId、候補ID、版、自身のpid）をprivate pipeへ送り、`Commit`を待つ。
+- helperは45秒以内に、そのtransactionのspawnした実child（nonce、全識別子、OSが返したpid）からの`Healthy`だけを受理する。受理後に`Committed`をdurableに書き、成功した場合だけ`Commit`を送る。書込失敗ならchildへ通知せずrollbackへ進む。helperが`Commit`送信前に死んだ場合、childは同じtransactionの`Committed`がjournalにdurableに残っているときだけ続行する。
+- 起動失敗、timeout、crash、wrong/stale identity、malformed/cut IPC、health拒否ではchildのpipeを閉じ、猶予後にhelper自身のchild handleで終了させ、OSの終了確認と排他runtime leaseの再取得（解放確認）を待ってから旧fileへrollbackする。終了またはlease解放を確認できなければrollbackを始めず`RecoveryRequired`にし、更新成功として返さない。
+- macOSは`PlatformBackend::apply`が引き続き`NotApplicable`で拒否し、新しい成功経路へ接続されない。
+- 未実施・既知の制約: 成功後に続行するchildは空環境で起動されるため、`HANE_STATE_DIR`等の検証済みstate rootの明示的な引き渡しは別増分で扱う（再起動UIは未接続）。read-onlyの設定/ticket検査は`ChildSession::run`のcheck closureに接続する余地を残しており、現時点では検査内容を持たない。実Windowsでの二版適用証拠（U5）、設定画面の再起動UI、macOSは対象外。
 
 ### Increment 2: Windows所有ファイル適用（`crates/update/src/windows_apply.rs`）
 
 - アプリは `prepare_restart` で、Ready候補のcatalog・署名・archiveだけを `Coordination::transaction_dir/<TransactionId>/candidate/` へcopyする。helperのprotocolには候補ID以外を追加していない（任意のsource/destination path、CLI引数、環境変数、commandなし）。
 - helperは親終了後に排他的runtime leaseを取ってから、自分の位置から導出した `Coordination` と `find_install` で配置を決め、現在のsigned inventory、候補catalog/署名（候補IDと照合）、archive hash、archive検査と展開（`stage/`）、新inventoryを独立して再検証する。適用planは署名確認済みinventory同士から `ApplyPlan::for_inventories` で作り、precondition違反は書込み前に停止する。
 - journal intentをdurable化してから既存の `apply::apply` で所有ファイルだけを置換し、`hane.exe` は最後になる。inventory外のfile、user state、Explorer登録、版別shell DLLは変更しない。曖昧なhashや壊れたbackupは既存engineがRecoveryRequiredにする。
-- 限定healthとdurable commitがないため、`apply_and_settle` は置換後に直ちに旧版へ戻し、`NotApplicable` を返す。成功を返す経路はなく、再起動ボタンへも接続していない。
-- 未実施: macOS bundle swap、限定health child、durable commit、restart UI有効化、実Windowsでの二版適用証拠（U5）。ここまでの検証はfake/temp directoryによるunit testのみで、実OSのpower-loss耐性は主張しない。
+- increment 2 時点では限定healthとdurable commitがなく、`apply_and_settle` は置換後に直ちに旧版へ戻していた。increment 3 で限定health childとdurable commitに接続した（下記）。再起動ボタンへは接続していない。
+- 未実施: macOS bundle swap、restart UI有効化、実Windowsでの二版適用証拠（U5）。ここまでの検証はfake/temp directoryによるunit testのみで、実OSのpower-loss耐性は主張しない。
 
 ## 目的
 

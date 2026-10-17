@@ -109,6 +109,18 @@ pub enum Body {
         transaction_id: String,
     },
     Abort,
+    // limited-health child -> helper (private inherited pipes, see `health`)
+    Healthy {
+        install_id: String,
+        transaction_id: String,
+        candidate_id: String,
+        version: String,
+        child_pid: u32,
+    },
+    // helper -> limited-health child, only after `Committed` is durable
+    Commit {
+        transaction_id: String,
+    },
     // helper -> application
     Prepared {
         install_id: String,

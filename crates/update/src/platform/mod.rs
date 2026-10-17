@@ -8,8 +8,8 @@
 //! still works there, it just never offers an update.
 //!
 //! The Windows file-set replacement lives in `windows_apply` and is driven by
-//! the helper. Not here yet: macOS `RENAME_SWAP`, the limited-health child and
-//! the durable commit.
+//! the helper, and the limited-health child and durable commit in `health`.
+//! Not here yet: macOS `RENAME_SWAP`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
