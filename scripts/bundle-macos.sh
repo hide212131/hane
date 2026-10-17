@@ -53,6 +53,21 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>md</string>
+      </array>
+      <key>CFBundleTypeName</key>
+      <string>Markdown Document</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+    </dict>
+  </array>
   <key>CFBundleDisplayName</key>
   <string>Hane</string>
   <key>CFBundleExecutable</key>
@@ -71,6 +86,35 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 /usr/bin/plutil -lint "$bundle/Contents/Info.plist" >/dev/null
+
+# Finder lists Hane under "Open With" only for the document types declared
+# here. Hane must offer exactly `.md` (not generic text) and must stay an
+# alternate handler so the user, not the bundle, chooses the default app.
+plist_buddy=/usr/libexec/PlistBuddy
+info_plist="$bundle/Contents/Info.plist"
+plist_value() {
+  "$plist_buddy" -c "Print :$1" "$info_plist" 2>/dev/null
+}
+if [[ "$(plist_value CFBundleDocumentTypes:0:CFBundleTypeExtensions:0)" != "md" ]]; then
+  echo "Info.plist must declare the md document type" >&2
+  exit 1
+fi
+if plist_value CFBundleDocumentTypes:0:CFBundleTypeExtensions:1 >/dev/null; then
+  echo "Info.plist must declare only the md extension" >&2
+  exit 1
+fi
+if plist_value CFBundleDocumentTypes:1 >/dev/null; then
+  echo "Info.plist must declare only one document type" >&2
+  exit 1
+fi
+if plist_value CFBundleDocumentTypes:0:LSItemContentTypes >/dev/null; then
+  echo "Info.plist must not claim generic content types" >&2
+  exit 1
+fi
+if [[ "$(plist_value CFBundleDocumentTypes:0:LSHandlerRank)" != "Alternate" ]]; then
+  echo "Info.plist document type must use LSHandlerRank Alternate" >&2
+  exit 1
+fi
 
 touch "$bundle"
 echo "Built: $bundle"
