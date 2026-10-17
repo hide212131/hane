@@ -273,7 +273,7 @@ pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -
         .join(HELPER_FILE_NAME);
     let present = hash_regular_file(&staged)?
         .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"))?;
-    if FileIdentity { size: present.0, sha256: present.1 } != identity {
+    if (FileIdentity { size: present.0, sha256: present.1 }) != identity {
         return Err(UpdateError::new(
             ErrorCode::HashMismatch,
             "the staged helper differs from its recorded identity",
