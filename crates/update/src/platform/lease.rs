@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::identity::{InstallId, TransactionId};
+use crate::platform::acl;
 
 pub const TRANSACTION_LOCK: &str = "transaction.lock";
 pub const STARTUP_LOCK: &str = "startup.lock";
@@ -86,13 +87,15 @@ fn refuse(detail: impl Into<String>) -> UpdateError {
     UpdateError::new(ErrorCode::UnsupportedInstall, detail)
 }
 
-/// Accepts only a real directory: a link or a file with the name is never adopted.
+/// Accepts only a real directory owned by the current principal and not
+/// writable by anyone else: a link, a file, or a directory another user
+/// created first is never adopted.
 fn require_plain_dir(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(refuse(format!("{} is not a plain directory", path.display())));
     }
-    Ok(())
+    acl::verify(path, true)
 }
 
 #[cfg(unix)]
@@ -108,7 +111,15 @@ fn create_dir(path: &Path, _mode: u32) -> io::Result<()> {
 
 fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
     match create_dir(path, mode) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Restrict first, then confirm; a directory that cannot be made
+            // private is removed so it is not left for a later adoption.
+            let secured = acl::secure_new(path, true, mode).and_then(|()| acl::verify(path, true));
+            if secured.is_err() {
+                let _ = fs::remove_dir(path);
+            }
+            secured
+        }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => require_plain_dir(path),
         Err(err) => Err(err.into()),
     }
@@ -162,7 +173,12 @@ impl Coordination {
         let name = dir.file_name().and_then(|n| n.to_str()).ok_or_else(bad)?;
         let id = name.strip_prefix(".hane-update-").ok_or_else(bad)?;
         let install_id = InstallId::parse(id).map_err(|_| bad())?;
-        require_plain_dir(dir)?;
+        // The whole chain from the root to the running copy must be ours and
+        // closed to other writers before the helper trusts its own location.
+        for checked in [dir, private, txn_dir, helper_dir] {
+            require_plain_dir(checked)?;
+        }
+        acl::verify(exe, false)?;
         Ok((
             Self {
                 dir: dir.to_path_buf(),
@@ -182,6 +198,7 @@ impl Coordination {
 
     /// `private/` exists with owner-only permission; created on first use.
     pub fn private_dir(&self) -> Result<PathBuf> {
+        require_plain_dir(&self.dir)?;
         let private = self.dir.join(PRIVATE_DIR);
         ensure_dir(&private, 0o700)?;
         Ok(private)
@@ -207,27 +224,32 @@ impl Coordination {
 
     fn open_lock(&self, kind: LeaseKind) -> Result<File> {
         let path = self.dir.join(kind.file_name());
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
-                return Err(refuse(format!("{} is not a regular lock file", path.display())));
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
+        // The root is re-checked so a directory swapped after `create` is not trusted.
+        require_plain_dir(&self.dir)?;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o644);
         }
         match options.open(&path) {
-            Ok(file) => Ok(file),
-            // Another user's ordinary launch can read the lock file but not
-            // write it; a read handle is enough to take the lock.
-            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                Ok(OpenOptions::new().read(true).open(&path)?)
+            Ok(file) => {
+                match acl::secure_new(&path, false, 0o644).and_then(|()| acl::verify(&path, false)) {
+                    Ok(()) => Ok(file),
+                    Err(err) => {
+                        drop(file);
+                        let _ = fs::remove_file(&path);
+                        Err(err)
+                    }
+                }
+            }
+            // An existing lock file is used only when it is a plain file of ours
+            // that nobody else can write. There is no read-only fallback: a
+            // lock this principal cannot write is not shared with.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                acl::verify(&path, false)?;
+                Ok(OpenOptions::new().read(true).write(true).open(&path)?)
             }
             Err(err) => Err(err.into()),
         }
@@ -403,10 +425,13 @@ mod tests {
         let dir = TempDir::new("lease-helper-path");
         let coord = coordination(&dir);
         let txn = TransactionId::generate().unwrap();
-        let exe = coord
-            .transaction_dir(&txn)
-            .join(HELPER_DIR)
-            .join("hane-updater");
+        let exe = coord.ensure_helper_dir(&txn).unwrap().join("hane-updater");
+        std::fs::write(&exe, b"helper").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let (derived, derived_txn) = Coordination::from_helper_exe(&exe).unwrap();
         assert_eq!(derived.install_id(), &install_id());
         assert_eq!(derived_txn, txn);
@@ -415,6 +440,40 @@ mod tests {
         assert!(Coordination::from_helper_exe(&elsewhere).is_err());
         let wrong_dir = coord.dir().join(PRIVATE_DIR).join("not-a-txn").join(HELPER_DIR).join("x");
         assert!(Coordination::from_helper_exe(&wrong_dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_entry_open_to_other_writers_is_not_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        let dir = TempDir::new("lease-open-root");
+        let id = install_id();
+        let root = dir.path().join(id.coordination_dir_name());
+        std::fs::create_dir(&root).unwrap();
+        mode(&root, 0o777);
+        assert_eq!(
+            Coordination::create(dir.path(), &id).unwrap_err().code,
+            ErrorCode::UnsupportedInstall
+        );
+        assert!(Coordination::open_existing(dir.path(), &id).is_err());
+
+        let other = TempDir::new("lease-open-private");
+        let coord = coordination(&other);
+        let private = coord.private_dir().unwrap();
+        mode(&private, 0o770);
+        assert!(coord.private_dir().is_err());
+        assert!(coord.ensure_helper_dir(&TransactionId::generate().unwrap()).is_err());
+        mode(&private, 0o700);
+
+        let lock = coord.dir().join(RUNTIME_LOCK);
+        std::fs::write(&lock, b"").unwrap();
+        mode(&lock, 0o666);
+        let err = coord.try_acquire(LeaseKind::RuntimeShared, &[]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
     }
 
     /// Runs only as the re-executed child of the real-process test below.

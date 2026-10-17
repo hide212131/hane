@@ -20,6 +20,7 @@ use crate::identity::{FileIdentity, InstallId, TransactionId};
 use crate::limits::MAX_ENTRY_BYTES;
 use crate::model::Target;
 
+pub(crate) mod acl;
 pub mod lease;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -168,10 +169,11 @@ pub fn stage_helper_copy(
     let dir = coordination.ensure_helper_dir(transaction)?;
     let dest = dir.join(HELPER_FILE_NAME);
     durable_write(&dest, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o700))?;
+    // The copy must be owned by this principal and writable by nobody else
+    // before it is hashed and run; the private subtree keeps it that way.
+    if let Err(err) = acl::secure_new(&dest, false, 0o700).and_then(|()| acl::verify(&dest, false)) {
+        let _ = fs::remove_file(&dest);
+        return Err(err);
     }
     let copied = hash_regular_file(&dest)?.map(|(size, sha256)| FileIdentity { size, sha256 });
     if copied.as_ref() == Some(&source.identity) {

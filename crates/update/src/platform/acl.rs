@@ -1,0 +1,341 @@
+//! Ownership and write-permission checks for the coordination tree.
+//!
+//! Everything under `.hane-update-<InstallId>/` (root, `private/`, the
+//! transaction and helper directories, lock files, the journal and the helper
+//! copy) must belong to the current OS principal and must not be writable by
+//! anyone else. A name that already exists is never adopted on trust: a
+//! predictable path could have been created first by another user. Any
+//! failure to read or set ownership/permissions is a refusal (fail closed),
+//! never "assume it is fine".
+//!
+//! POSIX uses the effective UID and the mode bits. Windows uses the process
+//! token's SID and the object's DACL. `USERNAME`/`USER` are never consulted.
+
+#![allow(unsafe_code, reason = "owner and ACL queries through libc / windows-sys")]
+
+use std::path::Path;
+
+use crate::error::{ErrorCode, Result, UpdateError};
+
+fn refuse(detail: impl Into<String>) -> UpdateError {
+    UpdateError::new(ErrorCode::UnsupportedInstall, detail)
+}
+
+/// Restricts a path this process has just created to the current principal.
+/// `mode` is the POSIX mode; Windows installs an owner-only protected DACL
+/// (inheritable for directories, so files created inside stay owner-only).
+pub(crate) fn secure_new(path: &Path, is_dir: bool, mode: u32) -> Result<()> {
+    imp::secure_new(path, is_dir, mode)
+}
+
+/// Requires a real (non-link) directory or file that is owned by the current
+/// principal and not writable by any other principal.
+pub(crate) fn verify(path: &Path, is_dir: bool) -> Result<()> {
+    imp::verify(path, is_dir)
+}
+
+#[cfg(unix)]
+mod imp {
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
+
+    use super::refuse;
+    use crate::error::Result;
+
+    pub fn secure_new(path: &Path, _is_dir: bool, mode: u32) -> Result<()> {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+
+    pub fn verify(path: &Path, is_dir: bool) -> Result<()> {
+        let meta = fs::symlink_metadata(path)?;
+        let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
+        if meta.file_type().is_symlink() || !kind_ok {
+            return Err(refuse(format!("{} is not a plain entry", path.display())));
+        }
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(refuse(format!(
+                "{} is not owned by the current user",
+                path.display()
+            )));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(refuse(format!(
+                "{} is writable by group or others",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    use std::ffi::c_void;
+    use std::fs;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, AddAccessAllowedAceEx, DACL_SECURITY_INFORMATION,
+        EqualSid, GetAce, GetLengthSid, GetTokenInformation, InitializeAcl, IsValidSid,
+        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use super::refuse;
+    use crate::error::{Result, UpdateError};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const TOKEN_USER_CLASS: i32 = 1;
+    const TOKEN_OWNER_CLASS: i32 = 4;
+    const WIN_LOCAL_SYSTEM_SID: i32 = 22;
+    const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
+    const ACL_REVISION: u32 = 2;
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const INHERIT_CONTAINER_AND_OBJECT: u32 = 0x3;
+    /// FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_DELETE_CHILD,
+    /// FILE_WRITE_ATTRIBUTES, DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE and
+    /// GENERIC_ALL.
+    const WRITE_MASK: u32 =
+        0x0002 | 0x0004 | 0x0010 | 0x0040 | 0x0100 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000
+            | 0x4000_0000
+            | 0x1000_0000;
+    /// Allow-type ACEs this check does not interpret (compound, object,
+    /// callback): refused rather than guessed at.
+    const OPAQUE_ALLOW_TYPES: [u8; 4] = [4, 5, 9, 11];
+
+    fn failure(what: &str) -> UpdateError {
+        refuse(format!("{what} could not be determined"))
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    /// A security descriptor allocated by the system.
+    struct Local(*mut c_void);
+
+    impl Drop for Local {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer came from a security-info call that
+                // documents `LocalFree` as the release function.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    /// Copies a SID into DWORD-aligned storage.
+    fn copy_sid(sid: *mut c_void) -> Result<Vec<u32>> {
+        // SAFETY: `sid` points to a SID inside a buffer that is alive here;
+        // validity is checked before the length is read.
+        unsafe {
+            if sid.is_null() || IsValidSid(sid) == 0 {
+                return Err(failure("a security identifier"));
+            }
+            let len = GetLengthSid(sid) as usize;
+            let mut copy = vec![0_u32; len.div_ceil(4)];
+            std::ptr::copy_nonoverlapping(sid.cast::<u8>(), copy.as_mut_ptr().cast::<u8>(), len);
+            Ok(copy)
+        }
+    }
+
+    fn sid_ptr(sid: &[u32]) -> *mut c_void {
+        sid.as_ptr() as *mut c_void
+    }
+
+    fn same_sid(a: *mut c_void, b: &[u32]) -> bool {
+        // SAFETY: both pointers refer to valid SIDs held by the caller.
+        unsafe { EqualSid(a, sid_ptr(b)) != 0 }
+    }
+
+    /// The process token's user SID (class 1) or default owner SID (class 4).
+    /// Both token structures start with the SID pointer.
+    fn token_sid(class: i32) -> Result<Vec<u32>> {
+        let mut token = std::ptr::null_mut();
+        // SAFETY: `token` is a live out-pointer; the pseudo handle needs no close.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(failure("the process token"));
+        }
+        let mut needed = 0_u32;
+        // SAFETY: a null buffer of length 0 asks only for the required size.
+        unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed) };
+        let result = if needed == 0 {
+            Err(failure("the process token"))
+        } else {
+            let mut buffer = vec![0_u64; (needed as usize).div_ceil(8)];
+            // SAFETY: the buffer is `buffer.len() * 8` bytes, 8-byte aligned.
+            let ok = unsafe {
+                GetTokenInformation(
+                    token,
+                    class,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                    &mut needed,
+                )
+            };
+            if ok == 0 {
+                Err(failure("the process token"))
+            } else {
+                // SAFETY: on success the buffer begins with a SID pointer.
+                let sid = unsafe { *buffer.as_ptr().cast::<*mut c_void>() };
+                copy_sid(sid)
+            }
+        };
+        // SAFETY: `token` was opened above and is closed exactly once.
+        unsafe { CloseHandle(token) };
+        result
+    }
+
+    fn well_known(sid: *mut c_void, kind: i32) -> bool {
+        // SAFETY: `sid` is a valid SID.
+        unsafe { IsWellKnownSid(sid, kind) != 0 }
+    }
+
+    pub fn secure_new(path: &Path, is_dir: bool, _mode: u32) -> Result<()> {
+        let user = token_sid(TOKEN_USER_CLASS)?;
+        let mut acl = vec![0_u32; 128];
+        let flags = if is_dir { INHERIT_CONTAINER_AND_OBJECT } else { 0 };
+        // SAFETY: `acl` is DWORD-aligned and its byte length is passed; the
+        // SID is a valid copy that outlives the call.
+        let built = unsafe {
+            InitializeAcl(acl.as_mut_ptr().cast(), (acl.len() * 4) as u32, ACL_REVISION) != 0
+                && AddAccessAllowedAceEx(
+                    acl.as_mut_ptr().cast(),
+                    ACL_REVISION,
+                    flags,
+                    FILE_ALL_ACCESS,
+                    sid_ptr(&user),
+                ) != 0
+        };
+        if !built {
+            return Err(failure("an owner-only access list"));
+        }
+        let name = wide(path);
+        // SAFETY: `name` is NUL-terminated; `acl` is an initialized ACL. The
+        // protected flag stops parent ACEs from being inherited.
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl.as_ptr().cast::<ACL>(),
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(refuse(format!(
+                "the access list of {} could not be set",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn verify(path: &Path, is_dir: bool) -> Result<()> {
+        let meta = fs::symlink_metadata(path)?;
+        let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
+        if meta.file_type().is_symlink()
+            || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !kind_ok
+        {
+            return Err(refuse(format!("{} is not a plain entry", path.display())));
+        }
+        let user = token_sid(TOKEN_USER_CLASS)?;
+        let default_owner = token_sid(TOKEN_OWNER_CLASS)?;
+        let name = wide(path);
+        let mut owner: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated and every out-pointer is a live local.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        let _release = Local(descriptor);
+        if rc != 0 {
+            return Err(failure(&format!("the security of {}", path.display())));
+        }
+        // A missing DACL grants everyone full access.
+        if owner.is_null() || dacl.is_null() {
+            return Err(refuse(format!("{} has no owner-only access list", path.display())));
+        }
+        if !same_sid(owner, &user) && !same_sid(owner, &default_owner) {
+            return Err(refuse(format!(
+                "{} is not owned by the current user",
+                path.display()
+            )));
+        }
+        let trusted = |sid: *mut c_void| {
+            same_sid(sid, &user)
+                || same_sid(sid, &default_owner)
+                || well_known(sid, WIN_LOCAL_SYSTEM_SID)
+                || well_known(sid, WIN_BUILTIN_ADMINISTRATORS_SID)
+        };
+        // SAFETY: `dacl` points into the descriptor kept alive by `_release`;
+        // each ACE pointer comes from `GetAce` for an index below the count.
+        unsafe {
+            for index in 0..u32::from((*dacl).AceCount) {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut ace) == 0 || ace.is_null() {
+                    return Err(failure("an access control entry"));
+                }
+                let kind = (*ace.cast::<ACE_HEADER>()).AceType;
+                if OPAQUE_ALLOW_TYPES.contains(&kind) {
+                    return Err(refuse(format!(
+                        "{} has an access entry that cannot be checked",
+                        path.display()
+                    )));
+                }
+                if kind != 0 {
+                    continue;
+                }
+                let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                let sid = std::ptr::addr_of!(allowed.SidStart) as *mut c_void;
+                if allowed.Mask & WRITE_MASK != 0 && !trusted(sid) {
+                    return Err(refuse(format!(
+                        "{} is writable by another principal",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod imp {
+    use std::path::Path;
+
+    use super::refuse;
+    use crate::error::Result;
+
+    pub fn secure_new(_path: &Path, _is_dir: bool, _mode: u32) -> Result<()> {
+        Err(refuse("ownership cannot be checked on this OS"))
+    }
+
+    pub fn verify(_path: &Path, _is_dir: bool) -> Result<()> {
+        Err(refuse("ownership cannot be checked on this OS"))
+    }
+}
