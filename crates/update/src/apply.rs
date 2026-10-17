@@ -130,17 +130,29 @@ fn run_steps<S: JournalStore, O: FileOps>(
     ops: &mut O,
 ) -> Result<()> {
     let steps = journal.journal().steps.clone();
+    // Every backup is made, verified and made durable in the transaction-private
+    // area before the first install or removal, so a backup failure leaves the
+    // install root untouched.
+    for step in &steps {
+        if let (Some(old), Some(backup_rel)) = (&step.old, &step.backup_rel) {
+            ensure_live_old(ops, step)?;
+            ops.backup(&step.rel_path, backup_rel)?;
+            if ops.observe(backup_rel)? != Observed::File(old.clone()) {
+                return Err(UpdateError::new(
+                    ErrorCode::HashMismatch,
+                    format!("backup of {} does not match the installed file", step.rel_path),
+                ));
+            }
+            ensure_live_old(ops, step)?;
+        }
+    }
     for (index, step) in steps.iter().enumerate() {
         // The intent is durable before the file is touched.
         journal.advance_step(index, StepState::Intent)?;
         // The install directory can change between steps, so each path is
         // re-observed against its journaled old identity (absent when the file
-        // is to be added) right before it is backed up, replaced or removed.
+        // is to be added) right before it is replaced or removed.
         ensure_live_old(ops, step)?;
-        if let (Some(_), Some(backup_rel)) = (&step.old, &step.backup_rel) {
-            ops.backup(&step.rel_path, backup_rel)?;
-            ensure_live_old(ops, step)?;
-        }
         match &step.new {
             Some(identity) => ops.install_new(&step.rel_path, identity)?,
             None => ops.remove(&step.rel_path)?,
@@ -558,6 +570,10 @@ mod tests {
         changed: Vec<String>,
         /// External change made right after the 1-based mutation completes.
         inject_after: Option<(usize, String, Vec<u8>)>,
+        /// Backup of this path fails outright.
+        fail_backup_of: Option<String>,
+        /// Backup of this path is written with damaged content.
+        corrupt_backup_of: Option<String>,
     }
 
     impl FakeOps {
@@ -618,7 +634,13 @@ mod tests {
     impl FileOps for FakeOps {
         fn backup(&mut self, rel_path: &str, backup_rel: &str) -> Result<()> {
             self.tick()?;
-            let bytes = self.files.get(rel_path).cloned().ok_or_else(io_error)?;
+            if self.fail_backup_of.as_deref() == Some(rel_path) {
+                return Err(io_error());
+            }
+            let mut bytes = self.files.get(rel_path).cloned().ok_or_else(io_error)?;
+            if self.corrupt_backup_of.as_deref() == Some(rel_path) {
+                bytes = b"damaged".to_vec();
+            }
             self.files.insert(backup_rel.to_string(), bytes);
             self.inject();
             Ok(())
@@ -789,15 +811,15 @@ mod tests {
     fn an_owned_file_changed_between_steps_is_kept_and_stops_later_mutations() {
         let mut journal = new_journal(flaky());
         let mut ops = FakeOps::new();
-        // After a.dll is installed (mutation 2), gone.txt is edited externally.
-        ops.inject_after = Some((2, "gone.txt".to_string(), b"edited".to_vec()));
+        // Three backups come first; after a.dll is installed (mutation 4),
+        // gone.txt is edited externally.
+        ops.inject_after = Some((4, "gone.txt".to_string(), b"edited".to_vec()));
         let mut child = Child::default();
         let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
         assert!(matches!(outcome, ApplyOutcome::RecoveryRequired(_)), "{outcome:?}");
         assert_eq!(ops.files["gone.txt"], b"edited");
-        assert!(!ops.files.contains_key("backup/gone.txt"));
         assert_eq!(ops.files["hane.exe"], OLD_EXE);
-        assert_eq!(ops.mutations, 3);
+        assert_eq!(ops.mutations, 5);
         assert_eq!(ops.changed, ["a.dll", "added.txt"]);
         assert_eq!(journal.journal().phase, Phase::RecoveryRequired);
     }
@@ -806,16 +828,38 @@ mod tests {
     fn an_unknown_file_at_a_planned_addition_is_never_overwritten() {
         let mut journal = new_journal(flaky());
         let mut ops = FakeOps::new();
-        // After a.dll is installed (mutation 2), someone creates added.txt.
-        ops.inject_after = Some((2, "added.txt".to_string(), b"user file".to_vec()));
+        // Three backups come first; after a.dll is installed (mutation 4),
+        // someone creates added.txt.
+        ops.inject_after = Some((4, "added.txt".to_string(), b"user file".to_vec()));
         let mut child = Child::default();
         let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
         assert!(matches!(outcome, ApplyOutcome::RecoveryRequired(_)), "{outcome:?}");
         assert_eq!(ops.files["added.txt"], b"user file");
-        assert_eq!(ops.mutations, 2);
+        assert_eq!(ops.mutations, 4);
         assert_eq!(ops.changed, ["a.dll"]);
         assert_eq!(ops.files["hane.exe"], OLD_EXE);
         assert_eq!(journal.journal().phase, Phase::RecoveryRequired);
+    }
+
+    #[test]
+    fn a_late_backup_failure_leaves_every_install_file_untouched() {
+        for corrupt in [false, true] {
+            let mut journal = new_journal(flaky());
+            let mut ops = FakeOps::new();
+            // hane.exe is the last step with a backup.
+            if corrupt {
+                ops.corrupt_backup_of = Some("hane.exe".to_string());
+            } else {
+                ops.fail_backup_of = Some("hane.exe".to_string());
+            }
+            let mut child = Child::default();
+            let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+            assert!(matches!(outcome, ApplyOutcome::RolledBack(_)), "{outcome:?}");
+            assert!(ops.changed.is_empty(), "corrupt={corrupt}");
+            assert_eq!(ops.non_backup(), original(), "corrupt={corrupt}");
+            assert_eq!(ops.mutations, 3, "corrupt={corrupt}");
+            assert_eq!(journal.journal().phase, Phase::RolledBack);
+        }
     }
 
     #[test]
