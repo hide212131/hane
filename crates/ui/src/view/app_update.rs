@@ -29,6 +29,8 @@ pub enum AppUpdatePhase {
     Downloading,
     Verifying,
     Ready,
+    /// The prepared update is being deleted in the background.
+    Discarding,
     Failed,
     /// Updates cannot be offered by this build at all (for example, no trusted
     /// update key is embedded). Shown with a diagnostic code and no actions.
@@ -72,7 +74,10 @@ impl AppUpdateSnapshot {
         self.restoring
             || matches!(
                 self.phase,
-                AppUpdatePhase::Checking | AppUpdatePhase::Downloading | AppUpdatePhase::Verifying
+                AppUpdatePhase::Checking
+                    | AppUpdatePhase::Downloading
+                    | AppUpdatePhase::Verifying
+                    | AppUpdatePhase::Discarding
             )
     }
 }
@@ -200,6 +205,9 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             model
                 .actions
                 .push((CardAction::DiscardReady, "準備した更新を削除"));
+        }
+        AppUpdatePhase::Discarding => {
+            model.detail = Some("更新を削除しています…".to_owned());
         }
         AppUpdatePhase::Failed => {
             model.detail = Some(format!("{} (診断コード: {code})", failure_text(code)));
@@ -661,6 +669,7 @@ mod tests {
             AppUpdatePhase::Downloading,
             AppUpdatePhase::Verifying,
             AppUpdatePhase::Ready,
+            AppUpdatePhase::Discarding,
             AppUpdatePhase::Failed,
             AppUpdatePhase::Unavailable,
         ] {
@@ -725,6 +734,16 @@ mod tests {
             model.actions,
             vec![(CardAction::Download("cand".to_owned()), "更新をダウンロード")]
         );
+    }
+
+    #[test]
+    fn a_discarding_update_is_busy_and_offers_no_action() {
+        let input = snapshot(AppUpdatePhase::Discarding);
+        assert!(input.is_busy());
+        let model = card_model(&input);
+        assert_eq!(model.detail.as_deref(), Some("更新を削除しています…"));
+        assert!(model.actions.is_empty());
+        assert!(!snapshot(AppUpdatePhase::Ready).is_busy());
     }
 
     #[test]

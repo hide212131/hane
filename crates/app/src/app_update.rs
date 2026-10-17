@@ -772,10 +772,14 @@ impl Inner {
                 describe(&mut snapshot, offer);
                 snapshot.received_bytes = received.load(Ordering::Relaxed);
             }
-            // While the removal runs the candidate is still on disk; repeated
-            // discard clicks are absorbed by the service.
-            Stage::Ready { offer, .. } | Stage::Discarding { offer, .. } => {
+            Stage::Ready { offer, .. } => {
                 snapshot.phase = AppUpdatePhase::Ready;
+                describe(&mut snapshot, offer);
+            }
+            // The removal runs in the background; the UI keeps polling until
+            // the service returns to Idle (or Ready after a failure).
+            Stage::Discarding { offer, .. } => {
+                snapshot.phase = AppUpdatePhase::Discarding;
                 describe(&mut snapshot, offer);
             }
             Stage::Failed { code } => {
@@ -1311,7 +1315,13 @@ mod tests {
         service.discard_ready();
         service.discard_ready();
         assert_eq!(queue.lock().unwrap().len(), 1);
+        // While the removal is queued the UI must see a busy Discarding phase
+        // so it keeps polling until the final state is rendered.
+        let during = service.snapshot();
+        assert_eq!(during.phase, AppUpdatePhase::Discarding);
+        assert!(during.is_busy());
         run_queued(&queue);
+        assert!(!service.snapshot().is_busy());
         assert_eq!(service.snapshot().phase, AppUpdatePhase::Idle);
         assert!(!dir.exists());
     }
