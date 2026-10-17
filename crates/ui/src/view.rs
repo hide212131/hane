@@ -7645,10 +7645,9 @@ mod tests {
         let view =
             gpui::AppContext::new(cx, |cx| EditorView::new(text.as_str(), "Untitled", cx));
         view.update(cx, |view, cx| {
-            let indexed = view.block_at_offset(inside_link).unwrap();
-            let span = block_line_span(view.editor().document(), &indexed).unwrap();
-            view.cached_block(&indexed, &span).unwrap();
-
+            // Pin the caret (and thus block disclosure) to the other block
+            // before the link block is first presented, so the edit below
+            // changes neither the link block's disclosure nor its source.
             let at = SourceOffset(text.find("other").unwrap());
             view.editor_mut()
                 .set_selection(Selection {
@@ -7656,6 +7655,11 @@ mod tests {
                     active: at,
                 })
                 .unwrap();
+
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            view.cached_block(&indexed, &span).unwrap();
+
             view.dispatch(EditorCommand::Insert("x"), cx);
 
             let indexed = view.block_at_offset(inside_link).unwrap();
