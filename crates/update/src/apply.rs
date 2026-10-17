@@ -244,6 +244,13 @@ pub fn recover<S: JournalStore, O: FileOps>(
                     return Ok(require(journal, format!("cannot roll back from {other:?}")));
                 }
             }
+            // Reject the whole rollback before the first write if any step lacks
+            // a durable intent.
+            for action in actions.iter() {
+                if let Err(why) = check_step_state(journal, action_rel_path(action)) {
+                    return Ok(require(journal, why));
+                }
+            }
             for action in actions.iter().rev() {
                 if let Some(why) = perform(journal, ops, action)? {
                     return Ok(require(journal, why));
@@ -290,7 +297,14 @@ fn perform<S: JournalStore, O: FileOps>(
     ops: &mut O,
     action: &RollbackAction,
 ) -> Result<Option<String>> {
-    let rel_path = match action {
+    let rel_path = action_rel_path(action);
+    // Validate the durable step state before any write: a Planned step has no
+    // recorded intent, so whatever is on disk is not ours to overwrite.
+    let (index, state) = match check_step_state(journal, rel_path) {
+        Ok(found) => found,
+        Err(why) => return Ok(Some(why)),
+    };
+    match action {
         RollbackAction::RestoreFromBackup {
             rel_path,
             backup_rel,
@@ -304,35 +318,46 @@ fn perform<S: JournalStore, O: FileOps>(
                 return Ok(Some(format!("backup of {rel_path} is missing or damaged")));
             }
             ops.restore(rel_path, backup_rel, restore)?;
-            rel_path
         }
         RollbackAction::RemoveAdded { rel_path, expected } => {
             if ops.observe(rel_path)? != Observed::File(expected.clone()) {
                 return Ok(Some(format!("{rel_path} changed during recovery")));
             }
             ops.remove(rel_path)?;
-            rel_path
         }
-    };
+    }
+    if matches!(state, StepState::Intent | StepState::Applied) {
+        journal.advance_step(index, StepState::Restored)?;
+    }
+    Ok(None)
+}
+
+fn action_rel_path(action: &RollbackAction) -> &str {
+    match action {
+        RollbackAction::RestoreFromBackup { rel_path, .. }
+        | RollbackAction::RemoveAdded { rel_path, .. } => rel_path,
+    }
+}
+
+/// Finds the journal step for `rel_path`; `Err(why)` when it is unknown or was
+/// never given a recorded intent (so nothing may be written for it).
+fn check_step_state<S: JournalStore>(
+    journal: &DurableJournal<S>,
+    rel_path: &str,
+) -> std::result::Result<(usize, StepState), String> {
     let Some(index) = journal
         .journal()
         .steps
         .iter()
-        .position(|step| &step.rel_path == rel_path)
+        .position(|step| step.rel_path == rel_path)
     else {
-        return Ok(Some(format!("{rel_path} is not part of the journal")));
+        return Err(format!("{rel_path} is not part of the journal"));
     };
     let state = journal.journal().steps[index].state;
-    match state {
-        StepState::Intent | StepState::Applied => {
-            journal.advance_step(index, StepState::Restored)?;
-        }
-        StepState::Restored => {}
-        StepState::Planned => {
-            return Ok(Some(format!("{rel_path} was changed without a recorded intent")));
-        }
+    if state == StepState::Planned {
+        return Err(format!("{rel_path} was changed without a recorded intent"));
     }
-    Ok(None)
+    Ok((index, state))
 }
 
 /// Real-filesystem [`FileOps`]. `root` is the install root, `backup_root` holds
@@ -980,6 +1005,24 @@ mod tests {
         let health = conclude_health(&mut journal, &mut ops, &mut child, false).unwrap();
         assert!(matches!(health, HealthOutcome::RecoveryRequired(_)));
         assert_eq!(ops.files, before);
+    }
+
+    #[test]
+    fn a_planned_step_with_new_bytes_and_a_backup_is_never_written_by_recovery() {
+        // Only the Applying phase is durable; no step intent was recorded.
+        let mut journal = new_journal(flaky());
+        journal.advance_phase(Phase::ExitAuthorized).unwrap();
+        journal.advance_phase(Phase::Applying).unwrap();
+        let mut ops = FakeOps::new();
+        ops.files.insert("a.dll".to_string(), NEW_DLL.to_vec());
+        ops.files.insert("backup/a.dll".to_string(), OLD_DLL.to_vec());
+        let before = ops.files.clone();
+        let mut child = Child::default();
+        let outcome = recover(&mut journal, &mut ops, &mut child).unwrap();
+        assert!(matches!(outcome, RecoveryOutcome::RecoveryRequired(_)));
+        assert_eq!(ops.files, before);
+        assert_eq!(ops.mutations, 0);
+        assert_eq!(journal.journal().phase, Phase::RecoveryRequired);
     }
 
     #[test]
