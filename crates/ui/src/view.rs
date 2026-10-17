@@ -5242,6 +5242,12 @@ impl EditorView {
                 !deltas
                     .iter()
                     .any(|delta| edit_affects_range(*delta, cached.source_range))
+                    // A link's destination may come from a reference
+                    // definition in another block, which an edit outside this
+                    // block's range can change. Rebasing would keep the old
+                    // destination, so present link-bearing blocks again.
+                    && !(cached.lines.iter().any(|line| !line.links.is_empty())
+                        && !deltas.is_empty())
                     && cached.rebase(&deltas, revision)
                     // The rows describe the same text at shifted offsets, so
                     // they move with the block rather than being rebuilt.
@@ -7582,6 +7588,46 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// Issue #502: editing a reference definition in another block must not
+    /// leave a cached link presentation that still opens the old destination.
+    #[gpui::test]
+    fn editing_a_reference_definition_elsewhere_does_not_reuse_stale_link_destination(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const OLD: &str = "https://old.example/";
+        let text = format!("see [Hane][r] end\n\n[r]: {OLD}\n");
+        let inside_link = SourceOffset(text.find("Hane").unwrap() + 1);
+        let view =
+            gpui::AppContext::new(cx, |cx| EditorView::new(text.as_str(), "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            view.cached_block(&indexed, &span).unwrap();
+
+            let at = SourceOffset(text.find("old").unwrap());
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: at,
+                    active: SourceOffset(at.0 + 3),
+                })
+                .unwrap();
+            view.dispatch(EditorCommand::Insert("new"), cx);
+
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let (visual, reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(!reused, "a link-bearing block is presented again");
+            assert!(
+                visual
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.links)
+                    .all(|link| &*link.destination != OLD),
+                "the stale destination must not remain openable"
+            );
+        });
     }
 
     fn relative_luminance(color: u32) -> f32 {
