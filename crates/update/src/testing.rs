@@ -860,12 +860,24 @@ pub fn windows_release_with(
 
 /// GitHub `releases/latest` JSON for a tag with the given asset names.
 pub fn release_json(tag: &str, assets: &[&str], draft: bool, prerelease: bool) -> Vec<u8> {
+    let sized: Vec<(&str, u64)> = assets.iter().map(|name| (*name, 1234)).collect();
+    release_json_sized(tag, &sized, draft, prerelease)
+}
+
+/// Like [`release_json`], with each asset's real byte size so the listing can
+/// agree with a signed catalog (`confirm_selection` compares the archive size).
+pub fn release_json_sized(
+    tag: &str,
+    assets: &[(&str, u64)],
+    draft: bool,
+    prerelease: bool,
+) -> Vec<u8> {
     let assets: Vec<serde_json::Value> = assets
         .iter()
-        .map(|name| {
+        .map(|(name, size)| {
             serde_json::json!({
                 "name": name,
-                "size": 1234,
+                "size": size,
                 "state": "uploaded",
                 "browser_download_url":
                     crate::download::asset_url(tag, name),

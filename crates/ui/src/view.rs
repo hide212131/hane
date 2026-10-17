@@ -93,6 +93,11 @@ use unicode_segmentation::UnicodeSegmentation;
 
 mod ai_prompts;
 mod ai_selection;
+mod app_update;
+pub use app_update::{
+    AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, ExternalOpenOutcome,
+    ExternalOpenQueue, RestartBlocker, RestartObservation, RestartPreparation,
+};
 mod ai_settings;
 mod background_parse;
 mod content_search;
@@ -829,6 +834,21 @@ pub struct EditorView {
     ai_settings: ai_settings::AiSettingsPage,
     ai_prompts: ai_prompts::AiPromptsPage,
     ai_selection: ai_selection::AiSelectionState,
+    /// The app-owned update service handle, if one is attached. The service
+    /// outlives this view; the view only sends explicit user commands to it.
+    app_update: Option<Arc<dyn AppUpdateController>>,
+    /// A card refresh loop is running while the update service is busy.
+    app_update_polling: bool,
+    /// Held only for the synchronous restart check; while set, the shared
+    /// external-open entrance answers `Busy`.
+    restart_freeze: bool,
+    /// Counts paths accepted through the shared external-open entrance, so a
+    /// restart observation can tell an open arrived after it was taken.
+    external_open_generation: u64,
+    /// Save As dialogs currently open (they outlive any single UI turn).
+    save_as_dialogs_open: usize,
+    /// The AI service handle the restart check reads busy state from.
+    restart_ai_service: Option<hane_ai::AiServiceHandle>,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -1670,6 +1690,12 @@ impl EditorView {
             ai_settings: ai_settings::AiSettingsPage::default(),
             ai_prompts: ai_prompts::AiPromptsPage::default(),
             ai_selection: ai_selection::AiSelectionState::default(),
+            app_update: None,
+            app_update_polling: false,
+            restart_freeze: false,
+            external_open_generation: 0,
+            save_as_dialogs_open: 0,
+            restart_ai_service: None,
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
@@ -2178,6 +2204,7 @@ impl EditorView {
             workspace: self.work_folder_generation,
         };
         let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
+        self.save_as_dialogs_open += 1;
         cx.spawn(async move |view, cx| {
             // Collapsed to one small response type before the single entry
             // gate in `handle_save_as_for_close_response` runs, so every
@@ -2193,6 +2220,9 @@ impl EditorView {
                 Err(_) => SaveAsForCloseResponse::Canceled,
             };
             let _ = view.update(cx, |view, cx| {
+                // Released before the instance gate: the dialog is over even
+                // when its answer no longer belongs to any open document.
+                view.save_as_dialogs_open = view.save_as_dialogs_open.saturating_sub(1);
                 view.handle_save_as_for_close_response(id, instance, response, cx);
             });
         })
@@ -3175,6 +3205,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.ai_selection.attach(service.clone());
+        self.restart_ai_service = service.clone();
         self.ai_settings.attach(service, cx);
     }
 
@@ -3219,6 +3250,9 @@ impl EditorView {
             });
         })
         .detach();
+        // Local re-validation of an already prepared update only; this never
+        // communicates, and a check or download still needs a button press.
+        self.restore_app_update_local(cx);
         window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
@@ -3532,6 +3566,7 @@ impl EditorView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("一般"),
             )
+            .children(self.app_update_card(cx))
             .child(
                 div()
                     .pt(px(16.0))

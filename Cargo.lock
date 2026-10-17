@@ -3045,6 +3045,9 @@ dependencies = [
  "hane-presentation",
  "hane-session",
  "hane-ui",
+ "hane-update",
+ "rustls",
+ "rustls-native-certs",
  "windows-sys 0.59.0",
 ]
 

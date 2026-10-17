@@ -127,6 +127,36 @@ impl EditorView {
         }
     }
 
+    /// The update-restart variant of `flush_pending_drafts`: every pending
+    /// draft is written and every failure is reported, instead of being
+    /// ignored. `Ok` carries the number of drafts written. The ordinary quit
+    /// path keeps using the best-effort method above.
+    pub(super) fn flush_pending_drafts_checked(&self) -> Result<usize, Vec<String>> {
+        if self.work_folder_drafts.is_empty() {
+            return Ok(0);
+        }
+        let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
+            return Err(vec!["作業フォルダーを特定できません".to_owned()]);
+        };
+        let mut written = 0;
+        let mut failures = Vec::new();
+        for (&id, draft) in &self.work_folder_drafts {
+            let Some(session) = self.sessions.get(id) else {
+                continue;
+            };
+            let text = session.editor().document().full_text();
+            match self.draft_store.write(root, draft.draft_id, &text) {
+                Ok(()) => written += 1,
+                Err(error) => failures.push(format!("{}: {error}", session.label())),
+            }
+        }
+        if failures.is_empty() {
+            Ok(written)
+        } else {
+            Err(failures)
+        }
+    }
+
     /// Issue #6: arms the debounce timer that keeps a work-folder note's
     /// filename following its first H1. A no-op outside a work folder.
     pub(super) fn schedule_title_sync(&mut self, cx: &mut Context<Self>) {
@@ -782,6 +812,7 @@ impl EditorView {
         // dialog was still open.
         let instance = self.document_instance(id);
         let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
+        self.save_as_dialogs_open += 1;
         cx.spawn(async move |view, cx| {
             let response = match receiver.await {
                 Ok(Ok(Some(path))) => SaveAsResponse::Chosen(path),
@@ -790,6 +821,9 @@ impl EditorView {
                 Err(_) => SaveAsResponse::Canceled,
             };
             let _ = view.update(cx, |view, cx| {
+                // Released before the instance gate: the dialog is over even
+                // when its answer no longer belongs to any open document.
+                view.save_as_dialogs_open = view.save_as_dialogs_open.saturating_sub(1);
                 view.handle_save_as_response(id, instance, response, cx);
             });
         })
