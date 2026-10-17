@@ -713,7 +713,7 @@ impl Inner {
             Stage::UpToDate => snapshot.phase = AppUpdatePhase::UpToDate,
             Stage::Available(offer) => {
                 snapshot.phase = AppUpdatePhase::Available;
-                describe(&mut snapshot, &**offer);
+                describe(&mut snapshot, offer);
             }
             Stage::Downloading {
                 offer,
@@ -726,12 +726,12 @@ impl Inner {
                 } else {
                     AppUpdatePhase::Downloading
                 };
-                describe(&mut snapshot, &**offer);
+                describe(&mut snapshot, offer);
                 snapshot.received_bytes = received.load(Ordering::Relaxed);
             }
             Stage::Ready { offer, .. } => {
                 snapshot.phase = AppUpdatePhase::Ready;
-                describe(&mut snapshot, &**offer);
+                describe(&mut snapshot, offer);
             }
             Stage::Failed { code } => {
                 snapshot.phase = AppUpdatePhase::Failed;

@@ -327,13 +327,11 @@ fn parse_head(raw: &[u8]) -> Result<Head, TransportError> {
                     ));
                 }
             }
-            "content-encoding" => {
-                if !value.eq_ignore_ascii_case("identity") {
-                    return Err(failure(
-                        TransportFailure::Other,
-                        "compressed responses are not accepted",
-                    ));
-                }
+            "content-encoding" if !value.eq_ignore_ascii_case("identity") => {
+                return Err(failure(
+                    TransportFailure::Other,
+                    "compressed responses are not accepted",
+                ));
             }
             _ => {}
         }
