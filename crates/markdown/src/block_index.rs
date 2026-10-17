@@ -23,6 +23,7 @@
 //!   not touch.
 
 use crate::block_store::BlockStore;
+use crate::list_projection::ListProjectionMarkers;
 use crate::{
     FenceHeightProjection, ListEditProjection, ListProjection, ListProjectionItem,
     ListProjectionList, ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree,
@@ -671,8 +672,10 @@ fn build_list_projections(
                     block_lists,
                     block_quotes,
                     rows,
-                    block_fence_markers,
-                    block_container_markers,
+                    ListProjectionMarkers {
+                        fence_markers: block_fence_markers,
+                        container_markers: block_container_markers,
+                    },
                     block_links,
                 ))
             }
