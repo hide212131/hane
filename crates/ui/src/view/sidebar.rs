@@ -991,31 +991,57 @@ fn move_path_to_trash(path: &Path) -> std::io::Result<()> {
     move_path_to_trash_with(path, native_move_to_trash)
 }
 
-/// Runs `operation` and confirms the move: an error, or an `Ok` while the
-/// original path still exists, is reported as a failure.
+/// Confirms the source exists, runs `operation`, then confirms the source is
+/// gone. Only a `NotFound` after the operation counts as a confirmed move; a
+/// missing source beforehand, a failed operation, a remaining source, or any
+/// other I/O error while checking is reported as a failure.
 fn move_path_to_trash_with(
     path: &Path,
     operation: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    path.symlink_metadata()?;
     operation(path)?;
-    if path.symlink_metadata().is_ok() {
-        return Err(std::io::Error::other(
+    match path.symlink_metadata() {
+        Ok(_) => Err(std::io::Error::other(
             "ゴミ箱への移動を確認できませんでした（元のファイルが残っています）",
-        ));
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 /// macOS: `NSFileManager trashItemAtURL:resultingItemURL:error:`, without
 /// Finder / Apple Events. `NO` or a missing resulting URL is an error.
 #[cfg(target_os = "macos")]
 fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
-    use objc::runtime::{BOOL, NO, Object};
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc::runtime::{BOOL, NO};
+    use std::ffi::{CStr, c_char, c_void};
     use std::os::unix::ffi::OsStrExt;
+
+    type Id = *mut c_void;
 
     #[link(name = "Foundation", kind = "framework")]
     unsafe extern "C" {}
+
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Id;
+        // Variadic in C; each call site casts it to the exact signature.
+        fn objc_msgSend();
+    }
+
+    /// Sends `selector` to `receiver` through `objc_msgSend` cast to the
+    /// exact C signature of the method (`$ret` result, `$ty` arguments).
+    macro_rules! send {
+        ($ret:ty; $receiver:expr, $selector:expr $(, $ty:ty = $arg:expr)*) => {{
+            let call = std::mem::transmute::<
+                unsafe extern "C" fn(),
+                unsafe extern "C" fn(Id, Id $(, $ty)*) -> $ret,
+            >(objc_msgSend as unsafe extern "C" fn());
+            call($receiver, sel_registerName($selector.as_ptr()) $(, $arg)*)
+        }};
+    }
 
     const NS_UTF8_STRING_ENCODING: usize = 4;
     let bytes = path.as_os_str().as_bytes();
@@ -1023,53 +1049,56 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
     // correctly typed arguments; every object created here is released (or
     // owned by the pool drained) before returning.
     unsafe {
-        let pool: *mut Object = msg_send![class!(NSAutoreleasePool), new];
+        let pool = send!(Id; objc_getClass(c"NSAutoreleasePool".as_ptr()), c"new");
         let result = (|| {
-            let string: *mut Object = msg_send![class!(NSString), alloc];
-            let string: *mut Object = msg_send![
-                string,
-                initWithBytes: bytes.as_ptr()
-                length: bytes.len()
-                encoding: NS_UTF8_STRING_ENCODING
-            ];
+            let string = send!(Id; objc_getClass(c"NSString".as_ptr()), c"alloc");
+            let string = send!(
+                Id; string, c"initWithBytes:length:encoding:",
+                *const u8 = bytes.as_ptr(),
+                usize = bytes.len(),
+                usize = NS_UTF8_STRING_ENCODING
+            );
             if string.is_null() {
                 return Err(std::io::Error::other("パスをNSStringに変換できません"));
             }
-            let url: *mut Object = msg_send![class!(NSURL), fileURLWithPath: string];
-            let _: () = msg_send![string, release];
+            let url = send!(
+                Id; objc_getClass(c"NSURL".as_ptr()), c"fileURLWithPath:",
+                Id = string
+            );
+            send!((); string, c"release");
             if url.is_null() {
                 return Err(std::io::Error::other("パスをNSURLに変換できません"));
             }
-            let manager: *mut Object = msg_send![class!(NSFileManager), defaultManager];
-            let mut resulting: *mut Object = std::ptr::null_mut();
-            let mut error: *mut Object = std::ptr::null_mut();
-            let moved: BOOL = msg_send![
-                manager,
-                trashItemAtURL: url
-                resultingItemURL: &mut resulting as *mut *mut Object
-                error: &mut error as *mut *mut Object
-            ];
+            let manager = send!(Id; objc_getClass(c"NSFileManager".as_ptr()), c"defaultManager");
+            let mut resulting: Id = std::ptr::null_mut();
+            let mut error: Id = std::ptr::null_mut();
+            let moved = send!(
+                BOOL; manager, c"trashItemAtURL:resultingItemURL:error:",
+                Id = url,
+                *mut Id = &mut resulting,
+                *mut Id = &mut error
+            );
             if moved == NO || resulting.is_null() {
                 let message = if error.is_null() {
                     "ゴミ箱への移動に失敗しました".to_owned()
                 } else {
-                    let description: *mut Object = msg_send![error, localizedDescription];
-                    let utf8: *const std::os::raw::c_char = if description.is_null() {
+                    let description = send!(Id; error, c"localizedDescription");
+                    let utf8: *const c_char = if description.is_null() {
                         std::ptr::null()
                     } else {
-                        msg_send![description, UTF8String]
+                        send!(*const c_char; description, c"UTF8String")
                     };
                     if utf8.is_null() {
                         "ゴミ箱への移動に失敗しました".to_owned()
                     } else {
-                        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                        CStr::from_ptr(utf8).to_string_lossy().into_owned()
                     }
                 };
                 return Err(std::io::Error::other(message));
             }
             Ok(())
         })();
-        let _: () = msg_send![pool, drain];
+        send!((); pool, c"drain");
         result
     }
 }
@@ -1273,31 +1302,77 @@ fn draft_preview(session: &DocumentSession) -> String {
 mod tests {
     use super::*;
 
+    fn trash_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hane-trash-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn trash_succeeds_when_operation_removes_existing_path() {
+        let dir = trash_test_dir("removed");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        let result = move_path_to_trash_with(&path, std::fs::remove_file);
+        assert!(result.is_ok());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn trash_reports_os_operation_error() {
-        let path = std::env::temp_dir();
+        let dir = trash_test_dir("op-error");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
         let result = move_path_to_trash_with(&path, |_| Err(std::io::Error::other("denied")));
         assert!(result.is_err());
         assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn trash_rejects_ok_when_original_path_remains() {
-        let path = std::env::temp_dir();
+        let dir = trash_test_dir("remains");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
         let result = move_path_to_trash_with(&path, |_| Ok(()));
         assert!(result.is_err());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn trash_succeeds_only_when_original_path_is_gone() {
-        let path = std::env::temp_dir().join("hane-trash-confirm-never-created");
-        assert!(move_path_to_trash_with(&path, |_| Ok(())).is_ok());
+    fn trash_of_initially_missing_path_is_an_error_without_running_operation() {
+        let dir = trash_test_dir("missing");
+        let path = dir.join("never-created.md");
+        let mut ran = false;
+        let result = move_path_to_trash_with(&path, |_| {
+            ran = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!ran);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn trash_of_missing_path_is_an_error() {
-        let path = std::env::temp_dir().join("hane-trash-missing-never-created");
-        assert!(move_path_to_trash(&path).is_err());
+    fn trash_reports_io_error_while_confirming_removal() {
+        let dir = trash_test_dir("confirm-error");
+        let parent = dir.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        // Replacing the parent directory with a file makes the post-check fail
+        // with NotADirectory rather than NotFound.
+        let result = move_path_to_trash_with(&path, |_| {
+            std::fs::remove_dir_all(&parent)?;
+            std::fs::write(&parent, "file")
+        });
+        let error = result.unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn relative_luminance(color: u32) -> f32 {
