@@ -621,6 +621,8 @@ mod tests {
         for next in path {
             durable.advance_phase(*next).unwrap();
         }
+    }
+
     fn set_modified(coord: &Coordination, transaction: &TransactionId, secs: u64) {
         let file = fs::OpenOptions::new()
             .write(true)
