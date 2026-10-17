@@ -428,6 +428,9 @@ pub struct ImagePresentation {
 pub struct LinkTarget {
     pub source_range: SourceRange,
     pub destination: Arc<str>,
+    /// Whether the destination comes from a reference definition, which an edit
+    /// outside this link's block can change.
+    pub uses_reference: bool,
 }
 
 impl LinkTarget {

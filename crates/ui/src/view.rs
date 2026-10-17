@@ -5242,11 +5242,15 @@ impl EditorView {
                 !deltas
                     .iter()
                     .any(|delta| edit_affects_range(*delta, cached.source_range))
-                    // A link's destination may come from a reference
-                    // definition in another block, which an edit outside this
-                    // block's range can change. Rebasing would keep the old
-                    // destination, so present link-bearing blocks again.
-                    && !(cached.lines.iter().any(|line| !line.links.is_empty())
+                    // A reference link's destination comes from a definition
+                    // that an edit outside this block's range can change.
+                    // Rebasing would keep the old destination, so present
+                    // blocks with reference links again. Inline links carry
+                    // their own destination and still rebase.
+                    && !(cached
+                        .lines
+                        .iter()
+                        .any(|line| line.links.iter().any(|link| link.uses_reference))
                         && !deltas.is_empty())
                     && cached.rebase(&deltas, revision)
                     // The rows describe the same text at shifted offsets, so
@@ -7450,6 +7454,7 @@ mod tests {
         let target = hane_presentation::LinkTarget {
             source_range: SourceRange::new(1, 5),
             destination: std::sync::Arc::from("https://example.com/"),
+            uses_reference: false,
         };
         assert!(!target.contains(SourceOffset(0)));
         assert!(target.contains(SourceOffset(1)));
@@ -7626,6 +7631,43 @@ mod tests {
                     .flat_map(|line| &line.links)
                     .all(|link| &*link.destination != OLD),
                 "the stale destination must not remain openable"
+            );
+        });
+    }
+
+    /// Issue #502: an inline link carries its own destination, so an unrelated
+    /// edit in another block keeps its cached presentation.
+    #[gpui::test]
+    fn unrelated_edit_reuses_cached_inline_link_presentation(cx: &mut gpui::TestAppContext) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = format!("see [Hane]({DESTINATION}) end\n\nother\n");
+        let inside_link = SourceOffset(text.find("Hane").unwrap() + 1);
+        let view =
+            gpui::AppContext::new(cx, |cx| EditorView::new(text.as_str(), "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            view.cached_block(&indexed, &span).unwrap();
+
+            let at = SourceOffset(text.find("other").unwrap());
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: at,
+                    active: at,
+                })
+                .unwrap();
+            view.dispatch(EditorCommand::Insert("x"), cx);
+
+            let indexed = view.block_at_offset(inside_link).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let (visual, reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(reused, "an inline-link block is not presented again");
+            assert!(
+                visual
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.links)
+                    .any(|link| &*link.destination == DESTINATION)
             );
         });
     }

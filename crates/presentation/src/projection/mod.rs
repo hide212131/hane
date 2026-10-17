@@ -1172,6 +1172,7 @@ fn present_markdown_from_parse(
                 (clipped.start < clipped.end).then(|| LinkTarget {
                     source_range: clipped,
                     destination: link.destination.clone(),
+                    uses_reference: link.uses_reference,
                 })
             })
             .collect::<Vec<_>>()
@@ -1195,6 +1196,7 @@ fn present_markdown_from_parse(
                 links.push(LinkTarget {
                     source_range: clipped,
                     destination: link.destination.clone(),
+                    uses_reference: link.uses_reference,
                 });
             }
         }

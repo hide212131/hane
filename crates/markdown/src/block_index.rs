@@ -107,6 +107,7 @@ pub struct TableProjectionCell {
 pub struct TableProjectionLink {
     pub text_range: SourceRange,
     pub destination: Arc<str>,
+    pub uses_reference: bool,
 }
 
 /// One physical table row retained by the formal source projection.
@@ -614,6 +615,7 @@ fn build_list_projections(
             links_by_block[block].push(TableProjectionLink {
                 text_range: link.text_range,
                 destination: link.destination.clone(),
+                uses_reference: link.uses_reference,
             });
         }
     }
@@ -758,6 +760,7 @@ fn build_table_projections(
                         .map(|link| TableProjectionLink {
                             text_range: link.text_range,
                             destination: link.destination.clone(),
+                            uses_reference: link.uses_reference,
                         })
                         .collect::<Vec<_>>()
                         .into();

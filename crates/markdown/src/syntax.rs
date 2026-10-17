@@ -148,6 +148,10 @@ pub struct LinkParse {
     /// brackets and the destination part.
     pub text_range: SourceRange,
     pub destination: Arc<str>,
+    /// Whether the destination comes from a link reference definition (full,
+    /// collapsed or shortcut reference) rather than from the link itself, so
+    /// an edit to a definition elsewhere can change it.
+    pub uses_reference: bool,
 }
 
 /// Block/inline node tree for one parsed source slice: parent/child structure,

@@ -65,7 +65,7 @@ fn build_tree(
 ) {
     let mut codes = Vec::new();
     let mut tables = Vec::new();
-    let mut pending_links: Vec<(NodeId, Arc<str>)> = Vec::new();
+    let mut pending_links: Vec<(NodeId, Arc<str>, bool)> = Vec::new();
     let mut nodes = vec![MarkdownNode {
         kind: NodeKind::Document,
         source_range,
@@ -112,7 +112,11 @@ fn build_tree(
                     )
                     && is_external_http_url(dest_url)
                 {
-                    pending_links.push((id, Arc::from(&**dest_url)));
+                    pending_links.push((
+                        id,
+                        Arc::from(&**dest_url),
+                        !matches!(link_type, LinkType::Inline),
+                    ));
                 }
                 if let Tag::Table(alignments) = &tag {
                     tables.push(TableParse {
@@ -179,7 +183,7 @@ fn build_tree(
     }
     let links = pending_links
         .into_iter()
-        .filter_map(|(node, destination)| {
+        .filter_map(|(node, destination, uses_reference)| {
             let children = &nodes[node.0].children;
             let start = nodes[children.first()?.0].source_range.start;
             let end = nodes[children.last()?.0].source_range.end;
@@ -187,6 +191,7 @@ fn build_tree(
                 node,
                 text_range: SourceRange { start, end },
                 destination,
+                uses_reference,
             })
         })
         .collect();

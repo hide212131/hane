@@ -342,6 +342,7 @@ pub fn present_block_with_table_projection(
                     .then(|| crate::LinkTarget {
                         source_range: clipped,
                         destination: link.destination.clone(),
+                        uses_reference: link.uses_reference,
                     })
                 })
                 .collect::<Vec<_>>();
