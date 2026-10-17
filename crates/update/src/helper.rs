@@ -740,7 +740,7 @@ mod tests {
     }
 
     struct Fixture {
-        dir: TempDir,
+        _dir: TempDir,
         coord: Coordination,
         txn: TransactionId,
     }
@@ -749,7 +749,7 @@ mod tests {
         let dir = TempDir::new("helper");
         let coord = Coordination::create(dir.path(), &install_id()).unwrap();
         Fixture {
-            dir,
+            _dir: dir,
             coord,
             txn: TransactionId::generate().unwrap(),
         }
@@ -1019,7 +1019,7 @@ mod tests {
             startup,
             runtime: None,
         };
-        let err = PlatformBackend::default()
+        let err = PlatformBackend
             .apply(&ApplyContext {
                 env: &env,
                 candidate_id: None,
