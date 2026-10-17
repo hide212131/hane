@@ -390,13 +390,14 @@ mod tests {
     fn surface_text(view: &TestView, cx: &mut TestCx, surface: Surface) -> String {
         view.read_with(cx, |view, _| match surface {
             Surface::Body => view.editor().document().full_text(),
-            Surface::Filter => view.sidebar_filter.clone(),
+            Surface::Filter => view.sidebar_filter.text().to_owned(),
             Surface::Rename => view
                 .inline_rename
                 .as_ref()
                 .expect("rename is active")
-                .text
-                .clone(),
+                .input
+                .text()
+                .to_owned(),
         })
     }
 
@@ -407,13 +408,13 @@ mod tests {
                 let range = view.editor().selection().range();
                 range.start.0..range.end.0
             }
-            Surface::Filter => view.sidebar_filter_selected_range.clone(),
+            Surface::Filter => view.sidebar_filter.selected_range(),
             Surface::Rename => view
                 .inline_rename
                 .as_ref()
                 .expect("rename is active")
-                .selected_range
-                .clone(),
+                .input
+                .selected_range(),
         })
     }
 
@@ -423,7 +424,7 @@ mod tests {
                 assert_eq!(view.editor().document().full_text(), "", "body leaked");
             }
             if surface != Surface::Filter {
-                assert_eq!(view.sidebar_filter, "", "filter leaked");
+                assert_eq!(view.sidebar_filter.text(), "", "filter leaked");
             }
             if surface != Surface::Rename {
                 assert!(view.inline_rename.is_none(), "rename leaked");
@@ -1034,7 +1035,10 @@ mod tests {
         assert!(!capture_enabled(&view, cx));
         cx.simulate_input("e");
         assert_eq!(body_text(&view, cx), body_after_typing);
-        assert_eq!(view.read_with(cx, |view, _| view.sidebar_filter.clone()), "e");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sidebar_filter.text().to_owned()),
+            "e"
+        );
 
         // Inline rename: not registered; text goes to the rename field.
         click_body(cx);
@@ -1183,8 +1187,10 @@ mod tests {
         view.read_with(cx, |view, _| {
             (
                 view.editor().document().full_text(),
-                view.sidebar_filter.clone(),
-                view.inline_rename.as_ref().map(|rename| rename.text.clone()),
+                view.sidebar_filter.text().to_owned(),
+                view.inline_rename
+                    .as_ref()
+                    .map(|rename| rename.input.text().to_owned()),
             )
         })
     }
@@ -1644,10 +1650,10 @@ mod tests {
         view.read_with(cx, |view, _| {
             let rename = view.inline_rename.as_ref().expect("rename is active");
             (
-                rename.text.clone(),
-                rename.selected_range.clone(),
-                rename.selection_reversed,
-                rename.marked_range.clone(),
+                rename.input.text().to_owned(),
+                rename.input.selected_range(),
+                rename.input.selection_reversed(),
+                rename.input.marked_range(),
             )
         })
     }
@@ -2034,8 +2040,8 @@ mod tests {
         // Blur keeps what is shown; it does not roll the text back to "abc".
         view.update(cx, |view, cx| view.blur_sidebar_filter(cx));
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "abcか");
-            assert_eq!(view.sidebar_filter_marked_range, None);
+            assert_eq!(view.sidebar_filter.text(), "abcか");
+            assert_eq!(view.sidebar_filter.marked_range(), None);
             assert!(!view.sidebar_filter_has_composition());
             assert!(!view.sidebar_filter_focused);
         });
@@ -2099,7 +2105,7 @@ mod tests {
             let rename = view.inline_rename.as_ref().expect("rename is active");
             assert_eq!(rename.fixed_extension.as_deref(), Some(".md"));
             assert_eq!(view.editor().document().full_text(), "");
-            assert_eq!(view.sidebar_filter, "");
+            assert_eq!(view.sidebar_filter.text(), "");
         });
         assert!(rename_path(&root).exists(), "the file name is unchanged");
         std::fs::remove_dir_all(root).unwrap();
@@ -2131,9 +2137,9 @@ mod tests {
             assert_eq!(state.selected_range, 0..0, "nothing is painted selected");
             assert_eq!(state.marked_range, None);
             // The model keeps the real selection and its direction.
-            assert_eq!(view.sidebar_filter, TEXT);
-            assert_eq!(view.sidebar_filter_selected_range, 1..5);
-            assert!(view.sidebar_filter_selection_reversed);
+            assert_eq!(view.sidebar_filter.text(), TEXT);
+            assert_eq!(view.sidebar_filter.selected_range(), 1..5);
+            assert!(view.sidebar_filter.selection_reversed());
         });
         std::fs::remove_dir_all(root).unwrap();
     }
