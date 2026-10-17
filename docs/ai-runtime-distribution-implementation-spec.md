@@ -64,7 +64,7 @@ HaneのZIP / .appにはruntimeの実行ファイルを置かず、P0のruntime�
   runtime-health/<operation-id>/
 ```
 
-`bundle-id`は`codex-<version>-<archive-sha先頭12文字>)、`installation-id`と`operation-id`はHaneが生成するランダムIDとする。同一版の修復もP1で新しいinstallation-idへ展開し、使用中のファイルを上書きしない。IDはASCII英数字とハイフンのみ、最大96文字。entrypointを含む相対パスはmanifestから解決し、正規化後に所有root内であることを確認する。
+`bundle-id`は`codex-<version>-<archive-sha先頭12文字>`、`installation-id`と`operation-id`はHaneが生成するランダムIDとする。同一版の修復もP1で新しいinstallation-idへ展開し、使用中のファイルを上書きしない。IDはASCII英数字とハイフンのみ、最大96文字。entrypointを含む相対パスはmanifestから解決し、正規化後に所有root内であることを確認する。
 
 app-dataは既存の`FileStateStore::from_environment()`を使う。Windows標準は`%LOCALAPPDATA%\\Hane`、macOS標準は`~/Library/Application Support/Hane`。`HANE_STATE_DIR`を尊重し、AIで使うrootが相対パスなら明確に設定エラーを返す。他アプリのCODEX_HOMEを代わりに使わない。[C3]
 
