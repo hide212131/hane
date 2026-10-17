@@ -26,6 +26,11 @@ After editing a new note, let the user right-click its file tab and choose an ar
 - Cancel, failure, or a tab/document change during the native dialog cannot discard or misdirect the edited content.
 - Existing file-tab context-menu actions continue to work.
 
+## Implementation note
+
+- The file-tab menu gained `file-tab-context-save-as` ("名前を付けて保存…"). It is bound to the menu's session id and document instance and calls the existing `prompt_save_as_for`, so the answer flows through `handle_save_as_response` and `save_session` (atomic write, draft retirement, sidebar indexing). A stale menu instance opens no dialog.
+- Regression tests were added in `crates/ui/src/view.rs`. They have not been run by the worker; CI and the macOS GUI scenario are still outstanding.
+
 ## Verification needed
 
 Run the repository-required tests and lint on the exact resulting head. Perform the focused macOS GUI scenario for a new edited note, including arbitrary destination and cancellation, and record evidence against the final head/base.

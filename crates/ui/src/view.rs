@@ -2448,6 +2448,23 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Save As for the tab whose menu was opened, not the active tab. The
+    /// instance the menu captured must still be current: a tab that was
+    /// replaced or reused since the menu opened must not get a dialog (and
+    /// so a write) it never asked for.
+    fn save_file_tab_as(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tab_context_menu = None;
+        if self.document_instance(id) == Some(instance) {
+            self.prompt_save_as_for(id, cx);
+        }
+        cx.notify();
+    }
+
     fn copy_file_tab_full_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         self.file_tab_context_menu = None;
         let Some(path) = path else {
@@ -6847,6 +6864,15 @@ impl EditorView {
             move |view, _, _, cx| view.copy_file_tab_full_path(copy_path.clone(), cx),
         );
 
+        let (save_as_id, save_as_instance) = (menu.id, menu.instance);
+        let save_as_item = self.file_tab_context_menu_item(
+            "file-tab-context-save-as",
+            "名前を付けて保存…",
+            true,
+            cx,
+            move |view, _, _, cx| view.save_file_tab_as(save_as_id, save_as_instance, cx),
+        );
+
         let menu_element = div()
             .id("file-tab-context-menu")
             .debug_selector(|| "file-tab-context-menu".to_owned())
@@ -6871,7 +6897,7 @@ impl EditorView {
             .child(vscode_item);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let menu_element = menu_element.child(reveal_item);
-        menu_element.child(copy_item)
+        menu_element.child(copy_item).child(save_as_item)
     }
 
     fn tab_close_confirm_element(
@@ -13102,6 +13128,86 @@ mod tests {
             assert_eq!(menu_target_path, Some(expected_clicked_path.as_path()));
         });
         assert!(cx.debug_bounds("file-tab-context-menu").is_some());
+        assert!(
+            cx.debug_bounds("file-tab-context-save-as").is_some(),
+            "the tab menu must expose Save As for the clicked tab"
+        );
+    }
+
+    #[gpui::test]
+    fn file_tab_save_as_ignores_a_menu_whose_document_instance_is_stale(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let stale = view.document_instance(id).expect("open session");
+            let stale = DocumentInstance {
+                generation: stale.generation + 1,
+                ..stale
+            };
+            view.open_file_tab_context_menu(id, gpui::Point::default(), cx);
+            view.save_file_tab_as(id, stale, cx);
+            assert!(view.file_tab_context_menu.is_none());
+            assert_eq!(view.status, None);
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_response_for_a_background_tab_saves_that_tab_only(cx: &mut gpui::TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-tab-save-as-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("Saved.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("first\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("second\n"),
+                    identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let background = SessionId(1);
+            let instance = view.document_instance(background);
+            view.handle_save_as_response(
+                background,
+                instance,
+                SaveAsResponse::Chosen(target.clone()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second\n");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), SessionId(0));
+            assert_eq!(
+                view.sessions.get(SessionId(1)).and_then(DocumentSession::path),
+                Some(target.as_path())
+            );
+            assert_eq!(
+                view.sessions.get(SessionId(0)).and_then(DocumentSession::path),
+                Some(Path::new("first.md"))
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
