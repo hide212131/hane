@@ -20,7 +20,9 @@ use std::time::Duration;
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::helper::{HelloRequest, PREPARE_TIMEOUT, spawn_helper};
 use crate::identity::TransactionId;
-use crate::journal::{FileJournalStore, JournalStore, Phase};
+use crate::journal::{
+    DiskView, FileJournalStore, FsDiskView, JournalStore, Phase, RecoveryDecision, decide_recovery,
+};
 use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
 use crate::platform::{self, Placement};
 use crate::protocol::{Mode, RecoveryReport, bounded_reason};
@@ -124,9 +126,13 @@ fn journal_problem(name: &str, why: impl std::fmt::Display) -> Pending {
     Pending::Stop(bounded_reason(&format!("journal {name}: {why}")))
 }
 
-/// Finds a transaction that still needs a decision. Terminal `Committed` and
-/// `RolledBack` journals need none; unknown entries are ignored, never deleted.
-fn scan_pending(coordination: &Coordination) -> io::Result<Option<Pending>> {
+/// Finds a transaction that still needs a decision. A terminal `Committed`
+/// journal needs none. A `RolledBack` journal is only trusted while every step
+/// of the live install still matches its recorded old identity: the rollback
+/// renames and the journal rename may not have been flushed together, so a
+/// mixed or unknown install stops instead of starting. Unknown entries are
+/// ignored, never deleted.
+fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<Option<Pending>> {
     let private = coordination.dir().join(PRIVATE_DIR);
     let entries = match fs::read_dir(&private) {
         Ok(entries) => entries,
@@ -157,7 +163,22 @@ fn scan_pending(coordination: &Coordination) -> io::Result<Option<Pending>> {
             return Ok(Some(journal_problem(&name, "belongs to another transaction or install")));
         }
         match journal.phase {
-            Phase::Committed | Phase::RolledBack => {}
+            Phase::Committed => {}
+            Phase::RolledBack => {
+                match decide_recovery(Some(&journal), coordination.install_id(), disk) {
+                    Ok(RecoveryDecision::KeepOld) => {}
+                    Ok(RecoveryDecision::RecoveryRequired(why)) => {
+                        return Ok(Some(journal_problem(&name, why)));
+                    }
+                    Ok(other) => {
+                        return Ok(Some(journal_problem(
+                            &name,
+                            format!("rolled back but the install is not at the old version: {other:?}"),
+                        )));
+                    }
+                    Err(err) => return Ok(Some(journal_problem(&name, err))),
+                }
+            }
             Phase::RecoveryRequired => {
                 return Ok(Some(journal_problem(&name, "an earlier recovery did not complete")));
             }
@@ -184,6 +205,7 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
         },
         Err(_) => return GateOutcome::Unmanaged,
     };
+    let disk = FsDiskView::new(&placement.install_root);
     // One recovery attempt: the second look must find nothing pending.
     for attempt in 0..2 {
         let startup = match coordination.acquire_within(LeaseKind::Startup, &[], wait) {
@@ -191,7 +213,7 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
             Err(err) if err.code == ErrorCode::Timeout => return GateOutcome::UpdateInProgress,
             Err(err) => return stop(&err),
         };
-        match scan_pending(&coordination) {
+        match scan_pending(&coordination, &disk) {
             Err(err) => return stop(&UpdateError::from(err)),
             Ok(Some(Pending::Stop(why))) => return GateOutcome::RecoveryRequired(why),
             Ok(None) => {
@@ -269,7 +291,11 @@ mod tests {
         .unwrap()
     }
 
+    /// The live install every test journal describes: `a.dll` at its old content.
     fn placement(dir: &TempDir) -> Placement {
+        let root = dir.path().join("Hane");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.dll"), b"old").unwrap();
         Placement {
             target: Target::WindowsX64,
             install_root: dir.path().join("Hane"),
@@ -429,6 +455,80 @@ mod tests {
         assert!(matches!(
             startup_gate(&placement, &runner, Duration::from_millis(50)),
             GateOutcome::Proceed(_)
+        ));
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_rolled_back_journal_needs_every_file_at_its_old_identity() {
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        type Damage = fn(&std::path::Path);
+        let cases: [(&str, Damage); 4] = [
+            ("new content", |root| fs::write(root.join("a.dll"), b"new").unwrap()),
+            ("unknown content", |root| fs::write(root.join("a.dll"), b"???").unwrap()),
+            ("missing file", |root| fs::remove_file(root.join("a.dll")).unwrap()),
+            ("unreadable (directory)", |root| {
+                fs::remove_file(root.join("a.dll")).unwrap();
+                fs::create_dir(root.join("a.dll")).unwrap();
+            }),
+        ];
+        for (name, damage) in cases {
+            let dir = TempDir::new("gate-rolled-back-mixed");
+            let placement = placement(&dir);
+            let coord = placement.coordination().unwrap();
+            write_journal(&coord, &TransactionId::generate().unwrap(), Phase::RolledBack);
+            damage(&placement.install_root);
+            let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+            assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{name}: {outcome:?}");
+            assert!(
+                coord
+                    .try_acquire(LeaseKind::RuntimeExclusive, &[])
+                    .unwrap()
+                    .is_some(),
+                "{name}: normal editing never started"
+            );
+        }
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_rolled_back_journal_with_an_added_file_present_stops() {
+        // A step that only adds a file: the old version had no such path.
+        let dir = TempDir::new("gate-rolled-back-added");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        let plan = ApplyPlan {
+            install_id: install_id(),
+            transaction_id: transaction.clone(),
+            source: release("0.1.0"),
+            destination: release("0.2.0"),
+            steps: vec![PlanStep {
+                rel_path: "added.dll".to_owned(),
+                old: None,
+                new: Some(FileIdentity::of(b"new")),
+                backup_rel: None,
+            }],
+            unchanged: Vec::new(),
+        };
+        coord.ensure_helper_dir(&transaction).unwrap();
+        let journal = UpdateJournal::begin(&plan, None).unwrap();
+        let mut durable = DurableJournal::create(
+            FileJournalStore::new(coord.journal_path(&transaction)),
+            journal,
+        )
+        .unwrap();
+        durable.advance_phase(Phase::RolledBack).unwrap();
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+
+        assert!(matches!(
+            startup_gate(&placement, &runner, Duration::from_millis(50)),
+            GateOutcome::Proceed(_)
+        ));
+        fs::write(placement.install_root.join("added.dll"), b"new").unwrap();
+        assert!(matches!(
+            startup_gate(&placement, &runner, Duration::from_millis(50)),
+            GateOutcome::RecoveryRequired(_)
         ));
         assert_eq!(runner.calls.get(), 0);
     }
