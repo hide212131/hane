@@ -91,7 +91,9 @@ mod tests {
     fn word_keys_reach_the_os_specific_offsets(cx: &mut gpui::TestAppContext) {
         let (view, cx) = open_view(cx, "one two\n");
         set_selection(&view, cx, 0, 0);
-        let (first, second) = if MAC { (3, 7) } else { (4, 7) };
+        // 文書は末尾LFを含む。WindowsのNextStartは語の後のseparatorを消費するため、
+        // 2回目は末尾LFを越えてEOF(8)に到達する。Macは語末(7)で止まる。
+        let (first, second) = if MAC { (3, 7) } else { (4, 8) };
         press(cx, WORD_RIGHT);
         assert_eq!(caret_by_insertion(&view, cx), first);
         assert_eq!(text(&view, cx), "one two\n");
