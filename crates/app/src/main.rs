@@ -72,7 +72,9 @@ type FinderSender = ();
 /// into `sender`. The platform callback has no `App` access, so the paths are
 /// queued for a polling task that opens them through the editor's normal
 /// open path. Other platforms ignore `sender`.
-fn application_with_finder_open(sender: FinderSender) -> gpui::Application {
+fn application_with_finder_open(
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] sender: FinderSender,
+) -> gpui::Application {
     let application = gpui_platform::application();
     #[cfg(target_os = "macos")]
     application.on_open_urls(move |urls| {
@@ -83,8 +85,6 @@ fn application_with_finder_open(sender: FinderSender) -> gpui::Application {
             let _ = sender.send(path);
         }
     });
-    #[cfg(not(target_os = "macos"))]
-    let _ = sender;
     application
 }
 
