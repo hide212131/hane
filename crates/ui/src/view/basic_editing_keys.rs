@@ -437,11 +437,9 @@ mod tests {
     }
 
     const PAGE_MOVE_UP: &str = if MAC { "alt-pageup" } else { "pageup" };
-    const PAGE_SELECT_DOWN: &str = if MAC {
-        "alt-shift-pagedown"
-    } else {
-        "shift-pagedown"
-    };
+    // Macではページ選択キーを登録しない。
+    #[cfg(not(target_os = "macos"))]
+    const PAGE_SELECT_DOWN: &str = "shift-pagedown";
     const SELECT_LINE_END: &str = if MAC { "cmd-shift-right" } else { "shift-end" };
     const SELECT_LINE_START: &str = if MAC { "cmd-shift-left" } else { "shift-home" };
     const SELECT_DOCUMENT_START: &str = if MAC { "shift-home" } else { "ctrl-shift-home" };
@@ -455,7 +453,7 @@ mod tests {
         format!("{}\n\n{tail}", words.trim_end())
     }
 
-    fn open_wrapped<'a>(cx: &'a mut gpui::TestAppContext) -> (TestView, &'a mut TestCx) {
+    fn open_wrapped(cx: &mut gpui::TestAppContext) -> (TestView, &mut TestCx) {
         let (view, cx) = open_view(cx, &wrapped_document());
         cx.simulate_resize(gpui::size(px(320.0), px(400.0)));
         cx.run_until_parked();
@@ -542,11 +540,14 @@ mod tests {
         press(cx, PAGE_MOVE_UP);
         assert!(selection(&view, cx).active.0 < down.active.0);
 
-        set_selection(&view, cx, caret, caret);
-        press(cx, PAGE_SELECT_DOWN);
-        let selected = selection(&view, cx);
-        assert_eq!(selected.anchor, SourceOffset(caret));
-        assert!(selected.active.0 > caret);
+        #[cfg(not(target_os = "macos"))]
+        {
+            set_selection(&view, cx, caret, caret);
+            press(cx, PAGE_SELECT_DOWN);
+            let selected = selection(&view, cx);
+            assert_eq!(selected.anchor, SourceOffset(caret));
+            assert!(selected.active.0 > caret);
+        }
     }
 
     #[gpui::test]
@@ -568,16 +569,19 @@ mod tests {
         view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
         assert_eq!(text(&view, cx), "abc");
 
-        // Shift keeps the anchor and stops at the edge.
-        set_selection(&view, cx, 0, 3);
-        press(cx, PAGE_SELECT_DOWN);
-        assert_eq!(
-            selection(&view, cx),
-            Selection {
-                anchor: SourceOffset(0),
-                active: SourceOffset(3)
-            }
-        );
+        // Shift keeps the anchor and stops at the edge (Mac has no such key).
+        #[cfg(not(target_os = "macos"))]
+        {
+            set_selection(&view, cx, 0, 3);
+            press(cx, PAGE_SELECT_DOWN);
+            assert_eq!(
+                selection(&view, cx),
+                Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(3)
+                }
+            );
+        }
     }
 
     #[gpui::test]

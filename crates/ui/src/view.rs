@@ -21180,14 +21180,29 @@ mod tests {
         } else {
             "ctrl-shift-z"
         };
-        for keystroke in [
-            "secondary-up",
-            "secondary-down",
-            "secondary-shift-up",
-            "secondary-shift-down",
-            undo_key,
-            redo_key,
-        ] {
+        // 短い欄では Shift 付きの文書端キーが欄の端まで選択を伸ばす。
+        // 非 Shift の文書端移動と Undo/Redo は欄でも no-op のまま。
+        // anchor は元の caret 位置 (1) を保持する。
+        let [doc_start, doc_end, select_doc_start, select_doc_end] =
+            if cfg!(target_os = "macos") {
+                ["cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down"]
+            } else {
+                ["ctrl-home", "ctrl-end", "ctrl-shift-home", "ctrl-shift-end"]
+            };
+        let mut steps: Vec<(&str, std::ops::Range<usize>, bool)> = vec![
+            (doc_start, 1..1, false),
+            (doc_end, 1..1, false),
+            (select_doc_start, 0..1, true),
+            (select_doc_end, 1..3, false),
+            (undo_key, 1..3, false),
+            (redo_key, 1..3, false),
+        ];
+        if cfg!(target_os = "macos") {
+            // Mac の shift-home/end は従来どおり欄内選択で、本文へ漏れない。
+            steps.push(("shift-home", 0..1, true));
+            steps.push(("shift-end", 1..3, false));
+        }
+        for (keystroke, expected_range, expected_reversed) in steps {
             cx.simulate_keystrokes(keystroke);
             cx.run_until_parked();
             view.read_with(cx, |view, _| {
@@ -21210,7 +21225,14 @@ mod tests {
                     "{keystroke} must not consume redo history while the sidebar filter is focused"
                 );
                 assert_eq!(view.sidebar_filter, "abc");
-                assert_eq!(view.sidebar_filter_selected_range, 1..1);
+                assert_eq!(
+                    view.sidebar_filter_selected_range, expected_range,
+                    "{keystroke} sidebar filter selection range"
+                );
+                assert_eq!(
+                    view.sidebar_filter_selection_reversed, expected_reversed,
+                    "{keystroke} sidebar filter selection direction"
+                );
                 assert!(view.sidebar_filter_is_focused());
             });
         }
@@ -21279,14 +21301,29 @@ mod tests {
         } else {
             "ctrl-shift-z"
         };
-        for keystroke in [
-            "secondary-up",
-            "secondary-down",
-            "secondary-shift-up",
-            "secondary-shift-down",
-            undo_key,
-            redo_key,
-        ] {
+        // 短い欄では Shift 付きの文書端キーが欄の端まで選択を伸ばす。
+        // 非 Shift の文書端移動と Undo/Redo は欄でも no-op のまま。
+        // anchor は元の caret 位置 (3) を保持する。
+        let [doc_start, doc_end, select_doc_start, select_doc_end] =
+            if cfg!(target_os = "macos") {
+                ["cmd-up", "cmd-down", "cmd-shift-up", "cmd-shift-down"]
+            } else {
+                ["ctrl-home", "ctrl-end", "ctrl-shift-home", "ctrl-shift-end"]
+            };
+        let mut steps: Vec<(&str, std::ops::Range<usize>, bool)> = vec![
+            (doc_start, 3..3, false),
+            (doc_end, 3..3, false),
+            (select_doc_start, 0..3, true),
+            (select_doc_end, 3..6, false),
+            (undo_key, 3..6, false),
+            (redo_key, 3..6, false),
+        ];
+        if cfg!(target_os = "macos") {
+            // Mac の shift-home/end は従来どおり欄内選択で、本文へ漏れない。
+            steps.push(("shift-home", 0..3, true));
+            steps.push(("shift-end", 3..6, false));
+        }
+        for (keystroke, expected_range, expected_reversed) in steps {
             cx.simulate_keystrokes(keystroke);
             cx.run_until_parked();
             view.read_with(cx, |view, _| {
@@ -21309,7 +21346,15 @@ mod tests {
                     "{keystroke} must not consume redo history while an inline rename is active"
                 );
                 assert_eq!(view.inline_rename.as_ref().unwrap().text, "abcdef");
-                assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+                let rename = view.inline_rename.as_ref().unwrap();
+                assert_eq!(
+                    rename.selected_range, expected_range,
+                    "{keystroke} inline rename selection range"
+                );
+                assert_eq!(
+                    rename.selection_reversed, expected_reversed,
+                    "{keystroke} inline rename selection direction"
+                );
                 assert!(view.inline_rename_active());
             });
         }
