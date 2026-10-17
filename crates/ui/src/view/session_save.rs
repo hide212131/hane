@@ -488,10 +488,10 @@ impl EditorView {
     /// the work folder index so it appears in the sidebar without waiting
     /// for the next full rescan.
     fn apply_pending_title_sync(&mut self, id: SessionId, path: &Path) {
-        if let Some(title) = self.title_sync_pending.remove(&id) {
-            if let Some(session) = self.sessions.get_mut(id) {
-                session.note_auto_named(title);
-            }
+        if let Some(title) = self.title_sync_pending.remove(&id)
+            && let Some(session) = self.sessions.get_mut(id)
+        {
+            session.note_auto_named(title);
         }
         // Every landed write is indexed, not only a title-sync first write:
         // a Save As into the work folder lands a path the tree has never
