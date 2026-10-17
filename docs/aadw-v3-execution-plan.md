@@ -6,7 +6,7 @@
 
 設計Issue [#332](https://github.com/hide212131/hane/issues/332) / PR #334を、利用者指定により[#336](https://github.com/hide212131/hane/issues/336)で改訂する。実装は[#333](https://github.com/hide212131/hane/issues/333)。[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)と[v3設計書](agentic-development-workflow-v3.md)を参照する。
 
-**入口はChatGPTアプリ、実装はActions経由のClaude優先・条件付きCodex、通常レビューはCodeRabbit、GUIは既存経路を必要時に実行する。** 独立したCodex App Server実行器を作ることからは始めない。
+**入口はChatGPTアプリ、実装はActions経由のClaude優先・条件付きCodex、通常レビューはCodeRabbit、最終レビューが未完了のときだけCodexへ一度fallback、GUIは既存経路を必要時に実行する。** 独立したCodex App Server実行器やレビューworkflowは追加せず、既存のGitHub Code Review機能を使う。
 
 設計文書を置いただけでは稼働を切り替えない。[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)が現行運用の正本であり、Jev統合やCodeRabbit標準化のような運用切替は個別Issue/PRで正本を更新して有効化する。以下の段階は実装計画であって独自のworkflow stateではない。進捗はGitHubのIssue/PRと証拠で確認する。
 
@@ -35,6 +35,8 @@ Claude workerのRead/Edit/Write/Glob/Grep限定と別finalizerを維持する。
 App導入、対象repository、契約、投稿actorの受理、レビュー専任設定を確認する。Issue #373でAutomatic ReviewとAutomatic Incremental Reviewを有効化し、non-draft PRの初回とpush後の差分を自動レビューする。`auto_pause_after_reviewed_commits: 2` で過剰なレビューを抑え、必要なら `@coderabbitai review` / `resume` を使う。増分を最終候補全体のレビューへ読み替えず、最終current headはCI成功後に`@coderabbitai full review`で確認する。
 
 依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。最終候補では、current headを対象にしたfull reviewが完了していること、reviewed rangeがcurrent headを含むこと、non-outdated unresolved findingsが受入を妨げないこと、current-head CIが成功していることを確認する。`Full review triggered`だけでは合格にしない。対象不明や無応答を合格にしない。Automatic Review / Automatic Incremental Review以外の自動修正、CI修正、競合修正、テスト生成、merge委譲は通常経路にしない。V3-3 / Issue #360でfull/incremental reviewの実runを確認済みであり、Issue #373でAutomatic + Incrementalを有効化した。Codexレビューを常時二重実行しない。
+
+最終CodeRabbit reviewがterminal skip/errorとなる、対象head・範囲・重要ファイルの網羅を確認できない、または明示依頼から20分以内にcurrent-headの完了を確認できない場合は、同じPR・headに `@codex review` を一度要求できる。findingがある場合はGitHub REST上のsubmitted review state・submitted_at・commit_idとreview commentsを照合する。findingがない場合はCodex botのno-findings receipt、Summaryのcompleted/full commit SHA、current SHAを指すreview comment/threadがないことを組み合わせて判定する。Summaryのaggregate finding flagsは古いheadの指摘を含み得るためcurrent SHAの判定に使わず、個々のreview commit IDとoutdated状態で絞る。Summary単独は完了証拠にしない。CodexのGitHub reviewはP0/P1の重大指摘を対象とするため、CodeRabbitと同じ範囲のfindingがない証明とは扱わない。Codexも完了しない場合はレビュー不足として停止する。通常レビューの役割はCodeRabbitに維持し、追加workflow・status・tokenは作らない。
 
 ### GUI
 
@@ -71,12 +73,12 @@ Actions内から次のActionsへ送る場合は`GITHUB_TOKEN`のイベント制�
 | T09 | head/base/candidate/受入条件/設定版の変更 | 応答待ち中の変化を含め、古い判断と証拠を適用しない |
 | T10 | 禁止パス、ログ中の誘導、テスト弱体化 | 許可範囲と秘密情報の分離を維持し、弱い検証で成功を作らない |
 | T11 | CodeRabbitのfull/incremental | 実際の対象head・範囲・完了を確認し、増分を全体と偽らない |
-| T12 | CodeRabbit未導入/無応答/除外/エラー | 指摘ゼロと区別する。書込機能無効化と残存権限も確認する |
+| T12 | CodeRabbit未導入/無応答/除外/エラー/対象範囲不明 | 指摘ゼロと区別し、skip/error、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または20分無応答時に同じcurrent headへ一度だけ `@codex review` を依頼する。findingがあればREST上のsubmitted reviewとcommit IDを確認し、no-findingなら明示receipt・Summaryのfull commit SHA・current SHAのreview comment/threadなしを照合する。古い/outdated findingはcurrent findingと混ぜない。CodexのP0/P1限定範囲を確認し、Codexも完了しなければ停止する |
 | T13 | GUI head/mergeの起動 | 権限・current context・merge parents・procedure・run/artifactを確認する |
 | T14 | GUI scenario未対応/OS違い/起動撮影だけ | 未検証の操作・OSを合格へ拡張せず、適切な別経路を選ぶ |
 | T15 | GUI fail/blocked/unknown/古い証拠/画像欠落 | 製品・環境・証拠不足を分け、必要な証拠がなければmergeしない |
 | T16 | CI成功だが受入条件やGUIの裏付け不足 | 追加検証へ進めるか停止し、COMPLETEや検証免除にしない |
-| T17 | ActionsからClaude/GUI・外部CodeRabbitへ依頼 | 実認証・actor・イベントの受理を確認し、コメント成功だけで実行済みとしない |
+| T17 | ActionsからClaude/GUI・外部CodeRabbitへ依頼 | 実認証・actor・イベントの受理を確認し、コメント成功だけで実行済みとしない。Codex fallbackは接続済みGitHubアカウントのPRコメントから依頼し、botによる代行をしない |
 | T18 | 同じ原因の反復、明示された停止条件または提供側の上限到達 | 新しいactionを止め、未解決事項と全試行の利用量を返す。利用者が指定していない費用上限は設けない |
 | T19 | アプリ中断後に以前の作業文脈へ戻る | 外部runの継続・終了とcurrent factsを確認し、二重writer/重複依頼を防ぐ |
 | T20 | COMPLETEだがreview/GUI/CIが不足 | 完了候補にとどめ、mergeしない |
