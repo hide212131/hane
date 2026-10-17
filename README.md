@@ -93,7 +93,7 @@ cargo run --release -p hane
 | 行頭・行末へ移動 / 選択 | Command + ← / →、Shift 付きで選択 | Home / End、Shift 付きで選択 |
 | 文書の先頭・末尾へ移動 / 選択 | Command + ↑ / ↓、Shift 付きで選択（Shift + Home / End でも選択） | Ctrl + Home / End、Shift 付きで選択 |
 | 単語単位で移動 / 選択 | Option + ← / →、Shift 付きで選択 | Ctrl + ← / →、Shift 付きで選択 |
-| 前・後の単語を削除 | Option + Backspace / Delete | Ctrl + Backspace / Delete |
+| 前・後の単語を削除 | Option + delete / Option + Fn + delete（前方削除キー） | Ctrl + Backspace / Delete |
 | 段落単位で移動 / 選択 | Option + ↑ / ↓、Shift 付きで選択 | Ctrl + ↑ / ↓、Shift 付きで選択 |
 | 1 画面分カーソルを移動 | Option + PageUp / PageDown | PageUp / PageDown（Shift 付きで選択） |
 | 画面だけをスクロール（カーソル・選択は動かさない） | Home / End（文書の先頭・末尾）、PageUp / PageDown（1 画面分） | なし |
