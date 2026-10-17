@@ -24,8 +24,17 @@ hane-metrics = { workspace = true, optional = true }
 hane-presentation = { workspace = true, optional = true }
 hane-session.workspace = true
 hane-ui.workspace = true
+hane-update.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
+# HTTPS transport for the explicit "check for updates" action. Both crates are
+# already resolved in Cargo.lock; the ring provider avoids a second crypto
+# backend and the platform verifier chain (native roots) validates TLS.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
+hane-update = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO"] }

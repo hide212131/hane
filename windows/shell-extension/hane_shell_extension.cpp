@@ -21,6 +21,23 @@ constexpr wchar_t kFileMarker[] = L"Hane.ShellIntegration.enabled";
 constexpr wchar_t kFolderMarker[] = L"Hane.ShellIntegration.folder.enabled";
 long g_objects = 0;
 
+// Strips the last path component from a directory that ends with a separator,
+// leaving the parent directory with its trailing separator. The removed
+// component is returned through `removed`.
+bool parent_directory(std::wstring& directory, std::wstring& removed) {
+    if (directory.empty()) return false;
+    const auto end = directory.size() - 1;
+    if (directory[end] != L'\\' && directory[end] != L'/') return false;
+    if (end == 0) return false;
+    const auto slash = directory.find_last_of(L"\\/", end - 1);
+    if (slash == std::wstring::npos) return false;
+    removed.assign(directory, slash + 1, end - slash - 1);
+    directory.resize(slash + 1);
+    return true;
+}
+
+// The DLL lives at <root>\shell-integration\<version>\hane_shell_extension.dll,
+// so the install root is a fixed two levels above the module directory.
 bool module_directory(std::wstring& directory) {
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
@@ -35,6 +52,12 @@ bool module_directory(std::wstring& directory) {
     const auto slash = directory.find_last_of(L"\\/");
     if (slash == std::wstring::npos) return false;
     directory.resize(slash + 1);
+    std::wstring version, container;
+    if (!parent_directory(directory, version) || version.empty()) return false;
+    if (!parent_directory(directory, container)
+        || _wcsicmp(container.c_str(), L"shell-integration") != 0) {
+        return false;
+    }
     return true;
 }
 
