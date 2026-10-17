@@ -15,13 +15,14 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::helper::{HelloRequest, PREPARE_TIMEOUT, spawn_helper};
 use crate::identity::TransactionId;
 use crate::journal::{
-    DiskView, FileJournalStore, FsDiskView, JournalStore, Phase, RecoveryDecision, decide_recovery,
+    DiskView, FileJournalStore, FsDiskView, JournalStore, Phase, RecoveryDecision, UpdateJournal,
+    decide_recovery,
 };
 use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
 use crate::platform::{self, Placement};
@@ -126,12 +127,13 @@ fn journal_problem(name: &str, why: impl std::fmt::Display) -> Pending {
     Pending::Stop(bounded_reason(&format!("journal {name}: {why}")))
 }
 
-/// Finds a transaction that still needs a decision. A terminal `Committed`
-/// journal needs none. A `RolledBack` journal is only trusted while every step
-/// of the live install still matches its recorded old identity: the rollback
-/// renames and the journal rename may not have been flushed together, so a
-/// mixed or unknown install stops instead of starting. Unknown entries are
-/// ignored, never deleted.
+/// Finds a transaction that still needs a decision. Every unfinished journal is
+/// inspected. Of the terminal journals only the newest is compared with the
+/// disk: a `Committed` one must still see every step at its new identity, a
+/// `RolledBack` one at its old identity (the rollback renames and the journal
+/// rename may not have been flushed together, so a mixed or unknown install
+/// stops instead of starting). Older terminal receipts were superseded by the
+/// newer transaction. Unknown entries are ignored, never deleted.
 fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<Option<Pending>> {
     let private = coordination.dir().join(PRIVATE_DIR);
     let entries = match fs::read_dir(&private) {
@@ -140,6 +142,7 @@ fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<
         Err(err) => return Err(err),
     };
     let mut pending: Vec<TransactionId> = Vec::new();
+    let mut terminal: Vec<Terminal> = Vec::new();
     for entry in entries {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -163,35 +166,14 @@ fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<
             return Ok(Some(journal_problem(&name, "belongs to another transaction or install")));
         }
         match journal.phase {
-            Phase::Committed => {
-                match decide_recovery(Some(&journal), coordination.install_id(), disk) {
-                    Ok(RecoveryDecision::KeepNew) => {}
-                    Ok(RecoveryDecision::RecoveryRequired(why)) => {
-                        return Ok(Some(journal_problem(&name, why)));
-                    }
-                    Ok(other) => {
-                        return Ok(Some(journal_problem(
-                            &name,
-                            format!("committed but the install is not at the new version: {other:?}"),
-                        )));
-                    }
-                    Err(err) => return Ok(Some(journal_problem(&name, err))),
-                }
-            }
-            Phase::RolledBack => {
-                match decide_recovery(Some(&journal), coordination.install_id(), disk) {
-                    Ok(RecoveryDecision::KeepOld) => {}
-                    Ok(RecoveryDecision::RecoveryRequired(why)) => {
-                        return Ok(Some(journal_problem(&name, why)));
-                    }
-                    Ok(other) => {
-                        return Ok(Some(journal_problem(
-                            &name,
-                            format!("rolled back but the install is not at the old version: {other:?}"),
-                        )));
-                    }
-                    Err(err) => return Ok(Some(journal_problem(&name, err))),
-                }
+            Phase::Committed | Phase::RolledBack => {
+                let modified = fs::symlink_metadata(coordination.journal_path(&transaction))
+                    .and_then(|meta| meta.modified())?;
+                terminal.push(Terminal {
+                    name,
+                    journal,
+                    modified,
+                });
             }
             Phase::RecoveryRequired => {
                 return Ok(Some(journal_problem(&name, "an earlier recovery did not complete")));
@@ -199,11 +181,117 @@ fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<
             _ => pending.push(transaction),
         }
     }
-    Ok(match pending.len() {
-        0 => None,
-        1 => pending.pop().map(Pending::Transaction),
-        _ => Some(Pending::Stop("more than one transaction is pending".to_owned())),
-    })
+    // Pending work is settled first, against its own journal. Terminal
+    // receipts only matter once nothing is pending, and then only the newest.
+    match pending.len() {
+        0 => {}
+        1 => return Ok(pending.pop().map(Pending::Transaction)),
+        _ => return Ok(Some(Pending::Stop("more than one transaction is pending".to_owned()))),
+    }
+    Ok(check_latest_terminal(coordination, terminal, disk))
+}
+
+/// A `Committed` / `RolledBack` journal and when it last changed.
+struct Terminal {
+    name: String,
+    journal: UpdateJournal,
+    modified: SystemTime,
+}
+
+/// Only the newest terminal receipt describes the current install; older ones
+/// were superseded by it and are not compared with the disk. Two receipts that
+/// cannot be ordered stop instead of guessing.
+fn check_latest_terminal(
+    coordination: &Coordination,
+    mut terminal: Vec<Terminal>,
+    disk: &dyn DiskView,
+) -> Option<Pending> {
+    let newest = terminal.iter().map(|entry| entry.modified).max()?;
+    terminal.retain(|entry| entry.modified == newest);
+    if terminal.len() > 1 {
+        return Some(Pending::Stop(
+            "the latest terminal journal cannot be determined".to_owned(),
+        ));
+    }
+    let latest = terminal.pop()?;
+    check_terminal(coordination, &latest.name, &latest.journal, disk)
+}
+
+fn check_terminal(
+    coordination: &Coordination,
+    name: &str,
+    journal: &UpdateJournal,
+    disk: &dyn DiskView,
+) -> Option<Pending> {
+    let decision = decide_recovery(Some(journal), coordination.install_id(), disk);
+    match (journal.phase, decision) {
+        (Phase::Committed, Ok(RecoveryDecision::KeepNew))
+        | (Phase::RolledBack, Ok(RecoveryDecision::KeepOld)) => None,
+        (_, Ok(RecoveryDecision::RecoveryRequired(why))) => Some(journal_problem(name, why)),
+        (Phase::Committed, Ok(other)) => Some(journal_problem(
+            name,
+            format!("committed but the install is not at the new version: {other:?}"),
+        )),
+        (_, Ok(other)) => Some(journal_problem(
+            name,
+            format!("rolled back but the install is not at the old version: {other:?}"),
+        )),
+        (_, Err(err)) => Some(journal_problem(name, err)),
+    }
+}
+
+/// Before a new mutation: nothing may be pending and the newest terminal
+/// receipt must still match the live install.
+pub(crate) fn ensure_prior_receipts_current(
+    coordination: &Coordination,
+    disk: &dyn DiskView,
+) -> Result<()> {
+    match scan_pending(coordination, disk).map_err(UpdateError::from)? {
+        None => Ok(()),
+        Some(Pending::Stop(why)) => Err(UpdateError::new(ErrorCode::InstallModified, why)),
+        Some(Pending::Transaction(_)) => Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            "another transaction is still pending",
+        )),
+    }
+}
+
+/// Retires the terminal receipts of earlier transactions. Call only after the
+/// new transaction's journal is durable: an interruption then leaves a pending
+/// journal, which the gate recovers before it looks at any receipt. Removal is
+/// best effort; a leftover receipt is ignored because the newest one wins.
+pub(crate) fn prune_superseded_receipts(coordination: &Coordination, current: &TransactionId) {
+    let private = coordination.dir().join(PRIVATE_DIR);
+    let Ok(entries) = fs::read_dir(&private) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(transaction) = TransactionId::parse(&name) else {
+            continue;
+        };
+        if &transaction == current {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let terminal = matches!(
+            FileJournalStore::new(coordination.journal_path(&transaction)).load(),
+            Ok(Some(journal))
+                if journal.transaction_id == transaction
+                    && &journal.install_id == coordination.install_id()
+                    && matches!(journal.phase, Phase::Committed | Phase::RolledBack)
+        );
+        if terminal {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Runs the gate for a verified placement.
@@ -477,6 +565,146 @@ mod tests {
             GateOutcome::Proceed(_)
         ));
         assert_eq!(runner.calls.get(), 0);
+    }
+
+    /// Journals `a.dll` from `from` to `to`, advanced to `phase`, with its file
+    /// time set `age_secs` after a fixed origin so receipts are ordered.
+    fn write_versioned(
+        coord: &Coordination,
+        transaction: &TransactionId,
+        (from, to): (&str, &str),
+        phase: Phase,
+        age_secs: u64,
+    ) {
+        let plan = ApplyPlan {
+            install_id: install_id(),
+            transaction_id: transaction.clone(),
+            source: release(from),
+            destination: release(to),
+            steps: vec![PlanStep {
+                rel_path: "a.dll".to_owned(),
+                old: Some(FileIdentity::of(from.as_bytes())),
+                new: Some(FileIdentity::of(to.as_bytes())),
+                backup_rel: Some("backup/a.dll".to_owned()),
+            }],
+            unchanged: Vec::new(),
+        };
+        coord.ensure_helper_dir(transaction).unwrap();
+        let mut durable = DurableJournal::create(
+            FileJournalStore::new(coord.journal_path(transaction)),
+            UpdateJournal::begin(&plan, None).unwrap(),
+        )
+        .unwrap();
+        let path: &[Phase] = match phase {
+            Phase::Applying => &[Phase::ExitAuthorized, Phase::Applying],
+            Phase::Committed => &[
+                Phase::ExitAuthorized,
+                Phase::Applying,
+                Phase::AwaitingHealth,
+                Phase::Committed,
+            ],
+            other => panic!("unused test phase {other:?}"),
+        };
+        for next in path {
+            durable.advance_phase(*next).unwrap();
+        }
+        set_age(coord, transaction, age_secs);
+    }
+
+    fn set_age(coord: &Coordination, transaction: &TransactionId, age_secs: u64) {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(coord.journal_path(transaction))
+            .unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + age_secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_later_update_is_not_blocked_by_an_older_committed_receipt() {
+        let dir = TempDir::new("gate-multi-version");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        // v1 -> v2 committed, then v2 -> v3 committed; the disk is at v3.
+        write_versioned(&coord, &TransactionId::generate().unwrap(), ("v1", "v2"), Phase::Committed, 0);
+        let newest = TransactionId::generate().unwrap();
+        write_versioned(&coord, &newest, ("v2", "v3"), Phase::Committed, 10);
+        fs::write(placement.install_root.join("a.dll"), b"v3").unwrap();
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        assert!(matches!(
+            startup_gate(&placement, &runner, Duration::from_millis(50)),
+            GateOutcome::Proceed(_)
+        ));
+        assert_eq!(runner.calls.get(), 0);
+
+        // The newest receipt still gates: a disk that is not at v3 stops.
+        fs::write(placement.install_root.join("a.dll"), b"v2").unwrap();
+        assert!(matches!(
+            startup_gate(&placement, &runner, Duration::from_millis(50)),
+            GateOutcome::RecoveryRequired(_)
+        ));
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn receipts_that_cannot_be_ordered_stop() {
+        let dir = TempDir::new("gate-unordered");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        write_versioned(&coord, &TransactionId::generate().unwrap(), ("v1", "v2"), Phase::Committed, 5);
+        write_versioned(&coord, &TransactionId::generate().unwrap(), ("v2", "v3"), Phase::Committed, 5);
+        fs::write(placement.install_root.join("a.dll"), b"v3").unwrap();
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        assert!(matches!(
+            startup_gate(&placement, &runner, Duration::from_millis(50)),
+            GateOutcome::RecoveryRequired(_)
+        ));
+    }
+
+    #[test]
+    fn a_pending_transaction_beside_an_older_receipt_is_recovered_first() {
+        // v1 -> v2 committed (disk at v2), then v2 -> v3 was cut short while
+        // applying: the older receipt must not hide or pre-empt the recovery.
+        for settle in [true, false] {
+            let dir = TempDir::new("gate-pending-after-commit");
+            let placement = placement(&dir);
+            let coord = placement.coordination().unwrap();
+            write_versioned(&coord, &TransactionId::generate().unwrap(), ("v1", "v2"), Phase::Committed, 0);
+            let pending = TransactionId::generate().unwrap();
+            write_versioned(&coord, &pending, ("v2", "v3"), Phase::Applying, 10);
+            // Mid-apply the disk matches neither receipt's committed state.
+            fs::write(placement.install_root.join("a.dll"), b"v3").unwrap();
+            let runner = Runner::new(settle, Ok(RecoveryReport::RolledBack));
+            if settle {
+                // The rollback restores v2, the older receipt's version.
+                fs::write(placement.install_root.join("a.dll"), b"v2").unwrap();
+            }
+            let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+            assert_eq!(runner.calls.get(), 1, "settle={settle}: pending journal reached recovery");
+            if settle {
+                assert!(matches!(outcome, GateOutcome::Proceed(_)), "{outcome:?}");
+            } else {
+                assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pruning_retires_only_earlier_terminal_receipts() {
+        let dir = TempDir::new("gate-prune");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let old_committed = TransactionId::generate().unwrap();
+        write_versioned(&coord, &old_committed, ("v1", "v2"), Phase::Committed, 0);
+        let other_pending = TransactionId::generate().unwrap();
+        write_versioned(&coord, &other_pending, ("v2", "v3"), Phase::Applying, 5);
+        let current = TransactionId::generate().unwrap();
+        write_versioned(&coord, &current, ("v2", "v3"), Phase::Applying, 10);
+
+        prune_superseded_receipts(&coord, &current);
+        assert!(!coord.transaction_dir(&old_committed).exists());
+        assert!(coord.journal_path(&other_pending).exists(), "unfinished work is never pruned");
+        assert!(coord.journal_path(&current).exists());
     }
 
     #[test]
