@@ -834,6 +834,45 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_find_jump_after_center_cursor_line_releases_the_pinned_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_multi_line(cx);
+        let text = multi_line_paragraph();
+        let caret = text.find("l02w050").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_everything(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.center_cursor_line(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.center_window_line.is_some()));
+
+        // A match far from the pinned line inside the same paragraph.
+        let target = text.find("l27w100").unwrap();
+        let before_text = text.clone();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.open_document_find(window, cx);
+                view.document_find.query_text = "l27w100".to_owned();
+                view.restart_document_find(cx, false, true);
+            });
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert_eq!(view.document_find.matches[0].start.0, target);
+            assert!(view.center_window_line.is_none());
+            assert!(view.retained_center_window.is_none());
+            assert_eq!(view.pending_center_caret_frames, 0);
+            assert_eq!(view.editor().document().full_text(), before_text);
+            assert!(!view.editor().can_undo());
+        });
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+    }
+
+    #[gpui::test]
     fn registered_page_keys_move_a_viewport_and_collapse_or_extend(cx: &mut gpui::TestAppContext) {
         let (view, cx) = open_wrapped(cx);
         let caret = wrapped_document().find("w100 ").unwrap();

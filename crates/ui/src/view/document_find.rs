@@ -576,6 +576,8 @@ impl EditorView {
         let Some(range) = self.document_find_current_match() else {
             return;
         };
+        // 中央表示の固定描画窓が残ると、遠い検索一致の行が描画されない。
+        self.cancel_center_caret();
         self.scroll_source_offset_into_view(range.start);
         self.pending_find_visibility_after_layout = true;
     }
