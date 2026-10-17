@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use hane_update::health::{COMMIT_WAIT, ChildEntry, detect_child};
+use hane_update::health::{COMMIT_WAIT, ChildEntry, VerifiedChild, detect_child};
 use hane_update::startup::{GateOutcome, HelperRecoveryRunner, RuntimeGuard, startup_gate_for_exe};
 use hane_update::trust::TrustPolicy;
 
@@ -26,9 +26,16 @@ pub enum Entry {
         guard: Option<RuntimeGuard>,
         state_root: Option<PathBuf>,
     },
+    /// The limited-health child of an update helper. Only the minimal update
+    /// UI may start; `Healthy` follows its first drawn frame and normal startup
+    /// follows the helper's durable `Commit`.
+    Limited(Box<VerifiedChild>),
     /// Do not start; exit the process with this status.
     Stop(i32),
 }
+
+/// How long the limited child waits for the helper's `Commit` after `Healthy`.
+pub const LIMITED_COMMIT_WAIT: std::time::Duration = COMMIT_WAIT;
 
 pub fn enter() -> Entry {
     let exe = match std::env::current_exe() {
@@ -58,15 +65,11 @@ pub fn enter() -> Entry {
             // The read-only inspection of the state root, the settings store
             // and the restart ticket runs before `Healthy`; it writes nothing.
             // The root is handed on only if the helper's `Commit` arrives.
-            let state_root = session.state_root().to_path_buf();
+            // `Healthy` is not sent here: the limited UI must first draw its
+            // first frame (see `limited_start`).
             let check = session.state_check();
-            return match session.run(std::io::stdin(), std::io::stdout(), COMMIT_WAIT, move || {
-                check.verify()
-            }) {
-                Ok(guard) => Entry::Start {
-                    guard: Some(guard),
-                    state_root: Some(state_root),
-                },
+            return match session.verify(move || check.verify()) {
+                Ok(verified) => Entry::Limited(Box::new(verified)),
                 Err(err) => {
                     eprintln!("Hane could not confirm the update it was started for ({err}).");
                     Entry::Stop(EXIT_RECOVERY_REQUIRED)

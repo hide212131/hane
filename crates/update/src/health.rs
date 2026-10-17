@@ -852,7 +852,7 @@ impl ChildSession {
     pub fn run<R, W>(
         self,
         reader: R,
-        mut writer: W,
+        writer: W,
         wait: Duration,
         check: impl FnOnce() -> Result<()>,
     ) -> Result<RuntimeGuard>
@@ -860,9 +860,40 @@ impl ChildSession {
         R: Read + Send + 'static,
         W: Write,
     {
+        self.verify(check)?.report_healthy(reader, writer, wait)
+    }
+
+    /// Runs the read-only inspection only. Nothing is sent to the helper: the
+    /// caller reports `Healthy` via [`VerifiedChild::report_healthy`] once the
+    /// limited UI has really drawn its first frame.
+    pub fn verify(self, check: impl FnOnce() -> Result<()>) -> Result<VerifiedChild> {
         check()?;
+        Ok(VerifiedChild { session: self })
+    }
+}
+
+/// A child whose read-only inspection passed. It has not reported anything yet.
+pub struct VerifiedChild {
+    session: ChildSession,
+}
+
+impl VerifiedChild {
+    /// The verified state root; usable for normal startup only after
+    /// [`VerifiedChild::report_healthy`] returned `Ok`.
+    pub fn state_root(&self) -> &Path {
+        self.session.state_root()
+    }
+
+    /// Reports `Healthy` and waits for `Commit`. The returned guard keeps the
+    /// shared `runtime` lease; normal startup may follow only on `Ok`.
+    pub fn report_healthy<R, W>(self, reader: R, mut writer: W, wait: Duration) -> Result<RuntimeGuard>
+    where
+        R: Read + Send + 'static,
+        W: Write,
+    {
+        let session = self.session;
         let incoming = spawn_reader(reader)?;
-        let cap = &self.capability;
+        let cap = &session.capability;
         let sent = write_frame(
             &mut writer,
             &Frame::new(
@@ -883,10 +914,10 @@ impl ChildSession {
                 ..
             }) => transaction_id == cap.transaction.as_str(),
             // A helper that died after committing is recognized by the journal.
-            _ => self.committed_durably(),
+            _ => session.committed_durably(),
         };
         if proceed {
-            Ok(RuntimeGuard::new(self.lease))
+            Ok(RuntimeGuard::new(session.lease))
         } else {
             Err(UpdateError::new(
                 ErrorCode::NotApplicable,
@@ -894,7 +925,9 @@ impl ChildSession {
             ))
         }
     }
+}
 
+impl ChildSession {
     fn committed_durably(&self) -> bool {
         let store = FileJournalStore::new(self.coordination.journal_path(&self.capability.transaction));
         matches!(

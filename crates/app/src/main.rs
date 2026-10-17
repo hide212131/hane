@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 mod app_update;
 mod https_transport;
+mod limited_start;
 #[cfg(target_os = "windows")]
 mod open_request;
 mod update_gate;
@@ -162,6 +163,12 @@ fn main() {
             }
             guard
         }
+        // The helper's limited child: a minimal update window only. Normal
+        // startup runs inside it, and only after the helper's durable commit.
+        update_gate::Entry::Limited(verified) => {
+            limited_start::run(verified);
+            return;
+        }
         update_gate::Entry::Stop(code) => std::process::exit(code),
     };
 
@@ -182,15 +189,43 @@ fn main() {
             std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(path))
         }
     });
+    let Some(launch) = prepare_launch(cli_path) else {
+        return;
+    };
+    gpui_platform::application()
+        .with_assets(AppAssets)
+        .run(move |cx: &mut App| open_editor(cx, launch));
+}
+
+/// Everything resolved before the editor window opens. Building it reads the
+/// settings store and starts the AI service, so the limited update child
+/// builds it only after the helper's commit.
+pub(crate) struct EditorLaunch {
+    path: Option<PathBuf>,
+    #[cfg_attr(feature = "instrument", allow(dead_code))]
+    needs_default_prompt: bool,
+    ai_service: Option<AiService>,
+    update_service: Option<Arc<app_update::AppUpdateService>>,
+    #[cfg(target_os = "windows")]
+    open_requests: std::sync::mpsc::Receiver<PathBuf>,
+    #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+    process_started: std::time::Instant,
+    #[cfg(feature = "instrument")]
+    config: hane_ui::InstrumentationConfig,
+}
+
+/// `None` when this launch must not open an editor (forwarded to a running
+/// instance, or the open-request pipe belongs to another instance).
+pub(crate) fn prepare_launch(cli_path: Option<PathBuf>) -> Option<EditorLaunch> {
     #[cfg(target_os = "windows")]
     {
         if let Some(path) = cli_path.as_deref() {
             match open_request::forward(path) {
-                Ok(true) => return,
+                Ok(true) => return None,
                 Ok(false) => {}
                 Err(error) => {
                     eprintln!("Could not forward Explorer open request: {error}");
-                    return;
+                    return None;
                 }
             }
         }
@@ -205,7 +240,7 @@ fn main() {
                 let _ = open_request::forward(path);
             }
             eprintln!("Could not own Hane's open-request pipe: {error}");
-            return;
+            return None;
         }
     };
     // Without a CLI path, an ordinary launch opens the saved default folder;
@@ -241,6 +276,37 @@ fn main() {
     // start its worker must never prevent the Markdown editor from opening.
     let ai_service = start_ai_service();
     let update_service = start_update_service();
+    Some(EditorLaunch {
+        path,
+        needs_default_prompt,
+        ai_service,
+        update_service,
+        #[cfg(target_os = "windows")]
+        open_requests,
+        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+        process_started,
+        #[cfg(feature = "instrument")]
+        config,
+    })
+}
+
+/// Opens the editor window and starts the app-owned services inside a running
+/// GPUI application.
+pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
+    let EditorLaunch {
+        path,
+        needs_default_prompt,
+        ai_service,
+        update_service,
+        #[cfg(target_os = "windows")]
+        open_requests,
+        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+        process_started,
+        #[cfg(feature = "instrument")]
+        config,
+    } = launch;
+    #[cfg(feature = "instrument")]
+    let _ = needs_default_prompt;
     #[cfg(feature = "instrument")]
     let untitled_source: &str = if config.start_empty {
         ""
@@ -249,114 +315,106 @@ fn main() {
     };
     #[cfg(not(feature = "instrument"))]
     let untitled_source: &str = DEFAULT_DOCUMENT;
-    gpui_platform::application()
-        .with_assets(AppAssets)
-        .run(move |cx: &mut App| {
-            if let Some(service) = ai_service {
-                // GPUI owns this value for the full application lifetime;
-                // views receive handles and may come and go independently.
-                cx.set_global(AppOwnedAiService(service));
-            }
-            let ai_service_handle = cx
-                .try_global::<AppOwnedAiService>()
-                .map(|owner| owner.0.handle());
-            let update_controller: Option<Arc<dyn AppUpdateController>> =
-                update_service.map(|service| {
-                    // The service belongs to the application, not to a window.
-                    cx.set_global(AppOwnedUpdateService(Arc::clone(&service)));
-                    service as Arc<dyn AppUpdateController>
+    if let Some(service) = ai_service {
+        // GPUI owns this value for the full application lifetime;
+        // views receive handles and may come and go independently.
+        cx.set_global(AppOwnedAiService(service));
+    }
+    let ai_service_handle = cx
+        .try_global::<AppOwnedAiService>()
+        .map(|owner| owner.0.handle());
+    let update_controller: Option<Arc<dyn AppUpdateController>> = update_service.map(|service| {
+        // The service belongs to the application, not to a window.
+        cx.set_global(AppOwnedUpdateService(Arc::clone(&service)));
+        service as Arc<dyn AppUpdateController>
+    });
+    register_key_bindings(cx);
+    let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |_, cx| {
+                cx.new(|cx| {
+                    #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
+                    let mut view = match path.as_deref() {
+                        Some(path) if path.is_dir() => EditorView::open_work_folder(path, cx),
+                        Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| {
+                            EditorView::new(
+                                &format!("Could not open {}: {error}", path.display()),
+                                path.display().to_string(),
+                                cx,
+                            )
+                        }),
+                        None => EditorView::new(untitled_source, "Untitled", cx),
+                    };
+                    view.attach_ai_service(ai_service_handle.clone(), cx);
+                    view.attach_app_update(update_controller.clone());
+                    #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+                    view.arm_startup_timing(process_started);
+                    view
+                })
+            },
+        )
+        .expect("open Hane window");
+    #[cfg(feature = "instrument")]
+    instrument::apply(&window, &config, cx);
+    #[cfg(not(feature = "instrument"))]
+    {
+        window
+            .update(cx, |view, window, cx| {
+                window.focus(&view.focus_handle(cx), cx);
+                // `Context::on_app_quit` (registered inside `EditorView`)
+                // only fires on an actual app-quit event, which closing
+                // this window does not always raise on its own; flushing
+                // here too means an unnamed note's last keystrokes still
+                // survive the window simply being closed.
+                let view_handle = cx.entity();
+                window.on_window_should_close(cx, move |_window, cx| {
+                    view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
+                    true
                 });
-            register_key_bindings(cx);
-            let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        ..Default::default()
-                    },
-                    |_, cx| {
-                        cx.new(|cx| {
-                            #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
-                            let mut view = match path.as_deref() {
-                                Some(path) if path.is_dir() => {
-                                    EditorView::open_work_folder(path, cx)
-                                }
-                                Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| {
-                                    EditorView::new(
-                                        &format!("Could not open {}: {error}", path.display()),
-                                        path.display().to_string(),
-                                        cx,
-                                    )
-                                }),
-                                None => EditorView::new(untitled_source, "Untitled", cx),
-                            };
-                            view.attach_ai_service(ai_service_handle.clone(), cx);
-                            view.attach_app_update(update_controller.clone());
-                            #[cfg(any(feature = "instrument", feature = "timing-probe"))]
-                            view.arm_startup_timing(process_started);
-                            view
-                        })
-                    },
-                )
-                .expect("open Hane window");
-            #[cfg(feature = "instrument")]
-            instrument::apply(&window, &config, cx);
-            #[cfg(not(feature = "instrument"))]
-            {
-                window
-                    .update(cx, |view, window, cx| {
-                        window.focus(&view.focus_handle(cx), cx);
-                        // `Context::on_app_quit` (registered inside `EditorView`)
-                        // only fires on an actual app-quit event, which closing
-                        // this window does not always raise on its own; flushing
-                        // here too means an unnamed note's last keystrokes still
-                        // survive the window simply being closed.
-                        let view_handle = cx.entity();
-                        window.on_window_should_close(cx, move |_window, cx| {
-                            view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
-                            true
-                        });
-                        if needs_default_prompt {
-                            view.prompt_default_work_folder(cx);
-                        }
-                    })
-                    .expect("focus editor");
-                cx.activate(true);
-            }
-            #[cfg(target_os = "windows")]
-            cx.spawn(async move |cx| {
-                // Paths wait here until the view accepts them; a request that
-                // arrives while the view is frozen for an update restart
-                // check stays queued and is retried on the next tick instead
-                // of being consumed.
-                let mut pending = hane_ui::ExternalOpenQueue::new();
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(40))
-                        .await;
-                    while let Ok(path) = open_requests.try_recv() {
-                        pending.push(path);
-                    }
-                    if pending.is_empty() {
-                        continue;
-                    }
-                    if window
-                        .update(cx, |view, window, cx| {
-                            let accepted =
-                                pending.drain_into(|path| view.submit_external_open(path, cx));
-                            if accepted > 0 {
-                                window.activate_window();
-                                if !view.settings_is_open() {
-                                    window.focus(&view.focus_handle(cx), cx);
-                                }
-                            }
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+                if needs_default_prompt {
+                    view.prompt_default_work_folder(cx);
                 }
             })
-            .detach();
-        });
+            .expect("focus editor");
+        cx.activate(true);
+    }
+    #[cfg(target_os = "windows")]
+    cx.spawn(async move |cx| {
+        // Paths wait here until the view accepts them; a request that
+        // arrives while the view is frozen for an update restart
+        // check stays queued and is retried on the next tick instead
+        // of being consumed.
+        let mut pending = hane_ui::ExternalOpenQueue::new();
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+            while let Ok(path) = open_requests.try_recv() {
+                pending.push(path);
+            }
+            if pending.is_empty() {
+                continue;
+            }
+            if window
+                .update(cx, |view, window, cx| {
+                    let accepted = pending.drain_into(|path| view.submit_external_open(path, cx));
+                    if accepted > 0 {
+                        window.activate_window();
+                        if !view.settings_is_open() {
+                            window.focus(&view.focus_handle(cx), cx);
+                        }
+                    }
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+    .detach();
 }
