@@ -733,25 +733,25 @@ mod tests {
         let caret = multi_line_paragraph().find("l15w100").unwrap();
         set_selection(&view, cx, caret, caret);
         scroll_away_and_evict_everything(&view, cx);
-        cx.update(|window, app| {
-            view.update(app, |view, cx| view.center_cursor_line(window, cx));
-        });
-        view.read_with(cx, |view, _| {
-            assert!(view.pending_center_caret_frames > 0);
-        });
-
         // The centring is still pending when a small pixel scroll arrives.
-        let manual = view.update(cx, |view, cx| {
-            let event = gpui::ScrollWheelEvent {
-                position: gpui::point(px(100.0), px(100.0)),
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-30.0))),
-                modifiers: gpui::Modifiers::none(),
-                touch_phase: gpui::TouchPhase::Moved,
-            };
-            view.on_scroll_at(&event, std::time::Instant::now(), cx);
-            assert_eq!(view.pending_center_caret_frames, 0);
-            assert!(view.center_window_line.is_none());
-            view.scroll_y
+        // Request, check and cancel inside one outer update so that no
+        // synchronous test draw consumes the pending frames in between.
+        let manual = cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.center_cursor_line(window, cx);
+                assert!(view.pending_center_caret_frames > 0);
+                assert!(view.center_window_line.is_some());
+                let event = gpui::ScrollWheelEvent {
+                    position: gpui::point(px(100.0), px(100.0)),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-30.0))),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                };
+                view.on_scroll_at(&event, std::time::Instant::now(), cx);
+                assert_eq!(view.pending_center_caret_frames, 0);
+                assert!(view.center_window_line.is_none());
+                view.scroll_y
+            })
         });
         cx.run_until_parked();
         let after = view.read_with(cx, |view, _| view.scroll_y);
@@ -763,19 +763,20 @@ mod tests {
 
         // A line-based wheel event cancels it as well.
         cx.update(|window, app| {
-            view.update(app, |view, cx| view.center_cursor_line(window, cx));
-        });
-        view.update(cx, |view, cx| {
-            assert!(view.pending_center_caret_frames > 0);
-            let event = gpui::ScrollWheelEvent {
-                position: gpui::point(px(100.0), px(100.0)),
-                delta: gpui::ScrollDelta::Lines(gpui::point(0.0, -1.0)),
-                modifiers: gpui::Modifiers::none(),
-                touch_phase: gpui::TouchPhase::Moved,
-            };
-            view.on_scroll_at(&event, std::time::Instant::now(), cx);
-            assert_eq!(view.pending_center_caret_frames, 0);
-            assert!(view.center_window_line.is_none());
+            view.update(app, |view, cx| {
+                view.center_cursor_line(window, cx);
+                assert!(view.pending_center_caret_frames > 0);
+                assert!(view.center_window_line.is_some());
+                let event = gpui::ScrollWheelEvent {
+                    position: gpui::point(px(100.0), px(100.0)),
+                    delta: gpui::ScrollDelta::Lines(gpui::point(0.0, -1.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                };
+                view.on_scroll_at(&event, std::time::Instant::now(), cx);
+                assert_eq!(view.pending_center_caret_frames, 0);
+                assert!(view.center_window_line.is_none());
+            });
         });
 
         // So does the start of a scrollbar drag.
