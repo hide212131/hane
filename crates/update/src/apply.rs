@@ -642,6 +642,42 @@ mod tests {
     }
 
     #[test]
+    fn begin_and_validate_reject_backup_paths_outside_the_canonical_backup() {
+        let canonical = UpdateJournal::begin(&plan(), None).unwrap();
+        assert!(canonical.validate().is_ok());
+        let replaced = canonical
+            .steps
+            .iter()
+            .position(|step| step.old.is_some())
+            .unwrap();
+        let added = canonical
+            .steps
+            .iter()
+            .position(|step| step.old.is_none())
+            .unwrap();
+
+        for bad in ["user.md", "backup/other.txt"] {
+            let mut p = plan();
+            p.steps[replaced].backup_rel = Some(bad.to_string());
+            let err = UpdateJournal::begin(&p, None).unwrap_err();
+            assert_eq!(err.code, ErrorCode::JournalInvalid);
+
+            let mut journal = canonical.clone();
+            journal.steps[replaced].backup_rel = Some(bad.to_string());
+            assert_eq!(journal.validate().unwrap_err().code, ErrorCode::JournalInvalid);
+        }
+
+        let mut p = plan();
+        p.steps[added].backup_rel = Some(format!("backup/{}", p.steps[added].rel_path));
+        let err = UpdateJournal::begin(&p, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::JournalInvalid);
+
+        let mut journal = canonical;
+        journal.steps[added].backup_rel = Some("user.md".to_string());
+        assert_eq!(journal.validate().unwrap_err().code, ErrorCode::JournalInvalid);
+    }
+
+    #[test]
     fn a_running_parent_blocks_every_mutation() {
         let mut journal = new_journal(flaky());
         let mut ops = FakeOps::new();
