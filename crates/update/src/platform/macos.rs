@@ -12,6 +12,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -53,7 +54,7 @@ fn query_volume(path: &Path) -> Result<Volume> {
         .collect();
     let flags = i64::from(stat.f_flags);
     Ok(Volume {
-        id: format!("{:x}:{:x}", stat.f_fsid.val[0], stat.f_fsid.val[1]),
+        id: format!("{:x}", fs::metadata(path)?.dev()),
         apfs: name_bytes == b"apfs",
         local: flags & i64::from(libc::MNT_LOCAL) != 0,
         read_only: flags & i64::from(libc::MNT_RDONLY) != 0,

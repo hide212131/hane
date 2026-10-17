@@ -13,7 +13,6 @@
 
 use std::io::{Read, Write};
 
-use ring::constant_time::verify_slices_are_equal;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +57,17 @@ impl Nonce {
     }
 
     fn matches(&self, other: &str) -> bool {
-        verify_slices_are_equal(self.0.as_bytes(), other.as_bytes()).is_ok()
+        let (a, b) = (self.0.as_bytes(), other.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        // Accumulate every byte difference so the time does not depend on
+        // where the first mismatch is.
+        let diff = a
+            .iter()
+            .zip(b)
+            .fold(0_u8, |acc, (x, y)| acc | std::hint::black_box(x ^ y));
+        diff == 0
     }
 }
 

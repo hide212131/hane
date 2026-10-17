@@ -21,10 +21,10 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use crate::apply::{self, FileOps, FsFileOps, HealthChild, RecoveryOutcome};
+use crate::apply::{self, FsFileOps, HealthChild, RecoveryOutcome};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::identity::{InstallId, TransactionId};
-use crate::journal::{DiskView, DurableJournal, FileJournalStore};
+use crate::journal::{DurableJournal, FileJournalStore};
 use crate::platform::lease::{Coordination, Lease, LeaseKind};
 use crate::protocol::{
     Body, Frame, Mode, Nonce, RecoveryReport, bounded_reason, read_frame, write_frame,
