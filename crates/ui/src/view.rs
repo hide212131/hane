@@ -580,6 +580,21 @@ struct FileTabContextMenu {
     instance: DocumentInstance,
 }
 
+/// The row a sidebar context menu was opened for.
+#[derive(Clone, Debug)]
+enum SidebarContextTarget {
+    File(PathBuf),
+    Folder(PathBuf),
+    /// An unnamed note row; it has no path yet, so only Save As applies.
+    Draft(SessionId, DocumentInstance),
+}
+
+#[derive(Clone, Debug)]
+struct SidebarContextMenu {
+    position: gpui::Point<Pixels>,
+    target: SidebarContextTarget,
+}
+
 /// A pending "close this tab" request whose session has unsaved changes, so
 /// the user is asked whether to save before it closes rather than losing the
 /// edits silently.
@@ -907,6 +922,9 @@ pub struct EditorView {
     /// every render instead of being snapshotted, so a rename that lands
     /// while the menu is open is reflected rather than shown stale.
     file_tab_context_menu: Option<FileTabContextMenu>,
+    /// The sidebar row context menu, if open. It names the row that was
+    /// right-clicked, never the active session or the sidebar selection.
+    sidebar_context_menu: Option<SidebarContextMenu>,
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
@@ -1723,6 +1741,7 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             file_tabs_scroll: ScrollHandle::new(),
             file_tab_context_menu: None,
+            sidebar_context_menu: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
             footer_scroll: ScrollHandle::new(),
@@ -2344,6 +2363,7 @@ impl EditorView {
         let Some(instance) = self.document_instance(id) else {
             return;
         };
+        self.sidebar_context_menu = None;
         self.file_tab_context_menu = Some(FileTabContextMenu {
             position,
             id,
@@ -2989,6 +3009,7 @@ impl EditorView {
         // comparisons elsewhere are what keep that dialog's eventual answer
         // from acting on the replacement document.
         self.file_tab_context_menu = None;
+        self.sidebar_context_menu = None;
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
         // Any background read still in flight for the old folder (or for
@@ -7087,6 +7108,16 @@ impl Render for EditorView {
                     .position(menu.position)
                     .snap_to_window()
                     .child(self.file_tab_context_menu_element(menu, cx)),
+            )
+        } else {
+            rendered
+        };
+        let rendered = if let Some(menu) = self.sidebar_context_menu.as_ref() {
+            rendered.child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window()
+                    .child(self.sidebar_context_menu_element(menu, cx)),
             )
         } else {
             rendered
