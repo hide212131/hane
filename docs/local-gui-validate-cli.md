@@ -31,7 +31,7 @@ base-sensitive な acceptance にこの CLI の結果を使えるのは、少な
 - 検証対象 head 自体が current base を取り込んでいる。
 - scenario が base の変更に影響されないことを具体的な evidence から判断できる。
 
-current head + current base の merge context 自体を検証する必要がある場合、この CLI は現状その context を構築・記録しないため単独では使えない。その場合は必要な runner で base / merge SHA を evidence に残す。現行 v2 の hosted entrypoint は Issue #162 で独立して扱う。
+current head + current base の merge context 自体を検証する必要がある場合、この CLI は現状その context を構築・記録しないため単独では使えない。その場合は必要な runner で base / merge SHA を evidence に残す。hosted entrypoint の導入経緯は Issue #162 に記録している。
 
 `result.json` に実際には検証していない base SHA を外部から metadata として付け足しても、merge-context を検証した証拠にはならない。必要な context を確認できない場合は `unknown` として fail closed にする。
 
