@@ -192,9 +192,9 @@ mod tests {
 
     #[test]
     fn a_window_that_failed_never_reports_healthy() {
-        // A window that never drew drops the gate without releasing the report.
-        let gate = HealthGate::new(|| panic!("Healthy must not be sent"));
-        drop(gate);
+        // A window that never drew leaves the gate at the end of the scope
+        // without releasing the report.
+        let _gate = HealthGate::new(|| panic!("Healthy must not be sent"));
     }
 
     #[test]
