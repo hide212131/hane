@@ -89,6 +89,12 @@ enum Stage {
         offer: Arc<Offer>,
         dir: PathBuf,
     },
+    /// The Ready candidate is being removed in the background.
+    Discarding {
+        op: u64,
+        offer: Arc<Offer>,
+        dir: PathBuf,
+    },
     Failed {
         code: ErrorCode,
     },
@@ -314,6 +320,7 @@ impl Inner {
                 Stage::Checking { .. }
                 | Stage::Downloading { .. }
                 | Stage::Ready { .. }
+                | Stage::Discarding { .. }
                 | Stage::Unavailable { .. } => return,
             }
             state.next_op += 1;
@@ -576,26 +583,62 @@ impl Inner {
 
     // ---------------------------------------------------------- discard
 
+    /// Returns before any filesystem call. The stage becomes `Discarding`, which
+    /// keeps check, download, restore and repeated discards away from the
+    /// candidate directory until the background task has finished.
     fn discard_ready(self: &Arc<Self>) {
-        let trashed = {
+        let (op, offer, dir) = {
             let mut state = self.lock();
-            let Stage::Ready { dir, .. } = &state.stage else {
+            let Stage::Ready { offer, dir } = &state.stage else {
                 return;
             };
+            let offer = Arc::clone(offer);
             let dir = dir.clone();
             state.next_op += 1;
-            let trash = self.trash_root().join(state.next_op.to_string());
-            let moved =
-                create_private_dir(&self.trash_root()).and_then(|()| fs::rename(&dir, &trash));
-            if moved.is_err() {
-                return;
-            }
-            state.stage = Stage::Idle;
-            trash
+            let op = state.next_op;
+            state.stage = Stage::Discarding {
+                op,
+                offer: Arc::clone(&offer),
+                dir: dir.clone(),
+            };
+            (op, offer, dir)
         };
-        // The slow deletion happens off the lock and off the UI thread; the
-        // candidate directory is already out of the way.
-        let _ = (self.runner)(Box::new(move || remove_dir_if_present(&trashed)));
+        let inner = Arc::clone(self);
+        let task_dir = dir.clone();
+        let started = (self.runner)(Box::new(move || inner.run_discard(op, &task_dir)));
+        if !started {
+            // Nothing ran, so the prepared update is untouched: make it
+            // Ready again so the user can retry.
+            let mut state = self.lock();
+            if matches!(&state.stage, Stage::Discarding { op: live, .. } if *live == op) {
+                state.stage = Stage::Ready { offer, dir };
+            }
+        }
+    }
+
+    fn run_discard(&self, op: u64, dir: &Path) {
+        let trash = self.trash_root().join(op.to_string());
+        let moved = create_private_dir(&self.trash_root()).and_then(|()| fs::rename(dir, &trash));
+        {
+            let mut state = self.lock();
+            let live = matches!(&state.stage, Stage::Discarding { op: live, .. } if *live == op);
+            if live {
+                state.stage = match (moved.as_ref(), &state.stage) {
+                    (Ok(()), _) => Stage::Idle,
+                    // The candidate is still in place: keep it retryable.
+                    (Err(_), Stage::Discarding { offer, dir, .. }) => Stage::Ready {
+                        offer: Arc::clone(offer),
+                        dir: dir.clone(),
+                    },
+                    (Err(_), _) => Stage::Idle,
+                };
+            }
+        }
+        if moved.is_ok() {
+            // The slow deletion runs after the candidate directory is out of
+            // the way and the lock is released.
+            remove_dir_if_present(&trash);
+        }
     }
 
     // ---------------------------------------------------------- restore
@@ -729,7 +772,9 @@ impl Inner {
                 describe(&mut snapshot, offer);
                 snapshot.received_bytes = received.load(Ordering::Relaxed);
             }
-            Stage::Ready { offer, .. } => {
+            // While the removal runs the candidate is still on disk; repeated
+            // discard clicks are absorbed by the service.
+            Stage::Ready { offer, .. } | Stage::Discarding { offer, .. } => {
                 snapshot.phase = AppUpdatePhase::Ready;
                 describe(&mut snapshot, offer);
             }
@@ -1202,11 +1247,73 @@ mod tests {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.prepare_ready();
         let candidates = fixture.updates_root().join("candidates");
+        let id = fixture.candidate_id();
         fixture.service.discard_ready();
-        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+        // Repeated clicks queue no second task.
+        fixture.service.discard_ready();
+        fixture.service.discard_ready();
+        assert_eq!(fixture.queue.lock().unwrap().len(), 1);
+        // Before the task runs nothing was touched and no operation may reuse the path.
+        assert!(candidates.join(&id).is_dir());
+        assert!(!fixture.updates_root().join("trash").exists());
+        let requests = fixture.requests();
+        fixture.service.check();
+        fixture.service.restore_local();
+        fixture.service.download(&id);
+        assert_eq!(fixture.queue.lock().unwrap().len(), 1);
+        assert_eq!(fixture.requests(), requests);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+
         run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
         assert!(candidates.read_dir().unwrap().next().is_none());
         assert!(!fixture.updates_root().join("trash").exists() || fixture.updates_root().join("trash").read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_runner_that_cannot_start_the_discard_keeps_the_ready_update_retryable() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let id = fixture.candidate_id();
+        let dir = fixture.updates_root().join("candidates").join(&id);
+
+        // Reopen over the same directories with a runner that can be told to refuse.
+        let accept = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let runner: Runner = {
+            let accept = Arc::clone(&accept);
+            let queue = Arc::clone(&queue);
+            Box::new(move |task| {
+                if !accept.load(Ordering::SeqCst) {
+                    return false;
+                }
+                queue.lock().unwrap().push(task);
+                true
+            })
+        };
+        let service = AppUpdateService::with_runner(
+            config(&fixture.dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            runner,
+        );
+        service.restore_local();
+        run_queued(&queue);
+        assert_eq!(service.snapshot().phase, AppUpdatePhase::Ready);
+
+        accept.store(false, Ordering::SeqCst);
+        service.discard_ready();
+        assert_eq!(service.snapshot().phase, AppUpdatePhase::Ready);
+        assert!(dir.is_dir(), "a refused task must not lose the prepared update");
+
+        // The retry works and a second click still queues exactly one task.
+        accept.store(true, Ordering::SeqCst);
+        service.discard_ready();
+        service.discard_ready();
+        assert_eq!(queue.lock().unwrap().len(), 1);
+        run_queued(&queue);
+        assert_eq!(service.snapshot().phase, AppUpdatePhase::Idle);
+        assert!(!dir.exists());
     }
 
     #[test]
