@@ -487,7 +487,7 @@ pub fn decide_recovery(
         Phase::RecoveryRequired => Ok(required("an earlier recovery did not complete")),
         Phase::Committed => {
             for step in &journal.steps {
-                if classify(step, disk)? != StepDisk::New {
+                if !identity_matches(&disk.observe(&step.rel_path)?, &step.new) {
                     return Ok(required(format!(
                         "committed update does not match the disk at {}",
                         step.rel_path

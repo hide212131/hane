@@ -163,7 +163,21 @@ fn scan_pending(coordination: &Coordination, disk: &dyn DiskView) -> io::Result<
             return Ok(Some(journal_problem(&name, "belongs to another transaction or install")));
         }
         match journal.phase {
-            Phase::Committed => {}
+            Phase::Committed => {
+                match decide_recovery(Some(&journal), coordination.install_id(), disk) {
+                    Ok(RecoveryDecision::KeepNew) => {}
+                    Ok(RecoveryDecision::RecoveryRequired(why)) => {
+                        return Ok(Some(journal_problem(&name, why)));
+                    }
+                    Ok(other) => {
+                        return Ok(Some(journal_problem(
+                            &name,
+                            format!("committed but the install is not at the new version: {other:?}"),
+                        )));
+                    }
+                    Err(err) => return Ok(Some(journal_problem(&name, err))),
+                }
+            }
             Phase::RolledBack => {
                 match decide_recovery(Some(&journal), coordination.install_id(), disk) {
                     Ok(RecoveryDecision::KeepOld) => {}
@@ -456,13 +470,53 @@ mod tests {
         let dir = TempDir::new("gate-terminal");
         let placement = placement(&dir);
         let coord = placement.coordination().unwrap();
-        write_journal(&coord, &TransactionId::generate().unwrap(), Phase::Committed);
         write_journal(&coord, &TransactionId::generate().unwrap(), Phase::RolledBack);
         let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
         assert!(matches!(
             startup_gate(&placement, &runner, Duration::from_millis(50)),
             GateOutcome::Proceed(_)
         ));
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_committed_journal_needs_every_file_at_its_new_identity() {
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        type Disk = fn(&std::path::Path);
+        let cases: [(&str, Disk, bool); 5] = [
+            ("new content", |root| fs::write(root.join("a.dll"), b"new").unwrap(), true),
+            ("old content", |_| {}, false),
+            ("unknown content", |root| fs::write(root.join("a.dll"), b"???").unwrap(), false),
+            ("missing file", |root| fs::remove_file(root.join("a.dll")).unwrap(), false),
+            (
+                "unreadable (directory)",
+                |root| {
+                    fs::remove_file(root.join("a.dll")).unwrap();
+                    fs::create_dir(root.join("a.dll")).unwrap();
+                },
+                false,
+            ),
+        ];
+        for (name, prepare, proceeds) in cases {
+            let dir = TempDir::new("gate-committed");
+            let placement = placement(&dir);
+            let coord = placement.coordination().unwrap();
+            write_journal(&coord, &TransactionId::generate().unwrap(), Phase::Committed);
+            prepare(&placement.install_root);
+            let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+            if proceeds {
+                assert!(matches!(outcome, GateOutcome::Proceed(_)), "{name}: {outcome:?}");
+            } else {
+                assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{name}: {outcome:?}");
+                assert!(
+                    coord
+                        .try_acquire(LeaseKind::RuntimeExclusive, &[])
+                        .unwrap()
+                        .is_some(),
+                    "{name}: normal editing never started"
+                );
+            }
+        }
         assert_eq!(runner.calls.get(), 0);
     }
 
