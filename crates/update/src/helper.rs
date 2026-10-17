@@ -229,7 +229,7 @@ pub fn run_session<R: Read, W: Write>(
         parent_pid,
     } = first.body
     else {
-        return Err(refuse(writer, &nonce, unexpected("first frame")));
+        return Err(refuse(writer, nonce, unexpected("first frame")));
     };
 
     let identity_ok = InstallId::parse(&install_id)
@@ -238,7 +238,7 @@ pub fn run_session<R: Read, W: Write>(
     if !identity_ok {
         return Err(refuse(
             writer,
-            &nonce,
+            nonce,
             UpdateError::new(
                 ErrorCode::IdentityMismatch,
                 "the request is not for this installation and transaction",
@@ -248,7 +248,7 @@ pub fn run_session<R: Read, W: Write>(
     if env.parent_pid != parent_pid {
         return Err(refuse(
             writer,
-            &nonce,
+            nonce,
             UpdateError::new(ErrorCode::IdentityMismatch, "the caller is not the real parent"),
         ));
     }
@@ -260,15 +260,15 @@ pub fn run_session<R: Read, W: Write>(
         Ok(None) => {
             return Err(refuse(
                 writer,
-                &nonce,
+                nonce,
                 UpdateError::new(ErrorCode::StaleJournal, "another updater owns this install"),
             ));
         }
-        Err(err) => return Err(refuse(writer, &nonce, err)),
+        Err(err) => return Err(refuse(writer, nonce, err)),
     };
     let startup = coord
         .acquire_within(LeaseKind::Startup, &[&transaction], env.gate_timeout)
-        .map_err(|err| refuse(writer, &nonce, err))?;
+        .map_err(|err| refuse(writer, nonce, err))?;
     let mut leases = HeldLeases {
         transaction,
         startup,
@@ -278,7 +278,7 @@ pub fn run_session<R: Read, W: Write>(
     write_frame(
         writer,
         &Frame::new(
-            &nonce,
+            nonce,
             Body::Prepared {
                 install_id,
                 transaction_id: transaction_id.clone(),
@@ -338,7 +338,7 @@ pub fn run_session<R: Read, W: Write>(
             write_frame(
                 writer,
                 &Frame::new(
-                    &nonce,
+                    nonce,
                     Body::Recovered {
                         transaction_id,
                         report: report.clone(),
