@@ -2,7 +2,29 @@
 
 準備ブランチの基準 main: e82b9a9fe42280bfa78497746bcd7e21c73430c5
 
-この文書は Issue #236 の実装範囲を共有するための準備資料です。この時点では製品コード、テスト、GUI検証を変更・実施していません。
+この文書は Issue #236 の実装範囲を共有するために作成した資料です。以下の「目的」から「実装・検証の提出条件」までは準備時点の計画であり、その時点では製品コード、テスト、GUI検証を変更・実施していませんでした（歴史的な記録）。現在の実装・検証状況は次の節を参照してください。
+
+## 現在の実装・検証状況
+
+### 実装済みの範囲
+
+- sidebar のファイル行とフォルダ行の context menu（対象は右クリックされた行）。
+- ファイル行の Save As。保存先は WorkFolder の外も選べ、保存した結果は WorkFolder の状態へ反映されます。
+- Trash 操作。失敗した場合は成功扱いにしません。
+
+### 検証済みの事実
+
+- regression tests と Clippy は、run `39027149284`（code head `bf394632dc37def9677d9ff2585498ca3fa68e9d`）で成功しています。この run では workspace tests も成功しています。
+
+### 未検証の事項
+
+- Save As dialog を最後まで操作する確認は未検証です。
+- macOS / Windows で OS の Trash / Recycle Bin へ移動する実機確認は未検証です。
+- GUI validation run `39020260329` は earlier head を対象としており、Save As dialog も OS Trash も操作していません。現在の head の GUI 合格証拠としては扱いません。
+
+### 別範囲
+
+- タブ右クリックの Save As は Issue #504 / PR #505 で扱い、この Issue の範囲には含めません。
 
 ## 目的
 
