@@ -800,6 +800,40 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_large_wheel_scroll_after_center_cursor_line_keeps_the_manual_position(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_multi_line(cx);
+        let caret = multi_line_paragraph().find("l15w100").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_everything(&view, cx);
+        // A scroll past the overscan of the centred position must keep the
+        // chosen position too, not only a small one.
+        let manual = cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.center_cursor_line(window, cx);
+                assert!(view.center_window_line.is_some());
+                let event = gpui::ScrollWheelEvent {
+                    position: gpui::point(px(100.0), px(100.0)),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-300.0))),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                };
+                view.on_scroll_at(&event, std::time::Instant::now(), cx);
+                assert!(view.center_window_line.is_none());
+                view.scroll_y
+            })
+        });
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            (after - manual).abs() <= 1.0,
+            "manual position {manual} was moved to {after}"
+        );
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+    }
+
+    #[gpui::test]
     fn registered_page_keys_move_a_viewport_and_collapse_or_extend(cx: &mut gpui::TestAppContext) {
         let (view, cx) = open_wrapped(cx);
         let caret = wrapped_document().find("w100 ").unwrap();

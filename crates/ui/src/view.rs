@@ -5395,6 +5395,39 @@ impl EditorView {
         start..end.max(start + 1)
     }
 
+    /// Moves the retained pin along with a manual scroll. Once `scroll_y` has
+    /// travelled half an overscan from where the pin was recorded, the pinned
+    /// line is advanced by the distance travelled (through the block's drawn
+    /// line height) and the anchor is reset to the current position. The block
+    /// is then still presented through a window around the position the user
+    /// chose, so its measured height stays consistent however far the manual
+    /// scroll goes, instead of the pin lapsing at the overscan edge and the
+    /// partial layout shrinking under the position.
+    fn follow_retained_center_window(&mut self, blocks: &[IndexedBlock]) {
+        let Some((line, anchor)) = self.retained_center_window else {
+            return;
+        };
+        if self.center_window_line.is_some() || self.granularity != Granularity::Blocks {
+            return;
+        }
+        let delta = self.scroll_y - anchor;
+        if delta.abs() <= self.theme.overscan / 2.0 {
+            return;
+        }
+        let document = self.sessions.active().editor().document();
+        let found = blocks.iter().find_map(|block| {
+            let span = block_line_span(document, block)?;
+            span.contains(&line).then_some((block, span))
+        });
+        let Some((block, span)) = found else {
+            return;
+        };
+        let moved = (delta / self.drawn_line_height(block)).round() as i64;
+        let next = (line as i64 + moved).clamp(span.start as i64, span.end.saturating_sub(1) as i64)
+            as usize;
+        self.retained_center_window = Some((next, self.scroll_y));
+    }
+
     /// How tall one line of a block draws, on average. A wrapped line occupies
     /// several rows, so the plain line height under-counts it; the block's own
     /// layout says by how much once it has been drawn once.
@@ -6652,6 +6685,7 @@ impl Render for EditorView {
             .retain(|id, _| retained.contains(id));
 
         let lines = self.visible_line_window(&blocks, &visible);
+        self.follow_retained_center_window(&blocks);
         let mut rendered = Vec::with_capacity(blocks.len());
         for block in &blocks {
             let window = self.render_window_for(block, &lines);
