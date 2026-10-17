@@ -190,6 +190,8 @@ const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
 /// sums accumulate f32 rounding error; anything below half a device-independent
 /// pixel is not a visible clip and must not keep a pending scroll request alive.
 const CARET_VISIBILITY_TOLERANCE: f32 = 0.5;
+/// Frames a centre-the-caret request may spend correcting its estimate.
+const CENTER_CARET_SETTLE_FRAMES: u8 = 8;
 /// Width of the sidebar's overlay scrollbar thumb while it is briefly shown
 /// during a scroll. Kept well under half of `SCROLLBAR_THUMB_WIDTH` (the
 /// editor's always-visible thumb) so the sidebar's idle right edge reads as
@@ -1087,6 +1089,11 @@ pub struct EditorView {
     /// changes a row height (for example, an inactive zero-height code fence
     /// becoming editable).
     pending_caret_visibility_after_layout: bool,
+    /// Frames left to settle a "center the caret row" request on the caret's
+    /// freshly measured row. The immediate scroll can only use the partial
+    /// layout estimate; this corrects it once the row is drawn. Cleared by any
+    /// other scroll-only operation, input, document switch and wheel inertia.
+    pending_center_caret_frames: u8,
     /// Set after document-find navigation moves the current match. Mirrors
     /// `pending_caret_visibility_after_layout`: forcing a hidden match's
     /// block open can change its row height only on the next render, so this
@@ -1750,6 +1757,7 @@ impl EditorView {
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
+            pending_center_caret_frames: 0,
             pending_find_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
@@ -2500,6 +2508,7 @@ impl EditorView {
         self.layout_cache.clear();
         self.caret_geometry = None;
         self.pending_caret_visibility_after_layout = false;
+        self.pending_center_caret_frames = 0;
         self.block_index = BlockIndexState::new();
         self.last_background_height_disclosure = None;
         self.last_applied_height_disclosure = None;
@@ -2574,6 +2583,7 @@ impl EditorView {
         // the next render. Re-check once after that layout is installed so
         // the caret and its input-mode badge use current geometry.
         self.pending_caret_visibility_after_layout = true;
+        self.pending_center_caret_frames = 0;
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
@@ -3952,21 +3962,50 @@ impl EditorView {
         extend: bool,
         shaper: &dyn LineShaper,
     ) -> bool {
+        self.step_vertical_by_layout(down, extend, shaper).is_some()
+    }
+
+    /// [`Self::move_vertical_by_layout`], also answering how far the caret row
+    /// moved in content-space pixels (`Some(0.0)` when it stayed put).
+    ///
+    /// The distance is measured inside layouts that share one origin: within
+    /// the caret's block, and for a block change from the shared edge into each
+    /// block. Absolute Ys of different partial layouts are never subtracted,
+    /// because each omits a different number of leading lines.
+    fn step_vertical_by_layout(
+        &mut self,
+        down: bool,
+        extend: bool,
+        shaper: &dyn LineShaper,
+    ) -> Option<f32> {
         let caret = self.editor().selection().active;
-        let Some((block, layout)) = self.layout_around(caret, shaper) else {
-            return false;
-        };
-        let Some(x) = self.editor().preferred_visual_x().or_else(|| {
-            layout
-                .point_for_source(&block, caret, shaper)
-                .map(|point| point.x)
-        }) else {
-            return false;
-        };
-        let target = match layout.vertical_target(&block, caret, down, x, shaper) {
-            VerticalMove::To(offset) => Some(offset),
-            VerticalMove::PastEdge => self.neighbor_row_target(&block, down, x, shaper),
-            VerticalMove::Unknown => return false,
+        let (block, layout) = self.layout_around(caret, shaper)?;
+        let from = layout.point_for_source(&block, caret, shaper);
+        let x = self
+            .editor()
+            .preferred_visual_x()
+            .or_else(|| from.map(|point| point.x))?;
+        let (target, distance) = match layout.vertical_target(&block, caret, down, x, shaper) {
+            VerticalMove::To(offset) => {
+                let distance = from
+                    .zip(layout.point_for_source(&block, offset, shaper))
+                    .map(|(from, to)| (to.y - from.y).abs());
+                (Some(offset), distance)
+            }
+            VerticalMove::PastEdge => match self.neighbor_row_target(&block, down, x, shaper) {
+                Some((offset, from_edge)) => {
+                    let to_edge = from.map(|from| {
+                        if down {
+                            layout.height() - from.y
+                        } else {
+                            from.y
+                        }
+                    });
+                    (Some(offset), to_edge.map(|to_edge| to_edge + from_edge))
+                }
+                None => (None, Some(0.0)),
+            },
+            VerticalMove::Unknown => return None,
         };
         // No neighbor means the caret is on the first or last row of the
         // document: staying put is the move.
@@ -3975,7 +4014,8 @@ impl EditorView {
         {
             self.report_error("vertical move", error);
         }
-        true
+        // An unmeasurable step counts as one line so a page still terminates.
+        Some(distance.unwrap_or_else(|| self.line_height()))
     }
 
     /// Moves the caret about one viewport up or down (Issue #494).
@@ -3997,13 +4037,13 @@ impl EditorView {
         const MAX_PAGE_ROWS: usize = 4_096;
         let shaper = WindowShaper::new(window, self.zoom);
         let page = (self.viewport_height - self.line_height()).max(self.line_height());
-        let start_top = self
-            .resolved_row_bounds(self.editor().selection().active, &shaper)
-            .map(|(top, _)| top);
+        // Distance is accumulated from each adjacent-row step: absolute Ys of
+        // separate partial layouts do not share an origin.
+        let mut travelled = 0.0_f32;
         let mut moved = false;
         for _ in 0..MAX_PAGE_ROWS {
             let before = self.editor().selection().active;
-            if !self.move_vertical_by_layout(down, extend, &shaper) {
+            let Some(step) = self.step_vertical_by_layout(down, extend, &shaper) else {
                 if !moved {
                     // No layout to resolve against yet (first frames): the
                     // source-line move stands in, as for the arrow keys.
@@ -4016,16 +4056,14 @@ impl EditorView {
                     return;
                 }
                 break;
-            }
+            };
             let after = self.editor().selection().active;
             if after == before {
                 break;
             }
             moved = true;
-            let travelled = start_top
-                .zip(self.resolved_row_bounds(after, &shaper))
-                .map(|(start, (top, _))| (top - start).abs());
-            if travelled.is_some_and(|travelled| travelled >= page) {
+            travelled += step;
+            if travelled >= page {
                 break;
             }
         }
@@ -4057,6 +4095,7 @@ impl EditorView {
         self.pending_caret_visibility_after_layout = false;
         self.pending_find_visibility_after_layout = false;
         self.pending_zoom_anchor = None;
+        self.pending_center_caret_frames = 0;
         cx.notify();
     }
 
@@ -4087,6 +4126,9 @@ impl EditorView {
         };
         let target = top + height / 2.0 - self.viewport_height / 2.0;
         self.finish_scroll_only(target, cx);
+        // `top` comes from a partial layout whose omitted leading lines are
+        // counted as single rows, so the row may not be centred once drawn.
+        self.pending_center_caret_frames = CENTER_CARET_SETTLE_FRAMES;
     }
 
     /// The block holding `offset`, laid out, with the line above and below it so
@@ -4199,7 +4241,7 @@ impl EditorView {
         down: bool,
         x: f32,
         shaper: &dyn LineShaper,
-    ) -> Option<SourceOffset> {
+    ) -> Option<(SourceOffset, f32)> {
         let (indexed, window) =
             neighbor_block_window(self.editor(), self.current_index(), block, down)?;
         let revision = self.editor().document().revision();
@@ -5511,7 +5553,7 @@ fn target_in_neighbor(
     list_projection: Option<&ListProjection>,
     table_projection: Option<&TableProjection>,
     line_height: f32,
-) -> Option<SourceOffset> {
+) -> Option<(SourceOffset, f32)> {
     let visual = presented_block_with_table_projection(
         editor,
         indexed,
@@ -5531,7 +5573,17 @@ fn target_in_neighbor(
     } else {
         layout.lines.len().checked_sub(1)?
     };
-    layout.source_at_x(&visual, row, x, shaper)
+    let target = layout.source_at_x(&visual, row, x, shaper)?;
+    // Distance from the edge shared with the block the caret leaves to the
+    // target row, measured inside this one layout so a partial window's
+    // omitted-line offset cancels out.
+    let target_y = layout.point_for_source(&visual, target, shaper)?.y;
+    let from_edge = if down {
+        target_y
+    } else {
+        layout.height() - target_y
+    };
+    Some((target, from_edge))
 }
 
 /// The caret target one row into the next or previous block, aiming at `x`.
@@ -5571,6 +5623,7 @@ fn neighbor_row_target(
         None,
         DEFAULT_LINE_HEIGHT,
     )
+    .map(|(target, _)| target)
 }
 
 /// The block holding one source offset: the formal index while it describes the
@@ -6645,6 +6698,30 @@ impl Render for EditorView {
                 // The fresh disclosed row has not been laid out yet. Keep the
                 // request alive for the next frame instead of consuming it
                 // against stale zero-height geometry.
+                cx.notify();
+            }
+        }
+        if self.pending_center_caret_frames > 0 {
+            // Re-centre on the drawn row. A row that was not laid out this
+            // frame keeps the request alive for a bounded number of frames.
+            self.pending_center_caret_frames -= 1;
+            if self.scroll_inertia.is_some() {
+                self.pending_center_caret_frames = 0;
+            } else if let Some((_, top, height)) = fresh_caret
+                && height > 0.0
+            {
+                let desired = clamp_scroll_y(
+                    top + height / 2.0 - self.viewport_height / 2.0,
+                    self.scrollable_content_height(),
+                    self.viewport_height,
+                );
+                if (desired - self.scroll_y).abs() > CARET_VISIBILITY_TOLERANCE {
+                    self.scroll_y = desired;
+                    cx.notify();
+                } else {
+                    self.pending_center_caret_frames = 0;
+                }
+            } else {
                 cx.notify();
             }
         }
