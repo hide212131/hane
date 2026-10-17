@@ -1,133 +1,138 @@
-# Issue #494: 基本編集操作の実装メモ
+# Issue #494: OS標準のキーによる基本編集操作
 
 - 仕事の契約: [Issue #494](https://github.com/hide212131/hane/issues/494)
 - 基準main: `2164b895e849eef4de8c80c3696c0fd8e00c496b`
-- 実装branch: `work/issue-494-basic-editing`
-- 準備時点: 文書だけ。製品実装、CI、レビュー、実画面の検証は未実施。
-- このファイルは具体的なキー、例、接続先をまとめる。目的・範囲・受入条件の正本はIssue。将来の状態はcurrent PRの証拠を確認する。
+- 実装branch: `work/issue-494-basic-editing`、PR #495
+- 2026-10-17: 利用者の追加指定により初回仕様を改訂。Emacs配列は外部のKarabiner/Keyhac等で実現する。
+- この改訂commitは文書のみ。製品コード、CI、レビュー、native GUIの完了はPRのcurrent evidenceで確認する。
+- 旧依頼run `38985021618` の製品差分はfinalizerのpause検査でpush前に停止した。旧依頼を継続せず、この文書を正として新規実装する。
 
-## 1. キーと実装の対応
+## 1. キー割当
 
-既存の一般的な操作を残し、本文の基本操作を補う。全キーをEmacsに切り替える設定は作らない。
+**HaneにはEmacs用のControl英字の別名を追加しない。** 各OSの通常のキーで編集操作を提供する。OSに共通の標準がない操作には独自キーを発明しない。
 
 | 操作 | macOS | Windows / 非macOS |
 | --- | --- | --- |
-| 行頭 / 行末へ移動 | 既存Home/End、追加Command+←/→、追加Control+A/E | 既存Home/End |
-| 行頭 / 行末まで選択 | 既存Shift+Home/End、追加Command+Shift+←/→、追加Control+Shift+A/E | 既存Shift+Home/End |
-| 文書の先頭 / 末尾へ移動・選択 | 既存Command+↑/↓、Shift付き | 既存Ctrl+Home/End、Shift付き |
-| 1文字前 / 後 | 既存←/→、追加Control+B/F | 既存←/→ |
-| 1表示行上 / 下 | 既存↑/↓、追加Control+P/N | 既存↑/↓ |
-| 上記の移動で選択を延ばす | 既存Shift+矢印、追加Control+Shift+B/F/P/N | 既存Shift+矢印 |
-| 前の単語先頭 | 追加Option+← | 追加Ctrl+← |
-| 次の単語 | 追加Option+→（単語末尾） | 追加Ctrl+→（次の単語先頭） |
-| 単語ごとに選択を延ばす | 上記Option+左右にShiftを追加 | 上記Ctrl+左右にShiftを追加 |
-| 前の単語を削除 | 追加Option+Backspace | 追加Ctrl+Backspace |
-| 後の単語を削除 | 追加Option+Delete | 追加Ctrl+Delete |
-| 行頭まで削除 | 追加Command+Backspace | 追加Ctrl+Shift+Backspace |
-| 行末まで削除 | 追加Command+Delete | 追加Ctrl+Shift+Delete |
-| 行末まで切り取り | 追加Control+K | 追加Ctrl+K |
-| 切り取った内容を貼り付け | 追加Control+Y、既存Command+V | 既存Ctrl+V（Ctrl+YはRedoのまま） |
-| 1画面分上 / 下へ移動 | 追加PageUp/PageDown | 追加PageUp/PageDown |
-| 1画面分選択を延ばす | 追加Shift+PageUp/PageDown | 追加Shift+PageUp/PageDown |
-| 前 / 後の1文字削除 | 既存Backspace/Delete、追加Control+H/D | 既存Backspace/Delete |
+| 全選択 | Command+A（維持） | Ctrl+A（維持） |
+| 左右・上下移動／選択 | 矢印、Shift+矢印（維持） | 矢印、Shift+矢印（維持） |
+| 行頭／行末へ移動 | Command+←/→（追加） | Home/End（維持） |
+| 行頭／行末まで選択 | Command+Shift+←/→（追加） | Shift+Home/End（維持） |
+| 文書先頭／末尾へ移動 | Command+↑/↓（維持） | Ctrl+Home/End（維持） |
+| 文書先頭／末尾まで選択 | Command+Shift+↑/↓、Shift+Home/End | Ctrl+Shift+Home/End |
+| 単語移動／選択 | Option+←/→、Shift付き（追加） | Ctrl+←/→、Shift付き（追加） |
+| 段落移動／選択 | Option+↑/↓、Shift付き（追加） | Ctrl+↑/↓、Shift付き（修正） |
+| 前の単語を削除 | Option+Backspace（追加） | Ctrl+Backspace（追加） |
+| 後の単語を削除 | Option+Delete（追加） | Ctrl+Delete（追加） |
+| 1画面分カーソル移動 | Option+PageUp/PageDown（追加） | PageUp/PageDown（追加） |
+| 1画面分の選択 | 今回は新規割当なし | Shift+PageUp/PageDown（追加） |
+| 文書先頭／末尾を表示 | Home/End（既存のカーソル移動から変更） | 独自キーを作らない |
+| 1画面分スクロール | PageUp/PageDown（追加） | 独自キーを作らない |
+| カーソル行を画面中央に表示 | Control+L（既存のAI起動から変更） | 独自キーを作らない |
+| 文字／選択の削除 | Backspace/Delete（維持） | Backspace/Delete（維持） |
+| コピー／切り取り／貼り付け | Command+C/X/V（維持） | Ctrl+C/X/V（維持） |
+| Undo／Redo | Command+Z、Command+Shift+Z（維持） | Ctrl+Z、Ctrl+Y、既存Ctrl+Shift+Z（維持） |
 
-表のBackspaceは後方削除、Deleteは前方削除というGPUIのキー名を示す。Macのキーボードで「delete」と刻印された後方削除はBackspaceに対応し、前方削除はFn+Delete等で送信される。
+Backspaceは後方削除、Deleteは前方削除のGPUI内部名。Macの刻印deleteはBackspace相当で、前方削除はFn+Delete等から使う。Home/Endは小型MacでFn+左右、PageUp/DownはFn+上下から使われるが、HaneはGPUIが受け取るキーへ登録する。
 
-文書全選択、コピー、通常切り取り、保存、開く、Undo/Redo、文書内検索と検索結果移動は既存実装を維持する。Control+HはmacOSの後方削除を参考にする。GNU Emacs標準ではHelpなので「Emacs完全互換」と案内しない。
+初回仕様のControl+A/E/B/F/P/N/K/Y/H/DとShift版、Windows Ctrl+Shift+Backspace/Delete、Command+Backspace/Deleteは追加しない。Control+Kのkill、Control+Yのyank、kill ring、Emacs設定は作らない。行単位の編集はShift+行頭末移動で選択し、通常の削除／切り取りを使う。Windows Ctrl+Yを貼り付けへ変更しない。OSのControl+SpaceやOption/Alt+英字による文字入力を奪わない。
 
-既存macOS Control+LのAI操作、Windows Ctrl+A/F/S/O/V/Y、OSのControl+Spaceを上書きしない。Option/Alt+英字を一括登録して文字入力を奪わない。
+既存の検索、保存、開く、ファイルタブ等のアプリ操作は維持する。Windows Ctrl+Insert / Shift+Insert / Shift+Delete等の補助別名は今回は必須にしない。
 
-## 2. 単語の到達位置
+## 2. 行・単語・段落の到達位置
 
-既存の `unicode-segmentation` を使い、ASCII空白だけに依存しない。単語の途中で開始した場合はその単語の対応する端へ進む。空白と句読点は次の単語まで越え、絵文字等の記号しかない範囲でも移動が止まり続けないよう、分断しない境界を使う。日本語の辞書や新しい依存は追加しない。
+### 行頭末
 
-`one two` のbyte位置は次の例をテストで固定する。
+キーの組合せは各OSの一般的な編集操作に合わせる。行頭・行末はHaneの既存仕様を維持し、改行文字で区切られた原文の行の先頭・末尾を指す。画面幅による折り返しはこの行の区切りに含めない。
 
-| 操作 | 開始 | 到達 |
-| --- | --- | --- |
-| macOS前方 | 0 | 3 |
-| macOS前方 | 3 | 7 |
-| Windows前方 | 0 | 4 |
-| Windows前方 | 4 | 7 |
-| 後方（両OS） | 7 | 4 |
-| 後方（両OS） | 4 | 0 |
+既存の `MoveToLineStart/End` と `line_content_range` を再利用する。表示行末のcaret affinity、表セルのfragment境界、Selectionの形の変更は今回の範囲に含めない。READMEにもOS標準テキスト欄との完全互換とは書かない。
 
-`one, two` はmacOS前方0→3→8、Windows前方0→5→8、後方8→5→0を確認する。空行・行末から隣の行へも移動できるようにする。CRLFを分割した位置やUnicode文字の途中へは移動しない。単語削除の範囲は対応する移動の到達位置までとする。
+### 単語
 
-選択があるときの非Shift単語移動は、既存の左右移動と同様、方向に応じた選択端へ畳む。その操作でさらに次の単語へ進まない。Shift付きはanchorを保ちactiveだけを動かす。削除時に選択があれば選択範囲だけを対象にする。
+既存の `unicode-segmentation` を利用する。ASCII空白だけで分割しない。単語途中からはその単語の対応する端へ進み、空白・句読点は必要な方向へ越える。記号・絵文字だけでも移動が止まり続けないようにする。日本語辞書や新しい依存は追加しない。
 
-単語操作のたびに `full_text()` で文書全体を複製しない。既存の行/範囲APIを利用し、必要な方向・境界まで読む。長い一行への追加の性能リスクがあれば明記する。
+`one two` のbyte位置:
 
-## 3. 行を削除・切り取る
-
-行は `line_content_range` が表す原文の行であり、折り返した画面の一行や表のセルの端へ意味を変更しない。
-
-行頭/行末までの通常削除は改行を含めず、既に境界上なら何もしない。切り取りではなく削除なのでOS clipboardを変更しない。
-
-Control+Kは次の範囲を一回の編集で切り取る。
-
-| 状態 | 切り取る範囲 |
+| 操作 | 到達 |
 | --- | --- |
-| 選択あり | その範囲だけ |
-| 行途中に本文が残る | 現在位置から改行直前 |
-| 行末、または残りがASCII空白/タブだけ | 残る空白/タブと、その行の改行まで |
-| 最終行で改行なし | 残る文字だけ |
-| 文書末尾、対象が空 | 何もしない |
+| Mac前方 | 0 → 3 → 7 |
+| Windows前方 | 0 → 4 → 7 |
+| 後方（両OS） | 7 → 4 → 0 |
 
-切り取る内容を検証して、成功した削除と対応する文字列をOS clipboardへ置く。空の操作や失敗で既存clipboardを消さない。CRLFは二文字を一つの改行として扱う。通常PasteとmacOS Control+Yはこのclipboardを使う。
+`one, two` はMac前方0→3→8、Windows前方0→5→8、後方8→5→0。単語の途中・行末・空行からも進み、CRLFの中間、結合文字や家族絵文字の途中へ置かない。
 
-今回は直近1件の通常clipboardを使い、連続Control+Kの合算と複数履歴の循環は実装しない。この差をREADMEに書く。各切り取り/削除は一回のUndoで元の本文・選択に戻り、Redoで同じ編集を再現する。既存の文字削除との履歴結合に巻き込まない。
+既存の左右移動との一貫性を保ち、非Shift単語移動は選択があれば方向側の端へ畳むだけとし、同時に追加の一語へ進まない。Shift付きはanchorを保ちactiveだけを動かす。単語削除の範囲は各OSの対応する移動の到達位置までとする。選択があれば、その選択だけを削除する。
 
-## 4. ページ移動と画面
+### 段落
 
-`PageUp/PageDown` は本文の表示高さに応じて1画面分の移動を行う。少なくとも1表示行を動かせる高さにし、前後の一行程度が重なる表示でよい。Shift版は同じ到達点まで選択する。
+今回の段落は原文の改行区切りとする。Markdownの空行区切りブロックではない。LF/CRLF/CRを認識し、改行の内部へカーソルを置かない。
 
-固定20行などにはせず、`viewport_height`、実レイアウト、既存の横位置保持を利用する。折り返しと見出し等の行高を尊重する。`EditorCommand::MoveUp/Down` を原文の行数だけ反復して代用しない。画面単位の処理を一つにまとめ、文字ごと/行ごとに `after_input()` を繰り返さない。既存の見える範囲だけを描く方式と高さ索引を使い、文書全体を同期的に整形・解析しない。
+- 後方は両OSとも現在の段落先頭へ、既に先頭なら前段落の先頭へ進む。
+- Windows前方は次の段落先頭へ進む。
+- Mac前方は現在の段落末尾へ、既に末尾なら次段落の末尾へ進む。
+- 空行・連続空行でも一回の操作が進むか文書端で停止し、ループしない。
+- Shift版はanchorを保ちactiveだけを同じ規則で移動する。
 
-文書頭末・極小viewportで必ず停止する。表の隠れたdelimiterを表示行に数えない。移動後は既存のカーソル追従と、記号の表示が切り替わった後の位置確認を通す。
+例 `one\ntwo\nlast` のbyte位置は、後方の9→8→4→0、Windows前方0→4→8→12、Mac前方0→3→7→12を確認する。非Shift時の選択の扱いは単語移動と同様、まず方向側の端へ畳む。
 
-## 5. 入力先と編集履歴の接続
+単語／段落操作のたびに `full_text()` で文書全体を複製しない。既存の行／範囲APIを使い必要な方向へ読む。巨大な一行の追加コストは、残る場合は明記する。
 
-受入済みRF3-Aの `input_target()` を使う。新規操作は本文だけに接続し、設定、検索入力/結果、絞り込み、rename、AI popupで本文へ漏らさない。既存の単位を持つキー別名を既存actionへ登録する場合、既存の入力先別処理を使い、既存の入力経路を壊さない。
+## 3. 編集履歴と入力先
 
-日本語変換中は新しい本文操作で勝手にcommitして移動/削除しない。`Editor::dispatch()` はcompositionをcommitするため、必要なguardをUI入口で設ける。既存ネイティブcallbackや入力先の優先順を作り直さない。
+単語削除は一回の編集として、既存の `replace_range_recorded()` 等から適用する。元のselectionを記録し、Undo/Redoで本文とselectionが戻るようにする。見かけの選択を広げてから通常Deleteへ渡し、Undoで元のselectionを失う実装は避ける。通常の文字削除と意図せず履歴結合しない。単語削除はOS clipboardを変更しない。空の削除は履歴とclipboardを汚さない。
 
-新たな削除は編集前のselectionを保存し、既存の `replace_range_recorded()` 等の正規履歴経路で適用する。見かけだけ選択を変えて通常Deleteへ渡し、Undo時に元のselectionが失われる実装を避ける。
+新規操作は受入済みRF3-Aの `input_target()` を使い、本文に限定する。検索入力／結果、文書内検索入力、絞り込み、rename、設定、AI popupに入力中に本文へ漏らさない。新しいguardは既存経路を利用して重複を抑える。既存の入力先別動作を壊さない。
+
+日本語変換中は新しい本文操作で勝手にcommitして移動／削除しない。`Editor::dispatch()` はcompositionをcommitするため、UI入口で必要なguardを通す。既存ネイティブcallback、入力先の優先順、IMEプロトコル全体は作り直さない。
+
+## 4. ページ移動とスクロール
+
+カーソルのページ移動は実際の本文 `viewport_height` とレイアウトを使い、少なくとも1表示行を動かせる高さにする。見出し等の行高、折り返し、横位置保持を尊重する。前後の一行程度が重なる表示でよい。WindowsのShift版は同じ到達点まで選択する。
+
+固定20行など原文の行数反復で代用しない。ページ操作で `after_input()` を繰り返さない。高さ索引、必要な範囲のレイアウト、既存の仮想表示を利用し、文書全体を同期整形しない。表の隠れたdelimiterを表示行に数えず、文書端／極小viewportで必ず停止する。移動後は既存のカーソル追従と、記号表示切替後の位置確認を通す。
+
+MacのHome/End/PageUp/PageDownとControl+Lはスクロールだけを変える。本文、selection、Undo履歴は不変。`after_input()` や無条件のcaret revealで即座に元の場所へ戻さない。`pending_caret_visibility_after_layout` と慣性スクロールを必要に応じて解除する。Control+Lは現在のカーソル行を可能な範囲で縦中央へ置き、文書頭末のscroll範囲にclampする。
+
+## 5. 選択AIの入口を保持する
+
+macOSのControl+LをAI起動から中央表示へ変更する。選択AIへ到達できなくしないため、既存 `EditorView::footer_element` の操作行へ小さい「AIに指示」ボタンを追加する。単独ファイル時の「設定」の後、Autosaveの前の既存行を使える。既存 `Button` の `xsmall().ghost()`、説明「選択した文章に指示する」を使い、新しいtoolbarやfooterの高さ変更はしない。両OSで表示する。
+
+クリックから既存 `open_ai_selection(window, cx)` を呼び、本文selectionを変更・再取得する別の仕組みは作らない。footerは本文行の兄弟なので、本文mouse handlerを呼ばない。未選択時の案内、設定不足、入力先・IMEの抑止は既存入口を再利用する。AI popupが開いているときは無効にし、同クリックによる閉じて開き直す動作を避ける。
+
+WindowsのAlt+Iはアプリ固有のAI操作として維持する。`docs/ai-selection-actions-implementation-spec.md` の現行キーと確認手順をボタン起動へ更新し、過去の実装記録は過去の事実として区別する。READMEの通常キー表へAI固有キーを混ぜてOS標準と説明しない。
+
+## 6. 実装箇所と検証
 
 主な読み取り先:
 
-- `crates/editor/src/lib.rs`: command、dispatch、`replace_range_recorded`。
-- `crates/editor/src/movement.rs`: grapheme、行境界、既存削除。
-- `crates/editor/src/history.rs`: 編集のまとまり。
-- `crates/ui/src/actions.rs`: platform bindingsと入力先guard。
-- `crates/ui/src/view/input_routing.rs`: 受入済みの入力先。
-- `crates/ui/src/view.rs`: `move_vertical`、`layout_around`、`after_input`、カーソル追従。
-- `crates/ui/src/view/viewport.rs`: viewport/scrollの既存処理。
-- `crates/editor/tests/cursor_boundaries.rs`、`editor_scenarios.rs`、`ime_contract.rs`と既存UIテスト。
+- `crates/editor/src/lib.rs`、`movement.rs`、`history.rs`: command、dispatch、境界、履歴。
+- `crates/ui/src/actions.rs`: OS別bindingとguard。既存 `secondary-up/down` を共通の文書移動に使うとWindows Ctrl+↑/↓が衝突するため分ける。Mac Home/EndとShift版も同じactionに一括登録しない。
+- `crates/ui/src/view/input_routing.rs`: 受入済み入力経路。
+- `crates/ui/src/view.rs` の `move_vertical`、`layout_around`、`after_input`、`footer_element`、AI入口とカーソル追従。
+- `crates/ui/src/view/viewport.rs`: viewport/scroll。
+- `crates/editor/tests/cursor_boundaries.rs`、`editor_scenarios.rs`、`ime_contract.rs`、既存UIテスト。
 
-今回のためにUI全体を整理したり、保護パス・vendor・workflowを変更しない。新しいsmall moduleが自然なら製品範囲内で切り出してよい。
+E01〜E06に直接対応する意味のあるcore/UIテストを追加する。登録キーを実際にdispatchし、到達位置へ文字を挿入して確認するテストも必要。Windows Ctrl+Aは選択を置換でき、Ctrl+↑/↓は文書移動にならないこと、Mac Home/Pageはselectionが変わらないことを確認する。両OS条件のkeymapを取り違えない。
 
-## 6. 検証の準備
+ASCII/Japanese混在、結合文字、家族絵文字、LF/CRLF/CR、前向き／逆向き選択、空行、文書端、Undo/Redo、狭いviewportでの折り返し、表／リスト／コードの既存保護を含める。スクロール専用操作の履歴・selection不変、AIボタンの実クリックと選択保持、変換中の本文guardを確認する。キーが同じactionへ登録されているだけのテストで意味を代替しない。
 
-Issue E01〜E06に対応するcore/UIテストを追加する。単にenumを直接呼ぶだけではなく、登録キーをdispatchし、編集後に文字を挿入して到達位置を確かめる。ASCII/Japanese混在、結合文字、家族絵文字、CRLF/CR、前向き/逆向き選択、空行、折り返し、表/リスト/コードの保護を含める。
-
-実画面でのfocused確認は次の5組を使える。
+native GUIでの重点確認:
 
 | 組 | 操作と観測 |
 | --- | --- |
-| 移動・選択 | `one two\n日本語 é 👨‍👩‍👧‍👦\nlast`を開き、各OSの行頭末・単語・文書頭末キーとShift版を送り、挿入位置/選択範囲を確認する |
-| 削除・復元 | 単語/行頭末を削除しUndo/Redo。Control+K→貼り付け、行末Control+K、空の末尾Control+Kを確認し、保存したbytesを比較する |
-| 表示 | 幅を狭くした長文、見出し、表、コード、画像の近くでPageUp/DownとShift版を使い、横位置・選択・画面内のcaretを確認する |
-| 入力先 | 検索欄/結果/絞り込み/rename/AI/設定で新規キーを送り、本文とclipboardが誤変更されないことを確認する |
-| 日本語入力 | 実OSの日本語変換中に新しいControl/単語/行編集キーを使い、変換・確定・取消と本文への二重入力がないことを確認する |
+| 基本移動・選択 | `one two\n日本語 é 👨‍👩‍👧‍👦\nlast` でOS別の行頭末・単語・段落・文書頭末とShift版を送り、挿入位置・選択範囲を確認 |
+| 削除・復元 | 単語削除、行端まで選択→通常削除／切り取り→貼付、Undo/Redo、保存bytesを確認 |
+| 表示 | 狭い長文、見出し、表、コードでカーソルのページ移動とMacスクロール、Control+Lを使い、caret/selectionとviewportを区別して確認 |
+| 入力先・日本語 | 検索、絞込、rename、AI、設定、OS日本語変換中で本文誤操作・二重入力がないことを確認 |
+| AI入口 | 本文選択→ボタン実クリックで同じ選択のAI画面を開けること、Windows Alt+I維持を確認 |
 
-現行のHosted総合GUI `hosted-gui-interaction/7` は既存操作の回帰確認には使えるが、新しい単語/行/ページキーを直接送るシナリオではない。Windowsの実画面は別のWindows操作環境が必要。これらを実施済みとしない。CI成功、GPUIのテスト、起動と撮影のみの結果は、未実施のnative確認を置き換えない。
+現行のHosted総合GUI `hosted-gui-interaction/7` は既存操作の回帰確認には使えるが、新しい単語／段落／ページキーやAIボタンを送るシナリオではない。Windowsのnative GUIは別のWindows操作環境が必要。CI、GPUIテスト、既存GUIの起動・撮影だけを新キーのnative確認として数えない。
 
-通常workerは製品コードと直接関係するテスト・READMEのみを編集する。shell/test/build/lint/commit/pushは使わない。trusted finalizer後のverifyと通常CIをCommanderが確認し、必要なCodeRabbitレビューと実画面の証拠をそろえる。準備PRやコードpushだけでIssueをcloseしない。
+通常workerは製品コードと直接関係するテスト・README・上記AI仕様の現行記述だけを編集する。workflow、vendor、AGENTS、Commander Policy、AI基盤、Selectionの形、入力経路全体の変更はしない。shell/test/build/lint/commit/pushは使わない。実行できない検証を完了と書かない。trusted finalizer後にverify、macOS/Windows CI、current-headのCodeRabbit manual full review、必要なnative GUIを確認する。
 
 ## 7. 参考
 
-- [GNU Emacs: Moving Point](https://www.gnu.org/software/emacs/manual/html_node/emacs/Moving-Point.html)
-- [GNU Emacs: Words](https://www.gnu.org/software/emacs/manual/html_node/emacs/Words.html)
-- [GNU Emacs: Killing by Lines](https://www.gnu.org/software/emacs/manual/html_node/emacs/Killing-by-Lines.html)
-- [Apple: Mac keyboard shortcuts](https://support.apple.com/en-us/102650)
+- [Microsoft: Keyboard shortcuts in Windows / Text editing](https://support.microsoft.com/en-gb/accessibility/windows/keyboard-shortcuts-in-windows)
+- [Apple: Mac keyboard shortcuts / Document shortcuts](https://support.apple.com/en-us/102650)
+- [Apple Pages: Keyboard shortcuts / Move around and select text](https://support.apple.com/guide/pages/keyboard-shortcuts-tanc0ffef022/mac)
+
+OS標準一覧とアプリ固有の補足を区別する。Option+PageUp/DownとShift+Home/Endの具体的な動作はApple Pagesの公開表を参照した。Mac Shift+PageUp/Downのキー対応は取得した公式表から確定できないため、今回新規に決め打ちしない。
