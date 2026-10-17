@@ -4,7 +4,7 @@
 //! policy, byte and time limits, cancellation, hashing and the `.part` file
 //! discipline. A real HTTP transport is wired in a later stage.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -89,13 +89,26 @@ pub struct Request {
     pub api_version: Option<&'static str>,
     pub connect_timeout_ms: u64,
     pub read_timeout_ms: u64,
+    /// Upper bound for the whole call: connecting and receiving the response
+    /// head together. It is what is left of the operation deadline, so it also
+    /// bounds `connect_timeout_ms + read_timeout_ms` taken together.
+    pub deadline_ms: u64,
+}
+
+/// Response body whose every read is bounded by the operation deadline.
+pub trait BodyReader: Send {
+    /// Reads into `buf`, returning within `timeout_ms` milliseconds. When no
+    /// data arrives in time it fails with [`io::ErrorKind::TimedOut`]. The
+    /// caller passes the smaller of the read-stall limit and the time left on
+    /// the operation deadline.
+    fn read_within(&mut self, buf: &mut [u8], timeout_ms: u64) -> io::Result<usize>;
 }
 
 pub struct Response {
     pub status: u16,
     pub location: Option<String>,
     pub content_length: Option<u64>,
-    pub body: Box<dyn Read + Send>,
+    pub body: Box<dyn BodyReader>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +126,9 @@ pub struct TransportError {
 }
 
 /// One HTTP GET without redirect following, compression or retries. The
-/// implementation applies the timeouts in the request and verifies TLS.
+/// implementation applies the timeouts in the request, returns (or fails with
+/// [`TransportFailure::Timeout`]) within `Request::deadline_ms`, hands back a
+/// body that honors the timeout of each read, and verifies TLS.
 pub trait Transport: Send + Sync {
     fn get(&self, request: &Request) -> std::result::Result<Response, TransportError>;
 }
@@ -263,8 +278,12 @@ impl Fetcher<'_> {
                 api_version: if hops == 0 { endpoint.api_version() } else { None },
                 connect_timeout_ms: CONNECT_TIMEOUT_MS.min(remaining),
                 read_timeout_ms: READ_STALL_MS.min(remaining),
+                deadline_ms: remaining,
             };
             let response = self.transport.get(&request).map_err(transport_error)?;
+            // A transport that returned after the deadline broke its contract;
+            // the late response is never used.
+            deadline.remaining(self.clock)?;
             match response.status {
                 200 => return Ok(response),
                 301 | 302 | 303 | 307 | 308 => {
@@ -319,12 +338,18 @@ impl Fetcher<'_> {
             if cancel.is_cancelled() {
                 return Err(cancelled());
             }
-            deadline.remaining(self.clock)?;
-            let read = match response.body.read(&mut buffer) {
+            let remaining = deadline.remaining(self.clock)?;
+            let read = match response
+                .body
+                .read_within(&mut buffer, READ_STALL_MS.min(remaining))
+            {
                 Ok(n) => n,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(read_error(&err)),
             };
+            // A read that returned after the deadline is not trusted, even if
+            // it produced data or reported the end of the body.
+            deadline.remaining(self.clock)?;
             if read == 0 {
                 break;
             }

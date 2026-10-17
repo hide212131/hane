@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ use crate::archive::{
 };
 use crate::catalog::{VerifiedCandidate, VerifyContext, confirm_selection, record_seen, verify_catalog};
 use crate::download::{
-    ArchiveDownload, CancelToken, Fetcher, PartStore, Response, TransportError, TransportFailure,
-    asset_url, latest_release_url,
+    ArchiveDownload, BodyReader, CancelToken, Fetcher, PartStore, Response, TransportError,
+    TransportFailure, asset_url, latest_release_url,
 };
 use crate::error::{ErrorCode, Result};
 use crate::fsutil::{DirPartStore, FileSeenStore};
@@ -33,7 +33,7 @@ use crate::model::{
 use crate::release::select_release;
 use crate::testing::{
     Fault, FaultyJournalStore, FixedClock, MemoryDisk, MemoryPartStore, MemorySeenStore,
-    Scripted, ScriptedTransport, TempDir, WindowsRelease, ZipEntry, build_zip, catalog_doc,
+    Scripted, ScriptedTransport, SlowBody, TempDir, WindowsRelease, ZipEntry, build_zip, catalog_doc,
     default_payload, macos_entry, release_json, sign, sign_catalog, sign_with, test_now,
     test_policy, windows_release, windows_release_with,
 };
@@ -826,6 +826,7 @@ fn after_ms(clock: &Arc<FixedClock>, ms: u64, response: Scripted) -> Scripted {
             Scripted::Respond(r) => Ok(r),
             Scripted::Fail(e) => Err(e),
             Scripted::Custom(make) => make(),
+            Scripted::Slow { .. } => unreachable!("after_ms wraps plain responses only"),
         }
     }))
 }
@@ -875,6 +876,7 @@ fn transport_timeouts_never_exceed_the_remaining_budget() {
     let requests = transport.requests();
     assert_eq!(requests[0].connect_timeout_ms, CONNECT_TIMEOUT_MS);
     assert_eq!(requests[0].read_timeout_ms, READ_STALL_MS);
+    assert_eq!(requests[0].deadline_ms, DOWNLOAD_TOTAL_MS);
 
     // Near the end of the metadata budget the per-request timeouts shrink.
     let clock = Arc::new(FixedClock::new(0));
@@ -900,6 +902,91 @@ fn transport_timeouts_never_exceed_the_remaining_budget() {
     let request = &transport.requests()[0];
     assert_eq!(request.connect_timeout_ms, 500);
     assert_eq!(request.read_timeout_ms, 500);
+}
+
+#[test]
+fn single_get_cannot_outlive_the_operation_deadline() {
+    // The connect + head phase would take longer than the whole download
+    // budget: the transport is cut off at the deadline and reports a timeout.
+    let entry = asset_url(TAG, ARCHIVE_NAME);
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &entry,
+        Scripted::slow(
+            &clock,
+            DOWNLOAD_TOTAL_MS + 1,
+            Scripted::body(200, payload_bytes()),
+        ),
+    );
+    let mut store = MemoryPartStore::default();
+    let result = run_download(&transport, &clock, &mut store, &CancelToken::new());
+    assert_eq!(code(result), ErrorCode::Timeout);
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(transport.requests()[0].deadline_ms, DOWNLOAD_TOTAL_MS);
+    assert!(store.was_discarded());
+    assert!(store.committed().is_none());
+
+    // A transport that ignores the deadline and returns late is still
+    // rejected by the fetcher.
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &entry,
+        after_ms(&clock, DOWNLOAD_TOTAL_MS, Scripted::body(200, payload_bytes())),
+    );
+    let mut store = MemoryPartStore::default();
+    let result = run_download(&transport, &clock, &mut store, &CancelToken::new());
+    assert_eq!(code(result), ErrorCode::Timeout);
+    assert!(store.committed().is_none());
+}
+
+#[test]
+fn body_read_crossing_the_deadline_times_out_without_commit() {
+    let entry = asset_url(TAG, ARCHIVE_NAME);
+    let respond = |clock: &Arc<FixedClock>, read_ms: u64, ignore_timeout: bool| {
+        Scripted::Respond(Response {
+            status: 200,
+            location: None,
+            content_length: Some(payload_bytes().len() as u64),
+            body: Box::new(SlowBody::new(payload_bytes(), clock, read_ms, ignore_timeout)),
+        })
+    };
+
+    // The head arrives with 500 ms left; the first read needs 1000 ms. A body
+    // honoring its timeout fails at the deadline.
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &entry,
+        after_ms(&clock, DOWNLOAD_TOTAL_MS - 500, respond(&clock, 1000, false)),
+    );
+    let mut store = MemoryPartStore::default();
+    let result = run_download(&transport, &clock, &mut store, &CancelToken::new());
+    assert_eq!(code(result), ErrorCode::Timeout);
+    assert!(store.was_discarded());
+    assert!(store.committed().is_none());
+
+    // A body that overruns the deadline and then succeeds is not trusted.
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(
+        &entry,
+        after_ms(&clock, DOWNLOAD_TOTAL_MS - 500, respond(&clock, 1000, true)),
+    );
+    let mut store = MemoryPartStore::default();
+    let result = run_download(&transport, &clock, &mut store, &CancelToken::new());
+    assert_eq!(code(result), ErrorCode::Timeout);
+    assert!(store.was_discarded());
+    assert!(store.committed().is_none());
+
+    // The same body well inside the budget completes and commits.
+    let clock = Arc::new(FixedClock::new(0));
+    let transport = ScriptedTransport::new();
+    transport.push(&entry, respond(&clock, 10, false));
+    let mut store = MemoryPartStore::default();
+    run_download(&transport, &clock, &mut store, &CancelToken::new()).unwrap();
+    assert_eq!(store.committed().unwrap(), payload_bytes());
 }
 
 #[test]
@@ -1022,8 +1109,8 @@ struct CancelOnRead {
     sent: bool,
 }
 
-impl Read for CancelOnRead {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+impl BodyReader for CancelOnRead {
+    fn read_within(&mut self, buf: &mut [u8], _timeout_ms: u64) -> io::Result<usize> {
         if self.sent {
             return Ok(0);
         }

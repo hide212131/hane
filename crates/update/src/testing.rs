@@ -17,7 +17,9 @@ use base64::engine::general_purpose::STANDARD;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use crate::clock::Clock;
-use crate::download::{PartStore, Request, Response, Transport, TransportError, TransportFailure};
+use crate::download::{
+    BodyReader, PartStore, Request, Response, Transport, TransportError, TransportFailure,
+};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::identity::{FileIdentity, Inventory, InventoryFile};
 use crate::journal::{DiskView, JournalStore, Observed, UpdateJournal};
@@ -165,6 +167,45 @@ impl ChunkReader {
     }
 }
 
+impl BodyReader for ChunkReader {
+    fn read_within(&mut self, buf: &mut [u8], _timeout_ms: u64) -> io::Result<usize> {
+        self.read(buf)
+    }
+}
+
+/// Body whose reads each take `read_ms` of monotonic time. A read that cannot
+/// finish within its timeout spends only the timeout and fails with `TimedOut`.
+/// With `ignore_timeout` it models a broken body that overruns and still
+/// succeeds.
+pub struct SlowBody {
+    inner: ChunkReader,
+    clock: Arc<FixedClock>,
+    read_ms: u64,
+    ignore_timeout: bool,
+}
+
+impl SlowBody {
+    pub fn new(data: Vec<u8>, clock: &Arc<FixedClock>, read_ms: u64, ignore_timeout: bool) -> Self {
+        Self {
+            inner: ChunkReader::new(data, None),
+            clock: Arc::clone(clock),
+            read_ms,
+            ignore_timeout,
+        }
+    }
+}
+
+impl BodyReader for SlowBody {
+    fn read_within(&mut self, buf: &mut [u8], timeout_ms: u64) -> io::Result<usize> {
+        if !self.ignore_timeout && self.read_ms > timeout_ms {
+            self.clock.advance(timeout_ms);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "read timed out"));
+        }
+        self.clock.advance(self.read_ms);
+        self.inner.read(buf)
+    }
+}
+
 impl Read for ChunkReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.pos < self.data.len() {
@@ -184,9 +225,44 @@ pub enum Scripted {
     Respond(Response),
     Fail(TransportError),
     Custom(Box<dyn FnOnce() -> std::result::Result<Response, TransportError> + Send>),
+    /// Connecting and receiving the head takes `ms`. If that exceeds the
+    /// request's `deadline_ms`, the call spends only the deadline and fails
+    /// with a timeout; otherwise it spends `ms` and yields `then`.
+    Slow {
+        clock: Arc<FixedClock>,
+        ms: u64,
+        then: Box<Scripted>,
+    },
 }
 
 impl Scripted {
+    pub fn slow(clock: &Arc<FixedClock>, ms: u64, then: Scripted) -> Self {
+        Scripted::Slow {
+            clock: Arc::clone(clock),
+            ms,
+            then: Box::new(then),
+        }
+    }
+
+    fn resolve(self, request: &Request) -> std::result::Result<Response, TransportError> {
+        match self {
+            Scripted::Respond(response) => Ok(response),
+            Scripted::Fail(err) => Err(err),
+            Scripted::Custom(make) => make(),
+            Scripted::Slow { clock, ms, then } => {
+                if ms > request.deadline_ms {
+                    clock.advance(request.deadline_ms);
+                    return Err(TransportError {
+                        kind: TransportFailure::Timeout,
+                        detail: "request deadline reached".to_string(),
+                    });
+                }
+                clock.advance(ms);
+                then.resolve(request)
+            }
+        }
+    }
+
     pub fn body(status: u16, body: Vec<u8>) -> Self {
         let length = body.len() as u64;
         Scripted::Respond(Response {
@@ -283,9 +359,7 @@ impl Transport for ScriptedTransport {
             .get_mut(&request.url)
             .and_then(VecDeque::pop_front);
         match next {
-            Some(Scripted::Respond(response)) => Ok(response),
-            Some(Scripted::Fail(err)) => Err(err),
-            Some(Scripted::Custom(make)) => make(),
+            Some(scripted) => scripted.resolve(request),
             None => Err(TransportError {
                 kind: TransportFailure::Other,
                 detail: format!("no scripted response for {}", request.url),
