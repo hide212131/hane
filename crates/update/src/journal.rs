@@ -374,7 +374,7 @@ impl DiskView for FsDiskView {
     }
 }
 
-fn identity_matches(observed: &Observed, expected: &Option<FileIdentity>) -> bool {
+pub(crate) fn identity_matches(observed: &Observed, expected: &Option<FileIdentity>) -> bool {
     match (observed, expected) {
         (Observed::Missing, None) => true,
         (Observed::File(actual), Some(wanted)) => actual == wanted,

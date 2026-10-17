@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
 pub mod archive;
 pub mod catalog;
 pub mod clock;
