@@ -3887,15 +3887,36 @@ impl EditorView {
         ) else {
             return;
         };
-        // An OS-standard modifier click on link text hands the destination to
-        // the default browser and leaves caret, selection and document alone.
-        if is_link_open_modifier(&event.modifiers, cfg!(target_os = "macos"))
+        if let RowClick::OpenLink(destination) = self.apply_row_click(
+            line,
+            offset,
+            &event.modifiers,
+            cfg!(target_os = "macos"),
+            cx,
+        ) {
+            cx.open_url(&destination);
+        }
+    }
+
+    /// Decides and applies a left click that resolved to `offset` on `line`.
+    ///
+    /// An OS-standard modifier click on link text only reports the destination
+    /// to open and leaves caret, selection and document alone. Any other click
+    /// is ordinary selection editing.
+    fn apply_row_click(
+        &mut self,
+        line: usize,
+        offset: SourceOffset,
+        modifiers: &gpui::Modifiers,
+        macos: bool,
+        cx: &mut Context<Self>,
+    ) -> RowClick {
+        if is_link_open_modifier(modifiers, macos)
             && let Some(destination) = self.link_destination_at(line, offset)
         {
-            cx.open_url(&destination);
-            return;
+            return RowClick::OpenLink(destination);
         }
-        let selection = if event.modifiers.shift {
+        let selection = if modifiers.shift {
             Selection {
                 anchor: self.editor().selection().anchor,
                 active: offset,
@@ -3910,6 +3931,7 @@ impl EditorView {
             self.status = None;
             self.after_input(cx);
         }
+        RowClick::Edit
     }
 
     fn on_row_mouse_move(
@@ -5396,6 +5418,15 @@ fn target_in_neighbor(
         layout.lines.len().checked_sub(1)?
     };
     layout.source_at_x(&visual, row, x, shaper)
+}
+
+/// What a left click on a text row resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowClick {
+    /// Hand this external destination to the default browser.
+    OpenLink(std::sync::Arc<str>),
+    /// Ordinary caret / selection editing was applied.
+    Edit,
 }
 
 /// Whether a left click carries exactly the OS-standard "open link" modifier:
@@ -7364,6 +7395,93 @@ mod tests {
         assert!(target.contains(SourceOffset(1)));
         assert!(target.contains(SourceOffset(4)));
         assert!(!target.contains(SourceOffset(5)));
+    }
+
+    /// Issue #502: drives the same `apply_row_click` the row mouse-down handler
+    /// uses, over presentation built by the real `cached_block` path.
+    #[gpui::test]
+    fn link_open_click_leaves_editor_state_untouched_and_other_clicks_edit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = format!("see [Hane]({DESTINATION}) end\n");
+        let inside_link = SourceOffset(text.find("Hane").unwrap() + 1);
+        let outside_link = SourceOffset(1);
+        let command = gpui::Modifiers {
+            platform: true,
+            ..gpui::Modifiers::none()
+        };
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..gpui::Modifiers::none()
+        };
+
+        for undone in [false, true] {
+            // (modifiers, macos, click offset, opens DESTINATION)
+            let cases = [
+                (command, true, inside_link, true),
+                (ctrl, false, inside_link, true),
+                (ctrl, true, inside_link, false),
+                (command, false, inside_link, false),
+                (gpui::Modifiers::none(), true, inside_link, false),
+                (command, true, outside_link, false),
+                (ctrl, false, outside_link, false),
+            ];
+            for (modifiers, macos, offset, opens) in cases {
+                let view = gpui::AppContext::new(cx, |cx| {
+                    EditorView::new(text.as_str(), "Untitled", cx)
+                });
+                view.update(cx, |view, cx| {
+                    let end = SourceOffset(view.editor().document().len_bytes().0);
+                    view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+                    view.dispatch(EditorCommand::Insert("!"), cx);
+                    if undone {
+                        view.dispatch(EditorCommand::Undo, cx);
+                    }
+                    let end = SourceOffset(view.editor().document().len_bytes().0);
+                    view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+
+                    // Present the paragraph the way the render loop does and
+                    // record which presented line belongs to which block.
+                    let indexed = view.block_at_offset(inside_link).unwrap();
+                    let span = block_line_span(view.editor().document(), &indexed).unwrap();
+                    let (visual, _) = view.cached_block(&indexed, &span).unwrap();
+                    view.line_owners.clear();
+                    for (at, line) in visual.lines.iter().enumerate() {
+                        view.line_owners
+                            .insert(line.line_id as usize, (visual.id, at));
+                    }
+                    let line = visual
+                        .lines
+                        .iter()
+                        .find(|line| line.links.iter().any(|link| link.contains(inside_link)))
+                        .map(|line| line.line_id as usize)
+                        .expect("the presentation records the link target");
+
+                    let text_before = view.editor().document().full_text();
+                    let selection_before = view.editor().selection();
+                    let revision_before = view.editor().document().revision();
+                    let can_undo_before = view.editor().can_undo();
+                    let can_redo_before = view.editor().can_redo();
+
+                    let outcome = view.apply_row_click(line, offset, &modifiers, macos, cx);
+
+                    if opens {
+                        assert_eq!(outcome, RowClick::OpenLink(DESTINATION.into()));
+                        assert_eq!(view.editor().document().full_text(), text_before);
+                        assert_eq!(view.editor().selection(), selection_before);
+                        assert_eq!(view.editor().document().revision(), revision_before);
+                        assert_eq!(view.editor().can_undo(), can_undo_before);
+                        assert_eq!(view.editor().can_redo(), can_redo_before);
+                    } else {
+                        assert_eq!(outcome, RowClick::Edit);
+                        assert_eq!(view.editor().selection(), Selection::caret(offset));
+                        assert_eq!(view.editor().document().full_text(), text_before);
+                        assert_eq!(view.editor().document().revision(), revision_before);
+                    }
+                });
+            }
+        }
     }
 
     fn relative_luminance(color: u32) -> f32 {
