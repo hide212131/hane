@@ -19047,10 +19047,10 @@ mod tests {
         // height (line 0 is the header, line 1 the delimiter).
         let body_line = 2;
         let body_row_bounds = cx
-            .debug_bounds(&format!("row-{body_line}-{body_line}"))
+            .debug_bounds("row-2-2")
             .expect("first data row painted");
         let body_bounds = cx
-            .debug_bounds(&format!("table-body-background-{body_line}"))
+            .debug_bounds("table-body-background-2")
             .expect("table body background painted");
         let (body_padding, body_first_x, body_last_right, body_row_height) =
             table_row_grid_span(&view, cx, body_line);
