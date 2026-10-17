@@ -178,9 +178,12 @@ def read_execution(path: Path | None) -> dict[str, Any]:
     _log_execution_file_diagnostics(path)
     if path is None:
         raise ValueError("Claude execution log path is missing")
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_EXECUTION_BYTES:
-        raise ValueError("Claude execution log must be a bounded regular file")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_EXECUTION_BYTES:
+            raise ValueError("Claude execution log must be a bounded regular file")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError:
+        raise ValueError("Claude execution log could not be inspected or read") from None
     _log_model_usage_diagnostics(payload)
     return verify_execution(payload)
 
