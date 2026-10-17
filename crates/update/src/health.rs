@@ -229,7 +229,7 @@ pub trait LimitedChild {
     fn send_commit(&mut self) -> Result<()>;
     /// Gives up ownership of the process so that dropping this value no longer
     /// kills it. Called only once this transaction's health succeeded,
-    /// `Committed` is durable and `Commit` was delivered.
+    /// `Committed` is durable, whether or not `Commit` was delivered.
     fn detach(&mut self);
     fn as_health_child(&mut self) -> &mut dyn HealthChild;
 }
@@ -586,11 +586,11 @@ pub fn conclude_with_child<S: JournalStore, O: FileOps>(
     if outcome == HealthOutcome::Committed {
         // Durable first. A failed notification leaves the child to the
         // journal check of `ChildSession`; the update itself is committed.
-        // Only a delivered `Commit` releases the child from the helper, so
-        // the new version keeps running after the helper's handle is gone.
-        if child.send_commit().is_ok() {
-            child.detach();
-        }
+        // The child is released from the helper whether or not the write
+        // succeeded, so the new version keeps running after the helper's handle
+        // is gone and a pipe error cannot make the drop kill it.
+        let _ = child.send_commit();
+        child.detach();
     } else if reason.is_none() {
         reason = Some(UpdateError::new(
             ErrorCode::Io,
@@ -914,7 +914,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::identity::InstallFacts;
+    use crate::identity::{FileIdentity, InstallFacts};
     use crate::testing::TempDir;
 
     fn install_id() -> InstallId {
@@ -1169,6 +1169,124 @@ mod tests {
         );
         drop(child);
         assert!(seen.killed.get() && seen.waited.get());
+    }
+
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "child pipe is gone"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "child pipe is gone"))
+        }
+    }
+
+    /// Never reached: committing a healthy child touches no file.
+    struct NoFiles;
+
+    impl crate::journal::DiskView for NoFiles {
+        fn observe(&self, _: &str) -> Result<crate::journal::Observed> {
+            Err(UpdateError::new(ErrorCode::Io, "unused"))
+        }
+    }
+
+    impl FileOps for NoFiles {
+        fn backup(&mut self, _: &str, _: &str) -> Result<()> {
+            Err(UpdateError::new(ErrorCode::Io, "unused"))
+        }
+
+        fn install_new(&mut self, _: &str, _: &FileIdentity) -> Result<()> {
+            Err(UpdateError::new(ErrorCode::Io, "unused"))
+        }
+
+        fn remove(&mut self, _: &str) -> Result<()> {
+            Err(UpdateError::new(ErrorCode::Io, "unused"))
+        }
+
+        fn restore(&mut self, _: &str, _: &str, _: &FileIdentity) -> Result<()> {
+            Err(UpdateError::new(ErrorCode::Io, "unused"))
+        }
+    }
+
+    #[test]
+    fn a_failed_commit_notification_after_a_durable_commit_keeps_the_child_alive() {
+        use crate::identity::{ApplyPlan, PlanStep, ReleaseIdentity};
+        use crate::journal::UpdateJournal;
+
+        let fx = fixture();
+        let release = |version: &str| ReleaseIdentity {
+            target: "x86_64-pc-windows-msvc".to_owned(),
+            version: version.to_owned(),
+            catalog_sha256: None,
+            inventory_sha256: None,
+            bundle_id: None,
+            team_id: None,
+        };
+        let plan = ApplyPlan {
+            install_id: install_id(),
+            transaction_id: fx.transaction.clone(),
+            source: release("0.25.0"),
+            destination: release("0.26.0"),
+            steps: vec![PlanStep {
+                rel_path: "a.dll".to_owned(),
+                old: Some(FileIdentity::of(b"old")),
+                new: Some(FileIdentity::of(b"new")),
+                backup_rel: Some("backup/a.dll".to_owned()),
+            }],
+            unchanged: Vec::new(),
+        };
+        let mut journal = DurableJournal::create(
+            FileJournalStore::new(fx.coordination.journal_path(&fx.transaction)),
+            UpdateJournal::begin(&plan, None).unwrap(),
+        )
+        .unwrap();
+        for phase in [Phase::ExitAuthorized, Phase::Applying, Phase::AwaitingHealth] {
+            journal.advance_phase(phase).unwrap();
+        }
+
+        let seen = Rc::new(Observed::default());
+        let nonce = Nonce::generate().unwrap();
+        let expected = identity(&fx.transaction);
+        let link = ChildLink::new(
+            wire(&[healthy(&nonce, &expected)]),
+            Box::new(BrokenPipe),
+            nonce.clone(),
+        )
+        .unwrap();
+        let mut child = ProcessChild::new(
+            FakeProcess {
+                seen: Rc::clone(&seen),
+                stubborn: true,
+                kill_fails: false,
+            },
+            link,
+            expected,
+            fx.coordination.clone(),
+            timing(),
+        );
+
+        let settled = conclude_with_child(
+            &mut journal,
+            &mut NoFiles,
+            &mut child,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(settled.outcome, HealthOutcome::Committed);
+        assert!(settled.reason.is_none(), "a pipe error must not change the result");
+        assert_eq!(journal.journal().phase, Phase::Committed);
+        assert!(child.process.is_none(), "the child handle must be detached");
+        assert!(!seen.killed.get(), "the committed child is still running");
+
+        drop(child);
+        assert!(!seen.killed.get() && !seen.waited.get(), "the drop must not kill it");
+        let reloaded = FileJournalStore::new(fx.coordination.journal_path(&fx.transaction))
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.phase, Phase::Committed);
     }
 
     #[test]
