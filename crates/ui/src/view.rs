@@ -1094,6 +1094,14 @@ pub struct EditorView {
     /// layout estimate; this corrects it once the row is drawn. Cleared by any
     /// other scroll-only operation, input, document switch and wheel inertia.
     pending_center_caret_frames: u8,
+    /// Physical document line a "center the caret row" request pinned the
+    /// presentation window to. The window of the block holding it is chosen
+    /// around this line instead of being inverted from `scroll_y` and an
+    /// average row height, so the target row is always drawn and the next
+    /// frames present the same rows. It outlives the settle counter, and is
+    /// dropped only by [`EditorView::cancel_center_caret`] (input, any other
+    /// scroll or zoom, document switch).
+    center_window_line: Option<usize>,
     /// Set after document-find navigation moves the current match. Mirrors
     /// `pending_caret_visibility_after_layout`: forcing a hidden match's
     /// block open can change its row height only on the next render, so this
@@ -1758,7 +1766,8 @@ impl EditorView {
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
             pending_center_caret_frames: 0,
-            pending_find_visibility_after_layout: false,
+            center_window_line: None,
+pending_find_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
@@ -2508,7 +2517,7 @@ impl EditorView {
         self.layout_cache.clear();
         self.caret_geometry = None;
         self.pending_caret_visibility_after_layout = false;
-        self.pending_center_caret_frames = 0;
+        self.cancel_center_caret();
         self.block_index = BlockIndexState::new();
         self.last_background_height_disclosure = None;
         self.last_applied_height_disclosure = None;
@@ -2583,7 +2592,7 @@ impl EditorView {
         // the next render. Re-check once after that layout is installed so
         // the caret and its input-mode badge use current geometry.
         self.pending_caret_visibility_after_layout = true;
-        self.pending_center_caret_frames = 0;
+        self.cancel_center_caret();
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
@@ -4095,8 +4104,17 @@ impl EditorView {
         self.pending_caret_visibility_after_layout = false;
         self.pending_find_visibility_after_layout = false;
         self.pending_zoom_anchor = None;
-        self.pending_center_caret_frames = 0;
+        self.cancel_center_caret();
         cx.notify();
+    }
+
+    /// Drops a pending "center the caret row" request and its pinned window.
+    /// Every later user-driven scroll or zoom (wheel, scrollbar drag, pinch),
+    /// input and document switch calls this, so an old centering never
+    /// overwrites a newer position.
+    pub(super) fn cancel_center_caret(&mut self) {
+        self.pending_center_caret_frames = 0;
+        self.center_window_line = None;
     }
 
     /// Scrolls to the top or bottom of the document without moving the caret.
@@ -4128,6 +4146,15 @@ impl EditorView {
         self.finish_scroll_only(target, cx);
         // `top` comes from a partial layout whose omitted leading lines are
         // counted as single rows, so the row may not be centred once drawn.
+        // Pin the caret line's block window around it so that row is drawn,
+        // and keeps being drawn the same way, while the next frames re-centre
+        // on its measured position.
+        self.center_window_line = self
+            .editor()
+            .document()
+            .line_for_offset(self.editor().selection().active)
+            .ok()
+            .map(|line| line.0);
         self.pending_center_caret_frames = CENTER_CARET_SETTLE_FRAMES;
     }
 
@@ -5319,6 +5346,40 @@ impl EditorView {
         }
     }
 
+    /// The lines of `block` to present. Normally the viewport window; the block
+    /// holding a pinned "center the caret row" line instead presents a bounded
+    /// run around that line.
+    ///
+    /// The viewport window is inverted from `scroll_y` through the average
+    /// drawn row height, while a partial layout stands in for its clipped
+    /// lines at one row each. For a block whose lines wrap into many rows the
+    /// two disagree, and the inverted window can miss the line that was just
+    /// centred. Choosing the window around the line itself keeps the layout
+    /// the centring was measured on, so the row stays drawn and in place. The
+    /// run is sized to fill half a viewport plus overscan on either side even
+    /// if every line took a single row; nothing between the run and the
+    /// previous window is shaped.
+    fn render_window_for(&self, block: &IndexedBlock, lines: &Range<usize>) -> Range<usize> {
+        let Some(line) = self.center_window_line else {
+            return lines.clone();
+        };
+        if self.granularity != Granularity::Blocks {
+            return lines.clone();
+        }
+        let Some(span) = block_line_span(self.editor().document(), block) else {
+            return lines.clone();
+        };
+        if !span.contains(&line) {
+            return lines.clone();
+        }
+        let reach = ((self.viewport_height / 2.0 + self.theme.overscan) / self.line_height().max(1.0))
+            .ceil() as usize
+            + 2;
+        let start = line.saturating_sub(reach).max(span.start);
+        let end = line.saturating_add(reach + 1).min(span.end);
+        start..end.max(start + 1)
+    }
+
     /// How tall one line of a block draws, on average. A wrapped line occupies
     /// several rows, so the plain line height under-counts it; the block's own
     /// layout says by how much once it has been drawn once.
@@ -6039,6 +6100,7 @@ impl EditorView {
         // away from that value. Clearing it explicitly here stops the coast
         // from fighting the drag once it does resume (issue #389).
         self.scroll_inertia = None;
+        self.cancel_center_caret();
         cx.stop_propagation();
         cx.notify();
     }
@@ -6577,7 +6639,8 @@ impl Render for EditorView {
         let lines = self.visible_line_window(&blocks, &visible);
         let mut rendered = Vec::with_capacity(blocks.len());
         for block in &blocks {
-            if let Some((visual, reused)) = self.cached_block(block, &lines) {
+            let window = self.render_window_for(block, &lines);
+            if let Some((visual, reused)) = self.cached_block(block, &window) {
                 let layout = self.block_layout(&visual, reused, &shaper);
                 rendered.push((block.ordinal, visual, layout));
             }
@@ -6706,7 +6769,7 @@ impl Render for EditorView {
             // frame keeps the request alive for a bounded number of frames.
             self.pending_center_caret_frames -= 1;
             if self.scroll_inertia.is_some() {
-                self.pending_center_caret_frames = 0;
+                self.cancel_center_caret();
             } else if let Some((_, top, height)) = fresh_caret
                 && height > 0.0
             {
@@ -6722,6 +6785,20 @@ impl Render for EditorView {
                     self.pending_center_caret_frames = 0;
                 }
             } else {
+                // The caret row is not in this frame's drawn blocks (the first
+                // scroll target came from estimated heights). Aim at the
+                // height index's current answer so the next frame draws the
+                // block holding it; the pinned window then draws the row.
+                if let Some((top, height)) = self.source_offset_row_bounds(caret) {
+                    let desired = clamp_scroll_y(
+                        top + height / 2.0 - self.viewport_height / 2.0,
+                        self.scrollable_content_height(),
+                        self.viewport_height,
+                    );
+                    if (desired - self.scroll_y).abs() > CARET_VISIBILITY_TOLERANCE {
+                        self.scroll_y = desired;
+                    }
+                }
                 cx.notify();
             }
         }

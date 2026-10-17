@@ -396,12 +396,16 @@ mod tests {
         cx.update(|window, app| {
             view.update(app, |view, cx| view.center_cursor_line(window, cx));
         });
-        view.update(cx, |view, _| {
-            let (top, height) = view
-                .source_offset_row_bounds(SourceOffset(caret))
-                .expect("row bounds");
-            let middle = view.scroll_y + view.viewport_height / 2.0;
-            assert!((top + height / 2.0 - middle).abs() < 1.0);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            // The row the settled frame actually drew, not a pre-render estimate.
+            let caret = view.caret_geometry().expect("the caret is painted");
+            let middle = caret.y + caret.height / 2.0;
+            assert!(
+                (middle - view.viewport_height / 2.0).abs() <= 1.0,
+                "caret centre {middle} in a viewport of {}",
+                view.viewport_height
+            );
             assert!(!view.pending_caret_visibility_after_layout);
         });
         assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
@@ -527,6 +531,229 @@ mod tests {
             let text = view.editor().document().full_text();
             let paragraph_end = text.find("\n\n").unwrap();
             assert!(view.editor().selection().active.0 < paragraph_end);
+        });
+    }
+
+    /// One paragraph (no blank line) of many physical lines, each of which
+    /// wraps into a few dozen rows at the narrow test width.
+    fn multi_line_paragraph() -> String {
+        (0..30)
+            .map(|line| {
+                let words: String = (0..120)
+                    .map(|word| format!("l{line:02}w{word:03} "))
+                    .collect();
+                format!("{}\n", words.trim_end())
+            })
+            .collect()
+    }
+
+    fn open_multi_line(cx: &mut gpui::TestAppContext) -> (TestView, &mut TestCx) {
+        let (view, cx) = open_view(cx, &multi_line_paragraph());
+        cx.simulate_resize(gpui::size(px(320.0), px(400.0)));
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// Scrolls away and drops every cached presentation and layout, so only a
+    /// freshly resolved window can draw the caret row.
+    fn scroll_away_and_evict_everything(view: &TestView, cx: &mut TestCx) {
+        view.update(cx, |view, cx| view.scroll_to_document_edge(true, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            view.layout_cache.clear();
+            view.block_cache.clear();
+        });
+    }
+
+    fn assert_caret_centered(view: &TestView, cx: &mut TestCx) -> (f32, f32) {
+        view.read_with(cx, |view, _| {
+            let caret = view
+                .caret_geometry()
+                .expect("the centred caret row is painted");
+            let middle = caret.y + caret.height / 2.0;
+            assert!(
+                (middle - view.viewport_height / 2.0).abs() <= 1.0,
+                "caret centre {middle} in a viewport of {}",
+                view.viewport_height
+            );
+            (view.scroll_y, caret.y)
+        })
+    }
+
+    #[gpui::test]
+    fn center_cursor_line_draws_and_keeps_a_row_of_a_multi_line_wrapped_paragraph(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_multi_line(cx);
+        let caret = multi_line_paragraph().find("l15w100").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_everything(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.center_cursor_line(window, cx));
+        });
+        cx.run_until_parked();
+        let settled = assert_caret_centered(&view, cx);
+
+        // Redrawing must neither lose the row nor move it.
+        for _ in 0..3 {
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            let again = assert_caret_centered(&view, cx);
+            assert!(
+                (again.0 - settled.0).abs() <= 1.0 && (again.1 - settled.1).abs() <= 1.0,
+                "settled at {settled:?}, redrawn at {again:?}"
+            );
+        }
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+        assert!(!view.read_with(cx, |view, _| view.editor().can_undo()));
+    }
+
+    /// Content-space y of `offset` in a layout of the whole paragraph, which
+    /// shares one origin for every offset and so is independent of the
+    /// partial layouts the view draws.
+    fn full_paragraph_y(
+        view: &TestView,
+        cx: &mut TestCx,
+        offsets: &[usize],
+    ) -> Vec<f32> {
+        cx.update(|window, app| {
+            view.update(app, |view, _| {
+                let shaper = WindowShaper::new(window, view.zoom);
+                let indexed = view
+                    .block_at_offset(SourceOffset(0))
+                    .expect("the paragraph block");
+                let span = block_line_span(view.editor().document(), &indexed)
+                    .expect("the paragraph's lines");
+                let visual = presented_block_with_table_projection(
+                    view.editor(),
+                    &indexed,
+                    &span,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    view.line_height(),
+                )
+                .expect("the whole paragraph is presented");
+                let layout = layout_block(&visual, view.content_width, &shaper);
+                offsets
+                    .iter()
+                    .map(|offset| {
+                        layout
+                            .point_for_source(&visual, SourceOffset(*offset), &shaper)
+                            .expect("the offset is laid out")
+                            .y
+                    })
+                    .collect()
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn page_move_from_the_last_row_of_a_physical_line_travels_a_viewport_both_ways(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_multi_line(cx);
+        let text = multi_line_paragraph();
+        for down in [true, false] {
+            let start = text.find("l15w119").unwrap();
+            set_selection(&view, cx, start, start);
+            scroll_away_and_evict_everything(&view, cx);
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.move_page(down, false, window, cx));
+            });
+            cx.run_until_parked();
+            let end = selection(&view, cx).active.0;
+            let (page, line_height) =
+                view.read_with(cx, |view, _| {
+                    (
+                        (view.viewport_height - view.line_height()).max(view.line_height()),
+                        view.line_height(),
+                    )
+                });
+            let ys = full_paragraph_y(&view, cx, &[start, end]);
+            let travelled = (ys[1] - ys[0]).abs();
+            assert_eq!(ys[1] > ys[0], down, "direction of {start} -> {end}");
+            assert!(
+                travelled >= page * 0.8,
+                "down={down}: moved {travelled} for a page of {page}"
+            );
+            assert!(
+                travelled <= page + line_height * 3.0,
+                "down={down}: moved {travelled} for a page of {page}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_wheel_scroll_after_center_cursor_line_is_not_pulled_back(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_multi_line(cx);
+        let caret = multi_line_paragraph().find("l15w100").unwrap();
+        set_selection(&view, cx, caret, caret);
+        scroll_away_and_evict_everything(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.center_cursor_line(window, cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_center_caret_frames > 0);
+        });
+
+        // The centring is still pending when a small pixel scroll arrives.
+        let manual = view.update(cx, |view, cx| {
+            let event = gpui::ScrollWheelEvent {
+                position: gpui::point(px(100.0), px(100.0)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-30.0))),
+                modifiers: gpui::Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            };
+            view.on_scroll_at(&event, std::time::Instant::now(), cx);
+            assert_eq!(view.pending_center_caret_frames, 0);
+            assert!(view.center_window_line.is_none());
+            view.scroll_y
+        });
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            (after - manual).abs() <= 1.0,
+            "manual position {manual} was moved to {after}"
+        );
+        assert_eq!(selection(&view, cx), Selection::caret(SourceOffset(caret)));
+
+        // A line-based wheel event cancels it as well.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.center_cursor_line(window, cx));
+        });
+        view.update(cx, |view, cx| {
+            assert!(view.pending_center_caret_frames > 0);
+            let event = gpui::ScrollWheelEvent {
+                position: gpui::point(px(100.0), px(100.0)),
+                delta: gpui::ScrollDelta::Lines(gpui::point(0.0, -1.0)),
+                modifiers: gpui::Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            };
+            view.on_scroll_at(&event, std::time::Instant::now(), cx);
+            assert_eq!(view.pending_center_caret_frames, 0);
+            assert!(view.center_window_line.is_none());
+        });
+
+        // So does the start of a scrollbar drag.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.center_cursor_line(window, cx);
+                assert!(view.pending_center_caret_frames > 0);
+                let event = MouseDownEvent {
+                    position: gpui::point(px(100.0), px(100.0)),
+                    button: MouseButton::Left,
+                    modifiers: gpui::Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                };
+                let content_height = view.scrollable_content_height();
+                view.begin_editor_scrollbar_drag(&event, content_height, window, cx);
+                assert_eq!(view.pending_center_caret_frames, 0);
+                assert!(view.center_window_line.is_none());
+            });
         });
     }
 
