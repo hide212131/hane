@@ -534,6 +534,19 @@ fn surface_color(surface: BlockSurface, theme: Theme) -> Option<u32> {
 /// Applies a whole-block render policy. Adding a Markdown construct means giving
 /// it a `BlockDisplay` in `hane-presentation`; nothing here changes.
 fn styled_block(element: Div, display: BlockDisplay, theme: Theme, zoom: f32) -> Div {
+    styled_block_with_surface(element, display, theme, zoom, true)
+}
+
+/// [`styled_block`], optionally leaving the background surface to the caller.
+/// A table row paints its surface itself, bounded to the table grid, instead of
+/// across the whole row width.
+fn styled_block_with_surface(
+    element: Div,
+    display: BlockDisplay,
+    theme: Theme,
+    zoom: f32,
+    paint_surface: bool,
+) -> Div {
     element
         .text_size(px(font_size_for(display, zoom)))
         .when(display.weight == BlockWeight::Semibold, |element| {
@@ -545,9 +558,10 @@ fn styled_block(element: Div, display: BlockDisplay, theme: Theme, zoom: f32) ->
         .when(display.tint == BlockTint::Muted, |element| {
             element.text_color(rgb(theme.quote_foreground))
         })
-        .when_some(surface_color(display.surface, theme), |element, color| {
-            element.bg(rgb(color))
-        })
+        .when_some(
+            surface_color(display.surface, theme).filter(|_| paint_surface),
+            |element, color| element.bg(rgb(color)),
+        )
 }
 
 /// Container for one Markdown block. The block is the virtualization unit; its
@@ -1006,6 +1020,25 @@ fn table_row_element(
     let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 2);
     let editing = line.table_row.is_none();
     let grid_bounds = table_grid_bounds(&row.table_cells);
+    if let Some(color) = surface_color(display.surface, theme)
+        && let Some((grid_left, grid_width)) = grid_bounds
+    {
+        // The table body background covers only the grid, so it never extends
+        // into the row's left/right margins outside the table.
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + grid_left))
+                .top(px(0.0))
+                .w(px(grid_width))
+                .h(px(row.height))
+                .bg(rgb(color))
+                .debug_selector({
+                    let selector = format!("table-body-background-{}", line.line_id);
+                    move || selector.clone()
+                }),
+        );
+    }
     if table.header && let Some((grid_left, grid_width)) = grid_bounds {
         // Bounded to the grid (first column's left border through the last
         // column's right border) so the header tint never bleeds into the
@@ -1231,7 +1264,7 @@ fn table_row_element(
                 .child(cursor_overlay(theme, caret_input_mode)),
         );
     }
-    styled_block(
+    styled_block_with_surface(
         div()
             .relative()
             .h(px(row.height))
@@ -1241,6 +1274,7 @@ fn table_row_element(
         display,
         theme,
         zoom,
+        grid_bounds.is_none(),
     )
 }
 

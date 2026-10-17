@@ -19040,6 +19040,38 @@ mod tests {
              border={border_bounds:?} row_height={row_height}"
         );
 
+        // Issue #513: the table body background used to paint the whole
+        // `w_full()` row, reaching the body's left/right margins. It must
+        // cover exactly the grid, at the row's full height.
+        let body_bounds = cx
+            .debug_bounds("table-body-background-0")
+            .expect("table body background painted");
+        let body_left = f32::from(body_bounds.origin.x);
+        let body_right = body_left + f32::from(body_bounds.size.width);
+        assert!(
+            (body_left - expected_left).abs() < 0.5,
+            "table body background must start at the first column's left border: \
+             body={body_bounds:?} expected_left={expected_left}"
+        );
+        assert!(
+            (body_right - expected_right).abs() < 0.5,
+            "table body background must end at the last column's right border, \
+             not the body width: body={body_bounds:?} expected_right={expected_right}"
+        );
+        assert!(
+            (f32::from(body_bounds.origin.y) - f32::from(background_bounds.origin.y)).abs() < 0.5
+                && (f32::from(body_bounds.size.height) - row_height).abs() < 0.5,
+            "table body background must cover the row's full (possibly wrapped) \
+             height: body={body_bounds:?} row_height={row_height}"
+        );
+        assert!(
+            body_bounds.origin.x > row_bounds.origin.x
+                && body_bounds.origin.x + body_bounds.size.width
+                    < row_bounds.origin.x + row_bounds.size.width,
+            "table body background must not reach the row's own margins: \
+             body={body_bounds:?} row={row_bounds:?}"
+        );
+
         if resize.is_some() {
             let line_height = view.read_with(cx, |view, _| view.line_height());
             assert!(
