@@ -84,6 +84,26 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>UTImportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.utf8-plain-text</string>
+      </array>
+      <key>UTTypeDescription</key>
+      <string>Markdown Document</string>
+      <key>UTTypeIdentifier</key>
+      <string>net.daringfireball.markdown</string>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>md</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST
@@ -92,8 +112,11 @@ PLIST
 # Finder lists Hane under "Open With" only for the document types declared
 # here. Hane must offer exactly the system Markdown UTI (not generic text) and
 # must stay an alternate handler so the user, not the bundle, chooses the
-# default app. macOS 11+ declares net.daringfireball.markdown with the md
-# extension, so the bundle requires 11.0 and does not redeclare the UTI.
+# default app. The system only defines net.daringfireball.markdown on newer
+# OSes (macOS 27+), so the bundle imports the same UTI with the md extension and
+# UTF-8 plain text conformance. Older systems then resolve .md to that UTI, and
+# newer systems coexist with the system definition. The minimum OS version
+# follows the build target, not the UTI's availability.
 plist_buddy=/usr/libexec/PlistBuddy
 info_plist="$bundle/Contents/Info.plist"
 plist_value() {
@@ -115,12 +138,30 @@ if plist_value CFBundleDocumentTypes:0:CFBundleTypeExtensions >/dev/null; then
   echo "Info.plist must not use the deprecated CFBundleTypeExtensions" >&2
   exit 1
 fi
-if plist_value UTImportedTypeDeclarations >/dev/null || plist_value UTExportedTypeDeclarations >/dev/null; then
-  echo "Info.plist must not redeclare the Markdown UTI" >&2
+if plist_value UTExportedTypeDeclarations >/dev/null; then
+  echo "Info.plist must import, not export, the Markdown UTI" >&2
+  exit 1
+fi
+if plist_value UTImportedTypeDeclarations:1 >/dev/null; then
+  echo "Info.plist must import only the Markdown UTI" >&2
+  exit 1
+fi
+if [[ "$(plist_value UTImportedTypeDeclarations:0:UTTypeIdentifier)" != "net.daringfireball.markdown" ]]; then
+  echo "Info.plist must import net.daringfireball.markdown" >&2
+  exit 1
+fi
+if [[ "$(plist_value UTImportedTypeDeclarations:0:UTTypeConformsTo:0)" != "public.utf8-plain-text" ]] \
+  || plist_value UTImportedTypeDeclarations:0:UTTypeConformsTo:1 >/dev/null; then
+  echo "Imported Markdown UTI must conform only to public.utf8-plain-text" >&2
+  exit 1
+fi
+if [[ "$(plist_value UTImportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:0)" != "md" ]] \
+  || plist_value UTImportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:1 >/dev/null; then
+  echo "Imported Markdown UTI must register only the md extension" >&2
   exit 1
 fi
 if [[ "$(plist_value LSMinimumSystemVersion)" != "11.0" ]]; then
-  echo "Info.plist must require macOS 11.0 for the system Markdown UTI" >&2
+  echo "Info.plist must keep the build target minimum macOS 11.0" >&2
   exit 1
 fi
 if [[ "$(plist_value CFBundleDocumentTypes:0:LSHandlerRank)" != "Alternate" ]]; then
