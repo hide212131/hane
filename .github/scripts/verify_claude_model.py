@@ -35,6 +35,7 @@ def _has_positive_token_usage(value: Any) -> bool:
 
 
 
+
 def _log_execution_file_diagnostics(path: Path | None) -> None:
     if path is None:
         diagnostics = {
@@ -44,7 +45,6 @@ def _log_execution_file_diagnostics(path: Path | None) -> None:
             "is_symlink": None,
             "is_regular_file": None,
             "lstat_size_bytes": None,
-            "metadata_available": False,
         }
     else:
         try:
@@ -57,7 +57,6 @@ def _log_execution_file_diagnostics(path: Path | None) -> None:
                 "is_symlink": False,
                 "is_regular_file": False,
                 "lstat_size_bytes": None,
-                "metadata_available": True,
             }
         except OSError:
             diagnostics = {
@@ -67,19 +66,16 @@ def _log_execution_file_diagnostics(path: Path | None) -> None:
                 "is_symlink": None,
                 "is_regular_file": None,
                 "lstat_size_bytes": None,
-                "metadata_available": False,
             }
         else:
             is_symlink = stat.S_ISLNK(metadata.st_mode)
             is_regular_file = stat.S_ISREG(metadata.st_mode)
-            if is_symlink:
-                file_type = "symlink"
-            elif is_regular_file:
-                file_type = "regular_file"
-            elif stat.S_ISDIR(metadata.st_mode):
-                file_type = "directory"
-            else:
-                file_type = "other"
+            file_type = (
+                "symlink" if is_symlink else
+                "regular_file" if is_regular_file else
+                "directory" if stat.S_ISDIR(metadata.st_mode) else
+                "other"
+            )
             diagnostics = {
                 "argument_present": True,
                 "exists": True,
@@ -87,9 +83,7 @@ def _log_execution_file_diagnostics(path: Path | None) -> None:
                 "is_symlink": is_symlink,
                 "is_regular_file": is_regular_file,
                 "lstat_size_bytes": metadata.st_size,
-                "metadata_available": True,
             }
-
     print(
         "Claude execution file diagnostics: "
         + json.dumps(diagnostics, sort_keys=True, separators=(",", ":")),
@@ -98,76 +92,48 @@ def _log_execution_file_diagnostics(path: Path | None) -> None:
     )
 
 
-def _model_usage_diagnostics(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, list):
-        return {
-            "event_list": False,
-            "result_event_count": 0,
-            "model_usage_key_present": False,
-            "model_usage_value_types": [],
-            "model_usage_object_count": 0,
-            "model_usage_model_count": 0,
-            "expected_model_entry_present": False,
-            "expected_model_positive_usage": False,
-        }
-
-    result_events = [
-        event
-        for event in payload
-        if isinstance(event, dict) and event.get("type") == "result"
-    ]
+def _log_model_usage_diagnostics(payload: Any) -> None:
+    result_events = (
+        [
+            event
+            for event in payload
+            if isinstance(event, dict) and event.get("type") == "result"
+        ]
+        if isinstance(payload, list)
+        else []
+    )
     model_usage_values = [
         event["modelUsage"] for event in result_events if "modelUsage" in event
     ]
     model_usage_objects = [
         value for value in model_usage_values if isinstance(value, dict)
     ]
-    model_names = [
-        model
-        for usage_by_model in model_usage_objects
-        for model in usage_by_model
-        if isinstance(model, str)
-    ]
-    expected_model_entry_present = any(_is_expected_model(model) for model in model_names)
-    expected_model_positive_usage = any(
-        _is_expected_model(model) and _has_positive_token_usage(usage)
-        for usage_by_model in model_usage_objects
-        for model, usage in usage_by_model.items()
-    )
-    return {
-        "event_list": True,
+    diagnostics = {
+        "event_list": isinstance(payload, list),
         "result_event_count": len(result_events),
         "model_usage_key_present": bool(model_usage_values),
-        "model_usage_value_types": sorted(
-            {
-                "null" if value is None else
-                "object" if isinstance(value, dict) else
-                "array" if isinstance(value, list) else
-                "string" if isinstance(value, str) else
-                "boolean" if isinstance(value, bool) else
-                "number" if isinstance(value, (int, float)) else
-                "other"
-                for value in model_usage_values
-            }
-        ),
         "model_usage_object_count": len(model_usage_objects),
-        "model_usage_model_count": sum(len(value) for value in model_usage_objects),
-        "expected_model_entry_present": expected_model_entry_present,
-        "expected_model_positive_usage": expected_model_positive_usage,
+        "model_usage_model_count": sum(
+            len(value) for value in model_usage_objects
+        ),
+        "expected_model_entry_present": any(
+            _is_expected_model(model)
+            for usage_by_model in model_usage_objects
+            for model in usage_by_model
+        ),
+        "expected_model_positive_usage": any(
+            _is_expected_model(model) and _has_positive_token_usage(usage)
+            for usage_by_model in model_usage_objects
+            for model, usage in usage_by_model.items()
+        ),
     }
-
-
-def _log_model_usage_diagnostics(payload: Any) -> None:
     print(
         "Claude modelUsage diagnostics: "
-        + json.dumps(
-            _model_usage_diagnostics(payload),
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
+        + json.dumps(diagnostics, sort_keys=True, separators=(",", ":")),
         file=sys.stderr,
         flush=True,
     )
+
 
 def verify_execution(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, list):
