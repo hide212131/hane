@@ -3792,8 +3792,21 @@ impl EditorView {
         window_y: f32,
         window: &Window,
     ) -> Option<SourceOffset> {
+        let shaper = WindowShaper::new(window, self.zoom);
+        self.row_hit_at_window_point(line, fragment, window_x, window_y, &shaper)
+            .map(|hit| hit.offset)
+    }
+
+    /// Resolves a window-space point on one row into a [`RowHit`].
+    fn row_hit_at_window_point(
+        &self,
+        line: usize,
+        fragment: Range<usize>,
+        window_x: f32,
+        window_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<RowHit> {
         let (block_id, visual_line) = *self.line_owners.get(&line)?;
-        let visual = self.block_cache.get(&block_id)?;
         let layout = &self.layout_cache.get(&block_id)?.layout;
         let row_index = layout
             .lines
@@ -3804,12 +3817,41 @@ impl EditorView {
         let content_y = self.scroll_y + window_y
             - self.theme.header_height
             - self.document_find_reserved_height();
-        let local_y = content_y - row_top;
-        let shaper = WindowShaper::new(window, self.zoom);
-        let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, &shaper)?;
+        self.row_hit_at_point(line, fragment, x, content_y - row_top, shaper)
+    }
+
+    /// Resolves a point on one row, in the row's text column (`x`) and relative
+    /// to the row's top (`local_y`). `offset` is the nearest caret boundary, which
+    /// is where an editing click lands. `glyph_offset` is where the glyph under
+    /// the point starts, which is what link hit-testing needs: the nearest caret
+    /// of a click on the right half of a link's last glyph is the link's
+    /// exclusive end, outside the half-open link range.
+    fn row_hit_at_point(
+        &self,
+        line: usize,
+        fragment: Range<usize>,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<RowHit> {
+        let (block_id, visual_line) = *self.line_owners.get(&line)?;
+        let visual = self.block_cache.get(&block_id)?;
+        let layout = &self.layout_cache.get(&block_id)?.layout;
+        let row_index = layout
+            .lines
+            .iter()
+            .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
+        let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, shaper)?;
         let line = visual.lines.get(visual_line)?;
         let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
-        layout.source_at_xy_with_bias(visual, row_index, x, local_y, &shaper, bias)
+        let offset = layout.source_at_xy_with_bias(visual, row_index, x, local_y, shaper, bias)?;
+        let glyph_offset = layout
+            .glyph_source_at_xy(visual, row_index, x, local_y, shaper)
+            .unwrap_or(offset);
+        Some(RowHit {
+            offset,
+            glyph_offset,
+        })
     }
 
     /// The external link destination under a click that resolved to `offset`
@@ -3878,18 +3920,19 @@ impl EditorView {
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
-        let Some(offset) = self.offset_at_row_x(
+        let shaper = WindowShaper::new(window, self.zoom);
+        let Some(hit) = self.row_hit_at_window_point(
             line,
             fragment,
             f32::from(event.position.x),
             f32::from(event.position.y),
-            window,
+            &shaper,
         ) else {
             return;
         };
         if let RowClick::OpenLink(destination) = self.apply_row_click(
             line,
-            offset,
+            hit,
             &event.modifiers,
             cfg!(target_os = "macos"),
             cx,
@@ -3898,21 +3941,22 @@ impl EditorView {
         }
     }
 
-    /// Decides and applies a left click that resolved to `offset` on `line`.
+    /// Decides and applies a left click that resolved to `hit` on `line`.
     ///
     /// An OS-standard modifier click on link text only reports the destination
     /// to open and leaves caret, selection and document alone. Any other click
-    /// is ordinary selection editing.
+    /// is ordinary selection editing at the nearest caret boundary.
     fn apply_row_click(
         &mut self,
         line: usize,
-        offset: SourceOffset,
+        hit: RowHit,
         modifiers: &gpui::Modifiers,
         macos: bool,
         cx: &mut Context<Self>,
     ) -> RowClick {
+        let offset = hit.offset;
         if is_link_open_modifier(modifiers, macos)
-            && let Some(destination) = self.link_destination_at(line, offset)
+            && let Some(destination) = self.link_destination_at(line, hit.glyph_offset)
         {
             return RowClick::OpenLink(destination);
         }
@@ -5418,6 +5462,15 @@ fn target_in_neighbor(
         layout.lines.len().checked_sub(1)?
     };
     layout.source_at_x(&visual, row, x, shaper)
+}
+
+/// Where a left click on a text row landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowHit {
+    /// The nearest caret boundary, used for ordinary selection editing.
+    offset: SourceOffset,
+    /// Where the glyph under the pointer starts, used to hit-test link text.
+    glyph_offset: SourceOffset,
 }
 
 /// What a left click on a text row resolved to.
@@ -7406,7 +7459,6 @@ mod tests {
         const DESTINATION: &str = "https://example.com/";
         let text = format!("see [Hane]({DESTINATION}) end\n");
         let inside_link = SourceOffset(text.find("Hane").unwrap() + 1);
-        let outside_link = SourceOffset(1);
         let command = gpui::Modifiers {
             platform: true,
             ..gpui::Modifiers::none()
@@ -7417,17 +7469,33 @@ mod tests {
         };
 
         for undone in [false, true] {
-            // (modifiers, macos, click offset, opens DESTINATION)
+            // Click x in 8px columns of the presented line, relative to the
+            // first column of the link text "Hane": inside the glyph "a", the
+            // right half of the last glyph "e" (whose nearest caret is the
+            // link's exclusive end), the left and right halves of the glyph
+            // right after the link, and the text before the link.
+            const INSIDE: f32 = 1.25;
+            const LAST_GLYPH_RIGHT_HALF: f32 = 3.75;
+            const AFTER_LEFT_HALF: f32 = 4.125;
+            const AFTER_RIGHT_HALF: f32 = 4.75;
+            const BEFORE_LINK: f32 = -3.5;
+            // (modifiers, macos, click column, opens DESTINATION)
             let cases = [
-                (command, true, inside_link, true),
-                (ctrl, false, inside_link, true),
-                (ctrl, true, inside_link, false),
-                (command, false, inside_link, false),
-                (gpui::Modifiers::none(), true, inside_link, false),
-                (command, true, outside_link, false),
-                (ctrl, false, outside_link, false),
+                (command, true, INSIDE, true),
+                (ctrl, false, INSIDE, true),
+                (ctrl, true, INSIDE, false),
+                (command, false, INSIDE, false),
+                (gpui::Modifiers::none(), true, INSIDE, false),
+                (command, true, LAST_GLYPH_RIGHT_HALF, true),
+                (ctrl, false, LAST_GLYPH_RIGHT_HALF, true),
+                (gpui::Modifiers::none(), true, LAST_GLYPH_RIGHT_HALF, false),
+                (command, true, AFTER_LEFT_HALF, false),
+                (command, true, AFTER_RIGHT_HALF, false),
+                (ctrl, false, AFTER_RIGHT_HALF, false),
+                (command, true, BEFORE_LINK, false),
+                (ctrl, false, BEFORE_LINK, false),
             ];
-            for (modifiers, macos, offset, opens) in cases {
+            for (modifiers, macos, column, opens) in cases {
                 let view = gpui::AppContext::new(cx, |cx| {
                     EditorView::new(text.as_str(), "Untitled", cx)
                 });
@@ -7451,12 +7519,43 @@ mod tests {
                         view.line_owners
                             .insert(line.line_id as usize, (visual.id, at));
                     }
-                    let line = visual
+                    let presented_at = visual
                         .lines
                         .iter()
-                        .find(|line| line.links.iter().any(|link| link.contains(inside_link)))
-                        .map(|line| line.line_id as usize)
+                        .position(|line| line.links.iter().any(|link| link.contains(inside_link)))
                         .expect("the presentation records the link target");
+                    let presented = &visual.lines[presented_at];
+                    let line = presented.line_id as usize;
+                    let link_column = presented
+                        .visual_text
+                        .find("Hane")
+                        .map(|byte| presented.visual_text[..byte].chars().count())
+                        .expect("the link text is presented");
+
+                    // Lay the block out as the render loop does so the click
+                    // goes through the production row hit-test.
+                    let shaper = FixedAdvanceShaper::new(8.0);
+                    let layout = layout_block(&visual, 800.0, &shaper);
+                    let fragment = layout
+                        .lines
+                        .iter()
+                        .find(|row| row.line == presented_at)
+                        .map(|row| row.line_visual_range.clone())
+                        .expect("the link line has a laid-out row");
+                    let block_id = visual.id;
+                    view.block_cache.insert(block_id, visual.clone());
+                    view.layout_cache.insert(
+                        block_id,
+                        LayoutCacheEntry {
+                            layout,
+                            font_revision: view.layout_font_revision,
+                        },
+                    );
+                    let x = (link_column as f32 + column) * 8.0;
+                    let hit = view
+                        .row_hit_at_point(line, fragment, x, 1.0, &shaper)
+                        .expect("the click resolves on the link row");
+                    let offset = hit.offset;
 
                     let text_before = view.editor().document().full_text();
                     let selection_before = view.editor().selection();
@@ -7464,7 +7563,7 @@ mod tests {
                     let can_undo_before = view.editor().can_undo();
                     let can_redo_before = view.editor().can_redo();
 
-                    let outcome = view.apply_row_click(line, offset, &modifiers, macos, cx);
+                    let outcome = view.apply_row_click(line, hit, &modifiers, macos, cx);
 
                     if opens {
                         assert_eq!(outcome, RowClick::OpenLink(DESTINATION.into()));

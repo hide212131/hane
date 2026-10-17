@@ -354,6 +354,51 @@ impl LayoutLine {
         self.visual_for_xy(line, x, 0.0, shaper)
     }
 
+    /// The visual offset where the glyph drawn under `(x, local_y)` starts.
+    ///
+    /// [`Self::visual_for_xy`] answers with the nearest caret boundary, which
+    /// for a click on the right half of a glyph is the boundary *after* it.
+    /// When that boundary lies to the right of the click, the click is on the
+    /// preceding character of the same row stretch, so step back to it. A
+    /// click at or past the boundary stays on the boundary, which keeps blank
+    /// space after the last glyph of a row from resolving to that glyph.
+    fn glyph_visual_for_xy(
+        &self,
+        line: &VisualLine,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> usize {
+        let visual = self.visual_for_xy(line, x, local_y, shaper);
+        let (origin, range) = if let Some(cell) = self.table_cell_for_x(x) {
+            match self.table_fragment_for_local_y(cell, local_y) {
+                Some(fragment) => (fragment.text_x, fragment.visual_range.clone()),
+                None => return visual,
+            }
+        } else if let Some(body) = self.body_visual_start
+            && body <= self.line_visual_range.end
+            && body.max(self.line_visual_range.start) < self.line_visual_range.end
+            && x >= self.body_x_origin
+        {
+            (
+                self.body_x_origin,
+                body.max(self.line_visual_range.start)..self.line_visual_range.end,
+            )
+        } else {
+            (self.text_x_origin, self.line_visual_range.clone())
+        };
+        if visual <= range.start || visual > range.end {
+            return visual;
+        }
+        if x >= origin + shaper.x_for_offset(line, range.clone(), visual) {
+            return visual;
+        }
+        line.visual_text[range.start..visual]
+            .char_indices()
+            .next_back()
+            .map_or(visual, |(relative, _)| range.start + relative)
+    }
+
     /// True when `offset` is inside this row, or at its end and the row is the
     /// last of its line. A soft break's boundary offset belongs to the row that
     /// starts there, so a caret at a wrap point renders at the start of the next
@@ -649,6 +694,28 @@ impl BlockLayout {
         Some(
             line.source_map
                 .visual_to_source(VisualOffset(visual), affinity)
+                .map_or(row.source_range.start, |candidate| candidate.source_offset),
+        )
+    }
+
+    /// The source offset where the glyph under `(x, y)` on one physical row
+    /// starts, for hit-testing link text. Unlike [`Self::source_at_xy`] this is
+    /// not the nearest caret boundary, so a click on the right half of the last
+    /// glyph of a range still resolves inside that range.
+    pub fn glyph_source_at_xy(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<SourceOffset> {
+        let row = self.lines.get(row_index)?;
+        let line = block.lines.get(row.line)?;
+        let visual = row.glyph_visual_for_xy(line, x, local_y, shaper);
+        Some(
+            line.source_map
+                .visual_to_source(VisualOffset(visual), Bias::After)
                 .map_or(row.source_range.start, |candidate| candidate.source_offset),
         )
     }
