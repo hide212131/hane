@@ -38,6 +38,53 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Moves the already-flushed `temp` over `dest`.
+///
+/// Windows cannot rely on a rename to replace an existing destination, so an
+/// existing file is swapped with `ReplaceFileW`, which keeps `dest` intact when
+/// it fails. A missing destination is a plain rename, which on Windows refuses
+/// to overwrite anything that appeared in the meantime (fail-closed). On other
+/// platforms `rename` replaces atomically.
+pub(crate) fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        match fs::symlink_metadata(dest) {
+            Ok(_) => {
+                let wide = |p: &Path| -> Vec<u16> {
+                    p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+                };
+                let dest_w = wide(dest);
+                let temp_w = wide(temp);
+                // SAFETY: both buffers are NUL-terminated and outlive the call;
+                // the optional backup, exclude and reserved arguments are null.
+                let ok = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
+                        dest_w.as_ptr(),
+                        temp_w.as_ptr(),
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                };
+                if ok == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => fs::rename(temp, dest),
+            Err(err) => Err(err),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp, dest)
+    }
+}
+
 /// Atomically replaces `path` with `bytes` via a sibling temp file.
 pub fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
@@ -63,7 +110,7 @@ pub fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temp);
         return Err(err);
     }
-    if let Err(err) = fs::rename(&temp, path) {
+    if let Err(err) = replace_file(&temp, path) {
         let _ = fs::remove_file(&temp);
         return Err(err);
     }

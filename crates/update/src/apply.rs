@@ -451,7 +451,7 @@ fn install_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()?;
         drop(file);
         match std::fs::symlink_metadata(path) {
-            Ok(_) => std::fs::rename(&temp, path)?,
+            Ok(_) => crate::fsutil::replace_file(&temp, path)?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // Atomic no-replace: fails with AlreadyExists if a file showed up.
                 std::fs::hard_link(&temp, path)?;
@@ -1082,5 +1082,27 @@ mod tests {
             .filter(|n| n.starts_with(".hane-update-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Runs the real replace path on whatever OS executes the tests; on Windows
+    /// it exercises `ReplaceFileW`, elsewhere `rename`.
+    #[test]
+    fn replacing_existing_files_and_rewriting_the_journal_file_succeeds_repeatedly() {
+        let dir = TempDir::new("apply-replace-existing");
+        let root = dir.path().join("install");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.dll"), OLD_DLL).unwrap();
+
+        install_write(&root.join("a.dll"), NEW_DLL).unwrap();
+        assert_eq!(fs::read(root.join("a.dll")).unwrap(), NEW_DLL);
+        install_write(&root.join("a.dll"), OLD_DLL).unwrap();
+        assert_eq!(fs::read(root.join("a.dll")).unwrap(), OLD_DLL);
+
+        let journal = dir.path().join("journal.json");
+        durable_write(&journal, b"intent").unwrap();
+        durable_write(&journal, b"phase").unwrap();
+        durable_write(&journal, b"rollback").unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), b"rollback");
+        assert!(!dir.path().join(".journal.json.tmp").exists());
     }
 }
