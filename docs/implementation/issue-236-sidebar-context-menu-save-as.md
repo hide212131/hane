@@ -12,19 +12,28 @@
 - ファイル行の Save As。保存先は WorkFolder の外も選べ、保存した結果は WorkFolder の状態へ反映されます。
 - Trash 操作。失敗した場合は成功扱いにしません。
 
-### 検証済みの事実
+### 検証済みの事実（PR head `1ba71efb6518ce475bbefc10be3629940fc5888c`）
 
-- regression tests と Clippy は、run `39027149284`（code head `bf394632dc37def9677d9ff2585498ca3fa68e9d`）で成功しています。この run では workspace tests も成功しています。
+- CI run `39027698405` で macOS / Windows の workspace tests と Clippy が成功しています。
+- macOS の手動 GUI 確認（隔離アプリ、証拠: https://github.com/hide212131/hane/pull/501#issuecomment-6233665582）:
+  - `Cmd+N` で新しいノートを作成して編集し、`Cmd+Shift+S` から Work folder 外の一時保存先へ保存しました。保存ファイルの内容が編集内容と一致することを確認しています。
+  - 同じセッションを Work folder 内の `Saved-in-work.md` へ Save As し、Work folder の切替や明示的な再スキャンをせずに、保存先のファイル行がサイドバーに表示されました。
 
 ### 未検証の事項
 
-- Save As dialog を最後まで操作する確認は未検証です。
+- サイドバー行を右クリックして Save As を選ぶ操作そのものは未確認です。上記の手動確認は Save As をキーボードショートカットから起動しています。
 - macOS / Windows で OS の Trash / Recycle Bin へ移動する実機確認は未検証です。
-- GUI validation run `39020260329` は earlier head を対象としており、Save As dialog も OS Trash も操作していません。現在の head の GUI 合格証拠としては扱いません。
+- Windows の手動 GUI 確認は行っていません。
+- exact-head の hosted GUI run `39029460377` は、Save As ではなく境界計測シナリオで `blocked` となりました。OCR / 座標入力の独立した証拠がないため、この結果は Issue #236 の Save As の合否や製品不具合の証拠として扱わず、合格証拠にもなりません。
+
+### 過去 head の記録（現在の head の証拠ではない）
+
+- run `39027149284`（code head `bf394632dc37def9677d9ff2585498ca3fa68e9d`）で regression tests、Clippy、workspace tests が成功しています。
+- GUI validation run `39020260329` は earlier head を対象とし、Save As dialog も OS Trash も操作していません。
 
 ### 別範囲
 
-- タブ右クリックの Save As は Issue #504 / PR #505 で扱い、この Issue の範囲には含めません。
+- タブ右クリックの Save As は Issue #504 / PR #505 で扱い、この Issue の範囲には含めません。この更新で製品コードとテストは変更していません。
 
 ## 目的
 
