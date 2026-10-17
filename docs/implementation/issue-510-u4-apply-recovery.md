@@ -4,7 +4,15 @@
 採用済み設計: `docs/adr/0034-zip-application-updates.md`、`docs/application-update-implementation-spec.md`、`docs/application-update-implementation-handoff.md`
 前段の実装: [#512 U0/U1/U3](https://github.com/hide212131/hane/pull/512)
 準備時の基点: `f9da614d93158fba95b5939ffdb44c67f06b8657`（#512 head）
-状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）をコードに追加済み。Windowsファイル置換、macOS bundle swap、限定health起動、commit/rollbackのOS adapter接続、実OSでの二版適用は未実施で、「再起動して更新」は有効化していない。
+状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）と increment 2（Windows x64 所有ファイル適用のhelper接続）をコードに追加済み。macOS bundle swap、限定health起動、durable commit、実OSでの二版適用は未実施で、「再起動して更新」は有効化していない。
+
+### Increment 2: Windows所有ファイル適用（`crates/update/src/windows_apply.rs`）
+
+- アプリは `prepare_restart` で、Ready候補のcatalog・署名・archiveだけを `Coordination::transaction_dir/<TransactionId>/candidate/` へcopyする。helperのprotocolには候補ID以外を追加していない（任意のsource/destination path、CLI引数、環境変数、commandなし）。
+- helperは親終了後に排他的runtime leaseを取ってから、自分の位置から導出した `Coordination` と `find_install` で配置を決め、現在のsigned inventory、候補catalog/署名（候補IDと照合）、archive hash、archive検査と展開（`stage/`）、新inventoryを独立して再検証する。適用planは署名確認済みinventory同士から `ApplyPlan::for_inventories` で作り、precondition違反は書込み前に停止する。
+- journal intentをdurable化してから既存の `apply::apply` で所有ファイルだけを置換し、`hane.exe` は最後になる。inventory外のfile、user state、Explorer登録、版別shell DLLは変更しない。曖昧なhashや壊れたbackupは既存engineがRecoveryRequiredにする。
+- 限定healthとdurable commitがないため、`apply_and_settle` は置換後に直ちに旧版へ戻し、`NotApplicable` を返す。成功を返す経路はなく、再起動ボタンへも接続していない。
+- 未実施: macOS bundle swap、限定health child、durable commit、restart UI有効化、実Windowsでの二版適用証拠（U5）。ここまでの検証はfake/temp directoryによるunit testのみで、実OSのpower-loss耐性は主張しない。
 
 ## 目的
 

@@ -12,22 +12,31 @@
 //! helper copy with piped stdio only, no arguments and a minimal environment,
 //! and requires `Prepared` from that very child before it reports success.
 //!
-//! The backend that replaces files (Windows) or swaps the bundle (macOS) is the
-//! next increment; [`PlatformBackend`] therefore refuses to apply.
+//! [`PlatformBackend`] applies the Windows owned-file set through
+//! [`crate::windows_apply`]. The macOS bundle swap, the limited-health child and
+//! the durable commit are not connected yet, so it never reports an applied
+//! update: the replaced files are restored before it answers.
 
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use crate::apply::{self, FsFileOps, HealthChild, RecoveryOutcome};
+use crate::apply::{self, FsFileOps, RecoveryOutcome};
+use crate::clock::{Clock, SystemClock};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::identity::{InstallId, TransactionId};
 use crate::journal::{DurableJournal, FileJournalStore};
+use crate::model::Target;
 use crate::platform::lease::{Coordination, Lease, LeaseKind};
 use crate::protocol::{
     Body, Frame, Mode, Nonce, RecoveryReport, bounded_reason, read_frame, write_frame,
+};
+use crate::trust::TrustPolicy;
+use crate::windows_apply::{
+    ApplyInputs, CandidateSource, NoChild, apply_and_settle, stage_candidate, valid_candidate_id,
 };
 
 pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -286,28 +295,50 @@ fn wait_for_parent_exit(
     }
 }
 
-struct NoChild;
+/// Real backend. It recovers a pending journal with the journal-first engine
+/// and applies the Windows owned-file set. The helper derives every input
+/// itself: the install from the coordination directory, the candidate from its
+/// own transaction directory and the requested (validated) candidate id.
+pub struct PlatformBackend {
+    policy: TrustPolicy,
+    clock: Arc<dyn Clock>,
+}
 
-impl HealthChild for NoChild {
-    fn stop_and_release_lease(&mut self) -> Result<()> {
-        // No limited-health child exists in this increment, and holding the
-        // runtime lease exclusively already proves no Hane process is alive.
-        Ok(())
+impl PlatformBackend {
+    pub fn new(policy: TrustPolicy, clock: Arc<dyn Clock>) -> Self {
+        Self { policy, clock }
+    }
+
+    pub fn production() -> Self {
+        Self::new(TrustPolicy::production(), Arc::new(SystemClock::new()))
     }
 }
 
-/// Real backend of this increment. It recovers a pending journal with the
-/// journal-first engine but refuses to apply: the platform replace/swap
-/// adapters are connected by the next increment.
-#[derive(Default)]
-pub struct PlatformBackend;
-
 impl HelperBackend for PlatformBackend {
-    fn apply(&mut self, _ctx: &ApplyContext<'_>) -> Result<()> {
-        Err(UpdateError::new(
-            ErrorCode::NotApplicable,
-            "the platform apply adapter is not connected yet",
-        ))
+    fn apply(&mut self, ctx: &ApplyContext<'_>) -> Result<()> {
+        let candidate_id = ctx
+            .candidate_id
+            .filter(|id| valid_candidate_id(id))
+            .ok_or_else(|| {
+                UpdateError::new(ErrorCode::IdentityMismatch, "the request names no valid candidate")
+            })?;
+        let coordination = &ctx.env.coordination;
+        let placement = crate::platform::find_install(coordination)?;
+        if placement.target != Target::WindowsX64 {
+            return Err(UpdateError::new(
+                ErrorCode::NotApplicable,
+                "the macOS bundle swap is not connected yet",
+            ));
+        }
+        apply_and_settle(&ApplyInputs {
+            coordination,
+            transaction: &ctx.env.transaction,
+            candidate_id,
+            placement: &placement,
+            policy: &self.policy,
+            clock: &*self.clock,
+            runtime_held: ctx.leases.runtime.is_some(),
+        })
     }
 
     fn recover(&mut self, ctx: &RecoverContext<'_>) -> Result<RecoveryReport> {
@@ -417,7 +448,7 @@ pub fn helper_main() -> i32 {
     let Ok(env) = HelperEnv::from_current_process() else {
         return 3;
     };
-    let mut backend = PlatformBackend;
+    let mut backend = PlatformBackend::production();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let result = run_session(&mut stdin.lock(), &mut stdout.lock(), &env, &mut backend);
@@ -680,21 +711,15 @@ impl Drop for PreparedRestart {
     }
 }
 
-fn valid_candidate_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-}
-
-/// Verifies the installed helper, stages its copy and completes the
-/// `Prepared` handshake. Nothing is changed and nothing exits: on any failure
-/// the application simply stays open.
+/// Verifies the installed helper, stages its copy and the Ready candidate into
+/// the transaction directory, and completes the `Prepared` handshake. Nothing
+/// in the install is changed and nothing exits: on any failure the application
+/// simply stays open.
 pub fn prepare_restart(
     placement: &crate::platform::Placement,
     policy: &crate::trust::TrustPolicy,
     candidate_id: &str,
+    candidate: &CandidateSource<'_>,
 ) -> Result<PreparedRestart> {
     if !valid_candidate_id(candidate_id) {
         return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed candidate id"));
@@ -703,6 +728,7 @@ pub fn prepare_restart(
     let transaction = TransactionId::generate()?;
     let source = crate::platform::installed_helper(placement, policy)?;
     let copy = crate::platform::stage_helper_copy(&coordination, &transaction, &source)?;
+    stage_candidate(&coordination, &transaction, candidate)?;
     let spawned = spawn_helper(
         &copy,
         &HelloRequest {
@@ -1005,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn the_platform_backend_refuses_to_apply() {
+    fn the_platform_backend_refuses_an_unnamed_or_unplaced_candidate() {
         let fx = fixture();
         let env = fx.env();
         let transaction = fx.coord.try_acquire(LeaseKind::Transaction, &[]).unwrap().unwrap();
@@ -1019,14 +1045,32 @@ mod tests {
             startup,
             runtime: None,
         };
-        let err = PlatformBackend
+        let mut backend = PlatformBackend::new(
+            crate::testing::test_policy(),
+            Arc::new(crate::testing::FixedClock::new(crate::testing::test_now())),
+        );
+        // Neither a missing nor a path-like candidate id reaches the disk.
+        for id in [None, Some("cand"), Some("../../escape")] {
+            let err = backend
+                .apply(&ApplyContext {
+                    env: &env,
+                    candidate_id: id,
+                    leases: &leases,
+                })
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::IdentityMismatch, "{id:?}");
+        }
+        // A well-formed id still needs an installation that matches the
+        // coordination directory; the temporary directory has none.
+        let well_formed = "a".repeat(64);
+        let err = backend
             .apply(&ApplyContext {
                 env: &env,
-                candidate_id: None,
+                candidate_id: Some(well_formed.as_str()),
                 leases: &leases,
             })
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotApplicable);
+        assert_eq!(err.code, ErrorCode::NotFound);
     }
 
     // ------------------------------------------------ application side

@@ -34,9 +34,9 @@ use hane_update::trust::{SeenStore, TrustPolicy};
 use hane_update::version::{VersionRelation, parse_current_version};
 use hane_update::{ErrorCode, UpdateError};
 
-const CATALOG_FILE: &str = "hane-update.json";
-const SIGNATURE_FILE: &str = "hane-update.json.sig";
-const ARCHIVE_FILE: &str = "archive.zip";
+pub(crate) const CATALOG_FILE: &str = "hane-update.json";
+pub(crate) const SIGNATURE_FILE: &str = "hane-update.json.sig";
+pub(crate) const ARCHIVE_FILE: &str = "archive.zip";
 const STAGE_DIR: &str = "stage";
 const READY_MARKER: &str = "ready";
 const SEEN_FILE: &str = "seen-catalog.json";

@@ -7,8 +7,9 @@
 //! other placement is `UnsupportedInstall` (fail closed); ordinary editing
 //! still works there, it just never offers an update.
 //!
-//! Not here yet: Windows file-set replacement, macOS `RENAME_SWAP`, the
-//! limited-health child and the commit/rollback adapters.
+//! The Windows file-set replacement lives in `windows_apply` and is driven by
+//! the helper. Not here yet: macOS `RENAME_SWAP`, the limited-health child and
+//! the durable commit.
 
 use std::fs;
 use std::path::{Path, PathBuf};

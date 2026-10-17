@@ -12,10 +12,14 @@
 //!
 //! U4 increment 1 adds process-lifetime leases, supported-placement checks,
 //! the verified helper copy, the private helper protocol and the startup gate
-//! (`platform`, `protocol`, `helper`, `startup`).
+//! (`platform`, `protocol`, `helper`, `startup`). Increment 2 connects the
+//! Windows owned-file apply path to the helper (`windows_apply`): the helper
+//! re-verifies a transaction-local candidate and replaces only the files of the
+//! signed inventories, journal first. Without the limited-health child and the
+//! durable commit it restores the old files again instead of reporting success.
 //!
 //! Deliberately **not** here: UI, GPUI, document or AI credential access, real
-//! HTTP transport, file replacement, bundle swapping, the limited-health child,
+//! HTTP transport, bundle swapping, the limited-health child, durable commit,
 //! and any production signing key. [`trust::TrustPolicy::production`] carries
 //! no key material until a maintainer embeds one, so no candidate can become
 //! applicable from a production build today. OS-specific locking and crash
@@ -45,6 +49,7 @@ pub mod startup;
 pub mod trust;
 mod util;
 pub mod version;
+pub mod windows_apply;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
