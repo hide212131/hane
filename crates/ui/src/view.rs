@@ -95,6 +95,7 @@ mod ai_prompts;
 mod ai_selection;
 mod ai_settings;
 mod background_parse;
+mod basic_editing_keys;
 mod content_search;
 mod document_find;
 mod inline_rename;
@@ -3977,6 +3978,103 @@ impl EditorView {
         true
     }
 
+    /// Moves the caret about one viewport up or down (Issue #494).
+    ///
+    /// Repeats the layout-driven row move — so wrapping, heading/table row
+    /// heights, hidden table delimiters and the remembered x all behave as for
+    /// the arrow keys — until the caret row has travelled a page, with one row
+    /// of overlap, or the document edge stops it. The loop is bounded by the
+    /// rows of one page; it never touches rows beyond them and runs
+    /// `after_input` once, at the end.
+    pub(crate) fn move_page(
+        &mut self,
+        down: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        /// Safety stop for a page made of pathologically short rows.
+        const MAX_PAGE_ROWS: usize = 4_096;
+        let shaper = WindowShaper::new(window, self.zoom);
+        let page = (self.viewport_height - self.line_height()).max(self.line_height());
+        let start_top = self
+            .source_offset_row_bounds(self.editor().selection().active)
+            .map(|(top, _)| top);
+        let mut moved = false;
+        for _ in 0..MAX_PAGE_ROWS {
+            let before = self.editor().selection().active;
+            if !self.move_vertical_by_layout(down, extend, &shaper) {
+                if !moved {
+                    // No layout to resolve against yet (first frames): the
+                    // source-line move stands in, as for the arrow keys.
+                    let command = if down {
+                        EditorCommand::MoveDown { extend }
+                    } else {
+                        EditorCommand::MoveUp { extend }
+                    };
+                    self.dispatch(command, cx);
+                    return;
+                }
+                break;
+            }
+            let after = self.editor().selection().active;
+            if after == before {
+                break;
+            }
+            moved = true;
+            let travelled = start_top
+                .zip(self.source_offset_row_bounds(after))
+                .map(|(start, (top, _))| (top - start).abs());
+            if travelled.is_some_and(|travelled| travelled >= page) {
+                break;
+            }
+        }
+        self.after_input(cx);
+    }
+
+    /// Ends a scroll-only operation (macOS Home/End/PageUp/PageDown and
+    /// Control+L). The caret, selection and undo history are untouched, so
+    /// nothing may pull the viewport back to the caret afterwards: the pending
+    /// post-layout caret reveal and any wheel coast are dropped.
+    fn finish_scroll_only(&mut self, scroll_y: f32, cx: &mut Context<Self>) {
+        self.scroll_y = clamp_scroll_y(
+            scroll_y,
+            self.scrollable_content_height(),
+            self.viewport_height,
+        );
+        self.scroll_inertia = None;
+        self.pending_caret_visibility_after_layout = false;
+        cx.notify();
+    }
+
+    /// Scrolls to the top or bottom of the document without moving the caret.
+    pub(crate) fn scroll_to_document_edge(&mut self, end: bool, cx: &mut Context<Self>) {
+        let target = if end {
+            self.scrollable_content_height()
+        } else {
+            0.0
+        };
+        self.finish_scroll_only(target, cx);
+    }
+
+    /// Scrolls one viewport (with one row of overlap) without moving the caret.
+    pub(crate) fn scroll_page(&mut self, down: bool, cx: &mut Context<Self>) {
+        let page = (self.viewport_height - self.line_height()).max(self.line_height());
+        let delta = if down { page } else { -page };
+        self.finish_scroll_only(self.scroll_y + delta, cx);
+    }
+
+    /// Scrolls so the caret's row sits in the vertical middle of the viewport,
+    /// clamped to the document's scroll range. Caret and selection unchanged.
+    pub(crate) fn center_cursor_line(&mut self, cx: &mut Context<Self>) {
+        let Some((top, height)) = self.source_offset_row_bounds(self.editor().selection().active)
+        else {
+            return;
+        };
+        let target = top + height / 2.0 - self.viewport_height / 2.0;
+        self.finish_scroll_only(target, cx);
+    }
+
     /// The block holding `offset`, laid out, with the line above and below it so
     /// one vertical step always lands on a row that exists.
     ///
@@ -4151,10 +4249,23 @@ impl EditorView {
     /// at most a few extra pixels of margin — and keeps this one shared path
     /// instead of a second one with its own rounding.
     fn scroll_source_offset_into_view(&mut self, offset: SourceOffset) {
-        let editor = self.sessions.active().editor();
-        let Ok(line) = editor.document().line_for_offset(offset) else {
+        let Some((top, height)) = self.source_offset_row_bounds(offset) else {
             return;
         };
+        self.scroll_y = scroll_y_for_cursor(
+            self.scroll_y,
+            top,
+            height + CARET_MODE_BADGE_HEIGHT,
+            self.viewport_height,
+        );
+    }
+
+    /// Content-space `(top, height)` of the row holding `offset`, from the
+    /// drawn layout when it is current and from the physical line otherwise.
+    /// Shared by caret-follow, page moves and centering the caret line.
+    fn source_offset_row_bounds(&self, offset: SourceOffset) -> Option<(f32, f32)> {
+        let editor = self.sessions.active().editor();
+        let line = editor.document().line_for_offset(offset).ok()?;
         let (top, height) = match self.granularity {
             Granularity::Lines => {
                 let line_top = self.heights.prefix_sum(line.0);
@@ -4188,12 +4299,9 @@ impl EditorView {
                 visual_row.unwrap_or((line_top, self.line_height()))
             }
             Granularity::Blocks => {
-                let Some(block) = self
+                let block = self
                     .current_index()
-                    .and_then(|index| index.block_at(offset))
-                else {
-                    return;
-                };
+                    .and_then(|index| index.block_at(offset))?;
                 let block_top = self.heights.prefix_sum(block.ordinal);
                 let row = self
                     .layout_cache
@@ -4218,12 +4326,7 @@ impl EditorView {
                 }
             }
         };
-        self.scroll_y = scroll_y_for_cursor(
-            self.scroll_y,
-            top,
-            height + CARET_MODE_BADGE_HEIGHT,
-            self.viewport_height,
-        );
+        Some((top, height))
     }
 
     /// The window-local `(x, top, height)` the caret (`offset ==
@@ -7114,6 +7217,27 @@ impl EditorView {
         } else {
             None
         };
+        // The macOS entry to the selection AI (Control+L now centers the caret
+        // line, Issue #494) and a second entry on Windows next to Alt+I. It
+        // calls the same `open_ai_selection` the key does, so the body
+        // selection is read, not changed, and an open popup disables it.
+        let ai_button = {
+            let view = cx.entity();
+            div()
+                .debug_selector(|| "footer-ai-selection".to_owned())
+                .flex_none()
+                .child(
+                    Button::new("footer-ai-selection-button")
+                        .label("AIに指示")
+                        .xsmall()
+                        .ghost()
+                        .tooltip("選択した文章に指示する")
+                        .disabled(self.ai_selection_blocks_editor_keys())
+                        .on_click(move |_, window, app| {
+                            view.update(app, |view, cx| view.open_ai_selection(window, cx));
+                        }),
+                )
+        };
         let controls = div()
             .h_full()
             .flex_none()
@@ -7123,6 +7247,7 @@ impl EditorView {
             .px_3()
             .text_size(px(11.0))
             .children(settings_button)
+            .child(ai_button)
             .child(
                 div()
                     .id("footer-autosave")
@@ -19669,19 +19794,27 @@ mod tests {
             Selection::caret(SourceOffset(3))
         );
 
-        cx.simulate_keystrokes("home");
+        // macOS Home/End scroll and Shift+Home/End select to the document
+        // edges (Issue #494); its line edges are Command+Left/Right.
+        let (line_start, line_end, select_line_start, select_line_end) =
+            if cfg!(target_os = "macos") {
+                ("cmd-left", "cmd-right", "cmd-shift-left", "cmd-shift-right")
+            } else {
+                ("home", "end", "shift-home", "shift-end")
+            };
+        cx.simulate_keystrokes(line_start);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection::caret(SourceOffset(0))
         );
 
-        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes(line_end);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection::caret(SourceOffset(6))
         );
 
-        cx.simulate_keystrokes("shift-home");
+        cx.simulate_keystrokes(select_line_start);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection {
@@ -19690,7 +19823,7 @@ mod tests {
             }
         );
 
-        cx.simulate_keystrokes("shift-end");
+        cx.simulate_keystrokes(select_line_end);
         assert_eq!(
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection::caret(SourceOffset(6))
