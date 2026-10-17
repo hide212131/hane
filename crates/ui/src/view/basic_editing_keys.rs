@@ -851,18 +851,21 @@ mod tests {
         // A match far from the pinned line inside the same paragraph.
         let target = text.find("l27w100").unwrap();
         let before_text = text.clone();
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                view.open_document_find(window, cx);
-                view.document_find.query_text = "l27w100".to_owned();
-                view.restart_document_find(cx, false, true);
-            });
-        });
-        cx.run_until_parked();
+        press(cx, "secondary-f");
+        cx.simulate_input("l27w100");
+        for _ in 0..50 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            if view.read_with(cx, |view, _| view.document_find_current_match().is_some()) {
+                break;
+            }
+        }
 
         view.read_with(cx, |view, _| {
-            assert_eq!(view.document_find.current, Some(0));
-            assert_eq!(view.document_find.matches[0].start.0, target);
+            let current = view
+                .document_find_current_match()
+                .expect("the search reached a current match");
+            assert_eq!(current.start.0, target);
             assert!(view.center_window_line.is_none());
             assert!(view.retained_center_window.is_none());
             assert_eq!(view.pending_center_caret_frames, 0);
