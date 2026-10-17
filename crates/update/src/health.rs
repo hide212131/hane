@@ -226,6 +226,10 @@ pub trait LimitedChild {
     fn await_healthy(&mut self, timeout: Duration) -> Result<()>;
     /// Called only after `Committed` is durable.
     fn send_commit(&mut self) -> Result<()>;
+    /// Gives up ownership of the process so that dropping this value no longer
+    /// kills it. Called only once this transaction's health succeeded,
+    /// `Committed` is durable and `Commit` was delivered.
+    fn detach(&mut self);
     fn as_health_child(&mut self) -> &mut dyn HealthChild;
 }
 
@@ -375,6 +379,11 @@ impl<P: ChildProcess> LimitedChild for ProcessChild<P> {
             UpdateError::new(ErrorCode::Truncated, "the health child has no pipe")
         })?;
         link.send_commit(&self.identity.transaction)
+    }
+
+    fn detach(&mut self) {
+        // Dropping the OS handle neither kills nor waits for the process.
+        self.process = None;
     }
 
     fn as_health_child(&mut self) -> &mut dyn HealthChild {
@@ -567,7 +576,11 @@ pub fn conclude_with_child<S: JournalStore, O: FileOps>(
     if outcome == HealthOutcome::Committed {
         // Durable first. A failed notification leaves the child to the
         // journal check of `ChildSession`; the update itself is committed.
-        let _ = child.send_commit();
+        // Only a delivered `Commit` releases the child from the helper, so
+        // the new version keeps running after the helper's handle is gone.
+        if child.send_commit().is_ok() {
+            child.detach();
+        }
     } else if reason.is_none() {
         reason = Some(UpdateError::new(
             ErrorCode::Io,
@@ -1078,6 +1091,37 @@ mod tests {
         assert!(fx.coordination.try_acquire(LeaseKind::RuntimeShared, &[]).unwrap().is_none());
         // Stopping again is harmless.
         child.stop_and_release_lease().unwrap();
+    }
+
+    #[test]
+    fn a_detached_child_survives_the_drop_of_the_helpers_handle() {
+        let fx = fixture();
+        let seen = Rc::new(Observed::default());
+        let mut child = process_child(
+            &fx,
+            FakeProcess {
+                seen: Rc::clone(&seen),
+                stubborn: true,
+                kill_fails: false,
+            },
+        );
+        child.detach();
+        drop(child);
+        assert!(!seen.killed.get(), "a committed child must keep running");
+        assert!(!seen.waited.get());
+
+        // Without a detach the helper never leaves its own child behind.
+        let seen = Rc::new(Observed::default());
+        let child = process_child(
+            &fx,
+            FakeProcess {
+                seen: Rc::clone(&seen),
+                stubborn: true,
+                kill_fails: false,
+            },
+        );
+        drop(child);
+        assert!(seen.killed.get() && seen.waited.get());
     }
 
     #[test]

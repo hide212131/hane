@@ -625,6 +625,9 @@ mod tests {
     struct Probe {
         stops: Cell<usize>,
         commits: Cell<usize>,
+        detaches: Cell<usize>,
+        phase_at_detach: RefCell<Option<Phase>>,
+        commits_at_detach: RefCell<Option<usize>>,
         phase_at_commit: RefCell<Option<Phase>>,
         launched: RefCell<Option<(PathBuf, String, String)>>,
     }
@@ -651,6 +654,18 @@ mod tests {
             let stored = FileJournalStore::new(self.journal_path.clone()).load().unwrap().unwrap();
             *self.probe.phase_at_commit.borrow_mut() = Some(stored.phase);
             Ok(())
+        }
+
+        fn detach(&mut self) {
+            self.probe.detaches.set(self.probe.detaches.get() + 1);
+            *self.probe.phase_at_detach.borrow_mut() = Some(
+                FileJournalStore::new(self.journal_path.clone())
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+            );
+            *self.probe.commits_at_detach.borrow_mut() = Some(self.probe.commits.get());
         }
 
         fn as_health_child(&mut self) -> &mut dyn HealthChild {
@@ -733,6 +748,11 @@ mod tests {
             "Commit is sent only after the journal is durably Committed"
         );
         assert_eq!(probe.stops.get(), 0);
+        // The child is released from the helper only after Committed is
+        // durable and Commit was delivered.
+        assert_eq!(probe.detaches.get(), 1);
+        assert_eq!(*probe.phase_at_detach.borrow(), Some(Phase::Committed));
+        assert_eq!(*probe.commits_at_detach.borrow(), Some(1));
         // The new version is kept, and the child came from the signed inventory.
         let after = snapshot(&fx.placement.install_root);
         assert_eq!(after["hane.exe"], format!("hane.exe {NEW}").into_bytes());
@@ -753,6 +773,7 @@ mod tests {
             assert_eq!(stored_phase(&fx), Phase::RolledBack, "{code:?}");
             assert_eq!(launcher.probe.stops.get(), 1, "{code:?}");
             assert_eq!(launcher.probe.commits.get(), 0, "{code:?}");
+            assert_eq!(launcher.probe.detaches.get(), 0, "{code:?}: a rollback never detaches");
         }
     }
 
@@ -785,6 +806,7 @@ mod tests {
         );
         assert!(apply_and_settle(&fx.inputs(), &mut launcher).is_err());
         assert_eq!(launcher.probe.commits.get(), 0, "no Commit, so no normal startup");
+        assert_eq!(launcher.probe.detaches.get(), 0, "the child stays owned and is stopped");
         assert_eq!(launcher.probe.stops.get(), 1, "the child is stopped, not released");
         assert_ne!(stored_phase(&fx), Phase::Committed);
     }
