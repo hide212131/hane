@@ -961,6 +961,14 @@ pub(crate) fn row_element(
     .children(elements)
 }
 
+/// Left edge and width of a table row's grid: from the first cell's left border
+/// through the last cell's right edge, in the cells' own (layout) coordinates.
+fn table_grid_bounds(cells: &[hane_presentation::TableCellLayout]) -> Option<(f32, f32)> {
+    let first = cells.first()?;
+    let last = cells.last()?;
+    Some((first.x, last.x + last.width - first.x))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn table_row_element(
     editor: &Editor,
@@ -997,19 +1005,17 @@ fn table_row_element(
         });
     let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 2);
     let editing = line.table_row.is_none();
-    if table.header
-        && let Some(first) = row.table_cells.first()
-        && let Some(last) = row.table_cells.last()
-    {
+    let grid_bounds = table_grid_bounds(&row.table_cells);
+    if table.header && let Some((grid_left, grid_width)) = grid_bounds {
         // Bounded to the grid (first column's left border through the last
         // column's right border) so the header tint never bleeds into the
         // row's left/right margins outside the table.
         elements.push(
             div()
                 .absolute()
-                .left(px(theme.line_horizontal_padding + first.x))
+                .left(px(theme.line_horizontal_padding + grid_left))
                 .top(px(0.0))
-                .w(px(last.x + last.width - first.x))
+                .w(px(grid_width))
                 .h(px(row.height))
                 .bg(rgb(theme.table_header_background))
                 .debug_selector({
@@ -1184,15 +1190,37 @@ fn table_row_element(
                 .child("|"),
         );
     }
-    elements.push(
-        div()
-            .absolute()
-            .left(px(theme.line_horizontal_padding))
-            .right(px(theme.line_horizontal_padding))
-            .bottom(px(0.0))
-            .h(px(1.0))
-            .bg(rgb(theme.table_border)),
-    );
+    // The horizontal rule and the closing right border follow the same grid
+    // bounds as the header tint and column borders, not the body margins: a
+    // table narrower than the body must not draw rules past its last column.
+    if let Some((grid_left, grid_width)) = grid_bounds {
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + grid_left))
+                .w(px(grid_width))
+                .bottom(px(0.0))
+                .h(px(1.0))
+                .bg(rgb(theme.table_border))
+                .debug_selector({
+                    let selector = format!("table-bottom-rule-{}", line.line_id);
+                    move || selector.clone()
+                }),
+        );
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + grid_left + grid_width - 1.0))
+                .top(px(0.0))
+                .w(px(1.0))
+                .h(px(row.height))
+                .bg(rgb(theme.table_border))
+                .debug_selector({
+                    let selector = format!("table-right-border-{}", line.line_id);
+                    move || selector.clone()
+                }),
+        );
+    }
     if let Some((cursor_x, cursor_y, cursor_height)) = cursor_geometry {
         elements.push(
             div()
@@ -1416,6 +1444,30 @@ mod tests {
     use hane_markdown::BlockIndex;
     use crate::input_mode::update_keyboard_input_mode;
     use hane_presentation::Visibility;
+
+    fn grid_cell(column: usize, x: f32, width: f32) -> hane_presentation::TableCellLayout {
+        hane_presentation::TableCellLayout {
+            column,
+            visual_range: 0..0,
+            source_range: SourceRange::new(0, 0),
+            alignment: hane_markdown::TableAlignment::Default,
+            x,
+            width,
+            text_x: x,
+            fragments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn table_grid_bounds_end_at_the_last_cell_not_the_body_width() {
+        // Issue #513: a content-width table inside a wide body. Rules and the
+        // closing border must stop at the last cell's right edge.
+        let cells = [grid_cell(0, 0.0, 160.0), grid_cell(1, 160.0, 60.0)];
+        assert_eq!(table_grid_bounds(&cells), Some((0.0, 220.0)));
+        // Narrow, constrained table and a single column share the same rule.
+        assert_eq!(table_grid_bounds(&cells[1..]), Some((160.0, 60.0)));
+        assert_eq!(table_grid_bounds(&[]), None);
+    }
 
     // A single-Range fixture built via `collect`, not a `Vec`-like sequence
     // literal (clippy::single_range_in_vec_init).
