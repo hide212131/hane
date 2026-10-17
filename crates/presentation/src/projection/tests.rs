@@ -598,6 +598,45 @@ fn external_link_target_carries_destination_and_absolute_text_range() {
 }
 
 #[test]
+fn rebase_moves_link_targets_with_the_source_map() {
+    let source = "go [docs](https://example.com/)";
+    let mut line = present_markdown(
+        1,
+        Revision(1),
+        SourceRange::new(10, 10 + source.len()),
+        source,
+        26.0,
+    );
+    let delta = RevisionDelta {
+        from_revision: Revision(1),
+        to_revision: Revision(2),
+        edited_source_range_before: SourceRange::empty(0),
+        edited_source_range_after: SourceRange::new(0, 5),
+        byte_delta: 5,
+    };
+    assert!(line.rebase(&[delta], Revision(2)));
+    assert_eq!(line.links[0].source_range, SourceRange::new(19, 23));
+
+    // A delta that overlaps the link text cannot be transformed, so the
+    // cached presentation is rejected instead of keeping a stale target.
+    let mut line = present_markdown(
+        1,
+        Revision(1),
+        SourceRange::new(10, 10 + source.len()),
+        source,
+        26.0,
+    );
+    let overlapping = RevisionDelta {
+        from_revision: Revision(1),
+        to_revision: Revision(2),
+        edited_source_range_before: SourceRange::new(15, 17),
+        edited_source_range_after: SourceRange::new(15, 18),
+        byte_delta: 1,
+    };
+    assert!(!line.rebase(&[overlapping], Revision(2)));
+}
+
+#[test]
 fn phase3_presentation_hides_markers_without_changing_source() {
     let source = "## Hello **太字** and _italic_ with `code`";
     let block = present_markdown(

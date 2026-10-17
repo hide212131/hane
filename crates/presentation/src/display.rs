@@ -531,6 +531,14 @@ impl VisualLine {
                 self.disclosure = Some(rebased);
             }
         }
+        for link in &mut self.links {
+            for delta in deltas {
+                let Some(rebased) = delta.transform_range(link.source_range) else {
+                    return false;
+                };
+                link.source_range = rebased;
+            }
+        }
         if let Some(list) = &mut self.list
             && !list.rebase(deltas)
         {

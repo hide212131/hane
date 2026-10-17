@@ -602,6 +602,30 @@ fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
 }
 
 #[test]
+fn inactive_table_row_keeps_inline_and_reference_link_targets() {
+    let source = "| h | k |\n| --- | --- |\n| [a](https://e.com/) | [r][x] | `c` |\n\n[x]: https://r.com/\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let row = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::TableRow && !line.links.is_empty())
+        .expect("body row keeps its links");
+    let a = source.find("a]").expect("inline link text");
+    let r = source.find("r]").expect("reference link text");
+    assert_eq!(row.links.len(), 2);
+    assert_eq!(&*row.links[0].destination, "https://e.com/");
+    assert_eq!(row.links[0].source_range, SourceRange::new(a, a + 1));
+    assert_eq!(&*row.links[1].destination, "https://r.com/");
+    assert_eq!(row.links[1].source_range, SourceRange::new(r, r + 1));
+    // Pipes and brackets are not part of any target.
+    let pipe = source.find(") | [").expect("cell boundary") + 2;
+    assert!(row.links.iter().all(|link| !link.contains(SourceOffset(pipe))));
+}
+
+#[test]
 fn table_layout_does_not_restore_cells_for_hidden_delimiter_rows() {
     let source = "| h | short |\n| --- | --- |\n| a | x |";
     let block = present(source, None)

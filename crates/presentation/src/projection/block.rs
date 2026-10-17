@@ -313,6 +313,33 @@ pub fn present_block_with_table_projection(
             table_header,
             &table_alignments,
         );
+        // The inactive table presenter reads one row in isolation, so the
+        // openable links come from the formal projection, which resolved them
+        // against the whole document.
+        if presented.kind == BlockKind::TableRow
+            && presented.links.is_empty()
+            && let Some(row) = table_projection.and_then(|projection| {
+                projection.rows.iter().find(|row| {
+                    row.source_range.start < line.range.end
+                        && line.range.start < row.source_range.end
+                })
+            })
+        {
+            presented.links = row
+                .links
+                .iter()
+                .filter_map(|link| {
+                    let clipped = SourceRange {
+                        start: link.text_range.start.max(line.range.start),
+                        end: link.text_range.end.min(line.range.end),
+                    };
+                    (clipped.start < clipped.end).then(|| crate::LinkTarget {
+                        source_range: clipped,
+                        destination: link.destination.clone(),
+                    })
+                })
+                .collect();
+        }
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
         }

@@ -99,6 +99,15 @@ pub struct TableProjectionCell {
     pub source_range: SourceRange,
 }
 
+/// An openable external link whose text lies inside one table row. It comes
+/// from the same formal parse as the row, so reference links resolve against
+/// the whole document's definitions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjectionLink {
+    pub text_range: SourceRange,
+    pub destination: Arc<str>,
+}
+
 /// One physical table row retained by the formal source projection.
 ///
 /// The source text is the exact row slice from the parsed revision. Keeping it
@@ -111,6 +120,7 @@ pub struct TableProjectionRow {
     pub source: Arc<str>,
     pub header: bool,
     pub cells: Arc<[TableProjectionCell]>,
+    pub links: Arc<[TableProjectionLink]>,
 }
 
 /// Formal table metadata used by presentation for rows outside the current
@@ -717,11 +727,25 @@ fn build_table_projections(
                         })
                         .collect::<Vec<_>>()
                         .into();
+                    let links = parsed
+                        .links
+                        .iter()
+                        .filter(|link| {
+                            row.source_range.start <= link.text_range.start
+                                && link.text_range.end <= row.source_range.end
+                        })
+                        .map(|link| TableProjectionLink {
+                            text_range: link.text_range,
+                            destination: link.destination.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
                     Some(TableProjectionRow {
                         source_range: row.source_range,
                         source,
                         header,
                         cells,
+                        links,
                     })
                 })
                 .collect::<Vec<_>>()
