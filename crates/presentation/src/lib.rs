@@ -47,7 +47,7 @@ pub use hane_markdown::TableAlignment;
 
 pub use display::{
     BlockDisplay, BlockKind, BlockSurface, BlockTint, BlockWeight, ImagePresentation,
-    InlineDisplay, LineContext, ListAlignment, ListId, ListItemId, ListMarkerKind,
+    InlineDisplay, LineContext, LinkTarget, ListAlignment, ListId, ListItemId, ListMarkerKind,
     ListMarkerMetadata, ListOwnerMetadata, ListRowMetadata, ListRowRole,
     ListStructuralPrefixMetadata, QuoteRowMetadata, StyleKind, StyleRun, TableCellDisplay,
     TableRowDisplay, VisualBlock, VisualLine, block_is_joinable, block_line_context,

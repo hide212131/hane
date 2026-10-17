@@ -40,7 +40,8 @@ mod syntax;
 
 pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
-    PublishOutcome, TableProjection, TableProjectionCell, TableProjectionRow,
+    PublishOutcome, TableProjection, TableProjectionCell, TableProjectionLink,
+    TableProjectionRow,
 };
 pub use fence_height::FenceHeightProjection;
 pub use list_editing::{
@@ -59,7 +60,8 @@ pub use markers::{
 };
 pub use parser::parse_document;
 pub use syntax::{
-    MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment, TableParse,
+    LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,
+    TableParse, links_intersecting,
 };
 
 #[cfg(test)]
