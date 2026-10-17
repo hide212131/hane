@@ -11,7 +11,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, Prefix};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{DRIVE_FIXED, GetDriveTypeW, GetVolumeInformationW};
+use windows_sys::Win32::Storage::FileSystem::{
+    DRIVE_FIXED, GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetVolumePathNameW,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -30,21 +33,65 @@ use crate::trust::TrustPolicy;
 
 const EXE_NAME: &str = "hane.exe";
 
+/// The volume that really holds a path, including directory mount points.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Volume {
+    /// Stable `\\?\Volume{GUID}\` name of the volume; the volume identity.
+    guid: String,
     serial: u32,
     file_system: String,
     fixed: bool,
 }
 
-fn wide(text: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(text)
-        .encode_wide()
-        .chain(Some(0))
-        .collect()
+const VOLUME_BUFFER_UNITS: usize = 1024;
+
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
-fn query_volume(root: &str) -> Result<Volume> {
-    let root_w = wide(root);
+fn from_wide(buffer: &[u16]) -> String {
+    let len = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len])
+}
+
+/// Query the volume that actually contains `path` (not the drive-letter root),
+/// resolving directory mount points. Any failure is an error, never a guess.
+fn query_volume(path: &Path) -> Result<Volume> {
+    let fail = |what: &str| UpdateError::new(ErrorCode::Io, what.to_owned());
+    let path_w = wide_path(path);
+    let mut mount_root = [0_u16; VOLUME_BUFFER_UNITS];
+    // SAFETY: `path_w` is NUL-terminated and the out buffer length is passed.
+    let ok = unsafe {
+        GetVolumePathNameW(path_w.as_ptr(), mount_root.as_mut_ptr(), mount_root.len() as u32)
+    };
+    if ok == 0 {
+        return Err(fail("the install volume root could not be resolved"));
+    }
+    let mut guid_buf = [0_u16; 64];
+    // SAFETY: `mount_root` is NUL-terminated by the previous call and the out
+    // buffer length is passed.
+    let ok = unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            mount_root.as_ptr(),
+            guid_buf.as_mut_ptr(),
+            guid_buf.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(fail("the install volume identity could not be resolved"));
+    }
+    let guid = from_wide(&guid_buf);
+    if !guid.starts_with(r"\\?\Volume{") || !guid.ends_with('\\') {
+        return Err(fail("the install volume identity is not recognised"));
+    }
+    query_volume_info(&guid)
+}
+
+fn query_volume_info(guid: &str) -> Result<Volume> {
+    let root_w = std::ffi::OsStr::new(guid)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<u16>>();
     let mut serial = 0_u32;
     let mut max_component = 0_u32;
     let mut flags = 0_u32;
@@ -73,10 +120,28 @@ fn query_volume(root: &str) -> Result<Volume> {
     // SAFETY: `root_w` is a NUL-terminated wide string.
     let drive_type = unsafe { GetDriveTypeW(root_w.as_ptr()) };
     Ok(Volume {
+        guid: guid.to_owned(),
         serial,
         file_system: String::from_utf16_lossy(&fs_name[..len]),
         fixed: drive_type == DRIVE_FIXED,
     })
+}
+
+/// Install root and coordination/stage area must share one fixed NTFS volume,
+/// otherwise atomic replacement and recovery cannot be relied on.
+fn ensure_supported_volumes(install: &Volume, coordination: &Volume) -> Result<()> {
+    if install.guid != coordination.guid || install.serial != coordination.serial {
+        return Err(unsupported(
+            "the install root and its coordination area are on different volumes",
+        ));
+    }
+    if !install.fixed {
+        return Err(unsupported("only a local fixed drive is supported"));
+    }
+    if !install.file_system.eq_ignore_ascii_case("NTFS") {
+        return Err(unsupported("only NTFS is supported"));
+    }
+    Ok(())
 }
 
 /// Creation time of a process as a 64-bit FILETIME, or `None` when unreadable.
@@ -159,17 +224,12 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     let Some(Component::Prefix(prefix)) = install_dir.components().next() else {
         return Err(unsupported("the install path has no drive"));
     };
-    let letter = match prefix.kind() {
-        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => char::from(letter),
-        _ => return Err(unsupported("network and device paths are not supported")),
-    };
-    let volume = query_volume(&format!("{}:\\", letter.to_ascii_uppercase()))?;
-    if !volume.fixed {
-        return Err(unsupported("only a local fixed drive is supported"));
+    if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) {
+        return Err(unsupported("network and device paths are not supported"));
     }
-    if !volume.file_system.eq_ignore_ascii_case("NTFS") {
-        return Err(unsupported("only NTFS is supported"));
-    }
+    let volume = query_volume(&install_dir)?;
+    let coordination_volume = query_volume(&coordination_parent)?;
+    ensure_supported_volumes(&volume, &coordination_volume)?;
     let managed_files = [HELPER_FILE_NAME, INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME];
     let present = managed_files
         .iter()
@@ -194,7 +254,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     let path_text = path_text.strip_prefix(r"\\?\").unwrap_or(&path_text).to_owned();
     let install_id = InstallId::derive(&InstallFacts {
         os: "windows",
-        volume_id: &format!("{}:{:08x}", letter.to_ascii_uppercase(), volume.serial),
+        volume_id: &format!("{}:{:08x}", volume.guid, volume.serial),
         install_path: &path_text,
         owner: &owner_name()?,
     })?;
@@ -237,4 +297,61 @@ pub fn installed_helper(placement: &Placement, policy: &TrustPolicy) -> Result<H
         ));
     }
     Ok(HelperSource { path, identity })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn volume(guid: &str, serial: u32, file_system: &str, fixed: bool) -> Volume {
+        Volume {
+            guid: guid.to_owned(),
+            serial,
+            file_system: file_system.to_owned(),
+            fixed,
+        }
+    }
+
+    const SYSTEM: &str = r"\\?\Volume{11111111-1111-1111-1111-111111111111}\";
+    const MOUNTED: &str = r"\\?\Volume{22222222-2222-2222-2222-222222222222}\";
+
+    #[test]
+    fn same_fixed_ntfs_volume_is_supported() {
+        let v = volume(SYSTEM, 1, "NTFS", true);
+        assert!(ensure_supported_volumes(&v, &v.clone()).is_ok());
+    }
+
+    #[test]
+    fn mount_point_volume_that_is_fixed_ntfs_is_supported() {
+        // Install root and coordination parent both live on the volume mounted
+        // under a directory, regardless of the drive-letter volume's type.
+        let v = volume(MOUNTED, 2, "ntfs", true);
+        assert!(ensure_supported_volumes(&v, &v.clone()).is_ok());
+    }
+
+    #[test]
+    fn install_root_that_is_a_mount_point_splits_volumes() {
+        let install = volume(MOUNTED, 2, "NTFS", true);
+        let coordination = volume(SYSTEM, 1, "NTFS", true);
+        assert!(ensure_supported_volumes(&install, &coordination).is_err());
+    }
+
+    #[test]
+    fn same_serial_but_different_volume_is_rejected() {
+        let install = volume(MOUNTED, 1, "NTFS", true);
+        let coordination = volume(SYSTEM, 1, "NTFS", true);
+        assert!(ensure_supported_volumes(&install, &coordination).is_err());
+    }
+
+    #[test]
+    fn removable_mount_point_volume_is_rejected() {
+        let v = volume(MOUNTED, 2, "NTFS", false);
+        assert!(ensure_supported_volumes(&v, &v.clone()).is_err());
+    }
+
+    #[test]
+    fn non_ntfs_mount_point_volume_is_rejected() {
+        let v = volume(MOUNTED, 2, "exFAT", true);
+        assert!(ensure_supported_volumes(&v, &v.clone()).is_err());
+    }
 }
