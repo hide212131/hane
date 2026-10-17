@@ -412,16 +412,56 @@ mod windows {
         powershell(&script).is_ok_and(|output| output.status.success())
     }
 
-    fn ensure_explorer_package(exe: &Path) -> io::Result<()> {
-        if !is_windows_11() || package_installed() {
-            return Ok(());
+    #[derive(Debug, PartialEq, Eq)]
+    enum PackagePlan {
+        /// Windows 10: no MSIX package is involved.
+        NotApplicable,
+        /// Current package registered and current-version DLL present.
+        Satisfied,
+        /// Current-version DLL is missing; never report success.
+        DllMissing,
+        /// DLL present but the current package is not registered.
+        Register,
+    }
+
+    fn package_plan(is_windows_11: bool, installed: bool, dll_present: bool) -> PackagePlan {
+        if !is_windows_11 {
+            PackagePlan::NotApplicable
+        } else if !dll_present {
+            PackagePlan::DllMissing
+        } else if installed {
+            PackagePlan::Satisfied
+        } else {
+            PackagePlan::Register
         }
+    }
+
+    fn ensure_explorer_package(exe: &Path) -> io::Result<()> {
+        let win11 = is_windows_11();
+        let plan = package_plan(
+            win11,
+            win11 && package_installed(),
+            shell_extension_present(exe),
+        );
         let directory = exe.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Hane.exe のディレクトリを確認できません",
             )
         })?;
+        match plan {
+            PackagePlan::NotApplicable | PackagePlan::Satisfied => return Ok(()),
+            PackagePlan::DllMissing => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "版別の Explorer 拡張 DLL が見つかりません: {}",
+                        shell_extension_dll_path(directory, env!("CARGO_PKG_VERSION")).display()
+                    ),
+                ));
+            }
+            PackagePlan::Register => {}
+        }
         let package = directory.join("Hane.ShellIntegration.msix");
         if !package.is_file() {
             return Err(io::Error::new(
@@ -429,15 +469,6 @@ mod windows {
                 format!(
                     "Windows 11 用の署名済み Explorer 拡張が見つかりません: {}",
                     package.display()
-                ),
-            ));
-        }
-        if !shell_extension_present(exe) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "版別の Explorer 拡張 DLL が見つかりません: {}",
-                    shell_extension_dll_path(directory, env!("CARGO_PKG_VERSION")).display()
                 ),
             ));
         }
@@ -538,6 +569,16 @@ mod windows {
             assert!(shell_extension_present(&exe));
             assert!(old.is_file(), "old version DLL must coexist");
             let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn package_plan_distinguishes_registration_and_dll_states() {
+            assert_eq!(package_plan(true, true, true), PackagePlan::Satisfied);
+            assert_eq!(package_plan(true, true, false), PackagePlan::DllMissing);
+            assert_eq!(package_plan(true, false, true), PackagePlan::Register);
+            assert_eq!(package_plan(true, false, false), PackagePlan::DllMissing);
+            assert_eq!(package_plan(false, false, false), PackagePlan::NotApplicable);
+            assert_eq!(package_plan(false, false, true), PackagePlan::NotApplicable);
         }
 
         #[test]
