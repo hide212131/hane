@@ -125,7 +125,9 @@ JSONはUTF-8、256 KiB以下、重複キーを拒否する。署名は**取得�
 
 署名鍵はHane本体更新専用とし、Codex runtime catalogの鍵/署名ドメインと共用しない。署名秘密鍵はコード・ZIP・ログへ入れず、配布用secretとして保管する。鍵値をこの設計PRでは発行しない。公開鍵とmacOS Team IDは最初の更新対応版へ組み込む。ローテーションは旧鍵で署名したbridge版に新公開鍵を同梱し、移行期間は両鍵の署名を配布する。旧鍵しか知らない版を支援する間は旧署名を残す。侵害・紛失時に安全なbridgeを出せない場合は手動導入とし、ネット上の新鍵を無条件採用しない。
 
-最大sequenceの保存失敗時はcandidateをReadyにしない。Readyを適用するときもcatalogの期限・sequenceと全取得物を再検証する。期限切れの古いReleaseは、同じZIP/hashのままsequenceを増やしてmetadataを再署名できる。これは配布基盤の明示操作とし、毎日起動する新しいautomationは作らない。
+最大sequenceは配置単位のprivate receiptsへ保存し、`HANE_STATE_DIR`変更で既知のsequenceを巻き戻せないようにする。保存失敗時はcandidateをReadyにしない。Readyを適用するときもcatalogの期限・sequenceと全取得物を再検証する。期限切れの古いReleaseは、同じZIP/hashのままsequenceを増やしてmetadataを再署名できる。これは配布基盤の明示操作とし、毎日起動する新しいautomationは作らない。
+
+この信頼境界は、通信途中・Release配信データの改ざんや破損を検出するためのもの。署名秘密鍵の侵害、同じOSユーザー権限で既に任意コードを実行できる攻撃者、OS管理者による改変まで防ぐものではない。helperへの入力とjournalはこの前提でもpath/identityを検査し、任意file操作へ拡張しない。
 
 ### 5.3 通信と展開
 
@@ -153,7 +155,6 @@ API JSON上限1 MiB、署名catalog上限は前節、ZIP上限256 MiB、展開�
 
 ```text
 <Hane state root>/updates/<InstallId>/
-  seen-catalog.json             # 署名済み最大sequenceとhash
   candidates/<CandidateId>/     # download、catalog、署名、ready情報
 <配置親>/.hane-update-<InstallId>/
   startup.lock                 # 短い起動調停／helperのhandoff中保持
@@ -161,6 +162,7 @@ API JSON上限1 MiB、署名catalog上限は前節、ZIP上限256 MiB、展開�
   transaction.lock             # updater/helperのexclusive lease
   private/<TransactionId>/     # 同volumeのstage、backup、journal、現在版helper copy
   receipts/                    # 検証済み旧inventory等。private permission
+    seen-catalog.json          # 配置単位の署名済み最大sequenceとhash
 ```
 
 macOSでは`.app`外にhelper copyを置く。Windowsでも更新中の`hane-updater.exe`そのものを上書きしない。コピーは現在版の署名/所有inventoryから検証し、copy後に再検証して実行する。未検証の新版helperを適用開始前に実行しない。
@@ -243,7 +245,7 @@ MSIX更新失敗は`本体は更新しましたが、Explorer連携の更新に�
 
 ## 10. macOS適用
 
-出荷前提は、`.app`内のhelperを含めたDeveloper ID署名、Hardened Runtime、notarization、stapling、`CFBundleShortVersionString`/`CFBundleVersion`/source SHAの設定。現在版と候補のBundle ID、固定Team ID、OSの署名検証・Gatekeeper評価を確認する。署名されていない既存版は手動で`V_bootstrap`を導入する。
+出荷前提は、`.app`内の`Contents/Helpers/hane-updater`を含めたDeveloper ID署名、Hardened Runtime、notarization、stapling。Info.plistに`CFBundleShortVersionString`/`CFBundleVersion`（Cargo版）、`HaneSourceCommit`（40桁source SHA）、`HaneUpdaterProtocol`（整数1）を設定する。現在版と候補のBundle ID、固定Team ID、OSの署名検証・Gatekeeper評価を確認する。署名されていない既存版は手動で`V_bootstrap`を導入する。
 
 ZIP layout revision 1は`hane-macos-arm64/Hane.app`とREADME/LICENSEに限定する。署名後にbundleを加工しない。候補helper/実行fileも同じ署名検証でsealed bundle内にあることを確認する。カタログ署名とAppleの署名はそれぞれ検査し、一方だけで代替しない。
 
@@ -267,7 +269,7 @@ journalはschema、TransactionId、InstallId、source/destinationの署名identi
 | durable Committedあり | 新版を維持しticketを一回だけ処理。確認後の再起動で勝手に旧版へ戻さない。 |
 | backup破損、未知hash、root移動、復元不可 | `RecoveryRequired`。追加削除・旧新どちらかの推測による上書きをしない。手動の署名済みZIP導入へ案内。 |
 
-pendingを見た最初の起動は同じtransactionの現在版helper copyを検証して復旧し、必要なら独立helperの進捗/復旧画面を出す。rootにアプリが残ることを前提にし、起動可能な場所を消す設計にしない。helper入口は対話のない任意ディレクトリ置換toolにしない。
+pendingを見た最初の起動は同じtransactionの現在版helper copyを検証して復旧し、必要なら独立helperの進捗/復旧画面を出す。起動側はruntime leaseをまだ取らず、startup gateを解放してからrecovery helperへ渡し、そのhelperが順序どおりtransaction/startup/runtimeを取る。gateを保持した親がhelperのgate取得を待つdeadlockを作らない。同時に複数の復旧要求が来てもtransaction leaseを取った一つだけが操作する。rootにアプリが残ることを前提にし、起動可能な場所を消す設計にしない。helper入口は対話のない任意ディレクトリ置換toolにしない。
 
 Committed後にcandidate/backupを急いで消さず、次の正常起動を1回確認してから当該transactionの検証済み所有物だけを削除する。cleanup失敗は`cleanup_pending`として次回に再試行し、更新成功を取消さない。旧shell DLLの保留は前節に従う。journal/receipt/診断履歴は直近3transactionまで残す。未知dirやsymlinkを再帰削除しない。
 

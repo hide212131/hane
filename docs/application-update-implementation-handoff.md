@@ -44,7 +44,7 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 | U-02 | catalog raw byte署名、domain違い、改ざん、未知/旧鍵、期限・未来時計、sequence後退/同値別bytes、保存不能を拒否。 | 既知のtest鍵による正負署名fixture。実署名鍵はtestへ入れない。 |
 | U-03 | TLS/redirectのhost検査、上限、途中切断、read timeout、disk full、cancel後の遅い結果、Readyの再検証。 | fake transport/clock/容量と、実TLS取得の限定smoke。起動・設定表示だけではrequest数0。 |
 | U-04 | ZIP traversal/ADS/予約名/link/reparse/Unicode・case衝突/重複/zip bomb/余分な実行物を拒否。stage外のfile不変。 | 悪意ある小さいarchive fixtureと実filesystem試験。manifest宣言と実byte数の双方を超過させる。 |
-| U-05 | 配置移動、別owner、別InstallId、別`HANE_STATE_DIR`、開発build、memory state、readonly/network filesystemで対象を誤認しない。 | 実一時配置でidentity変更・override分離。2配置の片方の更新で他方が不変。 |
+| U-05 | 配置移動、別owner、別InstallId、別`HANE_STATE_DIR`、開発build、memory state、readonly/network filesystemで対象を誤認しない。 | 実一時配置でidentity変更・override分離。2配置の片方の更新で他方が不変。同じ配置のstate override変更で最大catalog sequenceが下がらない。 |
 | U-06 | app所有service、二重クリック、カテゴリ往復、window寿命、stale op/candidate、cancel、通常終了後のReady保持。 | service/UI state試験。再起動時はローカル検証のみ、適用は明示操作後だけ。 |
 | U-07 | ZIP→inventory→catalogの版/hash/source/署名整合、未知schema/protocol拒否、同tag ZIP不変、二target不足で公開しない。 | 発行しない配布fixture/構成テスト。実publishをtest代わりにしない。 |
 | U-08 | dirtyなnamed/untitled/work-folder draft、autosave OFF、別tab、未保存AI/Prompts、IME、Save As取消、save/rename/AI中、draft書込失敗でquit不可。 | 保存境界とUI試験。最後の打鍵、非active tab、stale DocumentInstance、freeze直前の外部openも含む。文書byte/draft/設定が失われないことを確認。 |
