@@ -3,7 +3,7 @@ use crate::workfolder::WorkFolderSortOrder;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const RECENT_LIMIT: usize = 10;
 
@@ -309,7 +309,21 @@ impl RecentFilesRepository for MemoryStateStore {
     }
 }
 
+static PINNED_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Fixes the state directory of this process to a root verified elsewhere
+/// (the update helper's limited child, which has no environment to resolve one
+/// from). It must be called before any store is opened; once pinned, neither
+/// `HANE_STATE_DIR` nor the per-user default is consulted. Returns `false` and
+/// changes nothing when a root was already pinned.
+pub fn pin_state_root(root: PathBuf) -> bool {
+    PINNED_ROOT.set(root).is_ok()
+}
+
 fn state_directory() -> io::Result<PathBuf> {
+    if let Some(root) = PINNED_ROOT.get() {
+        return Ok(root.clone());
+    }
     if let Some(path) = std::env::var_os("HANE_STATE_DIR") {
         return Ok(PathBuf::from(path));
     }

@@ -5,6 +5,8 @@
 //! transaction is being settled, or if it cannot be settled, the process never
 //! reaches normal editing.
 
+use std::path::PathBuf;
+
 use hane_update::health::{COMMIT_WAIT, ChildEntry, detect_child};
 use hane_update::startup::{GateOutcome, HelperRecoveryRunner, RuntimeGuard, startup_gate_for_exe};
 use hane_update::trust::TrustPolicy;
@@ -16,7 +18,14 @@ const EXIT_RECOVERY_REQUIRED: i32 = 70;
 pub enum Entry {
     /// Start normally. Hold the guard until the process ends: it is the
     /// shared runtime lease that tells a helper this process is still alive.
-    Start(Option<RuntimeGuard>),
+    /// `state_root` is set only for a committed update's child: the root the
+    /// updating application used and the child verified read-only, which the
+    /// normal start must use instead of resolving one from its own (empty)
+    /// environment.
+    Start {
+        guard: Option<RuntimeGuard>,
+        state_root: Option<PathBuf>,
+    },
     /// Do not start; exit the process with this status.
     Stop(i32),
 }
@@ -46,10 +55,18 @@ pub fn enter() -> Entry {
             return Entry::Stop(EXIT_RECOVERY_REQUIRED);
         }
         ChildEntry::Child(session) => {
-            // Read-only checks of the settings and the restart ticket belong
-            // in this closure; they must not write anything.
-            return match session.run(std::io::stdin(), std::io::stdout(), COMMIT_WAIT, || Ok(())) {
-                Ok(guard) => Entry::Start(Some(guard)),
+            // The read-only inspection of the state root, the settings store
+            // and the restart ticket runs before `Healthy`; it writes nothing.
+            // The root is handed on only if the helper's `Commit` arrives.
+            let state_root = session.state_root().to_path_buf();
+            let check = session.state_check();
+            return match session.run(std::io::stdin(), std::io::stdout(), COMMIT_WAIT, move || {
+                check.verify()
+            }) {
+                Ok(guard) => Entry::Start {
+                    guard: Some(guard),
+                    state_root: Some(state_root),
+                },
                 Err(err) => {
                     eprintln!("Hane could not confirm the update it was started for ({err}).");
                     Entry::Stop(EXIT_RECOVERY_REQUIRED)
@@ -61,8 +78,14 @@ pub fn enter() -> Entry {
         policy: TrustPolicy::production(),
     };
     match startup_gate_for_exe(&exe, &runner) {
-        GateOutcome::Proceed(guard) => Entry::Start(Some(guard)),
-        GateOutcome::Unmanaged => Entry::Start(None),
+        GateOutcome::Proceed(guard) => Entry::Start {
+            guard: Some(guard),
+            state_root: None,
+        },
+        GateOutcome::Unmanaged => Entry::Start {
+            guard: None,
+            state_root: None,
+        },
         GateOutcome::UpdateInProgress => {
             eprintln!("Hane is being updated. Please start it again in a moment.");
             Entry::Stop(EXIT_UPDATE_IN_PROGRESS)

@@ -918,11 +918,17 @@ impl Drop for PreparedRestart {
 /// the transaction directory, and completes the `Prepared` handshake. Nothing
 /// in the install is changed and nothing exits: on any failure the application
 /// simply stays open.
+///
+/// `state_root` is the running application's actual state root (the one its
+/// `FileStateStore` resolved, default or `HANE_STATE_DIR`). It is validated and
+/// bound to this transaction before the helper exists, and later reaches the
+/// limited child only through the private health capability.
 pub fn prepare_restart(
     placement: &crate::platform::Placement,
     policy: &crate::trust::TrustPolicy,
     candidate_id: &str,
     candidate: &CandidateSource<'_>,
+    state_root: &Path,
 ) -> Result<PreparedRestart> {
     if !valid_candidate_id(candidate_id) {
         return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed candidate id"));
@@ -932,6 +938,7 @@ pub fn prepare_restart(
     let source = crate::platform::installed_helper(placement, policy)?;
     let copy = crate::platform::stage_helper_copy(&coordination, &transaction, &source)?;
     stage_candidate(&coordination, &transaction, candidate)?;
+    crate::state_root::publish_binding(&coordination, &transaction, state_root)?;
     let spawned = spawn_helper(
         &copy,
         &HelloRequest {
@@ -941,7 +948,8 @@ pub fn prepare_restart(
             candidate_id: Some(candidate_id.to_owned()),
         },
         PREPARE_TIMEOUT,
-    )?;
+    )
+    .inspect_err(|_| crate::state_root::discard_binding(&coordination, &transaction))?;
     Ok(PreparedRestart {
         spawned: Some(spawned),
         transaction,

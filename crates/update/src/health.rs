@@ -39,6 +39,7 @@ use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
 use crate::platform::{self, acl};
 use crate::protocol::{Body, Frame, Nonce, read_frame, write_frame};
 use crate::startup::RuntimeGuard;
+use crate::state_root::{self, StateCheck};
 use crate::windows_apply::valid_candidate_id;
 
 /// How long the helper waits for `Healthy` from the limited child.
@@ -51,7 +52,7 @@ const POLL: Duration = Duration::from_millis(25);
 
 const CAPABILITY_FILE: &str = "health.capability";
 const CAPABILITY_TAKEN: &str = "health.capability.taken";
-const CAPABILITY_LIMIT: u64 = 512;
+const CAPABILITY_LIMIT: u64 = 2048;
 const MAX_VERSION_BYTES: usize = 64;
 
 fn unexpected(what: &str) -> UpdateError {
@@ -512,16 +513,25 @@ impl HealthLauncher for ProcessLauncher<'_> {
     }
 }
 
-fn spawn_limited(request: &LaunchRequest<'_>) -> Result<(Child, ChildLink, u32)> {
-    let nonce = Nonce::generate()?;
-    let capability = Capability {
+/// The capability of the child about to start. The state root comes only from
+/// the binding the real parent published in the transaction directory; without
+/// a valid one there is no capability and so no child that could be healthy.
+fn capability_for(request: &LaunchRequest<'_>, nonce: &Nonce) -> Result<Capability> {
+    let state_root = state_root::read_binding(request.coordination, request.transaction)?;
+    Ok(Capability {
         nonce: nonce.clone(),
         helper_pid: std::process::id(),
         install_id: request.coordination.install_id().clone(),
         transaction: request.transaction.clone(),
         candidate_id: request.candidate_id.to_owned(),
         version: request.version.to_owned(),
-    };
+        state_root,
+    })
+}
+
+fn spawn_limited(request: &LaunchRequest<'_>) -> Result<(Child, ChildLink, u32)> {
+    let nonce = Nonce::generate()?;
+    let capability = capability_for(request, &nonce)?;
     publish_capability(request.coordination, request.transaction, &capability)?;
     let mut child = match child_command(request.exe).spawn() {
         Ok(child) => child,
@@ -601,25 +611,37 @@ struct Capability {
     transaction: TransactionId,
     candidate_id: String,
     version: String,
+    /// The verified state root of the application that started the update.
+    state_root: PathBuf,
 }
 
 impl Capability {
     fn encode(&self) -> String {
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             self.nonce.as_str(),
             self.helper_pid,
             self.install_id.as_str(),
             self.transaction.as_str(),
             self.candidate_id,
-            self.version
+            self.version,
+            self.state_root.display()
         )
     }
 
     fn parse(text: &str) -> Result<Self> {
         let bad = || UpdateError::new(ErrorCode::IdentityMismatch, "malformed health capability");
         let mut lines = text.lines();
-        let (Some(nonce), Some(pid), Some(install), Some(txn), Some(candidate), Some(version), None) = (
+        let (
+            Some(nonce),
+            Some(pid),
+            Some(install),
+            Some(txn),
+            Some(candidate),
+            Some(version),
+            Some(root),
+            None,
+        ) = (
             lines.next(),
             lines.next(),
             lines.next(),
@@ -627,13 +649,22 @@ impl Capability {
             lines.next(),
             lines.next(),
             lines.next(),
-        ) else {
+            lines.next(),
+        )
+        else {
             return Err(bad());
         };
         if !valid_candidate_id(candidate) || version.is_empty() || version.len() > MAX_VERSION_BYTES {
             return Err(bad());
         }
+        // The filesystem is checked by the child's read-only inspection; the
+        // shape must already be sound here.
+        let root_path = PathBuf::from(root);
+        if root.is_empty() || root.len() > state_root::MAX_ROOT_BYTES || !root_path.is_absolute() {
+            return Err(bad());
+        }
         Ok(Self {
+            state_root: root_path,
             nonce: Nonce::parse(nonce)?,
             helper_pid: pid.parse().map_err(|_| bad())?,
             install_id: InstallId::parse(install)?,
@@ -796,6 +827,22 @@ fn take_capability(coordination: &Coordination, transaction: &TransactionId, exp
 impl ChildSession {
     pub fn transaction(&self) -> &TransactionId {
         &self.capability.transaction
+    }
+
+    /// The state root the helper bound to this transaction. It is trusted for
+    /// normal startup only after [`StateCheck::verify`] passed and the helper
+    /// has committed.
+    pub fn state_root(&self) -> &Path {
+        &self.capability.state_root
+    }
+
+    /// The read-only inspection to run as the `check` of [`ChildSession::run`].
+    pub fn state_check(&self) -> StateCheck {
+        StateCheck::new(
+            self.coordination.clone(),
+            self.capability.transaction.clone(),
+            self.capability.state_root.clone(),
+        )
     }
 
     /// Reports `Healthy` after `check` (read-only inspection of the settings
@@ -1184,7 +1231,36 @@ mod tests {
             transaction: fx.transaction.clone(),
             candidate_id: candidate(),
             version: "0.26.0".to_owned(),
+            state_root: fx._dir.path().join("state"),
         }
+    }
+
+    #[test]
+    fn the_capability_is_built_only_from_a_published_state_root_binding() {
+        let fx = fixture();
+        let nonce = Nonce::generate().unwrap();
+        let exe = fx._dir.path().join("hane");
+        let candidate_id = candidate();
+        let request = LaunchRequest {
+            exe: &exe,
+            version: "0.26.0",
+            candidate_id: &candidate_id,
+            coordination: &fx.coordination,
+            transaction: &fx.transaction,
+        };
+        // Nothing published: no capability, so no child that could be healthy.
+        assert!(capability_for(&request, &nonce).is_err());
+
+        let root = fx._dir.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        acl::secure_new(&root, true, 0o700).unwrap();
+        state_root::publish_binding(&fx.coordination, &fx.transaction, &root).unwrap();
+        let built = capability_for(&request, &nonce).unwrap();
+        assert_eq!(built.state_root, root);
+        assert_eq!(built.transaction, fx.transaction);
+        assert_eq!(&built.install_id, fx.coordination.install_id());
+        // The root reaches the child only through the private capability.
+        assert_eq!(Capability::parse(&built.encode()).unwrap(), built);
     }
 
     #[test]
@@ -1204,6 +1280,9 @@ mod tests {
             with(1, "pid"),
             with(4, "../escape"),
             with(5, ""),
+            with(6, ""),
+            with(6, "relative/state"),
+            lines[..6].join("\n") + "\n",
             format!("{text}extra\n"),
         ] {
             assert!(Capability::parse(&bad).is_err(), "{bad:?}");
@@ -1244,6 +1323,8 @@ mod tests {
             panic!("the helper's child must be admitted");
         };
         assert_eq!(session.transaction(), &fx.transaction);
+        // The root rides in the private capability, not in the environment.
+        assert_eq!(session.state_root(), fx._dir.path().join("state"));
         // One time only, and the child holds the shared runtime lease.
         assert!(!capability_path(&fx.coordination, &fx.transaction).exists());
         assert!(matches!(
@@ -1359,6 +1440,33 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Io);
         assert!(sent.is_empty(), "no Healthy before the check passed");
+    }
+
+    #[test]
+    fn without_a_valid_ticket_the_child_never_reports_healthy_or_starts() {
+        let wait = Duration::from_secs(2);
+        let fx = fixture();
+        let (session, _helper) = admitted(&fx);
+        let root = session.state_root().to_path_buf();
+        std::fs::create_dir_all(&root).unwrap();
+        acl::secure_new(&root, true, 0o700).unwrap();
+        state_root::publish_binding(&fx.coordination, &fx.transaction, &root).unwrap();
+
+        // Even a Commit already waiting on the pipe cannot start the child:
+        // nothing issues a restart ticket yet, so the check fails first.
+        let commit = Frame::new(
+            &session.capability.nonce,
+            Body::Commit {
+                transaction_id: fx.transaction.as_str().to_owned(),
+            },
+        );
+        let check = session.state_check();
+        let mut sent = Vec::new();
+        let err = session
+            .run(wire(&[commit]), &mut sent, wait, move || check.verify())
+            .unwrap_err();
+        assert_ne!(err.code, ErrorCode::NotApplicable, "the check, not the commit wait, refused");
+        assert!(sent.is_empty(), "no Healthy without a valid ticket");
     }
 
     #[test]

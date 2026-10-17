@@ -26,7 +26,7 @@
 - helperは45秒以内に、そのtransactionのspawnした実child（nonce、全識別子、OSが返したpid）からの`Healthy`だけを受理する。受理後に`Committed`をdurableに書き、成功した場合だけ`Commit`を送る。書込失敗ならchildへ通知せずrollbackへ進む。helperが`Commit`送信前に死んだ場合、childは同じtransactionの`Committed`がjournalにdurableに残っているときだけ続行する。
 - 起動失敗、timeout、crash、wrong/stale identity、malformed/cut IPC、health拒否ではchildのpipeを閉じ、猶予後にhelper自身のchild handleで終了させ、OSの終了確認と排他runtime leaseの再取得（解放確認）を待ってから旧fileへrollbackする。終了またはlease解放を確認できなければrollbackを始めず`RecoveryRequired`にし、更新成功として返さない。
 - この増分時点ではmacOSは`PlatformBackend::apply`が`NotApplicable`で拒否していた。increment 4でbundle swapに接続した（上記）。
-- 未実施・既知の制約: 成功後に続行するchildは空環境で起動されるため、`HANE_STATE_DIR`等の検証済みstate rootの明示的な引き渡しは別増分で扱う（再起動UIは未接続）。read-onlyの設定/ticket検査は`ChildSession::run`のcheck closureに接続する余地を残しており、現時点では検査内容を持たない。実Windowsでの二版適用証拠（U5）、設定画面の再起動UI、macOSは対象外。
+- state rootの引渡しとread-only検査（`crates/update/src/state_root.rs`）: 更新を開始する親の実際の`FileStateStore::root()`（既定rootまたは`HANE_STATE_DIR`）を、`prepare_restart`がhelper起動前にtransaction専用directoryの`state-root.binding`へ束縛する（絶対・正規化・実directory・owner/権限を検証）。helperはそれを読んでchildの一回限りhealth capabilityに入れ、childは空環境のままcapability経由でだけrootを受け取る。flag・環境変数・任意path/commandの入口は追加しない。bindingが無い・不正ならchildは起動されずrollbackへ進む。childは`Healthy`の前に`StateCheck::verify`（root再検証、binding一致、設定storeのread-only open、`restart-ticket.json`のschema・サイズ・許可field・InstallId/TransactionId/state root一致）を実行し、一つでも失敗すれば`Healthy`を送らない。`Commit`後だけ`pin_state_root`で通常起動がそのrootを使う。ticketを発行する呼び出し元はまだ無いため、この増分ではHealthyは常にfail-closedで、再起動UIは有効化しない。ticketの作成・文書復元とSettingsのrestart/shutdown接続は次増分。実Windowsでの二版適用証拠（U5）、macOSは対象外。
 
 ### Increment 2: Windows所有ファイル適用（`crates/update/src/windows_apply.rs`）
 

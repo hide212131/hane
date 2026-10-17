@@ -151,7 +151,17 @@ fn main() {
     // request: settle a pending update transaction or stop. The guard is the
     // shared runtime lease and lives until the process ends.
     let _runtime_lease = match update_gate::enter() {
-        update_gate::Entry::Start(guard) => guard,
+        update_gate::Entry::Start { guard, state_root } => {
+            // A committed update's first start uses the root the updating
+            // application verified; it never falls back to a default of its
+            // own. This runs before any store, service or window exists.
+            if let Some(root) = state_root
+                && !hane_session::pin_state_root(root)
+            {
+                std::process::exit(70);
+            }
+            guard
+        }
         update_gate::Entry::Stop(code) => std::process::exit(code),
     };
 

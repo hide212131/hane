@@ -30,13 +30,16 @@ use hane_update::{ErrorCode, UpdateError};
 use crate::app_update::{ARCHIVE_FILE, CATALOG_FILE, SIGNATURE_FILE};
 
 /// `candidate_dir` is the Ready candidate directory, which is named after
-/// `candidate_id`; any other directory is refused.
+/// `candidate_id`; any other directory is refused. `state_root` is the running
+/// application's own `FileStateStore::root()`; the new version uses exactly
+/// that root, never a default it resolves itself.
 pub fn start_helper(
     preparation: &RestartPreparation,
     placement: &Placement,
     policy: &TrustPolicy,
     candidate_id: &str,
     candidate_dir: &Path,
+    state_root: &Path,
 ) -> Result<PreparedRestart, UpdateError> {
     match preparation {
         RestartPreparation::Clear(_) => {
@@ -55,6 +58,7 @@ pub fn start_helper(
                     signature: &candidate_dir.join(SIGNATURE_FILE),
                     archive: &candidate_dir.join(ARCHIVE_FILE),
                 },
+                state_root,
             )
         }
         RestartPreparation::Blocked(_) => Err(UpdateError::new(
