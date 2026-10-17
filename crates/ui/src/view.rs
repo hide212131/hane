@@ -18890,16 +18890,17 @@ mod tests {
     /// column geometry, read from the same `BlockLayout` the renderer paints
     /// from (see `table_row_element`'s `first.x`/`last.x + last.width`),
     /// plus the row's own painted height.
-    fn header_row_grid_span(
+    fn table_row_grid_span(
         view: &gpui::Entity<EditorView>,
         cx: &mut gpui::VisualTestContext,
+        line_id: usize,
     ) -> (f32, f32, f32, f32) {
         cx.update(|_, app| {
             view.read_with(app, |editor_view, _| {
                 let (block_id, visual_line) = *editor_view
                     .line_owners
-                    .get(&0)
-                    .expect("header line owner recorded");
+                    .get(&line_id)
+                    .expect("table line owner recorded");
                 let layout = &editor_view
                     .layout_cache
                     .get(&block_id)
@@ -18909,9 +18910,9 @@ mod tests {
                     .lines
                     .iter()
                     .find(|row| row.line == visual_line)
-                    .expect("header row layout exists");
-                let first = row.table_cells.first().expect("header row has cells");
-                let last = row.table_cells.last().expect("header row has cells");
+                    .expect("table row layout exists");
+                let first = row.table_cells.first().expect("table row has cells");
+                let last = row.table_cells.last().expect("table row has cells");
                 (
                     editor_view.theme.line_horizontal_padding,
                     first.x,
@@ -18971,7 +18972,7 @@ mod tests {
         let background_bounds = cx
             .debug_bounds("table-header-background-0")
             .expect("header background painted");
-        let (padding, first_x, last_right, row_height) = header_row_grid_span(&view, cx);
+        let (padding, first_x, last_right, row_height) = table_row_grid_span(&view, cx, 0);
 
         let expected_left = f32::from(row_bounds.origin.x) + padding + first_x;
         let expected_right = f32::from(row_bounds.origin.x) + padding + last_right;
@@ -18992,6 +18993,95 @@ mod tests {
             (f32::from(background_bounds.size.height) - row_height).abs() < 0.5,
             "header background must span the row's full (possibly wrapped) height: \
              background={background_bounds:?} row_height={row_height}"
+        );
+
+        // Issue #513: the horizontal rule and the closing right border used
+        // to follow the body width, so a table narrower than the body drew
+        // them past its last column. Both must close at the same grid edges
+        // as the header tint, at the row's full (possibly wrapped) height.
+        let rule_bounds = cx
+            .debug_bounds("table-bottom-rule-0")
+            .expect("bottom rule painted");
+        let rule_left = f32::from(rule_bounds.origin.x);
+        let rule_right = rule_left + f32::from(rule_bounds.size.width);
+        assert!(
+            (rule_left - expected_left).abs() < 0.5,
+            "bottom rule must start at the first column's left border: \
+             rule={rule_bounds:?} expected_left={expected_left}"
+        );
+        assert!(
+            (rule_right - expected_right).abs() < 0.5,
+            "bottom rule must end at the last column's right border, not the \
+             body width: rule={rule_bounds:?} expected_right={expected_right}"
+        );
+        let expected_bottom = f32::from(background_bounds.origin.y) + row_height;
+        assert!(
+            (f32::from(rule_bounds.origin.y) + f32::from(rule_bounds.size.height)
+                - expected_bottom)
+                .abs()
+                < 0.5,
+            "bottom rule must sit on the row's bottom edge: \
+             rule={rule_bounds:?} expected_bottom={expected_bottom}"
+        );
+
+        let border_bounds = cx
+            .debug_bounds("table-right-border-0")
+            .expect("right border painted");
+        let border_right = f32::from(border_bounds.origin.x) + f32::from(border_bounds.size.width);
+        assert!(
+            (border_right - expected_right).abs() < 0.5,
+            "right border must close the grid at the last column's right edge: \
+             border={border_bounds:?} expected_right={expected_right}"
+        );
+        assert!(
+            (f32::from(border_bounds.origin.y) - f32::from(background_bounds.origin.y)).abs()
+                < 0.5
+                && (f32::from(border_bounds.size.height) - row_height).abs() < 0.5,
+            "right border must cover the row's full (possibly wrapped) height: \
+             border={border_bounds:?} row_height={row_height}"
+        );
+
+        // Issue #513: the table body background used to paint the whole
+        // `w_full()` row, reaching the body's left/right margins. It must
+        // cover exactly the grid, at the first data row's own position and
+        // height (line 0 is the header, line 1 the delimiter).
+        let body_line = 2;
+        let body_row_bounds = cx
+            .debug_bounds("row-2-2")
+            .expect("first data row painted");
+        let body_bounds = cx
+            .debug_bounds("table-body-background-2")
+            .expect("table body background painted");
+        let (body_padding, body_first_x, body_last_right, body_row_height) =
+            table_row_grid_span(&view, cx, body_line);
+        let body_expected_left = f32::from(body_row_bounds.origin.x) + body_padding + body_first_x;
+        let body_expected_right =
+            f32::from(body_row_bounds.origin.x) + body_padding + body_last_right;
+        let body_left = f32::from(body_bounds.origin.x);
+        let body_right = body_left + f32::from(body_bounds.size.width);
+        assert!(
+            (body_left - body_expected_left).abs() < 0.5,
+            "table body background must start at the first column's left border: \
+             body={body_bounds:?} expected_left={body_expected_left}"
+        );
+        assert!(
+            (body_right - body_expected_right).abs() < 0.5,
+            "table body background must end at the last column's right border, \
+             not the body width: body={body_bounds:?} expected_right={body_expected_right}"
+        );
+        assert!(
+            (f32::from(body_bounds.origin.y) - f32::from(body_row_bounds.origin.y)).abs() < 0.5
+                && (f32::from(body_bounds.size.height) - body_row_height).abs() < 0.5,
+            "table body background must cover the data row's own y position and \
+             full (possibly wrapped) height: body={body_bounds:?} \
+             row={body_row_bounds:?} row_height={body_row_height}"
+        );
+        assert!(
+            body_bounds.origin.x > body_row_bounds.origin.x
+                && body_bounds.origin.x + body_bounds.size.width
+                    < body_row_bounds.origin.x + body_row_bounds.size.width,
+            "table body background must not reach the row's own margins: \
+             body={body_bounds:?} row={body_row_bounds:?}"
         );
 
         if resize.is_some() {
@@ -19027,6 +19117,10 @@ mod tests {
 
     #[gpui::test]
     fn table_header_background_stays_inside_the_grid(cx: &mut gpui::TestAppContext) {
+        // A single column, so the first and last cell are the same cell and
+        // the grid is much narrower than the body.
+        assert_table_header_background_matches_grid(cx, "| a |\n| --- |\n| c |", None);
+
         // Two columns, single-line cells: the minimal grid.
         assert_table_header_background_matches_grid(
             cx,
