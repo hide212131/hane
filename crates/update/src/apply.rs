@@ -350,8 +350,65 @@ impl FsFileOps {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        durable_write(&path, bytes).map_err(UpdateError::from)
+        if rel_path.starts_with(BACKUP_PREFIX) {
+            // Transaction-owned backup area: the ordinary durable write.
+            return durable_write(&path, bytes).map_err(UpdateError::from);
+        }
+        install_write(&path, bytes)
     }
+}
+
+static INSTALL_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Writes into the install root without touching any file this call did not
+/// create. The bytes go into a uniquely named scratch directory made
+/// exclusively next to the destination (same volume), then either atomically
+/// replace an existing file or are hard-linked into place, which fails rather
+/// than overwrite a file that appeared in the meantime. Only the scratch
+/// directory and the file this call created are ever removed.
+fn install_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or_else(|| {
+        UpdateError::new(ErrorCode::Io, "install path has no parent directory")
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        UpdateError::new(ErrorCode::Io, "install path has no file name")
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = INSTALL_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = parent.join(format!(
+        ".hane-update-{}-{nanos:x}-{seq}",
+        std::process::id()
+    ));
+    // `create_dir` fails when anything already has that name; nothing is reused.
+    std::fs::create_dir(&scratch)?;
+    let temp = scratch.join(name);
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => std::fs::rename(&temp, path)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Atomic no-replace: fails with AlreadyExists if a file showed up.
+                std::fs::hard_link(&temp, path)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+        Ok(())
+    })();
+    // Remove only what this call created.
+    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_dir(&scratch);
+    result
 }
 
 impl DiskView for FsFileOps {
@@ -847,5 +904,32 @@ mod tests {
             assert_eq!(fs::read(root.join(&path)).unwrap(), data, "{path}");
         }
         assert!(!root.join("added.txt").exists());
+    }
+
+    #[test]
+    fn install_write_keeps_unknown_neighbours_and_never_overwrites_new_files() {
+        let dir = TempDir::new("apply-neighbours");
+        let root = dir.path().join("install");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.dll"), OLD_DLL).unwrap();
+        fs::write(root.join(".a.dll.tmp"), b"user temp").unwrap();
+        fs::write(root.join(".added.txt.tmp"), b"user temp 2").unwrap();
+
+        install_write(&root.join("a.dll"), NEW_DLL).unwrap();
+        install_write(&root.join("added.txt"), NEW_ADDED).unwrap();
+        assert_eq!(fs::read(root.join("a.dll")).unwrap(), NEW_DLL);
+        assert_eq!(fs::read(root.join("added.txt")).unwrap(), NEW_ADDED);
+        assert_eq!(fs::read(root.join(".a.dll.tmp")).unwrap(), b"user temp");
+        assert_eq!(fs::read(root.join(".added.txt.tmp")).unwrap(), b"user temp 2");
+
+        // A file that is not owned at the destination is replaced only through
+        // the replace path; a vanished-then-reappeared target is never clobbered
+        // by the no-replace path.
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".hane-update-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }
