@@ -156,11 +156,20 @@ impl UpdateJournal {
             if step.old.is_none() && step.new.is_none() {
                 return invalid("step changes nothing");
             }
-            if let Some(backup) = &step.backup_rel {
-                validate_rel_path(backup)?;
-            }
-            if step.old.is_some() && step.backup_rel.is_none() {
-                return invalid("step replaces a file without a backup");
+            match (&step.old, &step.backup_rel) {
+                (Some(_), Some(backup)) => {
+                    validate_rel_path(backup)?;
+                    if backup != &format!("backup/{}", step.rel_path) {
+                        return invalid("step backup is not its own backup path");
+                    }
+                }
+                (Some(_), None) => {
+                    return invalid("step replaces a file without a backup");
+                }
+                (None, Some(_)) => {
+                    return invalid("step without an old file has a backup");
+                }
+                (None, None) => {}
             }
             for id in [&step.old, &step.new].into_iter().flatten() {
                 if !is_sha256_hex(&id.sha256) {
@@ -374,7 +383,7 @@ impl DiskView for FsDiskView {
     }
 }
 
-fn identity_matches(observed: &Observed, expected: &Option<FileIdentity>) -> bool {
+pub(crate) fn identity_matches(observed: &Observed, expected: &Option<FileIdentity>) -> bool {
     match (observed, expected) {
         (Observed::Missing, None) => true,
         (Observed::File(actual), Some(wanted)) => actual == wanted,

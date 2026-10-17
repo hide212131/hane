@@ -23,6 +23,8 @@ mod app_update;
 mod https_transport;
 #[cfg(target_os = "windows")]
 mod open_request;
+mod update_gate;
+mod update_restart;
 
 #[cfg(feature = "instrument")]
 mod instrument;
@@ -45,30 +47,44 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     let exe = std::env::current_exe().ok()?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let install_dir = exe.parent()?.to_path_buf();
-    let volume = install_dir
-        .components()
-        .next()?
-        .as_os_str()
-        .to_string_lossy()
-        .into_owned();
-    let owner = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .ok()
-        .filter(|owner| !owner.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned());
-    // Interim identity until the OS adapter (a later stage) supplies the real
-    // volume and owner identity; nothing is applied from it in this stage.
-    let install_id = InstallId::derive(&InstallFacts {
-        os: std::env::consts::OS,
-        volume_id: &volume,
-        install_path: &install_dir.to_string_lossy(),
-        owner: &owner,
-    })
-    .ok()?;
+    // A supported placement supplies the real install identity, the same one
+    // the startup gate leases on, and keeps its receipts in the coordination
+    // directory beside the install. Anything else keeps the interim identity;
+    // such a placement never becomes applicable.
+    let (install_id, receipts_dir) = match hane_update::platform::locate(&exe) {
+        Ok(placement) => {
+            let receipts = hane_update::platform::lease::Coordination::receipts_dir_for(
+                &placement.coordination_parent,
+                &placement.install_id,
+            );
+            (placement.install_id, receipts)
+        }
+        Err(_) => {
+            let volume = install_dir
+                .components()
+                .next()?
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned();
+            let owner = std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .ok()
+                .filter(|owner| !owner.is_empty())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let install_id = InstallId::derive(&InstallFacts {
+                os: std::env::consts::OS,
+                volume_id: &volume,
+                install_path: &install_dir.to_string_lossy(),
+                owner: &owner,
+            })
+            .ok()?;
+            let receipts = install_dir
+                .join(install_id.coordination_dir_name())
+                .join("receipts");
+            (install_id, receipts)
+        }
+    };
     let updates_root = state.root().join("updates").join(install_id.as_str());
-    let receipts_dir = install_dir
-        .join(install_id.coordination_dir_name())
-        .join("receipts");
     Some(Arc::new(app_update::AppUpdateService::new(
         app_update::UpdateServiceConfig {
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -131,6 +147,14 @@ fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
 }
 
 fn main() {
+    // First of all, before the AI service, state stores, any window or open
+    // request: settle a pending update transaction or stop. The guard is the
+    // shared runtime lease and lives until the process ends.
+    let _runtime_lease = match update_gate::enter() {
+        update_gate::Entry::Start(guard) => guard,
+        update_gate::Entry::Stop(code) => std::process::exit(code),
+    };
+
     #[cfg(target_os = "windows")]
     if let Some(flag) = std::env::args_os().nth(1)
         && run_context_menu_flag(&flag)
