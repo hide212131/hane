@@ -10,7 +10,15 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, Prefix};
 
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{DRIVE_FIXED, GetDriveTypeW, GetVolumeInformationW};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use super::{HELPER_FILE_NAME, HelperSource, Placement, owner_name, unsupported};
 use crate::error::{ErrorCode, Result, UpdateError};
@@ -69,6 +77,59 @@ fn query_volume(root: &str) -> Result<Volume> {
         file_system: String::from_utf16_lossy(&fs_name[..len]),
         fixed: drive_type == DRIVE_FIXED,
     })
+}
+
+/// Creation time of a process as a 64-bit FILETIME, or `None` when unreadable.
+fn creation_time(process: HANDLE) -> Option<u64> {
+    let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: `process` is a live process handle with query access and every
+    // out-pointer refers to a live local FILETIME.
+    let ok = unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    (ok != 0).then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+/// The id of the process that really started this one, as the OS records it.
+/// A parent that has exited, cannot be opened, or whose id was reused by a
+/// process created *after* this one is reported as `None`, never guessed.
+pub fn parent_process_id() -> Option<u32> {
+    // SAFETY: no arguments; returns the calling process id.
+    let own = unsafe { GetCurrentProcessId() };
+    // SAFETY: a plain process snapshot; the handle is closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: PROCESSENTRY32W is plain data for which all-zero is valid.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut parent = None;
+    // SAFETY: `snapshot` is valid and `entry.dwSize` is set as documented.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while more != 0 {
+        if entry.th32ProcessID == own {
+            parent = Some(entry.th32ParentProcessID);
+            break;
+        }
+        // SAFETY: same handle and entry as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    // SAFETY: `snapshot` is a handle this function owns.
+    unsafe { CloseHandle(snapshot) };
+    let parent = parent?;
+    // SAFETY: the current-process pseudo handle needs no closing.
+    let own_created = creation_time(unsafe { GetCurrentProcess() })?;
+    // SAFETY: plain open for limited query; null means failure.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent) };
+    if handle.is_null() {
+        return None;
+    }
+    let parent_created = creation_time(handle);
+    // SAFETY: `handle` is owned by this function.
+    unsafe { CloseHandle(handle) };
+    (parent_created? <= own_created).then_some(parent)
 }
 
 fn is_regular_file(path: &Path) -> bool {

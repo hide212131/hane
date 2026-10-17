@@ -30,6 +30,7 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::identity::{InstallId, TransactionId};
 use crate::journal::{DurableJournal, FileJournalStore};
 use crate::model::Target;
+use crate::platform::acl;
 use crate::platform::lease::{Coordination, Lease, LeaseKind};
 use crate::protocol::{
     Body, Frame, Mode, Nonce, RecoveryReport, bounded_reason, read_frame, write_frame,
@@ -44,16 +45,75 @@ pub const PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_POLL: Duration = Duration::from_millis(25);
 
-/// The parent process id as the OS reports it, where `std` can report it.
+/// How long after `Prepared` an `ExitAuthorized` is still honoured.
+pub const AUTHORIZE_WINDOW: Duration = Duration::from_secs(600);
+const SESSION_NONCE_FILE: &str = "session.nonce";
+const SESSION_NONCE_TAKEN: &str = "session.nonce.taken";
+
+/// The process that really started this one, as the OS records it. `None`
+/// means it cannot be established, which the helper treats as a refusal.
 pub fn os_parent_id() -> Option<u32> {
     #[cfg(unix)]
     {
         Some(std::os::unix::process::parent_id())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::platform::windows::parent_process_id()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
+}
+
+/// Parent side: publishes the one-shot session secret for the helper copy of
+/// `transaction` in the owner-only transaction directory, before the helper is
+/// spawned. The helper adopts nothing from the wire; it only accepts this value.
+pub fn publish_session_nonce(
+    coord: &Coordination,
+    transaction: &TransactionId,
+    nonce: &Nonce,
+) -> Result<()> {
+    let dir = coord.transaction_dir(transaction);
+    let path = dir.join(SESSION_NONCE_FILE);
+    let _ = std::fs::remove_file(dir.join(SESSION_NONCE_TAKEN));
+    let _ = std::fs::remove_file(&path);
+    crate::fsutil::durable_write(&path, nonce.as_str().as_bytes())?;
+    if let Err(err) = acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false)) {
+        let _ = std::fs::remove_file(&path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Removes an unconsumed published secret (the spawn or handshake failed).
+pub fn discard_session_nonce(coord: &Coordination, transaction: &TransactionId) {
+    let dir = coord.transaction_dir(transaction);
+    let _ = std::fs::remove_file(dir.join(SESSION_NONCE_FILE));
+    let _ = std::fs::remove_file(dir.join(SESSION_NONCE_TAKEN));
+}
+
+/// Helper side: consumes the published secret exactly once. The file is first
+/// renamed away (atomic, so only one process can win it), then verified to be
+/// owner-only, read and deleted. A helper started by anything that did not get
+/// the parent's published secret, or a second launch, finds nothing and fails.
+pub fn take_session_nonce(coord: &Coordination, transaction: &TransactionId) -> Result<Nonce> {
+    let dir = coord.transaction_dir(transaction);
+    let taken = dir.join(SESSION_NONCE_TAKEN);
+    std::fs::rename(dir.join(SESSION_NONCE_FILE), &taken).map_err(|_| {
+        UpdateError::new(ErrorCode::IdentityMismatch, "no session secret was published for this helper")
+    })?;
+    let outcome = acl::verify(&taken, false).and_then(|()| {
+        let raw = crate::fsutil::read_limited(&taken, 128)?.ok_or_else(|| {
+            UpdateError::new(ErrorCode::NotFound, "the session secret vanished")
+        })?;
+        let text = String::from_utf8(raw)
+            .map_err(|_| UpdateError::new(ErrorCode::IdentityMismatch, "malformed session secret"))?;
+        Nonce::parse(&text)
+    });
+    let _ = std::fs::remove_file(&taken);
+    outcome
 }
 
 // ------------------------------------------------------------ helper side
@@ -62,25 +122,32 @@ pub fn os_parent_id() -> Option<u32> {
 pub struct HelperEnv {
     pub coordination: Coordination,
     pub transaction: TransactionId,
-    /// The OS-reported parent, when available; must equal the `Hello` pid.
-    pub parent_pid: Option<u32>,
+    /// The OS-reported parent; must equal the `Hello` pid.
+    pub parent_pid: u32,
     pub own_pid: u32,
     pub gate_timeout: Duration,
     pub parent_exit_timeout: Duration,
+    /// `ExitAuthorized` arriving later than this after `Prepared` is stale.
+    pub authorize_window: Duration,
 }
 
 impl HelperEnv {
     /// For the real helper process: identity from the executable's location.
+    /// Without a verifiable OS parent there is no session.
     pub fn from_current_process() -> Result<Self> {
         let exe = std::env::current_exe()?;
         let (coordination, transaction) = Coordination::from_helper_exe(&exe)?;
+        let parent_pid = os_parent_id().ok_or_else(|| {
+            UpdateError::new(ErrorCode::IdentityMismatch, "the parent process cannot be verified")
+        })?;
         Ok(Self {
             coordination,
             transaction,
-            parent_pid: os_parent_id(),
+            parent_pid,
             own_pid: std::process::id(),
             gate_timeout: STARTUP_GATE_TIMEOUT,
             parent_exit_timeout: PARENT_EXIT_TIMEOUT,
+            authorize_window: AUTHORIZE_WINDOW,
         })
     }
 }
@@ -143,14 +210,17 @@ pub fn run_session<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     env: &HelperEnv,
+    session_nonce: &Nonce,
     backend: &mut dyn HelperBackend,
 ) -> Result<SessionEnd> {
     let first = read_frame(reader)?.ok_or_else(|| {
         UpdateError::new(ErrorCode::Truncated, "the application closed the pipe before Hello")
     })?;
-    // The first frame fixes the session nonce; every later frame must repeat it.
-    let nonce = Nonce::parse(&first.nonce)?;
-    first.check(&nonce)?;
+    // The session nonce is the secret the real parent published before the
+    // spawn. `Hello` must present it; it never chooses it. A mismatch gets no
+    // reply at all.
+    let nonce = session_nonce;
+    first.check(nonce)?;
     let Body::Hello {
         mode,
         install_id,
@@ -175,7 +245,7 @@ pub fn run_session<R: Read, W: Write>(
             ),
         ));
     }
-    if env.parent_pid.is_some_and(|actual| actual != parent_pid) {
+    if env.parent_pid != parent_pid {
         return Err(refuse(
             writer,
             &nonce,
@@ -217,18 +287,25 @@ pub fn run_session<R: Read, W: Write>(
         ),
     )?;
 
+    let prepared_at = Instant::now();
     match mode {
         Mode::Prepare => {
             // A cut pipe or an invalid frame before authorization is an abort.
             let Ok(Some(next)) = read_frame(reader) else {
                 return Ok(SessionEnd::Aborted);
             };
-            next.check(&nonce)?;
+            next.check(nonce)?;
             match next.body {
                 Body::Abort => return Ok(SessionEnd::Aborted),
                 Body::ExitAuthorized { transaction_id: authorized }
                     if authorized == transaction_id => {}
                 _ => return Err(unexpected("frame while waiting for ExitAuthorized")),
+            }
+            if prepared_at.elapsed() >= env.authorize_window {
+                return Err(UpdateError::new(
+                    ErrorCode::Timeout,
+                    "ExitAuthorized arrived after the authorization window",
+                ));
             }
             let Some(runtime) = wait_for_parent_exit(coord, &leases, env.parent_exit_timeout)?
             else {
@@ -448,10 +525,15 @@ pub fn helper_main() -> i32 {
     let Ok(env) = HelperEnv::from_current_process() else {
         return 3;
     };
+    // Consumed before any pipe is read: a launch that is not the parent's
+    // spawn has no published secret and never gets as far as `Hello`.
+    let Ok(nonce) = take_session_nonce(&env.coordination, &env.transaction) else {
+        return 5;
+    };
     let mut backend = PlatformBackend::production();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let result = run_session(&mut stdin.lock(), &mut stdout.lock(), &env, &mut backend);
+    let result = run_session(&mut stdin.lock(), &mut stdout.lock(), &env, &nonce, &mut backend);
     match result {
         Ok(SessionEnd::Applied | SessionEnd::Recovered(_) | SessionEnd::Aborted) => 0,
         Ok(SessionEnd::ParentStillRunning) => 4,
@@ -491,6 +573,7 @@ impl<W: Write> HelperLink<W> {
         mut reader: R,
         mut writer: W,
         request: &HelloRequest,
+        nonce: Nonce,
         expected_helper_pid: Option<u32>,
         timeout: Duration,
     ) -> Result<Self> {
@@ -510,7 +593,6 @@ impl<W: Write> HelperLink<W> {
                     }
                 }
             })?;
-        let nonce = Nonce::generate()?;
         write_frame(
             &mut writer,
             &Frame::new(
@@ -655,17 +737,37 @@ fn helper_command(exe: &Path) -> Result<Command> {
 /// minimal environment, and completes the `Hello`/`Prepared` handshake. A
 /// helper that does not prepare in time is stopped; it has changed nothing.
 pub fn spawn_helper(exe: &Path, request: &HelloRequest, timeout: Duration) -> Result<SpawnedHelper> {
-    let mut child = helper_command(exe)?.spawn()?;
+    let (coordination, transaction) = Coordination::from_helper_exe(exe)?;
+    if transaction != request.transaction_id {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the helper copy belongs to another transaction",
+        ));
+    }
+    // The secret exists before the helper does, and only this process can have
+    // put it there; the helper reads it from the private directory, not from
+    // anything the first frame says.
+    let nonce = Nonce::generate()?;
+    publish_session_nonce(&coordination, &transaction, &nonce)?;
+    let mut child = match helper_command(exe).and_then(|mut command| Ok(command.spawn()?)) {
+        Ok(child) => child,
+        Err(err) => {
+            discard_session_nonce(&coordination, &transaction);
+            return Err(err);
+        }
+    };
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = child.kill();
         let _ = child.wait();
+        discard_session_nonce(&coordination, &transaction);
         return Err(UpdateError::new(ErrorCode::Io, "the helper pipes are unavailable"));
     };
-    match HelperLink::handshake(stdout, stdin, request, Some(child.id()), timeout) {
+    match HelperLink::handshake(stdout, stdin, request, nonce, Some(child.id()), timeout) {
         Ok(link) => Ok(SpawnedHelper { link, child }),
         Err(err) => {
             let _ = child.kill();
             let _ = child.wait();
+            discard_session_nonce(&coordination, &transaction);
             Err(err)
         }
     }
@@ -810,10 +912,11 @@ mod tests {
             HelperEnv {
                 coordination: self.coord.clone(),
                 transaction: self.txn.clone(),
-                parent_pid: Some(42),
+                parent_pid: 42,
                 own_pid: 4242,
                 gate_timeout: Duration::from_millis(100),
                 parent_exit_timeout: Duration::from_millis(150),
+                authorize_window: Duration::from_secs(60),
             }
         }
 
@@ -878,11 +981,26 @@ mod tests {
         frames
     }
 
-    fn run(fx: &Fixture, input: &[Frame], spy: &mut Spy) -> (Result<SessionEnd>, Vec<Frame>) {
+    /// Runs a session whose published secret is `nonce`.
+    fn run_with(
+        fx: &Fixture,
+        nonce: &Nonce,
+        input: &[Frame],
+        spy: &mut Spy,
+    ) -> (Result<SessionEnd>, Vec<Frame>) {
         let mut reader = wire(input);
         let mut output = Vec::new();
-        let result = run_session(&mut reader, &mut output, &fx.env(), spy);
+        let result = run_session(&mut reader, &mut output, &fx.env(), nonce, spy);
         (result, replies(&output))
+    }
+
+    /// The legitimate parent: the published secret is the one its frames carry.
+    fn run(fx: &Fixture, input: &[Frame], spy: &mut Spy) -> (Result<SessionEnd>, Vec<Frame>) {
+        let nonce = input
+            .first()
+            .and_then(|frame| Nonce::parse(&frame.nonce).ok())
+            .unwrap_or_else(|| Nonce::generate().unwrap());
+        run_with(fx, &nonce, input, spy)
     }
 
     /// Plays the application: holds the runtime lease until `release` runs.
@@ -1097,6 +1215,72 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NotFound);
     }
 
+    #[test]
+    fn a_hello_with_a_nonce_the_parent_never_published_is_ignored() {
+        let fx = fixture();
+        let published = Nonce::generate().unwrap();
+        let forged = Nonce::generate().unwrap();
+        let mut spy = Spy::default();
+        // Another process launched the staged helper and brought its own nonce.
+        let (result, out) = run_with(
+            &fx,
+            &published,
+            &[fx.hello(&forged, Mode::Prepare), fx.authorized(&forged)],
+            &mut spy,
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::IdentityMismatch);
+        assert!(out.is_empty(), "a forged Hello gets no reply");
+        assert_eq!(spy.applied, 0);
+        // The genuine parent still completes the handshake.
+        let (result, _) = run_with(
+            &fx,
+            &published,
+            &[fx.hello(&published, Mode::Prepare), fx.authorized(&published)],
+            &mut spy,
+        );
+        assert_eq!(result.unwrap(), SessionEnd::Applied);
+    }
+
+    #[test]
+    fn a_late_exit_authorization_is_stale() {
+        let fx = fixture();
+        let nonce = Nonce::generate().unwrap();
+        let mut env = fx.env();
+        env.authorize_window = Duration::ZERO;
+        let mut reader = wire(&[fx.hello(&nonce, Mode::Prepare), fx.authorized(&nonce)]);
+        let mut output = Vec::new();
+        let mut spy = Spy::default();
+        let result = run_session(&mut reader, &mut output, &env, &nonce, &mut spy);
+        assert_eq!(result.unwrap_err().code, ErrorCode::Timeout);
+        assert_eq!(spy.applied, 0);
+    }
+
+    #[test]
+    fn the_session_secret_is_published_by_the_parent_and_consumed_once() {
+        let fx = fixture();
+        fx.coord.ensure_helper_dir(&fx.txn).unwrap();
+        // A direct launch of the staged helper finds no published secret.
+        assert_eq!(
+            take_session_nonce(&fx.coord, &fx.txn).unwrap_err().code,
+            ErrorCode::IdentityMismatch
+        );
+        let nonce = Nonce::generate().unwrap();
+        publish_session_nonce(&fx.coord, &fx.txn, &nonce).unwrap();
+        assert_eq!(take_session_nonce(&fx.coord, &fx.txn).unwrap(), nonce);
+        // A replayed or second launch gets nothing.
+        assert!(take_session_nonce(&fx.coord, &fx.txn).is_err());
+        // An unconsumed secret can be withdrawn.
+        publish_session_nonce(&fx.coord, &fx.txn, &nonce).unwrap();
+        discard_session_nonce(&fx.coord, &fx.txn);
+        assert!(take_session_nonce(&fx.coord, &fx.txn).is_err());
+    }
+
+    #[test]
+    fn the_helper_knows_its_real_parent() {
+        // The test process was started by something, and the OS says who.
+        assert!(os_parent_id().is_some_and(|pid| pid != std::process::id()));
+    }
+
     // ------------------------------------------------ application side
 
     /// One direction of an in-memory pipe.
@@ -1174,12 +1358,15 @@ mod tests {
         let (helper_in, app_to_helper) = pipe();
         let (app_from_helper, helper_out) = pipe();
         let mut env = fx.env();
-        env.parent_pid = Some(std::process::id());
+        env.parent_pid = std::process::id();
+        let nonce = Nonce::generate().unwrap();
+        let helper_nonce = nonce.clone();
         let helper_out_for_close = helper_out.clone();
         let thread = std::thread::spawn(move || {
             let mut reader = helper_in;
             let mut writer = helper_out;
-            let result = run_session(&mut reader, &mut writer, &env, &mut Spy::default());
+            let result =
+                run_session(&mut reader, &mut writer, &env, &helper_nonce, &mut Spy::default());
             helper_out_for_close.close();
             result
         });
@@ -1193,6 +1380,7 @@ mod tests {
             app_from_helper,
             app_to_helper.clone(),
             &request,
+            nonce,
             expected_pid,
             Duration::from_secs(5),
         );
@@ -1263,6 +1451,7 @@ mod tests {
             app_from_helper,
             app_to_helper,
             &request,
+            Nonce::generate().unwrap(),
             None,
             Duration::from_millis(80),
         )
@@ -1297,6 +1486,7 @@ mod tests {
             app_from_helper_reader,
             app_to_helper,
             &request,
+            Nonce::generate().unwrap(),
             None,
             Duration::from_secs(2),
         )
