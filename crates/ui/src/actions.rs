@@ -553,6 +553,9 @@ command_actions! {
         if view.dismiss_file_tab_context_menu(cx) {
             return;
         }
+        if view.dismiss_sidebar_context_menu(cx) {
+            return;
+        }
         if view.dismiss_tab_close_confirm(cx) {
             return;
         }

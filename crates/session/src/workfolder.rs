@@ -436,6 +436,13 @@ impl WorkFolder {
         set_modified(&mut self.children, to, entry.modified, entry.modified_seq, self.sort_order);
     }
 
+    /// Follows a file this app itself just moved to the Trash, dropping its
+    /// entry from the index. A `path` the folder was not scanned with is a
+    /// no-op.
+    pub fn remove(&mut self, path: &Path) {
+        let _ = remove_file(&mut self.children, path);
+    }
+
     /// Follows a folder rename this app itself just performed: `from` moves to
     /// `to`, and every descendant path (files and subfolders alike) moves with
     /// it, keeping the same structure relative to the new parent so the tree
