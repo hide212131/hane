@@ -82,7 +82,7 @@ Backspaceは後方削除、Deleteは前方削除のGPUI内部名。Macの刻印d
 
 新規の単語・段落・ページ操作は受入済みRF3-Aの `input_target()` を使い、本文に限定する。検索入力／結果、文書内検索入力、絞り込み、rename、設定、AI popupに入力中に本文へ漏らさない。新しいguardは既存経路を利用して重複を抑える。
 
-OS標準化に伴う短い入力欄の例外として、絞り込み／renameでの文書先頭・末尾までの選択（Mac Command+Shift+↑/↓およびShift+Home/End、Windows Ctrl+Shift+Home/End）は、その欄の先頭・末尾までを選択する。Mac Shift+Home/Endによる従来の欄内選択を維持し、同じ文書端選択の入口も一行の欄では同じ意味に揃える。RF3-A仕様の「Shift付き文書端操作は処理せず終了」はこの範囲のみ更新する。欄の本文・選択方向・focusを保ち、本文エディタの文字列・選択・undo/redoには一切作用させない。非Shiftの文書端移動と本文Undo/Redoは短い欄で引き続きno-opとする。これ以外の既存の入力先別動作は維持する。
+OS標準化に伴う短い入力欄の例外として、絞り込み／renameでの文書先頭・末尾までの選択（Mac Command+Shift+↑/↓およびShift+Home/End、Windows Ctrl+Shift+Home/End）は、その欄の先頭・末尾までを選択する。Mac Shift+Home/Endによる従来の欄内選択を維持し、同じ文書端選択の入口も一行の欄では同じ意味に揃える。RF3-A仕様の「Shift付き文書端操作は処理せず終了」はこの範囲のみ更新する。欄の文字列とfocusを保ち、選択のanchorを維持する。本文エディタの文字列・選択・undo/redoには一切作用させない。非Shiftの文書端移動と本文Undo/Redoは短い欄で引き続きno-opとする。これ以外の既存の入力先別動作は維持する。
 
 日本語変換中は新しい本文操作で勝手にcommitして移動／削除しない。`Editor::dispatch()` はcompositionをcommitするため、UI入口で必要なguardを通す。既存ネイティブcallback、入力先の優先順、IMEプロトコル全体は作り直さない。
 
