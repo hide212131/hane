@@ -4,7 +4,7 @@
 採用済み設計: `docs/adr/0034-zip-application-updates.md`、`docs/application-update-implementation-spec.md`、`docs/application-update-implementation-handoff.md`
 前段の実装: [#512 U0/U1/U3](https://github.com/hide212131/hane/pull/512)
 準備時の基点: `f9da614d93158fba95b5939ffdb44c67f06b8657`（#512 head）
-状態: 実装前。ここに列挙する適用・復旧・OS検証は未実施。
+状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）をコードに追加済み。Windowsファイル置換、macOS bundle swap、限定health起動、commit/rollbackのOS adapter接続、実OSでの二版適用は未実施で、「再起動して更新」は有効化していない。
 
 ## 目的
 

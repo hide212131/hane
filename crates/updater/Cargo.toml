@@ -1,0 +1,16 @@
+[package]
+name = "hane-updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The helper has no public command line: it speaks only the private protocol
+# over the stdio pipes its parent created, and takes its identity from where it
+# is installed. All logic lives in `hane-update` so it is testable in-process.
+[[bin]]
+name = "hane-updater"
+path = "src/main.rs"
+
+[dependencies]
+hane-update.workspace = true
