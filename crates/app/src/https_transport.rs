@@ -6,12 +6,14 @@
 //! operating system's trusted roots (rustls, `ring` provider), never follows
 //! redirects (the caller validates each hop), never negotiates compression, and
 //! bounds every connect, handshake, head read and body read by the deadlines in
-//! the [`Request`]. DNS resolution uses the system resolver and cannot be
-//! interrupted by `std`; it happens before the deadline-bounded steps.
+//! the [`Request`]. DNS resolution uses the system resolver, which `std` cannot
+//! interrupt; it runs on a single helper thread that the request stops waiting
+//! for at the deadline, and no second lookup starts while it is still running.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use hane_update::download::{
@@ -25,6 +27,7 @@ const MAX_LINE_BYTES: usize = 1024;
 
 pub struct HttpsTransport {
     config: Arc<ClientConfig>,
+    dns_in_flight: Arc<AtomicBool>,
 }
 
 impl HttpsTransport {
@@ -48,6 +51,7 @@ impl HttpsTransport {
             .with_no_client_auth();
         Ok(Self {
             config: Arc::new(config),
+            dns_in_flight: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -118,12 +122,131 @@ pub(crate) fn split_https_url(url: &str) -> Result<(&str, &str), TransportError>
     Ok((host, path))
 }
 
-struct TlsStream {
-    inner: StreamOwned<ClientConnection, TcpStream>,
+/// Looks the host up with the system resolver (blocking, not interruptible).
+fn system_lookup(host: &str) -> io::Result<Vec<SocketAddr>> {
+    (host, 443u16).to_socket_addrs().map(Iterator::collect)
 }
 
-/// A readable response stream whose per-read timeout can be changed.
+/// Clears the in-flight flag when the resolver thread ends, even on panic.
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Runs `lookup` on a helper thread and waits at most `budget` for it. `std`
+/// cannot cancel a system resolver call, so at most one lookup thread exists
+/// per `in_flight` flag: while a timed-out lookup is still running, further
+/// lookups fail with a timeout instead of piling up more threads.
+fn resolve_within<F>(
+    in_flight: &Arc<AtomicBool>,
+    host: &str,
+    budget: Duration,
+    lookup: F,
+) -> Result<Vec<SocketAddr>, TransportError>
+where
+    F: FnOnce(&str) -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(failure(
+            TransportFailure::Timeout,
+            "a previous DNS lookup is still running",
+        ));
+    }
+    let guard = InFlightGuard(Arc::clone(in_flight));
+    let (sender, receiver) = mpsc::channel();
+    let host = host.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("hane-dns".to_owned())
+        .spawn(move || {
+            let result = lookup(&host);
+            drop(guard);
+            let _ = sender.send(result);
+        });
+    if let Err(error) = spawned {
+        // The closure (and its guard) was dropped, which cleared the flag.
+        return Err(failure(TransportFailure::Other, error.to_string()));
+    }
+    match receiver.recv_timeout(budget) {
+        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Err(error)) => Err(failure(TransportFailure::Disconnected, error.to_string())),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(failure(
+            TransportFailure::Timeout,
+            "DNS resolution exceeded the request deadline",
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(failure(TransportFailure::Other, "DNS resolver thread ended"))
+        }
+    }
+}
+
+/// A TCP stream whose every read and write is bounded by the time left until
+/// `limit` (and by `step` per call), so multi-step operations such as the TLS
+/// handshake or a chunked body line sequence cannot outlast one overall budget.
+struct DeadlineSocket {
+    sock: TcpStream,
+    limit: Instant,
+    step: Duration,
+}
+
+impl DeadlineSocket {
+    fn new(sock: TcpStream, limit: Instant, step: Duration) -> Self {
+        Self { sock, limit, step }
+    }
+
+    /// Starts a new overall budget of `ms` milliseconds from now.
+    fn rearm(&mut self, ms: u64) {
+        let budget = Duration::from_millis(ms.max(1));
+        self.limit = Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(60 * 60 * 24 * 365));
+        self.step = budget;
+    }
+
+    fn budget(&self) -> io::Result<Duration> {
+        match self.limit.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => Ok(left.min(self.step)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "operation deadline reached",
+            )),
+        }
+    }
+}
+
+impl Read for DeadlineSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let budget = self.budget()?;
+        self.sock.set_read_timeout(Some(budget))?;
+        self.sock.read(buf)
+    }
+}
+
+impl Write for DeadlineSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let budget = self.budget()?;
+        self.sock.set_write_timeout(Some(budget))?;
+        self.sock.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sock.flush()
+    }
+}
+
+struct TlsStream {
+    inner: StreamOwned<ClientConnection, DeadlineSocket>,
+}
+
+/// A readable response stream whose overall read budget can be reset.
 pub(crate) trait BodyStream: Read + Send {
+    /// Bounds everything read until the next call (including every internal
+    /// read of one `read_within`) to `ms` milliseconds in total.
     fn set_read_timeout_ms(&mut self, ms: u64) -> io::Result<()>;
 }
 
@@ -135,9 +258,8 @@ impl Read for TlsStream {
 
 impl BodyStream for TlsStream {
     fn set_read_timeout_ms(&mut self, ms: u64) -> io::Result<()> {
-        self.inner
-            .sock
-            .set_read_timeout(Some(Duration::from_millis(ms.max(1))))
+        self.inner.sock.rearm(ms);
+        Ok(())
     }
 }
 
@@ -354,10 +476,12 @@ impl Transport for HttpsTransport {
         let deadline = Duration::from_millis(request.deadline_ms);
         let (host, path) = split_https_url(&request.url)?;
 
-        let addresses: Vec<_> = (host, 443u16)
-            .to_socket_addrs()
-            .map_err(|error| failure(TransportFailure::Disconnected, error.to_string()))?
-            .collect();
+        let addresses = resolve_within(
+            &self.dns_in_flight,
+            host,
+            Duration::from_millis(remaining_ms(started, deadline)?),
+            system_lookup,
+        )?;
         let mut socket = None;
         let mut last_error = failure(TransportFailure::Disconnected, "no address resolved");
         for address in addresses {
@@ -372,14 +496,17 @@ impl Transport for HttpsTransport {
         }
         let socket = socket.ok_or(last_error)?;
 
-        let step_ms = |started: Instant| -> Result<u64, TransportError> {
-            Ok(remaining_ms(started, deadline)?.min(request.read_timeout_ms.max(1)))
-        };
-        let timeout = Duration::from_millis(step_ms(started)?);
-        socket
-            .set_write_timeout(Some(timeout))
-            .and_then(|()| socket.set_read_timeout(Some(timeout)))
-            .map_err(|error| map_io(&error))?;
+        // Every read and write below (TLS handshake, request write, response
+        // head) goes through this socket, which re-applies the time left until
+        // the operation deadline before each I/O call.
+        let operation_end = started
+            .checked_add(deadline)
+            .unwrap_or_else(|| started + Duration::from_secs(60 * 60 * 24 * 365));
+        let socket = DeadlineSocket::new(
+            socket,
+            operation_end,
+            Duration::from_millis(request.read_timeout_ms.max(1)),
+        );
 
         let server_name = ServerName::try_from(host.to_owned())
             .map_err(|_| failure(TransportFailure::Tls, "invalid server name"))?;
@@ -405,8 +532,6 @@ impl Transport for HttpsTransport {
         let mut raw = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            tls.set_read_timeout_ms(step_ms(started)?)
-                .map_err(|error| map_io(&error))?;
             let read = tls.read(&mut byte).map_err(|error| map_io(&error))?;
             if read == 0 {
                 return Err(failure(
@@ -546,6 +671,133 @@ mod tests {
             },
         );
         assert_eq!(drain(&mut chunked).unwrap(), b"hello world");
+    }
+
+    struct Plain(DeadlineSocket);
+
+    impl Read for Plain {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl BodyStream for Plain {
+        fn set_read_timeout_ms(&mut self, ms: u64) -> io::Result<()> {
+            self.0.rearm(ms);
+            Ok(())
+        }
+    }
+
+    /// Connects to a loopback server that sends `drip` one byte at a time,
+    /// `gap` apart, and then idles until the client goes away.
+    fn dripping_client(drip: Vec<u8>, gap: Duration) -> (TcpStream, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            for byte in drip {
+                std::thread::sleep(gap);
+                if peer.write_all(&[byte]).is_err() {
+                    return;
+                }
+            }
+            let mut sink = [0u8; 1];
+            let _ = peer.read(&mut sink);
+        });
+        (TcpStream::connect(address).unwrap(), server)
+    }
+
+    fn is_timeout(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        )
+    }
+
+    #[test]
+    fn a_dns_lookup_past_the_deadline_times_out_and_never_stacks_threads() {
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let (release, gate) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let error = resolve_within(&in_flight, "example.test", Duration::from_millis(50), move |_| {
+            let _ = gate.recv();
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, TransportFailure::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // The first lookup is still blocked: a retry must not start another.
+        let error = resolve_within(&in_flight, "example.test", Duration::from_secs(5), |_| {
+            panic!("a second resolver thread must not start")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, TransportFailure::Timeout);
+
+        drop(release);
+        let waiting = Instant::now();
+        while in_flight.load(Ordering::Acquire) {
+            assert!(waiting.elapsed() < Duration::from_secs(5), "flag never cleared");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let address: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let resolved = resolve_within(&in_flight, "example.test", Duration::from_secs(5), move |_| {
+            Ok(vec![address])
+        })
+        .unwrap();
+        assert_eq!(resolved, vec![address]);
+    }
+
+    #[test]
+    fn a_silent_peer_hits_the_overall_deadline_across_many_reads() {
+        // One byte every 40 ms keeps each single read well inside the per-call
+        // step, yet the 250 ms overall limit must still end the loop.
+        let (client, server) = dripping_client(vec![b'x'; 200], Duration::from_millis(40));
+        let mut socket = DeadlineSocket::new(
+            client,
+            Instant::now() + Duration::from_millis(250),
+            Duration::from_secs(30),
+        );
+        let started = Instant::now();
+        let mut byte = [0u8; 1];
+        let error = loop {
+            if let Err(error) = socket.read(&mut byte) {
+                break error;
+            }
+        };
+        assert!(is_timeout(&error), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_slow_drip_chunked_body_returns_within_the_read_timeout() {
+        // The chunk-size line never completes in time: 60 extension bytes at
+        // 40 ms each take far longer than the 200 ms given to read_within.
+        let mut wire = b"1;".to_vec();
+        wire.extend_from_slice(&[b'a'; 60]);
+        wire.extend_from_slice(b"\r\nZ\r\n0\r\n\r\n");
+        let (client, server) = dripping_client(wire, Duration::from_millis(40));
+        let socket = DeadlineSocket::new(
+            client,
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let mut chunked = HttpBody {
+            stream: Plain(socket),
+            framing: Framing::Chunked {
+                chunk_remaining: 0,
+                finished: false,
+            },
+        };
+        let started = Instant::now();
+        let mut buf = [0u8; 8];
+        let error = chunked.read_within(&mut buf, 200).unwrap_err();
+        assert!(is_timeout(&error), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(chunked);
+        server.join().unwrap();
     }
 
     #[test]
