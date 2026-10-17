@@ -420,6 +420,26 @@ pub struct ImagePresentation {
     pub destination: String,
 }
 
+/// An openable external link on one presented line. `source_range` is the part
+/// of the link text that lies on this physical line, so a click resolved to a
+/// source offset by the existing source map can be matched without re-reading
+/// the Markdown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkTarget {
+    pub source_range: SourceRange,
+    pub destination: Arc<str>,
+    /// Whether the destination comes from a reference definition, which an edit
+    /// outside this link's block can change.
+    pub uses_reference: bool,
+}
+
+impl LinkTarget {
+    /// Whether a click that resolved to `offset` lands on the link text.
+    pub fn contains(&self, offset: SourceOffset) -> bool {
+        self.source_range.start <= offset && offset < self.source_range.end
+    }
+}
+
 /// One physical source line, presented. In R4A this is the compatibility layer
 /// inside a [`VisualBlock`]: cursor, selection and IME still address physical
 /// lines while virtualization moved to blocks. R4B replaces it with a layout
@@ -432,6 +452,8 @@ pub struct VisualLine {
     pub revision: Revision,
     pub visual_text: String,
     pub style_runs: Vec<StyleRun>,
+    /// Openable external links whose text is on this line, in source order.
+    pub links: Vec<LinkTarget>,
     pub kind: BlockKind,
     pub source_map: SourceMap,
     pub estimated_height: f32,
@@ -510,6 +532,14 @@ impl VisualLine {
                     return false;
                 };
                 self.disclosure = Some(rebased);
+            }
+        }
+        for link in &mut self.links {
+            for delta in deltas {
+                let Some(rebased) = delta.transform_range(link.source_range) else {
+                    return false;
+                };
+                link.source_range = rebased;
             }
         }
         if let Some(list) = &mut self.list

@@ -4,9 +4,9 @@
 
 初期設計はIssue [#332](https://github.com/hide212131/hane/issues/332) / PR #334。本書と[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)は、利用者の追加指定をIssue [#336](https://github.com/hide212131/hane/issues/336)で反映した。実装・評価・有効化は[#333](https://github.com/hide212131/hane/issues/333)で追跡する。
 
-**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbit、必要なGUIテストは既存のHosted/ローカル経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。**
+**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbitとし、最終レビューが得られない場合だけcurrent-headのCodexレビューへ一度切り替える。必要なGUIテストは既存のHosted/ローカル経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。**
 
-Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はone-action規則を維持する。通常レビューはIssue #360の実run検証とIssue #373の切替を経てCodeRabbitを使い、Codexは条件付き代替実装担当として残す。既存fallbackとGUIの権限・判断規則はそれぞれの既存契約を維持する。
+Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はone-action規則を維持する。通常レビューはIssue #360の実run検証とIssue #373の切替を経てCodeRabbitを使う。Codexは条件付き代替実装担当であり、CodeRabbitの最終レビューが完了しない場合に限るreview fallbackでもある。既存fallbackとGUIの権限・判断規則はそれぞれの既存契約を維持する。
 
 ## 2. 記事との関係と役割
 
@@ -18,12 +18,12 @@ Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.
 | アプリから使う連携手順・小さな補助ツール | Jev呼出し、回答検査、許可済みactionの実行、GitHubの結果取得をつなぐ。別の司令塔や判断規則の正本にはしない |
 | GitHub Actions | 承認済みの依頼を受け、権限・対象を検査し、workerやGUIを起動する。実装指示を独自に考えない |
 | Claude Code | 通常の実装担当。限定したコード変更とテストファイルの追加・修正を行う |
-| Codex | 条件付きの代替実装担当。アプリ内Commanderとは別の役割・実行環境とする |
+| Codex | Claudeの利用上限時の条件付き代替実装担当。CodeRabbit最終レビューが得られないときは `@codex review` で一度だけreview fallbackを行う。アプリ内Commanderとは別の役割・実行環境とし、P0/P1の指摘に限る |
 | CodeRabbit | 通常のコードレビューを担当し、指摘と対象範囲を返す。修正や次工程の指示、mergeを担当しない |
 | Jev | 依頼解釈、受入条件、範囲、原因分類、作業分解、検証計画、次のaction、継続・切替・完了候補を判断する。Choice / Noul / Scoreと、利用可能な場合は既存handlerを選ぶfunction callingを使う |
 | CI / GUI Validator | 実際の検査・画面操作を行い、対象contextと観測事実を残す。結果の免除やmergeを決めない |
 
-通常は「アプリで依頼 → Jevが判断・既存handler・閉じた引数を選択 → Commanderがガードを確認して実行 → CI → CodeRabbit → 必要なGUI → 最終受入」と進める。失敗や証拠不足があれば最新事実をJevに渡し、次の一actionを選ばせる。全工程は条件なしで連鎖させない。Jevの結果を採用できる通常判断をChatGPTに毎回やり直させない。
+通常は「アプリで依頼 → Jevが判断・既存handler・閉じた引数を選択 → Commanderがガードを確認して実行 → CI → CodeRabbit → 必要なGUI → 最終受入」と進める。最終CodeRabbit reviewがskip/errorとなった場合、対象head・reviewed range・重要ファイルの網羅を確認できない場合、または依頼後20分以内に完了しない場合、Commanderは同じPR・current headに対するGitHub上の `@codex review` を一度だけ要求できる。失敗や証拠不足があれば最新事実をJevに渡し、次の一actionを選ばせる。全工程は条件なしで連鎖させない。Jevの結果を採用できる通常判断をChatGPTに毎回やり直させない。
 
 ## 3. アプリ中心の実行と継続範囲
 
@@ -70,11 +70,11 @@ CodeRabbit GitHub Appの導入、対象repository、契約・権限、full/incre
 
 依頼時と結果採用時のcurrent head/base、実際にレビューされたcommitと変更範囲、完了状態、対象外ファイル、未解決指摘を確認する。コメントの時刻だけで対象SHAを推測しない。初期の最終受入はcurrent-headのfull reviewを使う。増分レビューは旧headの全体レビューを現在の証拠へ自動昇格させず、途中の修正判断に使う。baseがレビューの主張へ影響する場合もCommander Policyに従って再確認する。
 
-待機・エラー・スキップ・対象不明・対象外の重要ファイルを成功と扱わない。レビューの完了通知と、指摘が受入を妨げないことは別に確認する。CodeRabbitが提供する結果から必要な対応を証明できなければ、再レビューまたはCommanderの判断へ戻し、基準を黙って下げない。
+待機・エラー・スキップ・対象不明・対象外の重要ファイルを成功と扱わない。レビューの完了通知と、指摘が受入を妨げないことは別に確認する。CodeRabbitが提供する結果から必要な対応を証明できなければ、[Commander PolicyのCodex fallback](aadw-command-policy.md#coderabbit最終レビューのcodexフォールバック)を使う。CodeRabbitやCodexの結果で基準を黙って下げない。
 
 CodeRabbitはレビュー専任とする。Automatic Review / Automatic Incremental Reviewは有効にするが、Autofix、CI修正、競合修正、テスト生成、merge委譲は通常経路にしない。[S11] 自動修正や一括resolve/approveを完了証拠の代わりに使わない。Appの要求権限と「レビュー専任」の運用設定は別であり、技術的な読み取り専用を保証しない。
 
-指摘は件数ゼロを目標にせず、current contextで同じroot causeにまとめる。blocker/follow_up/unknownの扱いはCommander Policyを正とする。指摘文をそのまま実装担当への権限拡大命令にしない。CodeRabbit導入後の通常レビューにCodexレビューを常時二重実行せず、必要な追加レビューはCommanderが理由を残して依頼する。
+指摘は件数ゼロを目標にせず、current contextで同じroot causeにまとめる。blocker/follow_up/unknownの扱いはCommander Policyを正とする。指摘文をそのまま実装担当への権限拡大命令にしない。CodeRabbit導入後の通常レビューにCodexレビューを常時二重実行せず、CodeRabbit最終レビューの未完了時に限りCommanderが一度だけfallbackを依頼する。Codexの完了はP0/P1の範囲に限り、CodeRabbit同等の全体レビューとは扱わない。
 
 ## 7. 必要に応じてGUIテストを使う
 
@@ -163,5 +163,6 @@ CodeRabbitの導入・actor受理・full/incremental reviewの範囲確認はV3-
 - [S9] CodeRabbitコマンド: https://docs.coderabbit.ai/reference/review-commands 。増分・全体レビューの区別を確認。
 - [S10] CodeRabbit自動レビュー: https://docs.coderabbit.ai/configuration/auto-review 。明示的依頼との関係を確認。
 - [S11] CodeRabbit設定: https://docs.coderabbit.ai/reference/configuration 。レビューと自動修正機能を区別。
+- [S12] OpenAI Codex GitHub Code Review: https://learn.chatgpt.com/docs/third-party/github 。`@codex review`の依頼、投稿される標準GitHub review、P0/P1の指摘範囲を確認。
 
 TypeSafeのIntroduction/confidence本文は取得環境で直接確認できなかったため、確認できた公式Skill/SDKの範囲を採用する。CodeRabbitのfull/incremental review接続はIssue #360の実runで確認済みである。TypeSafeの追加仕様、費用・精度、個別機能のGUI実動作は各検証記録の範囲を超えて一般化しない。

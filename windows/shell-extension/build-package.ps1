@@ -59,7 +59,17 @@ $packageVersion = "$($versionMatch.Groups[1].Value).0"
 
 # Compile as the Explorer process architecture. Package identity is distinct
 # from the legacy HKCU switches; building does not register anything.
-$dll = Join-Path $output 'hane_shell_extension.dll'
+# The DLL is placed in a per-version directory so a newer build never replaces
+# a DLL that Explorer still has loaded. Existing DLLs are never removed.
+$cargoVersion = $versionMatch.Groups[1].Value
+$dllDirectory = Join-Path (Join-Path $output 'shell-integration') $cargoVersion
+if (-not (Test-Path -LiteralPath $dllDirectory)) {
+    New-Item -ItemType Directory -Path $dllDirectory | Out-Null
+}
+$dll = Join-Path $dllDirectory 'hane_shell_extension.dll'
+if ((Test-Path -LiteralPath $dll) -and -not $Overwrite) {
+    throw "Shell extension DLL already exists: $dll (use -Overwrite to rebuild this version)"
+}
 $object = Join-Path $output 'hane_shell_extension.obj'
 $importLibrary = Join-Path $output 'hane_shell_extension.lib'
 $compile = 'call "{0}" {1} >nul && cl.exe /nologo /std:c++17 /utf-8 /EHsc /MT /LD /Fo:"{2}" "{3}" /link /DEF:"{4}" /OUT:"{5}" /IMPLIB:"{6}" shlwapi.lib shell32.lib ole32.lib advapi32.lib' -f $vsvars, $Architecture, $object, $source, $definition, $dll, $importLibrary
@@ -86,7 +96,7 @@ try {
     }
     finally { $icon.Dispose() }
     $manifest = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'AppxManifest.xml.in'))
-    $manifest = $manifest.Replace('@PUBLISHER@', [System.Security.SecurityElement]::Escape($publisher)).Replace('@VERSION@', $packageVersion)
+    $manifest = $manifest.Replace('@PUBLISHER@', [System.Security.SecurityElement]::Escape($publisher)).Replace('@VERSION@', $packageVersion).Replace('@CARGO_VERSION@', $cargoVersion)
     [System.IO.File]::WriteAllText((Join-Path $stage 'AppxManifest.xml'), $manifest, [System.Text.UTF8Encoding]::new($false))
     if ((Test-Path -LiteralPath $package) -and -not $Overwrite) {
         throw "Package already exists: $package (use -Overwrite for a package built by this script)"

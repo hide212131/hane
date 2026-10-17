@@ -41,6 +41,7 @@ impl EditorView {
     /// position once `render` installs the new zoom's heights.
     fn set_zoom_from_raw(&mut self, raw: f32, window_offset: f32, cx: &mut Context<Self>) {
         let raw = raw.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.cancel_center_caret();
         self.raw_zoom = raw;
         self.wheel_zoom_animation = None;
         let next = clamp_and_snap_zoom(raw);
@@ -203,6 +204,14 @@ impl EditorView {
     /// which can exceed `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI
     /// runner and make the decay this measures nondeterministic.
     pub(super) fn on_scroll_at(&mut self, event: &ScrollWheelEvent, now: Instant, cx: &mut Context<Self>) {
+        // A wheel or trackpad event (scroll or wheel zoom) owns the viewport
+        // from here on; an earlier "centre the caret row" must not pull it back.
+        let scroll_y = self.scroll_y;
+        let pinned = self
+            .center_window_line
+            .map(|line| (line, scroll_y))
+            .or(self.retained_center_window);
+        self.cancel_center_caret();
         if event.modifiers.secondary() {
             // A still-coasting scroll inertia must not keep advancing
             // `scroll_y` underneath a zoom gesture started from the same
@@ -217,6 +226,10 @@ impl EditorView {
             self.queue_wheel_zoom_factor(factor, window_offset, cx);
             return;
         }
+        // Keep presenting the centred block through the same window while the
+        // user scrolls near it, so its measured height (and with it the
+        // scrollable range) does not collapse under the chosen position.
+        self.retained_center_window = pinned;
         let delta = event.delta.pixel_delta(px(self.line_height()));
         let scroll_delta = -f32::from(delta.y);
         match event.delta {
@@ -453,6 +466,7 @@ impl EditorView {
         // must not keep moving the document underneath the zoom gesture
         // (issue #389).
         self.scroll_inertia = None;
+        self.cancel_center_caret();
         let factor = (1.0 + event.delta).max(0.1);
         let window_offset = f32::from(event.position.y)
             - self.theme.header_height
