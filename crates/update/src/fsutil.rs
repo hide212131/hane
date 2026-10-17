@@ -1,0 +1,199 @@
+//! Real-filesystem helpers behind the seams used by the core.
+//!
+//! Durability here is "write temp, fsync, rename, fsync parent directory" as
+//! far as `std` exposes it. Behaviour across a real power loss on Windows or
+//! macOS is NOT verified by this crate; recovery therefore always reconciles
+//! the journal with the actual on-disk identity (see `journal`).
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+use crate::download::PartStore;
+use crate::error::{ErrorCode, Result, UpdateError};
+use crate::limits::MAX_JOURNAL_BYTES;
+use crate::paths::validate_component;
+use crate::trust::{SeenCatalog, SeenStore};
+use crate::util::{hex_encode, parse_strict, sha256_context};
+
+#[cfg(unix)]
+fn private_options(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn private_options(_options: &mut OpenOptions) {}
+
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        // Directories cannot be opened for flushing through std on Windows.
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Atomically replaces `path` with `bytes` via a sibling temp file.
+pub fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let temp = parent.join(format!(".{name}.tmp"));
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    private_options(&mut options);
+    let mut file = options.open(&temp)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    sync_directory(parent)
+}
+
+/// Reads at most `limit` bytes; larger files are an error, not truncated.
+pub fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut data = Vec::new();
+    file.take(limit + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Err(UpdateError::new(
+            ErrorCode::LimitExceeded,
+            format!("{} exceeds {limit} bytes", path.display()),
+        ));
+    }
+    Ok(Some(data))
+}
+
+/// SHA-256 and size of a regular file, never following a symlink.
+pub fn hash_regular_file(path: &Path) -> Result<Option<(u64, String)>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if !meta.is_file() {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut file = File::open(path)?;
+    let mut context = sha256_context();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        context.update(&buffer[..n]);
+    }
+    Ok(Some((size, hex_encode(context.finish().as_ref()))))
+}
+
+/// Downloads into `<final_name>.part` inside a private directory and renames
+/// it to `<final_name>` only when complete.
+pub struct DirPartStore {
+    part: PathBuf,
+    complete: PathBuf,
+}
+
+impl DirPartStore {
+    pub fn new(dir: &Path, final_name: &str) -> Result<Self> {
+        validate_component(final_name, final_name)?;
+        Ok(Self {
+            part: dir.join(format!("{final_name}.part")),
+            complete: dir.join(final_name),
+        })
+    }
+
+    pub fn complete_path(&self) -> &Path {
+        &self.complete
+    }
+}
+
+impl PartStore for DirPartStore {
+    fn begin_part(&mut self) -> io::Result<Box<dyn Write>> {
+        match fs::remove_file(&self.part) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        private_options(&mut options);
+        Ok(Box::new(options.open(&self.part)?))
+    }
+
+    fn commit_part(&mut self) -> io::Result<()> {
+        OpenOptions::new().write(true).open(&self.part)?.sync_all()?;
+        if fs::symlink_metadata(&self.complete).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "candidate archive already exists",
+            ));
+        }
+        fs::rename(&self.part, &self.complete)?;
+        if let Some(parent) = self.complete.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn discard_part(&mut self) {
+        let _ = fs::remove_file(&self.part);
+    }
+}
+
+/// File-backed sequence floor (`receipts/seen-catalog.json`).
+pub struct FileSeenStore {
+    path: PathBuf,
+}
+
+impl FileSeenStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl SeenStore for FileSeenStore {
+    fn load(&self) -> Result<Option<SeenCatalog>> {
+        let Some(bytes) = read_limited(&self.path, MAX_JOURNAL_BYTES)? else {
+            return Ok(None);
+        };
+        let seen: SeenCatalog = parse_strict(&bytes)?;
+        seen.validate()?;
+        Ok(Some(seen))
+    }
+
+    fn store(&mut self, seen: &SeenCatalog) -> Result<()> {
+        let bytes = serde_json::to_vec(seen)
+            .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
+        durable_write(&self.path, &bytes).map_err(UpdateError::from)
+    }
+}

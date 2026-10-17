@@ -3146,6 +3146,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hane-update"
+version = "0.26.0"
+dependencies = [
+ "base64",
+ "flate2",
+ "ring",
+ "semver",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "harfrust"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
