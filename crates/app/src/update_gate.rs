@@ -75,6 +75,18 @@ fn gate_with_open_retry(
     }
 }
 
+/// Whether this launch may carry a document to open. On macOS, LaunchServices
+/// delivers Finder documents through `on_open_urls` rather than argv, and only
+/// once the application runs, which is after this gate. Such a launch cannot be
+/// told apart from an ordinary one, so every macOS launch waits out an update in
+/// progress: the pending Finder event stays with the OS until the gate admits
+/// normal startup and is then queued by the callback registered before `run`
+/// and opened once through the normal open flow. The gate itself is never
+/// bypassed, and `RecoveryRequired` still stops the launch.
+fn may_carry_open_request(has_cli_path: bool) -> bool {
+    has_cli_path || cfg!(target_os = "macos")
+}
+
 pub fn enter() -> Entry {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -121,7 +133,7 @@ pub fn enter() -> Entry {
     // An explicit file argument must not be lost to an update in progress: keep
     // taking the gate (never bypassing it) and let this process deliver the path
     // through the ordinary open path once the gate admits it.
-    let has_explicit_open = std::env::args_os().nth(1).is_some();
+    let has_explicit_open = may_carry_open_request(std::env::args_os().nth(1).is_some());
     let started = std::time::Instant::now();
     let outcome = gate_with_open_retry(
         |wait| startup_gate_for_exe_within(&exe, &runner, wait),
@@ -191,6 +203,44 @@ mod tests {
         assert!(matches!(outcome, GateOutcome::Unmanaged));
         assert_eq!(admitted, 1, "the launch (and its path) is admitted exactly once");
         assert_eq!(sleeps, 3);
+    }
+
+    #[test]
+    fn a_launch_that_may_receive_a_finder_open_waits_for_the_update() {
+        assert!(may_carry_open_request(true));
+        assert_eq!(may_carry_open_request(false), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn a_finder_open_before_update_completion_is_opened_once_after_admission() {
+        let queue = hane_ui::SharedExternalOpenQueue::new();
+        // The event is queued while the update is still in progress.
+        queue.push(PathBuf::from("/notes/a.md"));
+        let mut opened = Vec::new();
+        let mut inner = scripted(2);
+        let outcome = gate_with_open_retry(
+            |wait| {
+                let outcome = inner(wait);
+                if matches!(outcome, GateOutcome::UpdateInProgress) {
+                    // Nothing opens before the gate admits normal editing.
+                    assert!(opened.is_empty());
+                }
+                outcome
+            },
+            true,
+            Duration::from_secs(60),
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        for _ in 0..2 {
+            queue.drain_into(|path| {
+                opened.push(path.to_path_buf());
+                hane_ui::ExternalOpenOutcome::Accepted
+            });
+        }
+        assert_eq!(opened, vec![PathBuf::from("/notes/a.md")]);
+        assert!(queue.is_empty());
     }
 
     #[test]
