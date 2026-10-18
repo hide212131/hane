@@ -38,6 +38,17 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Flushes the file at `path` and its parent directory entry, so a rename that
+/// produced `path` survives a power loss. Directory flushing is a no-op where
+/// `std` cannot open directories (Windows); there only the file is flushed.
+pub(crate) fn sync_renamed_file(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    OpenOptions::new().write(true).open(path)?.sync_all()?;
+    sync_directory(parent)
+}
+
 /// Moves the already-flushed `temp` over `dest`.
 ///
 /// Windows cannot rely on a rename to replace an existing destination, so an

@@ -27,7 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::fsutil::{durable_write, read_limited};
+use crate::fsutil::{durable_write, read_limited, sync_renamed_file};
 use crate::identity::{InstallId, TransactionId};
 use crate::journal::{FileJournalStore, JournalStore, Phase};
 use crate::platform::acl;
@@ -563,6 +563,18 @@ impl TicketRestore {
     /// damaged ticket can never make the same ticket apply twice. `Ok(None)`
     /// means there was nothing (left) to restore.
     pub fn take(&self) -> Result<Option<RestartTicket>> {
+        self.take_with(sync_renamed_file)
+    }
+
+    /// [`Self::take`] with the durability barrier of the claim rename as a
+    /// seam. The ticket is returned only after `barrier` confirmed the claim
+    /// is durable. If it fails, the rename is undone (best effort) and the
+    /// error is returned, so the ticket is neither handed out nor lost to a
+    /// rename that may or may not survive a power loss.
+    pub(crate) fn take_with(
+        &self,
+        barrier: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<Option<RestartTicket>> {
         if !self.committed_durably() {
             return Err(UpdateError::new(
                 ErrorCode::NotApplicable,
@@ -577,10 +589,16 @@ impl TicketRestore {
         if fs::symlink_metadata(&claimed).is_ok() {
             return Ok(None);
         }
-        match fs::rename(ticket_path(&self.coordination, &self.transaction), &claimed) {
+        let ticket = ticket_path(&self.coordination, &self.transaction);
+        match fs::rename(&ticket, &claimed) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
+        }
+        if let Err(err) = barrier(&claimed) {
+            // Not durable: do not treat the claim as made.
+            let _ = fs::rename(&claimed, &ticket);
+            return Err(err.into());
         }
         let bytes = read_private(&claimed, TICKET_LIMIT, "the claimed restart ticket")?;
         let ticket: RestartTicket = parse_strict(&bytes)?;
@@ -1169,6 +1187,48 @@ mod tests {
         assert_eq!(taken, fx.ticket());
         // A second start (or a restart after a crash) restores nothing again.
         assert!(restore(&fx).take().unwrap().is_none());
+        assert!(restore(&fx).take().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_claim_that_is_not_durable_is_never_handed_out() {
+        let fx = fixture();
+        fx.ready();
+        journal_at(&fx, Phase::Committed);
+
+        let mut barrier_ran = false;
+        let failed = restore(&fx).take_with(|claimed| {
+            barrier_ran = true;
+            // The rename is visible, but the barrier has not confirmed it.
+            assert!(claimed.exists());
+            Err(std::io::Error::other("sync failed"))
+        });
+        assert!(barrier_ran);
+        assert!(failed.is_err(), "take must not succeed before the claim is durable");
+        // The ticket is back and unclaimed, so a restart can retry once.
+        assert!(restore(&fx).has_unclaimed_ticket());
+
+        let taken = restore(&fx).take().unwrap().expect("retry after the failed barrier");
+        assert_eq!(taken, fx.ticket());
+        // Handed out exactly once.
+        assert!(restore(&fx).take().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_ticket_is_returned_only_after_the_barrier_confirmed_the_claim() {
+        let fx = fixture();
+        fx.ready();
+        journal_at(&fx, Phase::Committed);
+        let mut calls = 0;
+        let taken = restore(&fx)
+            .take_with(|claimed| {
+                calls += 1;
+                assert!(claimed.exists());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(taken, Some(fx.ticket()));
         assert!(restore(&fx).take().unwrap().is_none());
     }
 
