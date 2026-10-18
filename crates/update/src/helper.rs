@@ -987,10 +987,43 @@ impl PreparedRestart {
         if let Some(mut spawned) = self.spawned.take() {
             spawned.link.abort();
             // Only a confirmed exit allows the cleanup; a helper that may
-            // still be running keeps its transaction directory.
-            if spawned.child.wait().is_ok() {
+            // still be running keeps its transaction directory (and journal)
+            // for recovery. The wait is bounded because this runs on the UI
+            // thread and a hung helper must not freeze the application.
+            if confirm_child_exit(&mut spawned.child, ABORT_EXIT_GRACE, ABORT_KILL_WAIT) {
                 discard_unstarted_transaction(&self.coordination, &self.transaction);
             }
+        }
+    }
+}
+
+/// How long an aborted helper may take to exit by itself.
+const ABORT_EXIT_GRACE: Duration = Duration::from_secs(2);
+/// How long to wait for the exit after the helper was killed.
+const ABORT_KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// Waits at most `grace` for `child` to exit, then kills it and waits at most
+/// `kill_wait` more. Returns whether the exit was confirmed.
+fn confirm_child_exit(child: &mut Child, grace: Duration, kill_wait: Duration) -> bool {
+    fn wait_bounded(child: &mut Child, limit: Duration) -> Option<bool> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Some(true),
+                Ok(None) => {}
+                Err(_) => return Some(false),
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(RUNTIME_POLL);
+        }
+    }
+    match wait_bounded(child, grace) {
+        Some(confirmed) => confirmed,
+        None => {
+            let _ = child.kill();
+            wait_bounded(child, kill_wait).unwrap_or(false)
         }
     }
 }
@@ -1701,6 +1734,43 @@ mod tests {
         .unwrap();
         assert_eq!(err.code, ErrorCode::IdentityMismatch);
         helper_out.close();
+    }
+
+    /// A helper that ignores `Abort` must not block the caller forever: it is
+    /// killed after the grace period and its exit is confirmed.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_helper_is_killed_after_a_bounded_wait() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let started = Instant::now();
+        assert!(confirm_child_exit(
+            &mut child,
+            Duration::from_millis(100),
+            Duration::from_secs(5)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    /// A helper whose exit cannot be confirmed keeps its transaction: the
+    /// cleanup in `abort_in_place` runs only when this returns `true`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unconfirmed_exit_is_reported_and_never_waits_forever() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        // No time to confirm even after the kill: the answer is "unknown".
+        let confirmed = confirm_child_exit(&mut child, Duration::ZERO, Duration::ZERO);
+        // The kill signal may or may not have been reaped yet, but it returns.
+        let _ = confirmed;
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let mut exited = Command::new("true").spawn().unwrap();
+        assert!(confirm_child_exit(
+            &mut exited,
+            Duration::from_secs(5),
+            Duration::from_secs(1)
+        ));
     }
 
     /// Stages a file inside the transaction's helper directory.
