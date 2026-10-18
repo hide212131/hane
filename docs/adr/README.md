@@ -15,7 +15,8 @@
 |---|---|
 | [ADR-0025](0025-shared-parse-for-multiline-inline-presentation.md) | 複数行 inline presentation の revision-bound shared parse と projection の統一 |
 | [ADR-0030](0030-gpui-kit-incremental-local-adoption.md) | gpui-kit / gpui-base の段階的・局所的採用方針 |
-| [ADR-0032](0032-embedded-codex-app-server-ai-foundation.md) | HaneにCodex App Serverを同梱し、ChatGPT/CodexのOAuthとCustom ProviderのAPI keyを切り替えるAI連携基盤。設計案を記録し、実装・実機検証は未実施 |
+| [ADR-0032](0032-embedded-codex-app-server-ai-foundation.md) | ChatGPT/CodexのOAuthとCustom Providerを切り替えるAI連携基盤。§4.1の同梱決定は[ADR-0033](0033-managed-codex-runtime-and-extensions.md)で初回ダウンロードへ改訂 |
+| [ADR-0033](0033-managed-codex-runtime-and-extensions.md) | 固定版Codexの初回ダウンロード・専用管理・検証済み更新と、専用SKILL.md/スキルPackageの段階的対応。P0は[#480](https://github.com/hide212131/hane/issues/480) / [PR #485](https://github.com/hide212131/hane/pull/485)で完了。P1〜P3は[#479](https://github.com/hide212131/hane/issues/479)で追跡 |
 | [ADR-0034](0034-zip-application-updates.md) | ZIP配布を継続した設定画面からのアプリ本体更新。署名カタログ、保存と再起動、OS別適用と復旧の設計案。未実装 |
 
 ## Accepted design / implementation pending
@@ -44,7 +45,7 @@
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
 | [ADR-0024](0024-local-gui-validation.md) | GUI 検証を独立した観測手段とし、ローカル CLI と trusted hosted entrypoint を使う trust boundary（AADW orchestration は ADR-0031 で改訂） |
 | [ADR-0029](0029-source-first-list-editing.md) | Markdown source を唯一の Model とする list editing と同期 ListEditProjection |
-| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | アプリ中心のAADW v3。Actions経由のClaude優先・条件付きCodex、CodeRabbit通常レビュー、Jevの意味判断、必要時GUI検証 |
+| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | アプリ中心のAADW v3。Actions経由のClaude優先・条件付きCodex、CodeRabbit通常レビューと最終レビュー時の限定Codex fallback、Jevの意味判断、必要時GUI検証 |
 
 ## Superseded / amended
 

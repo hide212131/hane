@@ -518,12 +518,14 @@ impl EditorView {
     /// the work folder index so it appears in the sidebar without waiting
     /// for the next full rescan.
     fn apply_pending_title_sync(&mut self, id: SessionId, path: &Path) {
-        let Some(title) = self.title_sync_pending.remove(&id) else {
-            return;
-        };
-        if let Some(session) = self.sessions.get_mut(id) {
+        if let Some(title) = self.title_sync_pending.remove(&id)
+            && let Some(session) = self.sessions.get_mut(id)
+        {
             session.note_auto_named(title);
         }
+        // Every landed write is indexed, not only a title-sync first write:
+        // a Save As into the work folder lands a path the tree has never
+        // seen. `insert` ignores already-indexed and out-of-folder paths.
         if let Some(folder) = self.work_folder.as_mut() {
             folder.insert(path.to_path_buf());
         }
@@ -790,8 +792,17 @@ impl EditorView {
     }
 
     pub(crate) fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
-        let session = self.sessions.active();
-        let id = session.id();
+        self.prompt_save_as_for(self.sessions.active_id(), cx);
+    }
+
+    /// Opens the native Save As dialog for the session `id`, which need not be
+    /// the active one (a sidebar row's menu targets the row, not the tab). The
+    /// answer is applied through `handle_save_as_response`, bound to this
+    /// session's instance.
+    pub(super) fn prompt_save_as_for(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
         let directory = session
             .file()
             .directory()
@@ -987,6 +998,62 @@ mod tests {
                 "the stale rename completion must not clear a close-and-save request armed \
                  for the replacement document"
             );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #236: a Save As into the work folder must reach the sidebar index
+    // without waiting for a full rescan, for an already-saved document
+    // (`Saved`) and for one with newer edits pending (`SavedStale`) alike.
+    #[gpui::test]
+    fn save_as_into_the_work_folder_indexes_the_destination_without_a_rescan(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("save-as-index");
+        std::fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("Old.md");
+        std::fs::write(&old_path, "body\n").unwrap();
+        let loaded = OsFileService.load(&old_path).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _cx| {
+            view.work_folder = Some(work_folder);
+        });
+
+        let saved_path = root.join("Saved.md");
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.save_session(id, SaveIntent::To(saved_path.clone()), cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _cx| {
+            let folder = view.work_folder.as_ref().unwrap();
+            assert!(folder.entry_for_path(&saved_path).is_some());
+            assert!(folder.entry_for_path(&old_path).is_some());
+        });
+
+        // Edit while a Save As is in flight so the write lands as `SavedStale`.
+        let stale_path = root.join("Stale.md");
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.save_session(id, SaveIntent::To(stale_path.clone()), cx);
+            let _ = view.sessions.active_mut().editor_mut().insert_text("more\n");
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _cx| {
+            let folder = view.work_folder.as_ref().unwrap();
+            assert!(folder.entry_for_path(&stale_path).is_some());
         });
 
         std::fs::remove_dir_all(&root).unwrap();

@@ -137,6 +137,23 @@ pub struct TableParse {
     pub alignments: Arc<[TableAlignment]>,
 }
 
+/// An openable Markdown link: an inline or reference link whose destination is
+/// an absolute HTTP(S) URL. Only these are kept, so a consumer never has to
+/// re-judge the scheme; images, relative paths, `file:` and other schemes never
+/// appear here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkParse {
+    pub node: NodeId,
+    /// Source range of the link text (first to last child), excluding the
+    /// brackets and the destination part.
+    pub text_range: SourceRange,
+    pub destination: Arc<str>,
+    /// Whether the destination comes from a link reference definition (full,
+    /// collapsed or shortcut reference) rather than from the link itself, so
+    /// an edit to a definition elsewhere can change it.
+    pub uses_reference: bool,
+}
+
 /// Block/inline node tree for one parsed source slice: parent/child structure,
 /// document order, and a source range on every node.
 ///
@@ -227,6 +244,22 @@ impl MarkdownTree {
     }
 }
 
+/// The contiguous run of `links` whose text range intersects `range`.
+///
+/// `links` is in document order and link text never nests or overlaps, so
+/// both starts and ends are sorted; two binary searches bound the run without
+/// visiting links outside it. A link ending exactly at `range.start` or
+/// starting exactly at `range.end` does not intersect.
+pub fn links_intersecting(links: &[LinkParse], range: SourceRange) -> &[LinkParse] {
+    let first = links.partition_point(|link| link.text_range.end <= range.start);
+    let last = links.partition_point(|link| link.text_range.start < range.end);
+    if first < last {
+        &links[first..last]
+    } else {
+        &[]
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownParse {
     pub revision: Revision,
@@ -234,6 +267,8 @@ pub struct MarkdownParse {
     pub tree: MarkdownTree,
     /// Alignment metadata for each parsed table node, keyed by its tree node.
     pub table_parses: Vec<TableParse>,
+    /// Openable external links in document order, keyed by their tree node.
+    pub links: Vec<LinkParse>,
     /// Sorted, non-overlapping source ranges of the syntactic markers (heading
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.

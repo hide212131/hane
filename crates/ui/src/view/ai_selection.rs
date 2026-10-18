@@ -508,6 +508,13 @@ impl EditorView {
         self.ai_selection.open
     }
 
+    /// The text the open popup was started on, for tests that click the real
+    /// footer button and check what it captured.
+    #[cfg(test)]
+    pub(crate) fn ai_selection_original_text_for_test(&self) -> &str {
+        &self.ai_selection.original_text
+    }
+
     pub(crate) fn ai_selection_should_leave_on_escape(&self) -> bool {
         self.ai_selection.open && !self.ai_selection.escape_was_composing
     }

@@ -14,6 +14,6 @@ Hane repositoryでIssue実現やClaude実装を依頼されたときに使う。
 - 設計用PRを無断で実装用に転用しない。Claudeには設計のURLだけでなく、対象branchから読めるパスと必要な受入条件を渡す。
 - `@claude` と `AADW_COMMANDER_HANDOFF_V3` を含む依頼は、実装用PRのConversationへ一度だけ投稿する。投稿前にcurrent exact head、same-repository/open状態、依頼者のwrite権限を確認する。
 - コメント投稿やrun生成だけで受理済みとしない。`prepare`成功を受理の証拠にし、`skipped`や失敗は未開始として原因を確認する。Claude起動、Sonnet 5.5使用、patch/finalizer、current-head検証はそれぞれ別に確認する。
-- 原因診断は実装依頼と分ける。`usage_or_rate_limit`以外の失敗をCodex fallbackへ送らず、通常workerの保護パス制限を緩めない。
+- 原因診断は実装依頼と分ける。`usage_or_rate_limit`以外の失敗をCodexの実装fallbackへ送らず、通常workerの保護パス制限を緩めない。CodeRabbit最終reviewの未完了時に限るCodexのreview fallbackは、[Commander Policy](../../../docs/aadw-command-policy.md#coderabbit最終レビューのcodexフォールバック)に従い、実装fallbackと混同しない。
 
 Issue/PRの状態は証拠を添えて日本語で区別する。設計文書やDraft PRを作っただけで実装完了と報告しない。

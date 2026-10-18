@@ -36,6 +36,7 @@ pub use find::{
     MAX_QUERY_BYTES, NavigationStep, matches_in_range, scan as find_scan,
 };
 pub use ime::{ImeCancelOutcome, ImeState, utf16_range_to_byte};
+pub use movement::ForwardStop;
 pub use selection::Selection;
 
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
@@ -92,6 +93,21 @@ pub enum EditorCommand<'a> {
     MoveToEnd { extend: bool },
     MoveToLineStart { extend: bool },
     MoveToLineEnd { extend: bool },
+    /// Moves by word. `stop` only matters going forward.
+    MoveWord {
+        forward: bool,
+        stop: ForwardStop,
+        extend: bool,
+    },
+    /// Moves by source-line paragraph (LF/CRLF/CR separated), not by Markdown block.
+    MoveParagraph {
+        forward: bool,
+        stop: ForwardStop,
+        extend: bool,
+    },
+    /// Deletes the selection, or up to the word boundary the matching
+    /// [`EditorCommand::MoveWord`] reaches, as one undo step.
+    DeleteWord { forward: bool, stop: ForwardStop },
     SelectAll,
     Undo,
     Redo,
@@ -237,6 +253,25 @@ impl Editor {
             EditorCommand::MoveToLineEnd { extend } => {
                 self.move_to_line_boundary(true, extend)?;
                 None
+            }
+            EditorCommand::MoveWord {
+                forward,
+                stop,
+                extend,
+            } => {
+                self.move_word(forward, stop, extend)?;
+                None
+            }
+            EditorCommand::MoveParagraph {
+                forward,
+                stop,
+                extend,
+            } => {
+                self.move_paragraph(forward, stop, extend)?;
+                None
+            }
+            EditorCommand::DeleteWord { forward, stop } => {
+                self.delete_word(forward, stop, received)?
             }
             EditorCommand::SelectAll => {
                 self.selection = Selection {

@@ -27,6 +27,16 @@ Windows版は [最新のGitHub Release](https://github.com/hide212131/hane/relea
 
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
+### macOS Finder から Markdown を開く
+
+`Hane.app` は `.md` を扱える文書タイプとして登録されており、Finder で `.md` を右クリックして「このアプリケーションで開く」から Hane を選べます。Hane が起動していなくても、起動中でも開けます。未保存の編集がある場合は、既存の保存確認を通らずに内容が置き換わることはありません。
+
+Hane は既定のアプリを自動では変更しません。`.md` をダブルクリックで Hane で開きたい場合は、次の手順で設定します。
+
+1. Finder で `.md` ファイルを選び、「ファイル」メニューの「情報を見る」（`⌘I`）を開きます。
+2. 「このアプリケーションで開く」で `Hane` を選びます。
+3. 同じ種類のすべての書類に適用するには「すべてを変更…」を押します。
+
 ### Windows CLI / Explorer 統合
 
 ```text
@@ -88,9 +98,16 @@ cargo run --release -p hane
 
 | 操作 | macOS | Windows / Linux |
 | --- | --- | --- |
-| カーソル移動 | 矢印キー / Home / End | 矢印キー / Home / End |
+| カーソル移動 | 矢印キー | 矢印キー |
 | 選択 | Shift + 矢印キー | Shift + 矢印キー |
-| 文頭・文末へ移動 | Command + ↑ / ↓ | Ctrl + Home / End（Ctrl + ↑ / ↓ も可） |
+| 行頭・行末へ移動 / 選択 | Command + ← / →、Shift 付きで選択 | Home / End、Shift 付きで選択 |
+| 文書の先頭・末尾へ移動 / 選択 | Command + ↑ / ↓、Shift 付きで選択（Shift + Home / End でも選択） | Ctrl + Home / End、Shift 付きで選択 |
+| 単語単位で移動 / 選択 | Option + ← / →、Shift 付きで選択 | Ctrl + ← / →、Shift 付きで選択 |
+| 前・後の単語を削除 | Option + delete / Option + Fn + delete（前方削除キー） | Ctrl + Backspace / Delete |
+| 段落単位で移動 / 選択 | Option + ↑ / ↓、Shift 付きで選択 | Ctrl + ↑ / ↓、Shift 付きで選択 |
+| 1 画面分カーソルを移動 | Option + PageUp / PageDown | PageUp / PageDown（Shift 付きで選択） |
+| 画面だけをスクロール（カーソル・選択は動かさない） | Home / End（文書の先頭・末尾）、PageUp / PageDown（1 画面分） | なし |
+| カーソル行を画面の中央に表示 | Control + L | なし |
 | 全選択 | Command + A | Ctrl + A |
 | コピー / 切り取り / 貼り付け | Command + C / X / V | Ctrl + C / X / V |
 | 元に戻す / やり直す | Command + Z / Command + Shift + Z | Ctrl + Z / Ctrl + Y（Ctrl + Shift + Z も可） |
@@ -99,6 +116,12 @@ cargo run --release -p hane
 | Work folder の本文を検索 | Command + Shift + F | Ctrl + Shift + F |
 | 保存 / 名前を付けて保存 | Command + S / Command + Shift + S | Ctrl + S / Ctrl + Shift + S |
 | 自動保存の切り替え | Command + Option + A | Ctrl + Alt + A |
+
+行・段落は、画面幅による折り返しではなく、改行で区切られた原文の行を単位にします（Markdown の空行で区切るブロックではありません）。単語は Unicode の単語境界に従い、日本語の辞書による分かち書きはしません。OS 標準のテキスト欄との完全な互換は目指していません。前方への単語移動は、Windows では次の単語の先頭、macOS では単語の末尾に止まります。後方への単語移動は、どちらの OS でも語頭へ進みます。
+
+Emacs 風の Control + 英字（Control + A / E / B / F / K / Y など）は割り当てていません。必要な場合は Karabiner-Elements（macOS）や Keyhac（Windows）などでキー配列を変更してください。
+
+選択した文章への AI 指示は、フッターの「AIに指示」ボタン（macOS / Windows 共通）から開けます。Windows では Alt + I も使えます（Hane 固有のキーで、OS 標準の編集キーではありません）。
 
 テーマや自動保存は、ヘッダーの設定からも変更できます。
 
