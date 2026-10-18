@@ -1268,12 +1268,13 @@ mod tests {
         }
     }
 
-    /// Never reached: committing a healthy child touches no file.
+    /// Committing a healthy child only observes the journaled files, which
+    /// already hold their signed new identity; nothing is ever written.
     struct NoFiles;
 
     impl crate::journal::DiskView for NoFiles {
         fn observe(&self, _: &str) -> Result<crate::journal::Observed> {
-            Err(UpdateError::new(ErrorCode::Io, "unused"))
+            Ok(crate::journal::Observed::File(FileIdentity::of(b"new")))
         }
     }
 
