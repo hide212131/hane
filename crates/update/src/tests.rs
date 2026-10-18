@@ -2415,6 +2415,57 @@ fn unknown_content_or_damaged_backups_stop_recovery_without_guessing() {
 }
 
 #[test]
+fn a_stop_between_move_aside_and_link_in_restores_the_backup() {
+    // Windows displaces the verified file before linking the new one in. A stop
+    // in between leaves the pathname absent; the verified backup restores it.
+    let world = world();
+    let last = world.plan.steps.len() - 1;
+    let step = &world.plan.steps[last];
+    assert_eq!(step.rel_path, "hane.exe");
+    let backup = step.backup_rel.clone().unwrap();
+    for phase in [Phase::Applying, Phase::AwaitingHealth, Phase::RollingBack] {
+        let mut journal = journal(&world);
+        journal.phase = phase;
+        journal.steps[last].state = StepState::Intent;
+        let mut disk = world.old_disk();
+        disk.remove("hane.exe");
+        let RecoveryDecision::RollBack { actions, .. } = decide(&world, &journal, &disk) else {
+            panic!("a missing file with an intact backup must roll back ({phase:?})");
+        };
+        assert_eq!(
+            actions,
+            vec![RollbackAction::RestoreFromBackup {
+                rel_path: "hane.exe".to_string(),
+                backup_rel: backup.clone(),
+                restore: step.old.clone().unwrap(),
+                expected_current: None,
+            }]
+        );
+
+        // A missing or damaged backup is never guessed at.
+        for damage in [None, Some(&b"damaged"[..])] {
+            let mut broken = disk.clone();
+            match damage {
+                None => broken.remove(&backup),
+                Some(bytes) => broken.set(&backup, bytes),
+            }
+            assert!(matches!(
+                decide(&world, &journal, &broken),
+                RecoveryDecision::RecoveryRequired(_)
+            ));
+        }
+
+        // Third-party content at the path is still protected.
+        let mut foreign = disk.clone();
+        foreign.set("hane.exe", b"neither old nor new");
+        assert!(matches!(
+            decide(&world, &journal, &foreign),
+            RecoveryDecision::RecoveryRequired(_)
+        ));
+    }
+}
+
+#[test]
 fn a_durable_commit_is_kept_and_never_rolled_back_by_guesswork() {
     let world = world();
     let mut disk = world.old_disk();

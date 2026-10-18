@@ -513,6 +513,24 @@ pub fn decide_recovery(
                 match classify(step, disk)? {
                     StepDisk::Old => {}
                     StepDisk::Unknown => {
+                        // Windows replaces a verified file in two steps (move the
+                        // verified file aside, then link the new one in). A stop
+                        // between them leaves the pathname absent while the
+                        // verified backup still holds the old content. Absence
+                        // is the only extra state accepted; any other content is
+                        // a third party's and stops recovery.
+                        if let (Some(old), Some(backup_rel)) = (&step.old, &step.backup_rel)
+                            && disk.observe(&step.rel_path)? == Observed::Missing
+                            && disk.observe(backup_rel)? == Observed::File(old.clone())
+                        {
+                            actions.push(RollbackAction::RestoreFromBackup {
+                                rel_path: step.rel_path.clone(),
+                                backup_rel: backup_rel.clone(),
+                                restore: old.clone(),
+                                expected_current: None,
+                            });
+                            continue;
+                        }
                         return Ok(required(format!(
                             "{} matches neither the old nor the new content",
                             step.rel_path
