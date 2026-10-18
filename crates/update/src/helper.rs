@@ -1408,11 +1408,33 @@ mod tests {
         fx: &Fixture,
         nonce: &Nonce,
     ) -> (Result<SessionEnd>, Vec<Frame>, Spy) {
+        run_recover_retrying(fx, nonce, false)
+    }
+
+    /// Like `run_recover_settled`, but for a call made after the fixture has
+    /// dropped its own runtime lease: a `Blocked` verdict can then only be the
+    /// same transient duplicate on the runtime lock, so it is retried too.
+    fn run_recover_after_release(
+        fx: &Fixture,
+        nonce: &Nonce,
+    ) -> (Result<SessionEnd>, Vec<Frame>, Spy) {
+        run_recover_retrying(fx, nonce, true)
+    }
+
+    fn run_recover_retrying(
+        fx: &Fixture,
+        nonce: &Nonce,
+        retry_blocked: bool,
+    ) -> (Result<SessionEnd>, Vec<Frame>, Spy) {
         let started = Instant::now();
         loop {
             let mut spy = Spy::default();
             let (result, out) = run(fx, &[fx.hello(nonce, Mode::Recover)], &mut spy);
-            let transient = matches!(&result, Err(err) if err.code == ErrorCode::StaleJournal);
+            let transient = match &result {
+                Err(err) => err.code == ErrorCode::StaleJournal,
+                Ok(SessionEnd::Recovered(RecoveryReport::Blocked(_))) => retry_blocked,
+                Ok(_) => false,
+            };
             if !transient || started.elapsed() >= Duration::from_secs(10) {
                 return (result, out, spy);
             }
@@ -1434,7 +1456,7 @@ mod tests {
             assert_eq!(spy.recovered, 0);
             assert!(matches!(out[1].body, Body::Recovered { .. }));
         }
-        let (result, _, spy) = run_recover_settled(&fx, &nonce);
+        let (result, _, spy) = run_recover_after_release(&fx, &nonce);
         assert_eq!(
             result.unwrap(),
             SessionEnd::Recovered(RecoveryReport::KeptOld)
@@ -1666,7 +1688,20 @@ mod tests {
         to_helper.close();
         let _ = thread.join().unwrap();
 
-        let (link, thread, to_helper) = connect(&fx, Mode::Prepare, Some(4242));
+        // Another test's child spawn can briefly duplicate this fixture's
+        // transaction lock descriptor, so a refusal with StaleJournal is
+        // retried; any other outcome is used as is.
+        let started = Instant::now();
+        let (link, thread, to_helper) = loop {
+            let (link, thread, to_helper) = connect(&fx, Mode::Prepare, Some(4242));
+            let transient = matches!(&link, Err(err) if err.code == ErrorCode::StaleJournal);
+            if !transient || started.elapsed() >= Duration::from_secs(10) {
+                break (link, thread, to_helper);
+            }
+            to_helper.close();
+            let _ = thread.join();
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let mut link = link.unwrap();
         assert_eq!(link.helper_pid(), 4242);
         link.authorize_exit().unwrap();
