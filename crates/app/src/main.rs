@@ -63,22 +63,30 @@ impl AiOwner {
 /// out keeps counting as in flight until the service is really gone, so a new
 /// service is never started next to a worker that may still hold the owner lock.
 struct ServiceSlot<S> {
-    service: std::sync::Mutex<Option<S>>,
+    service: Arc<std::sync::Mutex<Option<S>>>,
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// A resume asked for while a stop was still in flight. The stop thread
+    /// runs it once, right after the old service is really gone.
+    pending_start: Arc<std::sync::Mutex<Option<PendingStart<S>>>>,
+}
+
+type PendingStart<S> = Box<dyn FnOnce() -> Option<S> + Send>;
+
+fn lock_ignoring_poison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl<S: Send + 'static> ServiceSlot<S> {
     fn new(service: Option<S>) -> Self {
         Self {
-            service: std::sync::Mutex::new(service),
+            service: Arc::new(std::sync::Mutex::new(service)),
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_start: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Option<S>> {
-        self.service
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_ignoring_poison(&self.service)
     }
 
     fn stop(&self, timeout: std::time::Duration) -> Result<(), String> {
@@ -96,11 +104,24 @@ impl<S: Send + 'static> ServiceSlot<S> {
         // runtime; do it on its own thread so the wait is bounded.
         let (done, finished) = std::sync::mpsc::channel();
         let stopping = Arc::clone(&self.stopping);
+        let shared_slot = Arc::clone(&self.service);
+        let pending_start = Arc::clone(&self.pending_start);
         let spawned = std::thread::Builder::new()
             .name("hane-ai-stop".to_owned())
             .spawn(move || {
                 drop(service);
+                // Under the slot lock, so a concurrent `resume` either sees the
+                // stop as in flight (and leaves its start pending) or sees it
+                // finished; the pending start then runs exactly once.
+                let mut slot = lock_ignoring_poison(&shared_slot);
                 stopping.store(false, Ordering::SeqCst);
+                let pending = lock_ignoring_poison(&pending_start).take();
+                if let Some(start) = pending
+                    && slot.is_none()
+                {
+                    *slot = start();
+                }
+                drop(slot);
                 let _ = done.send(());
             });
         if let Err(err) = spawned {
@@ -113,16 +134,22 @@ impl<S: Send + 'static> ServiceSlot<S> {
             .map_err(|_| "the AI service did not stop in time".to_owned())
     }
 
-    /// Starts a service only when none exists and no stop is in flight; an
-    /// unfinished stop leaves the AI unavailable instead of starting a second one.
+    /// Starts a service only when none exists and no stop is in flight. An
+    /// unfinished stop never gets a second service next to it: the start is
+    /// kept and run once by the stop thread when the old service is gone, and
+    /// a later `resume` then returns the handle of that service.
     fn resume<H>(
         &self,
-        start: impl FnOnce() -> Option<S>,
+        start: impl FnOnce() -> Option<S> + Send + 'static,
         handle: impl Fn(&S) -> H,
     ) -> Option<H> {
         use std::sync::atomic::Ordering;
         let mut slot = self.slot();
         if self.stopping.load(Ordering::SeqCst) {
+            let mut pending = lock_ignoring_poison(&self.pending_start);
+            if pending.is_none() {
+                *pending = Some(Box::new(start));
+            }
             return None;
         }
         if slot.is_none() {
@@ -766,6 +793,42 @@ mod service_slot_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(resumed.is_some());
+        assert_eq!(*starts.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_resume_kept_during_a_slow_stop_starts_once_after_the_stop_completes() {
+        let (service, release) = blocking();
+        let slot = ServiceSlot::new(Some(service));
+        // A stop past its timeout, as when the 10s limit is exceeded.
+        assert!(slot.stop(Duration::from_millis(20)).is_err());
+
+        let starts = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&starts);
+        assert!(
+            slot.resume(
+                move || {
+                    *counter.lock().unwrap() += 1;
+                    Some(Blocking(None))
+                },
+                |_| (),
+            )
+            .is_none()
+        );
+        assert_eq!(*starts.lock().unwrap(), 0, "no second service while stopping");
+
+        release.send(()).unwrap();
+        let mut resumed = None;
+        for _ in 0..200 {
+            resumed = slot.resume(|| panic!("the pending start must be the only one"), |_| ());
+            if resumed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(resumed.is_some(), "the AI must not stay unavailable");
+        assert_eq!(*starts.lock().unwrap(), 1);
+        assert!(slot.resume(|| panic!("already running"), |_| ()).is_some());
         assert_eq!(*starts.lock().unwrap(), 1);
     }
 

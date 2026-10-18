@@ -921,6 +921,9 @@ const RESTART_STALE_MESSAGE: &str =
 /// How long the AI service may take to stop before the restart is given up.
 pub(crate) const AI_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many 200ms polls wait for a stop that outlived [`AI_STOP_TIMEOUT`].
+const AI_RESUME_POLL_LIMIT: usize = 300;
+
 /// The steps of the final exit coordination, behind a seam so the order and
 /// every failure path can be tested without a window or a helper process.
 pub(crate) trait ExitSteps {
@@ -1042,8 +1045,29 @@ impl ExitSteps for ViewExit<'_, '_> {
         // service that cannot be started leaves the AI features unavailable
         // until the next launch, but the editor itself is unaffected.
         let handle = self.ai.as_ref().and_then(|ai| ai.resume());
+        let still_stopping = handle.is_none();
         self.view.attach_ai_service(handle, self.cx);
         self.ai_stopped = false;
+        if still_stopping && let Some(ai) = self.ai.clone() {
+            // The old service is still stopping, so the owner keeps the start
+            // pending and runs it once the stop completes. Wait for that and
+            // attach the new handle instead of leaving the AI detached.
+            self.cx
+                .spawn(async move |view, cx| {
+                    for _ in 0..AI_RESUME_POLL_LIMIT {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(200))
+                            .await;
+                        if let Some(handle) = ai.resume() {
+                            let _ = view.update(cx, |view, cx| {
+                                view.attach_ai_service(Some(handle), cx);
+                            });
+                            return;
+                        }
+                    }
+                })
+                .detach();
+        }
     }
 }
 
