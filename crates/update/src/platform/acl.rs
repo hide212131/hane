@@ -105,8 +105,7 @@ mod macos_acl {
 
     unsafe extern "C" {
         fn acl_get_link_np(path: *const libc::c_char, acl_type: c_int) -> *mut c_void;
-        fn acl_set_link_np(path: *const libc::c_char, acl_type: c_int, acl: *mut c_void) -> c_int;
-        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_delete_link_np(path: *const libc::c_char, acl_type: c_int) -> c_int;
         fn acl_free(obj: *mut c_void) -> c_int;
     }
 
@@ -141,17 +140,8 @@ mod macos_acl {
 
         fn clear(&self, path: &Path) -> Result<()> {
             let name = c_path(path)?;
-            // SAFETY: an empty ACL is allocated, applied and freed once.
-            let rc = unsafe {
-                let empty = acl_init(0);
-                if empty.is_null() {
-                    -1
-                } else {
-                    let rc = acl_set_link_np(name.as_ptr(), ACL_TYPE_EXTENDED, empty);
-                    acl_free(empty);
-                    rc
-                }
-            };
+            // SAFETY: `name` is NUL-terminated; the call does not follow links.
+            let rc = unsafe { acl_delete_link_np(name.as_ptr(), ACL_TYPE_EXTENDED) };
             if rc != 0 {
                 return Err(refuse(format!(
                     "the extended ACL of {} could not be removed: {}",
@@ -200,9 +190,10 @@ mod imp {
     }
 
     pub fn secure_new(path: &Path, _is_dir: bool, mode: u32) -> Result<()> {
-        strip_acl(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-        Ok(())
+        // Removed and read back after the mode is set, so nothing remains
+        // when this returns.
+        strip_acl(path)
     }
 
     pub fn verify(path: &Path, is_dir: bool) -> Result<()> {
@@ -513,10 +504,8 @@ mod imp {
     }
 }
 
-// The fake below exercises the fail-closed logic on every OS. Real inherited
-// ACLs (`acl_get_link_np` / `acl_set_link_np`) can only be exercised on a
-// physical macOS host, e.g. `chmod +a "everyone allow write,file_inherit,
-// directory_inherit"` on the parent before creating the tree.
+// The fake below exercises the fail-closed logic on every OS. The macOS
+// module at the end uses real ACLs (`chmod +a`, `acl_delete_link_np`).
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -606,5 +595,61 @@ mod tests {
         let mut fake = Fake::new(false);
         fake.fail_present = true;
         assert!(is_refusal(require_no_extended_acl(&fake, Path::new("x"))));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod real_acl {
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+
+        use super::super::{ExtendedAcl, imp, macos_acl::System};
+
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hane-acl-{name}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn add_acl(path: &Path) {
+            let status = Command::new("/bin/chmod")
+                .arg("+a")
+                .arg("everyone allow write,delete")
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "chmod +a failed");
+        }
+
+        #[test]
+        fn real_acl_is_removed_from_new_entry() {
+            let dir = scratch("new");
+            let file = dir.join("entry");
+            std::fs::write(&file, b"").unwrap();
+            add_acl(&file);
+            assert!(System.present(&file).unwrap());
+            imp::secure_new(&file, false, 0o600).unwrap();
+            assert!(!System.present(&file).unwrap());
+            imp::verify(&file, false).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn real_acl_on_existing_entry_is_refused() {
+            let dir = scratch("existing");
+            let file = dir.join("entry");
+            std::fs::write(&file, b"").unwrap();
+            std::fs::set_permissions(
+                &file,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .unwrap();
+            add_acl(&file);
+            assert!(imp::verify(&file, false).is_err());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }
