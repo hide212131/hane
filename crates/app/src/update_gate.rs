@@ -85,9 +85,23 @@ fn gate_with_open_retry(
 /// The retry budget for a launch that may carry an open request. A macOS launch
 /// may receive a Finder document that LaunchServices delivers only once, so it
 /// has no time limit and ends only on a terminal gate outcome; a launch with
-/// just a command-line path keeps the bounded wait.
+/// just a command-line path keeps the bounded wait on Linux. A Windows launch
+/// with a command-line path is likewise unbounded: the one-shot request is held
+/// until the gate reaches a terminal outcome instead of expiring after 60s.
 fn open_request_wait(has_cli_path: bool) -> Option<std::time::Duration> {
-    if cfg!(target_os = "macos") || !has_cli_path {
+    open_request_wait_for(
+        has_cli_path,
+        cfg!(target_os = "macos"),
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn open_request_wait_for(
+    has_cli_path: bool,
+    is_macos: bool,
+    is_windows: bool,
+) -> Option<std::time::Duration> {
+    if is_macos || (is_windows && has_cli_path) || !has_cli_path {
         None
     } else {
         Some(EXPLICIT_OPEN_WAIT)
@@ -354,13 +368,72 @@ mod tests {
     }
 
     #[test]
-    fn only_a_macos_launch_is_unbounded() {
+    fn only_macos_and_windows_cli_launches_are_unbounded() {
         assert_eq!(open_request_wait(false), None);
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
             assert_eq!(open_request_wait(true), None);
         } else {
             assert_eq!(open_request_wait(true), Some(EXPLICIT_OPEN_WAIT));
         }
+        // Linux CLI stays bounded; macOS and Windows CLI are unbounded.
+        assert_eq!(
+            open_request_wait_for(true, false, false),
+            Some(EXPLICIT_OPEN_WAIT)
+        );
+        assert_eq!(open_request_wait_for(true, true, false), None);
+        assert_eq!(open_request_wait_for(true, false, true), None);
+        assert_eq!(open_request_wait_for(false, true, false), None);
+    }
+
+    #[test]
+    fn a_windows_cli_open_outlives_the_old_60s_limit_and_is_handed_over_once() {
+        let wait = open_request_wait_for(true, false, true);
+        assert_eq!(wait, None);
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let mut admitted = 0;
+        let mut opened = Vec::new();
+        let outcome = gate_with_open_retry(
+            |attempt| {
+                clock.set(clock.get() + attempt);
+                if clock.get() <= Duration::from_secs(120) {
+                    GateOutcome::UpdateInProgress
+                } else {
+                    admitted += 1;
+                    GateOutcome::Unmanaged
+                }
+            },
+            true,
+            wait,
+            |d| clock.set(clock.get() + d),
+            || clock.get(),
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert_eq!(admitted, 1);
+        assert!(clock.get() > Duration::from_secs(60));
+        // Only after admission is the path passed to the normal open flow, once.
+        if matches!(outcome, GateOutcome::Unmanaged) {
+            opened.push(PathBuf::from("C:\\notes\\a.md"));
+        }
+        assert_eq!(opened, vec![PathBuf::from("C:\\notes\\a.md")]);
+    }
+
+    #[test]
+    fn a_linux_cli_open_stays_bounded() {
+        let wait = open_request_wait_for(true, false, false);
+        assert_eq!(wait, Some(EXPLICIT_OPEN_WAIT));
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let outcome = gate_with_open_retry(
+            |attempt| {
+                clock.set(clock.get() + attempt);
+                GateOutcome::UpdateInProgress
+            },
+            true,
+            wait,
+            |d| clock.set(clock.get() + d),
+            || clock.get(),
+        );
+        assert!(matches!(outcome, GateOutcome::UpdateInProgress));
+        assert!(clock.get() <= Duration::from_secs(60));
     }
 
     #[test]
