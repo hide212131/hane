@@ -39,6 +39,22 @@ pub struct InstallFacts<'a> {
     pub owner: &'a str,
 }
 
+/// The text of a placement path as it enters an [`InstallId`].
+///
+/// Valid Unicode paths are used unchanged, so existing InstallIds (and the
+/// coordination state named after them) stay reachable. A path that is not
+/// valid Unicode (arbitrary bytes on macOS, unpaired UTF-16 units on Windows)
+/// cannot be represented without a lossy replacement that would map different
+/// paths to one InstallId, so it is rejected as an unsupported placement.
+pub fn install_path_text(path: &std::path::Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the install path is not valid Unicode",
+        )
+    })
+}
+
 impl InstallId {
     pub fn derive(facts: &InstallFacts<'_>) -> Result<Self> {
         let fields = [facts.os, facts.volume_id, facts.install_path, facts.owner];

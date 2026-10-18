@@ -1675,6 +1675,58 @@ fn install_id_depends_on_every_fact() {
     assert_ne!(TransactionId::generate().unwrap(), TransactionId::generate().unwrap());
 }
 
+#[test]
+fn install_path_text_keeps_unicode_and_rejects_lossy_paths() {
+    use std::path::Path;
+    assert_eq!(
+        crate::identity::install_path_text(Path::new("/Applications/Hane.app")).unwrap(),
+        "/Applications/Hane.app"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn distinct_invalid_byte_paths_never_share_an_install_id() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    let a = Path::new(OsStr::from_bytes(b"/Apps/\xff/Hane.app"));
+    let b = Path::new(OsStr::from_bytes(b"/Apps/\xfe/Hane.app"));
+    // The lossy form collides; the contract must reject instead of adopting it.
+    assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+    assert_eq!(
+        code(crate::identity::install_path_text(a)),
+        ErrorCode::UnsupportedInstall
+    );
+    assert_eq!(
+        code(crate::identity::install_path_text(b)),
+        ErrorCode::UnsupportedInstall
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn distinct_invalid_utf16_paths_never_share_an_install_id() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+    let wide = |unit: u16| {
+        let mut units: Vec<u16> = "C:\\Apps\\".encode_utf16().collect();
+        units.push(unit);
+        PathBuf::from(OsString::from_wide(&units))
+    };
+    let (a, b) = (wide(0xD800), wide(0xD801));
+    assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+    assert_eq!(
+        code(crate::identity::install_path_text(&a)),
+        ErrorCode::UnsupportedInstall
+    );
+    assert_eq!(
+        code(crate::identity::install_path_text(&b)),
+        ErrorCode::UnsupportedInstall
+    );
+}
+
 fn old_payload() -> Vec<ZipEntry> {
     let mut payload = default_payload(CURRENT);
     payload.push(ZipEntry::file("Trust-HaneShellCertificate.ps1", b"trust script"));

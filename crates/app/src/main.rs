@@ -75,7 +75,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             let install_id = InstallId::derive(&InstallFacts {
                 os: std::env::consts::OS,
                 volume_id: &volume,
-                install_path: &install_dir.to_string_lossy(),
+                install_path: hane_update::identity::install_path_text(&install_dir).ok()?,
                 owner: &owner,
             })
             .ok()?;

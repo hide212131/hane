@@ -219,7 +219,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     let install_id = derive_install_id(
         &volume,
         volume_uuid(bundle),
-        &bundle.to_string_lossy(),
+        crate::identity::install_path_text(bundle)?,
         &owner_name()?,
     )?;
     Ok(Placement {
