@@ -10,6 +10,8 @@ GUI validation はAADW内のstageやjudgeではない。ChatGPT Commander が Is
 
 GUI validation は focused scenario を基本とする。毎回 full regression を要求しない。
 
+画面取得・入力・helperの失敗やGUI占有があった場合は、[GUIテストの診断・復旧手順](gui-test-recovery.md)に従って復旧と再実行を進める。Windows GUIは接続先のWindows版ChatGPTアプリから直接操作し、Mac経由VM操作は使わない。必須evidence不足による受入保留と、診断・復旧作業の継続を区別する。
+
 検証 evidence は current PR head と、そのシナリオに影響する current target branch / base context に対応していることを確認する。head が変わったら旧 head の GUI evidence は履歴になる。head が同じでも base の product code が変わり、scenario の結果へ影響し得る場合は、旧 evidence を current state の成功根拠として無条件に再利用しない。
 
 GUI validator は次を行う。

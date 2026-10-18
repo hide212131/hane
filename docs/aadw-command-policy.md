@@ -368,6 +368,8 @@ action の結果が GitHub に残ったら、過去の判断をそのまま継�
 
 Claude、Codex、CodeRabbit、GUI runner などが provider / infrastructure 理由で失敗した場合、その失敗を product failure とみなさない。
 
+GUIの画面取得・ウインドウ列挙・入力経路の障害では、必須evidence不足による受入・mergeの停止と、診断・復旧作業の継続を区別する。単発の失敗やGUI占有だけでセッションを終了せず、[GUIテストの診断・復旧手順](gui-test-recovery.md)に従って、安全な対象の再起動・接続再初期化・比較観測を進める。Windows GUIは接続先のWindows版ChatGPTアプリから直接操作し、Mac経由VM操作は使わない。復旧後に元シナリオを再実行し、実行不能な依存項目が残る場合も、独立した作業を進めて具体的な再開条件を記録する。これはunknownのpassへの読み替えや同じ条件の無制限な再送を認めるものではない。
+
 CodeRabbitの最終レビューがprovider / infrastructure理由で得られない場合は、§4.2の一度限りのCodex fallbackを使える。Codexレビューも取得できない、またはcurrent head / 必要なbase contextに結び付けられない場合は、必要なevidenceが不足したまま停止する。
 
 Claude の failure diagnostic が `usage_or_rate_limit` の場合だけ、既存の Claude checkpoint artifact と trusted `workflow_run` を使った Codex CLI fallback を許可する。この fallback は利用上限からの実装継続に限定し、一般的な provider routing や retry state machine にはしない。
