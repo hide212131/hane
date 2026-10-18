@@ -687,6 +687,7 @@ static INSTALL_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 ///
 /// On Windows an existing file is only ever displaced through the handle that
 /// verified it (`pin`); without one the call fails closed.
+#[cfg(test)]
 fn install_write(path: &Path, bytes: &[u8], pin: Option<PinnedFile>) -> Result<()> {
     install_write_tracked(path, bytes, pin).0
 }

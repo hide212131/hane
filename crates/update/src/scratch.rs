@@ -122,13 +122,15 @@ fn is_reparse(meta: &fs::Metadata) -> bool {
 /// or still holds entries the updater does not own (those are never touched).
 /// `false` means a removal failed and should be retried later.
 pub(crate) fn remove_owned(dir: &Path, files: &[String]) -> bool {
-    match fs::symlink_metadata(dir) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
+    // The directory itself is pinned (not a link, not a non-directory) while
+    // the listed children are inspected and removed, so it cannot be swapped
+    // for a junction that would redirect the deletions.
+    let pin = match pin_dir(dir) {
+        Chain::Held(pin) => pin,
         // A link or a non-directory is not the directory the updater made.
-        Ok(meta) if is_reparse(&meta) || !meta.is_dir() => return true,
-        Ok(_) => {}
-    }
+        Chain::Gone | Chain::Refused => return true,
+        Chain::Transient => return false,
+    };
     for name in files {
         let path = dir.join(name);
         match fs::symlink_metadata(&path) {
@@ -143,6 +145,8 @@ pub(crate) fn remove_owned(dir: &Path, files: &[String]) -> bool {
             Ok(_) => {}
         }
     }
+    // A held directory cannot be removed: release it just before.
+    drop(pin);
     if retry(|| remove_dir_checked(dir)).is_ok() {
         return true;
     }
@@ -209,6 +213,35 @@ pub(crate) struct ScratchLedger {
     install_id: String,
     transaction_id: String,
     leftovers: Vec<Leftover>,
+    /// Whether a record left by an earlier helper attempt has been merged in.
+    loaded: bool,
+}
+
+fn unusable_record(path: &Path, why: &str) -> UpdateError {
+    UpdateError::new(
+        ErrorCode::UnsupportedInstall,
+        format!("scratch ledger record {} {why}", path.display()),
+    )
+}
+
+/// Adds `leftover` to `list`, merging the file names of an already listed
+/// directory without duplicates.
+fn merge_leftover(list: &mut Vec<Leftover>, leftover: Leftover) {
+    if let Some(existing) = list.iter_mut().find(|item| item.dir == leftover.dir) {
+        for name in leftover.files {
+            if !existing.files.contains(&name) {
+                existing.files.push(name);
+            }
+        }
+    } else {
+        let mut files = Vec::new();
+        for name in leftover.files {
+            if !files.contains(&name) {
+                files.push(name);
+            }
+        }
+        list.push(Leftover { dir: leftover.dir, files });
+    }
 }
 
 impl ScratchLedger {
@@ -219,24 +252,60 @@ impl ScratchLedger {
             install_id: coordination.install_id().as_str().to_owned(),
             transaction_id: transaction.as_str().to_owned(),
             leftovers: Vec::new(),
+            loaded: false,
         }
+    }
+
+    /// Reads the record an earlier attempt of this transaction left, if any.
+    /// A record that is malformed, belongs to another installation or
+    /// transaction, or cannot be verified is an error: it is never overwritten.
+    fn load_existing(&self) -> Result<Vec<Leftover>> {
+        let meta = match fs::symlink_metadata(&self.path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        if is_reparse(&meta) || !meta.is_file() {
+            return Err(unusable_record(&self.path, "is not a plain file"));
+        }
+        acl::verify(&self.path, false)?;
+        let Some(bytes) = read_limited(&self.path, RECORD_LIMIT)? else {
+            return Ok(Vec::new());
+        };
+        let record = parse_strict::<Record>(&bytes)
+            .map_err(|_| unusable_record(&self.path, "is malformed"))?;
+        if record.schema != SCHEMA
+            || record.install_id != self.install_id
+            || record.transaction_id != self.transaction_id
+        {
+            return Err(unusable_record(&self.path, "belongs to another record scope"));
+        }
+        let mut list = Vec::new();
+        for leftover in record.leftovers {
+            merge_leftover(&mut list, leftover);
+        }
+        Ok(list)
     }
 
     /// Durably records `leftover` before the caller reports the mutation as
     /// done. A failure is an error and nothing is remembered.
     pub(crate) fn track(&mut self, leftover: Leftover) -> Result<()> {
         ensure_ledger_dir(&self.dir)?;
-        self.leftovers.push(leftover);
+        let mut merged = if self.loaded {
+            self.leftovers.clone()
+        } else {
+            self.load_existing()?
+        };
+        merge_leftover(&mut merged, leftover);
         let record = Record {
             schema: SCHEMA,
             install_id: self.install_id.clone(),
             transaction_id: self.transaction_id.clone(),
-            leftovers: self.leftovers.clone(),
+            leftovers: merged.clone(),
         };
-        if let Err(err) = write_record(&self.path, &record) {
-            self.leftovers.pop();
-            return Err(err);
-        }
+        write_record(&self.path, &record)?;
+        self.leftovers = merged;
+        self.loaded = true;
         Ok(())
     }
 }
@@ -567,5 +636,85 @@ mod tests {
         cleanup_pending(&fx.coordination, &fx.root);
         assert!(outside.join(".hane-update-1-a-7").join("a.dll.aside").exists());
         let _ = fs::remove_dir(&junction);
+    }
+
+    #[test]
+    fn a_junction_as_the_recorded_scratch_directory_is_not_followed() {
+        let fx = fixture();
+        let outside = fx.root.parent().unwrap().join("outside-leaf");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("a.dll.aside"), b"keep").unwrap();
+        let junction = fx.root.join("sub").join(".hane-update-1-a-8");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        assert!(status, "the junction could not be created");
+
+        let mut ledger = ScratchLedger::new(&fx.coordination, &fx.transaction);
+        ledger
+            .track(Leftover {
+                dir: "sub/.hane-update-1-a-8".to_owned(),
+                files: vec!["a.dll.aside".to_owned()],
+            })
+            .unwrap();
+        cleanup_pending(&fx.coordination, &fx.root);
+        assert_eq!(fs::read(outside.join("a.dll.aside")).unwrap(), b"keep");
+        assert!(remove_owned(&junction, &["a.dll.aside".to_owned()]));
+        assert_eq!(fs::read(outside.join("a.dll.aside")).unwrap(), b"keep");
+        let _ = fs::remove_dir(&junction);
+    }
+
+    #[test]
+    fn a_second_ledger_for_the_same_transaction_keeps_the_earlier_record() {
+        let fx = fixture();
+        let first = scratch_with(&fx, "sub/.hane-update-1-a-9", &["a.dll.aside"]);
+        let second = scratch_with(&fx, "sub/.hane-update-1-a-10", &["b.dll.aside"]);
+        ScratchLedger::new(&fx.coordination, &fx.transaction)
+            .track(first.clone())
+            .unwrap();
+        ScratchLedger::new(&fx.coordination, &fx.transaction)
+            .track(second.clone())
+            .unwrap();
+
+        let path = record_path(&fx.coordination, &fx.transaction);
+        let bytes = read_limited(&path, RECORD_LIMIT).unwrap().unwrap();
+        let record = parse_strict::<Record>(&bytes).unwrap();
+        assert_eq!(record.leftovers, vec![first.clone(), second.clone()]);
+
+        cleanup_pending(&fx.coordination, &fx.root);
+        assert!(!fx.root.join(&first.dir).exists());
+        assert!(!fx.root.join(&second.dir).exists());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_malformed_or_mismatched_existing_record_is_not_overwritten() {
+        let fx = fixture();
+        let leftover = scratch_with(&fx, "sub/.hane-update-1-a-11", &["a.dll.aside"]);
+        ensure_ledger_dir(&ledger_dir(&fx.coordination)).unwrap();
+        let path = record_path(&fx.coordination, &fx.transaction);
+        durable_write(&path, b"not json").unwrap();
+        acl::secure_new(&path, false, 0o600).unwrap();
+        assert!(ScratchLedger::new(&fx.coordination, &fx.transaction)
+            .track(leftover.clone())
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"not json");
+
+        let other = Record {
+            schema: SCHEMA,
+            install_id: "f".repeat(32),
+            transaction_id: fx.transaction.as_str().to_owned(),
+            leftovers: vec![],
+        };
+        write_record(&path, &other).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(ScratchLedger::new(&fx.coordination, &fx.transaction)
+            .track(leftover)
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }
