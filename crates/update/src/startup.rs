@@ -482,12 +482,26 @@ fn stop(err: &UpdateError) -> GateOutcome {
 /// `Unmanaged`; any other failure to resolve it (I/O errors, a partly missing
 /// or inconsistent managed install) stops with `RecoveryRequired`.
 pub fn startup_gate_for_exe(exe: &Path, runner: &dyn RecoveryRunner) -> GateOutcome {
-    gate_for_located(platform::locate(exe), runner)
+    startup_gate_for_exe_within(exe, runner, STARTUP_WAIT)
 }
 
-fn gate_for_located(located: Result<Placement>, runner: &dyn RecoveryRunner) -> GateOutcome {
+/// Like [`startup_gate_for_exe`], but waits at most `wait` for the startup
+/// lease, so a caller with its own deadline can bound the call.
+pub fn startup_gate_for_exe_within(
+    exe: &Path,
+    runner: &dyn RecoveryRunner,
+    wait: Duration,
+) -> GateOutcome {
+    gate_for_located(platform::locate(exe), runner, wait)
+}
+
+fn gate_for_located(
+    located: Result<Placement>,
+    runner: &dyn RecoveryRunner,
+    wait: Duration,
+) -> GateOutcome {
     match located {
-        Ok(placement) => startup_gate(&placement, runner, STARTUP_WAIT),
+        Ok(placement) => startup_gate(&placement, runner, wait),
         Err(err) if matches!(err.code, ErrorCode::UnsupportedInstall | ErrorCode::TargetUnsupported) => {
             GateOutcome::Unmanaged
         }
@@ -1388,7 +1402,7 @@ mod tests {
         for code in [ErrorCode::UnsupportedInstall, ErrorCode::TargetUnsupported] {
             assert!(
                 matches!(
-                    gate_for_located(Err(UpdateError::new(code, "no")), &runner),
+                    gate_for_located(Err(UpdateError::new(code, "no")), &runner, STARTUP_WAIT),
                     GateOutcome::Unmanaged
                 ),
                 "{code:?}"
@@ -1397,7 +1411,7 @@ mod tests {
         for code in [ErrorCode::Io, ErrorCode::InstallModified, ErrorCode::IdentityMismatch] {
             assert!(
                 matches!(
-                    gate_for_located(Err(UpdateError::new(code, "partial")), &runner),
+                    gate_for_located(Err(UpdateError::new(code, "partial")), &runner, STARTUP_WAIT),
                     GateOutcome::RecoveryRequired(_)
                 ),
                 "{code:?}"
@@ -1421,7 +1435,7 @@ mod tests {
             let err = failure.unwrap_err();
             assert!(
                 matches!(
-                    gate_for_located(Err(err), &runner),
+                    gate_for_located(Err(err), &runner, STARTUP_WAIT),
                     GateOutcome::RecoveryRequired(_)
                 ),
                 "principal failure must not start normal editing"

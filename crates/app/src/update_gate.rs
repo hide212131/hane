@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 
 use hane_update::health::{COMMIT_WAIT, ChildEntry, VerifiedChild, detect_child};
-use hane_update::startup::{GateOutcome, HelperRecoveryRunner, RuntimeGuard, startup_gate_for_exe};
+use hane_update::startup::{
+    GateOutcome, HelperRecoveryRunner, RuntimeGuard, STARTUP_WAIT, startup_gate_for_exe_within,
+};
 use hane_update::trust::TrustPolicy;
 
 /// Exit status of a launch that must not start the editor (EX_TEMPFAIL / EX_SOFTWARE).
@@ -44,24 +46,32 @@ const EXPLICIT_OPEN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::f
 
 /// Takes the startup gate. With an explicit open request, `UpdateInProgress`
 /// is retried (each attempt takes the gate again) until `wait` has elapsed in
-/// total sleep time; every other outcome is returned at once.
+/// total real time, including the time spent inside the gate calls; every
+/// other outcome is returned at once. `elapsed` reports the time since the
+/// start, and each attempt is told how long it may wait for the startup lease:
+/// never more than the remaining budget.
 fn gate_with_open_retry(
-    mut take_gate: impl FnMut() -> GateOutcome,
+    mut take_gate: impl FnMut(std::time::Duration) -> GateOutcome,
     has_explicit_open: bool,
     wait: std::time::Duration,
     mut sleep: impl FnMut(std::time::Duration),
+    mut elapsed: impl FnMut() -> std::time::Duration,
 ) -> GateOutcome {
-    let mut waited = std::time::Duration::ZERO;
     loop {
-        let outcome = take_gate();
-        if !has_explicit_open
-            || !matches!(outcome, GateOutcome::UpdateInProgress)
-            || waited >= wait
-        {
+        let attempt_wait = if has_explicit_open {
+            wait.saturating_sub(elapsed()).min(STARTUP_WAIT)
+        } else {
+            STARTUP_WAIT
+        };
+        let outcome = take_gate(attempt_wait);
+        if !has_explicit_open || !matches!(outcome, GateOutcome::UpdateInProgress) {
             return outcome;
         }
-        sleep(EXPLICIT_OPEN_RETRY_INTERVAL);
-        waited += EXPLICIT_OPEN_RETRY_INTERVAL;
+        let remaining = wait.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return outcome;
+        }
+        sleep(EXPLICIT_OPEN_RETRY_INTERVAL.min(remaining));
     }
 }
 
@@ -112,11 +122,13 @@ pub fn enter() -> Entry {
     // taking the gate (never bypassing it) and let this process deliver the path
     // through the ordinary open path once the gate admits it.
     let has_explicit_open = std::env::args_os().nth(1).is_some();
+    let started = std::time::Instant::now();
     let outcome = gate_with_open_retry(
-        || startup_gate_for_exe(&exe, &runner),
+        |wait| startup_gate_for_exe_within(&exe, &runner, wait),
         has_explicit_open,
         EXPLICIT_OPEN_WAIT,
         std::thread::sleep,
+        || started.elapsed(),
     );
     match outcome {
         GateOutcome::Proceed(guard) => Entry::Start {
@@ -146,9 +158,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn scripted(in_progress: usize) -> impl FnMut() -> GateOutcome {
+    fn scripted(in_progress: usize) -> impl FnMut(Duration) -> GateOutcome {
         let mut remaining = in_progress;
-        move || {
+        move |_| {
             if remaining > 0 {
                 remaining -= 1;
                 GateOutcome::UpdateInProgress
@@ -164,8 +176,8 @@ mod tests {
         let mut inner = scripted(3);
         let mut sleeps = 0;
         let outcome = gate_with_open_retry(
-            || {
-                let outcome = inner();
+            |wait| {
+                let outcome = inner(wait);
                 if matches!(outcome, GateOutcome::Unmanaged) {
                     admitted += 1;
                 }
@@ -174,6 +186,7 @@ mod tests {
             true,
             Duration::from_secs(60),
             |_| sleeps += 1,
+            || Duration::ZERO,
         );
         assert!(matches!(outcome, GateOutcome::Unmanaged));
         assert_eq!(admitted, 1, "the launch (and its path) is admitted exactly once");
@@ -183,21 +196,60 @@ mod tests {
     #[test]
     fn a_launch_without_an_explicit_open_still_stops_while_updating() {
         let mut sleeps = 0;
-        let outcome = gate_with_open_retry(scripted(3), false, Duration::from_secs(60), |_| sleeps += 1);
+        let outcome = gate_with_open_retry(
+            scripted(3),
+            false,
+            Duration::from_secs(60),
+            |_| sleeps += 1,
+            || Duration::ZERO,
+        );
         assert!(matches!(outcome, GateOutcome::UpdateInProgress));
         assert_eq!(sleeps, 0);
     }
 
     #[test]
     fn an_explicit_open_gives_up_after_the_wait_without_bypassing_the_gate() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
         let mut sleeps = 0;
         let outcome = gate_with_open_retry(
-            || GateOutcome::UpdateInProgress,
+            |_| GateOutcome::UpdateInProgress,
             true,
             Duration::from_secs(1),
-            |_| sleeps += 1,
+            |d| {
+                sleeps += 1;
+                clock.set(clock.get() + d);
+            },
+            || clock.get(),
         );
         assert!(matches!(outcome, GateOutcome::UpdateInProgress));
         assert_eq!(sleeps, 4);
+    }
+
+    #[test]
+    fn time_spent_inside_gate_calls_counts_toward_the_total_wait() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let mut calls = 0;
+        let mut granted = Vec::new();
+        let outcome = gate_with_open_retry(
+            |wait| {
+                calls += 1;
+                granted.push(wait);
+                // Each attempt consumes its whole grant, like a lease timeout.
+                clock.set(clock.get() + wait);
+                GateOutcome::UpdateInProgress
+            },
+            true,
+            Duration::from_secs(60),
+            |d| clock.set(clock.get() + d),
+            || clock.get(),
+        );
+        assert!(matches!(outcome, GateOutcome::UpdateInProgress));
+        assert!(
+            clock.get() <= Duration::from_secs(60),
+            "total wait {:?} exceeded the budget",
+            clock.get()
+        );
+        assert!(granted.iter().all(|w| *w <= STARTUP_WAIT));
+        assert!(calls <= 3, "{calls} gate calls cannot fit a 60s budget of 30s waits");
     }
 }
