@@ -2290,16 +2290,54 @@ mod tests {
         );
     }
 
-    /// A mark of the install, as an earlier Committed update leaves it behind.
+    /// An earlier Committed update as it is left behind: a valid terminal
+    /// receipt whose recorded new bundle is the one that is live now, and the
+    /// relocation mark of that transaction on the live bundle. Returns the
+    /// earlier transaction and the mark that was set.
     #[cfg(unix)]
-    fn stale_mark(fx: &Fixture) -> Vec<u8> {
-        RelocationMark {
+    fn earlier_committed_update(fx: &Fixture) -> (TransactionId, Vec<u8>) {
+        let earlier = TransactionId::generate().unwrap();
+        fx.coordination.ensure_helper_dir(&earlier).unwrap();
+
+        // A Committed journal of the same install from a separate fixture; only
+        // the transaction and the bundle step are rewritten to describe `fx`.
+        let template = fixture();
+        let _ = journal_at(&template, Reached::Committed);
+        let mut journal = template.stored();
+        let Observed::File(live_identity) = bundle_identity(fx.live()).unwrap() else {
+            panic!("the live bundle is missing");
+        };
+        journal.transaction_id = earlier.clone();
+        journal.steps[0].old = Some(crate::identity::FileIdentity::of(b"the bundle before"));
+        journal.steps[0].new = Some(live_identity);
+        fs::write(fx.coordination.journal_path(&earlier), serde_json::to_vec(&journal).unwrap())
+            .unwrap();
+
+        let mark = RelocationMark {
             install_id: fx.coordination.install_id().clone(),
-            transaction: TransactionId::generate().unwrap(),
+            transaction: earlier.clone(),
             coordination_parent: fx.placement.coordination_parent.clone(),
         }
         .encode()
-        .unwrap()
+        .unwrap();
+        fx.host.set_bundle_mark(fx.live(), &mark).unwrap();
+
+        // The receipt really is current, and it lets a moved bundle start.
+        let parent = fx.placement.coordination_parent.clone();
+        crate::startup::ensure_prior_receipts_current(&fx.coordination, &BundleView::new(fx.live()))
+            .unwrap();
+        check_relocation(Some(&mark), &moved_install_id(), &parent, fx.live()).unwrap();
+        (earlier, mark)
+    }
+
+    /// The earlier Committed receipt is still there and still Committed.
+    #[cfg(unix)]
+    fn earlier_receipt_is_kept(fx: &Fixture, earlier: &TransactionId) -> bool {
+        FileJournalStore::new(fx.coordination.journal_path(earlier))
+            .load()
+            .ok()
+            .flatten()
+            .is_some_and(|journal| journal.phase == Phase::Committed)
     }
 
     /// The mark of an earlier Committed update still sits on the live bundle
@@ -2310,13 +2348,17 @@ mod tests {
     #[test]
     fn a_stale_mark_is_removed_before_an_update_that_rolls_back() {
         let fx = fixture();
-        let stale = stale_mark(&fx);
-        fx.host.set_bundle_mark(fx.live(), &stale).unwrap();
+        let (earlier, _) = earlier_committed_update(&fx);
+        assert!(earlier_receipt_is_kept(&fx, &earlier));
         let mut launcher =
             FakeLauncher::new(&fx, Err(UpdateError::new(ErrorCode::Timeout, "no health")));
         apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
         assert!(fx.live_is_old());
         assert_eq!(fx.stored().phase, Phase::RolledBack);
+        assert!(
+            !fx.coordination.journal_path(&earlier).exists(),
+            "the earlier Committed receipt was retired"
+        );
         assert_eq!(fx.host.bundle_mark(fx.live()).unwrap(), None, "the restored bundle is unmarked");
         assert_eq!(fx.host.syncs.get(), 2, "the removal and the new mark are both made durable");
 
@@ -2331,8 +2373,7 @@ mod tests {
     fn a_stale_mark_that_cannot_be_removed_or_synced_refuses_before_any_mutation() {
         for sync in [false, true] {
             let fx = fixture();
-            let stale = stale_mark(&fx);
-            fx.host.set_bundle_mark(fx.live(), &stale).unwrap();
+            let (earlier, _) = earlier_committed_update(&fx);
             if sync {
                 fx.host.fail_sync.set(true);
             } else {
@@ -2344,6 +2385,7 @@ mod tests {
             assert!(fx.untouched(), "sync={sync}");
             assert!(!fx.journal_path().exists(), "no journal was created (sync={sync})");
             assert_eq!(fx.host.bundle_mark(&fx.slot()).unwrap(), None, "sync={sync}");
+            assert!(earlier_receipt_is_kept(&fx, &earlier), "the receipt is kept (sync={sync})");
         }
     }
 
