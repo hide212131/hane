@@ -1419,6 +1419,23 @@ mod tests {
         assert_eq!(fs::read(fx.root.join("added.txt")).unwrap(), b"third party");
     }
 
+    /// Windows displaces an existing file only through a handle whose identity
+    /// was checked, so the pin is bound to the expected content first.
+    #[cfg(windows)]
+    fn pin_existing_for_test(path: &Path, expected: &[u8]) -> Option<PinnedFile> {
+        let pin = PinnedFile::open(path)
+            .unwrap()
+            .expect("the target file exists");
+        assert_eq!(pin.identity().unwrap(), FileIdentity::of(expected));
+        Some(pin)
+    }
+
+    /// Elsewhere the existing file is replaced by path, so no pin is needed.
+    #[cfg(not(windows))]
+    fn pin_existing_for_test(_path: &Path, _expected: &[u8]) -> Option<PinnedFile> {
+        None
+    }
+
     #[test]
     fn install_write_keeps_unknown_neighbours_and_never_overwrites_new_files() {
         let dir = TempDir::new("apply-neighbours");
@@ -1428,8 +1445,9 @@ mod tests {
         fs::write(root.join(".a.dll.tmp"), b"user temp").unwrap();
         fs::write(root.join(".added.txt.tmp"), b"user temp 2").unwrap();
 
-        install_write(&root.join("a.dll"), NEW_DLL).unwrap();
-        install_write(&root.join("added.txt"), NEW_ADDED).unwrap();
+        let pin = pin_existing_for_test(&root.join("a.dll"), OLD_DLL);
+        install_write(&root.join("a.dll"), NEW_DLL, pin).unwrap();
+        install_write(&root.join("added.txt"), NEW_ADDED, None).unwrap();
         assert_eq!(fs::read(root.join("a.dll")).unwrap(), NEW_DLL);
         assert_eq!(fs::read(root.join("added.txt")).unwrap(), NEW_ADDED);
         assert_eq!(fs::read(root.join(".a.dll.tmp")).unwrap(), b"user temp");
@@ -1455,9 +1473,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.dll"), OLD_DLL).unwrap();
 
-        install_write(&root.join("a.dll"), NEW_DLL).unwrap();
+        let pin = pin_existing_for_test(&root.join("a.dll"), OLD_DLL);
+        install_write(&root.join("a.dll"), NEW_DLL, pin).unwrap();
         assert_eq!(fs::read(root.join("a.dll")).unwrap(), NEW_DLL);
-        install_write(&root.join("a.dll"), OLD_DLL).unwrap();
+        let pin = pin_existing_for_test(&root.join("a.dll"), NEW_DLL);
+        install_write(&root.join("a.dll"), OLD_DLL, pin).unwrap();
         assert_eq!(fs::read(root.join("a.dll")).unwrap(), OLD_DLL);
 
         let journal = dir.path().join("journal.json");
