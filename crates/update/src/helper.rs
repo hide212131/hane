@@ -1105,11 +1105,17 @@ mod tests {
     use crate::identity::InstallFacts;
     use crate::testing::TempDir;
 
-    fn install_id() -> InstallId {
+    /// Each fixture needs its own InstallId: the runtime lease registry is
+    /// process-global, so fixtures sharing one id would contend with each other
+    /// when tests run in parallel.
+    fn unique_install_id() -> InstallId {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = format!("/x/{}/{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         InstallId::derive(&InstallFacts {
             os: "test",
             volume_id: "v",
-            install_path: "/x",
+            install_path: &path,
             owner: "u",
         })
         .unwrap()
@@ -1134,15 +1140,18 @@ mod tests {
     struct Fixture {
         _dir: TempDir,
         coord: Coordination,
+        install: InstallId,
         txn: TransactionId,
     }
 
     fn fixture() -> Fixture {
         let dir = TempDir::new("helper");
-        let coord = Coordination::create(dir.path(), &install_id()).unwrap();
+        let install = unique_install_id();
+        let coord = Coordination::create(dir.path(), &install).unwrap();
         Fixture {
             _dir: dir,
             coord,
+            install,
             txn: TransactionId::generate().unwrap(),
         }
     }
@@ -1165,7 +1174,7 @@ mod tests {
                 nonce,
                 Body::Hello {
                     mode,
-                    install_id: install_id().as_str().to_owned(),
+                    install_id: self.install.as_str().to_owned(),
                     transaction_id: self.txn.as_str().to_owned(),
                     candidate_id: Some("cand".to_owned()),
                     parent_pid: 42,
@@ -1612,7 +1621,7 @@ mod tests {
         });
         let request = HelloRequest {
             mode,
-            install_id: install_id(),
+            install_id: fx.install.clone(),
             transaction_id: fx.txn.clone(),
             candidate_id: Some("cand".to_owned()),
         };
@@ -1683,7 +1692,7 @@ mod tests {
         drop(helper_in);
         let request = HelloRequest {
             mode: Mode::Prepare,
-            install_id: install_id(),
+            install_id: fx.install.clone(),
             transaction_id: fx.txn.clone(),
             candidate_id: None,
         };
@@ -1709,7 +1718,7 @@ mod tests {
         let forged = Frame::new(
             &Nonce::generate().unwrap(),
             Body::Prepared {
-                install_id: install_id().as_str().to_owned(),
+                install_id: fx.install.as_str().to_owned(),
                 transaction_id: fx.txn.as_str().to_owned(),
                 helper_pid: 9,
             },
@@ -1718,7 +1727,7 @@ mod tests {
         write_frame(&mut out, &forged).unwrap();
         let request = HelloRequest {
             mode: Mode::Prepare,
-            install_id: install_id(),
+            install_id: fx.install.clone(),
             transaction_id: fx.txn.clone(),
             candidate_id: None,
         };
