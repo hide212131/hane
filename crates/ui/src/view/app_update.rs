@@ -655,6 +655,10 @@ impl EditorView {
         if !self.loading_paths.is_empty() {
             blockers.push(RestartBlocker::OpenInFlight);
         }
+        #[cfg(test)]
+        if self.restart_test_ai_busy {
+            blockers.push(RestartBlocker::AiBusy);
+        }
         if let Some(service) = &self.restart_ai_service {
             let snapshot = service.snapshot();
             let login_running = !matches!(
@@ -820,6 +824,30 @@ impl EditorView {
         .detach();
     }
 
+    /// With the restart freeze already held, re-runs the full blocker check
+    /// (documents, sessions, settings/prompt forms, IME, save, rename, open,
+    /// AI operations, persistence) and compares against the first observation.
+    /// Nothing is stopped or written to the helper here.
+    fn recheck_restart_under_freeze(
+        &mut self,
+        observation: &RestartObservation,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match self.prepare_update_restart_frozen(cx) {
+            RestartPreparation::Blocked(blockers) => {
+                let reasons: Vec<String> = blockers.iter().map(RestartBlocker::message).collect();
+                Err(reasons.join(" "))
+            }
+            RestartPreparation::Clear(_) => {
+                if self.restart_observation_is_current(observation) {
+                    Ok(())
+                } else {
+                    Err(RESTART_STALE_MESSAGE.to_owned())
+                }
+            }
+        }
+    }
+
     fn keep_running_after_restart_attempt(&mut self, message: String, cx: &mut Context<Self>) {
         self.end_restart_freeze();
         self.restart_in_progress = false;
@@ -853,6 +881,14 @@ impl EditorView {
             cx.notify();
             return;
         }
+        // The window was editable while the helper prepared. With the freeze
+        // held, look at every blocker again and at whether anything the first
+        // check observed has moved, before a ticket or the AI stop.
+        if let Err(message) = self.recheck_restart_under_freeze(&observation, cx) {
+            prepared.abort();
+            self.keep_running_after_restart_attempt(message, cx);
+            return;
+        }
         let ai = self.ai_lifecycle.clone();
         let outcome = {
             let mut steps = ViewExit {
@@ -878,6 +914,9 @@ impl EditorView {
         }
     }
 }
+
+const RESTART_STALE_MESSAGE: &str =
+    "文書または設定が変更されたため、更新を中止しました。もう一度お試しください。";
 
 /// How long the AI service may take to stop before the restart is given up.
 pub(crate) const AI_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -911,8 +950,7 @@ pub(crate) enum ExitOutcome {
 /// install: the helper does that only after `authorize_exit` and this
 /// process's exit. Any failure aborts the helper and keeps the old window.
 pub(crate) fn run_exit_sequence(steps: &mut dyn ExitSteps) -> ExitOutcome {
-    const STALE: &str =
-        "文書または設定が変更されたため、更新を中止しました。もう一度お試しください。";
+    const STALE: &str = RESTART_STALE_MESSAGE;
     if !steps.permit_is_fresh() {
         steps.abort_helper();
         return ExitOutcome::Kept(STALE.to_owned());
@@ -1551,6 +1589,105 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), "from outside\n");
         });
         std::fs::remove_file(path).unwrap();
+    }
+
+    type CallLog = Arc<Mutex<Vec<&'static str>>>;
+
+    struct LoggingPrepared(CallLog);
+
+    impl PreparedUpdate for LoggingPrepared {
+        fn issue_ticket(
+            &mut self,
+            _: &RestartTicketSnapshot,
+            _: &dyn Fn() -> bool,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push("ticket");
+            Ok(())
+        }
+        fn authorize_exit(self: Box<Self>) -> Result<(), String> {
+            self.0.lock().unwrap().push("authorize");
+            Ok(())
+        }
+        fn abort(self: Box<Self>) {
+            self.0.lock().unwrap().push("abort");
+        }
+    }
+
+    struct LoggingAi(CallLog);
+
+    impl AiLifecycle for LoggingAi {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("stop_ai");
+            Ok(())
+        }
+        fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+            self.0.lock().unwrap().push("resume_ai");
+            None
+        }
+    }
+
+    /// Runs the post-`Prepared` step after `change` altered the window once
+    /// the first check had passed, and returns what the helper/AI saw.
+    fn restart_after_change(
+        cx: &mut gpui::TestAppContext,
+        change: impl FnOnce(&mut EditorView),
+    ) -> (Vec<&'static str>, bool, Option<String>) {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let ai: Arc<dyn AiLifecycle> = Arc::new(LoggingAi(log.clone()));
+        view.update(cx, |view, _| view.attach_ai_lifecycle(Some(ai)));
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        view.update(cx, |view, _| {
+            view.restart_in_progress = true;
+            change(view);
+        });
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        let prepared: Box<dyn PreparedUpdate> = Box::new(LoggingPrepared(log.clone()));
+        view.update(cx, |view, cx| {
+            view.continue_update_restart(Ok(prepared), observation, ticket, cx);
+        });
+        let (frozen, message) = view.read_with(cx, |view, _| {
+            assert!(!view.restart_in_progress);
+            (view.restart_freeze_active(), view.restart_message.clone())
+        });
+        let calls = log.lock().unwrap().clone();
+        (calls, frozen, message)
+    }
+
+    #[gpui::test]
+    fn prompts_made_dirty_while_the_helper_prepared_abort_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, message) =
+            restart_after_change(cx, |view| view.ai_prompts.force_dirty_for_test());
+        assert_eq!(calls, ["abort"], "no ticket, AI stop or authorization");
+        assert!(!frozen, "the freeze must be released");
+        assert!(message.is_some_and(|m| m.contains("AIプロンプト")));
+    }
+
+    #[gpui::test]
+    fn an_ai_operation_started_while_the_helper_prepared_aborts_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, message) =
+            restart_after_change(cx, |view| view.restart_test_ai_busy = true);
+        assert_eq!(calls, ["abort"], "no ticket, AI stop or authorization");
+        assert!(!frozen);
+        assert!(message.is_some_and(|m| m.contains("AIの処理")));
+    }
+
+    #[gpui::test]
+    fn an_open_that_started_while_the_helper_prepared_aborts_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, _) = restart_after_change(cx, |view| {
+            view.loading_paths.insert(PathBuf::from("late.md"));
+        });
+        assert_eq!(calls, ["abort"]);
+        assert!(!frozen);
     }
 
     #[gpui::test]

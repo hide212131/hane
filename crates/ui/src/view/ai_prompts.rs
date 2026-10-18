@@ -193,6 +193,14 @@ impl AiPromptsPage {
         self.loaded && self.dirty_draft(cx) != self.baseline
     }
 
+    /// Makes the form report unsaved changes (restart-check tests only).
+    #[cfg(test)]
+    pub(super) fn force_dirty_for_test(&mut self) {
+        self.loaded = true;
+        self.baseline = Vec::new();
+        self.draft = vec![hane_ai::initial_default_draft()];
+    }
+
     fn sync_inputs_from_selected(&mut self, window: &mut Window, cx: &mut Context<EditorView>) {
         let Some(entry) = self.draft.get(self.selected) else {
             self.title_input = None;

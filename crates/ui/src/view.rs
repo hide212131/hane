@@ -868,6 +868,9 @@ pub struct EditorView {
     save_as_dialogs_open: usize,
     /// The AI service handle the restart check reads busy state from.
     restart_ai_service: Option<hane_ai::AiServiceHandle>,
+    /// Test-only stand-in for a running AI operation in the restart check.
+    #[cfg(test)]
+    restart_test_ai_busy: bool,
     /// Explicit stop/start of the AI service around an update restart.
     ai_lifecycle: Option<Arc<dyn AiLifecycle>>,
     /// An update restart is being prepared or is about to quit.
@@ -1749,6 +1752,8 @@ impl EditorView {
             external_open_generation: 0,
             save_as_dialogs_open: 0,
             restart_ai_service: None,
+            #[cfg(test)]
+            restart_test_ai_busy: false,
             ai_lifecycle: None,
             restart_in_progress: false,
             restart_message: None,
