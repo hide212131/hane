@@ -379,6 +379,10 @@ pub enum ExternalOpenOutcome {
 #[derive(Debug, Default)]
 pub struct ExternalOpenQueue {
     pending: std::collections::VecDeque<PathBuf>,
+    /// Set by [`Self::seal_if_empty`] right before the helper is allowed to
+    /// replace this process. A sealed queue refuses `try_push`, so the sender
+    /// learns that this process can no longer open the request.
+    sealed: bool,
 }
 
 impl ExternalOpenQueue {
@@ -388,6 +392,32 @@ impl ExternalOpenQueue {
 
     pub fn push(&mut self, path: PathBuf) {
         self.pending.push_back(path);
+    }
+
+    /// Queues `path` unless the queue is sealed; a sealed queue hands the path
+    /// back so the sender can deliver it to the next process.
+    pub fn try_push(&mut self, path: PathBuf) -> Result<(), PathBuf> {
+        if self.sealed {
+            return Err(path);
+        }
+        self.pending.push_back(path);
+        Ok(())
+    }
+
+    /// Atomically closes the queue if nothing is waiting. Every request is
+    /// either already queued (this returns `false` and the restart is given
+    /// up) or refused by `try_push` afterwards; none falls between the two.
+    pub fn seal_if_empty(&mut self) -> bool {
+        if !self.pending.is_empty() {
+            return false;
+        }
+        self.sealed = true;
+        true
+    }
+
+    /// Reopens the queue after the restart was given up.
+    pub fn unseal(&mut self) {
+        self.sealed = false;
     }
 
     pub fn len(&self) -> usize {
@@ -438,6 +468,20 @@ impl SharedExternalOpenQueue {
         self.lock().push(path);
     }
 
+    /// See [`ExternalOpenQueue::try_push`].
+    pub fn try_push(&self, path: PathBuf) -> Result<(), PathBuf> {
+        self.lock().try_push(path)
+    }
+
+    /// See [`ExternalOpenQueue::seal_if_empty`].
+    pub fn seal_if_empty(&self) -> bool {
+        self.lock().seal_if_empty()
+    }
+
+    pub fn unseal(&self) {
+        self.lock().unseal();
+    }
+
     pub fn len(&self) -> usize {
         self.lock().len()
     }
@@ -473,6 +517,20 @@ impl EditorView {
     /// to keep this process running.
     pub fn attach_external_open_inbox(&mut self, inbox: Option<SharedExternalOpenQueue>) {
         self.external_open_inbox = inbox;
+    }
+
+    /// Closes the external-open entrance if nothing is waiting. Without an
+    /// inbox there is nothing to close.
+    fn seal_external_open(&self) -> bool {
+        self.external_open_inbox
+            .as_ref()
+            .is_none_or(|inbox| inbox.seal_if_empty())
+    }
+
+    fn unseal_external_open(&self) {
+        if let Some(inbox) = &self.external_open_inbox {
+            inbox.unseal();
+        }
     }
 
     fn external_open_waiting(&self) -> bool {
@@ -999,6 +1057,13 @@ pub(crate) trait ExitSteps {
     /// Writes every pending draft and reports any failure.
     fn drain_drafts(&mut self) -> Result<(), String>;
     fn stop_ai(&mut self) -> Result<(), String>;
+    /// Closes the external-open queue atomically with its emptiness check.
+    /// `false` means a request is waiting and the restart must be given up.
+    /// From here on a request is refused by the queue and handed to the next
+    /// process by the sender, never queued where this process cannot open it.
+    fn seal_open_queue(&mut self) -> bool;
+    /// Reopens the queue after the restart was given up.
+    fn unseal_open_queue(&mut self);
     /// Lets the helper proceed. After this returns `Ok` the caller quits.
     fn authorize_exit(&mut self) -> Result<(), String>;
     fn abort_helper(&mut self);
@@ -1041,8 +1106,14 @@ pub(crate) fn run_exit_sequence(steps: &mut dyn ExitSteps) -> ExitOutcome {
         steps.resume_ai();
         return ExitOutcome::Kept(STALE.to_owned());
     }
+    if !steps.seal_open_queue() {
+        steps.abort_helper();
+        steps.resume_ai();
+        return ExitOutcome::Kept(STALE.to_owned());
+    }
     if let Err(reason) = steps.authorize_exit() {
         // The handle is consumed (and the helper aborted) by the failure.
+        steps.unseal_open_queue();
         steps.resume_ai();
         return ExitOutcome::Kept(format!("更新ヘルパーへの終了許可に失敗しました: {reason}"));
     }
@@ -1091,6 +1162,14 @@ impl ExitSteps for ViewExit<'_, '_> {
         };
         self.ai_stopped = true;
         ai.stop(AI_STOP_TIMEOUT)
+    }
+
+    fn seal_open_queue(&mut self) -> bool {
+        self.view.seal_external_open()
+    }
+
+    fn unseal_open_queue(&mut self) {
+        self.view.unseal_external_open();
     }
 
     fn authorize_exit(&mut self) -> Result<(), String> {
@@ -1288,6 +1367,8 @@ mod tests {
         stale_after: Option<usize>,
         permit_checks: std::cell::Cell<usize>,
         fail: Option<&'static str>,
+        /// A request reached the queue before it was sealed.
+        open_waiting_at_seal: bool,
     }
 
     impl FakeExit {
@@ -1323,6 +1404,13 @@ mod tests {
         fn stop_ai(&mut self) -> Result<(), String> {
             self.step("stop_ai")
         }
+        fn seal_open_queue(&mut self) -> bool {
+            self.calls.push("seal");
+            !self.open_waiting_at_seal
+        }
+        fn unseal_open_queue(&mut self) {
+            self.calls.push("unseal");
+        }
         fn authorize_exit(&mut self) -> Result<(), String> {
             self.step("authorize")
         }
@@ -1338,7 +1426,61 @@ mod tests {
     fn the_exit_is_authorized_last_after_the_ticket_drain_and_ai_stop() {
         let mut steps = FakeExit::default();
         assert_eq!(run_exit_sequence(&mut steps), ExitOutcome::Quit);
-        assert_eq!(steps.calls, ["ticket", "drain", "stop_ai", "authorize"]);
+        assert_eq!(
+            steps.calls,
+            ["ticket", "drain", "stop_ai", "seal", "authorize"]
+        );
+    }
+
+    #[test]
+    fn a_request_queued_before_the_seal_gives_up_the_restart_without_authorizing() {
+        let mut steps = FakeExit {
+            open_waiting_at_seal: true,
+            ..FakeExit::default()
+        };
+        assert!(matches!(run_exit_sequence(&mut steps), ExitOutcome::Kept(_)));
+        assert_eq!(
+            steps.calls,
+            ["ticket", "drain", "stop_ai", "seal", "abort", "resume_ai"]
+        );
+    }
+
+    #[test]
+    fn the_queue_is_sealed_only_when_empty_and_refuses_later_requests() {
+        let mut queue = ExternalOpenQueue::new();
+        queue.push(PathBuf::from("a.md"));
+        assert!(!queue.seal_if_empty(), "a waiting request keeps the queue open");
+        assert_eq!(queue.try_push(PathBuf::from("b.md")), Ok(()));
+        queue.drain_into(|_| ExternalOpenOutcome::Accepted);
+        assert!(queue.seal_if_empty());
+        // After the seal (authorization, quit) nothing is queued where this
+        // process cannot open it; the sender gets the path back.
+        assert_eq!(
+            queue.try_push(PathBuf::from("c.md")),
+            Err(PathBuf::from("c.md"))
+        );
+        assert!(queue.is_empty());
+        queue.unseal();
+        assert_eq!(queue.try_push(PathBuf::from("c.md")), Ok(()));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn the_shared_queue_seal_is_atomic_with_the_emptiness_check() {
+        let queue = SharedExternalOpenQueue::new();
+        let sender = queue.clone();
+        // Arrived after the final check but before the seal: kept, restart
+        // given up.
+        sender.push(PathBuf::from("late.md"));
+        assert!(!queue.seal_if_empty());
+        queue.drain_into(|_| ExternalOpenOutcome::Accepted);
+        assert!(queue.seal_if_empty());
+        // Arrived after the seal (authorization / just before quit).
+        assert_eq!(
+            sender.try_push(PathBuf::from("quit.md")),
+            Err(PathBuf::from("quit.md"))
+        );
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -1387,7 +1529,7 @@ mod tests {
         assert!(matches!(run_exit_sequence(&mut steps), ExitOutcome::Kept(_)));
         assert_eq!(
             steps.calls,
-            ["ticket", "drain", "stop_ai", "authorize", "resume_ai"]
+            ["ticket", "drain", "stop_ai", "seal", "authorize", "unseal", "resume_ai"]
         );
     }
 
@@ -1870,6 +2012,70 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), "double clicked\n");
         });
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Records what the sender of a Finder request sees while the helper is
+    /// being authorized (and, afterwards, just before the quit).
+    struct FinderOpenDuringAuthorize {
+        log: CallLog,
+        inbox: SharedExternalOpenQueue,
+        refused: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl PreparedUpdate for FinderOpenDuringAuthorize {
+        fn issue_ticket(
+            &mut self,
+            _: &RestartTicketSnapshot,
+            _: &dyn Fn() -> bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn authorize_exit(self: Box<Self>) -> Result<(), String> {
+            self.log.lock().unwrap().push("authorize");
+            if let Err(path) = self.inbox.try_push(PathBuf::from("during-authorize.md")) {
+                self.refused.lock().unwrap().push(path);
+            }
+            Ok(())
+        }
+        fn abort(self: Box<Self>) {
+            self.log.lock().unwrap().push("abort");
+        }
+    }
+
+    #[gpui::test]
+    fn a_finder_open_during_authorization_is_refused_to_the_sender_not_queued(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(Mutex::new(Vec::new()));
+        let inbox = SharedExternalOpenQueue::new();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        view.update(cx, |view, _| {
+            view.attach_external_open_inbox(Some(inbox.clone()));
+        });
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        let prepared: Box<dyn PreparedUpdate> = Box::new(FinderOpenDuringAuthorize {
+            log: log.clone(),
+            inbox: inbox.clone(),
+            refused: refused.clone(),
+        });
+        view.update(cx, |view, cx| {
+            view.restart_in_progress = true;
+            view.continue_update_restart(Ok(prepared), observation, ticket, cx);
+        });
+        assert_eq!(log.lock().unwrap().clone(), ["authorize"]);
+        assert_eq!(
+            refused.lock().unwrap().clone(),
+            vec![PathBuf::from("during-authorize.md")],
+            "the sender must get the request back to hand to the next process"
+        );
+        assert!(inbox.is_empty(), "nothing is stranded in the exiting process");
+        // Just before the quit (after authorization) the queue stays closed.
+        assert!(inbox.try_push(PathBuf::from("before-quit.md")).is_err());
     }
 
     #[gpui::test]

@@ -325,10 +325,51 @@ pub(crate) fn application_with_finder_open(
             if path.is_dir() {
                 continue;
             }
-            sender.push(path);
+            // A sealed queue means the update helper is already authorized to
+            // replace this process: the request cannot be opened here, so it
+            // is handed to the process that follows instead of being lost.
+            if let Err(path) = sender.try_push(path) {
+                hand_off_to_next_process(&path);
+            }
         }
     });
     application
+}
+
+/// Re-delivers a Finder document that arrived after this process was
+/// authorized to exit for an update. A detached shell waits for this process to
+/// end and then opens the document with the application bundle, so the
+/// replacement process receives it through its ordinary Finder open path
+/// (its startup gate waits out the update). Arguments are passed positionally,
+/// never interpolated into the script.
+#[cfg(target_os = "macos")]
+fn hand_off_to_next_process(path: &std::path::Path) {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("Hane could not hand {} to the updated application.", path.display());
+        return;
+    };
+    let Some(bundle) = exe
+        .ancestors()
+        .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
+    else {
+        eprintln!("Hane could not hand {} to the updated application.", path.display());
+        return;
+    };
+    let script = r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open -a "$2" "$3""#;
+    if let Err(err) = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .arg("hane-handoff")
+        .arg(std::process::id().to_string())
+        .arg(bundle)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        eprintln!("Hane could not hand {} to the updated application: {err}", path.display());
+    }
 }
 
 #[cfg(target_os = "windows")]
