@@ -1048,6 +1048,24 @@ fn swap_bundle(
     journal.advance_phase(Phase::AwaitingHealth)
 }
 
+/// Verifies the relocation mark of the live bundle, if any, against its current
+/// placement and removes it durably. Any failure to read, verify, remove or sync
+/// it refuses the apply; nothing has been mutated yet.
+fn clear_stale_live_mark(inputs: &BundleApplyInputs<'_>) -> Result<()> {
+    let live = &inputs.placement.install_root;
+    let Some(bytes) = inputs.host.bundle_mark(live)? else {
+        return Ok(());
+    };
+    check_relocation(
+        Some(&bytes),
+        inputs.coordination.install_id(),
+        &inputs.placement.coordination_parent,
+        live,
+    )?;
+    inputs.host.clear_bundle_mark(live)?;
+    inputs.host.sync_bundle_mark(live)
+}
+
 /// Verifies, plans, writes the journal and exchanges the bundle. On success the
 /// journal is `AwaitingHealth`. A failure after the first journal write has
 /// already been rolled back (or stopped as `RecoveryRequired`).
@@ -1067,6 +1085,11 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     // The previous terminal receipt must still describe this install before
     // anything is mutated; otherwise it could not be retired safely.
     crate::startup::ensure_prior_receipts_current(inputs.coordination, &BundleView::new(live))?;
+
+    // A mark left on the live bundle by the previous Committed update refers to
+    // the receipt retired next. It is removed durably first, so a rollback that
+    // restores this bundle cannot bring back a mark without its receipt.
+    clear_stale_live_mark(inputs)?;
 
     // The previous receipt is retired (durably, or the apply is refused) before
     // the new journal exists, so the new receipt is the only terminal one and
@@ -1322,6 +1345,7 @@ mod tests {
         marks: RefCell<BTreeMap<String, Vec<u8>>>,
         fail_sync: Cell<bool>,
         fail_set_mark: Cell<bool>,
+        fail_clear_mark: Cell<bool>,
         /// Number of mark syncs requested.
         syncs: Cell<usize>,
         fail_swap_sync: Cell<bool>,
@@ -1365,6 +1389,7 @@ mod tests {
                 marks: RefCell::new(BTreeMap::new()),
                 fail_sync: Cell::new(false),
                 fail_set_mark: Cell::new(false),
+                fail_clear_mark: Cell::new(false),
                 syncs: Cell::new(0),
                 fail_swap_sync: Cell::new(false),
                 swap_syncs: RefCell::new(Vec::new()),
@@ -1449,6 +1474,9 @@ mod tests {
         }
 
         fn clear_bundle_mark(&self, bundle: &Path) -> Result<()> {
+            if self.fail_clear_mark.get() {
+                return Err(io_error("injected mark removal failure"));
+            }
             self.marks.borrow_mut().remove(&mark_key(bundle)?);
             Ok(())
         }
@@ -2260,6 +2288,95 @@ mod tests {
                 .all(|(_, seen)| *seen != Some((Phase::Applying, StepState::Applied))),
             "no sync ran after the journal was advanced"
         );
+    }
+
+    /// A mark of the install, as an earlier Committed update leaves it behind.
+    #[cfg(unix)]
+    fn stale_mark(fx: &Fixture) -> Vec<u8> {
+        RelocationMark {
+            install_id: fx.coordination.install_id().clone(),
+            transaction: TransactionId::generate().unwrap(),
+            coordination_parent: fx.placement.coordination_parent.clone(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// The mark of an earlier Committed update still sits on the live bundle
+    /// when the next update is applied and rolled back. The old bundle that
+    /// comes back must not carry it, or a move would depend on a receipt that
+    /// was retired.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_mark_is_removed_before_an_update_that_rolls_back() {
+        let fx = fixture();
+        let stale = stale_mark(&fx);
+        fx.host.set_bundle_mark(fx.live(), &stale).unwrap();
+        let mut launcher =
+            FakeLauncher::new(&fx, Err(UpdateError::new(ErrorCode::Timeout, "no health")));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+        assert!(fx.live_is_old());
+        assert_eq!(fx.stored().phase, Phase::RolledBack);
+        assert_eq!(fx.host.bundle_mark(fx.live()).unwrap(), None, "the restored bundle is unmarked");
+        assert_eq!(fx.host.syncs.get(), 2, "the removal and the new mark are both made durable");
+
+        // The restored bundle moves and starts without any receipt of the past.
+        let parent = fx.placement.coordination_parent.clone();
+        let mark = fx.host.bundle_mark(fx.live()).unwrap();
+        check_relocation(mark.as_deref(), &moved_install_id(), &parent, fx.live()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_mark_that_cannot_be_removed_or_synced_refuses_before_any_mutation() {
+        for sync in [false, true] {
+            let fx = fixture();
+            let stale = stale_mark(&fx);
+            fx.host.set_bundle_mark(fx.live(), &stale).unwrap();
+            if sync {
+                fx.host.fail_sync.set(true);
+            } else {
+                fx.host.fail_clear_mark.set(true);
+            }
+            let err = apply_bundle(&fx.inputs()).err().unwrap();
+            assert_eq!(err.code, ErrorCode::Io, "sync={sync}");
+            assert_eq!(fx.host.swaps.get(), 0, "sync={sync}");
+            assert!(fx.untouched(), "sync={sync}");
+            assert!(!fx.journal_path().exists(), "no journal was created (sync={sync})");
+            assert_eq!(fx.host.bundle_mark(&fx.slot()).unwrap(), None, "sync={sync}");
+        }
+    }
+
+    /// A mark that does not verify against the current placement stops the
+    /// apply; it is neither ignored nor removed.
+    #[cfg(unix)]
+    #[test]
+    fn an_unverifiable_stale_mark_refuses_before_any_mutation() {
+        for bytes in [b"garbage".to_vec(), {
+            RelocationMark {
+                install_id: moved_install_id(),
+                transaction: TransactionId::generate().unwrap(),
+                coordination_parent: TempDir::new("stale-parent").path().to_path_buf(),
+            }
+            .encode()
+            .unwrap()
+        }] {
+            let fx = fixture();
+            fx.host.set_bundle_mark(fx.live(), &bytes).unwrap();
+            let err = apply_bundle(&fx.inputs()).err().unwrap();
+            assert_eq!(err.code, ErrorCode::InstallModified);
+            assert!(fx.untouched());
+            assert!(!fx.journal_path().exists(), "no journal was created");
+            assert_eq!(fx.host.bundle_mark(fx.live()).unwrap(), Some(bytes));
+        }
+    }
+
+    #[test]
+    fn a_bundle_without_a_mark_is_applied_without_an_extra_sync() {
+        let fx = fixture();
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        drop(applied);
+        assert_eq!(fx.host.syncs.get(), 1, "only the new mark is synced");
     }
 
     #[test]
