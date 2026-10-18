@@ -228,11 +228,18 @@ pub fn locate(exe: &Path) -> Result<Placement> {
         return Err(unsupported("the bundle identifier is not Hane's"));
     }
     let volume = query_volume(bundle)?;
-    if !volume.apfs || !volume.local {
-        return Err(unsupported("only a local APFS volume is supported"));
-    }
-    if volume.read_only {
-        return Err(unsupported("the install volume is read-only"));
+    if !volume.apfs || !volume.local || volume.read_only {
+        // A marked bundle may have been moved here in the middle of an update:
+        // the original transaction is consulted before this counts as unmanaged.
+        crate::macos_apply::check_relocation_on_unsupported_volume(
+            read_mark(bundle)?.as_deref(),
+            &coordination_parent,
+        )?;
+        return Err(if volume.read_only && volume.apfs && volume.local {
+            unsupported("the install volume is read-only")
+        } else {
+            unsupported("only a local APFS volume is supported")
+        });
     }
     super::require_install_root_owner(bundle)?;
     // `volume.id` (st_dev) only identifies the mount for this boot; the durable

@@ -264,6 +264,26 @@ pub fn check_relocation(
     }
 }
 
+/// Startup check for a bundle on a volume this updater does not support (not
+/// local APFS, or read-only). Such a placement is normally unmanaged, but a
+/// bundle carrying a relocation mark may have been moved off the volume in the
+/// middle of an update. The original transaction is therefore inspected first;
+/// a pending or unverifiable one stops instead of allowing normal editing.
+/// No volume UUID exists to derive the current `InstallId`, so a sentinel that
+/// never equals a marked (APFS) install stands in for it.
+pub fn check_relocation_on_unsupported_volume(
+    mark: Option<&[u8]>,
+    current_parent: &Path,
+) -> Result<()> {
+    let sentinel = InstallId::derive(&crate::identity::InstallFacts {
+        os: "macos",
+        volume_id: "unsupported-volume",
+        install_path: "unsupported-volume",
+        owner: "unsupported-volume",
+    })?;
+    check_relocation(mark, &sentinel, current_parent)
+}
+
 pub fn valid_team_id(team_id: &str) -> bool {
     team_id.len() == 10 && team_id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
@@ -1928,6 +1948,39 @@ mod tests {
         let empty = TempDir::new("relocation-empty");
         let err = check_relocation(Some(&mark), &moved_install_id(), empty.path()).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    /// A marked bundle moved to a volume the updater does not support must meet
+    /// the original transaction before it can count as unmanaged.
+    #[cfg(unix)]
+    #[test]
+    fn a_marked_bundle_on_an_unsupported_volume_cannot_bypass_the_pending_journal() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        let parent = fx.placement.coordination_parent.clone();
+        let mark = RelocationMark {
+            install_id: fx.coordination.install_id().clone(),
+            transaction: fx.transaction.clone(),
+            coordination_parent: parent.clone(),
+        }
+        .encode()
+        .unwrap();
+
+        // The journal is still pending (prepared, not terminal).
+        let err = check_relocation_on_unsupported_volume(Some(&mark), &parent).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified, "pending must stop");
+        // An unreadable mark and an unfindable journal fail closed too.
+        let err = check_relocation_on_unsupported_volume(Some(b"garbage"), &parent).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        let empty = TempDir::new("relocation-unsupported-empty");
+        let err = check_relocation_on_unsupported_volume(Some(&mark), empty.path()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        // No mark: a plainly unsupported placement is left to the caller.
+        check_relocation_on_unsupported_volume(None, &parent).unwrap();
+
+        // Once the transaction is terminal the marked bundle is no longer held.
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+        check_relocation_on_unsupported_volume(Some(&mark), &parent).unwrap();
     }
 
     #[cfg(unix)]
