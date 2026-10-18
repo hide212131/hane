@@ -43,7 +43,8 @@ use crate::protocol::{
 };
 use crate::trust::TrustPolicy;
 use crate::windows_apply::{
-    ApplyInputs, CandidateSource, NoChild, apply_and_settle, stage_candidate, valid_candidate_id,
+    ApplyInputs, CandidateSource, NoChild, SystemFreeSpace, apply_and_settle, stage_candidate,
+    valid_candidate_id,
 };
 
 pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -445,6 +446,7 @@ impl HelperBackend for PlatformBackend {
                 };
                 apply_and_settle(
                     &ApplyInputs {
+                        free_space: &SystemFreeSpace,
                         coordination,
                         transaction: &env.transaction,
                         candidate_id,

@@ -12,7 +12,7 @@ use std::path::{Component, Path, Prefix};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -146,6 +146,30 @@ fn ensure_supported_volumes(install: &Volume, coordination: &Volume) -> Result<(
         return Err(unsupported("only NTFS is supported"));
     }
     Ok(())
+}
+
+/// Bytes the calling user can still allocate on the volume holding `path`
+/// (quota-aware). Any failure is an error, never a guess.
+pub fn available_bytes(path: &Path) -> Result<u64> {
+    let path_w = wide_path(path);
+    let mut available = 0_u64;
+    // SAFETY: `path_w` is NUL-terminated; only the first out-pointer refers to
+    // a live local and the other two are documented as optional.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            path_w.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(UpdateError::new(
+            ErrorCode::Io,
+            "the free space of the install volume could not be queried",
+        ));
+    }
+    Ok(available)
 }
 
 /// Creation time of a process as a 64-bit FILETIME, or `None` when unreadable.

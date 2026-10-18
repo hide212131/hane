@@ -44,7 +44,10 @@ use crate::identity::{ApplyPlan, SignedInventory, TransactionId};
 use crate::journal::{
     DurableJournal, FileJournalStore, FsDiskView, Phase, UpdateJournal, check_plan_preconditions,
 };
-use crate::limits::{MAX_ARCHIVE_BYTES, MAX_CATALOG_BYTES, MAX_INVENTORY_BYTES, MAX_SIGNATURE_BYTES};
+use crate::limits::{
+    JOURNAL_RESERVE_BYTES, MAX_ARCHIVE_BYTES, MAX_CATALOG_BYTES, MAX_INVENTORY_BYTES,
+    MAX_SIGNATURE_BYTES,
+};
 use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target, UPDATER_PROTOCOL};
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
@@ -121,8 +124,78 @@ pub fn stage_candidate(
     Ok(dir)
 }
 
+/// Free-space query of the volume holding a path. A seam so the preflight is
+/// testable deterministically.
+pub trait FreeSpace {
+    /// Bytes that can still be allocated on the volume of `path`.
+    fn available_bytes(&self, path: &Path) -> Result<u64>;
+}
+
+/// The real query: the Windows volume API. Any other OS is refused, never
+/// assumed to have room.
+pub struct SystemFreeSpace;
+
+impl FreeSpace for SystemFreeSpace {
+    #[cfg(target_os = "windows")]
+    fn available_bytes(&self, path: &Path) -> Result<u64> {
+        crate::platform::windows::available_bytes(path)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn available_bytes(&self, _path: &Path) -> Result<u64> {
+        Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the free space of the install volume cannot be queried on this OS",
+        ))
+    }
+}
+
+/// Space the replacement still needs on the install volume, counted from the
+/// moment of the check. The staged files already exist and are not counted
+/// again: whole-file backups of every replaced file, the largest single
+/// scratch copy (a replacement, or a restore during rollback) and the journal
+/// reserve. Any overflow is a refusal.
+fn required_free_bytes(plan: &ApplyPlan) -> Result<u64> {
+    let overflow = || UpdateError::new(ErrorCode::LimitExceeded, "the required free space overflows");
+    let mut backups = 0_u64;
+    let mut largest = 0_u64;
+    for step in &plan.steps {
+        let old = step.old.as_ref().map_or(0, |id| id.size);
+        let new = step.new.as_ref().map_or(0, |id| id.size);
+        if step.backup_rel.is_some() {
+            backups = backups.checked_add(old).ok_or_else(overflow)?;
+        }
+        largest = largest.max(old).max(new);
+    }
+    backups
+        .checked_add(largest)
+        .and_then(|sum| sum.checked_add(JOURNAL_RESERVE_BYTES))
+        .ok_or_else(overflow)
+}
+
+/// Refuses before any mutation when the install volume cannot hold the backups,
+/// the largest scratch copy and the journal reserve. The install root and the
+/// coordination area share one volume (checked at placement); both paths are
+/// queried and the smaller answer is used.
+fn ensure_free_space(inputs: &ApplyInputs<'_>, plan: &ApplyPlan) -> Result<()> {
+    let required = required_free_bytes(plan)?;
+    let txn_dir = inputs.coordination.transaction_dir(inputs.transaction);
+    let available = inputs
+        .free_space
+        .available_bytes(&inputs.placement.install_root)?
+        .min(inputs.free_space.available_bytes(&txn_dir)?);
+    if available < required {
+        return Err(UpdateError::new(
+            ErrorCode::InsufficientSpace,
+            format!("the update needs {required} free bytes but only {available} are available"),
+        ));
+    }
+    Ok(())
+}
+
 /// Everything the helper derives or holds when it applies.
 pub struct ApplyInputs<'a> {
+    pub free_space: &'a dyn FreeSpace,
     pub coordination: &'a Coordination,
     pub transaction: &'a TransactionId,
     pub candidate_id: &'a str,
@@ -307,6 +380,9 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
         ));
     }
     let plan = verify_and_plan(inputs)?;
+    // Before the receipts are retired, the backup directory exists or any
+    // journal is written: a refusal here leaves the install untouched.
+    ensure_free_space(inputs, &plan)?;
     // The previous terminal receipt must still describe this install before
     // anything is mutated; otherwise it could not be retired safely.
     crate::startup::ensure_prior_receipts_current(
@@ -493,6 +569,18 @@ mod tests {
         policy: TrustPolicy,
         clock: FixedClock,
         before: BTreeMap<String, Vec<u8>>,
+        space: FakeSpace,
+    }
+
+    /// Deterministic free-space answer; `None` is a failed query.
+    struct FakeSpace(Cell<Option<u64>>);
+
+    impl FreeSpace for FakeSpace {
+        fn available_bytes(&self, _path: &Path) -> Result<u64> {
+            self.0
+                .get()
+                .ok_or_else(|| UpdateError::new(ErrorCode::Io, "free space unavailable"))
+        }
     }
 
     fn release_files(release: &WindowsRelease, version: &str) -> Vec<(String, Vec<u8>)> {
@@ -581,12 +669,14 @@ mod tests {
             policy: test_policy(),
             clock: FixedClock::new(test_now()),
             before,
+            space: FakeSpace(Cell::new(Some(u64::MAX))),
         }
     }
 
     impl Fixture {
         fn inputs(&self) -> ApplyInputs<'_> {
             ApplyInputs {
+                free_space: &self.space,
                 coordination: &self.coordination,
                 transaction: &self.transaction,
                 candidate_id: &self.candidate_id,
@@ -638,6 +728,28 @@ mod tests {
                 "unexpected file {path}"
             );
         }
+    }
+
+    #[test]
+    fn too_little_free_space_refuses_before_any_mutation() {
+        let fx = fixture();
+        let payload: u64 = fx.before.values().map(|data| data.len() as u64).sum();
+        for available in [Some(0), Some(JOURNAL_RESERVE_BYTES), Some(JOURNAL_RESERVE_BYTES + 1), None] {
+            fx.space.0.set(available);
+            let err = apply_owned_files(&fx.inputs()).err().unwrap();
+            let expected = if available.is_some() { ErrorCode::InsufficientSpace } else { ErrorCode::Io };
+            assert_eq!(err.code, expected);
+            assert!(fx.unchanged(), "the install changed for {available:?}");
+            assert!(!fx.journal_path().exists(), "a journal was written for {available:?}");
+            assert!(
+                !fx.coordination.transaction_dir(&fx.transaction).join(BACKUP_DIR).exists(),
+                "a backup area was created for {available:?}"
+            );
+        }
+        // Backups of everything plus the largest copy and the reserve suffice.
+        fx.space.0.set(Some(JOURNAL_RESERVE_BYTES + 2 * payload));
+        let applied = apply_owned_files(&fx.inputs()).unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
     }
 
     /// What the fake limited child saw and was asked to do.
