@@ -555,6 +555,51 @@ fn candidate_is_not_ready_unless_the_sequence_floor_is_stored() {
 }
 
 #[test]
+fn concurrent_sequence_updates_never_lower_the_stored_floor() {
+    let dir = TempDir::new("seen-race");
+    let path = dir.path().join("receipts").join("seen-catalog.json");
+    let old = candidate(&windows_release(NEW_VERSION, 10, default_payload(NEW_VERSION)));
+    let new = candidate(&windows_release(NEW_VERSION, 11, default_payload(NEW_VERSION)));
+
+    // Process A holds the placement lock while it stores sequence 11; process B
+    // (a separate store on the same path) tries 10 and must wait for it.
+    let holder = FileSeenStore::new(path.clone());
+    let guard = holder.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let old = &old;
+        let other_path = path.clone();
+        scope.spawn(move || {
+            let mut other = FileSeenStore::new(other_path);
+            tx.send(record_seen(&mut other, old)).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the stale writer must wait for the lock"
+        );
+        let mut writer = FileSeenStore::new(path.clone());
+        writer
+            .store(&SeenCatalog::new(11, new.catalog_sha256.clone()))
+            .unwrap();
+        drop(guard);
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(code(result), ErrorCode::SequenceRegression);
+    });
+    let stored = FileSeenStore::new(path).load().unwrap().unwrap();
+    assert_eq!(stored.sequence, 11);
+}
+
+#[test]
+fn sequence_locks_of_different_installs_do_not_block_each_other() {
+    let dir = TempDir::new("seen-installs");
+    let first = FileSeenStore::new(dir.path().join("a").join("seen-catalog.json"));
+    let _held = first.lock().unwrap();
+    let mut second = FileSeenStore::new(dir.path().join("b").join("seen-catalog.json"));
+    let release = windows_release(NEW_VERSION, 10, default_payload(NEW_VERSION));
+    record_seen(&mut second, &candidate(&release)).unwrap();
+}
+
+#[test]
 fn file_seen_store_round_trips_and_rejects_corruption() {
     let dir = TempDir::new("seen");
     let path = dir.path().join("seen-catalog.json");

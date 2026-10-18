@@ -154,6 +154,13 @@ impl SeenCatalog {
 /// Persistence for the per-installation sequence floor. Implementations must
 /// fail loudly: a candidate is never made Ready if this cannot be stored.
 pub trait SeenStore {
+    /// Serializes load / compare / store of the sequence floor across every
+    /// process of this placement. The returned guard releases it on drop. A
+    /// store shared by several processes must override this; the default suits
+    /// a store only one owner can reach.
+    fn lock(&self) -> Result<Box<dyn Send>> {
+        Ok(Box::new(()))
+    }
     fn load(&self) -> Result<Option<SeenCatalog>>;
     fn store(&mut self, seen: &SeenCatalog) -> Result<()>;
 }

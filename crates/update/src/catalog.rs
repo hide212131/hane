@@ -351,6 +351,9 @@ pub fn record_seen(store: &mut dyn SeenStore, candidate: &VerifiedCandidate) -> 
             format!("cannot persist the catalog sequence: {err}"),
         )
     };
+    // Held across load, compare and store (not the download) so a concurrent
+    // process cannot lower the floor with a stale read.
+    let _guard = store.lock().map_err(unwritable)?;
     let existing = store.load().map_err(unwritable)?;
     if let Some(existing) = &existing {
         existing.validate()?;
