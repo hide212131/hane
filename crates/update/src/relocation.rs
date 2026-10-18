@@ -14,7 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::fsutil::{durable_write, read_limited};
+#[cfg(not(windows))]
+use crate::fsutil::durable_write;
+use crate::fsutil::read_limited;
 use crate::identity::{InstallId, TransactionId};
 use crate::platform::acl;
 use crate::platform::lease::Coordination;
@@ -57,10 +59,67 @@ pub fn write(
         transaction.as_str()
     );
     let path = record_path(install_root);
-    durable_write(&path, text.as_bytes())?;
-    if let Err(err) = acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false)) {
-        let _ = fs::remove_file(&path);
+    #[cfg(windows)]
+    {
+        publish_record(&path, text.as_bytes(), &crate::pinned::replace_write_through)
+    }
+    #[cfg(not(windows))]
+    {
+        durable_write(&path, text.as_bytes())?;
+        if let Err(err) =
+            acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false))
+        {
+            let _ = fs::remove_file(&path);
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// Windows publication of the record. The owner-only ACL is applied to and
+/// verified on a temp file, the file (data and ACL) is flushed, and only then
+/// does `publish` move it onto `path` with write-through, for a first record
+/// and for an update alike. The record is never visible without its ACL, and
+/// `Ok` means the record and ACL are durable, so the caller may start the
+/// first install mutation. On any failure the temp file is removed and an
+/// existing record is left exactly as it was.
+#[cfg(any(windows, test))]
+fn publish_record(
+    path: &Path,
+    bytes: &[u8],
+    publish: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| UpdateError::new(ErrorCode::Io, "the relocation record has no parent"))?;
+    let temp = parent.join(format!(".{RELOCATION_FILE}.tmp"));
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let prepared = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(bytes)?;
+        drop(file);
+        acl::secure_new(&temp, false, 0o600)?;
+        acl::verify(&temp, false)?;
+        // Flush after the ACL is in place so the flush covers it.
+        crate::fsutil::sync_renamed_file(&temp)?;
+        Ok(())
+    })();
+    if let Err(err) = prepared {
+        let _ = fs::remove_file(&temp);
         return Err(err);
+    }
+    if let Err(err) = publish(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(UpdateError::new(
+            ErrorCode::Io,
+            format!("the relocation record could not be published durably: {err}"),
+        ));
     }
     Ok(())
 }
@@ -118,6 +177,49 @@ mod tests {
         assert_eq!(record.install_id, install_id());
         assert_eq!(record.transaction, transaction);
         assert_eq!(record.coordination_parent, dir.path());
+    }
+
+    #[test]
+    fn the_record_is_secured_and_flushed_before_the_write_through_publish() {
+        let dir = TempDir::new("relocation-publish-order");
+        let path = dir.path().join(RELOCATION_FILE);
+        let temp = dir.path().join(format!(".{RELOCATION_FILE}.tmp"));
+        for round in [b"first\n".as_slice(), b"second\n".as_slice()] {
+            let published = std::cell::Cell::new(false);
+            publish_record(&path, round, &|from, to| {
+                // At publish time the temp holds the full data with a
+                // verified owner-only ACL, and the record is not yet replaced.
+                assert_eq!(from, temp);
+                assert_eq!(fs::read(from).unwrap(), round);
+                acl::verify(from, false).unwrap();
+                assert_ne!(fs::read(to).ok().as_deref(), Some(round));
+                published.set(true);
+                fs::rename(from, to)
+            })
+            .unwrap();
+            assert!(published.get());
+            assert_eq!(fs::read(&path).unwrap(), round);
+            assert!(!temp.exists());
+        }
+    }
+
+    #[test]
+    fn a_failed_publish_leaves_the_existing_record_and_no_temp() {
+        let dir = TempDir::new("relocation-publish-fail");
+        let path = dir.path().join(RELOCATION_FILE);
+        let temp = dir.path().join(format!(".{RELOCATION_FILE}.tmp"));
+        fs::write(&path, b"valid\n").unwrap();
+        let err = publish_record(&path, b"new\n", &|_, _| {
+            Err(std::io::Error::other("write-through failed"))
+        });
+        assert!(err.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"valid\n");
+        assert!(!temp.exists());
+
+        let fresh = dir.path().join("other-root").join(RELOCATION_FILE);
+        fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        assert!(publish_record(&fresh, b"x\n", &|_, _| Err(std::io::Error::other("no"))).is_err());
+        assert!(!fresh.exists());
     }
 
     #[test]

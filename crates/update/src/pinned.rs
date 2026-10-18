@@ -10,7 +10,7 @@
 //! never constructed.
 
 #[cfg(windows)]
-pub(crate) use imp::{PinnedDir, PinnedFile, move_write_through};
+pub(crate) use imp::{PinnedDir, PinnedFile, move_write_through, replace_write_through};
 
 #[cfg(not(windows))]
 #[allow(dead_code, reason = "only the Windows adapter constructs a pin")]
@@ -92,6 +92,34 @@ mod imp {
         let (from, to) = (wide(from), wide(to));
         // SAFETY: both buffers are NUL-terminated and live past the call.
         let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Like [`move_write_through`], but an existing `to` is replaced
+    /// (`MOVEFILE_REPLACE_EXISTING`). The replacement is a single namespace
+    /// operation, so a failure leaves the previous `to` untouched.
+    #[allow(unsafe_code, reason = "MoveFileExW through windows-sys")]
+    pub(crate) fn replace_write_through(from: &Path, to: &Path) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+
+        let wide = |path: &Path| -> Vec<u16> {
+            path.as_os_str().encode_wide().chain(Some(0)).collect()
+        };
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: both buffers are NUL-terminated and live past the call.
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING,
+            )
+        };
         if ok == 0 {
             Err(io::Error::last_os_error())
         } else {
