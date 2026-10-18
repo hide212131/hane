@@ -27,6 +27,16 @@ Windows版は [最新のGitHub Release](https://github.com/hide212131/hane/relea
 
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
+### macOS Finder から Markdown を開く
+
+`Hane.app` は `.md` を扱える文書タイプとして登録されており、Finder で `.md` を右クリックして「このアプリケーションで開く」から Hane を選べます。Hane が起動していなくても、起動中でも開けます。未保存の編集がある場合は、既存の保存確認を通らずに内容が置き換わることはありません。
+
+Hane は既定のアプリを自動では変更しません。`.md` をダブルクリックで Hane で開きたい場合は、次の手順で設定します。
+
+1. Finder で `.md` ファイルを選び、「ファイル」メニューの「情報を見る」（`⌘I`）を開きます。
+2. 「このアプリケーションで開く」で `Hane` を選びます。
+3. 同じ種類のすべての書類に適用するには「すべてを変更…」を押します。
+
 ### Windows CLI / Explorer 統合
 
 ```text

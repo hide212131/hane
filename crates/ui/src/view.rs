@@ -42,7 +42,7 @@ use crate::short_text_input::{ShortTextInput, utf16_offset_from_byte};
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme, sync_component_theme};
 use gpui::{
     Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Edges,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ExternalPaths, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, PinchEvent, Pixels, Render,
     ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
     Task, Window, anchored, div, point, prelude::FluentBuilder, px, rgb, rgba,
@@ -783,6 +783,10 @@ pub struct EditorView {
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
+    /// A drop held behind an unsaved-settings leave confirmation. It is
+    /// applied once, when the settings actually close (save succeeded or
+    /// discarded), and dropped on any other navigation.
+    pending_settings_drop: Option<ExternalDropTarget>,
     settings_error: Option<String>,
     recent: RecentFiles,
     /// The Markdown index of the directory this window was opened onto, if
@@ -1651,6 +1655,7 @@ impl EditorView {
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
+            pending_settings_drop: None,
             settings_error: None,
             recent,
             work_folder: None,
@@ -1907,7 +1912,14 @@ impl EditorView {
 
                 self.content_search_workspace_changed(cx);
 
-                if let Some(path) = first {
+                if self.latest_open_target.is_some() {
+                    // A document was requested (e.g. delivered by Finder at
+                    // launch) while this scan was running. That request owns
+                    // the initial session, so the folder's first entry must
+                    // not replace it; the folder stays available in the
+                    // sidebar and recovered drafts stay in their own tabs.
+                    self.activate_session(initial_session, cx);
+                } else if let Some(path) = first {
                     // Opening the first entry replaces whichever session is
                     // active through the same background-loading path as any
                     // other open, instead of leaving a spare empty session
@@ -2982,6 +2994,50 @@ impl EditorView {
         }
     }
 
+    /// Handles files dropped from Finder / Explorer onto the window. Only a
+    /// single path is opened, through `open_path`, so the dirty-session
+    /// refusal still applies. No filesystem metadata is read here, so a
+    /// dropped folder is never taken as a Work folder.
+    fn on_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_external_drop(paths.paths(), window, cx);
+    }
+
+    fn handle_external_drop(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = external_drop_target(paths);
+        if self.settings_open && target != ExternalDropTarget::Ignore {
+            // Return to the editor first so the opened document or the
+            // refusal is visible, through the same leave rule as the back
+            // button. Unsaved settings edits keep their leave confirmation;
+            // the latest drop is held and applied by `close_settings` once
+            // the leave really happens.
+            self.pending_settings_drop = Some(target);
+            self.leave_settings(window, cx);
+            return;
+        }
+        self.apply_external_drop(target, cx);
+    }
+
+    fn apply_external_drop(&mut self, target: ExternalDropTarget, cx: &mut Context<Self>) {
+        match target {
+            ExternalDropTarget::Open(path) => self.open_path(&path, cx),
+            ExternalDropTarget::TooMany => {
+                self.status = Some("Drop one item at a time".to_owned());
+                cx.notify();
+            }
+            ExternalDropTarget::Ignore => {}
+        }
+    }
+
     /// Opens a path the way a filer will: the session set decides whether this
     /// is a switch, a load, or a refusal, and the read itself happens on a
     /// background thread so a large file never blocks typing.
@@ -3238,6 +3294,9 @@ impl EditorView {
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle, cx);
         cx.notify();
+        if let Some(target) = self.pending_settings_drop.take() {
+            self.apply_external_drop(target, cx);
+        }
     }
 
     pub(crate) fn handle_settings_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3264,11 +3323,27 @@ impl EditorView {
             self.ai_settings.activate(cx);
         }
         self.settings_category = category;
+        self.pending_settings_drop = None;
+        // Moving on settles any save-then-leave intent that is still in
+        // flight; a late save completion must not route again.
+        self.ai_settings.cancel_pending_leave();
+        self.ai_prompts.cancel_pending_leave();
         window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
 
+    /// Ordinary leave request (back button, Escape): any held drop belongs to
+    /// an earlier request and is cancelled.
     fn request_leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_settings_drop = None;
+        self.leave_settings(window, cx);
+    }
+
+    pub(crate) fn cancel_pending_settings_drop(&mut self) {
+        self.pending_settings_drop = None;
+    }
+
+    fn leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.settings_category {
             SettingsCategory::Connection if self.ai_settings.is_dirty(cx) => {
                 self.ai_settings
@@ -3290,6 +3365,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         if self.settings_category != category {
+            self.pending_settings_drop = None;
             match self.settings_category {
                 SettingsCategory::Connection if self.ai_settings.is_dirty(cx) => {
                     self.ai_settings
@@ -3369,7 +3445,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        if let Some(target) = self.ai_settings.take_ready_route() {
+        if let Some(target) = self.ai_settings.take_ready_route(cx) {
             match target {
                 ai_settings::LeaveTarget::Category(category) => {
                     self.select_settings_category(category, window, cx)
@@ -3379,7 +3455,7 @@ impl EditorView {
                 }
             }
         }
-        if let Some(target) = self.ai_prompts.take_ready_route() {
+        if let Some(target) = self.ai_prompts.take_ready_route(cx) {
             match target {
                 ai_prompts::LeaveTarget::Category(category) => {
                     self.select_settings_category(category, window, cx)
@@ -6675,6 +6751,47 @@ mod panel_layout_tests {
     }
 }
 
+/// What an OS file drop asks Hane to do.
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalDropTarget {
+    Open(PathBuf),
+    TooMany,
+    Ignore,
+}
+
+fn external_drop_target(paths: &[PathBuf]) -> ExternalDropTarget {
+    match paths {
+        [] => ExternalDropTarget::Ignore,
+        [path] => ExternalDropTarget::Open(path.clone()),
+        _ => ExternalDropTarget::TooMany,
+    }
+}
+
+#[cfg(test)]
+mod external_drop_tests {
+    use super::*;
+
+    #[test]
+    fn single_path_is_opened() {
+        let path = PathBuf::from("/tmp/note.md");
+        assert_eq!(
+            external_drop_target(std::slice::from_ref(&path)),
+            ExternalDropTarget::Open(path)
+        );
+    }
+
+    #[test]
+    fn multiple_paths_are_refused() {
+        let paths = [PathBuf::from("/tmp/a.md"), PathBuf::from("/tmp/b.md")];
+        assert_eq!(external_drop_target(&paths), ExternalDropTarget::TooMany);
+    }
+
+    #[test]
+    fn empty_drop_is_ignored() {
+        assert_eq!(external_drop_target(&[]), ExternalDropTarget::Ignore);
+    }
+}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
@@ -6713,7 +6830,9 @@ impl Render for EditorView {
             .scroll_inertia
             .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         if self.settings_open {
-            return self.settings_screen_element(window, cx);
+            return self
+                .settings_screen_element(window, cx)
+                .on_drop(cx.listener(Self::on_external_paths_drop));
         }
         // Discards a context menu or close-confirmation left over for a tab
         // that closed through some other route while it was still showing,
@@ -7080,7 +7199,10 @@ impl Render for EditorView {
             .children(resizer)
             .on_mouse_move(cx.listener(Self::on_panel_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_panel_drag))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_drag));
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_drag))
+            // The drop listener stops the mouse-up it rides on, so a drop is
+            // never read as a body click or a selection.
+            .on_drop(cx.listener(Self::on_external_paths_drop));
         let main_column = div()
             .flex_1()
             .min_w(px(0.0))
@@ -7529,14 +7651,16 @@ impl EditorView {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            .bg(rgb(self.theme.header_background))
-            .text_color(rgb(self.theme.header_foreground))
+            .bg(rgb(self.theme.tab_bar_background))
+            .text_color(rgb(self.theme.tab_bar_foreground))
+            .border_b_1()
+            .border_color(rgb(self.theme.tab_bar_border))
             .child(
                 TabBar::new("file-tabs-tab-bar")
                     .h_full()
                     .w_full()
-                    .bg(rgb(self.theme.header_background))
-                    .text_color(rgb(self.theme.header_foreground))
+                    .bg(rgb(self.theme.tab_bar_background))
+                    .text_color(rgb(self.theme.tab_bar_foreground))
                     .selected_index(self.file_tab_index(active_id).unwrap_or_default())
                     .max_width(px(220.0))
                     .track_scroll(&self.file_tabs_scroll)
@@ -13610,6 +13734,100 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // Regression test for Issue #499: a Finder open request that reaches the
+    // view before the launch-time work folder scan finishes must stay the
+    // active document instead of being replaced by the folder's first note.
+    #[gpui::test]
+    fn a_finder_open_before_the_work_folder_scan_finishes_stays_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("finder-before-scan");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("2026-10-08_aaaa.md"), "# Folder first\n").unwrap();
+        let finder_dir = draft_test_root("finder-before-scan-external");
+        std::fs::create_dir_all(&finder_dir).unwrap();
+        let finder_file = finder_dir.join("cold-start.md");
+        std::fs::write(&finder_file, "# Cold start\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        assert_eq!(work_folder.entries().len(), 1);
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            // Finder's request arrives first, then the scan completes.
+            view.open_external_path(&finder_file, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            view.finish_work_folder_scan(
+                generation,
+                (
+                    Ok(work_folder),
+                    Ok(RecoveredDrafts::default()),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# Cold start\n");
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&finder_dir).unwrap();
+    }
+
+    // Without a Finder request, the first note of the saved work folder is
+    // still opened as before.
+    #[gpui::test]
+    fn the_work_folder_scan_opens_its_first_note_without_a_finder_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("scan-without-finder");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("2026-10-08_aaaa.md"), "# Folder first\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            view.finish_work_folder_scan(
+                generation,
+                (
+                    Ok(work_folder),
+                    Ok(RecoveredDrafts::default()),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# Folder first\n");
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn footer_status_line_combines_warning_and_status_without_dropping_either() {
         assert_eq!(footer_status_line(None, None), None);
@@ -16540,6 +16758,85 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
         assert!(view.read_with(cx, |view, _| view.settings_open));
+    }
+
+    // `ExternalPaths` has no public constructor outside gpui, so a real
+    // `FileDropEvent` can only carry an empty path list here. Non-empty
+    // drops reach the same handler through `handle_external_drop`.
+    #[gpui::test]
+    fn empty_file_drop_on_settings_screen_is_ignored(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+
+        let position = gpui::point(px(480.0), px(380.0));
+        cx.simulate_event(gpui::FileDropEvent::Entered {
+            position,
+            paths: ExternalPaths::default(),
+        });
+        cx.simulate_event(gpui::FileDropEvent::Submit { position });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.settings_open);
+            assert_eq!(view.status, None);
+            assert!(!view.sessions.active().is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn file_drop_on_settings_screen_returns_to_editor_without_discarding_dirty_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.settings.autosave = false;
+            view.editor_mut().insert_text("dirty").unwrap();
+            view.after_input(cx);
+        });
+        let before = view.read_with(cx, |view, _| {
+            assert!(view.sessions.active().is_dirty());
+            view.text_input_render_state().unwrap().text.to_string()
+        });
+
+        for paths in [
+            vec![PathBuf::from("/tmp/hane-drop-a.md")],
+            vec![
+                PathBuf::from("/tmp/hane-drop-a.md"),
+                PathBuf::from("/tmp/hane-drop-b.md"),
+            ],
+        ] {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.open_settings(window, cx));
+            });
+            cx.run_until_parked();
+            assert!(view.read_with(cx, |view, _| view.settings_open));
+
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.handle_external_drop(&paths, window, cx));
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(!view.settings_open, "the result must not stay behind settings");
+                let expected = if paths.len() == 1 {
+                    "Save current changes before opening another file"
+                } else {
+                    "Drop one item at a time"
+                };
+                assert_eq!(view.status.as_deref(), Some(expected));
+                assert!(view.sessions.active().is_dirty());
+                assert_eq!(view.sessions().count(), 1);
+                assert_eq!(view.text_input_render_state().unwrap().text.to_string(), before);
+            });
+        }
     }
 
     #[gpui::test]
