@@ -110,7 +110,11 @@ pub fn run(verified: Box<VerifiedChild>) {
         }
     });
 
-    gpui_platform::application()
+    // Finder callbacks are registered now but only queue paths; the receiver
+    // reaches the normal editor solely through `prepare_launch` after the
+    // durable commit, so nothing is opened before then.
+    let (finder_sender, finder_requests) = crate::finder_channel();
+    crate::application_with_finder_open(finder_sender)
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(420.), px(160.)), cx);
@@ -152,7 +156,7 @@ pub fn run(verified: Box<VerifiedChild>) {
                             if !hane_session::pin_state_root(state_root) {
                                 std::process::exit(EXIT_NOT_COMMITTED);
                             }
-                            match crate::prepare_launch(None) {
+                            match crate::prepare_launch(None, finder_requests) {
                                 Some(launch) => {
                                     crate::open_editor(cx, launch);
                                     let _ = window.update(cx, |_, window, _| window.remove_window());

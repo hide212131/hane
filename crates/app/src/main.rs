@@ -3,7 +3,11 @@
     windows_subsystem = "windows"
 )]
 
-#[cfg(any(target_os = "windows", not(feature = "instrument")))]
+#[cfg(any(
+    target_os = "windows",
+    target_os = "macos",
+    not(feature = "instrument")
+))]
 use gpui::Focusable;
 use gpui::{App, AppContext, Bounds, Global, WindowBounds, WindowOptions, px, size};
 use hane_ai::{
@@ -18,6 +22,9 @@ use hane_update::model::Target;
 use hane_update::trust::TrustPolicy;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod finder_open;
 
 mod app_update;
 mod https_transport;
@@ -131,6 +138,47 @@ fn start_ai_service() -> Option<AiService> {
     .ok()
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) type FinderSender = std::sync::mpsc::Sender<PathBuf>;
+#[cfg(not(target_os = "macos"))]
+pub(crate) type FinderSender = ();
+#[cfg(target_os = "macos")]
+pub(crate) type FinderReceiver = std::sync::mpsc::Receiver<PathBuf>;
+#[cfg(not(target_os = "macos"))]
+pub(crate) type FinderReceiver = ();
+
+#[cfg(target_os = "macos")]
+pub(crate) fn finder_channel() -> (FinderSender, FinderReceiver) {
+    std::sync::mpsc::channel::<PathBuf>()
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn finder_channel() -> (FinderSender, FinderReceiver) {
+    ((), ())
+}
+
+/// Creates the application and, on macOS, routes Finder's "Open With" /
+/// double-click file URLs (delivered at launch and to a running instance)
+/// into `sender`. The platform callback has no `App` access, so the paths are
+/// queued for a polling task that opens them through the editor's normal
+/// open path. The callback only queues; nothing is opened until the normal
+/// editor exists (after the limited child's durable commit, if any). Other
+/// platforms ignore `sender`.
+pub(crate) fn application_with_finder_open(
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] sender: FinderSender,
+) -> gpui::Application {
+    let application = gpui_platform::application();
+    #[cfg(target_os = "macos")]
+    application.on_open_urls(move |urls| {
+        for path in urls
+            .iter()
+            .filter_map(|url| finder_open::markdown_path_from_url(url))
+        {
+            let _ = sender.send(path);
+        }
+    });
+    application
+}
+
 #[cfg(target_os = "windows")]
 fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
     if flag == "--register-context-menu" {
@@ -189,10 +237,13 @@ fn main() {
             std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(path))
         }
     });
-    let Some(launch) = prepare_launch(cli_path) else {
+    // The callback is registered on the application before it runs, so a
+    // Finder document delivered at launch is queued, not lost.
+    let (finder_sender, finder_requests) = finder_channel();
+    let Some(launch) = prepare_launch(cli_path, finder_requests) else {
         return;
     };
-    gpui_platform::application()
+    application_with_finder_open(finder_sender)
         .with_assets(AppAssets)
         .run(move |cx: &mut App| open_editor(cx, launch));
 }
@@ -208,6 +259,8 @@ pub(crate) struct EditorLaunch {
     update_service: Option<Arc<app_update::AppUpdateService>>,
     #[cfg(target_os = "windows")]
     open_requests: std::sync::mpsc::Receiver<PathBuf>,
+    #[cfg(target_os = "macos")]
+    finder_requests: FinderReceiver,
     #[cfg(any(feature = "instrument", feature = "timing-probe"))]
     process_started: std::time::Instant,
     #[cfg(feature = "instrument")]
@@ -216,7 +269,13 @@ pub(crate) struct EditorLaunch {
 
 /// `None` when this launch must not open an editor (forwarded to a running
 /// instance, or the open-request pipe belongs to another instance).
-pub(crate) fn prepare_launch(cli_path: Option<PathBuf>) -> Option<EditorLaunch> {
+/// `finder_requests` receives Finder documents; it is handed to the editor
+/// only here, i.e. never before the update gate / durable commit allowed
+/// normal startup.
+pub(crate) fn prepare_launch(
+    cli_path: Option<PathBuf>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] finder_requests: FinderReceiver,
+) -> Option<EditorLaunch> {
     #[cfg(target_os = "windows")]
     {
         if let Some(path) = cli_path.as_deref() {
@@ -283,6 +342,8 @@ pub(crate) fn prepare_launch(cli_path: Option<PathBuf>) -> Option<EditorLaunch> 
         update_service,
         #[cfg(target_os = "windows")]
         open_requests,
+        #[cfg(target_os = "macos")]
+        finder_requests,
         #[cfg(any(feature = "instrument", feature = "timing-probe"))]
         process_started,
         #[cfg(feature = "instrument")]
@@ -300,6 +361,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         update_service,
         #[cfg(target_os = "windows")]
         open_requests,
+        #[cfg(target_os = "macos")]
+        finder_requests,
         #[cfg(any(feature = "instrument", feature = "timing-probe"))]
         process_started,
         #[cfg(feature = "instrument")]
@@ -376,6 +439,10 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                     view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
                     true
                 });
+                // On macOS the prompt is deferred to the Finder poller
+                // below so a document delivered by Finder at launch
+                // is not blocked by the folder picker.
+                #[cfg(not(target_os = "macos"))]
                 if needs_default_prompt {
                     view.prompt_default_work_folder(cx);
                 }
@@ -383,6 +450,58 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             .expect("focus editor");
         cx.activate(true);
     }
+    #[cfg(target_os = "macos")]
+    cx.spawn(async move |cx| {
+        // Finder usually delivers the launch document right after startup;
+        // give it a moment before asking for a default folder, and skip the
+        // prompt when a document arrived. Documents wait in the queue until
+        // the view accepts them; one that arrives while the view is frozen
+        // for an update restart check stays queued and is retried.
+        let mut prompt_pending = needs_default_prompt && cfg!(not(feature = "instrument"));
+        let started = std::time::Instant::now();
+        let mut pending = hane_ui::ExternalOpenQueue::new();
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+            while let Ok(path) = finder_requests.try_recv() {
+                prompt_pending = false;
+                // A folder is never opened from Finder: that would replace
+                // the sessions without the dirty-file guard `open_path`
+                // applies to documents.
+                if path.is_dir() {
+                    continue;
+                }
+                pending.push(path);
+            }
+            if !pending.is_empty()
+                && window
+                    .update(cx, |view, window, cx| {
+                        let accepted =
+                            pending.drain_into(|path| view.submit_external_open(path, cx));
+                        if accepted > 0 {
+                            window.activate_window();
+                            if !view.settings_is_open() {
+                                window.focus(&view.focus_handle(cx), cx);
+                            }
+                        }
+                    })
+                    .is_err()
+            {
+                return;
+            }
+            if prompt_pending && started.elapsed() >= std::time::Duration::from_millis(500) {
+                prompt_pending = false;
+                if window
+                    .update(cx, |view, _window, cx| view.prompt_default_work_folder(cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    })
+    .detach();
     #[cfg(target_os = "windows")]
     cx.spawn(async move |cx| {
         // Paths wait here until the view accepts them; a request that
