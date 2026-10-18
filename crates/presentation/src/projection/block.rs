@@ -313,6 +313,44 @@ pub fn present_block_with_table_projection(
             table_header,
             &table_alignments,
         );
+        // The inactive table presenter reads one row in isolation, so the
+        // openable links come from the formal projection, which resolved them
+        // against the whole document.
+        // A row mixing an inline link with a reference link resolved by a
+        // definition elsewhere keeps the former locally and gains the latter here.
+        if presented.kind == BlockKind::TableRow
+            && let Some(row) = table_projection.and_then(|projection| {
+                projection.rows.iter().find(|row| {
+                    row.source_range.start < line.range.end
+                        && line.range.start < row.source_range.end
+                })
+            })
+        {
+            let missing = row
+                .links
+                .iter()
+                .filter_map(|link| {
+                    let clipped = SourceRange {
+                        start: link.text_range.start.max(line.range.start),
+                        end: link.text_range.end.min(line.range.end),
+                    };
+                    (clipped.start < clipped.end
+                        && !presented
+                            .links
+                            .iter()
+                            .any(|existing| existing.source_range.intersects(clipped)))
+                    .then(|| crate::LinkTarget {
+                        source_range: clipped,
+                        destination: link.destination.clone(),
+                        uses_reference: link.uses_reference,
+                    })
+                })
+                .collect::<Vec<_>>();
+            presented.links.extend(missing);
+            presented
+                .links
+                .sort_by_key(|link| (link.source_range.start, link.source_range.end));
+        }
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
         }

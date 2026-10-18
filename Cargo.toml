@@ -10,6 +10,7 @@ members = [
     "crates/presentation",
     "crates/session",
     "crates/ui",
+    "crates/update",
 ]
 resolver = "2"
 exclude = ["vendor/gpui", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows"]
@@ -31,6 +32,7 @@ hane-presentation = { path = "crates/presentation" }
 hane-session = { path = "crates/session" }
 hane-benchmark = { path = "crates/benchmark" }
 hane-ui = { path = "crates/ui" }
+hane-update = { path = "crates/update" }
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["runtime_shaders", "font-kit", "wayland", "x11"] }
 gpui-component = { version = "=0.6.6", default-features = false }

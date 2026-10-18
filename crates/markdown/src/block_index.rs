@@ -23,6 +23,7 @@
 //!   not touch.
 
 use crate::block_store::BlockStore;
+use crate::list_projection::ListProjectionMarkers;
 use crate::{
     FenceHeightProjection, ListEditProjection, ListProjection, ListProjectionItem,
     ListProjectionList, ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree,
@@ -99,6 +100,16 @@ pub struct TableProjectionCell {
     pub source_range: SourceRange,
 }
 
+/// An openable external link whose text lies inside one table row. It comes
+/// from the same formal parse as the row, so reference links resolve against
+/// the whole document's definitions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjectionLink {
+    pub text_range: SourceRange,
+    pub destination: Arc<str>,
+    pub uses_reference: bool,
+}
+
 /// One physical table row retained by the formal source projection.
 ///
 /// The source text is the exact row slice from the parsed revision. Keeping it
@@ -111,6 +122,7 @@ pub struct TableProjectionRow {
     pub source: Arc<str>,
     pub header: bool,
     pub cells: Arc<[TableProjectionCell]>,
+    pub links: Arc<[TableProjectionLink]>,
 }
 
 /// Formal table metadata used by presentation for rows outside the current
@@ -593,6 +605,20 @@ fn build_list_projections(
         })
         .collect::<Vec<_>>();
     quotes.sort_by_key(|quote| (quote.source_range.start, quote.source_range.end));
+    let mut links_by_block: Vec<Vec<TableProjectionLink>> = vec![Vec::new(); block_ranges.len()];
+    for link in &parsed.links {
+        let block = block_ranges.partition_point(|range| range.end <= link.text_range.start);
+        if block_ranges
+            .get(block)
+            .is_some_and(|range| range.start <= link.text_range.start)
+        {
+            links_by_block[block].push(TableProjectionLink {
+                text_range: link.text_range,
+                destination: link.destination.clone(),
+                uses_reference: link.uses_reference,
+            });
+        }
+    }
     let mut quotes_by_block = vec![Vec::new(); block_ranges.len()];
     for quote in quotes {
         let block = block_ranges.partition_point(|range| range.end <= quote.source_range.start);
@@ -634,7 +660,12 @@ fn build_list_projections(
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
             let block_quotes = std::mem::take(&mut quotes_by_block[block]);
-            if block_items.is_empty() && rows.is_empty() && block_quotes.is_empty() {
+            let block_links = std::mem::take(&mut links_by_block[block]);
+            if block_items.is_empty()
+                && rows.is_empty()
+                && block_quotes.is_empty()
+                && block_links.is_empty()
+            {
                 None
             } else {
                 Some(ListProjection::new(
@@ -643,8 +674,11 @@ fn build_list_projections(
                     block_lists,
                     block_quotes,
                     rows,
-                    block_fence_markers,
-                    block_container_markers,
+                    ListProjectionMarkers {
+                        fence_markers: block_fence_markers,
+                        container_markers: block_container_markers,
+                    },
+                    block_links,
                 ))
             }
         })
@@ -717,11 +751,25 @@ fn build_table_projections(
                         })
                         .collect::<Vec<_>>()
                         .into();
+                    let links = crate::links_intersecting(&parsed.links, row.source_range)
+                        .iter()
+                        .filter(|link| {
+                            row.source_range.start <= link.text_range.start
+                                && link.text_range.end <= row.source_range.end
+                        })
+                        .map(|link| TableProjectionLink {
+                            text_range: link.text_range,
+                            destination: link.destination.clone(),
+                            uses_reference: link.uses_reference,
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
                     Some(TableProjectionRow {
                         source_range: row.source_range,
                         source,
                         header,
                         cells,
+                        links,
                     })
                 })
                 .collect::<Vec<_>>()

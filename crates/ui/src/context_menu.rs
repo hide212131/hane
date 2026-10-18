@@ -145,7 +145,9 @@ mod windows {
                 return FileContextMenuState::Conflict;
             }
             return match marker_enabled(exe, FILE_ENABLED_MARKER) {
-                Ok(true) if package_installed() => FileContextMenuState::Registered,
+                Ok(true) if package_installed() && shell_extension_present(exe) => {
+                    FileContextMenuState::Registered
+                }
                 Ok(true) => FileContextMenuState::Stale,
                 Ok(false) => FileContextMenuState::Unregistered,
                 Err(error) => FileContextMenuState::Unknown(error.to_string()),
@@ -200,7 +202,8 @@ mod windows {
                         .get_value::<String, _>("HaneExePath")
                         .is_ok_and(|path| path.eq_ignore_ascii_case(&exe.to_string_lossy()))
                     && marker_enabled(exe, FILE_ENABLED_MARKER).unwrap_or(false)
-                    && package_installed()))
+                    && package_installed()
+                    && shell_extension_present(exe)))
         {
             FileContextMenuState::Registered
         } else if label == MENU_LABEL {
@@ -308,6 +311,20 @@ mod windows {
         }
     }
 
+    /// Versioned DLL location relative to the install root:
+    /// `shell-integration/<cargo version>/hane_shell_extension.dll`.
+    fn shell_extension_dll_path(root: &Path, version: &str) -> PathBuf {
+        root.join("shell-integration")
+            .join(version)
+            .join("hane_shell_extension.dll")
+    }
+
+    fn shell_extension_present(exe: &Path) -> bool {
+        exe.parent().is_some_and(|root| {
+            shell_extension_dll_path(root, env!("CARGO_PKG_VERSION")).is_file()
+        })
+    }
+
     fn marker_path(exe: &Path, name: &str) -> io::Result<PathBuf> {
         Ok(exe
             .parent()
@@ -395,16 +412,56 @@ mod windows {
         powershell(&script).is_ok_and(|output| output.status.success())
     }
 
-    fn ensure_explorer_package(exe: &Path) -> io::Result<()> {
-        if !is_windows_11() || package_installed() {
-            return Ok(());
+    #[derive(Debug, PartialEq, Eq)]
+    enum PackagePlan {
+        /// Windows 10: no MSIX package is involved.
+        NotApplicable,
+        /// Current package registered and current-version DLL present.
+        Satisfied,
+        /// Current-version DLL is missing; never report success.
+        DllMissing,
+        /// DLL present but the current package is not registered.
+        Register,
+    }
+
+    fn package_plan(is_windows_11: bool, installed: bool, dll_present: bool) -> PackagePlan {
+        if !is_windows_11 {
+            PackagePlan::NotApplicable
+        } else if !dll_present {
+            PackagePlan::DllMissing
+        } else if installed {
+            PackagePlan::Satisfied
+        } else {
+            PackagePlan::Register
         }
+    }
+
+    fn ensure_explorer_package(exe: &Path) -> io::Result<()> {
+        let win11 = is_windows_11();
+        let plan = package_plan(
+            win11,
+            win11 && package_installed(),
+            shell_extension_present(exe),
+        );
         let directory = exe.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Hane.exe のディレクトリを確認できません",
             )
         })?;
+        match plan {
+            PackagePlan::NotApplicable | PackagePlan::Satisfied => return Ok(()),
+            PackagePlan::DllMissing => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "版別の Explorer 拡張 DLL が見つかりません: {}",
+                        shell_extension_dll_path(directory, env!("CARGO_PKG_VERSION")).display()
+                    ),
+                ));
+            }
+            PackagePlan::Register => {}
+        }
         let package = directory.join("Hane.ShellIntegration.msix");
         if !package.is_file() {
             return Err(io::Error::new(
@@ -461,6 +518,67 @@ mod windows {
                 command_line(exe),
                 r#""C:\Program Files\Hane\hane.exe" "%1""#
             );
+        }
+
+        #[test]
+        fn shell_extension_dll_is_under_the_version_directory() {
+            let root = Path::new(r"C:\Hane");
+            assert_eq!(
+                shell_extension_dll_path(root, "0.27.0"),
+                Path::new(r"C:\Hane\shell-integration\0.27.0\hane_shell_extension.dll")
+            );
+            assert_ne!(
+                shell_extension_dll_path(root, "0.26.0"),
+                shell_extension_dll_path(root, "0.27.0")
+            );
+        }
+
+        #[test]
+        fn package_version_is_the_cargo_version_with_a_zero_revision() {
+            assert_eq!(
+                PACKAGE_VERSION,
+                format!("{}.0", env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(env!("CARGO_PKG_VERSION").split('.').count(), 3);
+        }
+
+        #[test]
+        fn markers_stay_beside_the_exe_not_the_versioned_dll() {
+            let exe = Path::new(r"C:\Hane\hane.exe");
+            assert_eq!(
+                marker_path(exe, FILE_ENABLED_MARKER).unwrap(),
+                Path::new(r"C:\Hane\Hane.ShellIntegration.enabled")
+            );
+            assert_eq!(
+                marker_path(exe, FOLDER_ENABLED_MARKER).unwrap(),
+                Path::new(r"C:\Hane\Hane.ShellIntegration.folder.enabled")
+            );
+        }
+
+        #[test]
+        fn shell_extension_presence_requires_the_current_version_dll() {
+            let dir = std::env::temp_dir().join(format!("hane-shell-dll-{}", std::process::id()));
+            let exe = dir.join("hane.exe");
+            let old = shell_extension_dll_path(&dir, "0.0.1");
+            fs::create_dir_all(old.parent().unwrap()).unwrap();
+            fs::write(&old, b"old").unwrap();
+            assert!(!shell_extension_present(&exe));
+            let current = shell_extension_dll_path(&dir, env!("CARGO_PKG_VERSION"));
+            fs::create_dir_all(current.parent().unwrap()).unwrap();
+            fs::write(&current, b"new").unwrap();
+            assert!(shell_extension_present(&exe));
+            assert!(old.is_file(), "old version DLL must coexist");
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn package_plan_distinguishes_registration_and_dll_states() {
+            assert_eq!(package_plan(true, true, true), PackagePlan::Satisfied);
+            assert_eq!(package_plan(true, true, false), PackagePlan::DllMissing);
+            assert_eq!(package_plan(true, false, true), PackagePlan::Register);
+            assert_eq!(package_plan(true, false, false), PackagePlan::DllMissing);
+            assert_eq!(package_plan(false, false, false), PackagePlan::NotApplicable);
+            assert_eq!(package_plan(false, false, true), PackagePlan::NotApplicable);
         }
 
         #[test]

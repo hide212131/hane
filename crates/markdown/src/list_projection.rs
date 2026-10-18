@@ -1,4 +1,4 @@
-use crate::FenceMarkerEdge;
+use crate::{FenceMarkerEdge, TableProjectionLink};
 use hane_document::SourceRange;
 use std::sync::Arc;
 
@@ -24,6 +24,11 @@ pub struct ListProjection {
     /// resolved through `items` by range so nested list items retain their own
     /// metadata without leaking a `NodeId` across parse trees.
     container_markers: Vec<(SourceRange, Option<SourceRange>, usize)>,
+    /// Openable links of the owning block, resolved by the document-wide parse
+    /// in document order. A single physical line parsed alone cannot see a
+    /// reference definition on another line, so presentation restores the
+    /// formal destination from here.
+    links: Vec<TableProjectionLink>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +77,13 @@ pub struct ListProjectionRow {
     pub(super) is_code_block: bool,
 }
 
+/// Marker ranges of the owning block, grouped so [`ListProjection::new`] keeps
+/// a small argument list.
+pub(crate) struct ListProjectionMarkers {
+    pub(crate) fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
+    pub(crate) container_markers: Vec<(SourceRange, Option<SourceRange>, usize)>,
+}
+
 impl ListProjection {
     pub(crate) fn new(
         items: Vec<ListProjectionItem>,
@@ -79,8 +91,8 @@ impl ListProjection {
         lists: Vec<ListProjectionList>,
         quotes: Vec<QuoteProjection>,
         rows: Vec<ListProjectionRow>,
-        fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
-        container_markers: Vec<(SourceRange, Option<SourceRange>, usize)>,
+        markers: ListProjectionMarkers,
+        links: Vec<TableProjectionLink>,
     ) -> Self {
         Self {
             items,
@@ -88,9 +100,26 @@ impl ListProjection {
             lists,
             quotes,
             rows,
-            fence_markers,
-            container_markers,
+            fence_markers: markers.fence_markers,
+            container_markers: markers.container_markers,
+            links,
         }
+    }
+
+    /// Formally resolved openable links whose text intersects `range`.
+    pub fn links_in(&self, range: SourceRange) -> impl Iterator<Item = &TableProjectionLink> + '_ {
+        let start = self
+            .links
+            .partition_point(|link| link.text_range.end <= range.start);
+        let end = self
+            .links
+            .partition_point(|link| link.text_range.start < range.end);
+        let slice = if start < end {
+            &self.links[start..end]
+        } else {
+            &[]
+        };
+        slice.iter()
     }
 
     /// The formal opening/closing role for `range`, if it is a fence delimiter.
