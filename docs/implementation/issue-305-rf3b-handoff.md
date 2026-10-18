@@ -10,10 +10,10 @@
 ## GitHubの再開時点スナップショット
 
 - mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`（#522）。Issue #305はOPENで、受入条件5件はすべて未チェック。
-- PR #497はOPEN / Draft、head `d3fbcc048119f9270ae9935f5f9cbd75eea39697`、製品コードhead `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、baseは上記main。36 commits ahead / 0 behind、12 files、mergeable。製品コードhead以降のPR差分は引き継ぎ文書。
-- current-head CI run [39152525907](https://github.com/hide212131/hane/actions/runs/39152525907)はmacOS/Windows workspace tests、Windows IME notification dispatch、Clippyがsuccess。release-only checksはskip。
-- 利用者指定のcurrent-head Codex代替review [5564198600](https://github.com/hide212131/hane/pull/497#pullrequestreview-5564198600)は文書差分に追加指摘なし。COMMENTでありapprovalではない。CodeRabbit full reviewはDraftのため未実施。
-- Codex P1 review thread [PRRT_kwDOUETGuM6tsITw](https://github.com/hide212131/hane/pull/497#discussion_r4307731361)のpopup位置問題は、current mainとcandidateの同条件比較で両方に再現したため、#497固有の回帰ではない。利用者の方針に従い、修正はfollow-up Issue [#523](https://github.com/hide212131/hane/issues/523)・別PRへ分離する。
+- このスナップショット時点のPR #497はOPEN / Draft、head `f40744fa22a5b3e0786beead4990d6bebb8e9516`、製品コードhead `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、baseは上記main。36 commits ahead / 0 behind、12 files、mergeable。製品コードhead以降のPR差分は引き継ぎ文書。
+- 文書更新前のhead `f40744f`に対するCI run [39178099818](https://github.com/hide212131/hane/actions/runs/39178099818)は、このhandoff文書更新の時点で実行中だった。最終判断では、GitHub PR画面で最新headのCI結果を確認する。
+- 利用者指定のcurrent-head Codex代替review [5565587772](https://github.com/hide212131/hane/pull/497#pullrequestreview-5565587772)は文書差分に追加指摘なし。COMMENTでありapprovalではない。CodeRabbit full reviewはDraftのため未実施。
+- Codex P1 review thread [PRRT_kwDOUETGuM6tsITw](https://github.com/hide212131/hane/pull/497#discussion_r4307731361)のpopup位置問題は、current mainとcandidateの同条件比較で両方に再現したため、#497固有の回帰ではない。比較結果とfollow-up Issue [#523](https://github.com/hide212131/hane/issues/523)を記録し、#497では解決済みにした。別PRで修正する。
 - PR #496はMERGED（head `14def973e496c39b503c006db21fd187718ad683`）、PR #495はMERGED（head `76d53cbf5b33a51ed91dfa259ced76403064872a`）。
 
 ## 確認済みの受入状況
@@ -30,7 +30,7 @@
 
 - 以前の比較では利用者がKeyhac hook OFFをread-onlyで確認し、その時点のデスクトップ状態表示もWindows CUAでOFFと読めた。その後の停止済みWindowsタスク履歴には、停止指示後に`Keyhac フック OFF` shortcut（`KeyhacHook.ahk off`）を実行した記録がある。実行結果・現在のhook状態は確認できていないため、**現在状態はunknown**とする。OFF shortcutの実行や再実行で確認しない。
 - 停止済みcandidate試行について、Windows側記録に食い違いがある。一つのworker報告はcandidate Hane PID `7600`を起動してfilterをクリックした後、終了・fixture cleanup前に停止したとしている。別のhandoff記述は同PIDの正常終了とfixture一致を記録している。remote hostが現在unavailableなため照合できず、PID・fixtureの最終状態は未確認として扱う。該当fixture候補は`C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\fixtures\g04-filter-blur-a2b106-20261019-0003`。
-- 利用者は現在状態をデスクトップに表示できるようにしたと報告したが、本再開セッションのCUAにはmacOSアプリ・ブラウザしかなく、papa-win hostも`thread_list_unavailable`。新しい表示値はまだ取得できていない。Windows GUIを再開する前にWindows ChatGPT CUAを再接続し、状態を読み取り専用で確認するとともに、該当PIDと専用fixtureの状態を確認する。
+- 利用者は現在状態をデスクトップに表示できるようにしたと報告したが、本セッションのCUAにはmacOSアプリ・ブラウザしかなく、papa-win側のスレッド一覧も取得時にtimeoutした。新しい表示値はまだ読めていない。Windows GUIを再開する前にWindows ChatGPT CUAを再接続し、表示値を読み取り専用で確認するとともに、該当PIDと専用fixtureの状態を確認する。
 - Windows操作手順はmainの[GUI recovery runbook](../gui-test-recovery.md)に従う。MacからVMware経由でWindows画面を操作しない。
 
 ### macOS
@@ -51,8 +51,8 @@ Windows CUA接続が復旧したら、デスクトップに表示した現在の
 
 ## PR #497の残作業
 
-1. PR本文をリファクタ範囲と既存不具合の分離に合わせて更新する。#523/#524は別PRで扱う。
-2. Codex P1 threadをmain/candidate比較と#523を根拠に更新し、#497では解決する。
+1. PR本文はリファクタ範囲と既存不具合の分離に合わせて更新済み。#523/#524の修正は別PRで扱う。
+2. Codex P1 threadはmain/candidate比較と#523を根拠に更新・解決済み。
 3. PRをレビュー可能にし、CodeRabbitの通常レビューを取得して、#497の変更に起因する指摘だけを対応する。
 4. macOS GUI確認を進め、#497による文字列・範囲編集の回帰がないことを確認する。Windows candidate G06は接続が復旧したときにmain比較を行う。
 5. Issue #305はOPENのままにし、5受入条件の実際の達成を別途管理する。
