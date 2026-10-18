@@ -3095,10 +3095,30 @@ impl EditorView {
     fn on_external_paths_drop(
         &mut self,
         paths: &ExternalPaths,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match external_drop_target(paths.paths()) {
+        self.handle_external_drop(paths.paths(), window, cx);
+    }
+
+    fn handle_external_drop(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = external_drop_target(paths);
+        if self.settings_open && target != ExternalDropTarget::Ignore {
+            // Return to the editor first so the opened document or the
+            // refusal is visible, through the same leave rule as the back
+            // button. Unsaved settings edits keep their leave confirmation
+            // and the drop is not applied behind it.
+            self.request_leave_settings(window, cx);
+            if self.settings_open {
+                return;
+            }
+        }
+        match target {
             ExternalDropTarget::Open(path) => self.open_path(&path, cx),
             ExternalDropTarget::TooMany => {
                 self.status = Some("Drop one item at a time".to_owned());
@@ -6880,7 +6900,9 @@ impl Render for EditorView {
             .scroll_inertia
             .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         if self.settings_open {
-            return self.settings_screen_element(window, cx);
+            return self
+                .settings_screen_element(window, cx)
+                .on_drop(cx.listener(Self::on_external_paths_drop));
         }
         // Discards a context menu or close-confirmation left over for a tab
         // that closed through some other route while it was still showing,
@@ -16863,6 +16885,85 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
         assert!(view.read_with(cx, |view, _| view.settings_open));
+    }
+
+    // `ExternalPaths` has no public constructor outside gpui, so a real
+    // `FileDropEvent` can only carry an empty path list here. Non-empty
+    // drops reach the same handler through `handle_external_drop`.
+    #[gpui::test]
+    fn empty_file_drop_on_settings_screen_is_ignored(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+
+        let position = gpui::point(px(480.0), px(380.0));
+        cx.simulate_event(gpui::FileDropEvent::Entered {
+            position,
+            paths: ExternalPaths::default(),
+        });
+        cx.simulate_event(gpui::FileDropEvent::Submit { position });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.settings_open);
+            assert_eq!(view.status, None);
+            assert!(!view.sessions.active().is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn file_drop_on_settings_screen_returns_to_editor_without_discarding_dirty_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.settings.autosave = false;
+            view.editor_mut().insert_text("dirty").unwrap();
+            view.after_input(cx);
+        });
+        let before = view.read_with(cx, |view, _| {
+            assert!(view.sessions.active().is_dirty());
+            view.text_input_render_state().unwrap().text.to_string()
+        });
+
+        for paths in [
+            vec![PathBuf::from("/tmp/hane-drop-a.md")],
+            vec![
+                PathBuf::from("/tmp/hane-drop-a.md"),
+                PathBuf::from("/tmp/hane-drop-b.md"),
+            ],
+        ] {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.open_settings(window, cx));
+            });
+            cx.run_until_parked();
+            assert!(view.read_with(cx, |view, _| view.settings_open));
+
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.handle_external_drop(&paths, window, cx));
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(!view.settings_open, "the result must not stay behind settings");
+                let expected = if paths.len() == 1 {
+                    "Save current changes before opening another file"
+                } else {
+                    "Drop one item at a time"
+                };
+                assert_eq!(view.status.as_deref(), Some(expected));
+                assert!(view.sessions.active().is_dirty());
+                assert_eq!(view.sessions().count(), 1);
+                assert_eq!(view.text_input_render_state().unwrap().text.to_string(), before);
+            });
+        }
     }
 
     #[gpui::test]
