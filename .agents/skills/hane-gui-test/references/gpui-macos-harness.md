@@ -59,14 +59,15 @@ Open the fresh bundle with `open -a /absolute/path/HaneGuiTest.app`. This is a G
 
 Do not replace the main executable after LaunchServices has registered the bundle. A script launcher can produce `kLSNoExecutableErr`, and replacing it with a Mach-O binary may still leave cached invalid state. Create a new bundle path and bundle identifier instead.
 
-## Computer Use stopping rule
+## Computer Use diagnosis and recovery
 
 Hane's GPUI content may expose only the standard window controls in the accessibility tree. That is expected; inspect the screenshot.
 
 If a coordinate click or scroll reports `noWindowsAvailable`:
 
-1. Read fresh app state using the discovered bundle id.
-2. Retry the intended coordinate action once.
-3. If it fails again, record the automation limitation and use a GPUI `simulate_event` regression test for the behavior.
+1. Save the failure and read fresh app state using the discovered bundle id. Distinguish AX, screenshots, coordinate input, and keyboard input.
+2. Follow [GUI diagnosis and recovery](../../../../docs/gui-test-recovery.md). Compare a harmless app, use a permitted normal OS activation route such as Finder's Open, then reacquire the app and confirm a coordinate action by its visible result. AX Raise or background app discovery alone is not proof of normal activation. Do not assume the app must remain in front after activation.
+3. If recovery succeeds, rerun the original acceptance scenario. If it does not, investigate the failing layer and safely recover only the identified test process or dedicated helper; do not repeat unchanged calls or rebuild bundles indefinitely.
+4. Use a GPUI `simulate_event` regression test only for the internal invariant it can observe. It does not substitute for native Finder/Explorer drops, dialogs, or IME. Keep required native scenarios pending with evidence and concrete recovery/resume steps, while continuing independent work.
 
 Do not rebuild multiple bundles merely to overcome coordinate automation when GPUI can directly verify the invariant.
