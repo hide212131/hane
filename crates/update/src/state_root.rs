@@ -196,6 +196,16 @@ pub const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "HOMEPATH",
     "TEMP",
     "TMP",
+    // Connectivity and certificate settings the AI runtime passes to its own
+    // child, so the limited child reaches the same network as a normal start.
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
 ];
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -844,6 +854,41 @@ mod tests {
         assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
         fx.write_private(ENVIRONMENT_FILE, b"not json");
         assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
+    }
+
+    #[test]
+    fn network_settings_reach_the_child_but_loader_and_session_variables_do_not() {
+        let fx = fixture();
+        let network = [
+            ("ALL_PROXY", "socks5://proxy.example:1080"),
+            ("HTTP_PROXY", "http://proxy.example:8080"),
+            ("HTTPS_PROXY", "http://proxy.example:8443"),
+            ("NO_PROXY", "localhost,127.0.0.1"),
+            ("CURL_CA_BUNDLE", "/etc/ssl/ca.pem"),
+            ("REQUESTS_CA_BUNDLE", "/etc/ssl/ca.pem"),
+            ("SSL_CERT_DIR", "/etc/ssl/certs"),
+            ("SSL_CERT_FILE", "/etc/ssl/ca.pem"),
+        ];
+        let forbidden = ["PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "CODEX_HOME", "HANE_COMMAND"];
+        let ambient = |name: &str| -> Option<std::ffi::OsString> {
+            network
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).into())
+                .or_else(|| forbidden.contains(&name).then(|| "/tmp/evil".into()))
+        };
+        publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        for (name, value) in network {
+            assert!(
+                vars.contains(&(name.to_owned(), value.to_owned())),
+                "{name} must reach the limited child"
+            );
+        }
+        for name in forbidden {
+            assert!(vars.iter().all(|(key, _)| key != name), "{name} must stay out");
+        }
+        assert_eq!(vars.len(), network.len());
     }
 
     #[cfg(unix)]
