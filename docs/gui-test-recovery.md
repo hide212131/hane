@@ -168,6 +168,10 @@ Windowsのファイルopen転送先は、確認したPR #507の実装では`LOCA
 - `<Windows検証ルート>\hane-pr507-windows-drop-20261017-output\followup-20261018\validation-report.txt`
 - `<Windows検証ルート>\hane-pr507-windows-drop-20261017-output\pointer-recheck-20261018\validation-report.txt`
 
+### PR #497: Windows GUI受入の記録
+
+2026-10-18のWindows ARM64 GUI確認結果を[PR #497 Windows GUI受入記録](pr-497-windows-gui-acceptance-20261018.md)にまとめた。G03/G05はPASS、G01/G02/G04はPARTIAL、G06はNOT RUN。部分結果はPR #497やIssue #305の全受入完了を示さない。
+
 ## 5. 復旧できないときにも作業を引き継げる形にする
 
 同じ条件で失敗した操作を無限に再送しない。比較観測・専用アプリ/接続/helperの復旧・正規経路の確認を進めても、利用者操作や共有基盤の修復が必要だと確認された場合は、その依存項目だけを保留する。利用者に依頼する前に、実行可能な診断・証拠保存・独立した検証を済ませる。
