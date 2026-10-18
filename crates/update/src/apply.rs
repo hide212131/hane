@@ -23,6 +23,7 @@ use crate::journal::{
 };
 use crate::limits::MAX_ENTRY_BYTES;
 use crate::paths::validate_rel_path;
+use crate::root_guard::RootGuard;
 
 /// Backups are addressed as `backup/<path>`; no owned file may live there.
 pub const BACKUP_PREFIX: &str = "backup/";
@@ -362,23 +363,42 @@ fn check_step_state<S: JournalStore>(
 
 /// Real-filesystem [`FileOps`]. `root` is the install root, `backup_root` holds
 /// `backup/<path>` copies and `stage_root` holds the verified new files.
+///
+/// The install root's OS identity is fixed when the value is created. Every
+/// observation and mutation first checks that the root path still resolves to
+/// that same directory, so a root renamed or replaced mid-operation is never
+/// written to (or rolled back through) by pathname. A root whose identity
+/// cannot be fixed refuses every call.
 pub struct FsFileOps {
     root: PathBuf,
     backup_root: PathBuf,
     stage_root: PathBuf,
+    guard: Result<RootGuard>,
 }
 
 impl FsFileOps {
     pub fn new(root: PathBuf, backup_root: PathBuf, stage_root: PathBuf) -> Self {
+        let guard = RootGuard::open(&root);
         Self {
             root,
             backup_root,
             stage_root,
+            guard,
+        }
+    }
+
+    /// Fails closed unless the install root is still the directory fixed at
+    /// creation.
+    pub fn verify_root(&self) -> Result<()> {
+        match &self.guard {
+            Ok(guard) => guard.verify(),
+            Err(err) => Err(err.clone()),
         }
     }
 
     fn locate<'a>(&'a self, rel_path: &'a str) -> Result<(&'a Path, &'a str)> {
         validate_rel_path(rel_path)?;
+        self.verify_root()?;
         Ok(match rel_path.strip_prefix(BACKUP_PREFIX) {
             Some(rest) => (self.backup_root.as_path(), rest),
             None => (self.root.as_path(), rel_path),
@@ -1055,6 +1075,46 @@ mod tests {
             assert_eq!(fs::read(root.join(&path)).unwrap(), data, "{path}");
         }
         assert!(!root.join("added.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_moved_after_the_first_mutation_is_never_written_or_rolled_back_by_path() {
+        let dir = TempDir::new("apply-root-moved");
+        let root = dir.path().join("install");
+        let backup = dir.path().join("backup");
+        let stage = dir.path().join("stage");
+        for sub in [&root, &backup, &stage] {
+            fs::create_dir_all(sub).unwrap();
+        }
+        for (path, data) in original() {
+            fs::write(root.join(path), data).unwrap();
+        }
+        fs::write(stage.join("a.dll"), NEW_DLL).unwrap();
+        fs::write(stage.join("added.txt"), NEW_ADDED).unwrap();
+        fs::write(stage.join("hane.exe"), NEW_EXE).unwrap();
+
+        let mut ops = FsFileOps::new(root.clone(), backup, stage);
+        let mut journal = new_journal(flaky());
+        let mut child = Child::default();
+        assert_eq!(
+            apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap(),
+            ApplyOutcome::AwaitingHealth
+        );
+
+        // The mixed install moves away and another directory takes its path.
+        let moved = dir.path().join("moved");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("hane.exe"), b"decoy").unwrap();
+
+        assert!(ops.verify_root().is_err());
+        assert!(conclude_health(&mut journal, &mut ops, &mut child, false).is_err());
+        assert_eq!(fs::read(root.join("hane.exe")).unwrap(), b"decoy");
+        assert_eq!(fs::read(moved.join("hane.exe")).unwrap(), NEW_EXE);
+        assert!(!root.join("added.txt").exists());
+        // The refusal changed nothing, so the transaction stays pending.
+        assert_eq!(journal.journal().phase, Phase::AwaitingHealth);
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub mod paths;
 pub mod platform;
 pub mod protocol;
 pub mod release;
+pub mod root_guard;
 pub mod startup;
 pub mod state_root;
 pub mod trust;

@@ -42,7 +42,7 @@ use crate::fsutil::{FileSeenStore, hash_regular_file, read_limited};
 use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, Settled, conclude_with_child};
 use crate::identity::{ApplyPlan, SignedInventory, TransactionId};
 use crate::journal::{
-    DurableJournal, FileJournalStore, FsDiskView, UpdateJournal, check_plan_preconditions,
+    DurableJournal, FileJournalStore, FsDiskView, Phase, UpdateJournal, check_plan_preconditions,
 };
 use crate::limits::{MAX_ARCHIVE_BYTES, MAX_CATALOG_BYTES, MAX_INVENTORY_BYTES, MAX_SIGNATURE_BYTES};
 use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target, UPDATER_PROTOCOL};
@@ -341,8 +341,18 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
             // so the next start finds nothing pending. A failure here leaves
             // it for the startup recovery, which reaches the same result.
             let _ = apply::recover(&mut journal, &mut ops, &mut NoChild);
+            seal_if_root_lost(&mut journal, &ops);
             Err(err)
         }
+    }
+}
+
+/// When the install root is no longer the directory the operation started on,
+/// nothing can be written or rolled back safely: the journal is made
+/// `RecoveryRequired` so the pending transaction keeps blocking normal startup.
+fn seal_if_root_lost(journal: &mut DurableJournal<FileJournalStore>, ops: &FsFileOps) {
+    if ops.verify_root().is_err() && !journal.journal().phase.is_terminal() {
+        let _ = journal.advance_phase(Phase::RecoveryRequired);
     }
 }
 
@@ -405,8 +415,9 @@ pub fn apply_and_settle(inputs: &ApplyInputs<'_>, launcher: &mut dyn HealthLaunc
         &mut applied.ops,
         &mut *child,
         launcher.health_timeout(),
-    )?;
-    settled_result(settled)
+    );
+    seal_if_root_lost(&mut applied.journal, &applied.ops);
+    settled_result(settled?)
 }
 
 /// `Ok` only for a durable `Committed`; every other verdict is an error that
