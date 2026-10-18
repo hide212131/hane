@@ -78,10 +78,32 @@ pub(crate) fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
 #[cfg(windows)]
 #[allow(unsafe_code, reason = "one MoveFileExW call through windows-sys")]
 fn replace_write_through_windows(temp: &Path, dest: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    move_write_through_windows(temp, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+}
+
+/// Renames `from` to a `to` that must not exist, once and atomically, and
+/// returns only after the namespace change is flushed (Windows:
+/// `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` and no replace flag, so a
+/// concurrent second claimer fails instead of winning the same name). Other
+/// platforms: `rename`.
+pub(crate) fn rename_new_durable(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+        move_write_through_windows(from, to, MOVEFILE_WRITE_THROUGH)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "one MoveFileExW call through windows-sys")]
+fn move_write_through_windows(temp: &Path, dest: &Path, flags: u32) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
     let wide = |p: &Path| -> Vec<u16> {
         p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
@@ -89,13 +111,7 @@ fn replace_write_through_windows(temp: &Path, dest: &Path) -> io::Result<()> {
     let temp_w = wide(temp);
     let dest_w = wide(dest);
     // SAFETY: both buffers are NUL-terminated and outlive the call.
-    let ok = unsafe {
-        MoveFileExW(
-            temp_w.as_ptr(),
-            dest_w.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
+    let ok = unsafe { MoveFileExW(temp_w.as_ptr(), dest_w.as_ptr(), flags) };
     if ok == 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -347,6 +363,23 @@ mod durable_write_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_durable_new_rename_is_one_shot_and_never_replaces() {
+        let dir = scratch_dir("claim");
+        let ticket = dir.join("ticket");
+        let claimed = dir.join("claimed");
+        fs::write(&ticket, b"ticket").unwrap();
+        rename_new_durable(&ticket, &claimed).unwrap();
+        assert!(!ticket.exists());
+        assert_eq!(fs::read(&claimed).unwrap(), b"ticket");
+        // A second claimer of the same name loses and the winner is intact.
+        fs::write(&ticket, b"other").unwrap();
+        assert!(rename_new_durable(&ticket, &claimed).is_err());
+        assert_eq!(fs::read(&claimed).unwrap(), b"ticket");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -120,6 +120,15 @@ fn may_carry_open_request(has_cli_path: bool) -> bool {
     has_cli_path || cfg!(target_os = "macos")
 }
 
+/// Whether the first argument is an actual file path to open. The context menu
+/// management flags carry no open request, so they keep the bounded gate.
+fn is_cli_open_path(first_arg: Option<&std::ffi::OsStr>) -> bool {
+    match first_arg {
+        None => false,
+        Some(arg) => arg != "--register-context-menu" && arg != "--unregister-context-menu",
+    }
+}
+
 pub fn enter() -> Entry {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -166,7 +175,7 @@ pub fn enter() -> Entry {
     // An explicit file argument must not be lost to an update in progress: keep
     // taking the gate (never bypassing it) and let this process deliver the path
     // through the ordinary open path once the gate admits it.
-    let has_cli_path = std::env::args_os().nth(1).is_some();
+    let has_cli_path = is_cli_open_path(std::env::args_os().nth(1).as_deref());
     let has_explicit_open = may_carry_open_request(has_cli_path);
     let started = std::time::Instant::now();
     let outcome = gate_with_open_retry(
@@ -415,6 +424,28 @@ mod tests {
             opened.push(PathBuf::from("C:\\notes\\a.md"));
         }
         assert_eq!(opened, vec![PathBuf::from("C:\\notes\\a.md")]);
+    }
+
+    #[test]
+    fn context_menu_flags_are_not_open_paths_but_ordinary_paths_are() {
+        use std::ffi::OsStr;
+        assert!(!is_cli_open_path(None));
+        assert!(!is_cli_open_path(Some(OsStr::new("--register-context-menu"))));
+        assert!(!is_cli_open_path(Some(OsStr::new("--unregister-context-menu"))));
+        assert!(is_cli_open_path(Some(OsStr::new("C:\\notes\\a.md"))));
+        assert!(is_cli_open_path(Some(OsStr::new("a.md"))));
+        // A management flag keeps the bounded gate on Windows; a path waits
+        // for the terminal outcome.
+        let flag = is_cli_open_path(Some(OsStr::new("--register-context-menu")));
+        let gate = gate_with_open_retry(
+            |_| GateOutcome::UpdateInProgress,
+            flag,
+            open_request_wait_for(flag, false, true),
+            |_| panic!("a management flag never retries"),
+            || Duration::ZERO,
+        );
+        assert!(matches!(gate, GateOutcome::UpdateInProgress));
+        assert_eq!(open_request_wait_for(true, false, true), None);
     }
 
     #[test]

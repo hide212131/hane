@@ -27,7 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::fsutil::{durable_write, read_limited, sync_renamed_file};
+use crate::fsutil::{durable_write, read_limited, rename_new_durable, sync_renamed_file};
 use crate::identity::{InstallId, TransactionId};
 use crate::journal::{FileJournalStore, JournalStore, Phase};
 use crate::platform::acl;
@@ -617,7 +617,9 @@ impl TicketRestore {
             return Ok(None);
         }
         let ticket = ticket_path(&self.coordination, &self.transaction);
-        match fs::rename(&ticket, &claimed) {
+        // Write-through and never replacing: the claim is durable when it
+        // returns, and only one claimer can win the claimed name.
+        match rename_new_durable(&ticket, &claimed) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),

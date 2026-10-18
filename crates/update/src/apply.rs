@@ -668,7 +668,12 @@ impl FsFileOps {
         let (result, leftover) = install_write_tracked(&path, bytes, pin);
         #[cfg(windows)]
         if let Some(scratch) = leftover {
-            self.track_scratch(scratch)?;
+            // A failed mutation keeps its own error; a successful one must
+            // not report success without the leftover being recorded.
+            let tracked = self.track_scratch(scratch);
+            if result.is_ok() {
+                tracked?;
+            }
         }
         #[cfg(not(windows))]
         let _ = leftover;
@@ -736,17 +741,32 @@ fn finish_scratch(
     scratch: PathBuf,
     name: &std::ffi::OsStr,
 ) -> (Result<()>, Option<Scratch>) {
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-        let _ = std::fs::remove_dir(&scratch);
-        return (result, None);
-    }
     let name = name.to_string_lossy().into_owned();
     let owned = vec![format!("{name}.aside"), name];
+    if result.is_err() {
+        // Only the temp file is removed. A displaced old file that could be
+        // neither placed nor put back keeps the directory alive: record it so
+        // the startup cleanup tracks it instead of leaving it untracked.
+        let _ = std::fs::remove_file(temp);
+        let leftover = unresolved_scratch(scratch, owned);
+        return (result, leftover);
+    }
     if crate::scratch::remove_owned(&scratch, &owned) {
         (result, None)
     } else {
         (result, Some(Scratch { dir: scratch, owned }))
+    }
+}
+
+/// After a failed mutation: removes the scratch directory if it is empty and
+/// otherwise returns it (with the files this updater may have put there) so
+/// it can be recorded for a later cleanup.
+#[cfg(windows)]
+fn unresolved_scratch(scratch: PathBuf, owned: Vec<String>) -> Option<Scratch> {
+    let _ = std::fs::remove_dir(&scratch);
+    match std::fs::symlink_metadata(&scratch) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(Scratch { dir: scratch, owned }),
     }
 }
 
@@ -1016,12 +1036,15 @@ impl FileOps for FsFileOps {
                 // it still fails, tracked below.
                 Ok(())
             })();
+            let owned = vec!["removed".to_owned(), "removed.done".to_owned()];
             if result.is_err() {
-                // The file stays in the scratch directory.
-                let _ = std::fs::remove_dir(&scratch);
+                // The file stays in the scratch directory: record it so the
+                // startup cleanup tracks it.
+                if let Some(left) = unresolved_scratch(scratch, owned) {
+                    let _ = self.track_scratch(left);
+                }
                 return result;
             }
-            let owned = vec!["removed".to_owned(), "removed.done".to_owned()];
             if !crate::scratch::remove_owned(&scratch, &owned) {
                 self.track_scratch(Scratch {
                     dir: scratch,
@@ -2101,6 +2124,28 @@ mod tests {
                 .all(|dir| !dir.join("a.dll.aside").exists()),
             "the listed displaced file is removed"
         );
+        assert!(!ledger_record(&coordination, &transaction).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_failed_removal_records_its_scratch_and_does_not_accumulate() {
+        let (mut fx, coordination, transaction) = tracked_fixture();
+
+        reset_barrier(true);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        let outcome = fx.ops.remove("a.dll");
+        reset_barrier(false);
+        assert!(outcome.is_err());
+
+        // The displaced file could not be settled: its scratch is recorded.
+        assert_eq!(scratch_dirs(&fx.root).len(), 1);
+        assert!(ledger_record(&coordination, &transaction).exists());
+
+        crate::startup::sweep_install_scratch(&coordination, &fx.root);
+        assert!(scratch_dirs(&fx.root).is_empty());
         assert!(!ledger_record(&coordination, &transaction).exists());
     }
 
