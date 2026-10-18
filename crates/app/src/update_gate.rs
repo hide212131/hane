@@ -44,34 +44,53 @@ pub const LIMITED_COMMIT_WAIT: std::time::Duration = COMMIT_WAIT;
 const EXPLICIT_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const EXPLICIT_OPEN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Takes the startup gate. With an explicit open request, `UpdateInProgress`
-/// is retried (each attempt takes the gate again) until `wait` has elapsed in
-/// total real time, including the time spent inside the gate calls; every
-/// other outcome is returned at once. `elapsed` reports the time since the
-/// start, and each attempt is told how long it may wait for the startup lease:
-/// never more than the remaining budget.
+/// Takes the startup gate. With an open request, `UpdateInProgress` is retried
+/// (each attempt takes the gate again). `wait` is the total real-time budget,
+/// including the time spent inside the gate calls; `None` means no budget: the
+/// gate is retaken until it reaches a terminal outcome (a Finder event is
+/// delivered only once by LaunchServices, so the process must outlive any
+/// update). Every other outcome is returned at once. `elapsed` reports the time
+/// since the start, and each attempt is told how long it may wait for the
+/// startup lease: never more than the remaining budget.
 fn gate_with_open_retry(
     mut take_gate: impl FnMut(std::time::Duration) -> GateOutcome,
     has_explicit_open: bool,
-    wait: std::time::Duration,
+    wait: Option<std::time::Duration>,
     mut sleep: impl FnMut(std::time::Duration),
     mut elapsed: impl FnMut() -> std::time::Duration,
 ) -> GateOutcome {
     loop {
-        let attempt_wait = if has_explicit_open {
-            wait.saturating_sub(elapsed()).min(STARTUP_WAIT)
-        } else {
-            STARTUP_WAIT
+        let attempt_wait = match wait {
+            Some(wait) if has_explicit_open => wait.saturating_sub(elapsed()).min(STARTUP_WAIT),
+            _ => STARTUP_WAIT,
         };
         let outcome = take_gate(attempt_wait);
         if !has_explicit_open || !matches!(outcome, GateOutcome::UpdateInProgress) {
             return outcome;
         }
-        let remaining = wait.saturating_sub(elapsed());
-        if remaining.is_zero() {
-            return outcome;
-        }
-        sleep(EXPLICIT_OPEN_RETRY_INTERVAL.min(remaining));
+        let pause = match wait {
+            Some(wait) => {
+                let remaining = wait.saturating_sub(elapsed());
+                if remaining.is_zero() {
+                    return outcome;
+                }
+                EXPLICIT_OPEN_RETRY_INTERVAL.min(remaining)
+            }
+            None => EXPLICIT_OPEN_RETRY_INTERVAL,
+        };
+        sleep(pause);
+    }
+}
+
+/// The retry budget for a launch that may carry an open request. A macOS launch
+/// may receive a Finder document that LaunchServices delivers only once, so it
+/// has no time limit and ends only on a terminal gate outcome; a launch with
+/// just a command-line path keeps the bounded wait.
+fn open_request_wait(has_cli_path: bool) -> Option<std::time::Duration> {
+    if cfg!(target_os = "macos") || !has_cli_path {
+        None
+    } else {
+        Some(EXPLICIT_OPEN_WAIT)
     }
 }
 
@@ -133,12 +152,13 @@ pub fn enter() -> Entry {
     // An explicit file argument must not be lost to an update in progress: keep
     // taking the gate (never bypassing it) and let this process deliver the path
     // through the ordinary open path once the gate admits it.
-    let has_explicit_open = may_carry_open_request(std::env::args_os().nth(1).is_some());
+    let has_cli_path = std::env::args_os().nth(1).is_some();
+    let has_explicit_open = may_carry_open_request(has_cli_path);
     let started = std::time::Instant::now();
     let outcome = gate_with_open_retry(
         |wait| startup_gate_for_exe_within(&exe, &runner, wait),
         has_explicit_open,
-        EXPLICIT_OPEN_WAIT,
+        open_request_wait(has_cli_path),
         std::thread::sleep,
         || started.elapsed(),
     );
@@ -196,7 +216,7 @@ mod tests {
                 outcome
             },
             true,
-            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
             |_| sleeps += 1,
             || Duration::ZERO,
         );
@@ -228,7 +248,7 @@ mod tests {
                 outcome
             },
             true,
-            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
             |_| {},
             || Duration::ZERO,
         );
@@ -249,7 +269,7 @@ mod tests {
         let outcome = gate_with_open_retry(
             scripted(3),
             false,
-            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
             |_| sleeps += 1,
             || Duration::ZERO,
         );
@@ -264,7 +284,7 @@ mod tests {
         let outcome = gate_with_open_retry(
             |_| GateOutcome::UpdateInProgress,
             true,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             |d| {
                 sleeps += 1;
                 clock.set(clock.get() + d);
@@ -273,6 +293,74 @@ mod tests {
         );
         assert!(matches!(outcome, GateOutcome::UpdateInProgress));
         assert_eq!(sleeps, 4);
+    }
+
+    #[test]
+    fn a_launch_without_a_time_limit_outlives_the_old_budget_and_is_admitted_once() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let queue = hane_ui::SharedExternalOpenQueue::new();
+        let mut admitted = 0;
+        let mut opened = Vec::new();
+        let outcome = gate_with_open_retry(
+            |wait| {
+                clock.set(clock.get() + wait);
+                // The update outlasts both the 60s budget and many attempts.
+                if clock.get() <= Duration::from_secs(600) {
+                    assert!(opened.is_empty(), "nothing opens before admission");
+                    GateOutcome::UpdateInProgress
+                } else {
+                    admitted += 1;
+                    GateOutcome::Unmanaged
+                }
+            },
+            true,
+            None,
+            |d| clock.set(clock.get() + d),
+            || clock.get(),
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert_eq!(admitted, 1);
+        assert!(clock.get() > Duration::from_secs(600));
+        // The Finder event arrives only after admission and opens exactly once.
+        queue.push(PathBuf::from("/notes/a.md"));
+        for _ in 0..2 {
+            queue.drain_into(|path| {
+                opened.push(path.to_path_buf());
+                hane_ui::ExternalOpenOutcome::Accepted
+            });
+        }
+        assert_eq!(opened, vec![PathBuf::from("/notes/a.md")]);
+    }
+
+    #[test]
+    fn a_launch_without_a_time_limit_still_stops_on_recovery_required() {
+        let mut calls = 0;
+        let outcome = gate_with_open_retry(
+            |_| {
+                calls += 1;
+                if calls < 3 {
+                    GateOutcome::UpdateInProgress
+                } else {
+                    GateOutcome::RecoveryRequired("broken".into())
+                }
+            },
+            true,
+            None,
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn only_a_macos_launch_is_unbounded() {
+        assert_eq!(open_request_wait(false), None);
+        if cfg!(target_os = "macos") {
+            assert_eq!(open_request_wait(true), None);
+        } else {
+            assert_eq!(open_request_wait(true), Some(EXPLICIT_OPEN_WAIT));
+        }
     }
 
     #[test]
@@ -289,7 +377,7 @@ mod tests {
                 GateOutcome::UpdateInProgress
             },
             true,
-            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
             |d| clock.set(clock.get() + d),
             || clock.get(),
         );
