@@ -841,38 +841,51 @@ fn helper_command(exe: &Path) -> Result<Command> {
 /// minimal environment, and completes the `Hello`/`Prepared` handshake. A
 /// helper that does not prepare in time is stopped; it has changed nothing.
 pub fn spawn_helper(exe: &Path, request: &HelloRequest, timeout: Duration) -> Result<SpawnedHelper> {
-    let (coordination, transaction) = Coordination::from_helper_exe(exe)?;
+    spawn_helper_checked(exe, request, timeout).map_err(|(err, _)| err)
+}
+
+/// [`spawn_helper`] that also reports, on failure, whether the helper is
+/// certain not to be running (it never started, or its exit was confirmed).
+fn spawn_helper_checked(
+    exe: &Path,
+    request: &HelloRequest,
+    timeout: Duration,
+) -> std::result::Result<SpawnedHelper, (UpdateError, bool)> {
+    let (coordination, transaction) = Coordination::from_helper_exe(exe).map_err(|err| (err, true))?;
     if transaction != request.transaction_id {
-        return Err(UpdateError::new(
-            ErrorCode::IdentityMismatch,
-            "the helper copy belongs to another transaction",
+        return Err((
+            UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "the helper copy belongs to another transaction",
+            ),
+            true,
         ));
     }
     // The secret exists before the helper does, and only this process can have
     // put it there; the helper reads it from the private directory, not from
     // anything the first frame says.
-    let nonce = Nonce::generate()?;
-    publish_session_nonce(&coordination, &transaction, &nonce)?;
+    let nonce = Nonce::generate().map_err(|err| (err, true))?;
+    publish_session_nonce(&coordination, &transaction, &nonce).map_err(|err| (err, true))?;
     let mut child = match helper_command(exe).and_then(|mut command| Ok(command.spawn()?)) {
         Ok(child) => child,
         Err(err) => {
             discard_session_nonce(&coordination, &transaction);
-            return Err(err);
+            return Err((err, true));
         }
     };
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = child.kill();
-        let _ = child.wait();
+        let stopped = child.wait().is_ok();
         discard_session_nonce(&coordination, &transaction);
-        return Err(UpdateError::new(ErrorCode::Io, "the helper pipes are unavailable"));
+        return Err((UpdateError::new(ErrorCode::Io, "the helper pipes are unavailable"), stopped));
     };
     match HelperLink::handshake(stdout, stdin, request, nonce, Some(child.id()), timeout) {
         Ok(link) => Ok(SpawnedHelper { link, child }),
         Err(err) => {
             let _ = child.kill();
-            let _ = child.wait();
+            let stopped = child.wait().is_ok();
             discard_session_nonce(&coordination, &transaction);
-            Err(err)
+            Err((err, stopped))
         }
     }
 }
@@ -890,6 +903,28 @@ pub struct PreparedRestart {
 /// ever writing a journal. Best effort: whatever cannot be verified stays.
 fn discard_unstarted_transaction(coordination: &Coordination, transaction: &TransactionId) {
     let _ = coordination.remove_unjournaled_transaction(transaction);
+}
+
+/// Cleans up a transaction that failed before `PreparedRestart` took it over.
+/// Nothing is removed unless the helper is certainly stopped; the journal and
+/// path checks are made by `remove_unjournaled_transaction`, and anything
+/// unverifiable stays.
+struct PreparingTransaction<'a> {
+    coordination: &'a Coordination,
+    transaction: &'a TransactionId,
+    helper_stopped: bool,
+    armed: bool,
+}
+
+impl Drop for PreparingTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.armed || !self.helper_stopped {
+            return;
+        }
+        crate::state_root::discard_binding(self.coordination, self.transaction);
+        crate::state_root::discard_environment(self.coordination, self.transaction);
+        discard_unstarted_transaction(self.coordination, self.transaction);
+    }
 }
 
 impl PreparedRestart {
@@ -958,12 +993,19 @@ pub fn prepare_restart(
     let coordination = placement.coordination()?;
     let transaction = TransactionId::generate()?;
     let source = crate::platform::installed_helper(placement, policy)?;
+    // From the first staged file until `PreparedRestart` owns the transaction,
+    // any early return cleans this transaction (and only this one) up.
+    let mut cleanup = PreparingTransaction {
+        coordination: &coordination,
+        transaction: &transaction,
+        helper_stopped: true,
+        armed: true,
+    };
     let copy = crate::platform::stage_helper_copy(&coordination, &transaction, &source)?;
     stage_candidate(&coordination, &transaction, candidate)?;
     crate::state_root::publish_binding(&coordination, &transaction, state_root)?;
-    crate::state_root::publish_environment(&coordination, &transaction, |name| std::env::var_os(name))
-        .inspect_err(|_| crate::state_root::discard_binding(&coordination, &transaction))?;
-    let spawned = spawn_helper(
+    crate::state_root::publish_environment(&coordination, &transaction, |name| std::env::var_os(name))?;
+    let spawned = match spawn_helper_checked(
         &copy,
         &HelloRequest {
             mode: Mode::Prepare,
@@ -972,11 +1014,14 @@ pub fn prepare_restart(
             candidate_id: Some(candidate_id.to_owned()),
         },
         PREPARE_TIMEOUT,
-    )
-    .inspect_err(|_| {
-        crate::state_root::discard_binding(&coordination, &transaction);
-        crate::state_root::discard_environment(&coordination, &transaction);
-    })?;
+    ) {
+        Ok(spawned) => spawned,
+        Err((err, stopped)) => {
+            cleanup.helper_stopped = stopped;
+            return Err(err);
+        }
+    };
+    cleanup.armed = false;
     Ok(PreparedRestart {
         spawned: Some(spawned),
         coordination,
@@ -1623,5 +1668,66 @@ mod tests {
         .unwrap();
         assert_eq!(err.code, ErrorCode::IdentityMismatch);
         helper_out.close();
+    }
+
+    /// Stages a file inside the transaction's helper directory.
+    fn stage_marker(coord: &Coordination, txn: &TransactionId) -> std::path::PathBuf {
+        let marker = coord.ensure_helper_dir(txn).unwrap().join("marker");
+        std::fs::write(&marker, b"staged").unwrap();
+        marker
+    }
+
+    fn drop_guard(fx: &Fixture, helper_stopped: bool) {
+        let _guard = PreparingTransaction {
+            coordination: &fx.coord,
+            transaction: &fx.txn,
+            helper_stopped,
+            armed: true,
+        };
+    }
+
+    #[test]
+    fn a_failed_preparation_removes_only_its_own_transaction() {
+        let fx = fixture();
+        let other = TransactionId::generate().unwrap();
+        let own_marker = stage_marker(&fx.coord, &fx.txn);
+        let other_marker = stage_marker(&fx.coord, &other);
+        drop_guard(&fx, true);
+        assert!(!own_marker.exists());
+        assert!(!fx.coord.transaction_dir(&fx.txn).exists());
+        assert!(other_marker.exists(), "another transaction stays");
+    }
+
+    #[test]
+    fn a_failed_preparation_keeps_the_transaction_when_the_helper_may_run() {
+        let fx = fixture();
+        let marker = stage_marker(&fx.coord, &fx.txn);
+        drop_guard(&fx, false);
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn a_failed_preparation_keeps_a_journaled_transaction() {
+        let fx = fixture();
+        let marker = stage_marker(&fx.coord, &fx.txn);
+        std::fs::write(fx.coord.journal_path(&fx.txn), b"{}").unwrap();
+        drop_guard(&fx, true);
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn a_prepared_handoff_disarms_the_cleanup() {
+        let fx = fixture();
+        let marker = stage_marker(&fx.coord, &fx.txn);
+        {
+            let mut guard = PreparingTransaction {
+                coordination: &fx.coord,
+                transaction: &fx.txn,
+                helper_stopped: true,
+                armed: true,
+            };
+            guard.armed = false;
+        }
+        assert!(marker.exists());
     }
 }
