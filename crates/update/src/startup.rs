@@ -359,7 +359,7 @@ pub(crate) fn retire_prior_receipts(coordination: &Coordination, current: &Trans
                     && matches!(journal.phase, Phase::Committed | Phase::RolledBack)
         );
         if terminal {
-            fs::remove_dir_all(entry.path()).map_err(|err| {
+            remove_receipt_dir(&entry.path(), &private, &name).map_err(|err| {
                 UpdateError::new(
                     ErrorCode::InstallModified,
                     bounded_reason(&format!("the previous receipt {name} cannot be retired: {err}")),
@@ -370,6 +370,49 @@ pub(crate) fn retire_prior_receipts(coordination: &Coordination, current: &Trans
     #[cfg(unix)]
     fs::File::open(&private)?.sync_all()?;
     Ok(())
+}
+
+/// Removes one terminal receipt directory. Windows has no directory fsync, so the
+/// canonical name is first renamed with a write-through move to a name that
+/// `TransactionId::parse` rejects; only then is the tombstone deleted.
+#[cfg(windows)]
+fn remove_receipt_dir(dir: &Path, private: &Path, name: &str) -> io::Result<()> {
+    retire_receipt_dir(
+        dir,
+        &receipt_tombstone(private, name),
+        crate::fsutil::rename_new_durable,
+        |path| fs::remove_dir_all(path),
+    )
+}
+
+#[cfg(not(windows))]
+fn remove_receipt_dir(dir: &Path, _private: &Path, _name: &str) -> io::Result<()> {
+    fs::remove_dir_all(dir)
+}
+
+#[cfg(any(windows, test))]
+fn receipt_tombstone(private: &Path, name: &str) -> std::path::PathBuf {
+    private.join(format!(".{name}.retired"))
+}
+
+/// The retirement is complete once `rename` (durable) succeeded: a failure before
+/// it keeps the old receipt, and a `cleanup` failure afterwards is still an error
+/// so that no new journal is created, while the canonical name stays gone.
+#[cfg(any(windows, test))]
+fn retire_receipt_dir(
+    dir: &Path,
+    tombstone: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    cleanup: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // A tombstone left by an earlier failed cleanup would block the no-replace rename.
+    match fs::symlink_metadata(tombstone) {
+        Ok(_) => cleanup(tombstone)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    rename(dir, tombstone)?;
+    cleanup(tombstone)
 }
 
 /// Reclaims transactions that were abandoned before any journal was written
@@ -1111,6 +1154,78 @@ mod tests {
         assert!(!coord.transaction_dir(&old_committed).exists());
         assert!(coord.journal_path(&other_pending).exists(), "unfinished work is never pruned");
         assert!(coord.journal_path(&current).exists());
+    }
+
+    #[test]
+    fn the_windows_retire_path_renames_the_canonical_entry_to_a_name_no_scan_accepts() {
+        let dir = TempDir::new("gate-retire-rename");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let prior = TransactionId::generate().unwrap();
+        write_versioned(&coord, &prior, ("1.0.0", "2.0.0"), Phase::Committed);
+        let private = coord.dir().join(PRIVATE_DIR);
+        let tombstone = receipt_tombstone(&private, prior.as_str());
+        assert!(TransactionId::parse(tombstone.file_name().unwrap().to_str().unwrap()).is_err());
+
+        let renames = RefCell::new(Vec::new());
+        retire_receipt_dir(
+            &coord.transaction_dir(&prior),
+            &tombstone,
+            |from, to| {
+                renames.borrow_mut().push((from.to_path_buf(), to.to_path_buf()));
+                fs::rename(from, to)
+            },
+            |path| fs::remove_dir_all(path),
+        )
+        .unwrap();
+        assert_eq!(
+            renames.into_inner(),
+            vec![(coord.transaction_dir(&prior), tombstone.clone())]
+        );
+        assert!(!coord.transaction_dir(&prior).exists());
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn a_failed_durable_rename_keeps_the_prior_receipt() {
+        let dir = TempDir::new("gate-retire-rename-fails");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let prior = TransactionId::generate().unwrap();
+        write_versioned(&coord, &prior, ("1.0.0", "2.0.0"), Phase::Committed);
+        let tombstone = receipt_tombstone(&coord.dir().join(PRIVATE_DIR), prior.as_str());
+        let result = retire_receipt_dir(
+            &coord.transaction_dir(&prior),
+            &tombstone,
+            |_, _| Err(io::Error::other("write-through rename failed")),
+            |path| fs::remove_dir_all(path),
+        );
+        assert!(result.is_err());
+        assert!(coord.journal_path(&prior).exists(), "the old receipt is kept");
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn a_cleanup_failure_after_the_rename_leaves_no_canonical_receipt_and_is_an_error() {
+        let dir = TempDir::new("gate-retire-cleanup-fails");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let prior = TransactionId::generate().unwrap();
+        write_versioned(&coord, &prior, ("1.0.0", "2.0.0"), Phase::Committed);
+        let tombstone = receipt_tombstone(&coord.dir().join(PRIVATE_DIR), prior.as_str());
+        let result = retire_receipt_dir(
+            &coord.transaction_dir(&prior),
+            &tombstone,
+            fs::rename,
+            |_| Err(io::Error::other("cleanup failed")),
+        );
+        // The caller turns this error into a refused apply, so no new journal is created.
+        assert!(result.is_err());
+        assert!(!coord.transaction_dir(&prior).exists(), "the canonical name stays gone");
+        assert!(tombstone.exists());
+        // The leftover tombstone is not a transaction: the next scan finds no receipt.
+        let disk = placement.disk_view();
+        assert!(ensure_prior_receipts_current(&coord, &*disk).is_ok());
     }
 
     #[test]
