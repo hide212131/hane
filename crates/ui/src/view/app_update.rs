@@ -944,9 +944,9 @@ pub(crate) fn run_exit_sequence(steps: &mut dyn ExitSteps) -> ExitOutcome {
 }
 
 /// [`ExitSteps`] on the real window.
-struct ViewExit<'a> {
+struct ViewExit<'a, 'c> {
     view: &'a mut EditorView,
-    cx: &'a mut Context<'a, EditorView>,
+    cx: &'a mut Context<'c, EditorView>,
     prepared: Option<Box<dyn PreparedUpdate>>,
     observation: &'a RestartObservation,
     ticket: &'a RestartTicketSnapshot,
@@ -954,7 +954,7 @@ struct ViewExit<'a> {
     ai_stopped: bool,
 }
 
-impl ExitSteps for ViewExit<'_> {
+impl ExitSteps for ViewExit<'_, '_> {
     fn permit_is_fresh(&self) -> bool {
         self.view.restart_observation_is_current(self.observation)
     }
