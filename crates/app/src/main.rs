@@ -266,8 +266,9 @@ fn main() {
     // First of all, before the AI service, state stores, any window or open
     // request: settle a pending update transaction or stop. The guard is the
     // shared runtime lease and lives until the process ends.
+    let mut recovered_restart: Option<(Option<update_restart::RestorePlan>, String)> = None;
     let _runtime_lease = match update_gate::enter() {
-        update_gate::Entry::Start { guard, state_root } => {
+        update_gate::Entry::Start { mut guard, state_root } => {
             // A committed update's first start uses the root the updating
             // application verified; it never falls back to a default of its
             // own. This runs before any store, service or window exists.
@@ -275,6 +276,18 @@ fn main() {
                 && !hane_session::pin_state_root(root)
             {
                 std::process::exit(70);
+            }
+            // The limited child may have ended after the durable `Committed`
+            // but before it claimed the ticket. The gate hands over that
+            // unclaimed ticket (bound to the committed receipt's transaction,
+            // install and state root); it is claimed once, here, before any
+            // store, service or window exists.
+            if let Some(committed) = guard.as_mut().and_then(|guard| guard.take_committed_restore()) {
+                if !hane_session::pin_state_root(committed.restore.state_root().to_path_buf()) {
+                    std::process::exit(70);
+                }
+                let plan = update_restart::restore_after_commit(&committed.restore);
+                recovered_restart = Some((plan, committed.version));
             }
             guard
         }
@@ -307,9 +320,23 @@ fn main() {
     // The callback is registered on the application before it runs, so a
     // Finder document delivered at launch is queued, not lost.
     let (finder_sender, finder_requests) = finder_channel();
-    let Some(launch) = prepare_launch(cli_path, finder_requests) else {
+    let has_cli_path = cli_path.is_some();
+    let Some(mut launch) = prepare_launch(cli_path, finder_requests) else {
         return;
     };
+    if let Some((plan, version)) = recovered_restart {
+        // Only a ticket this start claimed announces the committed version,
+        // once; an explicit path argument keeps its own folder.
+        if plan.is_some() {
+            if !has_cli_path
+                && let Some(folder) = plan.as_ref().and_then(|plan| plan.work_folder.clone())
+            {
+                launch.path = Some(folder);
+            }
+            launch.restore = plan;
+            launch.update_completed = Some(version);
+        }
+    }
     application_with_finder_open(finder_sender)
         .with_assets(AppAssets)
         .run(move |cx: &mut App| open_editor(cx, launch));

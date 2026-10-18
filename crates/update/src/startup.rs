@@ -27,6 +27,7 @@ use crate::journal::{
 use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
 use crate::platform::{self, Placement};
 use crate::protocol::{Mode, RecoveryReport, bounded_reason};
+use crate::state_root::TicketRestore;
 use crate::trust::TrustPolicy;
 
 /// How long a normal launch waits for a helper that holds the startup gate.
@@ -37,14 +38,74 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug)]
 pub struct RuntimeGuard {
     _lease: Lease,
+    committed: Option<CommittedRestore>,
+}
+
+/// The unclaimed restart ticket of the one durable `Committed` receipt, handed
+/// to a normal start whose limited child ended before it claimed the ticket.
+/// It is bound to that receipt's install, transaction and state root.
+#[derive(Debug, Clone)]
+pub struct CommittedRestore {
+    pub restore: TicketRestore,
+    /// The version the committed transaction installed.
+    pub version: String,
 }
 
 impl RuntimeGuard {
     /// Only the limited-health child, after the durable commit, builds one
     /// without passing the gate (see [`crate::health`]).
     pub(crate) fn new(lease: Lease) -> Self {
-        Self { _lease: lease }
+        Self {
+            _lease: lease,
+            committed: None,
+        }
     }
+
+    /// The restore of an unclaimed committed ticket, handed out once.
+    pub fn take_committed_restore(&mut self) -> Option<CommittedRestore> {
+        self.committed.take()
+    }
+}
+
+/// The only terminal receipt, when it is `Committed` and its ticket is still
+/// unclaimed. Called after [`scan_pending`] accepted the receipt against the
+/// disk, so the install is at the new identity. Nothing is changed or removed;
+/// a damaged binding or receipt simply yields no restore.
+fn committed_restore(coordination: &Coordination) -> Option<CommittedRestore> {
+    let private = coordination.dir().join(PRIVATE_DIR);
+    let mut found: Option<(TransactionId, String)> = None;
+    for entry in fs::read_dir(&private).ok()? {
+        let entry = entry.ok()?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(transaction) = TransactionId::parse(&name) else {
+            continue;
+        };
+        let meta = fs::symlink_metadata(entry.path()).ok()?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let Ok(Some(journal)) = FileJournalStore::new(coordination.journal_path(&transaction)).load()
+        else {
+            continue;
+        };
+        if journal.phase != Phase::Committed
+            || journal.transaction_id != transaction
+            || &journal.install_id != coordination.install_id()
+        {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((transaction, journal.destination.version.clone()));
+    }
+    let (transaction, version) = found?;
+    let restore = TicketRestore::from_binding(coordination, &transaction).ok()?;
+    restore
+        .has_unclaimed_ticket()
+        .then_some(CommittedRestore { restore, version })
 }
 
 #[derive(Debug)]
@@ -343,8 +404,13 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
             Ok(None) => {
                 return match coordination.try_acquire(LeaseKind::RuntimeShared, &[&startup]) {
                     Ok(Some(lease)) => {
+                        // Read under the startup gate, before it is released.
+                        let committed = committed_restore(&coordination);
                         startup.release();
-                        GateOutcome::Proceed(RuntimeGuard { _lease: lease })
+                        GateOutcome::Proceed(RuntimeGuard {
+                            _lease: lease,
+                            committed,
+                        })
                     }
                     Ok(None) => GateOutcome::UpdateInProgress,
                     Err(err) => stop(&err),
@@ -1251,6 +1317,107 @@ mod tests {
             );
         }
         assert_eq!(runner.calls.get(), 0);
+    }
+
+    /// A private state root and a bound, issued restart ticket for `transaction`.
+    fn bind_and_issue(
+        dir: &TempDir,
+        coord: &Coordination,
+        transaction: &TransactionId,
+        name: &str,
+    ) -> std::path::PathBuf {
+        use crate::state_root::{TicketContent, TicketFile, issue_ticket, publish_binding};
+        let root = dir.path().join(name);
+        fs::create_dir_all(&root).unwrap();
+        crate::platform::acl::secure_new(&root, true, 0o700).unwrap();
+        publish_binding(coord, transaction, &root).unwrap();
+        let file = dir.path().join("work/a.md");
+        issue_ticket(
+            coord,
+            transaction,
+            &root,
+            TicketContent {
+                work_folder: Some(dir.path().join("work").to_str().unwrap().to_owned()),
+                files: vec![TicketFile {
+                    path: file.to_str().unwrap().to_owned(),
+                    scroll_line: 1,
+                    caret_offset: 2,
+                }],
+                active: Some(0),
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn a_normal_start_claims_the_committed_ticket_the_child_never_took_once() {
+        let dir = TempDir::new("gate-committed-ticket");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        write_versioned(&coord, &transaction, ("1.0.0", "2.0.0"), Phase::Committed);
+        fs::write(placement.install_root.join("a.dll"), b"2.0.0").unwrap();
+        let root = bind_and_issue(&dir, &coord, &transaction, "state");
+        // The child died after the durable Committed, before claiming.
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        let GateOutcome::Proceed(mut guard) =
+            startup_gate(&placement, &runner, Duration::from_millis(50))
+        else {
+            panic!("a committed receipt at the new identity must proceed");
+        };
+        assert_eq!(runner.calls.get(), 0);
+        let committed = guard.take_committed_restore().expect("the ticket is unclaimed");
+        assert_eq!(committed.version, "2.0.0");
+        assert_eq!(committed.restore.state_root(), crate::state_root::validate_root(&root).unwrap());
+        assert!(guard.take_committed_restore().is_none(), "handed out once");
+        assert!(committed.restore.take().unwrap().is_some(), "the first claim restores");
+        drop(guard);
+
+        // The next start finds the ticket claimed and restores nothing.
+        let GateOutcome::Proceed(mut again) =
+            startup_gate(&placement, &runner, Duration::from_millis(50))
+        else {
+            panic!("the receipt still lets the start proceed");
+        };
+        assert!(again.take_committed_restore().is_none());
+        assert!(committed.restore.take().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_committed_ticket_is_not_used_for_another_root_or_an_uncommitted_journal() {
+        let dir = TempDir::new("gate-committed-ticket-refused");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+
+        // No binding: no restore is built.
+        let unbound = TransactionId::generate().unwrap();
+        write_versioned(&coord, &unbound, ("1.0.0", "2.0.0"), Phase::Committed);
+        assert!(committed_restore(&coord).is_none());
+        retire_prior_receipts(&coord, &TransactionId::generate().unwrap()).unwrap();
+
+        // A journal that is not Committed never lets the ticket be claimed.
+        let applying = TransactionId::generate().unwrap();
+        write_versioned(&coord, &applying, ("1.0.0", "2.0.0"), Phase::Applying);
+        let root = bind_and_issue(&dir, &coord, &applying, "state");
+        assert!(committed_restore(&coord).is_none());
+        let restore = TicketRestore::new(coord.clone(), applying.clone(), root);
+        assert!(restore.take().is_err());
+        assert!(restore.has_unclaimed_ticket(), "a refusal leaves the ticket alone");
+        retire_prior_receipts(&coord, &TransactionId::generate().unwrap()).unwrap();
+        fs::remove_dir_all(coord.transaction_dir(&applying)).unwrap();
+
+        // A committed receipt refuses a root other than the bound one.
+        let committed = TransactionId::generate().unwrap();
+        write_versioned(&coord, &committed, ("1.0.0", "2.0.0"), Phase::Committed);
+        let _ = bind_and_issue(&dir, &coord, &committed, "state-bound");
+        let other = dir.path().join("state-other");
+        fs::create_dir_all(&other).unwrap();
+        crate::platform::acl::secure_new(&other, true, 0o700).unwrap();
+        let swapped = TicketRestore::new(coord.clone(), committed.clone(), other);
+        assert!(swapped.take().is_err());
+        assert!(swapped.has_unclaimed_ticket());
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

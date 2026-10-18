@@ -402,6 +402,26 @@ impl TicketRestore {
         }
     }
 
+    /// Normal-startup side: the restore of `transaction` bound to the root its
+    /// binding names. A missing, foreign or invalid binding is an error, so a
+    /// restore is never built for another install, transaction or root.
+    pub(crate) fn from_binding(coordination: &Coordination, transaction: &TransactionId) -> Result<Self> {
+        let root = read_binding(coordination, transaction)?;
+        Ok(Self::new(coordination.clone(), transaction.clone(), root))
+    }
+
+    /// The bound state root; [`Self::take`] re-validates it against the binding.
+    pub fn state_root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether an unclaimed ticket is still waiting. Reads nothing and changes
+    /// nothing.
+    pub fn has_unclaimed_ticket(&self) -> bool {
+        fs::symlink_metadata(claimed_path(&self.coordination, &self.transaction)).is_err()
+            && fs::symlink_metadata(ticket_path(&self.coordination, &self.transaction)).is_ok()
+    }
+
     fn committed_durably(&self) -> bool {
         let store = FileJournalStore::new(self.coordination.journal_path(&self.transaction));
         matches!(
