@@ -29,12 +29,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{durable_write, read_limited};
 use crate::identity::{InstallId, TransactionId};
+use crate::journal::{FileJournalStore, JournalStore, Phase};
 use crate::platform::acl;
 use crate::platform::lease::Coordination;
 use crate::util::parse_strict;
 
 pub const BINDING_FILE: &str = "state-root.binding";
 pub const TICKET_FILE: &str = "restart-ticket.json";
+/// The ticket after the new version took it. Its existence means the ticket was
+/// already processed, so a second start never restores the same files again.
+pub const CLAIMED_FILE: &str = "restart-ticket.claimed";
 pub const BINDING_SCHEMA: u32 = 1;
 pub const TICKET_SCHEMA: u32 = 1;
 
@@ -44,9 +48,9 @@ const BINDING_LIMIT: u64 = 4096;
 const TICKET_LIMIT: u64 = 64 * 1024;
 const SETTINGS_FILE: &str = "settings.conf";
 const SETTINGS_LIMIT: u64 = 1024 * 1024;
-const MAX_TICKET_FILES: usize = 64;
-const MAX_TICKET_PATH_BYTES: usize = 2048;
-const MAX_POSITION: u32 = 100_000_000;
+pub const MAX_TICKET_FILES: usize = 64;
+pub const MAX_TICKET_PATH_BYTES: usize = 2048;
+pub const MAX_POSITION: u32 = 100_000_000;
 
 fn mismatch(detail: impl Into<String>) -> UpdateError {
     UpdateError::new(ErrorCode::IdentityMismatch, detail)
@@ -186,7 +190,9 @@ pub struct RestartTicket {
     pub active: Option<u32>,
 }
 
-fn ticket_path_ok(text: &str) -> bool {
+/// Whether `text` is acceptable as a path in a ticket: absolute, bounded, free
+/// of control characters and of `.`/`..` components.
+pub fn ticket_path_ok(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= MAX_TICKET_PATH_BYTES
         && !text.chars().any(char::is_control)
@@ -287,6 +293,170 @@ impl StateCheck {
         let bytes = read_private(&ticket_path, TICKET_LIMIT, "the restart ticket")?;
         let ticket: RestartTicket = parse_strict(&bytes)?;
         ticket.validate(self.coordination.install_id(), &self.transaction, &root)
+    }
+}
+
+// ----------------------------------------------------------------- issue
+
+fn ticket_path(coordination: &Coordination, transaction: &TransactionId) -> PathBuf {
+    coordination.transaction_dir(transaction).join(TICKET_FILE)
+}
+
+fn claimed_path(coordination: &Coordination, transaction: &TransactionId) -> PathBuf {
+    coordination.transaction_dir(transaction).join(CLAIMED_FILE)
+}
+
+/// What the application contributes to a ticket. Paths and bounded positions
+/// only; every other field of the ticket is derived here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketContent {
+    pub work_folder: Option<String>,
+    pub files: Vec<TicketFile>,
+    /// Index into `files` of the file that was active.
+    pub active: Option<u32>,
+}
+
+/// Parent side: writes `restart-ticket.json` into the transaction directory.
+///
+/// The ticket is built and fully validated first (schema, size, fields, the
+/// bound state root, this installation and transaction). Only then is
+/// `still_permitted` asked, as the very last check before the write: it
+/// re-confirms the candidate, the placement and the freshness of the restart
+/// permit. A refusal leaves no ticket behind. The file is written atomically
+/// and flushed before this returns `Ok`.
+pub fn issue_ticket(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    root: &Path,
+    content: TicketContent,
+    still_permitted: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let root = validate_root(root)?;
+    if read_binding(coordination, transaction)? != root {
+        return Err(mismatch("the state root is not the one bound to this transaction"));
+    }
+    let state_root = root
+        .to_str()
+        .ok_or_else(|| mismatch("the state root is not valid text"))?
+        .to_owned();
+    let ticket = RestartTicket {
+        schema: TICKET_SCHEMA,
+        install_id: coordination.install_id().as_str().to_owned(),
+        transaction_id: transaction.as_str().to_owned(),
+        state_root,
+        work_folder: content.work_folder,
+        files: content.files,
+        active: content.active,
+    };
+    ticket.validate(coordination.install_id(), transaction, &root)?;
+    let bytes = serde_json::to_vec(&ticket)
+        .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
+    if bytes.len() as u64 > TICKET_LIMIT {
+        return Err(UpdateError::new(
+            ErrorCode::LimitExceeded,
+            "the restart ticket is too large",
+        ));
+    }
+    still_permitted()?;
+    let path = ticket_path(coordination, transaction);
+    let _ = fs::remove_file(&path);
+    durable_write(&path, &bytes)?;
+    if let Err(err) = acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false)) {
+        let _ = fs::remove_file(&path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Removes a ticket that is no longer wanted (an aborted restart).
+pub fn discard_ticket(coordination: &Coordination, transaction: &TransactionId) {
+    let _ = fs::remove_file(ticket_path(coordination, transaction));
+}
+
+// ---------------------------------------------------------------- restore
+
+/// Whether the claimed ticket could be removed after it was used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cleanup {
+    Done,
+    /// The leftover could not be removed yet. It is harmless (it only marks
+    /// the ticket as used) and removal can be retried.
+    CleanupPending(String),
+}
+
+/// New-version side: processes the ticket of the transaction that just
+/// committed, once.
+#[derive(Debug, Clone)]
+pub struct TicketRestore {
+    coordination: Coordination,
+    transaction: TransactionId,
+    root: PathBuf,
+}
+
+impl TicketRestore {
+    pub(crate) fn new(coordination: Coordination, transaction: TransactionId, root: PathBuf) -> Self {
+        Self {
+            coordination,
+            transaction,
+            root,
+        }
+    }
+
+    fn committed_durably(&self) -> bool {
+        let store = FileJournalStore::new(self.coordination.journal_path(&self.transaction));
+        matches!(
+            store.load(),
+            Ok(Some(journal))
+                if journal.phase == Phase::Committed
+                    && journal.transaction_id == self.transaction
+                    && &journal.install_id == self.coordination.install_id()
+        )
+    }
+
+    /// Takes the ticket exactly once. It refuses unless the journal of this
+    /// transaction is durably `Committed`. The ticket is renamed to a claimed
+    /// file before it is read, so a crash while restoring, a second start or a
+    /// damaged ticket can never make the same ticket apply twice. `Ok(None)`
+    /// means there was nothing (left) to restore.
+    pub fn take(&self) -> Result<Option<RestartTicket>> {
+        if !self.committed_durably() {
+            return Err(UpdateError::new(
+                ErrorCode::NotApplicable,
+                "the update is not durably committed, so its ticket is not used",
+            ));
+        }
+        let root = validate_root(&self.root)?;
+        if read_binding(&self.coordination, &self.transaction)? != root {
+            return Err(mismatch("the state root changed after it was bound"));
+        }
+        let claimed = claimed_path(&self.coordination, &self.transaction);
+        if fs::symlink_metadata(&claimed).is_ok() {
+            return Ok(None);
+        }
+        match fs::rename(ticket_path(&self.coordination, &self.transaction), &claimed) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+        let bytes = read_private(&claimed, TICKET_LIMIT, "the claimed restart ticket")?;
+        let ticket: RestartTicket = parse_strict(&bytes)?;
+        ticket.validate(self.coordination.install_id(), &self.transaction, &root)?;
+        Ok(Some(ticket))
+    }
+
+    /// Removes the claimed ticket. A failure is reported as pending, not as an
+    /// error: the files were already restored and nothing is repeated.
+    pub fn finish(&self) -> Cleanup {
+        self.finish_with(|path| fs::remove_file(path))
+    }
+
+    pub(crate) fn finish_with(&self, remove: impl FnOnce(&Path) -> std::io::Result<()>) -> Cleanup {
+        let claimed = claimed_path(&self.coordination, &self.transaction);
+        match remove(&claimed) {
+            Ok(()) => Cleanup::Done,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Cleanup::Done,
+            Err(err) => Cleanup::CleanupPending(crate::protocol::bounded_reason(&err.to_string())),
+        }
     }
 }
 
@@ -632,5 +802,222 @@ mod tests {
         fx.check().verify().unwrap();
         fs::remove_dir_all(&fx.root).unwrap();
         assert!(fx.check().verify().is_err());
+    }
+
+    // ------------------------------------------------- issue and restore
+
+    fn content(fx: &Fixture) -> TicketContent {
+        let ticket = fx.ticket();
+        TicketContent {
+            work_folder: ticket.work_folder,
+            files: ticket.files,
+            active: ticket.active,
+        }
+    }
+
+    fn restore(fx: &Fixture) -> TicketRestore {
+        TicketRestore::new(fx.coordination.clone(), fx.transaction.clone(), fx.root.clone())
+    }
+
+    /// Writes a journal of this transaction that has reached `phase`.
+    fn journal_at(fx: &Fixture, phase: Phase) {
+        use crate::identity::{ApplyPlan, FileIdentity, PlanStep, ReleaseIdentity};
+        use crate::journal::{DurableJournal, UpdateJournal};
+
+        let release = |version: &str| ReleaseIdentity {
+            target: "x86_64-pc-windows-msvc".to_owned(),
+            version: version.to_owned(),
+            catalog_sha256: None,
+            inventory_sha256: None,
+            bundle_id: None,
+            team_id: None,
+        };
+        let plan = ApplyPlan {
+            install_id: install_id(),
+            transaction_id: fx.transaction.clone(),
+            source: release("0.25.0"),
+            destination: release("0.26.0"),
+            steps: vec![PlanStep {
+                rel_path: "a.dll".to_owned(),
+                old: Some(FileIdentity::of(b"old")),
+                new: Some(FileIdentity::of(b"new")),
+                backup_rel: Some("backup/a.dll".to_owned()),
+            }],
+            unchanged: Vec::new(),
+        };
+        let mut journal = DurableJournal::create(
+            FileJournalStore::new(fx.coordination.journal_path(&fx.transaction)),
+            UpdateJournal::begin(&plan, None).unwrap(),
+        )
+        .unwrap();
+        for step in [
+            Phase::ExitAuthorized,
+            Phase::Applying,
+            Phase::AwaitingHealth,
+            Phase::Committed,
+        ] {
+            journal.advance_phase(step).unwrap();
+            if step == phase {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn an_issued_ticket_is_what_the_child_verifies_and_contains_no_text() {
+        let fx = fixture();
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        issue_ticket(&fx.coordination, &fx.transaction, &fx.root, content(&fx), || Ok(())).unwrap();
+        fx.check().verify().unwrap();
+
+        let raw = fs::read_to_string(
+            fx.coordination.transaction_dir(&fx.transaction).join(TICKET_FILE),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["active", "files", "install_id", "schema", "state_root", "transaction_id", "work_folder"]
+        );
+    }
+
+    #[test]
+    fn a_stale_permit_or_failed_recheck_leaves_no_ticket() {
+        let fx = fixture();
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        let path = fx.coordination.transaction_dir(&fx.transaction).join(TICKET_FILE);
+
+        let refused = issue_ticket(&fx.coordination, &fx.transaction, &fx.root, content(&fx), || {
+            Err(UpdateError::new(ErrorCode::StaleJournal, "the permit is stale"))
+        });
+        assert_eq!(refused.unwrap_err().code, ErrorCode::StaleJournal);
+        assert!(!path.exists());
+        assert!(fx.check().verify().is_err());
+
+        // A previously issued ticket does not survive a refused re-issue as a valid one.
+        issue_ticket(&fx.coordination, &fx.transaction, &fx.root, content(&fx), || Ok(())).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn an_invalid_ticket_is_never_asked_about_its_permit_or_written() {
+        let fx = fixture();
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        let path = fx.coordination.transaction_dir(&fx.transaction).join(TICKET_FILE);
+        let asked = std::cell::Cell::new(false);
+
+        let mut relative = content(&fx);
+        relative.files[0].path = "relative.md".to_owned();
+        let mut dangling = content(&fx);
+        dangling.active = Some(9);
+        let mut many = content(&fx);
+        many.files = (0..=MAX_TICKET_FILES).map(|_| many.files[0].clone()).collect();
+        for bad in [relative, dangling, many] {
+            let outcome = issue_ticket(&fx.coordination, &fx.transaction, &fx.root, bad, || {
+                asked.set(true);
+                Ok(())
+            });
+            assert!(outcome.is_err());
+        }
+        assert!(!asked.get());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_ticket_for_an_unbound_or_other_root_is_not_issued() {
+        let fx = fixture();
+        // No binding yet.
+        assert!(
+            issue_ticket(&fx.coordination, &fx.transaction, &fx.root, content(&fx), || Ok(())).is_err()
+        );
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        let other = fx.dir.path().join("other-state");
+        private_dir(&other);
+        assert!(
+            issue_ticket(&fx.coordination, &fx.transaction, &other, content(&fx), || Ok(())).is_err()
+        );
+        assert!(
+            !fx.coordination
+                .transaction_dir(&fx.transaction)
+                .join(TICKET_FILE)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn the_ticket_is_used_only_after_a_durable_commit_and_only_once() {
+        let fx = fixture();
+        fx.ready();
+
+        // Nothing is taken before the journal says Committed.
+        assert!(restore(&fx).take().is_err());
+        journal_at(&fx, Phase::AwaitingHealth);
+        assert!(restore(&fx).take().is_err());
+        assert!(
+            fx.coordination
+                .transaction_dir(&fx.transaction)
+                .join(TICKET_FILE)
+                .exists(),
+            "an uncommitted update must not consume the ticket"
+        );
+
+        // Replace the journal by a committed one.
+        let _ = fs::remove_file(fx.coordination.journal_path(&fx.transaction));
+        journal_at(&fx, Phase::Committed);
+        let taken = restore(&fx).take().unwrap().expect("a ticket");
+        assert_eq!(taken, fx.ticket());
+        // A second start (or a restart after a crash) restores nothing again.
+        assert!(restore(&fx).take().unwrap().is_none());
+        assert!(restore(&fx).take().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_damaged_ticket_is_consumed_and_never_retried() {
+        let fx = fixture();
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        fx.write_private(TICKET_FILE, b"not json");
+        journal_at(&fx, Phase::Committed);
+        assert!(restore(&fx).take().is_err());
+        assert!(restore(&fx).take().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_missing_ticket_restores_nothing() {
+        let fx = fixture();
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        journal_at(&fx, Phase::Committed);
+        assert!(restore(&fx).take().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_cleanup_failure_is_pending_and_can_be_retried() {
+        let fx = fixture();
+        fx.ready();
+        journal_at(&fx, Phase::Committed);
+        assert!(restore(&fx).take().unwrap().is_some());
+
+        let failed = restore(&fx).finish_with(|_| {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "busy"))
+        });
+        assert!(matches!(failed, Cleanup::CleanupPending(_)));
+        // The ticket stays used while the cleanup is pending.
+        assert!(restore(&fx).take().unwrap().is_none());
+
+        assert_eq!(restore(&fx).finish(), Cleanup::Done);
+        assert_eq!(restore(&fx).finish(), Cleanup::Done);
+        assert!(restore(&fx).take().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rebound_root_is_refused_at_restore() {
+        let fx = fixture();
+        fx.ready();
+        journal_at(&fx, Phase::Committed);
+        let other = fx.dir.path().join("swapped");
+        private_dir(&other);
+        let swapped = TicketRestore::new(fx.coordination.clone(), fx.transaction.clone(), other);
+        assert!(swapped.take().is_err());
     }
 }

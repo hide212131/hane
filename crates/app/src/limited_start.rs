@@ -83,6 +83,10 @@ impl Render for LimitedView {
 
 pub fn run(verified: Box<VerifiedChild>) {
     let state_root = verified.state_root().to_path_buf();
+    // Used only after the helper's durable commit: the ticket of this
+    // transaction and the version that may then be announced as installed.
+    let ticket_restore = verified.ticket_restore();
+    let installed_version = verified.version().to_owned();
     let (done_tx, done_rx) = mpsc::channel::<Result<RuntimeGuard, String>>();
     let drawn = Arc::new(AtomicBool::new(false));
     {
@@ -148,6 +152,8 @@ pub fn run(verified: Box<VerifiedChild>) {
                         }
                     };
                     let state_root = state_root.clone();
+                    let ticket_restore = ticket_restore.clone();
+                    let installed_version = installed_version.clone();
                     cx.update(|cx| {
                         let started = start_after_commit(result, |guard| {
                             cx.set_global(HeldRuntimeLease(guard));
@@ -156,8 +162,24 @@ pub fn run(verified: Box<VerifiedChild>) {
                             if !hane_session::pin_state_root(state_root) {
                                 std::process::exit(EXIT_NOT_COMMITTED);
                             }
+                            // The ticket is taken here and only here: the
+                            // commit is durable (`Commit` arrived, or the
+                            // journal says `Committed`), and taking it also
+                            // refuses unless the journal agrees. A damaged or
+                            // used ticket restores nothing and never blocks
+                            // the start.
+                            let plan = crate::update_restart::restore_after_commit(&ticket_restore);
                             match crate::prepare_launch(None, finder_requests) {
-                                Some(launch) => {
+                                Some(mut launch) => {
+                                    if let Some(folder) =
+                                        plan.as_ref().and_then(|plan| plan.work_folder.clone())
+                                    {
+                                        launch.path = Some(folder);
+                                    }
+                                    launch.restore = plan;
+                                    // The first and only "updated" notice of
+                                    // this committed version.
+                                    launch.update_completed = Some(installed_version);
                                     crate::open_editor(cx, launch);
                                     let _ = window.update(cx, |_, window, _| window.remove_window());
                                 }

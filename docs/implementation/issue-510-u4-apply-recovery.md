@@ -4,7 +4,17 @@
 採用済み設計: `docs/adr/0034-zip-application-updates.md`、`docs/application-update-implementation-spec.md`、`docs/application-update-implementation-handoff.md`
 前段の実装: [#512 U0/U1/U3](https://github.com/hide212131/hane/pull/512)
 準備時の基点: `f9da614d93158fba95b5939ffdb44c67f06b8657`（#512 head）
-状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）、increment 2（Windows x64 所有ファイル適用のhelper接続）、increment 3（限定health起動とdurable commit/rollback）、increment 4（macOS bundle swapとjournal/recovery）をコードに追加済み。実macOS・実Developer ID署名・実Gatekeeperでの二版適用は未実施で、「再起動して更新」は有効化していない。
+状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）、increment 2（Windows x64 所有ファイル適用のhelper接続）、increment 3（限定health起動とdurable commit/rollback）、increment 4（macOS bundle swapとjournal/recovery）、increment 5（再起動ticket・Settingsの再起動操作・commit後の一回復元）をコードに追加済み。実macOS・実Developer ID署名・実Gatekeeperでの二版適用は未実施。`TrustPolicy::production()` は未設定のため、production buildでは「再起動して更新」は表示も実行もされない（fail-closed）。
+
+### Increment 5: 再起動ticket、再起動操作、commit後の復元（`state_root.rs`、`app/src/update_restart.rs`、`ui/src/view/app_update.rs`）
+
+- **ticket発行**（`state_root::issue_ticket`）: TransactionId / InstallId / 束縛済みstate rootと一致するticketを組み立て、schema・件数・path・サイズを検証してから、最後に `still_permitted` を呼び（候補がReadyのままか、配置が同じinstallか、restart permitが新鮮か）、通ればatomic write + fsyncする。拒否・検証失敗ではticketを残さない。内容は保存済みfile path、work folder、active、有界なscroll/caret値だけで、本文・token・command/environmentは持てない（`deny_unknown_fields`）。scroll/caretは現在 `0` を記録し、復元でも適用しない（位置の復元は未実装）。
+- **commit後の一回処理**（`TicketRestore::take`）: 当該transactionのjournalがdurableに`Committed`のときだけticketを `restart-ticket.claimed` へrenameして取得する。取得後に読むため、破損ticketや途中crashでも同じticketは二度適用されない。claimed fileの削除失敗は `Cleanup::CleanupPending` で、数回再試行し、残っても再適用はされない。取得は限定childが `Commit`（またはdurable Committed）を確認した後の `limited_start` だけで行う。
+- **復元**（`update_restart::plan_restore`）: 存在しない保存済みfileは飛ばして件数をstatusに表示し、残りを既存の通常open経路（`open_path` / `open_work_folder_entry`）で順に開く。activeは最後に開く。work folderが無ければ通常起動の既定に戻る。通常起動のdefault folder設定は書き換えない。
+- **Settingsの操作**（`EditorView::start_update_restart`）: ReadyかつサービスがrestartをサポートするときだけCardに「再起動して更新」を出す。全blocker再確認（`prepare_update_restart`）→ helper準備（background、`Prepared`を受けるまで終了しない）→ freeze → `run_exit_sequence`: permit確認 → ticket発行 → draft flush(Result付き) → AIの明示停止(10秒) → permit再確認 → `ExitAuthorized` → 通常quit。どこで失敗してもhelperをAbort（ticket削除）、freezeを解除、停止したAI serviceを再起動し、文書・設定・draft・外部openは失わない。freeze中の外部openは既存の `Busy` で送信元が保持する。
+- **サポート条件**: `AppUpdateSnapshot::restart_supported` は、trust policyが設定済み・target有り・サポート配置の `RestartWiring` が有効のときだけtrue。production buildはtrust未設定のため常にfalse。
+- **更新完了の表示**: durable Commit確認後の限定child由来のプロセスだけが、General settingsのCardに一度だけ「Hane {version} に更新しました。」を表示する。rollback/recoveryや通常起動では表示しない。
+- **検証範囲**: fake session / 一時directory / fake `ExitSteps` による単体試験のみ。実Windows・実macOSでの二版適用、実際のGUI操作、U-08/U-09/U-14の実OS証拠は未実施であり、fixture成功を実OS成功とはみなさない。
 
 ### Increment 4: macOS bundle適用と復旧（`crates/update/src/macos_apply.rs`、`platform/macos.rs`）
 

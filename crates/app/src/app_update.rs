@@ -17,9 +17,9 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use hane_ui::{AppUpdateController, AppUpdatePhase, AppUpdateSnapshot};
+use hane_ui::{AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, PreparedUpdate};
 use hane_update::archive::{ArchiveLimits, stage_archive};
 use hane_update::catalog::{
     CandidateId, VerifiedCandidate, VerifyContext, confirm_selection, record_seen, verify_catalog,
@@ -33,6 +33,8 @@ use hane_update::model::Target;
 use hane_update::trust::{SeenStore, TrustPolicy};
 use hane_update::version::{VersionRelation, parse_current_version};
 use hane_update::{ErrorCode, UpdateError};
+
+use crate::update_restart::{self, HelperHandoff};
 
 pub(crate) const CATALOG_FILE: &str = "hane-update.json";
 pub(crate) const SIGNATURE_FILE: &str = "hane-update.json.sig";
@@ -55,6 +57,17 @@ pub struct UpdateServiceConfig {
     pub updates_root: PathBuf,
     /// Private directory for the highest-seen catalog sequence.
     pub receipts_dir: PathBuf,
+}
+
+/// What the service needs to hand a Ready update to the helper. A service
+/// without it (tests, unsupported placements) never offers a restart.
+pub struct RestartWiring {
+    /// The supported placement of the running install.
+    pub placement: hane_update::platform::Placement,
+    /// The running executable, used to re-locate the install before a ticket.
+    pub exe: PathBuf,
+    /// The running application's own state root.
+    pub state_root: PathBuf,
 }
 
 /// Everything about one verified, signed release candidate.
@@ -148,6 +161,7 @@ struct Inner {
     clock: Arc<dyn Clock>,
     runner: Runner,
     state: Mutex<State>,
+    restart: OnceLock<RestartWiring>,
 }
 
 pub struct AppUpdateService {
@@ -261,8 +275,16 @@ impl AppUpdateService {
                     restoring: false,
                     restore_started: false,
                 }),
+                restart: OnceLock::new(),
             }),
         }
+    }
+
+    /// Lets the service hand a Ready update to the helper. Called once at
+    /// startup, and only for a supported placement; the restart is still
+    /// offered only when the trust policy is configured.
+    pub fn enable_restart(&self, wiring: RestartWiring) {
+        let _ = self.inner.restart.set(wiring);
     }
 }
 
@@ -741,10 +763,89 @@ impl Inner {
         })
     }
 
+    /// Whether this build can really apply a Ready update: trust material is
+    /// embedded, this OS/CPU has a distribution and the install is at a
+    /// supported placement. Everything else stays fail-closed.
+    fn restart_supported(&self) -> bool {
+        self.config.policy.is_configured()
+            && self.config.target.is_some()
+            && self.restart.get().is_some()
+    }
+
+    /// True while `candidate_id` is still the Ready update and nothing is
+    /// restoring it.
+    fn is_ready(&self, candidate_id: &str) -> bool {
+        let state = self.lock();
+        matches!(
+            &state.stage,
+            Stage::Ready { offer, .. } if !state.restoring && offer.id().as_str() == candidate_id
+        )
+    }
+
+    /// Re-confirms the Ready candidate and the install location. The ticket is
+    /// written only if this still holds.
+    fn confirm_restart(&self, candidate_id: &str) -> Result<(), String> {
+        if !self.is_ready(candidate_id) {
+            return Err("the prepared update changed".to_owned());
+        }
+        let wiring = self
+            .restart
+            .get()
+            .ok_or_else(|| "restart is not enabled".to_owned())?;
+        let placement = hane_update::platform::locate(&wiring.exe).map_err(|err| err.to_string())?;
+        if placement.install_id != wiring.placement.install_id {
+            return Err("the install location changed".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Starts the helper for the Ready candidate. The lock is not held while
+    /// the helper starts. Nothing is stopped or quit here.
+    fn prepare_restart(self: &Arc<Self>, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
+        let unsupported = || "この環境では更新を適用できません".to_owned();
+        if !self.restart_supported() {
+            return Err(unsupported());
+        }
+        let wiring = self.restart.get().ok_or_else(unsupported)?;
+        let dir = {
+            let state = self.lock();
+            match &state.stage {
+                Stage::Ready { offer, dir }
+                    if !state.restoring && offer.id().as_str() == candidate_id =>
+                {
+                    dir.clone()
+                }
+                _ => return Err("準備した更新が変わりました。もう一度お試しください".to_owned()),
+            }
+        };
+        let prepared = update_restart::start_helper(
+            &wiring.placement,
+            &self.config.policy,
+            candidate_id,
+            &dir,
+            &wiring.state_root,
+        )
+        .map_err(|err| err.to_string())?;
+        // A failure from here on drops `prepared`, which aborts the helper.
+        let coordination = wiring
+            .placement
+            .coordination()
+            .map_err(|err| err.to_string())?;
+        let inner = Arc::clone(self);
+        let candidate = candidate_id.to_owned();
+        Ok(Box::new(HelperHandoff::new(
+            prepared,
+            coordination,
+            wiring.state_root.clone(),
+            Box::new(move || inner.confirm_restart(&candidate)),
+        )))
+    }
+
     fn snapshot(&self) -> AppUpdateSnapshot {
         let state = self.lock();
         let mut snapshot = AppUpdateSnapshot::idle(self.config.current_version.clone());
         snapshot.restoring = state.restoring;
+        snapshot.restart_supported = self.restart_supported();
         let describe = |snapshot: &mut AppUpdateSnapshot, offer: &Offer| {
             snapshot.candidate_id = Some(offer.id().as_str().to_owned());
             snapshot.candidate_version = Some(offer.candidate.version().to_string());
@@ -818,6 +919,10 @@ impl AppUpdateController for AppUpdateService {
 
     fn restore_local(&self) {
         self.inner.start_restore();
+    }
+
+    fn prepare_restart(&self, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
+        self.inner.prepare_restart(candidate_id)
     }
 }
 
@@ -1007,6 +1112,22 @@ mod tests {
         run_queued(&queue);
         assert!(transport.requests().is_empty());
         assert_eq!(service.snapshot().phase, AppUpdatePhase::Unavailable);
+        assert!(!snapshot.restart_supported);
+        assert!(service.prepare_restart(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn a_service_without_a_wired_placement_never_offers_or_starts_a_restart() {
+        let dir = TempDir::new("app-update-unwired");
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        assert!(!service.snapshot().restart_supported);
+        assert!(service.prepare_restart(&"a".repeat(64)).is_err());
     }
 
     #[test]

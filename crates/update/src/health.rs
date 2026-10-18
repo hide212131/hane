@@ -884,6 +884,23 @@ impl VerifiedChild {
         self.session.state_root()
     }
 
+    /// The version the update installed (and this process is). It may be shown
+    /// as "updated" only after [`VerifiedChild::report_healthy`] returned `Ok`,
+    /// i.e. after the helper's durable commit.
+    pub fn version(&self) -> &str {
+        &self.session.capability.version
+    }
+
+    /// The handle that processes this transaction's restart ticket. Taking the
+    /// ticket itself refuses until the journal is durably `Committed`.
+    pub fn ticket_restore(&self) -> state_root::TicketRestore {
+        state_root::TicketRestore::new(
+            self.session.coordination.clone(),
+            self.session.capability.transaction.clone(),
+            self.session.capability.state_root.clone(),
+        )
+    }
+
     /// Reports `Healthy` and waits for `Commit`. The returned guard keeps the
     /// shared `runtime` lease; normal startup may follow only on `Ok`.
     pub fn report_healthy<R, W>(self, reader: R, mut writer: W, wait: Duration) -> Result<RuntimeGuard>

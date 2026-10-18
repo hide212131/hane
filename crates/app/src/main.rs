@@ -15,7 +15,7 @@ use hane_ai::{
     ShellEnvironmentPolicyFormat, SystemBrowserOpener, resolve_runtime_binary,
 };
 use hane_session::{FileStateStore, StateStores};
-use hane_ui::{AppAssets, AppUpdateController, EditorView, register_key_bindings};
+use hane_ui::{AiLifecycle, AppAssets, AppUpdateController, EditorView, register_key_bindings};
 use hane_update::clock::SystemClock;
 use hane_update::identity::{InstallFacts, InstallId};
 use hane_update::model::Target;
@@ -39,7 +39,62 @@ mod instrument;
 
 const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、Undo / Redo、Markdown記号の段階表示に加えて、画像、表、保存、自動保存、Recent Files、themeを試せます。\n\n![Hane feather](assets/phase4-feather.svg)\n\n| Feature | Status |\n|:---|---:|\n| Typora-style editing | ✓ |\n| Atomic autosave | ✓ |\n| Light / Dark theme | ✓ |\n\n## Polish\n\n画像と表も元Markdownを唯一の正として保持します。行へカーソルを移動するとsourceを編集できます。\n";
 
-struct AppOwnedAiService(AiService);
+/// Owns the AI service for the application lifetime. It is the one place that
+/// can stop the service explicitly (and wait for it) and start it again, which
+/// an update restart needs: the service must be gone before the helper may
+/// replace files, and must come back if the restart is given up.
+struct AiOwner {
+    service: std::sync::Mutex<Option<AiService>>,
+}
+
+impl AiOwner {
+    fn new(service: Option<AiService>) -> Self {
+        Self {
+            service: std::sync::Mutex::new(service),
+        }
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<AiService>> {
+        self.service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn handle(&self) -> Option<hane_ai::AiServiceHandle> {
+        self.slot().as_ref().map(AiService::handle)
+    }
+}
+
+impl AiLifecycle for AiOwner {
+    fn stop(&self, timeout: std::time::Duration) -> Result<(), String> {
+        let Some(service) = self.slot().take() else {
+            return Ok(());
+        };
+        // Dropping the service joins its worker, which may wait for a running
+        // runtime; do it on its own thread so the wait is bounded.
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("hane-ai-stop".to_owned())
+            .spawn(move || {
+                drop(service);
+                let _ = done.send(());
+            })
+            .map_err(|err| err.to_string())?;
+        finished
+            .recv_timeout(timeout)
+            .map_err(|_| "the AI service did not stop in time".to_owned())
+    }
+
+    fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+        let mut slot = self.slot();
+        if slot.is_none() {
+            *slot = start_ai_service();
+        }
+        slot.as_ref().map(AiService::handle)
+    }
+}
+
+struct AppOwnedAiService(#[allow(dead_code, reason = "owns the service for the app lifetime")] Arc<AiOwner>);
 
 impl Global for AppOwnedAiService {}
 
@@ -59,15 +114,16 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     // the startup gate leases on, and keeps its receipts in the coordination
     // directory beside the install. Anything else keeps the interim identity;
     // such a placement never becomes applicable.
-    let (install_id, receipts_dir) = match hane_update::platform::locate(&exe) {
-        Ok(placement) => {
+    let located = hane_update::platform::locate(&exe).ok();
+    let (install_id, receipts_dir) = match &located {
+        Some(placement) => {
             let receipts = hane_update::platform::lease::Coordination::receipts_dir_for(
                 &placement.coordination_parent,
                 &placement.install_id,
             );
-            (placement.install_id, receipts)
+            (placement.install_id.clone(), receipts)
         }
-        Err(_) => {
+        None => {
             let volume = install_dir
                 .components()
                 .next()?
@@ -93,7 +149,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
         }
     };
     let updates_root = state.root().join("updates").join(install_id.as_str());
-    Some(Arc::new(app_update::AppUpdateService::new(
+    let service = Arc::new(app_update::AppUpdateService::new(
         app_update::UpdateServiceConfig {
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
             target: Target::current().ok(),
@@ -107,7 +163,18 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
         },
         Arc::new(https_transport::LazyHttpsTransport::default()),
         Arc::new(SystemClock::new()),
-    )))
+    ));
+    // Only a supported placement can hand a Ready update to the helper, and
+    // even then "restart and update" is offered only once the trust policy is
+    // configured; the production policy is not, so it stays fail-closed.
+    if let Some(placement) = located {
+        service.enable_restart(app_update::RestartWiring {
+            placement,
+            exe,
+            state_root: state.root().to_path_buf(),
+        });
+    }
+    Some(service)
 }
 
 fn start_ai_service() -> Option<AiService> {
@@ -257,6 +324,12 @@ pub(crate) struct EditorLaunch {
     needs_default_prompt: bool,
     ai_service: Option<AiService>,
     update_service: Option<Arc<app_update::AppUpdateService>>,
+    /// Saved files of the previous version's window, set only for a process an
+    /// update just committed. Opened through the ordinary open path.
+    restore: Option<update_restart::RestorePlan>,
+    /// The version an update just installed, shown once in Settings. Set only
+    /// after the helper's durable commit.
+    update_completed: Option<String>,
     #[cfg(target_os = "windows")]
     open_requests: std::sync::mpsc::Receiver<PathBuf>,
     #[cfg(target_os = "macos")]
@@ -340,6 +413,8 @@ pub(crate) fn prepare_launch(
         needs_default_prompt,
         ai_service,
         update_service,
+        restore: None,
+        update_completed: None,
         #[cfg(target_os = "windows")]
         open_requests,
         #[cfg(target_os = "macos")]
@@ -359,6 +434,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         needs_default_prompt,
         ai_service,
         update_service,
+        restore,
+        update_completed,
         #[cfg(target_os = "windows")]
         open_requests,
         #[cfg(target_os = "macos")]
@@ -378,14 +455,12 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
     };
     #[cfg(not(feature = "instrument"))]
     let untitled_source: &str = DEFAULT_DOCUMENT;
-    if let Some(service) = ai_service {
-        // GPUI owns this value for the full application lifetime;
-        // views receive handles and may come and go independently.
-        cx.set_global(AppOwnedAiService(service));
-    }
-    let ai_service_handle = cx
-        .try_global::<AppOwnedAiService>()
-        .map(|owner| owner.0.handle());
+    // GPUI owns this value for the full application lifetime; views receive
+    // handles and may come and go independently.
+    let ai_owner = Arc::new(AiOwner::new(ai_service));
+    cx.set_global(AppOwnedAiService(Arc::clone(&ai_owner)));
+    let ai_service_handle = ai_owner.handle();
+    let ai_lifecycle: Arc<dyn AiLifecycle> = ai_owner;
     let update_controller: Option<Arc<dyn AppUpdateController>> = update_service.map(|service| {
         // The service belongs to the application, not to a window.
         cx.set_global(AppOwnedUpdateService(Arc::clone(&service)));
@@ -414,7 +489,13 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                         None => EditorView::new(untitled_source, "Untitled", cx),
                     };
                     view.attach_ai_service(ai_service_handle.clone(), cx);
+                    view.attach_ai_lifecycle(Some(ai_lifecycle.clone()));
                     view.attach_app_update(update_controller.clone());
+                    if let Some(version) = update_completed.as_deref() {
+                        // Only a process started by a committed update gets
+                        // this; an ordinary launch never shows it.
+                        view.show_update_completed(version, cx);
+                    }
                     #[cfg(any(feature = "instrument", feature = "timing-probe"))]
                     view.arm_startup_timing(process_started);
                     view
@@ -422,6 +503,24 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             },
         )
         .expect("open Hane window");
+    if let Some(plan) = restore {
+        // The saved files of the previous version, through the ordinary open
+        // path and in order (the active file last, so it is the one shown).
+        // A file that was deleted or moved was left out of the plan and does
+        // not stop the others.
+        let _ = window.update(cx, |view, _window, cx| {
+            for (index, path) in plan.files.iter().enumerate() {
+                if index == 0 {
+                    view.open_path(path, cx);
+                } else {
+                    view.open_work_folder_entry(path, cx);
+                }
+            }
+            if !plan.missing.is_empty() {
+                view.report_restore_skipped(plan.missing.len(), cx);
+            }
+        });
+    }
     #[cfg(feature = "instrument")]
     instrument::apply(&window, &config, cx);
     #[cfg(not(feature = "instrument"))]

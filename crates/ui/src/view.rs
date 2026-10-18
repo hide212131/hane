@@ -95,8 +95,9 @@ mod ai_prompts;
 mod ai_selection;
 mod app_update;
 pub use app_update::{
-    AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, ExternalOpenOutcome,
-    ExternalOpenQueue, RestartBlocker, RestartObservation, RestartPreparation,
+    AiLifecycle, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, ExternalOpenOutcome,
+    ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation, RestartPreparation,
+    RestartTicketFile, RestartTicketSnapshot,
 };
 mod ai_settings;
 mod background_parse;
@@ -867,6 +868,15 @@ pub struct EditorView {
     save_as_dialogs_open: usize,
     /// The AI service handle the restart check reads busy state from.
     restart_ai_service: Option<hane_ai::AiServiceHandle>,
+    /// Explicit stop/start of the AI service around an update restart.
+    ai_lifecycle: Option<Arc<dyn AiLifecycle>>,
+    /// An update restart is being prepared or is about to quit.
+    restart_in_progress: bool,
+    /// Why the last restart attempt did not proceed, shown on the card.
+    restart_message: Option<String>,
+    /// Version of the update this process was started for, shown once after
+    /// the helper's durable commit.
+    update_completed: Option<String>,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -1739,6 +1749,10 @@ impl EditorView {
             external_open_generation: 0,
             save_as_dialogs_open: 0,
             restart_ai_service: None,
+            ai_lifecycle: None,
+            restart_in_progress: false,
+            restart_message: None,
+            update_completed: None,
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
