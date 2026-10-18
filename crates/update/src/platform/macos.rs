@@ -79,6 +79,26 @@ fn query_volume(path: &Path) -> Result<VolumeFacts> {
     })
 }
 
+/// Bytes an unprivileged writer can still allocate on the volume of `path`
+/// (`f_bavail * f_bsize`). A failed query or an overflow is an error.
+fn query_available_bytes(path: &Path) -> Result<u64> {
+    let failed = || UpdateError::new(ErrorCode::Io, "the free space of the install volume could not be queried");
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| failed())?;
+    // SAFETY: `statfs` is plain data, so the zeroed value is valid storage; the
+    // path is NUL-terminated and the out-pointer refers to that local.
+    let (rc, stat) = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        let rc = libc::statfs(c_path.as_ptr(), &mut stat);
+        (rc, stat)
+    };
+    if rc != 0 {
+        return Err(failed());
+    }
+    u64::from(stat.f_bavail)
+        .checked_mul(u64::from(stat.f_bsize))
+        .ok_or_else(|| UpdateError::new(ErrorCode::LimitExceeded, "the free space of the install volume overflows"))
+}
+
 /// `struct attrlist` of `<sys/attr.h>`.
 #[repr(C)]
 struct AttrList {
@@ -307,6 +327,10 @@ pub struct MacHost;
 impl BundleHost for MacHost {
     fn volume(&self, path: &Path) -> Result<VolumeFacts> {
         query_volume(path)
+    }
+
+    fn available_bytes(&self, path: &Path) -> Result<u64> {
+        query_available_bytes(path)
     }
 
     /// Proves the exchange between the two parents with scratch directories

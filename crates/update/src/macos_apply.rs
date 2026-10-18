@@ -57,7 +57,7 @@ use crate::journal::{
     DiskView, DurableJournal, FileJournalStore, Observed, Phase, StepState, UpdateJournal,
     identity_matches,
 };
-use crate::limits::{MAX_CATALOG_BYTES, MAX_SIGNATURE_BYTES};
+use crate::limits::{JOURNAL_RESERVE_BYTES, MAX_CATALOG_BYTES, MAX_SIGNATURE_BYTES};
 use crate::model::{MACOS_BUNDLE_ID, Target, UPDATER_PROTOCOL};
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
@@ -105,6 +105,8 @@ pub struct VolumeFacts {
 /// re-signing, no Gatekeeper bypass.
 pub trait BundleHost {
     fn volume(&self, path: &Path) -> Result<VolumeFacts>;
+    /// Bytes that can still be allocated on the volume of `path`.
+    fn available_bytes(&self, path: &Path) -> Result<u64>;
     /// True only if an exchange of two scratch directories created in
     /// `first_dir` and `second_dir` really worked. They are the parents the
     /// real exchange will touch. The scratch directories are removed again.
@@ -756,6 +758,25 @@ fn holds(ops: &BundleOps<'_>, rel_path: &str, wanted: &Option<FileIdentity>) -> 
     Ok(identity_matches(&ops.observe(rel_path)?, wanted))
 }
 
+/// Refuses, with nothing changed, when the install volume (and the coordination
+/// area) cannot hold [`JOURNAL_RESERVE_BYTES`]. A failed query is a refusal.
+fn ensure_journal_space(inputs: &BundleApplyInputs<'_>) -> Result<()> {
+    let txn_dir = inputs.coordination.transaction_dir(inputs.transaction);
+    let available = inputs
+        .host
+        .available_bytes(&inputs.placement.install_root)?
+        .min(inputs.host.available_bytes(&txn_dir)?);
+    if available < JOURNAL_RESERVE_BYTES {
+        return Err(UpdateError::new(
+            ErrorCode::InsufficientSpace,
+            format!(
+                "the update needs {JOURNAL_RESERVE_BYTES} free bytes but only {available} are available"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Journal intent, exchange, observation, journal result. Any error leaves the
 /// caller to recover from the disk.
 fn swap_bundle(
@@ -803,6 +824,10 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     }
     let verified = verify_and_plan(inputs)?;
     let live = &inputs.placement.install_root;
+    // The candidate is staged (its bytes are already consumed), so only the
+    // journal updates and the rollback still need room. Checked before the
+    // first mutation of the receipt, the journal or the install.
+    ensure_journal_space(inputs)?;
     // The previous terminal receipt must still describe this install before
     // anything is mutated; otherwise it could not be retired safely.
     crate::startup::ensure_prior_receipts_current(inputs.coordination, &BundleView::new(live))?;
@@ -1021,6 +1046,8 @@ mod tests {
         local: Cell<bool>,
         read_only: Cell<bool>,
         slot_on_other_volume: Cell<bool>,
+        /// `None` makes the free-space query fail.
+        available: Cell<Option<u64>>,
         bad_signature: RefCell<Vec<PathBuf>>,
         bad_gatekeeper: RefCell<Vec<PathBuf>>,
         journal_path: RefCell<Option<PathBuf>>,
@@ -1039,6 +1066,7 @@ mod tests {
                 local: Cell::new(true),
                 read_only: Cell::new(false),
                 slot_on_other_volume: Cell::new(false),
+                available: Cell::new(Some(u64::MAX)),
                 bad_signature: RefCell::new(Vec::new()),
                 bad_gatekeeper: RefCell::new(Vec::new()),
                 journal_path: RefCell::new(None),
@@ -1057,6 +1085,12 @@ mod tests {
                 local: self.local.get(),
                 read_only: self.read_only.get(),
             })
+        }
+
+        fn available_bytes(&self, _path: &Path) -> Result<u64> {
+            self.available
+                .get()
+                .ok_or_else(|| UpdateError::new(ErrorCode::Io, "free space unavailable"))
         }
 
         fn supports_swap(&self, _first_dir: &Path, _second_dir: &Path) -> Result<bool> {
@@ -1601,6 +1635,27 @@ mod tests {
         let err = apply_bundle(&fx.inputs()).err().unwrap();
         assert_eq!(err.code, ErrorCode::TrustUnconfigured);
         assert!(fx.untouched());
+    }
+
+    #[test]
+    fn too_little_or_unknown_free_space_refuses_before_any_receipt_journal_or_exchange() {
+        for available in [Some(0), Some(JOURNAL_RESERVE_BYTES - 1), None] {
+            let fx = fixture();
+            fx.host.available.set(available);
+            let err = apply_bundle(&fx.inputs()).err().unwrap();
+            let expected = if available.is_some() { ErrorCode::InsufficientSpace } else { ErrorCode::Io };
+            assert_eq!(err.code, expected, "{available:?}");
+            assert!(fx.untouched(), "the install changed for {available:?}");
+        }
+    }
+
+    #[test]
+    fn exactly_the_journal_reserve_is_enough_to_apply() {
+        let fx = fixture();
+        fx.host.available.set(Some(JOURNAL_RESERVE_BYTES));
+        let applied = apply_bundle(&fx.inputs()).ok().unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+        assert!(fx.live_is_new());
     }
 
     #[test]
