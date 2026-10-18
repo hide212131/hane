@@ -7,7 +7,7 @@
 
 採用設計を維持し、仕様書の作り直しは行わない。設計の正本は[短い入力欄の実装仕様書](../refactor-rf3b-short-text-input-implementation-spec.md)で、§3・§5〜§10を実装・受入契約とする。
 
-2026-10-19現在、Issue #305はOPENで、受入条件5件はすべて未チェック。PR #497はOPEN / Draft、current head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、base `fd894ff8136cfe0bcae903211b3b422713db8b54`。ClaudeのAADW実装依頼run `39139696316`はprepare・worker・trusted finalizer・exact-result verifierがsuccess。Sonnet 5.5確認、workspace regression tests、lintもsuccess。通常PR CI run `39139812875`は`action_required`でjobなし。CodeRabbitのsuccess statusはDraft未レビューを意味しない。
+2026-10-19の確認時点でIssue #305はOPEN、受入条件5件はすべて未チェック。PR #497もOPEN / Draft。製品コードの確認済みheadは`a2b1062f573aa28a5117ba1d50e8a9db23b33e70`で、その後のPR更新は引き継ぎ文書だけ。baseは`fd894ff8136cfe0bcae903211b3b422713db8b54`。ClaudeのAADW実装依頼run `39139696316`は同製品headでprepare・worker・trusted finalizer・exact-result verifierがsuccess。Sonnet 5.5確認、workspace regression tests、lintもsuccess。PRの最新head・compare・CIはGitHub上の[PR #497](https://github.com/hide212131/hane/pull/497)を再取得する。CodeRabbitのsuccess statusだけではDraft PRのfull review完了を意味しない。
 
 このheadにはG04向けのbounds-origin変更通知が入った。Windows current-head確認ではrename行移動後の候補位置と変換確定後クリックを確認した。C05ではfilter composition中の再クリックによるcaret位置更新と、rename再クリック時の位置変更拒否を確認したが、filter blur後の文字列保持は未確認のためC05全体はPARTIAL。filter再クリック後もIME候補popupがクリック前の座標に残った観測は、G04の「現在の文字位置付近」条件に対する未達サブケースとして記録する。current mainで同じ操作を比較しておらず、PR固有の回帰とはまだ断定できない。macOS current-head release buildはできたが、候補起動がCUA timeout、Finderの無害なclickもCUA再初期化後にnoWindowsAvailableとなり、Mac GUI試験を開始できなかった。利用者の最新read-only確認はKeyhac hook OFF。以後、Keyhacの設定・トレイ・shortcut・processは操作しない。G06 callback-order regressionも残る。#496/#495の採用済み内容は再設計しない。
 
@@ -39,8 +39,8 @@
 - 2026-10-19の再確認でもcurrent mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`、Issue #305はOPEN、5つの受入条件はすべて未チェックのまま。
 - PR #496: MERGED、head `14def973e496c39b503c006db21fd187718ad683`。CodeRabbit full reviewは最終headで完了し、actionable commentなし。
 - PR #495: MERGED、head `76d53cbf5b33a51ed91dfa259ced76403064872a`。OS別の文書端選択挙動を受け入れ済み。#497のC09がその挙動を保護する。
-- PR #497はOPEN / Draft、current head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、base `fd894ff8136cfe0bcae903211b3b422713db8b54`、mergeable。baseから29 commits ahead / 0 behind。current PR CI run `39139812875`は`action_required`でjobsなし。以前のrun `39126127128`は旧head `561c94d...`のsuccessであり、現headのCI successではない。
-- GitHub上のIssue #305本文とPR #497本文はcurrent head `a2b1062...`、Windows run 2、C05の部分確認とG04のpopup位置未達、受入チェック未完了を反映するよう更新済み。IssueはOPEN、PRはDraftのまま。この引き継ぎ文書の今回の更新は、PR #497の文書差分として記録する。
+- PR #497はOPEN / Draftのまま。製品コードは`a2b1062...`、その後は引き継ぎ文書だけを更新した。current baseは`fd894ff8136cfe0bcae903211b3b422713db8b54`。正確なPR head・ahead/behind・最新CIはGitHub上のPR metadataとchecksで再取得する。旧head `561c94d...`のCI成功をcurrent headの結果に読み替えない。
+- GitHub上のIssue #305本文とPR #497本文は、Windows run 2、C05の部分確認、G04のpopup位置未達、受入チェック未完了を反映するよう更新済み。IssueはOPEN、PRはDraftのまま。current headと最新CI状態は作業再開前にPR metadataから読み直す。
 - current main `fd894ff...`にはGUI失敗時の復旧runbook更新（#522）が含まれる。今回その文書と`AGENTS.md`を読み直し、Windows GUIは接続済みWindows版ChatGPTから直接操作し、Mac経由のVMware操作は使わないことを確認した。
 - 利用者からWindows環境を修復したとの連絡があり、papa-winのnative CUAでWindows再確認を完了した。Haneの`foreground window did not report a process id`はCUA session reset・`@oai/sky`再import・最新window再取得で解消し、その後のGUI操作を継続できた。復旧は確認したが、原因イベントは未特定。current main G04 baselineはrename行移動でFAIL、候補head `561c94d`のG01/G02/G03/G05/G06は確認済み、G04はfilter側の一部条件のみでPARTIAL。詳細を次節に記録する。
 - 2026-10-18の再開では、current mainの復旧手順に沿ったWindows CUAの軽量確認が通った。Explorerの画面取得・無害なクリック・検索欄への入力を別々に確認し、入力表示後に検索を閉じた。途中のelement indexエラーは状態再取得と座標操作で解消。更新確認は`up_to_date`だったが、これはCodex desktop updaterの状態で、ChatGPTサービスの更新を示すものではない。
@@ -52,7 +52,7 @@
 - 最後のClaude製品実装commitは`a043ba76c9337eecbf1b78a88f8db8bac7cb502e`で、ShortTextInputへのfilter/rename移行、M01〜M15、C01〜C09を含む。今回のmerge commitではcurrent main側の`view.rs`等も入ったため、これまでのGUI結果は同期済みPR候補の受入証拠ではない。
 - current candidate head `561c94d`のCI run [39126127128](https://github.com/hide212131/hane/actions/runs/39126127128) はsuccessで、macOS / Windows workspace tests、OS別check、Clippyが成功。release-only checksはskip。
 - 候補コードでの`view::input_routing::tests` 59件、`short_text_input::tests` 19件、および`cargo build --locked -p hane`成功記録がある。これらはnative GUI受入の代替ではない。
-- 利用者指定のcurrent-head Codex代替レビューをPR review [5563807610](https://github.com/hide212131/hane/pull/497#pullrequestreview-5563807610)として投稿した。対象は`a2b1062...`のG04 bounds-refresh差分。実画面ではC05のfilter caret位置更新は確認できた一方、同じ再クリック後のIME候補popupは旧位置に残り、G04の候補位置条件に合わないことをline 115に記録した。CodeRabbit full reviewやformal AADW `@codex review`ではない。PR #497はDraftでcurrent-head CIも`action_required`のため、formal `@codex review`のAADW fallback条件を満たしていない。PR #496のCodeRabbit full reviewは最終head `14def973`で完了し、actionable指摘なし。
+- 利用者指定のcurrent-head Codex代替レビューはproduct code head `a2b1062...`を対象に行った。前の要約を訂正する[Codex review note](https://github.com/hide212131/hane/pull/497#pullrequestreview-5563847682)で、C05 caret位置更新は観測済み、G04 popup位置サブケースは未達、blur保持は未確認、current mainとの同条件比較は未実施と区別した。これはCodeRabbit full reviewやformal AADW `@codex review`ではない。PR #496のCodeRabbit full reviewは最終head `14def973`で完了し、actionable指摘なし。
 - 最後のClaude製品実装commitは`a043ba76c9337eecbf1b78a88f8db8bac7cb502e`。current G04 fix commit `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`は`crates/ui/src/input.rs`と`crates/ui/src/view.rs`を変更し、active short text fieldのbounds originが変わった時に次frameのcharacter-coordinate/IME位置再計算を依頼する。新しいtest `text_input_bounds_report_origin_moves_for_ime_position_refresh`はfilter/rename双方でoriginの初期・不変・移動を確認する。Windows GUIではrename行移動後の候補追従は確認できたが、filterの再クリックはcaretだけ動き、IME候補popupが旧座標に残った。
 - G04の静的確認では、`InlineRenameInput::prepaint`が各frameの`bounds`を`EditorView::set_text_input_bounds`へ渡し、`bounds_for_range`が現在のrender selection/caretと受け取った`bounds`から1px caret rectを返す接続を確認した。新headではbounds originの移動を検出して`Window::invalidate_character_coordinates`を呼び、固定boundsのcaret testにbounds移動のstate regressionを追加した。これは実際のWindows IME候補windowを動かすGUI証拠の代替ではない。
 - 2026-10-18、同じheadで未分類のG04観測をClaudeのAADW diagnostics-onlyへ一度依頼した。根本原因IDは`issue-305-g04-windows-ime-bounds-after-sidebar-resize`、evidence commentは[#6251236043](https://github.com/hide212131/hane/pull/497#issuecomment-6251236043)、診断依頼commentは[#6251239865](https://github.com/hide212131/hane/pull/497#issuecomment-6251239865)。workflow run [39137331278](https://github.com/hide212131/hane/actions/runs/39137331278)は診断artifactの生成までsuccess。artifact `12140496696`の`diagnosis.json`はtarget SHA `561c94d...`、`failure_class=unknown`、`product_acceptance=not_evaluated`。製品変更・pushは行っていない。
@@ -152,6 +152,6 @@ Haneプロセスは残存0、候補checkoutはclean、専用fixture 8件のpath/
 
 現在の具体的な一手は、実装担当がcurrent mainとcandidate `a2b1062...`でfilter composition中の欄内再クリックを同じIME・caret位置で比較し、C05のcaret移動とG04の候補位置を別々に記録するfocused regressionを追加すること。candidateではcaretがクリック位置へ移る一方、popupは旧座標に残る。current main側の同条件結果は未確認なので、まず再現・差分を確定してから原因を狭める。専用fixtureを使い、Keyhacは操作しない。
 
-Windows current-head run 2でC05のfilter caret位置更新は確認し、G04の候補popup旧位置残留を記録済み。次はそのG04サブケースをcurrent mainとcandidateで比較し、macOS current-headの未確認GUI条件とG06 callback-order regressionを補う。現headのPR reviewとIssue/PR本文は更新済みだが、通常PR CIはaction_required。必要な検証・CI・レビューが揃うまでPRはDraft、IssueはOPENのまま維持する。
+Windows run 2でC05のfilter caret位置更新は確認し、G04の候補popup旧位置残留を記録済み。次はそのG04サブケースをcurrent mainとcandidateで比較し、macOSの未確認GUI条件とG06 callback-order regressionを補う。current-head PR CIと必要なレビューは、作業開始前にGitHubの最新状態を確認する。必要な検証・CI・レビューが揃うまでPRはDraft、IssueはOPENのまま維持する。
 
 全Gの証拠が揃うまでPR #497はDraftを維持し、Issue #305の5条件を満たしたと扱わない。受入条件が実際に満たされるまでIssueはOPENのままにする。
