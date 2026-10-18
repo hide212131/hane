@@ -1,51 +1,44 @@
 # Issue #305 実装引き継ぎ
 
-更新日: 2026-10-17（日本時間）
+更新日: 2026-10-18（日本時間）
 対象: hide212131/hane Issue #305 / PR #497
-次にGitHubへ書き込む前にもmain、Issue、PR head/checks/reviews、active AADW runを再取得してください。
 
-## 設計とIssue
+## Issue と設計
 
-Issue #305はopenです。5つの受入条件は未達のまま残し、設計mergeだけで閉じません。設計PR [#496](https://github.com/hide212131/hane/pull/496) はmerge済み、最終head `14def973e496c39b503c006db21fd187718ad683`。正本は [実装仕様書](../refactor-rf3b-short-text-input-implementation-spec.md) で、§3・§5〜§10を実装契約とします。設計を作り直しません。
+Issue #305 は open。5つの受入条件は未達のまま維持し、設計PRのmergeやCI成功だけで閉じない。
 
-current mainは `efb38c2a0167bac8d0dfa512bacd0f85ba21817b`。設計読解基準 `2164b895e849eef4de8c80c3696c0fd8e00c496b` から7 commit進み、その範囲はAADW verifier/testsと設計・運用文書です。製品Rust source/testはmainに追加されていません。
+設計PR [#496](https://github.com/hide212131/hane/pull/496) はmerge済み。採用仕様の正本は [短い入力欄の実装仕様書](../refactor-rf3b-short-text-input-implementation-spec.md)（設計PR最終head `14def973e496c39b503c006db21fd187718ad683`）。設計を作り直さず、仕様§3・§5〜§10を実装契約とする。
 
-## AADW計測の修正
+## current main と並行変更
 
-前回run [39024106716](https://github.com/hide212131/hane/actions/runs/39024106716) はClaude worker成功後、52,504,659 byteの通常ログを旧16 MiB上限で拒否し、positive modelUsageを確認できずpatch/finalizer/verifyへ進みませんでした。旧runのusageは遡及証明できません。
+確認時点のcurrent mainは `aab1dd5a28dc1383d34e09e0e2f01b634ad6301a`。PR #495、#501、#503とAADW運用PR #514はすべてmainへmerge済み。#514はClaude実行ログの64 MiB bounded readと不正入力の拒否、positive modelUsage確認を維持する専用運用PRであり、製品仕様を変えない。
 
-専用運用PR [#514](https://github.com/hide212131/hane/pull/514) は64 MiB有限上限と上限+1 byteのbounded readを導入し、missing/symlink/non-regular/malformed/oversized拒否とpositive Sonnet 5.5 usage確認を維持しました。CI [39025192853](https://github.com/hide212131/hane/actions/runs/39025192853) とCodexレビュー [5557402407](https://github.com/hide212131/hane/pull/514#pullrequestreview-5557402407) の後、専用運用PRとしてmainへmerge済みです。保護パスguardは緩和していません。
+#495で受け入れられたOS別のSelectDocumentStart/End割当と短い欄での選択動作を維持する。仕様§6.2・§10.2の条件付きC09を現候補へ追加済み。未受入コードを別PRから取り込んでいない。
 
-## 実装PR #497
+## PR #497 の候補
 
-このfollow-up handoff更新直前のPR headは `e9be7f1c920e6066cfcabd3f13fbaedf691d9099`。PRはopen/Draftです。製品コード・exact AADW verification対象は `2c659e2723fd4f99f7c58b31227758dd6b03ebd5`。製品commit後のPR commit `a9324af`、`3994e39`、`7352af0`、`a202c0a`、`e9be7f1` はすべてhandoff文書のみです。current main `efb38c2` との比較はこの更新前でahead 18 / behind 3、merge base `e82b9a9fe42280bfa78497746bcd7e21c73430c5`。このfollow-upも文書のみで、commit後はahead 19 / behind 3になります。製品コードと10 filesの内訳は変わりません。
+この文書更新前の製品コード・テスト候補は `a043ba76c9337eecbf1b78a88f8db8bac7cb502e`。PRはopen / Draft、baseはcurrent main `aab1dd5a28dc1383d34e09e0e2f01b634ad6301a`、比較はahead 22 / behind 0、merge baseはcurrent main。PR差分は11 filesで、共通型 ShortTextInput、filter/rename切替、M01〜M15、C01〜C09を含む。
 
-`crates/ui/src/short_text_input.rs` に共通型とM01〜M15を追加し、filter/renameの文字列・selection・marked/composition状態、編集helper、初期化/reset、描画読み出し、test fixtureを一括切替しました。既存のC01〜C08を維持し、未mergeの#495に依存するC09は加えていません。filterとrenameは別々のモデル値です。focus、入力先判定、clipboard順、通知・一覧更新、pending時の操作差、描画bounds、OS取消通知と遅延入力guardは既存所有者に残しました。#495/#501/#503の未mergeコードは取り込んでいません。
+最新のClaude修正は古いString fixtureをShortTextInput fixtureへ直し、#495の文書端選択actionをfilter・通常rename・pending rename・本文で確認するC09を追加したもの。製品実装をこの文書更新で追加しない。文書をPRへcommitするとheadは進むため、その後の判断ではGitHubから新しいheadを取り直すこと。
 
-### 検証とレビュー
+## 検証・レビュー
 
-AADW run [39025772438](https://github.com/hide212131/hane/actions/runs/39025772438) はprepare、worker、Sonnet 5.5 positive usage確認、patch upload、trusted finalizerが成功しました。trusted verifyはexact product head `2c659e2723fd4f99f7c58b31227758dd6b03ebd5` で `cargo test --workspace --all-features --locked` と `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` を実行し、両方successしました。依存 `block v0.1.6` の将来Rust互換性warningはありましたが、tests/lintは成功です。独立した `cargo test -p hane-ui --all-features` の実行記録はありません。
+- AADW run [39080808213](https://github.com/hide212131/hane/actions/runs/39080808213) はprepare、Claude worker、Sonnet 5.5確認、trusted finalizer、exact worker result のworkspace testsとClippyまでsuccess。製品候補SHAは `a043ba76c9337eecbf1b78a88f8db8bac7cb502e`。
+- 通常PR CI [39080917931](https://github.com/hide212131/hane/actions/runs/39080917931) はattempt 2で再実行中。対象headは同じ `a043ba76c9337eecbf1b78a88f8db8bac7cb502e`。確認時点ではmacOS / Windowsのworkspace tests、OS別チェック、Clippyが進行中で、完了扱いにしない。以前のhead `8effd04` では#495由来の古いfixtureが原因で失敗した。今回の修正はそのfixtureを直す。
+- 直前のCodex代替レビュー [5557600998](https://github.com/hide212131/hane/pull/497#pullrequestreview-5557600998) はhead `53baadbb96d5a1eb5b5927322b5e01a5bbd18922` が対象で、今回のC09追加前。current候補の正式レビューとはみなさない。
+- CodeRabbitはDraftのためreviewをskipしている。current-head CI成功後にPRをnon-draftへ進め、current mainのCommander Policyに従ってCodeRabbit full reviewを確認する。Codex fallbackはPolicyの条件を満たした場合だけ使う。
 
-直前のhandoff head `e9be7f1` の通常PR CI [39029177481](https://github.com/hide212131/hane/actions/runs/39029177481) はmacOSとWindowsのworkspace tests、OS別チェック、Clippyがsuccessしました。release-only jobは対象外でskipです。このfollow-up文書commit後のPR headはahead 19 / behind 3となり、CI結果は別途確認します。CI successはnative GUI受け入れの代わりにはなりません。
+## GUI と残課題
 
-Codex代替レビュー [5557581322](https://github.com/hide212131/hane/pull/497#pullrequestreview-5557581322) はhead `e9be7f1` で追加指摘なしでした。状態snapshotとMarkdown code spanの指摘は修正済みで、3つのreview threadをresolve済みです。このfollow-upも文書のみで、製品コード差分を変えません。CodeRabbitのstatus successはfull reviewの証拠とは扱いません。
+仕様§10のG01〜G06はmacOS / Windowsとも未実施。CI、AADWのworkspace tests、画面captureを実GUI操作の代わりにしない。
 
-ローカルmacOS debug buildはsource checkout `a9324faf9aa934a52c65af9eb654c3f1fc4e1324` から作成し、binary SHA-256は `d46bbb88ef9558beec9cd501307b0894af0b8800489f75d56de461ff9f8accc3` です。これはbuild確認のみで、focused GUIシナリオの証拠ではありません。仕様§10のnative GUI G01〜G06はmacOS/Windowsとも未実施です。CUAでは候補アプリ画面へのクリックが失敗し、VMware FusionのWindows VMにも入力できませんでした。IME候補位置、取消、clipboard/focus、rename待ちと完了後の遅延入力は両OSで未確認です。画面確認できたbuild/head、操作、期待/観測値、画像または動画がそろうまでpassにしません。
+Windows VM画面は取得できるが、空白領域へのクリックもComputer Use backendから `noWindowsAvailable` で失敗した。したがって入力を送れず、Windows GUI acceptanceはunknown。Mac側も候補headでのfocused G01〜G06 evidenceはない。IME、候補位置、clipboard/focus、rename待ちと完了後の遅延入力は未確認。G06の5秒遅延は隔離checkoutにだけ入れ、製品PRへ含めない。
 
-## 並行PR
+## 次の手順
 
-- [#495](https://github.com/hide212131/hane/pull/495): open/ready・未merge、current head `76d53cbf5b33a51ed91dfa259ced76403064872a`。`actions.rs` / `view.rs` / `input_routing.rs`が重なります。current-head CI [39022930215](https://github.com/hide212131/hane/actions/runs/39022930215) のmacOS/Windows workspace tests・Clippyはsuccessです。full review実施の証拠は未確認で、CodeRabbit statusはpendingです。未受入コード・条件付きC09を取り込みません。
-- [#501](https://github.com/hide212131/hane/pull/501): open/ready・未merge、current head `1ba71efb6518ce475bbefc10be3629940fc5888c`。`view.rs` / `sidebar.rs`が重なります。current-head CI [39027698405](https://github.com/hide212131/hane/actions/runs/39027698405) のmacOS/Windows workspace tests・OS別チェック・Clippyはsuccessです。未mergeコードを持ち込みません。
-- [#503](https://github.com/hide212131/hane/pull/503): open/ready・未merge、current head `1ce4f06368b5045fcd0301a0171e4b7613d243b2`。`view.rs`が重なります。current-head CI [39029224160](https://github.com/hide212131/hane/actions/runs/39029224160) はmacOS/Windowsともworkspace tests後のClippyがfailureでした。変更は未mergeのままです。
+1. この文書更新後のPR current head、base、checksを再取得し、current-head macOS / Windows CIを完了させる。
+2. CodeRabbitのcurrent-head full reviewを取得し、指摘を仕様と照合する。CodeRabbitがPolicy上のfallback条件を満たさない限り、Codex reviewへ切り替えない。
+3. 両OSで仕様§10のG01〜G06を実行し、head/build、入力方式、操作、期待/観測値、画像または動画を記録する。取得不能な結果はunknownのまま残す。
+4. 旧状態/helper撤去、受入5条件、最終SHA、revert方法を照合する。merge前にexpected head、base、CI、review、必要なGUI evidence、mergeabilityを再確認し、Issue #305はすべての受入条件が満たされるまでopenのままにする。
 
-#495/#501/#503の受入は#305の一律先行条件にしません。mainへ入った変更が短い入力欄と実際に重なる場合だけ仕様§6.2で再評価します。
-
-## 残作業
-
-1. 次の書込み前にmain、Issue、PR head/checks/reviews、active AADW runを再取得する。本書のsnapshotはhandoff head `e9be7f1` 時点で、このfollow-up文書commitの後にPR headが進みます。
-2. 仕様§10のG01〜G06をmacOSとWindowsで実施し、OS/build/head、操作、期待/観測値、画像または動画を記録する。Windows shortcut確認前にKeyhac hookをOFF、終了後必ずONへ戻す。
-3. 5つのIssue受入条件、旧helper/state撤去、最終SHA、結果、revert手順を確認する。Issue #305は全条件が実際に満たされるまでopenのままにする。
-
-G06の5秒待ち差分は隔離した検証checkoutだけに置き、baselineとcandidateに同じ一時差分を適用します。製品PRへ含めません。テスト終了時は不要なHaneプロセスだけ終了し、通常/検証用として動作中のHaneを止めません。
-
-merge前はPR #497を閉じれば製品変更はmainへ入りません。merge後に戻す場合は製品commitをrevertします。完了条件を満たす前はIssue #305をopenのままにします。
+新規実装を別に始める場合の具体的な一手は、current mainからclean checkoutを作り、仕様§10.2の不足する既存挙動テストを追加して変更前結果とSHAを記録すること。その後に限り、仕様§3・§5〜§8に沿って一つの製品PRで状態移行と旧経路撤去を行う。既存のPR #497があるため、同じ実装を重複して開始しない。
