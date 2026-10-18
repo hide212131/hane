@@ -197,8 +197,8 @@ impl RelocationMark {
 /// `InstallId` derived from where it runs now. Where the bundle still is the
 /// marked install, the ordinary gate (same `InstallId`) handles its journal.
 /// Where it runs under another `InstallId` (it was moved), the journal of the
-/// install it was swapped into is consulted directly: anything but a definite
-/// "no journal" or a terminal one stops, so a moved bundle can never bypass a
+/// install it was swapped into is consulted directly: anything but a durably
+/// `Committed` one stops (`RolledBack` included), so a moved bundle can never bypass a
 /// pending transaction. Unverifiable state is an error (fail closed).
 ///
 /// The parent directory may have moved together with the bundle, so the
@@ -256,7 +256,14 @@ pub fn check_relocation(
         ));
     }
     match journal.phase {
-        Phase::Committed | Phase::RolledBack => Ok(()),
+        Phase::Committed => Ok(()),
+        // A rolled-back transaction was rejected by the health check, so the
+        // marked bundle must still pass its recovery gate; it never authorizes
+        // a normal start from another location.
+        Phase::RolledBack => Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            "the bundle was moved after its update was rolled back at the original location",
+        )),
         _ => Err(UpdateError::new(
             ErrorCode::InstallModified,
             "the bundle was moved while its update is still pending at the original location",
@@ -1998,6 +2005,29 @@ mod tests {
         .encode()
         .unwrap();
         check_relocation(Some(&mark), &moved_install_id(), &current_parent).unwrap();
+    }
+
+    /// A rolled-back transaction was rejected by the health check; its marked
+    /// bundle must not start from another location, while Committed may.
+    #[cfg(unix)]
+    #[test]
+    fn a_marked_bundle_with_a_rolled_back_journal_fails_closed_after_relocation() {
+        let fx = fixture();
+        fx.host.fail_swap.set(true);
+        apply_bundle(&fx.inputs()).err().expect("the exchange fails");
+        assert_eq!(fx.stored().phase, Phase::RolledBack);
+        let parent = fx.placement.coordination_parent.clone();
+        let mark = RelocationMark {
+            install_id: fx.coordination.install_id().clone(),
+            transaction: fx.transaction.clone(),
+            coordination_parent: parent.clone(),
+        }
+        .encode()
+        .unwrap();
+        let err = check_relocation(Some(&mark), &moved_install_id(), &parent).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        let err = check_relocation_on_unsupported_volume(Some(&mark), &parent).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
     }
 
     #[cfg(unix)]
