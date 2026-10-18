@@ -10,7 +10,11 @@
 //! never constructed.
 
 #[cfg(windows)]
-pub(crate) use imp::PinnedFile;
+pub(crate) use imp::{PinnedDir, PinnedFile};
+
+#[cfg(not(windows))]
+#[allow(dead_code, reason = "only the Windows adapter constructs a pin")]
+pub(crate) struct PinnedDir(());
 
 #[cfg(not(windows))]
 #[allow(dead_code, reason = "only the Windows adapter constructs a pin")]
@@ -34,6 +38,42 @@ mod imp {
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    /// An install directory verified as a real (non-reparse) directory and
+    /// held open without delete sharing: while the handle lives, the directory
+    /// and therefore every ancestor path leading to it cannot be renamed,
+    /// replaced or deleted, so names resolved beneath it stay inside it.
+    pub(crate) struct PinnedDir {
+        _dir: std::fs::File,
+    }
+
+    impl PinnedDir {
+        /// Opens `path` without following a reparse point. `Ok(None)` when it
+        /// does not exist; an error when it is a link or not a directory.
+        pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
+            let dir = match OpenOptions::new()
+                .access_mode(GENERIC_READ)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+            {
+                Ok(dir) => dir,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            let meta = dir.metadata()?;
+            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_dir() {
+                return Err(UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{} is not a regular directory", path.display()),
+                ));
+            }
+            Ok(Some(Self { _dir: dir }))
+        }
+    }
 
     /// An install file whose identity was verified through this very handle.
     pub(crate) struct PinnedFile {

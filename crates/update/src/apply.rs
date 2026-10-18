@@ -23,7 +23,7 @@ use crate::journal::{
 };
 use crate::limits::MAX_ENTRY_BYTES;
 use crate::paths::validate_rel_path;
-use crate::pinned::PinnedFile;
+use crate::pinned::{PinnedDir, PinnedFile};
 use crate::root_guard::RootGuard;
 
 /// Backups are addressed as `backup/<path>`; no owned file may live there.
@@ -457,6 +457,9 @@ pub struct FsFileOps {
     guard: Result<RootGuard>,
     /// The verified install file the next mutation is bound to (Windows).
     pinned: Option<(String, PinnedFile)>,
+    /// The verified ancestor directories of that target (Windows).
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows pins directories"))]
+    dir_pins: Option<(String, Vec<PinnedDir>)>,
     /// Owned files the update does not touch, with their signed identities.
     /// Re-verified right before the commit.
     unchanged: Vec<(String, FileIdentity)>,
@@ -474,6 +477,7 @@ impl FsFileOps {
             stage_root,
             guard,
             pinned: None,
+            dir_pins: None,
             unchanged: Vec::new(),
             #[cfg(test)]
             before_mutation: None,
@@ -535,20 +539,78 @@ impl FsFileOps {
         })
     }
 
+    /// Windows: binds every existing ancestor of `rel_path` beneath the
+    /// install root to a verified non-reparse directory handle, continuing
+    /// from the ancestors already pinned for this path. With `create`, the
+    /// missing ones are created one level at a time and pinned right away, so
+    /// no name is ever resolved through an unpinned directory. Fails closed
+    /// when an ancestor is a link or not a directory.
+    #[cfg(windows)]
+    fn pin_hierarchy(&mut self, rel_path: &str, create: bool) -> Result<Vec<PinnedDir>> {
+        let mut pins = match self.dir_pins.take() {
+            Some((bound, pins)) if bound == rel_path => pins,
+            _ => Vec::new(),
+        };
+        let (base, rest) = self.locate(rel_path)?;
+        let components: Vec<&str> = rest.split('/').collect();
+        let ancestors = &components[..components.len() - 1];
+        let mut path = base.to_path_buf();
+        for (index, component) in ancestors.iter().enumerate() {
+            path.push(component);
+            if index < pins.len() {
+                continue;
+            }
+            let pin = match PinnedDir::open(&path)? {
+                Some(pin) => pin,
+                None if create => {
+                    match std::fs::create_dir(&path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                    PinnedDir::open(&path)?.ok_or_else(|| {
+                        UpdateError::new(
+                            ErrorCode::InstallModified,
+                            format!("{} vanished while it was being created", path.display()),
+                        )
+                    })?
+                }
+                None => break,
+            };
+            pins.push(pin);
+        }
+        Ok(pins)
+    }
+
+    #[cfg(not(windows))]
+    fn pin_hierarchy(&mut self, _rel_path: &str, _create: bool) -> Result<Vec<PinnedDir>> {
+        Ok(Vec::new())
+    }
+
     fn write_atomic(
-        &self,
+        &mut self,
         rel_path: &str,
         bytes: &[u8],
         pin: Option<PinnedFile>,
     ) -> Result<()> {
-        let (base, rest) = self.locate(rel_path)?;
-        let path = base.join(rest);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         if rel_path.starts_with(BACKUP_PREFIX) {
+            let (base, rest) = self.locate(rel_path)?;
+            let path = base.join(rest);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             // Transaction-owned backup area: the ordinary durable write.
             return durable_write(&path, bytes).map_err(UpdateError::from);
+        }
+        validate_rel_path(rel_path)?;
+        // Held until the file is placed (Windows): the pinned directories
+        // cannot be swapped for links meanwhile.
+        let _dirs = self.pin_hierarchy(rel_path, true)?;
+        let (base, rest) = self.locate(rel_path)?;
+        let path = base.join(rest);
+        #[cfg(not(windows))]
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         install_write(&path, bytes, pin)
     }
@@ -701,8 +763,15 @@ impl FileOps for FsFileOps {
 
     fn bind_target(&mut self, rel_path: &str, expected: &Option<FileIdentity>) -> Result<()> {
         self.pinned = None;
+        self.dir_pins = None;
         #[cfg(windows)]
         {
+            if !rel_path.starts_with(BACKUP_PREFIX) {
+                // Bind the existing ancestors before the target itself, so a
+                // new file's parents are fixed from the moment it is validated.
+                let pins = self.pin_hierarchy(rel_path, false)?;
+                self.dir_pins = Some((rel_path.to_string(), pins));
+            }
             let (base, rest) = self.locate(rel_path)?;
             let path = base.join(rest);
             let mismatch = || {
@@ -1556,6 +1625,75 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(fx.root.join("added.txt")).unwrap(), b"third party");
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_new_files_ancestor_swapped_for_a_junction_never_writes_outside_the_root() {
+        let mut fx = race_fixture();
+        let stage = fx._dir.path().join("stage");
+        let outside = fx._dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(stage.join("sub/deep")).unwrap();
+        fs::write(stage.join("sub/deep/added.txt"), NEW_ADDED).unwrap();
+        fs::create_dir_all(fx.root.join("sub")).unwrap();
+
+        fx.ops.bind_target("sub/deep/added.txt", &None).unwrap();
+        let sub = fx.root.join("sub");
+        let moved = fx.root.join("sub.moved");
+        let link_outside = outside.clone();
+        let refused = Rc::new(Cell::new(false));
+        let flag = refused.clone();
+        fx.ops.before_mutation = Some(Box::new(move || {
+            // Validation is over: try to replace the ancestor with a junction.
+            if fs::rename(&sub, &moved).is_ok() {
+                make_junction(&sub, &link_outside);
+            } else {
+                flag.set(true);
+            }
+        }));
+        let result = fx
+            .ops
+            .install_new("sub/deep/added.txt", &FileIdentity::of(NEW_ADDED));
+
+        assert!(refused.get(), "the pinned ancestor could be swapped");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            fs::read(fx.root.join("sub/deep/added.txt")).unwrap(),
+            NEW_ADDED
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_new_file_below_a_junction_ancestor_is_refused_before_any_mutation() {
+        let mut fx = race_fixture();
+        let stage = fx._dir.path().join("stage");
+        let outside = fx._dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(stage.join("sub")).unwrap();
+        fs::write(stage.join("sub/added.txt"), NEW_ADDED).unwrap();
+        assert!(make_junction(&fx.root.join("sub"), &outside));
+
+        assert!(fx.ops.bind_target("sub/added.txt", &None).is_err());
+        assert!(
+            fx.ops
+                .install_new("sub/added.txt", &FileIdentity::of(NEW_ADDED))
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     /// Windows displaces an existing file only through a handle whose identity
