@@ -162,15 +162,20 @@ pub fn run(verified: Box<VerifiedChild>) {
                             if !hane_session::pin_state_root(state_root) {
                                 std::process::exit(EXIT_NOT_COMMITTED);
                             }
-                            // The ticket is taken here and only here: the
-                            // commit is durable (`Commit` arrived, or the
-                            // journal says `Committed`), and taking it also
-                            // refuses unless the journal agrees. A damaged or
-                            // used ticket restores nothing and never blocks
-                            // the start.
-                            let plan = crate::update_restart::restore_after_commit(&ticket_restore);
-                            match crate::prepare_launch(None, finder_requests) {
-                                Some(mut launch) => {
+                            // The ticket is taken here and only here, and only
+                            // once this start owns the editor (open-request
+                            // pipe): the commit is durable (`Commit` arrived,
+                            // or the journal says `Committed`), and taking it
+                            // also refuses unless the journal agrees. If
+                            // ownership is lost the ticket stays unclaimed
+                            // for the owning instance. A damaged or used
+                            // ticket restores nothing and never blocks the
+                            // start.
+                            let prepared = crate::prepare_launch(None, finder_requests, || {
+                                crate::update_restart::restore_after_commit(&ticket_restore)
+                            });
+                            match prepared {
+                                Some((mut launch, plan)) => {
                                     if let Some(folder) =
                                         plan.as_ref().and_then(|plan| plan.work_folder.clone())
                                     {

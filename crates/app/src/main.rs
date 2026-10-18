@@ -341,7 +341,7 @@ fn main() {
     // First of all, before the AI service, state stores, any window or open
     // request: settle a pending update transaction or stop. The guard is the
     // shared runtime lease and lives until the process ends.
-    let mut recovered_restart: Option<(Option<update_restart::RestorePlan>, String)> = None;
+    let mut recovered_restart: Option<hane_update::startup::CommittedRestore> = None;
     let _runtime_lease = match update_gate::enter() {
         update_gate::Entry::Start { mut guard, state_root } => {
             // A committed update's first start uses the root the updating
@@ -355,14 +355,14 @@ fn main() {
             // The limited child may have ended after the durable `Committed`
             // but before it claimed the ticket. The gate hands over that
             // unclaimed ticket (bound to the committed receipt's transaction,
-            // install and state root); it is claimed once, here, before any
-            // store, service or window exists.
+            // install and state root); its state root is pinned here, before
+            // any store, service or window exists. The ticket itself is
+            // claimed once, only after this start owns the editor.
             if let Some(committed) = guard.as_mut().and_then(|guard| guard.take_committed_restore()) {
                 if !hane_session::pin_state_root(committed.restore.state_root().to_path_buf()) {
                     std::process::exit(70);
                 }
-                let plan = update_restart::restore_after_commit(&committed.restore);
-                recovered_restart = Some((plan, committed.version));
+                recovered_restart = Some(committed);
             }
             guard
         }
@@ -396,10 +396,18 @@ fn main() {
     // Finder document delivered at launch is queued, not lost.
     let (finder_sender, finder_requests) = finder_channel();
     let has_cli_path = cli_path.is_some();
-    let Some(mut launch) = prepare_launch(cli_path, finder_requests) else {
+    // An instance that does not become the editor leaves the ticket unclaimed.
+    let Some((mut launch, recovered)) = prepare_launch(cli_path, finder_requests, || {
+        recovered_restart.map(|committed| {
+            (
+                update_restart::restore_after_commit(&committed.restore),
+                committed.version,
+            )
+        })
+    }) else {
         return;
     };
-    if let Some((plan, version)) = recovered_restart {
+    if let Some((plan, version)) = recovered {
         // Only a ticket this start claimed announces the committed version,
         // once; an explicit path argument keeps its own folder.
         if plan.is_some() {
@@ -447,10 +455,16 @@ pub(crate) struct EditorLaunch {
 /// `finder_requests` receives Finder documents; it is handed to the editor
 /// only here, i.e. never before the update gate / durable commit allowed
 /// normal startup.
-pub(crate) fn prepare_launch(
+///
+/// `claim` runs only after this launch owns the editor (on Windows, the
+/// open-request pipe), so a restart ticket is never consumed by a launch that
+/// then fails to become the editor; the ticket stays for the owning instance.
+/// It runs at most once and its result is returned with the launch.
+pub(crate) fn prepare_launch<T>(
     cli_path: Option<PathBuf>,
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] finder_requests: FinderReceiver,
-) -> Option<EditorLaunch> {
+    claim: impl FnOnce() -> T,
+) -> Option<(EditorLaunch, T)> {
     #[cfg(target_os = "windows")]
     {
         if let Some(path) = cli_path.as_deref() {
@@ -465,8 +479,15 @@ pub(crate) fn prepare_launch(
         }
     }
     #[cfg(target_os = "windows")]
-    let open_requests = match open_request::listen() {
-        Ok(receiver) => receiver,
+    let listened = claim_after_ownership(open_request::listen, claim);
+    #[cfg(not(target_os = "windows"))]
+    let listened = claim_after_ownership(|| Ok::<(), std::convert::Infallible>(()), claim);
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+    let (open_requests, claimed) = match listened {
+        Ok(owned) => owned,
+        #[cfg(not(target_os = "windows"))]
+        Err(never) => match never {},
+        #[cfg(target_os = "windows")]
         Err(error) => {
             // Another instance won the pipe-creation race. Forward the path
             // there rather than opening a second editor with the wrong file.
@@ -510,22 +531,34 @@ pub(crate) fn prepare_launch(
     // start its worker must never prevent the Markdown editor from opening.
     let ai_service = start_ai_service();
     let update_service = start_update_service();
-    Some(EditorLaunch {
-        path,
-        needs_default_prompt,
-        ai_service,
-        update_service,
-        restore: None,
-        update_completed: None,
-        #[cfg(target_os = "windows")]
-        open_requests,
-        #[cfg(target_os = "macos")]
-        finder_requests,
-        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
-        process_started,
-        #[cfg(feature = "instrument")]
-        config,
-    })
+    Some((
+        EditorLaunch {
+            path,
+            needs_default_prompt,
+            ai_service,
+            update_service,
+            restore: None,
+            update_completed: None,
+            #[cfg(target_os = "windows")]
+            open_requests,
+            #[cfg(target_os = "macos")]
+            finder_requests,
+            #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+            process_started,
+            #[cfg(feature = "instrument")]
+            config,
+        },
+        claimed,
+    ))
+}
+
+/// Acquires `ownership` first and runs `claim` only if that succeeded.
+fn claim_after_ownership<O, E, T>(
+    ownership: impl FnOnce() -> Result<O, E>,
+    claim: impl FnOnce() -> T,
+) -> Result<(O, T), E> {
+    let owned = ownership()?;
+    Ok((owned, claim()))
 }
 
 /// Opens the editor window and starts the app-owned services inside a running
@@ -731,6 +764,46 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod ownership_claim_tests {
+    use super::claim_after_ownership;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_lost_ownership_race_leaves_the_ticket_unclaimed() {
+        let claims = Cell::new(0);
+        let outcome: Result<((), u8), &str> = claim_after_ownership(
+            || Err("another instance owns the open-request pipe"),
+            || {
+                claims.set(claims.get() + 1);
+                1
+            },
+        );
+        assert!(outcome.is_err());
+        assert_eq!(claims.get(), 0, "the ticket stays for the owning instance");
+    }
+
+    #[test]
+    fn the_ticket_is_claimed_exactly_once_after_ownership() {
+        let order = Cell::new(0);
+        let claims = Cell::new(0);
+        let outcome: Result<(u8, u8), &str> = claim_after_ownership(
+            || {
+                assert_eq!(order.get(), 0, "ownership comes first");
+                order.set(1);
+                Ok(7)
+            },
+            || {
+                assert_eq!(order.get(), 1, "the claim follows ownership");
+                claims.set(claims.get() + 1);
+                9
+            },
+        );
+        assert_eq!(outcome, Ok((7, 9)));
+        assert_eq!(claims.get(), 1);
+    }
 }
 
 #[cfg(test)]
