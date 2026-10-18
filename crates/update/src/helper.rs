@@ -1397,14 +1397,36 @@ mod tests {
         assert_eq!(spy.applied, 0);
     }
 
+    /// Runs a Recover session, retrying only while the transaction lease is
+    /// transiently held. Tests run in parallel threads, and another test
+    /// spawning a child process can briefly duplicate this test's lock
+    /// descriptors (`flock` is released only when every duplicate is gone, i.e.
+    /// at the child's `exec` on macOS), so a just-released lease may be
+    /// observed as held for a short moment. The result is otherwise unchanged:
+    /// every other outcome is returned immediately.
+    fn run_recover_settled(
+        fx: &Fixture,
+        nonce: &Nonce,
+    ) -> (Result<SessionEnd>, Vec<Frame>, Spy) {
+        let started = Instant::now();
+        loop {
+            let mut spy = Spy::default();
+            let (result, out) = run(fx, &[fx.hello(nonce, Mode::Recover)], &mut spy);
+            let transient = matches!(&result, Err(err) if err.code == ErrorCode::StaleJournal);
+            if !transient || started.elapsed() >= Duration::from_secs(10) {
+                return (result, out, spy);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn recovery_is_blocked_while_another_hane_process_runs() {
         let fx = fixture();
         let nonce = Nonce::generate().unwrap();
         {
             let _running = parent_runtime(&fx);
-            let mut spy = Spy::default();
-            let (result, out) = run(&fx, &[fx.hello(&nonce, Mode::Recover)], &mut spy);
+            let (result, out, spy) = run_recover_settled(&fx, &nonce);
             assert!(matches!(
                 result.unwrap(),
                 SessionEnd::Recovered(RecoveryReport::Blocked(_))
@@ -1412,8 +1434,7 @@ mod tests {
             assert_eq!(spy.recovered, 0);
             assert!(matches!(out[1].body, Body::Recovered { .. }));
         }
-        let mut spy = Spy::default();
-        let (result, _) = run(&fx, &[fx.hello(&nonce, Mode::Recover)], &mut spy);
+        let (result, _, spy) = run_recover_settled(&fx, &nonce);
         assert_eq!(
             result.unwrap(),
             SessionEnd::Recovered(RecoveryReport::KeptOld)
