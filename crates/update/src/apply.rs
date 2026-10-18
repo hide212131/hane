@@ -463,9 +463,21 @@ pub struct FsFileOps {
     /// Owned files the update does not touch, with their signed identities.
     /// Re-verified right before the commit.
     unchanged: Vec<(String, FileIdentity)>,
+    /// Where scratch directories that could not be cleaned up are recorded
+    /// (Windows), so a later safe startup can retry them.
+    #[cfg(windows)]
+    ledger: Option<crate::scratch::ScratchLedger>,
     /// Runs after the target is bound and before the mutation touches it.
     #[cfg(test)]
     before_mutation: Option<Box<dyn FnMut()>>,
+}
+
+/// A scratch directory whose cleanup did not finish: the directory and the
+/// names of the files this updater put in it.
+#[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows adapter leaves scratch"))]
+struct Scratch {
+    dir: PathBuf,
+    owned: Vec<String>,
 }
 
 impl FsFileOps {
@@ -479,9 +491,42 @@ impl FsFileOps {
             pinned: None,
             dir_pins: None,
             unchanged: Vec::new(),
+            #[cfg(windows)]
+            ledger: None,
             #[cfg(test)]
             before_mutation: None,
         }
+    }
+
+    /// Windows: scratch directories that cannot be removed right away are
+    /// recorded for this transaction, outside its transaction directory.
+    #[cfg(windows)]
+    pub(crate) fn with_scratch_ledger(
+        mut self,
+        coordination: &crate::platform::lease::Coordination,
+        transaction: &crate::identity::TransactionId,
+    ) -> Self {
+        self.ledger = Some(crate::scratch::ScratchLedger::new(coordination, transaction));
+        self
+    }
+
+    /// Durably records a scratch directory that is still on disk. Fails when
+    /// it cannot be recorded, so a leftover is never silently untracked.
+    #[cfg(windows)]
+    fn track_scratch(&mut self, scratch: Scratch) -> Result<()> {
+        let Some(ledger) = self.ledger.as_mut() else {
+            return Ok(());
+        };
+        let dir = crate::scratch::rel_dir(&self.root, &scratch.dir).ok_or_else(|| {
+            UpdateError::new(
+                ErrorCode::Io,
+                format!("{} is not beneath the install root", scratch.dir.display()),
+            )
+        })?;
+        ledger.track(crate::scratch::Leftover {
+            dir,
+            files: scratch.owned,
+        })
     }
 
     /// Declares the signed identities of the owned files the update leaves in
@@ -620,7 +665,14 @@ impl FsFileOps {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        install_write(&path, bytes, pin)
+        let (result, leftover) = install_write_tracked(&path, bytes, pin);
+        #[cfg(windows)]
+        if let Some(scratch) = leftover {
+            self.track_scratch(scratch)?;
+        }
+        #[cfg(not(windows))]
+        let _ = leftover;
+        result
     }
 }
 
@@ -636,16 +688,27 @@ static INSTALL_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// On Windows an existing file is only ever displaced through the handle that
 /// verified it (`pin`); without one the call fails closed.
 fn install_write(path: &Path, bytes: &[u8], pin: Option<PinnedFile>) -> Result<()> {
+    install_write_tracked(path, bytes, pin).0
+}
+
+/// [`install_write`] that also reports a scratch directory it could not clean
+/// up after a successful write, so the caller can track it.
+fn install_write_tracked(
+    path: &Path,
+    bytes: &[u8],
+    pin: Option<PinnedFile>,
+) -> (Result<()>, Option<Scratch>) {
     use std::io::Write;
 
-    let parent = path.parent().ok_or_else(|| {
-        UpdateError::new(ErrorCode::Io, "install path has no parent directory")
-    })?;
-    let name = path.file_name().ok_or_else(|| {
-        UpdateError::new(ErrorCode::Io, "install path has no file name")
-    })?;
-    // `create_dir` fails when anything already has that name; nothing is reused.
-    let scratch = make_scratch_dir(parent)?;
+    let prepared = path
+        .parent()
+        .zip(path.file_name())
+        .ok_or_else(|| UpdateError::new(ErrorCode::Io, "install path has no parent directory"))
+        .and_then(|(parent, name)| Ok((make_scratch_dir(parent)?, name)));
+    let (scratch, name) = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => return (Err(err), None),
+    };
     let temp = scratch.join(name);
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
@@ -657,10 +720,46 @@ fn install_write(path: &Path, bytes: &[u8], pin: Option<PinnedFile>) -> Result<(
         drop(file);
         place(&temp, &scratch, name, path, pin)
     })();
+    finish_scratch(result, &temp, scratch, name)
+}
+
+/// Removes only what the install write created: the temp file and, on
+/// success, the displaced old file. A failed removal is retried a bounded
+/// number of times; if it still fails, the directory is returned so it can be
+/// tracked. After a failed write nothing but the temp file is removed, because
+/// the old file may be the only copy left.
+#[cfg(windows)]
+fn finish_scratch(
+    result: Result<()>,
+    temp: &Path,
+    scratch: PathBuf,
+    name: &std::ffi::OsStr,
+) -> (Result<()>, Option<Scratch>) {
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+        let _ = std::fs::remove_dir(&scratch);
+        return (result, None);
+    }
+    let name = name.to_string_lossy().into_owned();
+    let owned = vec![format!("{name}.aside"), name];
+    if crate::scratch::remove_owned(&scratch, &owned) {
+        (result, None)
+    } else {
+        (result, Some(Scratch { dir: scratch, owned }))
+    }
+}
+
+#[cfg(not(windows))]
+fn finish_scratch(
+    result: Result<()>,
+    temp: &Path,
+    scratch: PathBuf,
+    _name: &std::ffi::OsStr,
+) -> (Result<()>, Option<Scratch>) {
     // Remove only what this call created.
-    let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_file(temp);
     let _ = std::fs::remove_dir(&scratch);
-    result
+    (result, None)
 }
 
 #[cfg(not(windows))]
@@ -783,8 +882,9 @@ fn place(
             // only once the placement is on disk, and the ordered log commits
             // the rename aside before it. If it fails, the old file is put
             // back, or stays in the scratch directory when that is impossible.
+            // Deleting the displaced file is cleanup, done (and tracked when
+            // it fails) by the caller.
             drop(pin);
-            let _ = std::fs::remove_file(&aside);
             Ok(())
         }
         None => match std::fs::symlink_metadata(path) {
@@ -911,11 +1011,22 @@ impl FileOps for FsFileOps {
                 // file stays in the scratch directory.
                 let settled = scratch.join("removed.done");
                 durable_move(&aside, &settled)?;
-                let _ = std::fs::remove_file(&settled);
+                // Deleting `removed.done` is cleanup: it is retried and, if
+                // it still fails, tracked below.
                 Ok(())
             })();
-            let _ = std::fs::remove_dir(&scratch);
-            result?;
+            if result.is_err() {
+                // The file stays in the scratch directory.
+                let _ = std::fs::remove_dir(&scratch);
+                return result;
+            }
+            let owned = vec!["removed".to_owned(), "removed.done".to_owned()];
+            if !crate::scratch::remove_owned(&scratch, &owned) {
+                self.track_scratch(Scratch {
+                    dir: scratch,
+                    owned,
+                })?;
+            }
         }
         #[cfg(not(windows))]
         {
@@ -1874,6 +1985,139 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert_eq!(fs::read(kept[0].join("removed")).unwrap(), OLD_DLL);
+    }
+
+    #[cfg(windows)]
+    fn tracked_fixture() -> (
+        RaceFixture,
+        crate::platform::lease::Coordination,
+        TransactionId,
+    ) {
+        let RaceFixture { _dir, root, ops } = race_fixture();
+        let install_id = InstallId::parse(&"0".repeat(32)).unwrap();
+        let coordination =
+            crate::platform::lease::Coordination::create(_dir.path(), &install_id).unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        let ops = ops.with_scratch_ledger(&coordination, &transaction);
+        (RaceFixture { _dir, root, ops }, coordination, transaction)
+    }
+
+    #[cfg(windows)]
+    fn fail_cleanup(count: u32) {
+        crate::scratch::probe::FAILURES.with(|cell| cell.set(count));
+    }
+
+    #[cfg(windows)]
+    fn scratch_dirs(root: &Path) -> Vec<std::path::PathBuf> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".hane-update-"))
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn ledger_record(
+        coordination: &crate::platform::lease::Coordination,
+        transaction: &TransactionId,
+    ) -> std::path::PathBuf {
+        coordination
+            .dir()
+            .join(crate::scratch::LEDGER_DIR)
+            .join(format!("{}.json", transaction.as_str()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_transient_cleanup_failure_is_retried_without_a_record() {
+        let (mut fx, coordination, transaction) = tracked_fixture();
+        fail_cleanup(2);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap();
+        fail_cleanup(0);
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), NEW_DLL);
+        assert!(scratch_dirs(&fx.root).is_empty());
+        assert!(!ledger_record(&coordination, &transaction).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_terminal_cleanup_failure_still_succeeds_and_is_cleaned_up_later() {
+        let (mut fx, coordination, transaction) = tracked_fixture();
+
+        fail_cleanup(u32::MAX);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL)))
+            .unwrap();
+        fx.ops.remove("a.dll").unwrap();
+        fail_cleanup(0);
+
+        // The update succeeded; the displaced files are tracked, durably and
+        // outside the transaction directory.
+        assert!(!fx.root.join("a.dll").exists());
+        let kept = scratch_dirs(&fx.root);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        let record = ledger_record(&coordination, &transaction);
+        assert!(record.exists());
+        assert!(!record.starts_with(coordination.transaction_dir(&transaction)));
+
+        // A neighbour the updater does not own, and a prefixed directory that
+        // no record lists, must survive the later cleanup.
+        let stranger = fx.root.join(".hane-update-unlisted");
+        fs::create_dir(&stranger).unwrap();
+        fs::write(stranger.join("removed.done"), b"not ours").unwrap();
+        let neighbour = kept
+            .iter()
+            .find(|dir| dir.join("removed.done").exists())
+            .expect("the removal scratch is kept")
+            .join("user.txt");
+        fs::write(&neighbour, b"keep").unwrap();
+
+        crate::startup::sweep_install_scratch(&coordination, &fx.root);
+
+        assert_eq!(fs::read(&neighbour).unwrap(), b"keep");
+        assert_eq!(fs::read(stranger.join("removed.done")).unwrap(), b"not ours");
+        let remaining = scratch_dirs(&fx.root);
+        assert_eq!(remaining.len(), 2, "{remaining:?}");
+        assert!(remaining.contains(&stranger));
+        assert!(
+            remaining
+                .iter()
+                .all(|dir| !dir.join("a.dll.aside").exists()),
+            "the listed displaced file is removed"
+        );
+        assert!(!ledger_record(&coordination, &transaction).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_an_untrackable_cleanup_failure_is_not_reported_as_success() {
+        let (mut fx, coordination, transaction) = tracked_fixture();
+        // A file where the ledger directory belongs: nothing can be recorded.
+        fs::write(coordination.dir().join(crate::scratch::LEDGER_DIR), b"x").unwrap();
+
+        fail_cleanup(u32::MAX);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        let outcome = fx.ops.remove("a.dll");
+        fail_cleanup(0);
+        assert!(outcome.is_err());
+        assert!(!ledger_record(&coordination, &transaction).exists());
     }
 
     #[cfg(windows)]

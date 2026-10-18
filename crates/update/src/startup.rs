@@ -389,6 +389,30 @@ pub(crate) fn sweep_abandoned_transactions(coordination: &Coordination) {
     else {
         return;
     };
+    sweep_unjournaled(coordination);
+}
+
+/// Retries the install scratch cleanups recorded by earlier updates (Windows).
+/// Like the sweep above it acts only while it holds `transaction`, `startup`
+/// and the exclusive `runtime` lease, and removes only what a record of this
+/// installation lists.
+#[cfg(windows)]
+pub(crate) fn sweep_install_scratch(coordination: &Coordination, install_root: &Path) {
+    let Ok(Some(transaction)) = coordination.try_acquire(LeaseKind::Transaction, &[]) else {
+        return;
+    };
+    let Ok(Some(startup)) = coordination.try_acquire(LeaseKind::Startup, &[&transaction]) else {
+        return;
+    };
+    let Ok(Some(_runtime)) =
+        coordination.try_acquire(LeaseKind::RuntimeExclusive, &[&transaction, &startup])
+    else {
+        return;
+    };
+    crate::scratch::cleanup_pending(coordination, install_root);
+}
+
+fn sweep_unjournaled(coordination: &Coordination) {
     let private = coordination.dir().join(PRIVATE_DIR);
     let Ok(entries) = fs::read_dir(&private) else {
         return;
@@ -426,6 +450,8 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
     };
     let disk = placement.disk_view();
     sweep_abandoned_transactions(&coordination);
+    #[cfg(windows)]
+    sweep_install_scratch(&coordination, &placement.install_root);
     // One recovery attempt: the second look must find nothing pending.
     for attempt in 0..2 {
         let startup = match coordination.acquire_within(LeaseKind::Startup, &[], wait) {

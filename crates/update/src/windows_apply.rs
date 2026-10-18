@@ -405,7 +405,7 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     let journal = UpdateJournal::begin(&plan, None)?;
     let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
     let mut journal = DurableJournal::create(store, journal)?;
-    let mut ops = FsFileOps::new(
+    let ops = FsFileOps::new(
         inputs.placement.install_root.clone(),
         backup,
         txn_dir.join(STAGE_DIR),
@@ -416,6 +416,9 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
             .map(|file| (file.rel_path.clone(), file.identity.clone()))
             .collect(),
     );
+    #[cfg(windows)]
+    let ops = ops.with_scratch_ledger(inputs.coordination, inputs.transaction);
+    let mut ops = ops;
     match apply::apply(&mut journal, &mut ops, &parent, &mut NoChild) {
         Ok(ApplyOutcome::AwaitingHealth) => Ok(AppliedFiles { journal, ops }),
         Ok(ApplyOutcome::RolledBack(err)) => Err(err),

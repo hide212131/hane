@@ -568,6 +568,8 @@ pub fn recover_pending_with(
             txn_dir.join("backup"),
             txn_dir.join("stage"),
         );
+        #[cfg(windows)]
+        let ops = ops.with_scratch_ledger(coord, transaction);
         let mut ops = GuardedOps {
             inner: ops,
             may_mutate: cfg!(windows),

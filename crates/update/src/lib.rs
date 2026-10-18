@@ -55,6 +55,8 @@ mod pinned;
 pub mod protocol;
 pub mod release;
 pub mod root_guard;
+#[cfg(windows)]
+pub(crate) mod scratch;
 pub mod startup;
 pub mod state_root;
 pub mod trust;
