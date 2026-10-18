@@ -27,7 +27,7 @@ pub use icons::{AppAssets, WorkFolderIcons};
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
 pub use view::{
-    AiLifecycle, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
+    AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
     ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
     RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
 };

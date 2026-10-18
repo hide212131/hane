@@ -153,8 +153,22 @@ pub trait PreparedUpdate: Send {
 pub trait AiLifecycle: Send + Sync {
     /// Stops the service and waits (up to `timeout`) until it is gone.
     fn stop(&self, timeout: Duration) -> Result<(), String>;
-    /// Starts the service again after an abandoned restart.
-    fn resume(&self) -> Option<hane_ai::AiServiceHandle>;
+    /// Starts the service again after an abandoned restart. This is the one
+    /// explicit request: a stop still in flight keeps the start pending.
+    fn resume(&self) -> AiResume;
+    /// Asks how a resume that is waiting on a stop went. It never starts a
+    /// service, so repeating it cannot repeat a start.
+    fn poll_resume(&self) -> AiResume;
+}
+
+/// How a resume request went.
+pub enum AiResume<H = hane_ai::AiServiceHandle> {
+    /// The service is running; attach this handle.
+    Started(H),
+    /// The old service is still stopping and the start is pending.
+    Stopping,
+    /// The new service could not be started. A later explicit resume may retry.
+    Failed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1192,8 +1206,12 @@ impl ExitSteps for ViewExit<'_, '_> {
         // The service is started again and the window gets its new handle; a
         // service that cannot be started leaves the AI features unavailable
         // until the next launch, but the editor itself is unaffected.
-        let handle = self.ai.as_ref().and_then(|ai| ai.resume());
-        let still_stopping = handle.is_none();
+        let outcome = self.ai.as_ref().map(|ai| ai.resume());
+        let (handle, still_stopping) = match outcome {
+            Some(AiResume::Started(handle)) => (Some(handle), false),
+            Some(AiResume::Stopping) => (None, true),
+            Some(AiResume::Failed) | None => (None, false),
+        };
         self.view.attach_ai_service(handle, self.cx);
         self.ai_stopped = false;
         if still_stopping && let Some(ai) = self.ai.clone() {
@@ -1203,10 +1221,10 @@ impl ExitSteps for ViewExit<'_, '_> {
 }
 
 /// The old service is still stopping, so the owner keeps the start pending and
-/// runs it once the stop completes. Wait for that and attach the new handle
-/// instead of leaving the AI detached. There is no poll limit, because a stop
-/// can finish arbitrarily late; the wait ends when the handle is attached or
-/// when the view is gone.
+/// runs it once the stop completes. Poll only the state of that one pending
+/// start and attach the new handle instead of leaving the AI detached. There is
+/// no poll limit, because a stop can finish arbitrarily late; the wait ends
+/// when the handle is attached, when the start failed, or when the view is gone.
 fn spawn_ai_resume_wait(ai: Arc<dyn AiLifecycle>, cx: &mut Context<EditorView>) {
     cx.spawn(async move |view, cx| {
         loop {
@@ -1215,11 +1233,15 @@ fn spawn_ai_resume_wait(ai: Arc<dyn AiLifecycle>, cx: &mut Context<EditorView>) 
             if view.update(cx, |_, _| ()).is_err() {
                 return;
             }
-            if let Some(handle) = ai.resume() {
-                let _ = view.update(cx, |view, cx| {
-                    view.attach_ai_service(Some(handle), cx);
-                });
-                return;
+            match ai.poll_resume() {
+                AiResume::Started(handle) => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.attach_ai_service(Some(handle), cx);
+                    });
+                    return;
+                }
+                AiResume::Stopping => {}
+                AiResume::Failed => return,
             }
         }
     })
@@ -1862,23 +1884,111 @@ mod tests {
             self.0.lock().unwrap().push("stop_ai");
             Ok(())
         }
-        fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+        fn resume(&self) -> AiResume {
             self.0.lock().unwrap().push("resume_ai");
-            None
+            AiResume::Failed
+        }
+        fn poll_resume(&self) -> AiResume {
+            self.0.lock().unwrap().push("poll_resume");
+            AiResume::Failed
         }
     }
 
-    /// Never yields a handle, and counts how often the wait asked for one.
+    /// Stays in `Stopping` (never a handle), and counts the wait's polls.
     struct NeverResumes(Arc<std::sync::atomic::AtomicUsize>);
 
     impl AiLifecycle for NeverResumes {
         fn stop(&self, _: Duration) -> Result<(), String> {
             Ok(())
         }
-        fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            None
+        fn resume(&self) -> AiResume {
+            AiResume::Stopping
         }
+        fn poll_resume(&self) -> AiResume {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            AiResume::Stopping
+        }
+    }
+
+    /// The pending start failed: counts explicit resumes and polls.
+    struct FailsToStart {
+        resumes: std::sync::atomic::AtomicUsize,
+        polls: std::sync::atomic::AtomicUsize,
+        resume_result_is_stopping: bool,
+    }
+
+    impl AiLifecycle for FailsToStart {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&self) -> AiResume {
+            self.resumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.resume_result_is_stopping {
+                AiResume::Stopping
+            } else {
+                AiResume::Failed
+            }
+        }
+        fn poll_resume(&self) -> AiResume {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            AiResume::Failed
+        }
+    }
+
+    #[gpui::test]
+    fn a_failed_pending_start_ends_the_wait_without_starting_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let ai = Arc::new(FailsToStart {
+            resumes: std::sync::atomic::AtomicUsize::new(0),
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            resume_result_is_stopping: true,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let lifecycle: Arc<dyn AiLifecycle> = ai.clone();
+        view.update(cx, |_, cx| spawn_ai_resume_wait(lifecycle, cx));
+        for _ in 0..50 {
+            cx.executor().advance_clock(AI_RESUME_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        let order = std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(ai.polls.load(order), 1, "the wait ends at the failure");
+        assert_eq!(ai.resumes.load(order), 0, "the wait never starts a service");
+    }
+
+    #[gpui::test]
+    fn an_immediate_start_failure_does_not_begin_a_wait(cx: &mut gpui::TestAppContext) {
+        let ai = Arc::new(FailsToStart {
+            resumes: std::sync::atomic::AtomicUsize::new(0),
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            resume_result_is_stopping: false,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let lifecycle: Arc<dyn AiLifecycle> = ai.clone();
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        view.update(cx, |view, cx| {
+            let mut exit = ViewExit {
+                view,
+                cx,
+                prepared: None,
+                observation: &observation,
+                ticket: &ticket,
+                ai: Some(lifecycle),
+                ai_stopped: true,
+            };
+            exit.resume_ai();
+        });
+        for _ in 0..50 {
+            cx.executor().advance_clock(AI_RESUME_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        let order = std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(ai.resumes.load(order), 1, "one explicit resume");
+        assert_eq!(ai.polls.load(order), 0, "no wait after an immediate failure");
     }
 
     #[gpui::test]
@@ -1988,9 +2098,12 @@ mod tests {
             self.inbox.push(self.path.clone());
             Ok(())
         }
-        fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+        fn resume(&self) -> AiResume {
             self.log.lock().unwrap().push("resume_ai");
-            None
+            AiResume::Failed
+        }
+        fn poll_resume(&self) -> AiResume {
+            AiResume::Failed
         }
     }
 

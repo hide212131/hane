@@ -95,9 +95,9 @@ mod ai_prompts;
 mod ai_selection;
 mod app_update;
 pub use app_update::{
-    AiLifecycle, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, ExternalOpenOutcome,
-    ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation, RestartPreparation,
-    RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
+    AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot,
+    ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
+    RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
 };
 mod ai_settings;
 mod background_parse;

@@ -15,7 +15,7 @@ use hane_ai::{
     ShellEnvironmentPolicyFormat, SystemBrowserOpener, resolve_runtime_binary,
 };
 use hane_session::{FileStateStore, StateStores};
-use hane_ui::{AiLifecycle, AppAssets, AppUpdateController, EditorView, register_key_bindings};
+use hane_ui::{AiLifecycle, AiResume, AppAssets, AppUpdateController, EditorView, register_key_bindings};
 use hane_update::clock::SystemClock;
 use hane_update::identity::{InstallFacts, InstallId};
 use hane_update::model::Target;
@@ -136,13 +136,14 @@ impl<S: Send + 'static> ServiceSlot<S> {
 
     /// Starts a service only when none exists and no stop is in flight. An
     /// unfinished stop never gets a second service next to it: the start is
-    /// kept and run once by the stop thread when the old service is gone, and
-    /// a later `resume` then returns the handle of that service.
+    /// kept and run once by the stop thread when the old service is gone;
+    /// [`Self::poll_resume`] then reports how that start went. A start that
+    /// fails is `Failed`, and a later explicit `resume` may try again.
     fn resume<H>(
         &self,
         start: impl FnOnce() -> Option<S> + Send + 'static,
         handle: impl Fn(&S) -> H,
-    ) -> Option<H> {
+    ) -> AiResume<H> {
         use std::sync::atomic::Ordering;
         let mut slot = self.slot();
         if self.stopping.load(Ordering::SeqCst) {
@@ -150,12 +151,29 @@ impl<S: Send + 'static> ServiceSlot<S> {
             if pending.is_none() {
                 *pending = Some(Box::new(start));
             }
-            return None;
+            return AiResume::Stopping;
         }
         if slot.is_none() {
             *slot = start();
         }
-        slot.as_ref().map(handle)
+        match slot.as_ref() {
+            Some(service) => AiResume::Started(handle(service)),
+            None => AiResume::Failed,
+        }
+    }
+
+    /// Reports the outcome of a resume that was left pending. It only looks at
+    /// the state and never starts a service.
+    fn poll_resume<H>(&self, handle: impl Fn(&S) -> H) -> AiResume<H> {
+        use std::sync::atomic::Ordering;
+        let slot = self.slot();
+        if self.stopping.load(Ordering::SeqCst) {
+            return AiResume::Stopping;
+        }
+        match slot.as_ref() {
+            Some(service) => AiResume::Started(handle(service)),
+            None => AiResume::Failed,
+        }
     }
 }
 
@@ -164,8 +182,12 @@ impl AiLifecycle for AiOwner {
         self.service.stop(timeout)
     }
 
-    fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+    fn resume(&self) -> AiResume {
         self.service.resume(start_ai_service, AiService::handle)
+    }
+
+    fn poll_resume(&self) -> AiResume {
+        self.service.poll_resume(AiService::handle)
     }
 }
 
@@ -902,7 +924,7 @@ mod ownership_claim_tests {
 
 #[cfg(test)]
 mod service_slot_tests {
-    use super::ServiceSlot;
+    use super::{AiResume, ServiceSlot};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -938,28 +960,21 @@ mod service_slot_tests {
             },
             |_| (),
         );
-        assert!(resumed.is_none());
+        assert!(matches!(resumed, AiResume::Stopping));
         assert_eq!(*starts.lock().unwrap(), 0);
         assert!(slot.stop(Duration::from_millis(20)).is_err());
 
-        // Once the old service is really gone, resuming starts a new one.
+        // Once the old service is really gone, the pending start runs once.
         release.send(()).unwrap();
-        let mut resumed = None;
+        let mut resumed = AiResume::Stopping;
         for _ in 0..200 {
-            let counter = Arc::clone(&starts);
-            resumed = slot.resume(
-                move || {
-                    *counter.lock().unwrap() += 1;
-                    Some(Blocking(None))
-                },
-                |_| (),
-            );
-            if resumed.is_some() {
+            resumed = slot.poll_resume(|_| ());
+            if !matches!(resumed, AiResume::Stopping) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(resumed.is_some());
+        assert!(matches!(resumed, AiResume::Started(())));
         assert_eq!(*starts.lock().unwrap(), 1);
     }
 
@@ -972,30 +987,36 @@ mod service_slot_tests {
 
         let starts = Arc::new(Mutex::new(0));
         let counter = Arc::clone(&starts);
-        assert!(
+        assert!(matches!(
             slot.resume(
                 move || {
                     *counter.lock().unwrap() += 1;
                     Some(Blocking(None))
                 },
                 |_| (),
-            )
-            .is_none()
-        );
+            ),
+            AiResume::Stopping
+        ));
         assert_eq!(*starts.lock().unwrap(), 0, "no second service while stopping");
 
         release.send(()).unwrap();
-        let mut resumed = None;
+        let mut resumed = AiResume::Stopping;
         for _ in 0..200 {
-            resumed = slot.resume(|| panic!("the pending start must be the only one"), |_| ());
-            if resumed.is_some() {
+            resumed = slot.poll_resume(|_| ());
+            if !matches!(resumed, AiResume::Stopping) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(resumed.is_some(), "the AI must not stay unavailable");
+        assert!(
+            matches!(resumed, AiResume::Started(())),
+            "the AI must not stay unavailable"
+        );
         assert_eq!(*starts.lock().unwrap(), 1);
-        assert!(slot.resume(|| panic!("already running"), |_| ()).is_some());
+        assert!(matches!(
+            slot.resume(|| panic!("already running"), |_| ()),
+            AiResume::Started(())
+        ));
         assert_eq!(*starts.lock().unwrap(), 1);
     }
 
@@ -1004,6 +1025,70 @@ mod service_slot_tests {
         let slot = ServiceSlot::new(Some(Blocking(None)));
         assert!(slot.stop(Duration::from_secs(5)).is_ok());
         let resumed = slot.resume(|| Some(Blocking(None)), |_| ());
-        assert!(resumed.is_some());
+        assert!(matches!(resumed, AiResume::Started(())));
+    }
+
+    #[test]
+    fn an_immediate_start_failure_is_reported_and_a_later_resume_retries() {
+        let slot = ServiceSlot::new(Some(Blocking(None)));
+        assert!(slot.stop(Duration::from_secs(5)).is_ok());
+        let starts = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&starts);
+        let failed = slot.resume(
+            move || {
+                *counter.lock().unwrap() += 1;
+                None::<Blocking>
+            },
+            |_| (),
+        );
+        assert!(matches!(failed, AiResume::Failed));
+        // Polling only looks; it never starts again.
+        assert!(matches!(slot.poll_resume(|_| ()), AiResume::Failed));
+        assert_eq!(*starts.lock().unwrap(), 1);
+        // A separate explicit resume may retry.
+        assert!(matches!(
+            slot.resume(|| Some(Blocking(None)), |_| ()),
+            AiResume::Started(())
+        ));
+    }
+
+    #[test]
+    fn a_failed_pending_start_ends_the_wait_without_repeating_the_start() {
+        let (service, release) = blocking();
+        let slot = ServiceSlot::new(Some(service));
+        assert!(slot.stop(Duration::from_millis(20)).is_err());
+        let starts = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&starts);
+        assert!(matches!(
+            slot.resume(
+                move || {
+                    *counter.lock().unwrap() += 1;
+                    None::<Blocking>
+                },
+                |_| (),
+            ),
+            AiResume::Stopping
+        ));
+
+        release.send(()).unwrap();
+        let mut outcome = AiResume::Stopping;
+        for _ in 0..200 {
+            outcome = slot.poll_resume(|_| ());
+            if !matches!(outcome, AiResume::Stopping) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(outcome, AiResume::Failed));
+        for _ in 0..5 {
+            assert!(matches!(slot.poll_resume(|_| ()), AiResume::Failed));
+        }
+        assert_eq!(*starts.lock().unwrap(), 1, "polling never restarts");
+
+        // A new explicit resume after the failure can try again.
+        assert!(matches!(
+            slot.resume(|| Some(Blocking(None)), |_| ()),
+            AiResume::Started(())
+        ));
     }
 }
