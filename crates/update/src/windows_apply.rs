@@ -152,12 +152,15 @@ impl FreeSpace for SystemFreeSpace {
 
 /// Space the replacement still needs on the install volume, counted from the
 /// moment of the check. The staged files already exist and are not counted
-/// again: whole-file backups of every replaced file, the largest single
-/// scratch copy (a replacement, or a restore during rollback) and the journal
-/// reserve. Any overflow is a refusal.
+/// again, but the peak use of the install volume is: whole-file backups of
+/// every replaced file, every new file that accumulates in the install (the
+/// space of replaced old files is conservatively not assumed to be freed), the
+/// largest single scratch copy (a replacement, or a restore during rollback)
+/// and the journal reserve. Any overflow is a refusal.
 fn required_free_bytes(plan: &ApplyPlan) -> Result<u64> {
     let overflow = || UpdateError::new(ErrorCode::LimitExceeded, "the required free space overflows");
     let mut backups = 0_u64;
+    let mut installed = 0_u64;
     let mut largest = 0_u64;
     for step in &plan.steps {
         let old = step.old.as_ref().map_or(0, |id| id.size);
@@ -165,10 +168,12 @@ fn required_free_bytes(plan: &ApplyPlan) -> Result<u64> {
         if step.backup_rel.is_some() {
             backups = backups.checked_add(old).ok_or_else(overflow)?;
         }
+        installed = installed.checked_add(new).ok_or_else(overflow)?;
         largest = largest.max(old).max(new);
     }
     backups
-        .checked_add(largest)
+        .checked_add(installed)
+        .and_then(|sum| sum.checked_add(largest))
         .and_then(|sum| sum.checked_add(JOURNAL_RESERVE_BYTES))
         .ok_or_else(overflow)
 }
@@ -738,7 +743,6 @@ mod tests {
 
     #[test]
     fn too_little_free_space_refuses_before_any_mutation() {
-        let payload: u64 = fixture().before.values().map(|data| data.len() as u64).sum();
         for available in [Some(0), Some(JOURNAL_RESERVE_BYTES), Some(JOURNAL_RESERVE_BYTES + 1), None] {
             // Each case gets its own fixture so a prior case's stage state
             // cannot make the apply fail before the free-space check.
@@ -754,11 +758,64 @@ mod tests {
                 "a backup area was created for {available:?}"
             );
         }
-        // Backups of everything plus the largest copy and the reserve suffice.
+        // Backups, the accumulated new files, the largest copy and the reserve suffice.
+        let required = plan_requirement().required;
         let fx = fixture();
-        fx.space.0.set(Some(JOURNAL_RESERVE_BYTES + 2 * payload));
+        fx.space.0.set(Some(required));
         let applied = apply_owned_files(&fx.inputs()).unwrap();
         assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+    }
+
+    struct PlanRequirement {
+        required: u64,
+        without_accumulated_new: u64,
+    }
+
+    /// The requirement of the fixture's plan, and what it would be if only the
+    /// backups, the largest copy and the reserve were counted.
+    fn plan_requirement() -> PlanRequirement {
+        let fx = fixture();
+        let plan = verify_and_plan(&fx.inputs()).unwrap();
+        let mut backups = 0_u64;
+        let mut largest = 0_u64;
+        for step in &plan.steps {
+            let old = step.old.as_ref().map_or(0, |id| id.size);
+            let new = step.new.as_ref().map_or(0, |id| id.size);
+            if step.backup_rel.is_some() {
+                backups += old;
+            }
+            largest = largest.max(old).max(new);
+        }
+        PlanRequirement {
+            required: required_free_bytes(&plan).unwrap(),
+            without_accumulated_new: backups + largest + JOURNAL_RESERVE_BYTES,
+        }
+    }
+
+    #[test]
+    fn accumulated_new_files_are_reserved_before_any_mutation() {
+        let need = plan_requirement();
+        assert!(
+            need.without_accumulated_new < need.required,
+            "the fixture must replace more than one file for this case to bite"
+        );
+        // Enough for every backup and the largest file, but not for the new
+        // files that pile up in the install: refused with the install untouched.
+        let fx = fixture();
+        fx.space.0.set(Some(need.without_accumulated_new));
+        let err = apply_owned_files(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::InsufficientSpace);
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+        assert!(
+            !fx.coordination.transaction_dir(&fx.transaction).join(BACKUP_DIR).exists(),
+            "a backup area was created"
+        );
+        // One byte short of the full requirement is still refused.
+        let fx = fixture();
+        fx.space.0.set(Some(need.required - 1));
+        assert_eq!(apply_owned_files(&fx.inputs()).err().unwrap().code, ErrorCode::InsufficientSpace);
+        assert!(fx.unchanged());
     }
 
     /// What the fake limited child saw and was asked to do.
