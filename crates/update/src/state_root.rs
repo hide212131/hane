@@ -284,6 +284,14 @@ pub fn publish_environment(
     let bytes = serde_json::to_vec(&document)
         .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
     discard_environment(coordination, transaction);
+    // The child re-reads this record with `ENVIRONMENT_LIMIT`; refuse before
+    // writing anything a reader would reject.
+    if bytes.len() as u64 > ENVIRONMENT_LIMIT {
+        return Err(UpdateError::new(
+            ErrorCode::LimitExceeded,
+            "the child environment is too large",
+        ));
+    }
     let path = environment_path(coordination, transaction);
     durable_write(&path, &bytes)?;
     if let Err(err) = acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false)) {
@@ -946,6 +954,53 @@ mod tests {
         assert_eq!(ENVIRONMENT_LIMIT, 16 * 1024);
         fx.write_private(ENVIRONMENT_FILE, &vec![b' '; ENVIRONMENT_LIMIT as usize + 1]);
         assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
+    }
+
+    #[test]
+    fn a_record_over_the_whole_limit_is_refused_before_it_is_written() {
+        let fx = fixture();
+        let to_os = |(k, v): (&str, String)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v));
+
+        // Every value is within its own per-key limit, but together they
+        // serialize past ENVIRONMENT_LIMIT.
+        let oversized = [
+            ("PATH", "p".repeat(MAX_PATH_ENV_VALUE_BYTES)),
+            ("HOME", "h".repeat(MAX_ENV_VALUE_BYTES)),
+            ("TMPDIR", "t".repeat(MAX_ENV_VALUE_BYTES)),
+            ("TEMP", "e".repeat(MAX_ENV_VALUE_BYTES)),
+            ("TMP", "m".repeat(MAX_ENV_VALUE_BYTES)),
+            ("APPDATA", "a".repeat(MAX_ENV_VALUE_BYTES)),
+            ("LOCALAPPDATA", "l".repeat(MAX_ENV_VALUE_BYTES)),
+            ("USERPROFILE", "u".repeat(MAX_ENV_VALUE_BYTES)),
+            ("XDG_CONFIG_HOME", "c".repeat(MAX_ENV_VALUE_BYTES)),
+            ("XDG_DATA_HOME", "d".repeat(MAX_ENV_VALUE_BYTES)),
+        ];
+        let total: usize = oversized.iter().map(|(_, v)| v.len()).sum();
+        assert!(total > ENVIRONMENT_LIMIT as usize);
+
+        // A previously published, valid record must not survive as a stale one.
+        publish_environment(
+            &fx.coordination,
+            &fx.transaction,
+            [("HOME", "/home/u".to_owned())].map(to_os),
+        )
+        .unwrap();
+        let err = publish_environment(&fx.coordination, &fx.transaction, oversized.map(to_os))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::LimitExceeded);
+        assert!(!environment_path(&fx.coordination, &fx.transaction).exists());
+        assert!(read_environment(&fx.coordination, &fx.transaction).unwrap().is_empty());
+
+        // A record within the limit is still published and read back.
+        let within = [
+            ("PATH", "p".repeat(MAX_PATH_ENV_VALUE_BYTES)),
+            ("HOME", "h".repeat(MAX_ENV_VALUE_BYTES)),
+        ];
+        publish_environment(&fx.coordination, &fx.transaction, within.clone().map(to_os)).unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        for (name, value) in within {
+            assert!(vars.contains(&(name.to_owned(), value)));
+        }
     }
 
     #[test]
