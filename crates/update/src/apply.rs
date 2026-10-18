@@ -1403,6 +1403,7 @@ mod tests {
         assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_added_file_created_by_a_third_party_first_is_never_overwritten() {
         let mut fx = race_fixture();
