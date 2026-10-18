@@ -78,9 +78,9 @@ const MAX_PLIST_BYTES: u64 = 256 << 10;
 const STAGE_DIR: &str = "stage";
 const STAGED_APP: [&str; 2] = ["hane-macos-arm64", "Hane.app"];
 const MAIN_EXE: &str = "Contents/MacOS/hane";
-/// The files that stand for the whole sealed bundle. `CodeResources` lists the
-/// hash of every other resource and nested code, so a change anywhere else
-/// changes it; the executable, the helper and the Info.plist are hashed directly.
+/// The files a complete bundle must contain. The identity itself covers every
+/// entry under `Hane.app`; `CodeResources` is only a static manifest and does not
+/// vouch for the bytes actually on disk.
 const IDENTITY_FILES: [&str; 4] = [
     "Contents/Info.plist",
     MAIN_EXE,
@@ -234,15 +234,68 @@ pub fn bundle_identity(bundle: &Path) -> Result<Observed> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Observed::Missing),
         Err(err) => return Err(err.into()),
     }
-    let mut lines = Vec::with_capacity(IDENTITY_FILES.len());
     for rel in IDENTITY_FILES {
         let parts: Vec<&str> = rel.split('/').collect();
-        let (size, sha256) = hash_regular_file_under(bundle, &parts)?.ok_or_else(|| {
+        hash_regular_file_under(bundle, &parts)?.ok_or_else(|| {
             UpdateError::new(ErrorCode::InstallModified, format!("the bundle lacks {rel}"))
         })?;
-        lines.push(format!("{rel}\n{size}\n{sha256}\n"));
     }
-    Ok(Observed::File(FileIdentity::of(lines.concat().as_bytes())))
+    let mut manifest = String::new();
+    collect_identity_entries(bundle, "", &mut manifest)?;
+    Ok(Observed::File(FileIdentity::of(manifest.as_bytes())))
+}
+
+/// Appends one unambiguous record per entry below `dir`, in byte order of the
+/// names: the type, the length-prefixed relative path and then the file size
+/// and hash or the symlink target. Symlinks are recorded, never followed; any
+/// other kind of entry, a non-UTF-8 name or a read failure is an error.
+/// Timestamps and other volatile metadata are not part of the identity.
+fn collect_identity_entries(dir: &Path, prefix: &str, out: &mut String) -> Result<()> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("a name in {} is not UTF-8", dir.display()),
+            )
+        })?;
+        names.push(name);
+    }
+    names.sort();
+    for name in names {
+        let path = dir.join(&name);
+        let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+        let meta = fs::symlink_metadata(&path)?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            let target = fs::read_link(&path)?;
+            let target = target.to_str().ok_or_else(|| {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("the target of {} is not UTF-8", path.display()),
+                )
+            })?;
+            out.push_str(&format!("L {} {rel} {} {target}\n", rel.len(), target.len()));
+        } else if kind.is_dir() {
+            out.push_str(&format!("D {} {rel}\n", rel.len()));
+            collect_identity_entries(&path, &rel, out)?;
+        } else if kind.is_file() {
+            let (size, sha256) = hash_regular_file(&path)?.ok_or_else(|| {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{} vanished while being read", path.display()),
+                )
+            })?;
+            out.push_str(&format!("F {} {rel} {size} {sha256}\n", rel.len()));
+        } else {
+            return Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} is neither a file, a directory nor a symlink", path.display()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Where the candidate bundle is staged, and so where the old bundle rests
@@ -1208,6 +1261,52 @@ mod tests {
         assert!(bundle_identity(&bundle).is_err());
     }
 
+    #[test]
+    fn the_bundle_identity_covers_resources_and_nested_code_not_just_the_seal() {
+        let dir = TempDir::new("macos-identity-deep");
+        let bundle = dir.path().join("Hane.app");
+        write_bundle(&bundle, &bundle_files(OLD, &good_plist(OLD)));
+        let resource = bundle.join("Contents/Resources/icon.icns");
+        let nested = bundle.join("Contents/Frameworks/X.framework/Versions/A/X");
+        for path in [&resource, &nested] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"original").unwrap();
+        }
+        let base = bundle_identity(&bundle).unwrap();
+        for path in [&resource, &nested] {
+            fs::write(path, b"tampered").unwrap();
+            assert_ne!(bundle_identity(&bundle).unwrap(), base, "{}", path.display());
+            fs::write(path, b"original").unwrap();
+            assert_eq!(bundle_identity(&bundle).unwrap(), base);
+        }
+        // An extra entry changes it as well.
+        fs::write(bundle.join("Contents/Resources/extra"), b"x").unwrap();
+        assert_ne!(bundle_identity(&bundle).unwrap(), base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bundle_identity_follows_symlink_targets_without_following_them() {
+        let dir = TempDir::new("macos-identity-symlink");
+        let bundle = dir.path().join("Hane.app");
+        write_bundle(&bundle, &bundle_files(OLD, &good_plist(OLD)));
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"one").unwrap();
+        let link = bundle.join("Contents/Frameworks-link");
+        std::os::unix::fs::symlink("Info.plist", &link).unwrap();
+        let base = bundle_identity(&bundle).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("MacOS/hane", &link).unwrap();
+        let retargeted = bundle_identity(&bundle).unwrap();
+        assert_ne!(retargeted, base);
+        // A target outside the bundle is recorded, and its bytes are not read.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let before = bundle_identity(&bundle).unwrap();
+        fs::write(&outside, b"two").unwrap();
+        assert_eq!(bundle_identity(&bundle).unwrap(), before);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_linked_bundle_is_never_an_identity() {
@@ -1548,6 +1647,22 @@ mod tests {
         assert!(matches!(recover(&fx, &mut journal), RecoveryOutcome::RecoveryRequired(_)));
         assert_eq!(fx.host.swaps.get(), 0);
         assert!(fx.live_is_old());
+    }
+
+    #[test]
+    fn a_committed_receipt_rejects_a_bundle_changed_below_the_unchanged_seal() {
+        let fx = fixture();
+        let mut journal = journal_at(&fx, Reached::Committed);
+        exchanged_before_the_interruption(&fx);
+        let seal = fx.live().join("Contents/_CodeSignature/CodeResources");
+        let seal_before = fs::read(&seal).unwrap();
+        let resource = fx.live().join("Contents/Resources/data.bin");
+        fs::create_dir_all(resource.parent().unwrap()).unwrap();
+        fs::write(&resource, b"tampered resource").unwrap();
+        assert_eq!(fs::read(&seal).unwrap(), seal_before);
+        let outcome = recover(&fx, &mut journal);
+        assert!(matches!(outcome, RecoveryOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(fx.host.swaps.get(), 0);
     }
 
     #[test]
