@@ -37,6 +37,34 @@ pub enum Entry {
 /// How long the limited child waits for the helper's `Commit` after `Healthy`.
 pub const LIMITED_COMMIT_WAIT: std::time::Duration = COMMIT_WAIT;
 
+/// How long a launch carrying an explicit file argument keeps waiting for an
+/// update in progress, so the request is delivered instead of dropped.
+const EXPLICIT_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+const EXPLICIT_OPEN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Takes the startup gate. With an explicit open request, `UpdateInProgress`
+/// is retried (each attempt takes the gate again) until `wait` has elapsed in
+/// total sleep time; every other outcome is returned at once.
+fn gate_with_open_retry(
+    mut take_gate: impl FnMut() -> GateOutcome,
+    has_explicit_open: bool,
+    wait: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> GateOutcome {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        let outcome = take_gate();
+        if !has_explicit_open
+            || !matches!(outcome, GateOutcome::UpdateInProgress)
+            || waited >= wait
+        {
+            return outcome;
+        }
+        sleep(EXPLICIT_OPEN_RETRY_INTERVAL);
+        waited += EXPLICIT_OPEN_RETRY_INTERVAL;
+    }
+}
+
 pub fn enter() -> Entry {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -80,7 +108,17 @@ pub fn enter() -> Entry {
     let runner = HelperRecoveryRunner {
         policy: TrustPolicy::production(),
     };
-    match startup_gate_for_exe(&exe, &runner) {
+    // An explicit file argument must not be lost to an update in progress: keep
+    // taking the gate (never bypassing it) and let this process deliver the path
+    // through the ordinary open path once the gate admits it.
+    let has_explicit_open = std::env::args_os().nth(1).is_some();
+    let outcome = gate_with_open_retry(
+        || startup_gate_for_exe(&exe, &runner),
+        has_explicit_open,
+        EXPLICIT_OPEN_WAIT,
+        std::thread::sleep,
+    );
+    match outcome {
         GateOutcome::Proceed(guard) => Entry::Start {
             guard: Some(guard),
             state_root: None,
@@ -100,5 +138,66 @@ pub fn enter() -> Entry {
             );
             Entry::Stop(EXIT_RECOVERY_REQUIRED)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn scripted(in_progress: usize) -> impl FnMut() -> GateOutcome {
+        let mut remaining = in_progress;
+        move || {
+            if remaining > 0 {
+                remaining -= 1;
+                GateOutcome::UpdateInProgress
+            } else {
+                GateOutcome::Unmanaged
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_open_waits_out_the_update_and_is_admitted_once() {
+        let mut admitted = 0;
+        let mut inner = scripted(3);
+        let mut sleeps = 0;
+        let outcome = gate_with_open_retry(
+            || {
+                let outcome = inner();
+                if matches!(outcome, GateOutcome::Unmanaged) {
+                    admitted += 1;
+                }
+                outcome
+            },
+            true,
+            Duration::from_secs(60),
+            |_| sleeps += 1,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert_eq!(admitted, 1, "the launch (and its path) is admitted exactly once");
+        assert_eq!(sleeps, 3);
+    }
+
+    #[test]
+    fn a_launch_without_an_explicit_open_still_stops_while_updating() {
+        let mut sleeps = 0;
+        let outcome = gate_with_open_retry(scripted(3), false, Duration::from_secs(60), |_| sleeps += 1);
+        assert!(matches!(outcome, GateOutcome::UpdateInProgress));
+        assert_eq!(sleeps, 0);
+    }
+
+    #[test]
+    fn an_explicit_open_gives_up_after_the_wait_without_bypassing_the_gate() {
+        let mut sleeps = 0;
+        let outcome = gate_with_open_retry(
+            || GateOutcome::UpdateInProgress,
+            true,
+            Duration::from_secs(1),
+            |_| sleeps += 1,
+        );
+        assert!(matches!(outcome, GateOutcome::UpdateInProgress));
+        assert_eq!(sleeps, 4);
     }
 }
