@@ -444,7 +444,7 @@ pub(crate) struct EditorLaunch {
     /// after the helper's durable commit.
     update_completed: Option<String>,
     #[cfg(target_os = "windows")]
-    open_requests: std::sync::mpsc::Receiver<PathBuf>,
+    open_requests: std::sync::mpsc::Receiver<open_request::OpenRequest>,
     #[cfg(target_os = "macos")]
     finder_requests: FinderReceiver,
     #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -746,24 +746,36 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
     .detach();
     #[cfg(target_os = "windows")]
     cx.spawn(async move |cx| {
-        // Paths wait here until the view accepts them; a request that
-        // arrives while the view is frozen for an update restart
-        // check stays queued and is retried on the next tick instead
-        // of being consumed.
-        let mut pending = hane_ui::ExternalOpenQueue::new();
+        // The sender is acknowledged only once the view really took the path.
+        // A request that meets the restart freeze (including the final freeze
+        // up to `cx.quit()`) is refused on the pipe, so its sender retries
+        // instead of the request dying with this process.
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(40))
                 .await;
-            while let Ok(path) = open_requests.try_recv() {
-                pending.push(path);
+            let mut batch = Vec::new();
+            while let Ok(request) = open_requests.try_recv() {
+                batch.push(request);
             }
-            if pending.is_empty() {
+            if batch.is_empty() {
                 continue;
             }
             if window
                 .update(cx, |view, window, cx| {
-                    let accepted = pending.drain_into(|path| view.submit_external_open(path, cx));
+                    let mut accepted = 0;
+                    for request in batch {
+                        if request.is_abandoned() {
+                            continue;
+                        }
+                        match view.submit_external_open(request.path(), cx) {
+                            hane_ui::ExternalOpenOutcome::Accepted => {
+                                accepted += 1;
+                                request.accept();
+                            }
+                            hane_ui::ExternalOpenOutcome::Busy => request.refuse(),
+                        }
+                    }
                     if accepted > 0 {
                         window.activate_window();
                         if !view.settings_is_open() {
