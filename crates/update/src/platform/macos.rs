@@ -79,6 +79,100 @@ fn query_volume(path: &Path) -> Result<VolumeFacts> {
     })
 }
 
+/// `struct attrlist` of `<sys/attr.h>`.
+#[repr(C)]
+struct AttrList {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+const ATTR_VOL_INFO: u32 = 0x8000_0000;
+const ATTR_VOL_UUID: u32 = 0x0004_0000;
+
+unsafe extern "C" {
+    fn getattrlist(
+        path: *const libc::c_char,
+        attr_list: *mut AttrList,
+        attr_buf: *mut libc::c_void,
+        attr_buf_size: libc::size_t,
+        options: libc::c_ulong,
+    ) -> libc::c_int;
+}
+
+/// The persistent UUID of the volume holding `path`, lowercase hex. Any
+/// failure (including an all-zero UUID) is an error, never a fallback value.
+fn volume_uuid(path: &Path) -> Result<String> {
+    let failed = || {
+        UpdateError::new(
+            ErrorCode::Io,
+            "the install volume UUID could not be determined",
+        )
+    };
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| failed())?;
+    let mut list = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: ATTR_VOL_INFO | ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // 4-byte length prefix followed by the 16-byte uuid_t.
+    let mut buf = [0u8; 32];
+    // SAFETY: the path is NUL-terminated, `list` and `buf` are live locals and
+    // the size passed is that of `buf`; the call only writes within it.
+    let rc = unsafe {
+        getattrlist(
+            c_path.as_ptr(),
+            &mut list,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(failed());
+    }
+    let length = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if length < 20 {
+        return Err(failed());
+    }
+    uuid_to_hex(&buf[4..20]).ok_or_else(failed)
+}
+
+fn uuid_to_hex(bytes: &[u8]) -> Option<String> {
+    if bytes.len() != 16 || bytes.iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The InstallId of a bundle on `volume`. Only the persistent volume UUID
+/// enters the identity; `volume.id` (st_dev) can change when the volume is
+/// remounted. A missing UUID is an error so startup fails closed.
+fn derive_install_id(
+    volume: &VolumeFacts,
+    uuid: Result<String>,
+    install_path: &str,
+    owner: &str,
+) -> Result<InstallId> {
+    let _ = &volume.id;
+    let uuid = uuid?;
+    InstallId::derive(&InstallFacts {
+        os: "macos",
+        volume_id: &format!("apfs-uuid:{uuid}"),
+        install_path,
+        owner,
+    })
+}
+
 pub fn locate(exe: &Path) -> Result<Placement> {
     if Target::current()? != Target::MacosArm64 {
         return Err(unsupported("not an Apple Silicon macOS build"));
@@ -120,12 +214,14 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     if volume.read_only {
         return Err(unsupported("the install volume is read-only"));
     }
-    let install_id = InstallId::derive(&InstallFacts {
-        os: "macos",
-        volume_id: &format!("apfs:{}", volume.id),
-        install_path: &bundle.to_string_lossy(),
-        owner: &owner_name()?,
-    })?;
+    // `volume.id` (st_dev) only identifies the mount for this boot; the durable
+    // InstallId uses the persistent volume UUID and fails closed without it.
+    let install_id = derive_install_id(
+        &volume,
+        volume_uuid(bundle),
+        &bundle.to_string_lossy(),
+        &owner_name()?,
+    )?;
     Ok(Placement {
         target: Target::MacosArm64,
         install_root: bundle.to_path_buf(),
@@ -327,6 +423,39 @@ mod tests {
         }
         // A missing side is an error and moves nothing.
         assert!(MacHost.swap(&first, &dir.path().join("absent")).is_err());
+    }
+
+    fn facts(dev: &str) -> VolumeFacts {
+        VolumeFacts {
+            id: dev.to_owned(),
+            apfs: true,
+            local: true,
+            read_only: false,
+        }
+    }
+
+    fn id_for(dev: &str, uuid: Result<String>) -> Result<InstallId> {
+        derive_install_id(&facts(dev), uuid, "/Applications/Hane.app", "alice")
+    }
+
+    #[test]
+    fn the_install_id_follows_the_volume_uuid_not_st_dev() {
+        let uuid = || Ok("0123456789abcdef0123456789abcdef".to_owned());
+        let before = id_for("1000004", uuid()).unwrap();
+        let after_remount = id_for("1000009", uuid()).unwrap();
+        assert_eq!(before, after_remount);
+        let other = id_for("1000004", Ok("fedcba9876543210fedcba9876543210".to_owned())).unwrap();
+        assert_ne!(before, other);
+    }
+
+    #[test]
+    fn a_missing_volume_uuid_fails_closed() {
+        let failure = Err(UpdateError::new(ErrorCode::Io, "no uuid"));
+        let err = id_for("1000004", failure).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(uuid_to_hex(&[0u8; 16]).is_none());
+        assert!(uuid_to_hex(&[1u8; 15]).is_none());
+        assert_eq!(uuid_to_hex(&[0xab; 16]).unwrap(), "ab".repeat(16));
     }
 
     #[test]
