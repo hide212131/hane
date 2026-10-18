@@ -421,6 +421,31 @@ impl BundleHost for MacHost {
         exchange(first, second)
     }
 
+    /// `renamex_np` only updates the cached directory entries. `F_FULLFSYNC`
+    /// on both parent directories (the live bundle's and the slot's) flushes
+    /// the exchange to the device; a failure is an error, never a success.
+    fn sync_swap(&self, first: &Path, second: &Path) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut parents = Vec::with_capacity(2);
+        for path in [first, second] {
+            let parent = path
+                .parent()
+                .ok_or_else(|| unsupported("a bundle path has no parent directory"))?;
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+        for parent in parents {
+            let dir = fs::File::open(parent)?;
+            // SAFETY: the descriptor is open for the duration of the call.
+            let rc = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_FULLFSYNC) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+
     fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()> {
         verify_developer_id(bundle, team_id)
     }

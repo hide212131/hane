@@ -116,6 +116,10 @@ pub trait BundleHost {
     /// Atomically exchanges two existing paths on one volume. It either did
     /// exchange them or changed nothing.
     fn swap(&self, first: &Path, second: &Path) -> Result<()>;
+    /// Flushes the parent directories of both exchanged paths to stable
+    /// storage, so the exchanged directory entries survive a power loss. An
+    /// error means the exchange is not known to be durable.
+    fn sync_swap(&self, first: &Path, second: &Path) -> Result<()>;
     /// Strict verification of the complete bundle against the Developer ID
     /// requirement pinned to exactly `team_id`.
     fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()>;
@@ -643,7 +647,10 @@ impl<'a> BundleOps<'a> {
 
     fn exchange(&self) -> Result<()> {
         self.check_placement()?;
-        self.host.swap(&self.live, &self.slot)
+        self.host.swap(&self.live, &self.slot)?;
+        // The journal must not advance on an exchange that is not durable. An
+        // error here leaves recovery to settle from the journal and the disk.
+        self.host.sync_swap(&self.live, &self.slot)
     }
 }
 
@@ -1286,6 +1293,10 @@ mod tests {
         fail_set_mark: Cell<bool>,
         /// Number of mark syncs requested.
         syncs: Cell<usize>,
+        fail_swap_sync: Cell<bool>,
+        /// Exchanges done so far and the journal phase / step state seen at
+        /// each parent-directory sync after an exchange.
+        swap_syncs: RefCell<Vec<(usize, Option<(Phase, StepState)>)>>,
         /// Runs right after a successful exchange, before anything observes it
         /// (the Finder moving the live bundle).
         after_swap: RefCell<Option<Box<dyn Fn()>>>,
@@ -1324,6 +1335,8 @@ mod tests {
                 fail_sync: Cell::new(false),
                 fail_set_mark: Cell::new(false),
                 syncs: Cell::new(0),
+                fail_swap_sync: Cell::new(false),
+                swap_syncs: RefCell::new(Vec::new()),
                 after_swap: RefCell::new(None),
             }
         }
@@ -1366,6 +1379,20 @@ mod tests {
             }
             if let Some(hook) = self.after_swap.borrow().as_ref() {
                 hook();
+            }
+            Ok(())
+        }
+
+        fn sync_swap(&self, _first: &Path, _second: &Path) -> Result<()> {
+            let journal = self
+                .journal_path
+                .borrow()
+                .as_ref()
+                .and_then(|path| FileJournalStore::new(path.clone()).load().unwrap())
+                .map(|journal| (journal.phase, journal.steps[0].state));
+            self.swap_syncs.borrow_mut().push((self.swaps.get(), journal));
+            if self.fail_swap_sync.get() {
+                return Err(io_error("injected swap directory sync failure"));
             }
             Ok(())
         }
@@ -2088,6 +2115,41 @@ mod tests {
         assert!(fx.untouched());
         assert!(!fx.journal_path().exists(), "no journal was created");
         assert_eq!(fx.host.bundle_mark(&fx.slot()).unwrap(), None, "the unsynced mark is withdrawn");
+    }
+
+    /// The parent directories are synced right after the exchange, while the
+    /// journal still records only the intent.
+    #[test]
+    fn the_swap_parents_are_synced_before_the_journal_records_applied() {
+        let fx = fixture();
+        *fx.host.journal_path.borrow_mut() = Some(fx.journal_path());
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        assert_eq!(
+            *fx.host.swap_syncs.borrow(),
+            vec![(1, Some((Phase::Applying, StepState::Intent)))]
+        );
+        assert_eq!(applied.journal().steps[0].state, StepState::Applied);
+    }
+
+    #[test]
+    fn a_swap_directory_sync_failure_does_not_advance_the_journal_or_claim_success() {
+        let fx = fixture();
+        *fx.host.journal_path.borrow_mut() = Some(fx.journal_path());
+        fx.host.fail_swap_sync.set(true);
+        // The rollback exchange cannot be made durable either, so recovery
+        // stops as required instead of reporting a settled outcome.
+        assert!(apply_bundle(&fx.inputs()).is_err());
+        let journal = FileJournalStore::new(fx.journal_path()).load().unwrap().unwrap();
+        assert_ne!(journal.steps[0].state, StepState::Applied);
+        assert_ne!(journal.phase, Phase::AwaitingHealth);
+        assert!(
+            fx.host
+                .swap_syncs
+                .borrow()
+                .iter()
+                .all(|(_, seen)| *seen != Some((Phase::Applying, StepState::Applied))),
+            "no sync ran after the journal was advanced"
+        );
     }
 
     #[test]
