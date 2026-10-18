@@ -443,6 +443,24 @@ impl BundleHost for MacHost {
         }
     }
 
+    /// `setxattr` returning success only means the attribute is in the cache.
+    /// `F_FULLFSYNC` on the bundle directory flushes its metadata to the
+    /// device; a failure is an error, never a silent success.
+    fn sync_bundle_mark(&self, bundle: &Path) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let dir = fs::File::open(bundle)?;
+        // SAFETY: the descriptor is open for the duration of the call.
+        let rc = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_FULLFSYNC) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if let Some(parent) = bundle.parent() {
+            // The directory entry of the bundle itself.
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     fn clear_bundle_mark(&self, bundle: &Path) -> Result<()> {
         let path = c_path(bundle)?;
         // SAFETY: both pointers refer to NUL-terminated C strings.

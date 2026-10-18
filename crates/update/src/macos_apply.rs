@@ -129,6 +129,11 @@ pub trait BundleHost {
     /// not part of the sealed contents, so signatures and [`bundle_identity`]
     /// are unaffected.
     fn set_bundle_mark(&self, bundle: &Path, mark: &[u8]) -> Result<()>;
+    /// Flushes the bundle directory's metadata (the mark's extended attribute)
+    /// to stable storage. A successful `set_bundle_mark` alone does not survive
+    /// a power loss; the journal and the exchange must not begin before this
+    /// succeeds.
+    fn sync_bundle_mark(&self, bundle: &Path) -> Result<()>;
     /// Removes the relocation mark; a bundle without one is not an error.
     fn clear_bundle_mark(&self, bundle: &Path) -> Result<()>;
 }
@@ -1016,6 +1021,12 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
         coordination_parent: inputs.placement.coordination_parent.clone(),
     };
     inputs.host.set_bundle_mark(&verified.slot, &mark.encode()?)?;
+    // Only a mark that is durable lets the journal and the exchange begin; a
+    // power loss after the exchange must not leave a swapped bundle unmarked.
+    if let Err(err) = inputs.host.sync_bundle_mark(&verified.slot) {
+        let _ = inputs.host.clear_bundle_mark(&verified.slot);
+        return Err(err);
+    }
 
     let journal = UpdateJournal::begin(&verified.plan, None)?;
     let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
@@ -1244,6 +1255,10 @@ mod tests {
         /// Relocation marks by directory identity, like an extended attribute:
         /// they follow the directory through a rename.
         marks: RefCell<BTreeMap<String, Vec<u8>>>,
+        fail_sync: Cell<bool>,
+        fail_set_mark: Cell<bool>,
+        /// Number of mark syncs requested.
+        syncs: Cell<usize>,
         /// Runs right after a successful exchange, before anything observes it
         /// (the Finder moving the live bundle).
         after_swap: RefCell<Option<Box<dyn Fn()>>>,
@@ -1279,6 +1294,9 @@ mod tests {
                 journal_path: RefCell::new(None),
                 at_swap: RefCell::new(Vec::new()),
                 marks: RefCell::new(BTreeMap::new()),
+                fail_sync: Cell::new(false),
+                fail_set_mark: Cell::new(false),
+                syncs: Cell::new(0),
                 after_swap: RefCell::new(None),
             }
         }
@@ -1330,7 +1348,18 @@ mod tests {
         }
 
         fn set_bundle_mark(&self, bundle: &Path, mark: &[u8]) -> Result<()> {
+            if self.fail_set_mark.get() {
+                return Err(io_error("injected mark write failure"));
+            }
             self.marks.borrow_mut().insert(mark_key(bundle)?, mark.to_vec());
+            Ok(())
+        }
+
+        fn sync_bundle_mark(&self, _bundle: &Path) -> Result<()> {
+            self.syncs.set(self.syncs.get() + 1);
+            if self.fail_sync.get() {
+                return Err(io_error("injected mark sync failure"));
+            }
             Ok(())
         }
 
@@ -1953,6 +1982,56 @@ mod tests {
         assert_eq!(&parsed.install_id, fx.coordination.install_id());
         assert_eq!(parsed.transaction, fx.transaction);
         assert_eq!(fx.host.bundle_mark(&fx.slot()).unwrap(), None, "the old bundle is unmarked");
+    }
+
+    /// The mark is made durable after it is written and before the journal
+    /// exists or anything is exchanged.
+    #[test]
+    fn the_mark_is_synced_before_the_journal_and_the_exchange() {
+        let fx = fixture();
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        drop(applied);
+        assert_eq!(fx.host.syncs.get(), 1);
+    }
+
+    #[test]
+    fn a_mark_that_cannot_be_synced_refuses_before_any_journal_or_exchange() {
+        let fx = fixture();
+        fx.host.fail_sync.set(true);
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert_eq!(fx.host.syncs.get(), 1);
+        assert_eq!(fx.host.swaps.get(), 0);
+        assert!(fx.untouched());
+        assert!(!fx.journal_path().exists(), "no journal was created");
+        assert_eq!(fx.host.bundle_mark(&fx.slot()).unwrap(), None, "the unsynced mark is withdrawn");
+    }
+
+    #[test]
+    fn a_mark_that_cannot_be_written_refuses_before_any_journal_or_exchange() {
+        let fx = fixture();
+        fx.host.fail_set_mark.set(true);
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert_eq!(fx.host.syncs.get(), 0, "nothing is synced for a mark that was not written");
+        assert_eq!(fx.host.swaps.get(), 0);
+        assert!(fx.untouched());
+        assert!(!fx.journal_path().exists(), "no journal was created");
+    }
+
+    /// A crash after the exchange finds the durable mark on the new live bundle,
+    /// so a relocated bundle cannot start as an uncommitted new version.
+    #[cfg(unix)]
+    #[test]
+    fn a_crash_after_the_exchange_leaves_a_durable_mark_that_blocks_a_moved_bundle() {
+        let fx = fixture();
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        drop(applied);
+        assert_eq!(fx.host.syncs.get(), 1);
+        let mark = fx.host.bundle_mark(fx.live()).unwrap();
+        let parent = fx.placement.coordination_parent.clone();
+        let err = check_relocation(mark.as_deref(), &moved_install_id(), &parent).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
     }
 
     #[test]
