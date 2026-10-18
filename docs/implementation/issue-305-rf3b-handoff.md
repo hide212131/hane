@@ -1,39 +1,71 @@
 # Issue #305 実装・GUI受入の引き継ぎ
 
-更新日: 2026-10-18（日本時間）
+更新日: 2026-10-19（日本時間）
 対象: hide212131/hane Issue #305 / PR #497
 
 ## 現在の判定
 
 採用設計を維持し、仕様書の作り直しは行わない。設計の正本は[短い入力欄の実装仕様書](../refactor-rf3b-short-text-input-implementation-spec.md)で、§3・§5〜§10を実装・受入契約とする。
 
-Issue #305はOPENで、受入条件5件はすべて未チェック。設計PR #496のmerge、CI、Codexレビュー、部分的なOS別GUI確認をIssue完了と扱わない。このhandoff更新では製品コードを変更しない。
+2026-10-19現在、Issue #305はOPENで、受入条件5件はすべて未チェック。PR #497はOPEN / Draft、current head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、base `fd894ff8136cfe0bcae903211b3b422713db8b54`。ClaudeのAADW実装依頼run `39139696316`はprepare・worker・trusted finalizer・exact-result verifierがsuccess。Sonnet 5.5確認、workspace regression tests、lintもsuccess。通常PR CI run `39139812875`は`action_required`でjobなし。CodeRabbitのsuccess statusはDraft未レビューを意味しない。
+
+このheadにはG04向けのbounds-origin変更通知が入った。Windows current-head確認ではrename行移動後の候補位置と変換確定後クリックを確認した。C05ではfilter composition中の再クリックによるcaret位置更新と、rename再クリック時の位置変更拒否を確認したが、filter blur後の文字列保持は未確認のためC05全体はPARTIAL。filter再クリック後もIME候補popupがクリック前の座標に残った観測は、G04の「現在の文字位置付近」条件に対する未達サブケースとして記録する。current mainで同じ操作を比較しておらず、PR固有の回帰とはまだ断定できない。macOS current-head release buildはできたが、候補起動がCUA timeout、Finderの無害なclickもCUA再初期化後にnoWindowsAvailableとなり、Mac GUI試験を開始できなかった。利用者の最新read-only確認はKeyhac hook OFF。以後、Keyhacの設定・トレイ・shortcut・processは操作しない。G06 callback-order regressionも残る。#496/#495の採用済み内容は再設計しない。
+
+### Windows current-head G04（partial、run 1）
+
+- Candidate head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`をRust/Cargo 1.98.1、`aarch64-pc-windows-msvc`でrelease build。実行ファイルSHA-256 `7F65B9587218546C0850A99F70C7E202F61F4EEF9FE878E8D7CB5583DA920399`。起動前にhead/base、fixture、clean worktreeを照合し、専用stateとfixtureでPID 7516を使った。
+- Filter: IME未確定「か」の候補をcaret start/middle/endと逆向き選択後に表示し、各caret付近にあることを確認。sidebar幅を広げた後もfilter欄から候補が逸れなかった。
+- Rename: 候補はrename欄付近に表示。composition中に同じrename行を再クリックした時、caretとfilenameは変わらず、C05のrename拒否と一致した。一時renameで行を4番目から最下段へ動かし、その新位置でも候補がrename行付近に表示された。移動後のcaret start/middle/end・reverse selectionを個別に網羅したとは記録されていない。
+- run 1時点ではIME確定後クリックとfilter C05が未確認だった。run 2でrenameの未確認項目を補ったが、filter C05は候補popupの旧位置残留が確認され、current-head G04は引き続きpartial。
+- 利用者は試験開始前にKeyhac hookをread-onlyでOFF確認。Windows workerはON/OFF shortcutのpath・引数・scriptを読み取り調査しようとしたが、実行前に中止指示を受けてshortcutを実行せず、以後Keyhacには触れていない。終了時に状態を再確認していない。
+- 専用Hane PID 7516を通常終了し、6 fixture filesのpath/size/hashが全て開始時と一致。worktree clean、process残存なし。Windows evidence: `C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\evidence\g04-current-a2b106-20261019-0001\final-evidence.md` と `pre-cleanup-ui-state.md`。これらはlocal temp recordで、GitHubへuploadしていない。
+
+### Windows current-head G04 focused follow-up（run 2）
+
+- 同じ候補head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`と前runのRust/Cargo 1.98.1 build（SHA-256 `7F65B9587218546C0850A99F70C7E202F61F4EEF9FE878E8D7CB5583DA920399`）を再照合して使用。専用fixture/stateを使い、PR head/base・clean worktree・Hane不在を起動前に確認。
+- Rename行を更新日時順の5番目から名前順の最下段へ動かした後、start/middle/end/reverse selectionで候補がcaret付近に表示された。変換確定後に欄内をクリックするとcaretがクリック位置へ移った。
+- C05のfilter再クリックではcaretがクリック位置へ移り、§6.2の位置更新条件を満たした。rename再クリックの拒否もrun 1で確認済みだが、filter blur後の文字列保持は未確認なのでC05全体はPARTIAL。別のG04観測として、再クリック後の日本語候補popupはクリック前の座標に残り、現在caret付近に表示されなかった。このサブケースはG04未達として記録し、current mainとの同条件比較は未実施のためPR固有の回帰かは未確定。G04全体は引き続き未完了。
+- 専用Hane PID 5096を終了。fixture 6件の名前・hashは開始時と一致し、worktreeはclean。Keyhacには触れていない。証拠: `C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\evidence\g04-focus-a2b106-20261019-0002\final-evidence.md`（local temp、GitHub未upload）。
+
+### macOS current-head build（GUI blocked）
+
+- head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`をmacOS ARM64 / Rust-Cargo 1.98.1でrelease build。candidate binary SHA-256 `da6b80a2b16ff0482f81bf8a7ade93a432266183bef08e3bacbbd6191feeab89`。専用fixture/state、固有bundle IDの検証appを用意した。
+- 起動時の`cua.getApp(bundlePath)`は`timeoutReached`。候補Hane processは存在せず、製品画面は開いていない。Finderの状態・画像取得は成功したが、無害なFinder clickは`noWindowsAvailable`。CUA JS sessionを一度reset後も同じclick失敗。共有ChatGPT配下の`SkyComputerUseService`はプロセス関係を確認できたが、共有helperなので再起動していない。
+- macOS G01〜G06はいずれも今回未実施。fixture 6件のhashは開始manifestと一致し、candidate worktreeはhead一致・clean。詳細記録は`/private/tmp/hane-issue305-macos-a2b106-20261019-0001/evidence/gui-launch-failure.md`。native input接続が復旧したらこのbuildを使ってGUI受入を再開する。
 
 ## current main と関連PR
 
 - current main: `fd894ff8136cfe0bcae903211b3b422713db8b54`（#522）。
-- Issue #305本文の「実装・検証状況」は、current main `fd894ff...`、PR #497 remote head `581ceee...`、CI run `39123002036`を反映していた。今回mainをローカルbranchへmergeしたため、pushとcurrent-head CIの確認後にIssue本文も更新する。受入5条件はすべて未チェック。
+- 2026-10-19の再確認でもcurrent mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`、Issue #305はOPEN、5つの受入条件はすべて未チェックのまま。
 - PR #496: MERGED、head `14def973e496c39b503c006db21fd187718ad683`。CodeRabbit full reviewは最終headで完了し、actionable commentなし。
 - PR #495: MERGED、head `76d53cbf5b33a51ed91dfa259ced76403064872a`。OS別の文書端選択挙動を受け入れ済み。#497のC09がその挙動を保護する。
-- PR #497はOPEN / Draft、GitHub remote head `581ceee3d1e179ac6e77eb6fb6d6f502c7409e91`、base `aab1dd5a28dc1383d34e09e0e2f01b634ad6301a`だった。今回`origin/main` `fd894ff8136cfe0bcae903211b3b422713db8b54`をローカルbranchへmergeし、merge commitは`271453ba0b6f71270ff46b2b2b2d07dd0deee5c9`。branchはorigin/mainより0 commits behind / 27 ahead。merge-treeは競合なし、`view.rs`は自動mergeされた。変更はまだpushしていない。
-- GitHub上のPRはpush前のhead `581ceee`のままで、手元の同期済みbranchとは一致していない。push後にremote head、merge state、CIを再確認する。GUI証拠はmain/candidate双方ともこの同期済みheadに対して取り直す。
+- PR #497はOPEN / Draft、current head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、base `fd894ff8136cfe0bcae903211b3b422713db8b54`、mergeable。baseから29 commits ahead / 0 behind。current PR CI run `39139812875`は`action_required`でjobsなし。以前のrun `39126127128`は旧head `561c94d...`のsuccessであり、現headのCI successではない。
+- GitHub上のIssue #305本文とPR #497本文はcurrent head `a2b1062...`、Windows run 2、C05の部分確認とG04のpopup位置未達、受入チェック未完了を反映するよう更新済み。IssueはOPEN、PRはDraftのまま。この引き継ぎ文書の今回の更新は、PR #497の文書差分として記録する。
 - current main `fd894ff...`にはGUI失敗時の復旧runbook更新（#522）が含まれる。今回その文書と`AGENTS.md`を読み直し、Windows GUIは接続済みWindows版ChatGPTから直接操作し、Mac経由のVMware操作は使わないことを確認した。
-- Windows側の既存papa-winスレッドは、`read_thread` / `wait_threads`でremote host unavailable、`send_message_to_thread`で`Codex app-server is not available`となり、更新手順の再依頼を届けられなかった。Windows側で復旧したという利用者の報告は受け取ったが、このセッションから接続復旧は独立確認できていない。Mac上のVMwareでは内包画面を取得できたが、試したキー入力では画面変化がなく、座標クリックは`noWindowsAvailableWindow`となった。current mainのrunbookがMac経由のVM操作を禁止しているため、受入操作・証拠には使わず中止した。Keyhac状態は依然unknownで、切り替えていない。current-main G04 baselineは未実施。
+- 利用者からWindows環境を修復したとの連絡があり、papa-winのnative CUAでWindows再確認を完了した。Haneの`foreground window did not report a process id`はCUA session reset・`@oai/sky`再import・最新window再取得で解消し、その後のGUI操作を継続できた。復旧は確認したが、原因イベントは未特定。current main G04 baselineはrename行移動でFAIL、候補head `561c94d`のG01/G02/G03/G05/G06は確認済み、G04はfilter側の一部条件のみでPARTIAL。詳細を次節に記録する。
+- 2026-10-18の再開では、current mainの復旧手順に沿ったWindows CUAの軽量確認が通った。Explorerの画面取得・無害なクリック・検索欄への入力を別々に確認し、入力表示後に検索を閉じた。途中のelement indexエラーは状態再取得と座標操作で解消。更新確認は`up_to_date`だったが、これはCodex desktop updaterの状態で、ChatGPTサービスの更新を示すものではない。
+- 10/18時点では候補G04ゲートをNOT RUNで停止した。デスクトップ上の`Keyhac フック OFF`ショートカットに4回の起動gesture/commandを送ってしまい、当時は実行回数と操作後状態を確認できなかった。その後、利用者がread-onlyでOFFを確認し、10/19のcurrent-head run 1/2ではKeyhacに触れずG04を続行した。shortcutの実行やKeyhacの追加操作・復元は行わない。
 - #501、#503、運用基盤専用PR #514もmainへmerge済み。
 
 ## PR #497 の候補・レビュー・CI
 
 - 最後のClaude製品実装commitは`a043ba76c9337eecbf1b78a88f8db8bac7cb502e`で、ShortTextInputへのfilter/rename移行、M01〜M15、C01〜C09を含む。今回のmerge commitではcurrent main側の`view.rs`等も入ったため、これまでのGUI結果は同期済みPR候補の受入証拠ではない。
-- GUI候補head `d2ebf5c`のCI run [39082800146](https://github.com/hide212131/hane/actions/runs/39082800146) はmacOS / Windows workspace tests、OS別チェック、Clippyがsuccess。handoff更新commit `38089b06bcae34a059a88a92fc30d34517abd038`のrun [39122500854](https://github.com/hide212131/hane/actions/runs/39122500854) とremote PR head `581ceee`のrun [39123002036](https://github.com/hide212131/hane/actions/runs/39123002036) も両OSのworkspace tests・OS別check・Clippyがsuccess。今回のmerge・文書更新後のheadではCI未実施。
+- current candidate head `561c94d`のCI run [39126127128](https://github.com/hide212131/hane/actions/runs/39126127128) はsuccessで、macOS / Windows workspace tests、OS別check、Clippyが成功。release-only checksはskip。
 - 候補コードでの`view::input_routing::tests` 59件、`short_text_input::tests` 19件、および`cargo build --locked -p hane`成功記録がある。これらはnative GUI受入の代替ではない。
-- 利用者指定のCodex代替レビュー [5560801376](https://github.com/hide212131/hane/pull/497#pullrequestreview-5560801376) は`d2ebf5c`を対象に追加指摘なし。CodeRabbitはDraftのためskipで、CodeRabbit full reviewではない。
-- 製品コード候補は`a043ba76c9337eecbf1b78a88f8db8bac7cb502e`のまま。以後のPR変更はhandoff文書のみである。今回の静的差分再確認ではこの候補から新しい実装修正を確定していない。
+- 利用者指定のcurrent-head Codex代替レビューをPR review [5563807610](https://github.com/hide212131/hane/pull/497#pullrequestreview-5563807610)として投稿した。対象は`a2b1062...`のG04 bounds-refresh差分。実画面ではC05のfilter caret位置更新は確認できた一方、同じ再クリック後のIME候補popupは旧位置に残り、G04の候補位置条件に合わないことをline 115に記録した。CodeRabbit full reviewやformal AADW `@codex review`ではない。PR #497はDraftでcurrent-head CIも`action_required`のため、formal `@codex review`のAADW fallback条件を満たしていない。PR #496のCodeRabbit full reviewは最終head `14def973`で完了し、actionable指摘なし。
+- 最後のClaude製品実装commitは`a043ba76c9337eecbf1b78a88f8db8bac7cb502e`。current G04 fix commit `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`は`crates/ui/src/input.rs`と`crates/ui/src/view.rs`を変更し、active short text fieldのbounds originが変わった時に次frameのcharacter-coordinate/IME位置再計算を依頼する。新しいtest `text_input_bounds_report_origin_moves_for_ime_position_refresh`はfilter/rename双方でoriginの初期・不変・移動を確認する。Windows GUIではrename行移動後の候補追従は確認できたが、filterの再クリックはcaretだけ動き、IME候補popupが旧座標に残った。
+- G04の静的確認では、`InlineRenameInput::prepaint`が各frameの`bounds`を`EditorView::set_text_input_bounds`へ渡し、`bounds_for_range`が現在のrender selection/caretと受け取った`bounds`から1px caret rectを返す接続を確認した。新headではbounds originの移動を検出して`Window::invalidate_character_coordinates`を呼び、固定boundsのcaret testにbounds移動のstate regressionを追加した。これは実際のWindows IME候補windowを動かすGUI証拠の代替ではない。
+- 2026-10-18、同じheadで未分類のG04観測をClaudeのAADW diagnostics-onlyへ一度依頼した。根本原因IDは`issue-305-g04-windows-ime-bounds-after-sidebar-resize`、evidence commentは[#6251236043](https://github.com/hide212131/hane/pull/497#issuecomment-6251236043)、診断依頼commentは[#6251239865](https://github.com/hide212131/hane/pull/497#issuecomment-6251239865)。workflow run [39137331278](https://github.com/hide212131/hane/actions/runs/39137331278)は診断artifactの生成までsuccess。artifact `12140496696`の`diagnosis.json`はtarget SHA `561c94d...`、`failure_class=unknown`、`product_acceptance=not_evaluated`。製品変更・pushは行っていない。
+- その後のread-onlyな依存ソース確認で、`Cargo.toml` / `Cargo.lock`がcrates.io `gpui-pre 0.3.6`（checksum `a0437c0b83e636a92bd1a39fa1d05fb632ae671289537497b35871ffbe231b84`）を固定していることを確認した。同packageの`src/window.rs:6433-6443`にある`Window::invalidate_character_coordinates`はnext-frameで選択範囲boundsを計算し、`platform_window.update_ime_position`を呼ぶ。正確なregistry source、Hane `crates`、`vendor/gpui`、`vendor/gpui-pre-windows`を検索した範囲で、このmethodのcallsiteは見つからなかった。Windows vendorの`WM_IME_STARTCOMPOSITION` handlerはcomposition開始時に`update_ime_position`を呼び、`ImmSetCandidateWindow`を設定するが、その後のbounds移動を通知するHane callsiteは見つかっていない。current-head run 2ではrename行移動後の候補追従は確認できた一方、filterでcomposition中に再クリックするとcaretは新位置へ移ってもpopupが旧座標に残った。これはC05のcaret更新失敗ではなく、G04候補位置の観測結果。原因およびPR固有回帰かは未確定。次はcurrent mainとcandidateで同条件のG04サブケースを再現し、caret座標queryとIME popup更新の経路を切り分ける。
+- 利用者からWindows環境を修復したとの連絡があったため、接続先Windows版ChatGPTの既存papa-winスレッドでcurrent mainの`AGENTS.md`と`docs/gui-test-recovery.md`を読み直し、runbookどおりのCUA確認を行った。Explorerでwindow列挙・画像取得・無害なクリック・検索欄への入力と消去・検索結果を閉じてdesktopへ戻る操作が成功し、以前の`cached app state に要素154がない`エラーは再発しなかった。Mac経由VMは使用していない。10/18時点ではWindowsのトレイ状態をread-onlyで確定できずG04候補IME試験をNOT RUNとして止めたが、利用者のOFF確認後、10/19にcurrent-head run 1/2を実施した。両runでKeyhacを操作していない。PR #497の当時のhead/baseは`561c94d410c6f2052a9e4511e7ebd0ce5bb37d62` / `fd894ff8136cfe0bcae903211b3b422713db8b54`、両checkout clean、Hane process残存なし、専用fixture 8件のhash一致。desktop updaterは26.1013.40934 / build 20770でup_to_dateだが、ChatGPTサービス更新の確認ではない。Windows側レポートは`C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\evidence\g04-cua-recovery-followup-20261018.md`。
 
 ## GUI受入の状況
 
 WindowsとmacOSの結果は別々に扱う。PASSは確認した範囲に限り、部分結果から未確認のIME・表示・focus条件を推定しない。
 
 ### Windows 11 Home ARM64 build 26200 / Microsoft Japanese IME
+
+以下の最初の表とbuild SHAは、PR候補 `d2ebf5c` の前回検証記録であり、履歴として保持する。current main `fd894ff`とPR候補head `561c94d`の2026-10-18再確認は次の表に別記する。
 
 Windows 11 Home ARM64 build 26200、Rust/Cargo 1.98.1。current mainとPR候補を別々の隔離checkoutでrelease buildし、G06用にbackground rename処理直前へ同じ5秒sleepを一時追加した。遅延差分は検証checkoutだけにあり、PRには含めていない。
 
@@ -54,6 +86,45 @@ G04の失敗はcandidate上のrename行位置サブケースであり、G04全�
 
 検証Haneは終了済みで、Explorerは開始時のStartup folder表示へ戻した。KeyhacはPID 8672のまま稼働していたが、フックのON/OFFは特定できず、切り替えていない。専用root `C:\Users\hide2\AppData\Local\Temp\hane-gui-retest-20261018`は削除が安全ポリシーで拒否され、残っている。結果メモは別の一時rootへ退避されたが、旧PR #507の検証root配下に保存され、完全なファイルパスは確認できていない。この保存物をPR #497のcanonical evidenceとして扱わない。
 
+#### current main / current candidateの再確認（2026-10-18）
+
+Windows 11 Home ARM64 build 26200、`ja-JP`、Microsoft Japanese IME。候補はPR head `561c94d410c6f2052a9e4511e7ebd0ce5bb37d62`、基準mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`。G01〜G05は候補版、G04 baselineはcurrent main、G06は両方で実施した。
+
+| 仕様§10 | current candidate / baseline | 確認範囲と残り |
+| --- | --- | --- |
+| G01 | PASS（候補） | 部分/全選択で日本語変換、最初のEscapeで変換取消とfocus維持、二度目のEscapeでblur、本文不変を確認。探索中のBackspaceで一時的に本文を削除したが、元の文面へ復元しhash一致。clean rerunでは再発なし。 |
+| G02 | PASS（候補） | `.md`/`.MD`で日本語変換、rename取消/確定、失敗後再編集を確認。`invalid:rename`はWindows error 87で拒否され、再編集可能。大文字拡張子を保持し、ファイル名を元に戻した。 |
+| G03 | PASS（候補） | `A😀éZ`のfilter/renameで移動、grapheme選択・削除、Home/End、Copy/Cut/Paste。欠損・別欄流入なし。専用画像は未保存。 |
+| G04 | PARTIAL（候補） / FAIL（main baselineのrename行移動） | mainでは候補を行付近に開いた後、sidebarを広げてrename行が右へ動いても候補windowが旧位置（x≈55）に残り、後続キーでも追従しなかった（行はx≈315）。候補版ではcaret start/middle/end・逆向きselectionを確認し、filter幅変更後にpopupが本文へ飛ばないことを確認。初回resize dragは`TextInputHost.exe`に当たり失敗、Haneを再activeし再スクリーンショット後に位置を変えてresizeを完了した。rename行を移動した状態での候補追従と、確定後クリックは未確認。mainでも同じrename-row失敗があるため少なくともこの観測は候補PR固有の回帰ではないが、G04の受入条件は未達。 |
+| G05 | PASS（候補、接続範囲） | 本文検索・文書内検索、本文選択からのAI選択popup、Settingsを切替。AI未接続で送信はdisabledだが、入力はprompt内に留まり、送信していない。Settings後の入力先がfilterへ戻ることを確認。本文に入った`_G05`はUndoし、元hashを確認。 |
+| G06 | PASS（候補・main、画面シナリオ） | §10.4どおり同じbackground closure直前へ5秒sleepを一時追加し、別fixtureで比較。両方とも待機中の日本語「に」の変換を保持、完了後Enterの本文漏れなし、その後の`fresh`入力再開。両版の候補popup・本文状態は一致。callback到着順を固定する回帰テストは未実施。 |
+
+G06の隔離buildはRust 1.98.1 / `aarch64-pc-windows-msvc`で成功。既定cargoのRust 1.95.0ではversion要件エラーとなったため、指定toolchainを明示して再実行した。G06 main executable SHA-256は`A450CF37F3B24611D182954D9EA122E8A2D360BF5D6D7D65A1CDFD975FAE3277`、candidateは`6322D91F110B67803C51E247C489F83670A46A0A703B61D4FEB270594E56E274`。通常buildはbaseline `39F28AB1EA4A89F4710807239172DA2DAD4E7416CFB85451BF7110B9CBB72A42`、candidate `22A62CD253B74DC3B1F76A55D82DB8F5D4E2EB02701E229AD0993A415B5FED66`。
+
+main側のpaired runではEnterからIMEキー入力まで3.317秒、candidateは2.313秒。最初のmain probeは5秒内と確定できない入力で本文が変わったため判定から除外し、入力時刻を記録したpaired runを両方で実施した。main/candidateの検証checkoutから一時sleep差分を戻し、checkout status cleanを確認。test Hane processは通常終了して残存0、5つのfixture（各6ファイル）は初期manifestと全hash一致。
+
+Windows GUIレポート、CUA復旧JSON、スクリーンショット、timing/build logsは次のremote temp rootに保存した。これらはGitHubにcommitしておらず、共有canonical artifactとは扱わない: `C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\evidence`。作業中に誤ってOneDrive Documentsへ作られた空の`New Folder`はごみ箱へ移動し、元のDesktop folder表示へ戻した。
+
+前回の検証ではKeyhac開始時状態がunknownで、OFFショートカット後にOFFを観測した。今回の再開では同じOFFショートカットに、accessibility double-click・Enter・coordinate double-click・context-menu Openの4操作を送った。最初の3操作後も見た目上は選択状態のまま、最後はメニューが閉じただけで、実際の起動回数は不明（明示的Openは1回、先行3回は最大3回起動した可能性）。状態確認を含め、その後Keyhacには触れず、復元もしていない。現在の状態はunknownとして扱う。
+
+#### CUA復旧後の候補G04ゲート（2026-10-18）
+
+Windows版ChatGPTからのCUA接続は復旧しており、Explorerで画像取得・空白クリック・検索欄への入力・表示確認までできた。GitHubからPR #497のcurrent head `561c94d410c6f2052a9e4511e7ebd0ce5bb37d62`とbase `fd894ff8136cfe0bcae903211b3b422713db8b54`を再確認した。
+
+ただしKeyhacの現在状態を安全に読む方法を確保できなかったため、日本語IMEを使う候補G04は実行しなかった。これは製品failではなくNOT RUNであり、前節に記録したcandidate G04のPARTIALとcurrent mainのrename-row FAILは変わらない。報告されたcandidate executableはSHA-256 `22A62CD253B74DC3B1F76A55D82DB8F5D4E2EB02701E229AD0993A415B5FED66`。今回のショートカット操作後に実際に何回起動したかとKeyhac状態は不明のため、追加操作・復元は行わず、後続のGUI操作も停止した。
+
+Haneプロセスは残存0、候補checkoutはclean、専用fixture 8件のpath/size/hashは初期manifestと一致。PR・Issue・branchは変更していない。Windows側の記録は`C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\evidence\g04-candidate-gate-20261018.md`。
+
+#### 2026-10-19 候補G04再開の中断（旧head `561c94d`）
+
+10月19日にGitHubを再確認した。mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`、Issue #305はOPEN、PR #496/#495はMERGED、PR #497はOPEN / Draftでhead `561c94d410c6f2052a9e4511e7ebd0ce5bb37d62` / base `fd894ff8136cfe0bcae903211b3b422713db8b54`。変更はない。
+
+利用者はKeyhacフックをread-onlyでOFFと確認した。しかしWindows側の再開タスクは停止指示と「Keyhacやショートカットに触れない」という明示の後、デスクトップの`Keyhac フック OFF`ショートカットにReturnを送り実行した。後続の記録ではAutoHotkey操作は終了したとあるが、OFF状態を再確認できていないため、この操作後のKeyhac状態はunknownとして扱う。Keyhacの追加確認・復元・トグルはしていない。
+
+候補Hane（PR #497 exact head）の検証は専用fixture clone `C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\fixtures\g04-candidate-followup-20261019-0001`、専用state、候補exe SHA-256 `22A62CD253B74DC3B1F76A55D82DB8F5D4E2EB02701E229AD0993A415B5FED66`、PID `9400`で開始した。候補filterには日本語IMEの「に」が表示され、候補／予測popupは欄の下に出た。先頭・途中・末尾でcaret付近にpopupが出るところまで確認した。これはG04のfilter caret位置サブケースの部分結果であり、逆向き選択、sidebar幅変更、inline rename行移動、確定後クリックはNOT RUN。従ってG04全体は引き続き未達である。
+
+開始manifestとの比較は6ファイルすべて一致し、source/candidate checkoutはいずれも期待head `fd894ff...` / `561c94d...`でclean。証拠は`C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\evidence\g04-candidate-followup-20261019-0001\partial-evidence.md`と`partial-evidence.json`に保存した。検証で使ったHane PID `9400`はfilter欄に「に本」を残していたが、終了前にPID・実行ファイルパス・専用fixtureへのcommand lineが一致することを確認し、PowerShellからそのプロセスだけ終了した。終了後にPID消失、fixture 6件のhash一致、source/candidate checkout cleanを確認した。cleanup結果は`cleanup-verification.json`に保存した。利用者が以前OFFとread-only確認した後にOFF shortcutを1回実行したため、実行後のKeyhac状態はunknownであり、再確認・復元・トグルはしていない。複数の停止指示後もHane入力は続いたが、最終的にはG04の残りをNOT RUNとして部分記録し、GUI操作を止めた。これをG04全体の受入証拠に数えない。
+
 ### macOS / PR #497 isolated candidate
 
 候補を専用bundle ID・fixtureで起動して行った確認。日本語IMEの未確定文字・変換候補はどのGでも未確認。
@@ -65,16 +136,22 @@ G04の失敗はcandidate上のrename行位置サブケースであり、G04全�
 | G03 | PARTIAL | `A😀éZ`をpasteで入力し、左右移動・Shift選択・Backspaceを確認。`typeText`ではemoji/結合列が欠落したためpasteを使用。Copy/Cut、rename Unicode、日本語IMEは未確認。 |
 | G04 | PARTIAL | 日本語候補の表示位置、sidebar幅変更時の候補位置、rename行位置はいずれも未確認。 |
 | G05 | PARTIAL | filter、本文検索、文書内検索、選択語のAI popup、設定を行き来しfilter queryの保持を確認。AI未設定でprompt入力・全対象fieldのfocus確認は未実施。 |
-| G06 | PARTIAL | 同じ5秒sleepを入れた隔離main baseline / candidateでASCII入力を比較。pending中に`late`はrename field/bodyへ入らず、完了後のReturnも本文改行にならないことを確認。IME入力での同条件比較は未実施。 |
+| G06 | PARTIAL | current main `fd894ff`とcandidate `561c94d`に同じ5秒sleepを一時追加したbuildで比較。両方とも処理待ち表示を確認し、待機中の`k`→`a`→Space入力後も本文は不変。完了後のEnterで改行は見えず、次の通常`z`入力は本文へ入り、Undoで復元。実際の日本語変換候補・未確定文字は画面上で観測できず、callback到着順も不明のためPARTIAL。 |
 
-G06の一時build SHAはbaseline `55c61da91b718945a9617c59590e4ab8df445ec50b363c75018b31f58e58dc6e`、candidate `9238323e1e79d38d88486b691c65b3dcb904eb8457d98df4c4d110f315129ddb`。同じ5秒遅延patchは隔離worktreeだけに入り、製品PRには含まれない。候補側のpending / after画像は`/tmp/hane-issue305-gui-20261018-2828412/evidence/g06-candidate-pending.png`と`g06-candidate-after.png`。G01/G02/G05画像、fixture初期SHA manifestも同ディレクトリに保存した。G03/G04の専用画像とbaseline pending画像はない。
+旧G06の一時build SHAはbaseline `55c61da91b718945a9617c59590e4ab8df445ec50b363c75018b31f58e58dc6e`、candidate `9238323e1e79d38d88486b691c65b3dcb904eb8457d98df4c4d110f315129ddb`。今回の一時build SHAはbaseline `900e9c67dfcd310d6087aad307d412f9cd6a5e91be70b88ef55c377fe23e12eb`、candidate `97480c447bcddab5d428a90dd46a91e927eeb6d55324f57c1138e7402259c006`。今回も`crates/ui/src/view/inline_rename.rs`のbackground closure内、`let result = match kind`直前だけに同じ5秒sleepを加え、変更は各検証worktreeに限定した。通常PR候補や配布物には含まれない。
+
+今回のG06起動環境はmacOS arm64 / Rust 1.98.1、bundle ID `io.github.hide212131.hane.issue305.g06.main.fd894ff`（PID `69383`）と`io.github.hide212131.hane.issue305.g06.candidate.561c94d`（PID `76793`）。専用stateとfixtureを用い、両プロセスは終了確認後、6ファイルの初期SHA-256全件一致を確認した。GUI画像はこのチャット上のCUA観測で、ローカル証拠ファイルとしては保存していない。候補位置・IME windowの表示は別途検証が必要。
+
+2026-10-18の追加macOS G03試行では、ScreenCaptureKitの`SCStreamError -3811`後、CUAがMacをロック状態と報告したため画面操作を停止した。候補アプリPID `88410`を終了し、隔離fixture 6ファイルのSHA-256が開始時と一致することを確認した。新しいUnicode入力・rename commitは行っていないため、この試行はG03結果に数えない。macOSの再開条件は利用者側でMacのロックを解除すること。
+
+前回のG06一時buildのpending / after画像は`/tmp/hane-issue305-gui-20261018-2828412/evidence/g06-candidate-pending.png`と`g06-candidate-after.png`。G01/G02/G05画像、fixture初期SHA manifestも同ディレクトリに保存した。G03/G04の専用画像とbaseline pending画像はない。
 
 試験プロセスは終了済み。rename fixtureを初期名へ戻し、6ファイルの初期SHA manifestを全件照合した。
 
 ## 実装開始時の具体的な一手
 
-次の実作業は、同期済みPR branchをpushしてcurrent-head CIを確認し、接続済みWindows ChatGPTからGUI復旧手順を適用してcurrent main `fd894ff...`のG04 baselineを隔離環境で完了すること。その後、同期済みPR候補headでG04を再実行して原因を分類する。candidateでも失敗する場合、既存PR上でfocused regressionを追加してからanchor更新経路を修正する。実装はAADWに従いClaudeへ依頼し、Codexは製品コードを直接変更しない。仕様§10.2、#495由来C09、採用設計を保ち、G06の5秒sleepは検証checkoutに限定する。
+現在の具体的な一手は、実装担当がcurrent mainとcandidate `a2b1062...`でfilter composition中の欄内再クリックを同じIME・caret位置で比較し、C05のcaret移動とG04の候補位置を別々に記録するfocused regressionを追加すること。candidateではcaretがクリック位置へ移る一方、popupは旧座標に残る。current main側の同条件結果は未確認なので、まず再現・差分を確定してから原因を狭める。専用fixtureを使い、Keyhacは操作しない。
 
-製品修正後はまずWindowsでG04失敗ケースを再現・確認し、macOSでは未確認のIMEケースを含むG01〜G06の不足条件を補う。Windows G04の残り（filter、caretの複数位置、逆向き選択、確定後クリック）も実行する。G06は仕様§10に従い、5秒遅延をmain baselineと候補の同じ隔離checkoutへ適用し、build SHA・画像・操作順を分けて保存する。遅延入りbuildを完成candidateの受入証拠に混ぜない。
+Windows current-head run 2でC05のfilter caret位置更新は確認し、G04の候補popup旧位置残留を記録済み。次はそのG04サブケースをcurrent mainとcandidateで比較し、macOS current-headの未確認GUI条件とG06 callback-order regressionを補う。現headのPR reviewとIssue/PR本文は更新済みだが、通常PR CIはaction_required。必要な検証・CI・レビューが揃うまでPRはDraft、IssueはOPENのまま維持する。
 
 全Gの証拠が揃うまでPR #497はDraftを維持し、Issue #305の5条件を満たしたと扱わない。受入条件が実際に満たされるまでIssueはOPENのままにする。
