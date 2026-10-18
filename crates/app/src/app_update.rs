@@ -1498,8 +1498,9 @@ mod tests {
     #[test]
     fn restore_in_another_service_does_not_touch_an_active_download() {
         let first = fixture("0.26.0", "0.27.0", 5);
+        // The archive route is scripted below with a hook, so the plain
+        // `script_archive` response must not be queued ahead of it.
         first.script_check();
-        first.script_archive();
         first.check_now();
         let id = first.candidate_id();
 
