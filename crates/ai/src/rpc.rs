@@ -811,9 +811,12 @@ mod tests {
 
         let (timed_out_tx, timed_out_rx) = std::sync::mpsc::channel::<()>();
         let responder = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let n = server_read.read(&mut buf).unwrap();
-            let request: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            // A pipe `read` may return only part of a request (notably on
+            // Windows), so read each newline-delimited request as a full line.
+            let mut server_read = BufReader::new(server_read);
+            let mut line = String::new();
+            server_read.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(line.trim()).unwrap();
             let id = request["id"].clone();
             // Reply only after the caller has observed the timeout. Waiting on
             // an explicit signal (not a sleep) keeps this independent of
@@ -823,8 +826,9 @@ mod tests {
             writeln!(server_write, "{}", resp).unwrap();
 
             // Then answer the subsequent call with its own response only.
-            let n = server_read.read(&mut buf).unwrap();
-            let request: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            line.clear();
+            server_read.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(line.trim()).unwrap();
             let id = request["id"].clone();
             let resp = serde_json::json!({"id": id, "result": "fresh"});
             writeln!(server_write, "{}", resp).unwrap();
