@@ -39,6 +39,12 @@ pub trait FileOps: DiskView {
     fn remove(&mut self, rel_path: &str) -> Result<()>;
     /// Puts the backup (whose identity is `expected`) back at `rel_path`.
     fn restore(&mut self, rel_path: &str, backup_rel: &str, expected: &FileIdentity) -> Result<()>;
+    /// Fails closed when the placement fixed at the start of the operation is
+    /// no longer the one in use (moved or replaced). Checked before the health
+    /// commit and before any recovery; the default has nothing to verify.
+    fn verify_placement(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The old application process, observed through the OS process lifetime.
@@ -198,7 +204,7 @@ pub fn conclude_health<S: JournalStore, O: FileOps>(
             "health can only be concluded while awaiting health",
         ));
     }
-    if healthy && journal.advance_phase(Phase::Committed).is_ok() {
+    if healthy && ops.verify_placement().is_ok() && journal.advance_phase(Phase::Committed).is_ok() {
         return Ok(HealthOutcome::Committed);
     }
     Ok(match recover(journal, ops, child)? {
@@ -215,6 +221,16 @@ pub fn recover<S: JournalStore, O: FileOps>(
     ops: &mut O,
     child: &mut dyn HealthChild,
 ) -> Result<RecoveryOutcome> {
+    if let Err(err) = ops.verify_placement() {
+        // Nothing may be written or rolled back through a pathname that no
+        // longer names the operation's placement. The pending journal keeps
+        // blocking normal startup.
+        let _ = child.stop_and_release_lease();
+        return Ok(require(
+            journal,
+            format!("the placement changed during the update: {err}"),
+        ));
+    }
     let current = journal.journal().clone();
     let decision = decide_recovery(Some(&current), &current.install_id, &*ops)?;
     match decision {

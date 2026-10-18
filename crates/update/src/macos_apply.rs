@@ -346,6 +346,85 @@ pub struct BundleOps<'a> {
     host: &'a dyn BundleHost,
     live: PathBuf,
     slot: PathBuf,
+    /// Fixed before the exchange; `None` for startup recovery, which has no
+    /// earlier placement to compare with.
+    guard: Option<PlacementGuard>,
+}
+
+/// Directory identity (device, inode) of the install parent and of the two
+/// bundle directories, fixed before the exchange. An exchange keeps both
+/// bundles' identities and only swaps which path names which, so the live and
+/// slot paths must always name this pair, in either order. A bundle moved away
+/// (Finder) or replaced by another directory is refused. The directories are
+/// held open so their identities cannot be reused meanwhile.
+#[cfg(unix)]
+struct PlacementGuard {
+    parent: PathBuf,
+    parent_id: (u64, u64),
+    live_id: (u64, u64),
+    slot_id: (u64, u64),
+    _pins: Vec<File>,
+}
+
+#[cfg(unix)]
+impl PlacementGuard {
+    fn dir_id(path: &Path, follow: bool) -> Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = if follow { fs::metadata(path)? } else { fs::symlink_metadata(path)? };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} is not a real directory", path.display()),
+            ));
+        }
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    fn capture(live: &Path, slot: &Path) -> Result<Self> {
+        let parent = live.parent().ok_or_else(|| {
+            UpdateError::new(ErrorCode::UnsupportedInstall, "the bundle has no parent directory")
+        })?;
+        let pins = vec![File::open(parent)?, File::open(live)?, File::open(slot)?];
+        Ok(Self {
+            parent: parent.to_path_buf(),
+            parent_id: Self::dir_id(parent, true)?,
+            live_id: Self::dir_id(live, false)?,
+            slot_id: Self::dir_id(slot, false)?,
+            _pins: pins,
+        })
+    }
+
+    fn verify(&self, live: &Path, slot: &Path) -> Result<()> {
+        let moved = || {
+            UpdateError::new(
+                ErrorCode::InstallModified,
+                "the installed bundle was moved or replaced during the update",
+            )
+        };
+        let parent = Self::dir_id(&self.parent, true).map_err(|_| moved())?;
+        let now_live = Self::dir_id(live, false).map_err(|_| moved())?;
+        let now_slot = Self::dir_id(slot, false).map_err(|_| moved())?;
+        let in_place = now_live == self.live_id && now_slot == self.slot_id;
+        let exchanged = now_live == self.slot_id && now_slot == self.live_id;
+        if parent != self.parent_id || !(in_place || exchanged) {
+            return Err(moved());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+struct PlacementGuard;
+
+#[cfg(not(unix))]
+impl PlacementGuard {
+    fn capture(_live: &Path, _slot: &Path) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn verify(&self, _live: &Path, _slot: &Path) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<'a> BundleOps<'a> {
@@ -354,10 +433,28 @@ impl<'a> BundleOps<'a> {
             host,
             live: live.to_path_buf(),
             slot: slot.to_path_buf(),
+            guard: None,
+        }
+    }
+
+    /// Like [`BundleOps::new`], with the placement of the live bundle, its
+    /// parent and the slot fixed now. Every exchange, rollback, commit and
+    /// recovery re-verifies it.
+    pub fn pinned(host: &'a dyn BundleHost, live: &Path, slot: &Path) -> Result<Self> {
+        let mut ops = Self::new(host, live, slot);
+        ops.guard = Some(PlacementGuard::capture(live, slot)?);
+        Ok(ops)
+    }
+
+    fn check_placement(&self) -> Result<()> {
+        match &self.guard {
+            Some(guard) => guard.verify(&self.live, &self.slot),
+            None => Ok(()),
         }
     }
 
     fn exchange(&self) -> Result<()> {
+        self.check_placement()?;
         self.host.swap(&self.live, &self.slot)
     }
 }
@@ -392,12 +489,17 @@ impl FileOps for BundleOps<'_> {
         Err(no_file_ops())
     }
 
+    fn verify_placement(&self) -> Result<()> {
+        self.check_placement()
+    }
+
     /// Rolls back by exchanging again. The slot must still hold exactly the
     /// recorded old bundle, and afterwards the live path must hold it.
     fn restore(&mut self, rel_path: &str, backup_rel: &str, expected: &FileIdentity) -> Result<()> {
         if rel_path != BUNDLE_REL || backup_rel != BACKUP_REL {
             return Err(unknown_rel(rel_path));
         }
+        self.check_placement()?;
         if bundle_identity(&self.slot)? != Observed::File(expected.clone()) {
             return Err(UpdateError::new(
                 ErrorCode::HashMismatch,
@@ -663,8 +765,10 @@ fn swap_bundle(
     let step = journal.journal().steps.first().cloned().ok_or_else(|| {
         UpdateError::new(ErrorCode::JournalInvalid, "the bundle journal has no step")
     })?;
+    ops.check_placement()?;
     journal.advance_phase(Phase::ExitAuthorized)?;
     journal.advance_phase(Phase::Applying)?;
+    ops.check_placement()?;
     // The intent, with both identities, is durable before the exchange.
     journal.advance_step(0, StepState::Intent)?;
     if !holds(ops, BUNDLE_REL, &step.old)? || !holds(ops, BACKUP_REL, &step.new)? {
@@ -681,7 +785,9 @@ fn swap_bundle(
             "the bundles are not exchanged after the swap",
         ));
     }
+    ops.check_placement()?;
     journal.advance_step(0, StepState::Applied)?;
+    ops.check_placement()?;
     journal.advance_phase(Phase::AwaitingHealth)
 }
 
@@ -709,7 +815,9 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     let journal = UpdateJournal::begin(&verified.plan, None)?;
     let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
     let mut journal = DurableJournal::create(store, journal)?;
-    let mut ops = BundleOps::new(inputs.host, live, &verified.slot);
+    // The placement is fixed before the first mutation; a bundle that cannot be
+    // pinned is refused here, with nothing written.
+    let mut ops = BundleOps::pinned(inputs.host, live, &verified.slot)?;
     match swap_bundle(&mut journal, &mut ops) {
         Ok(()) => Ok(AppliedBundle { journal, ops }),
         Err(err) => match apply::recover(&mut journal, &mut ops, &mut NoChild) {
@@ -737,6 +845,7 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
 /// pinned Team ID after the exchange.
 fn verified_child(inputs: &BundleApplyInputs<'_>, applied: &AppliedBundle<'_>) -> Result<(PathBuf, String)> {
     let live = &inputs.placement.install_root;
+    applied.ops.check_placement()?;
     let journal = applied.journal();
     let step = journal.steps.first().ok_or_else(|| {
         UpdateError::new(ErrorCode::JournalInvalid, "the bundle journal has no step")
@@ -1154,10 +1263,15 @@ mod tests {
         stop: Result<()>,
         journal_path: PathBuf,
         probe: Rc<Probe>,
+        /// Runs just before the verdict, i.e. after the exchange.
+        before_verdict: Option<Rc<dyn Fn()>>,
     }
 
     impl LimitedChild for FakeChild {
         fn await_healthy(&mut self, _timeout: Duration) -> Result<()> {
+            if let Some(hook) = &self.before_verdict {
+                hook();
+            }
             self.health.clone()
         }
 
@@ -1187,6 +1301,7 @@ mod tests {
         stop: Result<()>,
         journal_path: PathBuf,
         probe: Rc<Probe>,
+        before_verdict: Option<Rc<dyn Fn()>>,
     }
 
     impl FakeLauncher {
@@ -1196,6 +1311,7 @@ mod tests {
                 stop: Ok(()),
                 journal_path: fx.journal_path(),
                 probe: Rc::new(Probe::default()),
+                before_verdict: None,
             }
         }
 
@@ -1205,6 +1321,7 @@ mod tests {
                 stop: self.stop.clone(),
                 journal_path: self.journal_path.clone(),
                 probe: Rc::clone(&self.probe),
+                before_verdict: self.before_verdict.clone(),
             })
         }
     }
@@ -1393,6 +1510,55 @@ mod tests {
         assert_eq!(fx.host.swaps.get(), 1, "no second exchange while the child may run");
         assert!(fx.live_is_new());
         assert_eq!(launcher.probe.commits.get(), 0);
+    }
+
+    /// The bundle is moved (or replaced) after the exchange and before the
+    /// health verdict is accepted: never Committed, nothing else is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_moved_or_replaced_before_the_health_commit_is_never_committed() {
+        for replace in [false, true] {
+            for healthy in [true, false] {
+                let fx = fixture();
+                let live = fx.live().to_path_buf();
+                let moved = live.with_file_name("Moved.app");
+                let hook_live = live.clone();
+                let hook_moved = moved.clone();
+                let mut launcher = FakeLauncher::new(
+                    &fx,
+                    if healthy {
+                        Ok(())
+                    } else {
+                        Err(UpdateError::new(ErrorCode::Timeout, "no health"))
+                    },
+                );
+                launcher.before_verdict = Some(Rc::new(move || {
+                    fs::rename(&hook_live, &hook_moved).unwrap();
+                    if replace {
+                        write_bundle(&hook_live, &[("Contents/unknown.txt", b"user".to_vec())]);
+                    }
+                }));
+                let label = format!("replace={replace} healthy={healthy}");
+
+                let err = apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+                assert_eq!(err.code, ErrorCode::InstallModified, "{label}");
+                assert_eq!(fx.stored().phase, Phase::RecoveryRequired, "{label}");
+                assert_eq!(launcher.probe.commits.get(), 0, "{label}");
+                assert_eq!(fx.host.swaps.get(), 1, "{label}: no rollback exchange by pathname");
+                // The moved bundle is untouched; the slot still holds the old one.
+                assert_eq!(tree(&moved), files_tree(&fx.new_files), "{label}");
+                assert_eq!(tree(&fx.slot()), files_tree(&fx.old_files), "{label}");
+                if replace {
+                    assert_eq!(
+                        tree(&live),
+                        files_tree(&[("Contents/unknown.txt", b"user".to_vec())]),
+                        "{label}: unknown content is not overwritten"
+                    );
+                } else {
+                    assert!(!live.exists(), "{label}");
+                }
+            }
+        }
     }
 
     #[test]
