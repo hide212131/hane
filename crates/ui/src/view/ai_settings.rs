@@ -268,6 +268,8 @@ pub(super) struct AiSettingsPage {
     save_then_leave: Option<(OperationId, LeaveTarget)>,
     route_ready: Option<LeaveTarget>,
     subscription_started: bool,
+    #[cfg(test)]
+    forced_dirty_for_test: bool,
 }
 
 impl Default for AiSettingsPage {
@@ -288,6 +290,8 @@ impl Default for AiSettingsPage {
             save_then_leave: None,
             route_ready: None,
             subscription_started: false,
+            #[cfg(test)]
+            forced_dirty_for_test: false,
         }
     }
 }
@@ -426,7 +430,17 @@ impl AiSettingsPage {
         }
     }
 
+    /// Makes the form report unsaved changes (restart-check tests only).
+    #[cfg(test)]
+    pub(super) fn force_dirty_for_test(&mut self) {
+        self.forced_dirty_for_test = true;
+    }
+
     pub(super) fn is_dirty(&self, cx: &App) -> bool {
+        #[cfg(test)]
+        if self.forced_dirty_for_test {
+            return true;
+        }
         let Some(inputs) = &self.inputs else {
             return false;
         };

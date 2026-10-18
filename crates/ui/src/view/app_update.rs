@@ -1669,6 +1669,17 @@ mod tests {
     }
 
     #[gpui::test]
+    fn ai_settings_made_dirty_while_the_helper_prepared_abort_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, message) =
+            restart_after_change(cx, |view| view.ai_settings.force_dirty_for_test());
+        assert_eq!(calls, ["abort"], "no ticket, AI stop or authorization");
+        assert!(!frozen, "the freeze must be released");
+        assert!(message.is_some_and(|m| m.contains("AI設定")));
+    }
+
+    #[gpui::test]
     fn an_ai_operation_started_while_the_helper_prepared_aborts_the_restart(
         cx: &mut gpui::TestAppContext,
     ) {
