@@ -1069,7 +1069,7 @@ pub fn prepare_restart(
     let copy = crate::platform::stage_helper_copy(&coordination, &transaction, &source)?;
     stage_candidate(&coordination, &transaction, candidate)?;
     crate::state_root::publish_binding(&coordination, &transaction, state_root)?;
-    crate::state_root::publish_environment(&coordination, &transaction, |name| std::env::var_os(name))?;
+    crate::state_root::publish_environment(&coordination, &transaction, std::env::vars_os())?;
     let spawned = match spawn_helper_checked(
         &copy,
         &HelloRequest {

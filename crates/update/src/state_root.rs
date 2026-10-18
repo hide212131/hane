@@ -221,23 +221,36 @@ fn environment_path(coordination: &Coordination, transaction: &TransactionId) ->
     coordination.transaction_dir(transaction).join(ENVIRONMENT_FILE)
 }
 
+/// Whether `name` is on the allowlist, ignoring ASCII case.
+pub fn env_name_allowed(name: &str) -> bool {
+    CHILD_ENV_ALLOWLIST
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
 fn env_value_ok(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_ENV_VALUE_BYTES && !value.chars().any(char::is_control)
 }
 
 /// Parent side: records the allowlisted variables of the real parent in the
 /// owner-only transaction directory. Anything absent, not text, empty, too long
-/// or with control characters is simply left out.
+/// or with control characters is simply left out. Names are matched against the
+/// allowlist ASCII case-insensitively, like the normal AI runtime does, and the
+/// original spelling of the name is kept.
 pub fn publish_environment(
     coordination: &Coordination,
     transaction: &TransactionId,
-    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ambient: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<()> {
-    let vars = CHILD_ENV_ALLOWLIST
-        .iter()
-        .filter_map(|name| {
-            let value = lookup(name)?.into_string().ok()?;
-            env_value_ok(&value).then(|| ((*name).to_owned(), value))
+    let vars = ambient
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            if !env_name_allowed(&name) {
+                return None;
+            }
+            let value = value.into_string().ok()?;
+            env_value_ok(&value).then_some((name, value))
         })
         .collect();
     let document = ChildEnvironment {
@@ -293,7 +306,7 @@ pub fn read_environment(
     }
     let mut vars = Vec::new();
     for (name, value) in document.vars {
-        if !CHILD_ENV_ALLOWLIST.contains(&name.as_str()) || !env_value_ok(&value) {
+        if !env_name_allowed(&name) || !env_value_ok(&value) {
             return Err(mismatch("the child environment names a variable that is not allowed"));
         }
         vars.push((name, value));
@@ -807,15 +820,13 @@ mod tests {
         // Nothing recorded: no variables.
         assert!(read_environment(&fx.coordination, &fx.transaction).unwrap().is_empty());
 
-        let ambient = |name: &str| -> Option<std::ffi::OsString> {
-            match name {
-                "HOME" => Some("/home/u".into()),
-                "LOCALAPPDATA" => Some("C:\\Users\\u\\AppData\\Local".into()),
-                "TMP" => Some("bad\nvalue".into()),
-                "TEMP" => Some("x".repeat(MAX_ENV_VALUE_BYTES + 1).into()),
-                _ => None,
-            }
-        };
+        let ambient = [
+            ("HOME".to_owned(), "/home/u".to_owned()),
+            ("LOCALAPPDATA".to_owned(), "C:\\Users\\u\\AppData\\Local".to_owned()),
+            ("TMP".to_owned(), "bad\nvalue".to_owned()),
+            ("TEMP".to_owned(), "x".repeat(MAX_ENV_VALUE_BYTES + 1)),
+        ]
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
         publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
         let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
         assert_eq!(
@@ -870,13 +881,11 @@ mod tests {
             ("SSL_CERT_FILE", "/etc/ssl/ca.pem"),
         ];
         let forbidden = ["PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "CODEX_HOME", "HANE_COMMAND"];
-        let ambient = |name: &str| -> Option<std::ffi::OsString> {
-            network
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| (*value).into())
-                .or_else(|| forbidden.contains(&name).then(|| "/tmp/evil".into()))
-        };
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = network
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .chain(forbidden.iter().map(|key| ((*key).into(), "/tmp/evil".into())))
+            .collect();
         publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
         let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
         for (name, value) in network {
@@ -889,6 +898,31 @@ mod tests {
             assert!(vars.iter().all(|(key, _)| key != name), "{name} must stay out");
         }
         assert_eq!(vars.len(), network.len());
+    }
+
+    #[test]
+    fn lowercase_network_variables_are_kept_and_unlisted_case_variants_are_not() {
+        let fx = fixture();
+        let kept = [
+            ("https_proxy", "http://proxy.example:8443"),
+            ("no_proxy", "localhost"),
+            ("Ssl_Cert_File", "/etc/ssl/ca.pem"),
+        ];
+        let dropped = ["path", "ld_preload", "dyld_insert_libraries", "Path"];
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = kept
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .chain(dropped.iter().map(|key| ((*key).into(), "/tmp/evil".into())))
+            .collect();
+        publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        for (name, value) in kept {
+            assert!(
+                vars.contains(&(name.to_owned(), value.to_owned())),
+                "{name} must be restored with its original spelling"
+            );
+        }
+        assert_eq!(vars.len(), kept.len());
     }
 
     #[cfg(unix)]

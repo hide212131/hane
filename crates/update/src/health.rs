@@ -455,7 +455,7 @@ fn child_command(exe: &Path, profile: &[(String, String)]) -> Command {
         command.current_dir(dir);
     }
     for (name, value) in profile {
-        if state_root::CHILD_ENV_ALLOWLIST.contains(&name.as_str()) {
+        if state_root::env_name_allowed(name) {
             command.env(name, value);
         }
     }
