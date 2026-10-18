@@ -7635,14 +7635,16 @@ impl EditorView {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            .bg(rgb(self.theme.header_background))
-            .text_color(rgb(self.theme.header_foreground))
+            .bg(rgb(self.theme.tab_bar_background))
+            .text_color(rgb(self.theme.tab_bar_foreground))
+            .border_b_1()
+            .border_color(rgb(self.theme.tab_bar_border))
             .child(
                 TabBar::new("file-tabs-tab-bar")
                     .h_full()
                     .w_full()
-                    .bg(rgb(self.theme.header_background))
-                    .text_color(rgb(self.theme.header_foreground))
+                    .bg(rgb(self.theme.tab_bar_background))
+                    .text_color(rgb(self.theme.tab_bar_foreground))
                     .selected_index(self.file_tab_index(active_id).unwrap_or_default())
                     .max_width(px(220.0))
                     .track_scroll(&self.file_tabs_scroll)
