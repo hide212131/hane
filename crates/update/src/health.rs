@@ -440,7 +440,11 @@ pub struct ProcessLauncher<'a> {
     pub timing: StopTiming,
 }
 
-fn child_command(exe: &Path) -> Command {
+/// The limited child's command. The environment starts empty; only `profile`
+/// (the allowlisted variables of the real parent, read from the owner-only
+/// transaction directory) is added, so the child that continues as the normal
+/// editor after the commit sees the same user profile as a normal start.
+fn child_command(exe: &Path, profile: &[(String, String)]) -> Command {
     let mut command = Command::new(exe);
     command
         .env_clear()
@@ -450,10 +454,17 @@ fn child_command(exe: &Path) -> Command {
     if let Some(dir) = exe.parent() {
         command.current_dir(dir);
     }
+    for (name, value) in profile {
+        if state_root::CHILD_ENV_ALLOWLIST.contains(&name.as_str()) {
+            command.env(name, value);
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        if let Some(root) = std::env::var_os("SystemRoot") {
+        if !profile.iter().any(|(name, _)| name == "SystemRoot")
+            && let Some(root) = std::env::var_os("SystemRoot")
+        {
             command.env("SystemRoot", root);
         }
         // CREATE_NO_WINDOW
@@ -532,8 +543,9 @@ fn capability_for(request: &LaunchRequest<'_>, nonce: &Nonce) -> Result<Capabili
 fn spawn_limited(request: &LaunchRequest<'_>) -> Result<(Child, ChildLink, u32)> {
     let nonce = Nonce::generate()?;
     let capability = capability_for(request, &nonce)?;
+    let profile = state_root::read_environment(request.coordination, request.transaction)?;
     publish_capability(request.coordination, request.transaction, &capability)?;
-    let mut child = match child_command(request.exe).spawn() {
+    let mut child = match child_command(request.exe, &profile).spawn() {
         Ok(child) => child,
         Err(err) => {
             discard_capability(request.coordination, request.transaction);
@@ -966,6 +978,29 @@ mod tests {
     use super::*;
     use crate::identity::{FileIdentity, InstallFacts};
     use crate::testing::TempDir;
+
+    #[test]
+    fn the_child_gets_only_the_allowlisted_profile() {
+        let profile = vec![
+            ("HOME".to_owned(), "/home/u".to_owned()),
+            ("LOCALAPPDATA".to_owned(), "C:\\Users\\u\\AppData\\Local".to_owned()),
+            ("LD_PRELOAD".to_owned(), "/tmp/evil.so".to_owned()),
+            ("DYLD_INSERT_LIBRARIES".to_owned(), "/tmp/evil.dylib".to_owned()),
+        ];
+        let command = child_command(Path::new("hane"), &profile);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned())))
+            .collect();
+        assert_eq!(envs.get("HOME").map(String::as_str), Some("/home/u"));
+        assert_eq!(
+            envs.get("LOCALAPPDATA").map(String::as_str),
+            Some("C:\\Users\\u\\AppData\\Local")
+        );
+        assert!(!envs.contains_key("LD_PRELOAD"));
+        assert!(!envs.contains_key("DYLD_INSERT_LIBRARIES"));
+        assert!(envs.keys().all(|key| state_root::CHILD_ENV_ALLOWLIST.contains(&key.as_str())));
+    }
 
     fn install_id() -> InstallId {
         InstallId::derive(&InstallFacts {

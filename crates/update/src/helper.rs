@@ -961,6 +961,8 @@ pub fn prepare_restart(
     let copy = crate::platform::stage_helper_copy(&coordination, &transaction, &source)?;
     stage_candidate(&coordination, &transaction, candidate)?;
     crate::state_root::publish_binding(&coordination, &transaction, state_root)?;
+    crate::state_root::publish_environment(&coordination, &transaction, |name| std::env::var_os(name))
+        .inspect_err(|_| crate::state_root::discard_binding(&coordination, &transaction))?;
     let spawned = spawn_helper(
         &copy,
         &HelloRequest {
@@ -971,7 +973,10 @@ pub fn prepare_restart(
         },
         PREPARE_TIMEOUT,
     )
-    .inspect_err(|_| crate::state_root::discard_binding(&coordination, &transaction))?;
+    .inspect_err(|_| {
+        crate::state_root::discard_binding(&coordination, &transaction);
+        crate::state_root::discard_environment(&coordination, &transaction);
+    })?;
     Ok(PreparedRestart {
         spawned: Some(spawned),
         coordination,

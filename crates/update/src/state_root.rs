@@ -163,6 +163,130 @@ pub fn read_binding(coordination: &Coordination, transaction: &TransactionId) ->
     validate_root(Path::new(&binding.state_root))
 }
 
+// ----------------------------------------------------------- environment
+
+pub const ENVIRONMENT_FILE: &str = "child-env.json";
+const ENVIRONMENT_LIMIT: u64 = 16 * 1024;
+const MAX_ENV_VALUE_BYTES: usize = 1024;
+
+/// The only variables that may reach the limited child. They are what a normal
+/// Hane start needs to find the same user profile (settings, AI configuration,
+/// the named pipe derived from `LOCALAPPDATA`). Loader and search-path variables
+/// (`LD_PRELOAD`, `DYLD_*`, `PATH`, ...) are deliberately absent.
+pub const CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "HANE_STATE_DIR",
+    "SystemRoot",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "USERPROFILE",
+    "USERNAME",
+    "USERDOMAIN",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TEMP",
+    "TMP",
+];
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildEnvironment {
+    schema: u32,
+    install_id: String,
+    transaction_id: String,
+    vars: std::collections::BTreeMap<String, String>,
+}
+
+fn environment_path(coordination: &Coordination, transaction: &TransactionId) -> PathBuf {
+    coordination.transaction_dir(transaction).join(ENVIRONMENT_FILE)
+}
+
+fn env_value_ok(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_ENV_VALUE_BYTES && !value.chars().any(char::is_control)
+}
+
+/// Parent side: records the allowlisted variables of the real parent in the
+/// owner-only transaction directory. Anything absent, not text, empty, too long
+/// or with control characters is simply left out.
+pub fn publish_environment(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<()> {
+    let vars = CHILD_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|name| {
+            let value = lookup(name)?.into_string().ok()?;
+            env_value_ok(&value).then(|| ((*name).to_owned(), value))
+        })
+        .collect();
+    let document = ChildEnvironment {
+        schema: BINDING_SCHEMA,
+        install_id: coordination.install_id().as_str().to_owned(),
+        transaction_id: transaction.as_str().to_owned(),
+        vars,
+    };
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
+    discard_environment(coordination, transaction);
+    let path = environment_path(coordination, transaction);
+    durable_write(&path, &bytes)?;
+    if let Err(err) = acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false)) {
+        let _ = fs::remove_file(&path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Removes a recorded environment that is no longer wanted.
+pub fn discard_environment(coordination: &Coordination, transaction: &TransactionId) {
+    let _ = fs::remove_file(environment_path(coordination, transaction));
+}
+
+/// Helper side: the recorded variables, re-checked against the allowlist and
+/// the limits. A missing record means no variables; a damaged, foreign or
+/// non-allowlisted one is an error.
+pub fn read_environment(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+) -> Result<Vec<(String, String)>> {
+    let path = environment_path(coordination, transaction);
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(Vec::new());
+    }
+    let bytes = read_private(&path, ENVIRONMENT_LIMIT, "the child environment")?;
+    let document: ChildEnvironment = parse_strict(&bytes)?;
+    if document.schema != BINDING_SCHEMA {
+        return Err(UpdateError::new(
+            ErrorCode::SchemaUnsupported,
+            "unsupported child environment",
+        ));
+    }
+    if document.install_id != coordination.install_id().as_str()
+        || document.transaction_id != transaction.as_str()
+    {
+        return Err(mismatch("the child environment is for another installation or transaction"));
+    }
+    let mut vars = Vec::new();
+    for (name, value) in document.vars {
+        if !CHILD_ENV_ALLOWLIST.contains(&name.as_str()) || !env_value_ok(&value) {
+            return Err(mismatch("the child environment names a variable that is not allowed"));
+        }
+        vars.push((name, value));
+    }
+    Ok(vars)
+}
+
 // ---------------------------------------------------------------- ticket
 
 /// One saved file of the restart ticket. Only a path and bounded positions:
@@ -643,6 +767,61 @@ mod tests {
         // Discarded.
         discard_binding(&fx.coordination, &fx.transaction);
         assert!(read_binding(&fx.coordination, &fx.transaction).is_err());
+    }
+
+    #[test]
+    fn only_allowlisted_variables_travel_to_the_child() {
+        let fx = fixture();
+        // Nothing recorded: no variables.
+        assert!(read_environment(&fx.coordination, &fx.transaction).unwrap().is_empty());
+
+        let ambient = |name: &str| -> Option<std::ffi::OsString> {
+            match name {
+                "HOME" => Some("/home/u".into()),
+                "LOCALAPPDATA" => Some("C:\\Users\\u\\AppData\\Local".into()),
+                "TMP" => Some("bad\nvalue".into()),
+                "TEMP" => Some("x".repeat(MAX_ENV_VALUE_BYTES + 1).into()),
+                _ => None,
+            }
+        };
+        publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        assert_eq!(
+            vars,
+            [
+                ("HOME".to_owned(), "/home/u".to_owned()),
+                ("LOCALAPPDATA".to_owned(), "C:\\Users\\u\\AppData\\Local".to_owned()),
+            ]
+        );
+
+        // A loader variable is never accepted, even if it is written by hand.
+        let install = install_id();
+        for name in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HANE_COMMAND"] {
+            let doc = serde_json::json!({
+                "schema": 1,
+                "install_id": install.as_str(),
+                "transaction_id": fx.transaction.as_str(),
+                "vars": { name: "/tmp/evil" },
+            });
+            fx.write_private(ENVIRONMENT_FILE, &serde_json::to_vec(&doc).unwrap());
+            assert!(read_environment(&fx.coordination, &fx.transaction).is_err(), "{name}");
+        }
+
+        // Another transaction's record is refused.
+        let doc = serde_json::json!({
+            "schema": 1,
+            "install_id": install.as_str(),
+            "transaction_id": TransactionId::generate().unwrap().as_str(),
+            "vars": { "HOME": "/home/u" },
+        });
+        fx.write_private(ENVIRONMENT_FILE, &serde_json::to_vec(&doc).unwrap());
+        assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
+
+        // Oversized and damaged records are refused.
+        fx.write_private(ENVIRONMENT_FILE, &vec![b' '; 20_000]);
+        assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
+        fx.write_private(ENVIRONMENT_FILE, b"not json");
+        assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
     }
 
     #[test]
