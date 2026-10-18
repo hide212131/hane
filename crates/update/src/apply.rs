@@ -56,6 +56,14 @@ pub trait FileOps: DiskView {
     fn verify_placement(&self) -> Result<()> {
         Ok(())
     }
+    /// Re-verifies, right before `Committed`, everything the install must be
+    /// beyond the journaled steps (Windows: the unchanged owned files; macOS:
+    /// the bundle facts and the Developer ID signature). The expectation was
+    /// fixed from the signed candidate, never learned from the live install.
+    /// An error (mismatch or failed query) prevents the commit.
+    fn verify_commit_state(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The old application process, observed through the OS process lifetime.
@@ -216,14 +224,57 @@ pub fn conclude_health<S: JournalStore, O: FileOps>(
             "health can only be concluded while awaiting health",
         ));
     }
-    if healthy && ops.verify_placement().is_ok() && journal.advance_phase(Phase::Committed).is_ok() {
-        return Ok(HealthOutcome::Committed);
+    if healthy && ops.verify_placement().is_ok() {
+        match verify_before_commit(journal, ops) {
+            Ok(()) => {
+                if journal.advance_phase(Phase::Committed).is_ok() {
+                    return Ok(HealthOutcome::Committed);
+                }
+            }
+            Err(err) => {
+                // The files were changed while the child was running. The child
+                // must be gone before anything else happens; nothing unknown
+                // is overwritten, the recovery below decides from the disk.
+                if let Err(stop) = child.stop_and_release_lease() {
+                    return Ok(HealthOutcome::RecoveryRequired(
+                        match require(
+                            journal,
+                            format!(
+                                "the install changed before the commit ({err}) and the health child could not be stopped: {stop}"
+                            ),
+                        ) {
+                            RecoveryOutcome::RecoveryRequired(why) => why,
+                            _ => String::new(),
+                        },
+                    ));
+                }
+            }
+        }
     }
     Ok(match recover(journal, ops, child)? {
         RecoveryOutcome::RecoveryRequired(why) => HealthOutcome::RecoveryRequired(why),
         RecoveryOutcome::RolledBack | RecoveryOutcome::KeptOld => HealthOutcome::RolledBack,
         other => HealthOutcome::RecoveryRequired(format!("unexpected recovery result {other:?}")),
     })
+}
+
+/// Compares the whole install with the state the signed plan requires: every
+/// journaled step must hold its `new` identity (absent when removed), then the
+/// platform's own checks run. The expectation comes from the journal, which was
+/// built from the signed candidate, not from the live disk.
+fn verify_before_commit<S: JournalStore, O: FileOps>(
+    journal: &DurableJournal<S>,
+    ops: &O,
+) -> Result<()> {
+    for step in &journal.journal().steps {
+        if !identity_matches(&ops.observe(&step.rel_path)?, &step.new) {
+            return Err(UpdateError::new(
+                ErrorCode::HashMismatch,
+                format!("{} differs from the signed new version", step.rel_path),
+            ));
+        }
+    }
+    ops.verify_commit_state()
 }
 
 /// Decides from the journal and the actual disk, then acts. Used both after a
@@ -406,6 +457,9 @@ pub struct FsFileOps {
     guard: Result<RootGuard>,
     /// The verified install file the next mutation is bound to (Windows).
     pinned: Option<(String, PinnedFile)>,
+    /// Owned files the update does not touch, with their signed identities.
+    /// Re-verified right before the commit.
+    unchanged: Vec<(String, FileIdentity)>,
     /// Runs after the target is bound and before the mutation touches it.
     #[cfg(test)]
     before_mutation: Option<Box<dyn FnMut()>>,
@@ -420,9 +474,17 @@ impl FsFileOps {
             stage_root,
             guard,
             pinned: None,
+            unchanged: Vec::new(),
             #[cfg(test)]
             before_mutation: None,
         }
+    }
+
+    /// Declares the signed identities of the owned files the update leaves in
+    /// place, so the commit re-verifies them too.
+    pub fn with_unchanged(mut self, unchanged: Vec<(String, FileIdentity)>) -> Self {
+        self.unchanged = unchanged;
+        self
     }
 
     fn mutation_point(&mut self) {
@@ -620,6 +682,18 @@ impl DiskView for FsFileOps {
 }
 
 impl FileOps for FsFileOps {
+    fn verify_commit_state(&self) -> Result<()> {
+        for (rel_path, identity) in &self.unchanged {
+            if self.observe(rel_path)? != Observed::File(identity.clone()) {
+                return Err(UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{rel_path} differs from the signed inventory"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn backup(&mut self, rel_path: &str, backup_rel: &str) -> Result<()> {
         let bytes = self.read_regular(rel_path)?;
         self.write_atomic(backup_rel, &bytes, None)
@@ -794,6 +868,8 @@ mod tests {
         fail_backup_of: Option<String>,
         /// Backup of this path is written with damaged content.
         corrupt_backup_of: Option<String>,
+        /// Owned files the update leaves alone, verified before the commit.
+        unchanged: Vec<(String, FileIdentity)>,
     }
 
     impl FakeOps {
@@ -852,6 +928,15 @@ mod tests {
     }
 
     impl FileOps for FakeOps {
+        fn verify_commit_state(&self) -> Result<()> {
+            for (path, identity) in &self.unchanged {
+                if self.observe(path)? != Observed::File(identity.clone()) {
+                    return Err(UpdateError::new(ErrorCode::InstallModified, "unchanged file differs"));
+                }
+            }
+            Ok(())
+        }
+
         fn backup(&mut self, rel_path: &str, backup_rel: &str) -> Result<()> {
             self.tick()?;
             if self.fail_backup_of.as_deref() == Some(rel_path) {
@@ -969,6 +1054,57 @@ mod tests {
         assert_eq!(ops.files["hane.exe"], NEW_EXE);
         assert!(!ops.files.contains_key("gone.txt"));
         assert_eq!(child.stops, 0);
+    }
+
+    fn applied_with_unchanged() -> (DurableJournal<FlakyStore>, FakeOps, Child) {
+        let mut journal = new_journal(flaky());
+        let mut ops = FakeOps::new();
+        ops.unchanged = vec![("user.md".to_string(), FileIdentity::of(b"user data"))];
+        let mut child = Child::default();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert_eq!(outcome, ApplyOutcome::AwaitingHealth);
+        (journal, ops, child)
+    }
+
+    #[test]
+    fn an_exact_match_before_the_commit_still_commits() {
+        let (mut journal, mut ops, mut child) = applied_with_unchanged();
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert_eq!(health, HealthOutcome::Committed);
+        assert_eq!(journal.journal().phase, Phase::Committed);
+    }
+
+    #[test]
+    fn a_changed_file_modified_before_the_commit_is_not_committed_and_is_kept() {
+        let (mut journal, mut ops, mut child) = applied_with_unchanged();
+        ops.files.insert("a.dll".to_string(), b"third party".to_vec());
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert!(matches!(health, HealthOutcome::RecoveryRequired(_)), "{health:?}");
+        assert_ne!(journal.journal().phase, Phase::Committed);
+        assert!(child.stops >= 1);
+        assert_eq!(ops.files["a.dll"], b"third party");
+    }
+
+    #[test]
+    fn an_unchanged_file_modified_before_the_commit_is_not_committed_and_is_kept() {
+        let (mut journal, mut ops, mut child) = applied_with_unchanged();
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert_ne!(health, HealthOutcome::Committed);
+        assert_ne!(journal.journal().phase, Phase::Committed);
+        assert!(child.stops >= 1);
+        assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_stopped_after_a_mismatch_requires_recovery() {
+        let (mut journal, mut ops, mut child) = applied_with_unchanged();
+        child.fail = true;
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert!(matches!(health, HealthOutcome::RecoveryRequired(_)), "{health:?}");
+        assert_eq!(journal.journal().phase, Phase::RecoveryRequired);
+        assert_eq!(ops.files["user.md"], b"third party");
     }
 
     #[test]

@@ -351,6 +351,14 @@ pub struct BundleOps<'a> {
     /// Fixed before the exchange; `None` for startup recovery, which has no
     /// earlier placement to compare with.
     guard: Option<PlacementGuard>,
+    /// The bundle version and pinned Team ID taken from the signed candidate
+    /// and the policy; re-verified against the live bundle before the commit.
+    commit_check: Option<CommitCheck>,
+}
+
+struct CommitCheck {
+    version: String,
+    team_id: String,
 }
 
 /// Directory identity (device, inode) of the install parent and of the two
@@ -436,7 +444,15 @@ impl<'a> BundleOps<'a> {
             live: live.to_path_buf(),
             slot: slot.to_path_buf(),
             guard: None,
+            commit_check: None,
         }
+    }
+
+    /// Fixes what the live bundle must be (version from the signed candidate,
+    /// the pinned Team ID) when the update is about to be committed.
+    pub fn with_commit_check(mut self, version: String, team_id: String) -> Self {
+        self.commit_check = Some(CommitCheck { version, team_id });
+        self
     }
 
     /// Like [`BundleOps::new`], with the placement of the live bundle, its
@@ -493,6 +509,21 @@ impl FileOps for BundleOps<'_> {
 
     fn verify_placement(&self) -> Result<()> {
         self.check_placement()
+    }
+
+    fn verify_commit_state(&self) -> Result<()> {
+        let Some(check) = &self.commit_check else {
+            return Ok(());
+        };
+        let facts = read_bundle_facts(&self.live)?;
+        check_bundle_facts(&facts, "the live bundle")?;
+        if facts.short_version != check.version {
+            return Err(UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "the live bundle is not the signed candidate version",
+            ));
+        }
+        require_signed(self.host, &self.live, &check.team_id)
     }
 
     /// Rolls back by exchanging again. The slot must still hold exactly the
@@ -842,7 +873,9 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     let mut journal = DurableJournal::create(store, journal)?;
     // The placement is fixed before the first mutation; a bundle that cannot be
     // pinned is refused here, with nothing written.
-    let mut ops = BundleOps::pinned(inputs.host, live, &verified.slot)?;
+    let team_id = required_team_id(inputs.policy)?.to_owned();
+    let mut ops = BundleOps::pinned(inputs.host, live, &verified.slot)?
+        .with_commit_check(verified.plan.destination.version.clone(), team_id);
     match swap_bundle(&mut journal, &mut ops) {
         Ok(()) => Ok(AppliedBundle { journal, ops }),
         Err(err) => match apply::recover(&mut journal, &mut ops, &mut NoChild) {

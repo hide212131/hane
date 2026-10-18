@@ -404,6 +404,12 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
         inputs.placement.install_root.clone(),
         backup,
         txn_dir.join(STAGE_DIR),
+    )
+    .with_unchanged(
+        plan.unchanged
+            .iter()
+            .map(|file| (file.rel_path.clone(), file.identity.clone()))
+            .collect(),
     );
     match apply::apply(&mut journal, &mut ops, &parent, &mut NoChild) {
         Ok(ApplyOutcome::AwaitingHealth) => Ok(AppliedFiles { journal, ops }),
