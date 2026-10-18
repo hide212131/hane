@@ -1269,6 +1269,9 @@ mod tests {
         fs::rename(&parked, second).unwrap();
     }
 
+    /// Journal phase and step state, when a journal was readable.
+    type JournalSnapshot = Option<(Phase, StepState)>;
+
     struct FakeHost {
         swaps: Cell<usize>,
         fail_swap: Cell<bool>,
@@ -1296,7 +1299,7 @@ mod tests {
         fail_swap_sync: Cell<bool>,
         /// Exchanges done so far and the journal phase / step state seen at
         /// each parent-directory sync after an exchange.
-        swap_syncs: RefCell<Vec<(usize, Option<(Phase, StepState)>)>>,
+        swap_syncs: RefCell<Vec<(usize, JournalSnapshot)>>,
         /// Runs right after a successful exchange, before anything observes it
         /// (the Finder moving the live bundle).
         after_swap: RefCell<Option<Box<dyn Fn()>>>,
