@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn call_times_out_and_a_late_response_is_dropped_not_delivered_to_a_new_call() {
         let handler = Arc::new(RejectAllServerRequests);
-        let (transport, mut server_write, mut server_read, events_rx, _closed) =
+        let (transport, mut server_write, server_read, events_rx, _closed) =
             spawn_transport_over_pipes(handler);
         let core = transport.handle();
 
