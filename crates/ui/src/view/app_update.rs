@@ -946,7 +946,7 @@ pub(crate) fn run_exit_sequence(steps: &mut dyn ExitSteps) -> ExitOutcome {
 /// [`ExitSteps`] on the real window.
 struct ViewExit<'a> {
     view: &'a mut EditorView,
-    cx: &'a mut Context<EditorView>,
+    cx: &'a mut Context<'a, EditorView>,
     prepared: Option<Box<dyn PreparedUpdate>>,
     observation: &'a RestartObservation,
     ticket: &'a RestartTicketSnapshot,
