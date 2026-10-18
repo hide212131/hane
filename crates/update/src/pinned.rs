@@ -10,7 +10,7 @@
 //! never constructed.
 
 #[cfg(windows)]
-pub(crate) use imp::{PinnedDir, PinnedFile};
+pub(crate) use imp::{PinnedDir, PinnedFile, flush_dir};
 
 #[cfg(not(windows))]
 #[allow(dead_code, reason = "only the Windows adapter constructs a pin")]
@@ -73,6 +73,29 @@ mod imp {
             }
             Ok(Some(Self { _dir: dir }))
         }
+    }
+
+    /// Durability barrier for a directory's namespace: flushes the directory
+    /// itself (`FlushFileBuffers` on a write-access directory handle), so link,
+    /// rename and delete entries made in it before the call survive a power
+    /// loss. The directory is opened without following a reparse point and
+    /// must be a real directory.
+    pub(crate) fn flush_dir(path: &Path) -> io::Result<()> {
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        let dir = OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let meta = dir.metadata()?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is not a regular directory",
+                path.display()
+            )));
+        }
+        dir.sync_all()
     }
 
     /// An install file whose identity was verified through this very handle.

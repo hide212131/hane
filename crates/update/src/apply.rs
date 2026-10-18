@@ -568,6 +568,9 @@ impl FsFileOps {
                         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                         Err(err) => return Err(err.into()),
                     }
+                    // The new directory entry must be durable before a file
+                    // is placed beneath it.
+                    namespace_barrier(parent_of(&path)?)?;
                     PinnedDir::open(&path)?.ok_or_else(|| {
                         UpdateError::new(
                             ErrorCode::InstallModified,
@@ -683,6 +686,48 @@ fn place(
     Ok(())
 }
 
+#[cfg(windows)]
+fn parent_of(path: &Path) -> Result<&Path> {
+    path.parent()
+        .ok_or_else(|| UpdateError::new(ErrorCode::Io, "install path has no parent directory"))
+}
+
+/// Windows: makes the namespace changes made in `dir` durable. A failure is an
+/// error, so the caller neither advances the journal nor reports success.
+#[cfg(windows)]
+fn namespace_barrier(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    barrier_probe::reached(dir)?;
+    crate::pinned::flush_dir(dir).map_err(|err| {
+        UpdateError::new(
+            ErrorCode::Io,
+            format!("{} could not be flushed to disk: {err}", dir.display()),
+        )
+    })
+}
+
+/// Test seam: records every barrier and can make it fail.
+#[cfg(all(windows, test))]
+mod barrier_probe {
+    use std::cell::{Cell, RefCell};
+    use std::path::{Path, PathBuf};
+
+    use crate::error::{ErrorCode, Result, UpdateError};
+
+    thread_local! {
+        pub(super) static LOG: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        pub(super) static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn reached(dir: &Path) -> Result<()> {
+        LOG.with(|log| log.borrow_mut().push(dir.to_path_buf()));
+        if FAIL.with(Cell::get) {
+            return Err(UpdateError::new(ErrorCode::Io, "injected barrier failure"));
+        }
+        Ok(())
+    }
+}
+
 /// Windows: the verified file is moved aside through its own handle (no other
 /// process could rename or replace it meanwhile), then the new file is linked
 /// into the now-free name, which fails rather than overwrite anything that
@@ -714,6 +759,12 @@ fn place(
                     )),
                 };
             }
+            // The rename aside and the link are namespace changes: both
+            // directories are flushed before the call can report success. On
+            // failure the aside file stays in the scratch directory, so the old
+            // content is still recoverable.
+            namespace_barrier(scratch)?;
+            namespace_barrier(parent_of(path)?)?;
             drop(pin);
             let _ = std::fs::remove_file(&aside);
             Ok(())
@@ -725,6 +776,7 @@ fn place(
             )),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::hard_link(temp, path)?;
+                namespace_barrier(parent_of(path)?)?;
                 Ok(())
             }
             Err(err) => Err(err.into()),
@@ -821,7 +873,6 @@ impl FileOps for FsFileOps {
         let (base, rest) = self.locate(rel_path)?;
         #[cfg(windows)]
         {
-            let _ = (base, rest);
             // Only the verified file, deleted through its own handle.
             let pin = pin.ok_or_else(|| {
                 UpdateError::new(
@@ -830,7 +881,10 @@ impl FileOps for FsFileOps {
                 )
             })?;
             pin.delete()?;
+            // The deletion takes effect when the handle closes; only then is
+            // the directory entry removed and can it be flushed.
             drop(pin);
+            namespace_barrier(parent_of(&base.join(rest))?)?;
         }
         #[cfg(not(windows))]
         {
@@ -1694,6 +1748,126 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    fn barrier_log() -> Vec<std::path::PathBuf> {
+        barrier_probe::LOG.with(|log| log.borrow().clone())
+    }
+
+    #[cfg(windows)]
+    fn reset_barrier(fail: bool) {
+        barrier_probe::LOG.with(|log| log.borrow_mut().clear());
+        barrier_probe::FAIL.with(|flag| flag.set(fail));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_new_file_replacement_and_removal_each_flush_the_namespace() {
+        let mut fx = race_fixture();
+
+        reset_barrier(false);
+        fx.ops.bind_target("added.txt", &None).unwrap();
+        fx.ops
+            .install_new("added.txt", &FileIdentity::of(NEW_ADDED))
+            .unwrap();
+        assert!(barrier_log().contains(&fx.root), "new-file placement was not flushed");
+
+        reset_barrier(false);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap();
+        let log = barrier_log();
+        assert!(log.contains(&fx.root), "replacement was not flushed");
+        assert!(
+            log.iter().any(|dir| dir != &fx.root),
+            "the scratch directory of the rename aside was not flushed"
+        );
+
+        reset_barrier(false);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL)))
+            .unwrap();
+        fx.ops.remove("a.dll").unwrap();
+        assert!(!fx.root.join("a.dll").exists());
+        assert!(barrier_log().contains(&fx.root), "removal was not flushed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_failed_barrier_fails_each_mutation_and_keeps_the_old_file_recoverable() {
+        let mut fx = race_fixture();
+
+        reset_barrier(true);
+        fx.ops.bind_target("added.txt", &None).unwrap();
+        assert!(
+            fx.ops
+                .install_new("added.txt", &FileIdentity::of(NEW_ADDED))
+                .is_err()
+        );
+
+        reset_barrier(true);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        assert!(fx.ops.install_new("a.dll", &FileIdentity::of(NEW_DLL)).is_err());
+        // The displaced old file is still held in the scratch directory.
+        let kept: Vec<_> = fs::read_dir(&fx.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".hane-update-"))
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(fs::read(kept[0].join("a.dll.aside")).unwrap(), OLD_DLL);
+
+        let mut fx = race_fixture();
+        reset_barrier(true);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        assert!(fx.ops.remove("a.dll").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_apply_never_marks_a_step_applied_when_the_barrier_fails() {
+        let dir = TempDir::new("apply-barrier");
+        let root = dir.path().join("install");
+        let backup = dir.path().join("backup");
+        let stage = dir.path().join("stage");
+        for sub in [&root, &backup, &stage] {
+            fs::create_dir_all(sub).unwrap();
+        }
+        for (path, data) in original() {
+            fs::write(root.join(path), data).unwrap();
+        }
+        fs::write(stage.join("a.dll"), NEW_DLL).unwrap();
+        fs::write(stage.join("added.txt"), NEW_ADDED).unwrap();
+        fs::write(stage.join("hane.exe"), NEW_EXE).unwrap();
+
+        reset_barrier(true);
+        let mut ops = FsFileOps::new(root.clone(), backup, stage);
+        let mut journal = new_journal(flaky());
+        let mut child = Child::default();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child);
+        assert!(!matches!(outcome, Ok(ApplyOutcome::AwaitingHealth)), "{outcome:?}");
+        assert_ne!(journal.journal().phase, Phase::AwaitingHealth);
+        assert_ne!(journal.journal().phase, Phase::Committed);
+        assert!(
+            journal
+                .journal()
+                .steps
+                .iter()
+                .all(|step| step.state != StepState::Applied),
+            "a step was marked Applied without a durable mutation"
+        );
     }
 
     /// Windows displaces an existing file only through a handle whose identity
