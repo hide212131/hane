@@ -168,6 +168,7 @@ pub fn read_binding(coordination: &Coordination, transaction: &TransactionId) ->
 pub const ENVIRONMENT_FILE: &str = "child-env.json";
 const ENVIRONMENT_LIMIT: u64 = 16 * 1024;
 const MAX_ENV_VALUE_BYTES: usize = 1024;
+const MAX_PATH_ENV_VALUE_BYTES: usize = 8 * 1024;
 
 /// The only variables that may reach the limited child. They are what a normal
 /// Hane start needs to find the same user profile (settings, AI configuration,
@@ -236,8 +237,21 @@ pub fn env_name_allowed(name: &str) -> bool {
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
 }
 
-fn env_value_ok(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_ENV_VALUE_BYTES && !value.chars().any(char::is_control)
+/// The value limit for `name`. A Windows `PATH` routinely exceeds 1 KiB, so it
+/// alone gets a larger limit; the serialized record stays under
+/// `ENVIRONMENT_LIMIT` either way.
+fn env_value_limit(name: &str) -> usize {
+    if name.eq_ignore_ascii_case("PATH") {
+        MAX_PATH_ENV_VALUE_BYTES
+    } else {
+        MAX_ENV_VALUE_BYTES
+    }
+}
+
+fn env_value_ok(name: &str, value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= env_value_limit(name)
+        && !value.chars().any(char::is_control)
 }
 
 /// Parent side: records the allowlisted variables of the real parent in the
@@ -258,7 +272,7 @@ pub fn publish_environment(
                 return None;
             }
             let value = value.into_string().ok()?;
-            env_value_ok(&value).then_some((name, value))
+            env_value_ok(&name, &value).then_some((name, value))
         })
         .collect();
     let document = ChildEnvironment {
@@ -314,7 +328,7 @@ pub fn read_environment(
     }
     let mut vars = Vec::new();
     for (name, value) in document.vars {
-        if !env_name_allowed(&name) || !env_value_ok(&value) {
+        if !env_name_allowed(&name) || !env_value_ok(&name, &value) {
             return Err(mismatch("the child environment names a variable that is not allowed"));
         }
         vars.push((name, value));
@@ -874,6 +888,63 @@ mod tests {
         fx.write_private(ENVIRONMENT_FILE, &vec![b' '; 20_000]);
         assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
         fx.write_private(ENVIRONMENT_FILE, b"not json");
+        assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
+    }
+
+    #[test]
+    fn a_long_path_is_kept_but_other_values_and_the_whole_record_stay_bounded() {
+        let fx = fixture();
+        let long_path = format!("C:\\{}", "a;".repeat(2048));
+        assert!(long_path.len() > MAX_ENV_VALUE_BYTES && long_path.len() <= 8 * 1024);
+        let too_long_path = "p".repeat(8 * 1024 + 1);
+        let to_os = |(k, v): (&str, String)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v));
+
+        // A PATH above 1 KiB and within the PATH limit is recorded.
+        publish_environment(
+            &fx.coordination,
+            &fx.transaction,
+            [("PATH", long_path.clone()), ("HOME", "/home/u".to_owned())].map(to_os),
+        )
+        .unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        assert!(vars.contains(&("PATH".to_owned(), long_path.clone())));
+
+        // A PATH over its own limit is left out, and other variables keep 1 KiB.
+        publish_environment(
+            &fx.coordination,
+            &fx.transaction,
+            [
+                ("PATH", too_long_path.clone()),
+                ("TEMP", "x".repeat(MAX_ENV_VALUE_BYTES + 1)),
+                ("HOME", "/home/u".to_owned()),
+            ]
+            .map(to_os),
+        )
+        .unwrap();
+        assert_eq!(
+            read_environment(&fx.coordination, &fx.transaction).unwrap(),
+            [("HOME".to_owned(), "/home/u".to_owned())]
+        );
+
+        // A hand-written record is checked with the same per-key limits.
+        let install = install_id();
+        for (name, value) in [
+            ("PATH", too_long_path),
+            ("TEMP", "x".repeat(MAX_ENV_VALUE_BYTES + 1)),
+        ] {
+            let doc = serde_json::json!({
+                "schema": 1,
+                "install_id": install.as_str(),
+                "transaction_id": fx.transaction.as_str(),
+                "vars": { name: value },
+            });
+            fx.write_private(ENVIRONMENT_FILE, &serde_json::to_vec(&doc).unwrap());
+            assert!(read_environment(&fx.coordination, &fx.transaction).is_err(), "{name}");
+        }
+
+        // The whole-record limit is unchanged.
+        assert_eq!(ENVIRONMENT_LIMIT, 16 * 1024);
+        fx.write_private(ENVIRONMENT_FILE, &vec![b' '; ENVIRONMENT_LIMIT as usize + 1]);
         assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
     }
 
