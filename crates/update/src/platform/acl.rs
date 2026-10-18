@@ -94,33 +94,70 @@ fn require_no_extended_acl(ops: &dyn ExtendedAcl, path: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 mod macos_acl {
-    use std::ffi::{CString, c_int, c_void};
-    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::{c_int, c_void};
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
     use std::path::Path;
 
     use super::{ExtendedAcl, refuse};
     use crate::error::Result;
 
     const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    /// `FILESEC_ACL` of `filesec_property_t`.
+    const FILESEC_ACL: c_int = 5;
+    /// `_FILESEC_REMOVE_ACL`: the sentinel pointer `((acl_t)1)` that asks the
+    /// extended chmod call to delete the ACL.
+    const FILESEC_REMOVE_ACL: usize = 1;
 
     unsafe extern "C" {
-        fn acl_get_link_np(path: *const libc::c_char, acl_type: c_int) -> *mut c_void;
-        fn acl_delete_link_np(path: *const libc::c_char, acl_type: c_int) -> c_int;
+        fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
         fn acl_free(obj: *mut c_void) -> c_int;
+        fn filesec_init() -> *mut c_void;
+        fn filesec_set_property(fsec: *mut c_void, property: c_int, value: *const c_void) -> c_int;
+        fn filesec_free(fsec: *mut c_void);
+        fn fchmodx_np(fd: c_int, fsec: *mut c_void) -> c_int;
     }
 
-    pub struct System;
+    /// A descriptor opened without following links. The ACL query, removal and
+    /// read-back all use this one descriptor, so the path is never resolved
+    /// again.
+    pub struct Descriptor(File);
 
-    fn c_path(path: &Path) -> Result<CString> {
-        CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| refuse(format!("{} is not a valid path", path.display())))
+    impl Descriptor {
+        pub fn open(path: &Path) -> Result<Self> {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|err| {
+                    refuse(format!(
+                        "{} could not be opened without following links: {err}",
+                        path.display()
+                    ))
+                })?;
+            Ok(Self(file))
+        }
+
+        pub fn file(&self) -> &File {
+            &self.0
+        }
     }
 
-    impl ExtendedAcl for System {
+    /// Frees a `filesec_t` on every exit path.
+    struct FileSec(*mut c_void);
+
+    impl Drop for FileSec {
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from `filesec_init` and is freed once.
+            unsafe { filesec_free(self.0) };
+        }
+    }
+
+    impl ExtendedAcl for Descriptor {
         fn present(&self, path: &Path) -> Result<bool> {
-            let name = c_path(path)?;
-            // SAFETY: `name` is NUL-terminated; the returned ACL is freed below.
-            let acl = unsafe { acl_get_link_np(name.as_ptr(), ACL_TYPE_EXTENDED) };
+            // SAFETY: the descriptor is open; the returned ACL is freed below.
+            let acl = unsafe { acl_get_fd_np(self.0.as_raw_fd(), ACL_TYPE_EXTENDED) };
             if acl.is_null() {
                 // ENOENT from this call means "no extended ACL"; anything else
                 // (unsupported volume, permission, ...) is undeterminable.
@@ -133,15 +170,37 @@ mod macos_acl {
                     path.display()
                 )));
             }
-            // SAFETY: `acl` came from `acl_get_link_np` and is freed once.
+            // SAFETY: `acl` came from `acl_get_fd_np` and is freed once.
             unsafe { acl_free(acl) };
             Ok(true)
         }
 
         fn clear(&self, path: &Path) -> Result<()> {
-            let name = c_path(path)?;
-            // SAFETY: `name` is NUL-terminated; the call does not follow links.
-            let rc = unsafe { acl_delete_link_np(name.as_ptr(), ACL_TYPE_EXTENDED) };
+            // SAFETY: `filesec_init` has no preconditions; null is checked.
+            let raw = unsafe { filesec_init() };
+            if raw.is_null() {
+                return Err(refuse(format!(
+                    "the extended ACL of {} could not be removed: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let fsec = FileSec(raw);
+            // SAFETY: `fsec.0` is a live filesec; for `FILESEC_ACL` the value
+            // is the ACL pointer itself, here the remove sentinel.
+            let set = unsafe {
+                filesec_set_property(fsec.0, FILESEC_ACL, FILESEC_REMOVE_ACL as *const c_void)
+            };
+            if set != 0 {
+                return Err(refuse(format!(
+                    "the extended ACL of {} could not be removed: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: the descriptor is open and `fsec.0` is a live filesec. The
+            // mode is left unchanged because no mode property is set.
+            let rc = unsafe { fchmodx_np(self.0.as_raw_fd(), fsec.0) };
             if rc != 0 {
                 return Err(refuse(format!(
                     "the extended ACL of {} could not be removed: {}",
@@ -163,23 +222,37 @@ mod imp {
     use super::refuse;
     use crate::error::Result;
 
+    /// Sets the mode and removes any extended ACL through one no-follow
+    /// descriptor. The ACL is removed after the mode and read back.
     #[cfg(target_os = "macos")]
-    fn strip_acl(path: &Path) -> Result<()> {
-        super::strip_extended_acl(&super::macos_acl::System, path)
+    pub(super) fn secure_entry(path: &Path, mode: u32) -> Result<()> {
+        let descriptor = super::macos_acl::Descriptor::open(path)?;
+        descriptor
+            .file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
+        super::strip_extended_acl(&descriptor, path)
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn strip_acl(_path: &Path) -> Result<()> {
+    pub(super) fn secure_entry(path: &Path, mode: u32) -> Result<()> {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
         Ok(())
     }
 
+    /// Refuses an ACL on the entry `meta` describes; the no-follow descriptor
+    /// must be that same file.
     #[cfg(target_os = "macos")]
-    fn require_no_acl(path: &Path) -> Result<()> {
-        super::require_no_extended_acl(&super::macos_acl::System, path)
+    fn require_no_acl(path: &Path, meta: &fs::Metadata) -> Result<()> {
+        let descriptor = super::macos_acl::Descriptor::open(path)?;
+        let opened = descriptor.file().metadata()?;
+        if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+            return Err(refuse(format!("{} changed while being checked", path.display())));
+        }
+        super::require_no_extended_acl(&descriptor, path)
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn require_no_acl(_path: &Path) -> Result<()> {
+    fn require_no_acl(_path: &Path, _meta: &fs::Metadata) -> Result<()> {
         Ok(())
     }
 
@@ -190,10 +263,9 @@ mod imp {
     }
 
     pub fn secure_new(path: &Path, _is_dir: bool, mode: u32) -> Result<()> {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-        // Removed and read back after the mode is set, so nothing remains
-        // when this returns.
-        strip_acl(path)
+        // On macOS the ACL is removed and read back after the mode is set,
+        // so nothing remains when this returns.
+        secure_entry(path, mode)
     }
 
     pub fn verify(path: &Path, is_dir: bool) -> Result<()> {
@@ -216,7 +288,7 @@ mod imp {
                 path.display()
             )));
         }
-        require_no_acl(path)?;
+        require_no_acl(path, &meta)?;
         Ok(())
     }
 }
@@ -505,7 +577,7 @@ mod imp {
 }
 
 // The fake below exercises the fail-closed logic on every OS. The macOS
-// module at the end uses real ACLs (`chmod +a`, `acl_delete_link_np`).
+// module at the end uses real ACLs (`chmod +a`, `fchmodx_np`).
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -602,7 +674,11 @@ mod tests {
         use std::path::{Path, PathBuf};
         use std::process::Command;
 
-        use super::super::{ExtendedAcl, imp, macos_acl::System};
+        use super::super::{ExtendedAcl, imp, macos_acl::Descriptor};
+
+        fn present(path: &Path) -> bool {
+            Descriptor::open(path).unwrap().present(path).unwrap()
+        }
 
         fn scratch(name: &str) -> PathBuf {
             let dir = std::env::temp_dir().join(format!(
@@ -630,9 +706,9 @@ mod tests {
             let file = dir.join("entry");
             std::fs::write(&file, b"").unwrap();
             add_acl(&file);
-            assert!(System.present(&file).unwrap());
+            assert!(present(&file));
             imp::secure_new(&file, false, 0o600).unwrap();
-            assert!(!System.present(&file).unwrap());
+            assert!(!present(&file));
             imp::verify(&file, false).unwrap();
             std::fs::remove_dir_all(&dir).unwrap();
         }
