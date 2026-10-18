@@ -323,11 +323,22 @@ pub fn run_session<R: Read, W: Write>(
                 return Ok(SessionEnd::ParentStillRunning);
             };
             leases.runtime = Some(runtime);
-            backend.apply(&mut ApplyContext {
+            // The parent is gone, so nothing else can reclaim this transaction
+            // until the helper has made its journal durable. The guard drops
+            // before `leases`, while the leases are still held.
+            let mut cleanup = UnjournaledCleanup {
+                coordination: coord,
+                transaction: &env.transaction,
+                armed: true,
+            };
+            let applied = backend.apply(&mut ApplyContext {
                 env,
                 candidate_id: candidate_id.as_deref(),
                 leases: &mut leases,
-            })?;
+            });
+            // A panic skips this line and leaves the guard armed.
+            cleanup.armed = applied.is_err();
+            applied?;
             Ok(SessionEnd::Applied)
         }
         Mode::Recover => {
@@ -357,6 +368,25 @@ pub fn run_session<R: Read, W: Write>(
                 ),
             )?;
             Ok(SessionEnd::Recovered(report))
+        }
+    }
+}
+
+/// Helper-owned cleanup for the window between `ExitAuthorized` and the durable
+/// journal. If the apply ends in failure (or a panic) before any journal exists,
+/// the transaction's archive, stage and helper copy are removed; the check for
+/// journal traces and path ownership is `remove_unjournaled_transaction`, and
+/// whatever it cannot verify stays for the next startup sweep.
+struct UnjournaledCleanup<'a> {
+    coordination: &'a Coordination,
+    transaction: &'a TransactionId,
+    armed: bool,
+}
+
+impl Drop for UnjournaledCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.coordination.remove_unjournaled_transaction(self.transaction);
         }
     }
 }
@@ -1716,6 +1746,70 @@ mod tests {
         std::fs::write(fx.coord.journal_path(&fx.txn), b"{}").unwrap();
         drop_guard(&fx, true);
         assert!(marker.exists());
+    }
+
+    /// A backend whose apply fails the way a candidate revalidation, extraction
+    /// or capacity check does; optionally after a journal file exists.
+    struct FailingApply {
+        journal_first: bool,
+        panic: bool,
+    }
+
+    impl HelperBackend for FailingApply {
+        fn apply(&mut self, ctx: &mut ApplyContext<'_>) -> Result<()> {
+            if self.journal_first {
+                std::fs::write(ctx.env.coordination.journal_path(&ctx.env.transaction), b"{}")?;
+            }
+            if self.panic {
+                panic!("helper crashed before the journal");
+            }
+            Err(UpdateError::new(ErrorCode::Io, "candidate revalidation failed"))
+        }
+
+        fn recover(&mut self, _ctx: &RecoverContext<'_>) -> Result<RecoveryReport> {
+            Ok(RecoveryReport::Nothing)
+        }
+    }
+
+    fn run_failing(fx: &Fixture, mut backend: FailingApply) -> Result<SessionEnd> {
+        let nonce = Nonce::generate().unwrap();
+        let mut reader = wire(&[fx.hello(&nonce, Mode::Prepare), fx.authorized(&nonce)]);
+        let mut output = Vec::new();
+        run_session(&mut reader, &mut output, &fx.env(), &nonce, &mut backend)
+    }
+
+    #[test]
+    fn a_helper_side_failure_before_the_journal_removes_its_own_transaction_only() {
+        let fx = fixture();
+        let other = TransactionId::generate().unwrap();
+        let own_marker = stage_marker(&fx.coord, &fx.txn);
+        let other_marker = stage_marker(&fx.coord, &other);
+        let result = run_failing(&fx, FailingApply { journal_first: false, panic: false });
+        assert_eq!(result.unwrap_err().code, ErrorCode::Io);
+        assert!(!own_marker.exists());
+        assert!(!fx.coord.transaction_dir(&fx.txn).exists());
+        assert!(other_marker.exists(), "another transaction stays");
+    }
+
+    #[test]
+    fn a_helper_crash_before_the_journal_removes_its_own_transaction() {
+        let fx = fixture();
+        let marker = stage_marker(&fx.coord, &fx.txn);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_failing(&fx, FailingApply { journal_first: false, panic: true })
+        }));
+        assert!(outcome.is_err());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_helper_side_failure_after_the_journal_keeps_the_transaction() {
+        let fx = fixture();
+        let marker = stage_marker(&fx.coord, &fx.txn);
+        let result = run_failing(&fx, FailingApply { journal_first: true, panic: false });
+        assert!(result.is_err());
+        assert!(marker.exists());
+        assert!(fx.coord.journal_path(&fx.txn).exists());
     }
 
     #[test]

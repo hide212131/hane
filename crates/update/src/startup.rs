@@ -370,6 +370,40 @@ pub(crate) fn retire_prior_receipts(coordination: &Coordination, current: &Trans
     Ok(())
 }
 
+/// Reclaims transactions that were abandoned before any journal was written
+/// (a helper that was stopped or crashed after `ExitAuthorized`). It acts only
+/// when it holds `transaction`, `startup` and the exclusive `runtime` lease, so
+/// no helper and no other Hane process is alive, and removes only plain,
+/// owned, `TransactionId`-named directories without any trace of a journal.
+/// Anything live, journaled, foreign or unverifiable stays, and every failure
+/// leaves the directory as it is.
+pub(crate) fn sweep_abandoned_transactions(coordination: &Coordination) {
+    let Ok(Some(transaction)) = coordination.try_acquire(LeaseKind::Transaction, &[]) else {
+        return;
+    };
+    let Ok(Some(startup)) = coordination.try_acquire(LeaseKind::Startup, &[&transaction]) else {
+        return;
+    };
+    let Ok(Some(_runtime)) =
+        coordination.try_acquire(LeaseKind::RuntimeExclusive, &[&transaction, &startup])
+    else {
+        return;
+    };
+    let private = coordination.dir().join(PRIVATE_DIR);
+    let Ok(entries) = fs::read_dir(&private) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(id) = TransactionId::parse(&name) else {
+            continue;
+        };
+        let _ = coordination.remove_unjournaled_transaction(&id);
+    }
+}
+
 /// Runs the gate for a verified placement.
 pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Duration) -> GateOutcome {
     // Only a definite absence may start unmanaged. An existing entry that
@@ -391,6 +425,7 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
         Err(err) => return stop(&err),
     };
     let disk = placement.disk_view();
+    sweep_abandoned_transactions(&coordination);
     // One recovery attempt: the second look must find nothing pending.
     for attempt in 0..2 {
         let startup = match coordination.acquire_within(LeaseKind::Startup, &[], wait) {
@@ -1116,6 +1151,82 @@ mod tests {
                 .is_some(),
             "normal editing never started"
         );
+    }
+
+    /// A transaction directory with staged data and no journal.
+    fn abandoned(coord: &Coordination) -> TransactionId {
+        let transaction = TransactionId::generate().unwrap();
+        let helper = coord.ensure_helper_dir(&transaction).unwrap();
+        fs::write(helper.join("staged.bin"), b"staged").unwrap();
+        transaction
+    }
+
+    #[test]
+    fn startup_reclaims_a_transaction_the_helper_abandoned_before_its_journal() {
+        let dir = TempDir::new("gate-sweep");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let gone = abandoned(&coord);
+        let journaled = TransactionId::generate().unwrap();
+        write_journal(&coord, &journaled, Phase::RolledBack);
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+        assert!(matches!(outcome, GateOutcome::Proceed(_)), "{outcome:?}");
+        assert!(!coord.transaction_dir(&gone).exists());
+        assert!(coord.journal_path(&journaled).exists(), "a journaled transaction stays");
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn the_sweep_keeps_everything_live_foreign_or_unverifiable() {
+        let dir = TempDir::new("gate-sweep-keep");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let live = abandoned(&coord);
+        let marker = coord.transaction_dir(&live).join(crate::platform::lease::HELPER_DIR).join("staged.bin");
+
+        // A helper that still holds the transaction lease.
+        let helper = coord.try_acquire(LeaseKind::Transaction, &[]).unwrap().unwrap();
+        sweep_abandoned_transactions(&coord);
+        assert!(marker.exists(), "live helper lease");
+        drop(helper);
+
+        // Another Hane process (or a parent still preparing) holds the runtime lease.
+        let parent = coord.try_acquire(LeaseKind::RuntimeShared, &[]).unwrap().unwrap();
+        sweep_abandoned_transactions(&coord);
+        assert!(marker.exists(), "live runtime lease");
+        drop(parent);
+
+        // An entry that is not a transaction id, and one with a journal trace.
+        let foreign = coord.private_dir().unwrap().join("not-a-transaction");
+        fs::create_dir(&foreign).unwrap();
+        let odd = abandoned(&coord);
+        fs::create_dir(coord.journal_path(&odd)).unwrap();
+        sweep_abandoned_transactions(&coord);
+        assert!(foreign.exists(), "identity unknown");
+        assert!(coord.transaction_dir(&odd).exists(), "journal trace");
+        assert!(!coord.transaction_dir(&live).exists(), "nothing alive: reclaimed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_never_follows_or_removes_an_unverifiable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("gate-sweep-unverifiable");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let outside = TempDir::new("gate-sweep-target");
+        fs::write(outside.path().join("keep.txt"), b"keep").unwrap();
+        let linked = TransactionId::generate().unwrap();
+        coord.private_dir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), coord.transaction_dir(&linked)).unwrap();
+        let open = abandoned(&coord);
+        fs::set_permissions(coord.transaction_dir(&open), fs::Permissions::from_mode(0o777)).unwrap();
+        sweep_abandoned_transactions(&coord);
+        assert!(outside.path().join("keep.txt").exists());
+        assert!(coord.transaction_dir(&open).exists(), "not owner-only: kept");
+        fs::set_permissions(coord.transaction_dir(&open), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
