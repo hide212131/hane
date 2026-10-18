@@ -435,8 +435,10 @@ impl AiSettingsPage {
     }
 
     /// Drops a save-then-leave intent that a newer decision superseded.
+    /// An already generated ready route is superseded as well.
     pub(super) fn cancel_pending_leave(&mut self) {
         self.save_then_leave = None;
+        self.route_ready = None;
     }
 
     pub(super) fn is_dirty(&self, cx: &App) -> bool {
@@ -582,11 +584,20 @@ impl AiSettingsPage {
 
     pub(super) fn confirm_leave(&mut self, target: LeaveTarget) {
         self.save_then_leave = None;
+        self.route_ready = None;
         self.leave_prompt = Some(target);
     }
 
-    pub(super) fn take_ready_route(&mut self) -> Option<LeaveTarget> {
-        self.route_ready.take()
+    /// The last synchronous boundary before actually leaving: edits made
+    /// after the save completed (and before the route is consumed) turn the
+    /// route back into a leave confirmation instead of discarding them.
+    pub(super) fn take_ready_route(&mut self, cx: &App) -> Option<LeaveTarget> {
+        let target = self.route_ready.take()?;
+        if self.is_dirty(cx) {
+            self.leave_prompt = Some(target);
+            return None;
+        }
+        Some(target)
     }
 
     pub(super) fn input_has_focus(&self, window: &Window, cx: &App) -> bool {

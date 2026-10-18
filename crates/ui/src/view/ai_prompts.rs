@@ -426,17 +426,28 @@ impl AiPromptsPage {
     }
 
     /// Drops a save-then-leave intent that a newer decision superseded.
+    /// An already generated ready route is superseded as well.
     pub(super) fn cancel_pending_leave(&mut self) {
         self.pending_target = None;
+        self.route_ready = None;
     }
 
     pub(super) fn confirm_leave(&mut self, target: LeaveTarget) {
         self.pending_target = None;
+        self.route_ready = None;
         self.leave_prompt = Some(target);
     }
 
-    pub(super) fn take_ready_route(&mut self) -> Option<LeaveTarget> {
-        self.route_ready.take()
+    /// The last synchronous boundary before actually leaving: edits made
+    /// after the save completed (and before the route is consumed) turn the
+    /// route back into a leave confirmation instead of discarding them.
+    pub(super) fn take_ready_route(&mut self, cx: &App) -> Option<LeaveTarget> {
+        let target = self.route_ready.take()?;
+        if self.is_dirty(cx) {
+            self.leave_prompt = Some(target);
+            return None;
+        }
+        Some(target)
     }
 
     pub(super) fn input_has_focus(&self, window: &Window, cx: &App) -> bool {
@@ -1281,6 +1292,58 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.settings_open);
             assert_eq!(view.status, None, "the cancelled drop must not apply");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn an_edit_between_save_completion_and_route_consumption_keeps_settings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-ready-route-edit", true);
+        drop_two(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                // The save completed cleanly: the route is ready but unconsumed.
+                view.ai_prompts.baseline = view.ai_prompts.dirty_draft(cx);
+                view.ai_prompts.route_ready = Some(LeaveTarget::Close);
+                // A further edit lands before the route is consumed.
+                set_value(
+                    view.ai_prompts.title_input.as_ref().unwrap(),
+                    "経路消費前の編集",
+                    window,
+                    cx,
+                );
+                assert!(view.ai_prompts.take_ready_route(cx).is_none());
+                assert_eq!(view.ai_prompts.leave_prompt, Some(LeaveTarget::Close));
+                assert!(view.settings_open);
+                assert_eq!(
+                    view.pending_settings_drop,
+                    Some(ExternalDropTarget::TooMany)
+                );
+                assert_eq!(
+                    value(view.ai_prompts.title_input.as_ref().unwrap(), cx),
+                    "経路消費前の編集"
+                );
+            });
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_superseding_intent_clears_an_unconsumed_ready_route(cx: &mut gpui::TestAppContext) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-ready-route-cancel", true);
+        view.update(cx, |view, cx| {
+            view.ai_prompts.baseline = view.ai_prompts.dirty_draft(cx);
+            view.ai_prompts.route_ready = Some(LeaveTarget::Close);
+            // Same steps as the 「編集を続ける」 button.
+            view.ai_prompts.cancel_pending_leave();
+            assert!(view.ai_prompts.take_ready_route(cx).is_none());
+            assert!(view.ai_prompts.leave_prompt.is_none());
+
+            view.ai_prompts.route_ready = Some(LeaveTarget::Close);
+            view.ai_prompts.confirm_leave(LeaveTarget::Category(SettingsCategory::General));
+            assert!(view.ai_prompts.take_ready_route(cx).is_none());
         });
         let _ = std::fs::remove_dir_all(&root);
     }

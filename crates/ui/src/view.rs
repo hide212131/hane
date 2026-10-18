@@ -3544,7 +3544,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        if let Some(target) = self.ai_settings.take_ready_route() {
+        if let Some(target) = self.ai_settings.take_ready_route(cx) {
             match target {
                 ai_settings::LeaveTarget::Category(category) => {
                     self.select_settings_category(category, window, cx)
@@ -3554,7 +3554,7 @@ impl EditorView {
                 }
             }
         }
-        if let Some(target) = self.ai_prompts.take_ready_route() {
+        if let Some(target) = self.ai_prompts.take_ready_route(cx) {
             match target {
                 ai_prompts::LeaveTarget::Category(category) => {
                     self.select_settings_category(category, window, cx)
