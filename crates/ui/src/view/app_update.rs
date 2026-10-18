@@ -1044,8 +1044,8 @@ const RESTART_STALE_MESSAGE: &str =
 /// How long the AI service may take to stop before the restart is given up.
 pub(crate) const AI_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many 200ms polls wait for a stop that outlived [`AI_STOP_TIMEOUT`].
-const AI_RESUME_POLL_LIMIT: usize = 300;
+/// How often a stop that outlived [`AI_STOP_TIMEOUT`] is checked for completion.
+const AI_RESUME_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The steps of the final exit coordination, behind a seam so the order and
 /// every failure path can be tested without a window or a helper process.
@@ -1197,26 +1197,33 @@ impl ExitSteps for ViewExit<'_, '_> {
         self.view.attach_ai_service(handle, self.cx);
         self.ai_stopped = false;
         if still_stopping && let Some(ai) = self.ai.clone() {
-            // The old service is still stopping, so the owner keeps the start
-            // pending and runs it once the stop completes. Wait for that and
-            // attach the new handle instead of leaving the AI detached.
-            self.cx
-                .spawn(async move |view, cx| {
-                    for _ in 0..AI_RESUME_POLL_LIMIT {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(200))
-                            .await;
-                        if let Some(handle) = ai.resume() {
-                            let _ = view.update(cx, |view, cx| {
-                                view.attach_ai_service(Some(handle), cx);
-                            });
-                            return;
-                        }
-                    }
-                })
-                .detach();
+            spawn_ai_resume_wait(ai, self.cx);
         }
     }
+}
+
+/// The old service is still stopping, so the owner keeps the start pending and
+/// runs it once the stop completes. Wait for that and attach the new handle
+/// instead of leaving the AI detached. There is no poll limit, because a stop
+/// can finish arbitrarily late; the wait ends when the handle is attached or
+/// when the view is gone.
+fn spawn_ai_resume_wait(ai: Arc<dyn AiLifecycle>, cx: &mut Context<EditorView>) {
+    cx.spawn(async move |view, cx| {
+        loop {
+            cx.background_executor().timer(AI_RESUME_POLL_INTERVAL).await;
+            // A released view ends the wait; nothing is left to attach to.
+            if view.update(cx, |_, _| ()).is_err() {
+                return;
+            }
+            if let Some(handle) = ai.resume() {
+                let _ = view.update(cx, |view, cx| {
+                    view.attach_ai_service(Some(handle), cx);
+                });
+                return;
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -1859,6 +1866,37 @@ mod tests {
             self.0.lock().unwrap().push("resume_ai");
             None
         }
+    }
+
+    /// Never yields a handle, and counts how often the wait asked for one.
+    struct NeverResumes(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl AiLifecycle for NeverResumes {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    #[gpui::test]
+    fn the_ai_resume_wait_keeps_polling_past_the_old_limit(cx: &mut gpui::TestAppContext) {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let ai: Arc<dyn AiLifecycle> = Arc::new(NeverResumes(polls.clone()));
+        view.update(cx, |_, cx| spawn_ai_resume_wait(ai, cx));
+        // The old limit was 300 polls (about a minute); the clock is virtual,
+        // so going well past it costs no real time.
+        for _ in 0..400 {
+            cx.executor().advance_clock(AI_RESUME_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 300,
+            "the wait must outlive the old poll limit"
+        );
     }
 
     /// Runs the post-`Prepared` step after `change` altered the window once
