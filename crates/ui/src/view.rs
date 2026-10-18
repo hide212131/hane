@@ -1505,12 +1505,22 @@ impl EditorView {
         })
     }
 
-    pub(crate) fn set_text_input_bounds(&mut self, bounds: Bounds<Pixels>) {
+    /// Records the bounds the active short text field was laid out at and
+    /// returns whether its origin moved since the previous frame. The IME
+    /// candidate position derives from this origin, so the caller must ask the
+    /// platform to re-query it when it changes (sidebar resize, row move).
+    pub(crate) fn set_text_input_bounds(&mut self, bounds: Bounds<Pixels>) -> bool {
+        let previous = if self.inline_rename_active() {
+            self.inline_rename_input_bounds
+        } else {
+            self.sidebar_filter_input_bounds
+        };
         if self.inline_rename_active() {
             self.set_inline_rename_input_bounds(bounds);
-        } else if !self.inline_rename_active() {
+        } else {
             self.sidebar_filter_input_bounds = Some(bounds);
         }
+        previous.is_none_or(|previous| previous.origin != bounds.origin)
     }
 
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
@@ -20029,6 +20039,44 @@ mod tests {
                 view.inline_rename.as_ref().map(|rename| rename.kind),
                 Some(InlineRenameKind::Folder)
             );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn text_input_bounds_report_origin_moves_for_ime_position_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("text-input-bounds-origin-move");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("LongFileName.md"), "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let size = gpui::size(px(120.0), px(20.0));
+        let first = Bounds::new(point(px(10.0), px(30.0)), size);
+        let shifted = Bounds::new(point(px(50.0), px(30.0)), size);
+        view.update(cx, |view, _| {
+            // Sidebar filter (no rename active).
+            assert!(!view.inline_rename_active());
+            view.sidebar_filter_input_bounds = None;
+            assert!(view.set_text_input_bounds(first));
+            assert!(!view.set_text_input_bounds(first));
+            assert!(view.set_text_input_bounds(shifted));
+            assert_eq!(view.sidebar_filter_input_bounds, Some(shifted));
+        });
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert!(view.inline_rename_active());
+            // Rename row moved right after a sidebar width change.
+            assert!(view.set_text_input_bounds(first));
+            assert!(!view.set_text_input_bounds(first));
+            assert!(view.set_text_input_bounds(shifted));
+            assert_eq!(view.inline_rename_input_bounds, Some(shifted));
         });
 
         std::fs::remove_dir_all(root).unwrap();
