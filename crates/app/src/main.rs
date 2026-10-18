@@ -142,78 +142,6 @@ impl AiLifecycle for AiOwner {
     }
 }
 
-#[cfg(test)]
-mod service_slot_tests {
-    use super::ServiceSlot;
-    use std::sync::mpsc::{Receiver, Sender, channel};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    /// Drop blocks until released, like a worker still finishing a runtime.
-    struct Blocking(Option<Mutex<Receiver<()>>>);
-
-    impl Drop for Blocking {
-        fn drop(&mut self) {
-            if let Some(gate) = self.0.take() {
-                let _ = gate.lock().unwrap().recv();
-            }
-        }
-    }
-
-    fn blocking() -> (Blocking, Sender<()>) {
-        let (release, gate) = channel();
-        (Blocking(Some(Mutex::new(gate))), release)
-    }
-
-    #[test]
-    fn resume_after_a_timed_out_stop_does_not_start_a_second_service() {
-        let (service, release) = blocking();
-        let slot = ServiceSlot::new(Some(service));
-        assert!(slot.stop(Duration::from_millis(20)).is_err());
-
-        let starts = Arc::new(Mutex::new(0));
-        let counter = Arc::clone(&starts);
-        let resumed = slot.resume(
-            move || {
-                *counter.lock().unwrap() += 1;
-                Some(Blocking(None))
-            },
-            |_| (),
-        );
-        assert!(resumed.is_none());
-        assert_eq!(*starts.lock().unwrap(), 0);
-        assert!(slot.stop(Duration::from_millis(20)).is_err());
-
-        // Once the old service is really gone, resuming starts a new one.
-        release.send(()).unwrap();
-        let mut resumed = None;
-        for _ in 0..200 {
-            let counter = Arc::clone(&starts);
-            resumed = slot.resume(
-                move || {
-                    *counter.lock().unwrap() += 1;
-                    Some(Blocking(None))
-                },
-                |_| (),
-            );
-            if resumed.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(resumed.is_some());
-        assert_eq!(*starts.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn resume_after_a_completed_stop_starts_the_service() {
-        let slot = ServiceSlot::new(Some(Blocking(None)));
-        assert!(slot.stop(Duration::from_secs(5)).is_ok());
-        let resumed = slot.resume(|| Some(Blocking(None)), |_| ());
-        assert!(resumed.is_some());
-    }
-}
-
 struct AppOwnedAiService(#[allow(dead_code, reason = "owns the service for the app lifetime")] Arc<AiOwner>);
 
 impl Global for AppOwnedAiService {}
@@ -776,4 +704,76 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod service_slot_tests {
+    use super::ServiceSlot;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Drop blocks until released, like a worker still finishing a runtime.
+    struct Blocking(Option<Mutex<Receiver<()>>>);
+
+    impl Drop for Blocking {
+        fn drop(&mut self) {
+            if let Some(gate) = self.0.take() {
+                let _ = gate.lock().unwrap().recv();
+            }
+        }
+    }
+
+    fn blocking() -> (Blocking, Sender<()>) {
+        let (release, gate) = channel();
+        (Blocking(Some(Mutex::new(gate))), release)
+    }
+
+    #[test]
+    fn resume_after_a_timed_out_stop_does_not_start_a_second_service() {
+        let (service, release) = blocking();
+        let slot = ServiceSlot::new(Some(service));
+        assert!(slot.stop(Duration::from_millis(20)).is_err());
+
+        let starts = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&starts);
+        let resumed = slot.resume(
+            move || {
+                *counter.lock().unwrap() += 1;
+                Some(Blocking(None))
+            },
+            |_| (),
+        );
+        assert!(resumed.is_none());
+        assert_eq!(*starts.lock().unwrap(), 0);
+        assert!(slot.stop(Duration::from_millis(20)).is_err());
+
+        // Once the old service is really gone, resuming starts a new one.
+        release.send(()).unwrap();
+        let mut resumed = None;
+        for _ in 0..200 {
+            let counter = Arc::clone(&starts);
+            resumed = slot.resume(
+                move || {
+                    *counter.lock().unwrap() += 1;
+                    Some(Blocking(None))
+                },
+                |_| (),
+            );
+            if resumed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(resumed.is_some());
+        assert_eq!(*starts.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn resume_after_a_completed_stop_starts_the_service() {
+        let slot = ServiceSlot::new(Some(Blocking(None)));
+        assert!(slot.stop(Duration::from_secs(5)).is_ok());
+        let resumed = slot.resume(|| Some(Blocking(None)), |_| ());
+        assert!(resumed.is_some());
+    }
 }
