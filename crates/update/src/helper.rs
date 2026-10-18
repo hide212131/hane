@@ -1022,6 +1022,9 @@ pub fn prepare_restart(
         }
     };
     cleanup.armed = false;
+    // The guard borrows `coordination` and `transaction`; end that borrow
+    // before they move into `PreparedRestart`.
+    drop(cleanup);
     Ok(PreparedRestart {
         spawned: Some(spawned),
         coordination,
