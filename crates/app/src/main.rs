@@ -44,53 +44,173 @@ const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、
 /// an update restart needs: the service must be gone before the helper may
 /// replace files, and must come back if the restart is given up.
 struct AiOwner {
-    service: std::sync::Mutex<Option<AiService>>,
+    service: ServiceSlot<AiService>,
 }
 
 impl AiOwner {
     fn new(service: Option<AiService>) -> Self {
         Self {
-            service: std::sync::Mutex::new(service),
+            service: ServiceSlot::new(service),
         }
     }
 
-    fn slot(&self) -> std::sync::MutexGuard<'_, Option<AiService>> {
+    fn handle(&self) -> Option<hane_ai::AiServiceHandle> {
+        self.service.slot().as_ref().map(AiService::handle)
+    }
+}
+
+/// The owned service plus whether a stop is still in flight. A stop that timed
+/// out keeps counting as in flight until the service is really gone, so a new
+/// service is never started next to a worker that may still hold the owner lock.
+struct ServiceSlot<S> {
+    service: std::sync::Mutex<Option<S>>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<S: Send + 'static> ServiceSlot<S> {
+    fn new(service: Option<S>) -> Self {
+        Self {
+            service: std::sync::Mutex::new(service),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<S>> {
         self.service
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn handle(&self) -> Option<hane_ai::AiServiceHandle> {
-        self.slot().as_ref().map(AiService::handle)
-    }
-}
-
-impl AiLifecycle for AiOwner {
     fn stop(&self, timeout: std::time::Duration) -> Result<(), String> {
-        let Some(service) = self.slot().take() else {
+        use std::sync::atomic::Ordering;
+        let mut slot = self.slot();
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err("the AI service is still stopping".to_owned());
+        }
+        let Some(service) = slot.take() else {
             return Ok(());
         };
+        self.stopping.store(true, Ordering::SeqCst);
+        drop(slot);
         // Dropping the service joins its worker, which may wait for a running
         // runtime; do it on its own thread so the wait is bounded.
         let (done, finished) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
+        let stopping = Arc::clone(&self.stopping);
+        let spawned = std::thread::Builder::new()
             .name("hane-ai-stop".to_owned())
             .spawn(move || {
                 drop(service);
+                stopping.store(false, Ordering::SeqCst);
                 let _ = done.send(());
-            })
-            .map_err(|err| err.to_string())?;
+            });
+        if let Err(err) = spawned {
+            // The closure (and the service) was dropped by the failed spawn.
+            self.stopping.store(false, Ordering::SeqCst);
+            return Err(err.to_string());
+        }
         finished
             .recv_timeout(timeout)
             .map_err(|_| "the AI service did not stop in time".to_owned())
     }
 
-    fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+    /// Starts a service only when none exists and no stop is in flight; an
+    /// unfinished stop leaves the AI unavailable instead of starting a second one.
+    fn resume<H>(
+        &self,
+        start: impl FnOnce() -> Option<S>,
+        handle: impl Fn(&S) -> H,
+    ) -> Option<H> {
+        use std::sync::atomic::Ordering;
         let mut slot = self.slot();
-        if slot.is_none() {
-            *slot = start_ai_service();
+        if self.stopping.load(Ordering::SeqCst) {
+            return None;
         }
-        slot.as_ref().map(AiService::handle)
+        if slot.is_none() {
+            *slot = start();
+        }
+        slot.as_ref().map(handle)
+    }
+}
+
+impl AiLifecycle for AiOwner {
+    fn stop(&self, timeout: std::time::Duration) -> Result<(), String> {
+        self.service.stop(timeout)
+    }
+
+    fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+        self.service.resume(start_ai_service, AiService::handle)
+    }
+}
+
+#[cfg(test)]
+mod service_slot_tests {
+    use super::ServiceSlot;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Drop blocks until released, like a worker still finishing a runtime.
+    struct Blocking(Option<Mutex<Receiver<()>>>);
+
+    impl Drop for Blocking {
+        fn drop(&mut self) {
+            if let Some(gate) = self.0.take() {
+                let _ = gate.lock().unwrap().recv();
+            }
+        }
+    }
+
+    fn blocking() -> (Blocking, Sender<()>) {
+        let (release, gate) = channel();
+        (Blocking(Some(Mutex::new(gate))), release)
+    }
+
+    #[test]
+    fn resume_after_a_timed_out_stop_does_not_start_a_second_service() {
+        let (service, release) = blocking();
+        let slot = ServiceSlot::new(Some(service));
+        assert!(slot.stop(Duration::from_millis(20)).is_err());
+
+        let starts = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&starts);
+        let resumed = slot.resume(
+            move || {
+                *counter.lock().unwrap() += 1;
+                Some(Blocking(None))
+            },
+            |_| (),
+        );
+        assert!(resumed.is_none());
+        assert_eq!(*starts.lock().unwrap(), 0);
+        assert!(slot.stop(Duration::from_millis(20)).is_err());
+
+        // Once the old service is really gone, resuming starts a new one.
+        release.send(()).unwrap();
+        let mut resumed = None;
+        for _ in 0..200 {
+            let counter = Arc::clone(&starts);
+            resumed = slot.resume(
+                move || {
+                    *counter.lock().unwrap() += 1;
+                    Some(Blocking(None))
+                },
+                |_| (),
+            );
+            if resumed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(resumed.is_some());
+        assert_eq!(*starts.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn resume_after_a_completed_stop_starts_the_service() {
+        let slot = ServiceSlot::new(Some(Blocking(None)));
+        assert!(slot.stop(Duration::from_secs(5)).is_ok());
+        let resumed = slot.resume(|| Some(Blocking(None)), |_| ());
+        assert!(resumed.is_some());
     }
 }
 
