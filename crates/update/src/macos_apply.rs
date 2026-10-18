@@ -195,7 +195,16 @@ impl RelocationMark {
 /// install it was swapped into is consulted directly: anything but a definite
 /// "no journal" or a terminal one stops, so a moved bundle can never bypass a
 /// pending transaction. Unverifiable state is an error (fail closed).
-pub fn check_relocation(mark: Option<&[u8]>, current: &InstallId) -> Result<()> {
+///
+/// The parent directory may have moved together with the bundle, so the
+/// recorded coordination parent can be gone. The transaction bound by the mark
+/// is then looked up under `current_parent`; if it cannot be found and verified
+/// in either place the start is refused, never treated as "no journal".
+pub fn check_relocation(
+    mark: Option<&[u8]>,
+    current: &InstallId,
+    current_parent: &Path,
+) -> Result<()> {
     let Some(bytes) = mark else {
         return Ok(());
     };
@@ -212,16 +221,28 @@ pub fn check_relocation(mark: Option<&[u8]>, current: &InstallId) -> Result<()> 
             err
         }
     };
-    let Some(coordination) =
-        Coordination::open_existing(&mark.coordination_parent, &mark.install_id).map_err(stop)?
-    else {
-        return Ok(());
+    let unverifiable = || {
+        UpdateError::new(
+            ErrorCode::InstallModified,
+            "the journal of the transaction bound to the relocation mark cannot be found",
+        )
     };
-    let Some(journal) = FileJournalStore::new(coordination.journal_path(&mark.transaction))
-        .load()
-        .map_err(stop)?
-    else {
-        return Ok(());
+    let mut journal = None;
+    for parent in [mark.coordination_parent.as_path(), current_parent] {
+        let Some(coordination) =
+            Coordination::open_existing(parent, &mark.install_id).map_err(stop)?
+        else {
+            continue;
+        };
+        journal = FileJournalStore::new(coordination.journal_path(&mark.transaction))
+            .load()
+            .map_err(stop)?;
+        if journal.is_some() {
+            break;
+        }
+    }
+    let Some(journal) = journal else {
+        return Err(unverifiable());
     };
     if journal.transaction_id != mark.transaction || journal.install_id != mark.install_id {
         return Err(UpdateError::new(
@@ -1834,13 +1855,67 @@ mod tests {
         let mark = fx.host.bundle_mark(&moved).unwrap();
         assert!(mark.is_some(), "the mark follows the bundle directory");
         assert_ne!(&moved_install_id(), fx.coordination.install_id());
-        let err = check_relocation(mark.as_deref(), &moved_install_id()).unwrap_err();
+        let parent = fx.placement.coordination_parent.clone();
+        let err = check_relocation(mark.as_deref(), &moved_install_id(), &parent).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified, "the moved bundle must stop");
         // At the original location the ordinary gate handles the same journal.
-        check_relocation(mark.as_deref(), fx.coordination.install_id()).unwrap();
+        check_relocation(mark.as_deref(), fx.coordination.install_id(), &parent).unwrap();
         // An unreadable mark is never ignored.
-        let err = check_relocation(Some(b"garbage"), &moved_install_id()).unwrap_err();
+        let err = check_relocation(Some(b"garbage"), &moved_install_id(), &parent).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    /// The parent directory moves together with the bundle, so the coordination
+    /// parent recorded in the mark is gone. The transaction is found under the
+    /// current parent: pending stops, a terminal state starts, and a missing
+    /// journal fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn a_relocated_parent_cannot_bypass_the_pending_journal() {
+        let fx = fixture();
+        let live = fx.live().to_path_buf();
+        let moved = live.with_file_name("Moved.app");
+        let (hook_live, hook_moved) = (live.clone(), moved.clone());
+        *fx.host.after_swap.borrow_mut() =
+            Some(Box::new(move || fs::rename(&hook_live, &hook_moved).unwrap()));
+        apply_bundle(&fx.inputs()).err().expect("the move is detected");
+        assert_eq!(fx.stored().phase, Phase::RecoveryRequired);
+
+        let current_parent = fx.placement.coordination_parent.clone();
+        let old_parent = current_parent.join("old-parent-that-no-longer-exists");
+        let mark = RelocationMark {
+            install_id: fx.coordination.install_id().clone(),
+            transaction: fx.transaction.clone(),
+            coordination_parent: old_parent.clone(),
+        }
+        .encode()
+        .unwrap();
+        assert!(!old_parent.exists());
+
+        let err = check_relocation(Some(&mark), &moved_install_id(), &current_parent).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified, "the pending journal must stop it");
+
+        // Nothing verifiable anywhere: refuse instead of treating it as safe.
+        let empty = TempDir::new("relocation-empty");
+        let err = check_relocation(Some(&mark), &moved_install_id(), empty.path()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relocated_parent_with_a_terminal_journal_starts_normally() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+        let current_parent = fx.placement.coordination_parent.clone();
+        let mark = RelocationMark {
+            install_id: fx.coordination.install_id().clone(),
+            transaction: fx.transaction.clone(),
+            coordination_parent: current_parent.join("old-parent-that-no-longer-exists"),
+        }
+        .encode()
+        .unwrap();
+        check_relocation(Some(&mark), &moved_install_id(), &current_parent).unwrap();
     }
 
     #[cfg(unix)]
@@ -1860,8 +1935,9 @@ mod tests {
         let bytes = mark.encode().unwrap();
         assert_eq!(RelocationMark::parse(&bytes).unwrap(), mark);
         // A leftover mark of a Committed transaction lets a moved bundle start.
-        check_relocation(Some(&bytes), &moved_install_id()).unwrap();
-        check_relocation(None, &moved_install_id()).unwrap();
+        let parent = fx.placement.coordination_parent.clone();
+        check_relocation(Some(&bytes), &moved_install_id(), &parent).unwrap();
+        check_relocation(None, &moved_install_id(), &parent).unwrap();
     }
 
     /// The mark sits on the candidate directory, so after the exchange it is the

@@ -247,7 +247,11 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     // If it was moved, `install_id` differs and the pending transaction of the
     // original location is consulted; unverifiable or pending stops (this is
     // `InstallModified`/`Io`, never `UnsupportedInstall`, so it is not unmanaged).
-    crate::macos_apply::check_relocation(read_mark(bundle)?.as_deref(), &install_id)?;
+    crate::macos_apply::check_relocation(
+        read_mark(bundle)?.as_deref(),
+        &install_id,
+        &coordination_parent,
+    )?;
     Ok(Placement {
         target: Target::MacosArm64,
         install_root: bundle.to_path_buf(),
