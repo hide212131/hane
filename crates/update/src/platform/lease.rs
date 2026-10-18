@@ -237,6 +237,26 @@ impl Coordination {
         self.transaction_dir(transaction).join(JOURNAL_FILE)
     }
 
+    /// Removes the transaction directory of `transaction` when it is certain
+    /// that no journal was ever written for it. The chain from the root to the
+    /// directory must be plain, owned and closed to other writers; anything
+    /// that cannot be verified, or any trace of a journal (even an unreadable
+    /// one), leaves the directory untouched. Returns whether it was removed.
+    pub fn remove_unjournaled_transaction(&self, transaction: &TransactionId) -> Result<bool> {
+        let private = self.dir.join(PRIVATE_DIR);
+        let txn_dir = self.transaction_dir(transaction);
+        for checked in [&self.dir, &private, &txn_dir] {
+            require_plain_dir(checked)?;
+        }
+        match fs::symlink_metadata(self.journal_path(transaction)) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            _ => return Ok(false),
+        }
+        // `remove_dir_all` unlinks links inside instead of following them.
+        fs::remove_dir_all(&txn_dir)?;
+        Ok(true)
+    }
+
     fn open_lock(&self, kind: LeaseKind) -> Result<File> {
         let path = self.dir.join(kind.file_name());
         // The root is re-checked so a directory swapped after `create` is not trusted.
@@ -357,6 +377,59 @@ mod tests {
         assert!(second.try_acquire(LeaseKind::Transaction, &[]).unwrap().is_none());
         held.release();
         assert!(second.try_acquire(LeaseKind::Transaction, &[]).unwrap().is_some());
+    }
+
+    fn staged(coord: &Coordination) -> TransactionId {
+        let transaction = TransactionId::generate().unwrap();
+        let helper = coord.ensure_helper_dir(&transaction).unwrap();
+        fs::write(helper.join("staged.bin"), b"staged data").unwrap();
+        fs::write(coord.transaction_dir(&transaction).join("candidate.bin"), b"candidate").unwrap();
+        transaction
+    }
+
+    #[test]
+    fn an_unjournaled_transaction_is_removed_with_its_staged_data_only() {
+        let dir = TempDir::new("lease-unjournaled");
+        let coord = coordination(&dir);
+        let aborted = staged(&coord);
+        let other = staged(&coord);
+        assert!(coord.remove_unjournaled_transaction(&aborted).unwrap());
+        assert!(!coord.transaction_dir(&aborted).exists());
+        assert!(coord.transaction_dir(&other).join(HELPER_DIR).join("staged.bin").exists());
+        assert!(coord.private_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn a_transaction_with_any_journal_trace_is_kept() {
+        let dir = TempDir::new("lease-journaled");
+        let coord = coordination(&dir);
+        let journaled = staged(&coord);
+        fs::write(coord.journal_path(&journaled), b"{ not a journal").unwrap();
+        assert!(!coord.remove_unjournaled_transaction(&journaled).unwrap());
+        assert!(coord.journal_path(&journaled).exists());
+        assert!(coord.transaction_dir(&journaled).join(HELPER_DIR).join("staged.bin").exists());
+        // A journal path that is not a plain file is ambiguous and kept too.
+        let odd = staged(&coord);
+        fs::create_dir(coord.journal_path(&odd)).unwrap();
+        assert!(!coord.remove_unjournaled_transaction(&odd).unwrap());
+        assert!(coord.transaction_dir(&odd).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unverifiable_transaction_directory_is_never_followed() {
+        let dir = TempDir::new("lease-symlink");
+        let coord = coordination(&dir);
+        let target = TempDir::new("lease-symlink-target");
+        fs::write(target.path().join("keep.txt"), b"keep").unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        coord.private_dir().unwrap();
+        std::os::unix::fs::symlink(target.path(), coord.transaction_dir(&transaction)).unwrap();
+        assert!(coord.remove_unjournaled_transaction(&transaction).is_err());
+        assert!(target.path().join("keep.txt").exists());
+        // A transaction that was never staged is simply not there to remove.
+        let missing = TransactionId::generate().unwrap();
+        assert!(coord.remove_unjournaled_transaction(&missing).is_err());
     }
 
     #[test]

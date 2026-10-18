@@ -873,7 +873,14 @@ pub fn spawn_helper(exe: &Path, request: &HelloRequest, timeout: Duration) -> Re
 /// Dropping it without [`PreparedRestart::authorize_exit`] aborts the helper.
 pub struct PreparedRestart {
     spawned: Option<SpawnedHelper>,
+    coordination: Coordination,
     transaction: TransactionId,
+}
+
+/// Removes the staged files of a transaction whose helper has exited without
+/// ever writing a journal. Best effort: whatever cannot be verified stays.
+fn discard_unstarted_transaction(coordination: &Coordination, transaction: &TransactionId) {
+    let _ = coordination.remove_unjournaled_transaction(transaction);
 }
 
 impl PreparedRestart {
@@ -905,7 +912,11 @@ impl PreparedRestart {
     fn abort_in_place(&mut self) {
         if let Some(mut spawned) = self.spawned.take() {
             spawned.link.abort();
-            let _ = spawned.child.wait();
+            // Only a confirmed exit allows the cleanup; a helper that may
+            // still be running keeps its transaction directory.
+            if spawned.child.wait().is_ok() {
+                discard_unstarted_transaction(&self.coordination, &self.transaction);
+            }
         }
     }
 }
@@ -954,6 +965,7 @@ pub fn prepare_restart(
     .inspect_err(|_| crate::state_root::discard_binding(&coordination, &transaction))?;
     Ok(PreparedRestart {
         spawned: Some(spawned),
+        coordination,
         transaction,
     })
 }
