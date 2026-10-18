@@ -2002,7 +2002,14 @@ impl EditorView {
 
                 self.content_search_workspace_changed(cx);
 
-                if let Some(path) = first {
+                if self.latest_open_target.is_some() {
+                    // A document was requested (e.g. delivered by Finder at
+                    // launch) while this scan was running. That request owns
+                    // the initial session, so the folder's first entry must
+                    // not replace it; the folder stays available in the
+                    // sidebar and recovered drafts stay in their own tabs.
+                    self.activate_session(initial_session, cx);
+                } else if let Some(path) = first {
                     // Opening the first entry replaces whichever session is
                     // active through the same background-loading path as any
                     // other open, instead of leaving a spare empty session
@@ -13759,6 +13766,100 @@ mod tests {
                 "expected the recovery warning to survive the first note's open completing, got {:?}",
                 view.draft_recovery_warning
             );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression test for Issue #499: a Finder open request that reaches the
+    // view before the launch-time work folder scan finishes must stay the
+    // active document instead of being replaced by the folder's first note.
+    #[gpui::test]
+    fn a_finder_open_before_the_work_folder_scan_finishes_stays_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("finder-before-scan");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("2026-10-08_aaaa.md"), "# Folder first\n").unwrap();
+        let finder_dir = draft_test_root("finder-before-scan-external");
+        std::fs::create_dir_all(&finder_dir).unwrap();
+        let finder_file = finder_dir.join("cold-start.md");
+        std::fs::write(&finder_file, "# Cold start\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        assert_eq!(work_folder.entries().len(), 1);
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            // Finder's request arrives first, then the scan completes.
+            view.open_external_path(&finder_file, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            view.finish_work_folder_scan(
+                generation,
+                (
+                    Ok(work_folder),
+                    Ok(RecoveredDrafts::default()),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# Cold start\n");
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&finder_dir).unwrap();
+    }
+
+    // Without a Finder request, the first note of the saved work folder is
+    // still opened as before.
+    #[gpui::test]
+    fn the_work_folder_scan_opens_its_first_note_without_a_finder_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("scan-without-finder");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("2026-10-08_aaaa.md"), "# Folder first\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            view.finish_work_folder_scan(
+                generation,
+                (
+                    Ok(work_folder),
+                    Ok(RecoveredDrafts::default()),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# Folder first\n");
         });
 
         std::fs::remove_dir_all(&root).unwrap();
