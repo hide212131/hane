@@ -45,6 +45,125 @@ pub(crate) fn principal_id() -> Result<String> {
     imp::principal_id()
 }
 
+/// Access to the extended (non-POSIX) ACL of a path, without following links.
+/// Any `Err` means the ACL could not be determined or changed.
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    allow(dead_code, reason = "only macOS inherits extended ACLs from the parent")
+)]
+trait ExtendedAcl {
+    /// Whether the path carries any extended ACL entry list.
+    fn present(&self, path: &Path) -> Result<bool>;
+    /// Removes the extended ACL from the path.
+    fn clear(&self, path: &Path) -> Result<()>;
+}
+
+/// Removes an inherited extended ACL from a path just created and proves it
+/// is gone. Any failure, or a remaining ACL, is a refusal.
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    allow(dead_code, reason = "only macOS inherits extended ACLs from the parent")
+)]
+fn strip_extended_acl(ops: &dyn ExtendedAcl, path: &Path) -> Result<()> {
+    if ops.present(path)? {
+        ops.clear(path)?;
+        if ops.present(path)? {
+            return Err(refuse(format!(
+                "an extended ACL on {} could not be removed",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses an existing entry that carries any extended ACL.
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    allow(dead_code, reason = "only macOS inherits extended ACLs from the parent")
+)]
+fn require_no_extended_acl(ops: &dyn ExtendedAcl, path: &Path) -> Result<()> {
+    if ops.present(path)? {
+        return Err(refuse(format!(
+            "{} has an extended ACL that grants access to other principals",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+mod macos_acl {
+    use std::ffi::{CString, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    use super::{ExtendedAcl, refuse};
+    use crate::error::Result;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_link_np(path: *const libc::c_char, acl_type: c_int) -> *mut c_void;
+        fn acl_set_link_np(path: *const libc::c_char, acl_type: c_int, acl: *mut c_void) -> c_int;
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+
+    pub struct System;
+
+    fn c_path(path: &Path) -> Result<CString> {
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| refuse(format!("{} is not a valid path", path.display())))
+    }
+
+    impl ExtendedAcl for System {
+        fn present(&self, path: &Path) -> Result<bool> {
+            let name = c_path(path)?;
+            // SAFETY: `name` is NUL-terminated; the returned ACL is freed below.
+            let acl = unsafe { acl_get_link_np(name.as_ptr(), ACL_TYPE_EXTENDED) };
+            if acl.is_null() {
+                // ENOENT from this call means "no extended ACL"; anything else
+                // (unsupported volume, permission, ...) is undeterminable.
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(false);
+                }
+                return Err(refuse(format!(
+                    "the extended ACL of {} could not be read: {err}",
+                    path.display()
+                )));
+            }
+            // SAFETY: `acl` came from `acl_get_link_np` and is freed once.
+            unsafe { acl_free(acl) };
+            Ok(true)
+        }
+
+        fn clear(&self, path: &Path) -> Result<()> {
+            let name = c_path(path)?;
+            // SAFETY: an empty ACL is allocated, applied and freed once.
+            let rc = unsafe {
+                let empty = acl_init(0);
+                if empty.is_null() {
+                    -1
+                } else {
+                    let rc = acl_set_link_np(name.as_ptr(), ACL_TYPE_EXTENDED, empty);
+                    acl_free(empty);
+                    rc
+                }
+            };
+            if rc != 0 {
+                return Err(refuse(format!(
+                    "the extended ACL of {} could not be removed: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use std::fs;
@@ -54,6 +173,26 @@ mod imp {
     use super::refuse;
     use crate::error::Result;
 
+    #[cfg(target_os = "macos")]
+    fn strip_acl(path: &Path) -> Result<()> {
+        super::strip_extended_acl(&super::macos_acl::System, path)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn strip_acl(_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn require_no_acl(path: &Path) -> Result<()> {
+        super::require_no_extended_acl(&super::macos_acl::System, path)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn require_no_acl(_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
     pub fn principal_id() -> Result<String> {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
@@ -61,6 +200,7 @@ mod imp {
     }
 
     pub fn secure_new(path: &Path, _is_dir: bool, mode: u32) -> Result<()> {
+        strip_acl(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
         Ok(())
     }
@@ -85,6 +225,7 @@ mod imp {
                 path.display()
             )));
         }
+        require_no_acl(path)?;
         Ok(())
     }
 }
@@ -369,5 +510,101 @@ mod imp {
 
     pub fn verify(_path: &Path, _is_dir: bool) -> Result<()> {
         Err(refuse("ownership cannot be checked on this OS"))
+    }
+}
+
+// The fake below exercises the fail-closed logic on every OS. Real inherited
+// ACLs (`acl_get_link_np` / `acl_set_link_np`) can only be exercised on a
+// physical macOS host, e.g. `chmod +a "everyone allow write,file_inherit,
+// directory_inherit"` on the parent before creating the tree.
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    use super::{ExtendedAcl, require_no_extended_acl, strip_extended_acl};
+    use crate::error::{Result, UpdateError};
+
+    struct Fake {
+        present: Cell<bool>,
+        sticky: bool,
+        fail_present: bool,
+        fail_clear: bool,
+    }
+
+    impl Fake {
+        fn new(present: bool) -> Self {
+            Self {
+                present: Cell::new(present),
+                sticky: false,
+                fail_present: false,
+                fail_clear: false,
+            }
+        }
+    }
+
+    impl ExtendedAcl for Fake {
+        fn present(&self, _path: &Path) -> Result<bool> {
+            if self.fail_present {
+                return Err(super::refuse("query failed"));
+            }
+            Ok(self.present.get())
+        }
+
+        fn clear(&self, _path: &Path) -> Result<()> {
+            if self.fail_clear {
+                return Err(super::refuse("clear failed"));
+            }
+            if !self.sticky {
+                self.present.set(false);
+            }
+            Ok(())
+        }
+    }
+
+    fn is_refusal<T>(result: Result<T>) -> bool {
+        matches!(result, Err(UpdateError { .. }))
+    }
+
+    #[test]
+    fn inherited_acl_is_removed_from_new_entry() {
+        let fake = Fake::new(true);
+        strip_extended_acl(&fake, Path::new("x")).unwrap();
+        assert!(!fake.present.get());
+    }
+
+    #[test]
+    fn new_entry_without_acl_is_accepted() {
+        strip_extended_acl(&Fake::new(false), Path::new("x")).unwrap();
+    }
+
+    #[test]
+    fn new_entry_fails_closed_when_acl_remains() {
+        let mut fake = Fake::new(true);
+        fake.sticky = true;
+        assert!(is_refusal(strip_extended_acl(&fake, Path::new("x"))));
+    }
+
+    #[test]
+    fn new_entry_fails_closed_on_acl_errors() {
+        let mut query = Fake::new(true);
+        query.fail_present = true;
+        assert!(is_refusal(strip_extended_acl(&query, Path::new("x"))));
+        let mut clear = Fake::new(true);
+        clear.fail_clear = true;
+        assert!(is_refusal(strip_extended_acl(&clear, Path::new("x"))));
+    }
+
+    #[test]
+    fn existing_entry_with_acl_is_refused() {
+        assert!(is_refusal(require_no_extended_acl(&Fake::new(true), Path::new("x"))));
+        require_no_extended_acl(&Fake::new(false), Path::new("x")).unwrap();
+    }
+
+    #[test]
+    fn existing_entry_fails_closed_when_acl_is_undeterminable() {
+        let mut fake = Fake::new(false);
+        fake.fail_present = true;
+        assert!(is_refusal(require_no_extended_acl(&fake, Path::new("x"))));
     }
 }
