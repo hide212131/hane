@@ -171,8 +171,9 @@ const MAX_ENV_VALUE_BYTES: usize = 1024;
 
 /// The only variables that may reach the limited child. They are what a normal
 /// Hane start needs to find the same user profile (settings, AI configuration,
-/// the named pipe derived from `LOCALAPPDATA`). Loader and search-path variables
-/// (`LD_PRELOAD`, `DYLD_*`, `PATH`, ...) are deliberately absent.
+/// the named pipe derived from `LOCALAPPDATA`) and the Windows execution
+/// environment the AI runtime passes to its commands. Loader variables
+/// (`LD_PRELOAD`, `DYLD_*`, ...) are deliberately absent.
 pub const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "HOME",
     "USER",
@@ -196,6 +197,13 @@ pub const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "HOMEPATH",
     "TEMP",
     "TMP",
+    // Command execution environment the normal AI runtime allows, so the AI
+    // tools of the first editor after an update can resolve and run commands.
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "WINDIR",
+    "PROCESSOR_ARCHITECTURE",
     // Connectivity and certificate settings the AI runtime passes to its own
     // child, so the limited child reaches the same network as a normal start.
     "ALL_PROXY",
@@ -841,7 +849,7 @@ mod tests {
 
         // A loader variable is never accepted, even if it is written by hand.
         let install = install_id();
-        for name in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HANE_COMMAND"] {
+        for name in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "HANE_COMMAND"] {
             let doc = serde_json::json!({
                 "schema": 1,
                 "install_id": install.as_str(),
@@ -882,7 +890,7 @@ mod tests {
             ("SSL_CERT_DIR", "/etc/ssl/certs"),
             ("SSL_CERT_FILE", "/etc/ssl/ca.pem"),
         ];
-        let forbidden = ["PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "CODEX_HOME", "HANE_COMMAND"];
+        let forbidden = ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "CODEX_HOME", "HANE_COMMAND"];
         let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = network
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into()))
@@ -910,7 +918,7 @@ mod tests {
             ("no_proxy", "localhost"),
             ("Ssl_Cert_File", "/etc/ssl/ca.pem"),
         ];
-        let dropped = ["path", "ld_preload", "dyld_insert_libraries", "Path"];
+        let dropped = ["ld_preload", "dyld_insert_libraries"];
         let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = kept
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into()))
@@ -925,6 +933,36 @@ mod tests {
             );
         }
         assert_eq!(vars.len(), kept.len());
+    }
+
+    #[test]
+    fn windows_execution_variables_reach_the_child_and_unlisted_ones_do_not() {
+        let fx = fixture();
+        let execution = [
+            ("Path", "C:\\Windows\\System32;C:\\Tools"),
+            ("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+            ("ComSpec", "C:\\Windows\\System32\\cmd.exe"),
+            ("WINDIR", "C:\\Windows"),
+            ("PROCESSOR_ARCHITECTURE", "AMD64"),
+        ];
+        let unlisted = ["CODEX_HOME", "OPENAI_API_KEY", "PSModulePath"];
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = execution
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .chain(unlisted.iter().map(|key| ((*key).into(), "secret".into())))
+            .collect();
+        publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        for (name, value) in execution {
+            assert!(
+                vars.contains(&(name.to_owned(), value.to_owned())),
+                "{name} must reach the limited child"
+            );
+        }
+        for name in unlisted {
+            assert!(vars.iter().all(|(key, _)| key != name), "{name} must stay out");
+        }
+        assert_eq!(vars.len(), execution.len());
     }
 
     #[cfg(unix)]
