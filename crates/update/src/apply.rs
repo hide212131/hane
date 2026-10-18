@@ -1292,12 +1292,14 @@ mod tests {
         assert_eq!(journal.journal().phase, Phase::AwaitingHealth);
     }
 
+    #[cfg(windows)]
     struct RaceFixture {
         _dir: TempDir,
         root: std::path::PathBuf,
         ops: FsFileOps,
     }
 
+    #[cfg(windows)]
     fn race_fixture() -> RaceFixture {
         let dir = TempDir::new("apply-race");
         let root = dir.path().join("install");
