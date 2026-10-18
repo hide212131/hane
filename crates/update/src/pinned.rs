@@ -10,7 +10,7 @@
 //! never constructed.
 
 #[cfg(windows)]
-pub(crate) use imp::{PinnedDir, PinnedFile, flush_dir};
+pub(crate) use imp::{PinnedDir, PinnedFile, move_write_through};
 
 #[cfg(not(windows))]
 #[allow(dead_code, reason = "only the Windows adapter constructs a pin")]
@@ -75,27 +75,28 @@ mod imp {
         }
     }
 
-    /// Durability barrier for a directory's namespace: flushes the directory
-    /// itself (`FlushFileBuffers` on a write-access directory handle), so link,
-    /// rename and delete entries made in it before the call survive a power
-    /// loss. The directory is opened without following a reparse point and
-    /// must be a real directory.
-    pub(crate) fn flush_dir(path: &Path) -> io::Result<()> {
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-        let dir = OpenOptions::new()
-            .access_mode(GENERIC_READ | GENERIC_WRITE)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        let meta = dir.metadata()?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_dir() {
-            return Err(io::Error::other(format!(
-                "{} is not a regular directory",
-                path.display()
-            )));
+    /// Durable no-replace move on one volume: `MoveFileExW` with
+    /// `MOVEFILE_WRITE_THROUGH`, which does not return until the move has been
+    /// written to disk. Without `MOVEFILE_REPLACE_EXISTING` it fails when `to`
+    /// exists, and without `MOVEFILE_COPY_ALLOWED` it never degrades to a
+    /// copy. Windows documents no flush for a directory handle (opening one
+    /// for write is refused), so namespace changes are made durable by
+    /// performing them through this call.
+    #[allow(unsafe_code, reason = "MoveFileExW through windows-sys")]
+    pub(crate) fn move_write_through(from: &Path, to: &Path) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+        let wide = |path: &Path| -> Vec<u16> {
+            path.as_os_str().encode_wide().chain(Some(0)).collect()
+        };
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: both buffers are NUL-terminated and live past the call.
+        let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
-        dir.sync_all()
     }
 
     /// An install file whose identity was verified through this very handle.
@@ -153,11 +154,6 @@ mod imp {
             rename_by_handle(self, dest)
         }
 
-        /// Marks the file behind the handle for deletion; it disappears when
-        /// the handle is dropped.
-        pub(crate) fn delete(&self) -> io::Result<()> {
-            delete_by_handle(self)
-        }
     }
 
     #[allow(unsafe_code, reason = "SetFileInformationByHandle through windows-sys")]
@@ -186,29 +182,6 @@ mod imp {
                 FileRenameInfo,
                 base.cast_const().cast(),
                 (buffer.len() * 8) as u32,
-            )
-        };
-        if ok == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    #[allow(unsafe_code, reason = "SetFileInformationByHandle through windows-sys")]
-    fn delete_by_handle(pin: &PinnedFile) -> io::Result<()> {
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-        };
-
-        let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
-        // SAFETY: `info` is a valid FILE_DISPOSITION_INFO for the whole call.
-        let ok = unsafe {
-            SetFileInformationByHandle(
-                pin.file.as_raw_handle().cast(),
-                FileDispositionInfo,
-                (&raw const info).cast(),
-                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
             )
         };
         if ok == 0 {

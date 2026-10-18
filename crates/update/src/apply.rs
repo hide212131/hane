@@ -563,14 +563,19 @@ impl FsFileOps {
             let pin = match PinnedDir::open(&path)? {
                 Some(pin) => pin,
                 None if create => {
-                    match std::fs::create_dir(&path) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                        Err(err) => return Err(err.into()),
-                    }
                     // The new directory entry must be durable before a file
-                    // is placed beneath it.
-                    namespace_barrier(parent_of(&path)?)?;
+                    // is placed beneath it: it is created under a scratch
+                    // name and moved into place with a no-replace
+                    // write-through move.
+                    let scratch = make_scratch_dir(parent_of(&path)?)?;
+                    if let Err(err) = durable_move(&scratch, &path) {
+                        let _ = std::fs::remove_dir(&scratch);
+                        // Someone else created it meanwhile: it is verified
+                        // by the pin below. Anything else is a failure.
+                        if !path.exists() {
+                            return Err(err);
+                        }
+                    }
                     PinnedDir::open(&path)?.ok_or_else(|| {
                         UpdateError::new(
                             ErrorCode::InstallModified,
@@ -639,17 +644,8 @@ fn install_write(path: &Path, bytes: &[u8], pin: Option<PinnedFile>) -> Result<(
     let name = path.file_name().ok_or_else(|| {
         UpdateError::new(ErrorCode::Io, "install path has no file name")
     })?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = INSTALL_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let scratch = parent.join(format!(
-        ".hane-update-{}-{nanos:x}-{seq}",
-        std::process::id()
-    ));
     // `create_dir` fails when anything already has that name; nothing is reused.
-    std::fs::create_dir(&scratch)?;
+    let scratch = make_scratch_dir(parent)?;
     let temp = scratch.join(name);
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
@@ -692,21 +688,44 @@ fn parent_of(path: &Path) -> Result<&Path> {
         .ok_or_else(|| UpdateError::new(ErrorCode::Io, "install path has no parent directory"))
 }
 
-/// Windows: makes the namespace changes made in `dir` durable. A failure is an
-/// error, so the caller neither advances the journal nor reports success.
+/// Windows: a no-replace move that is on disk when it returns
+/// (`MOVEFILE_WRITE_THROUGH`). Windows has no supported directory flush, so
+/// every install-path namespace change is made durable through this call. A
+/// failure is an error, so the caller neither advances the journal nor reports
+/// success.
 #[cfg(windows)]
-fn namespace_barrier(dir: &Path) -> Result<()> {
+fn durable_move(from: &Path, to: &Path) -> Result<()> {
     #[cfg(test)]
-    barrier_probe::reached(dir)?;
-    crate::pinned::flush_dir(dir).map_err(|err| {
+    barrier_probe::reached(from, to)?;
+    crate::pinned::move_write_through(from, to).map_err(|err| {
         UpdateError::new(
             ErrorCode::Io,
-            format!("{} could not be flushed to disk: {err}", dir.display()),
+            format!(
+                "{} could not be moved to {} durably: {err}",
+                from.display(),
+                to.display()
+            ),
         )
     })
 }
 
-/// Test seam: records every barrier and can make it fail.
+/// Creates a uniquely named scratch directory in `parent` (same volume);
+/// fails when anything already has that name.
+fn make_scratch_dir(parent: &Path) -> Result<std::path::PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = INSTALL_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = parent.join(format!(
+        ".hane-update-{}-{nanos:x}-{seq}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&scratch)?;
+    Ok(scratch)
+}
+
+/// Test seam: records every durable move (before it runs) and can make it fail.
 #[cfg(all(windows, test))]
 mod barrier_probe {
     use std::cell::{Cell, RefCell};
@@ -715,12 +734,12 @@ mod barrier_probe {
     use crate::error::{ErrorCode, Result, UpdateError};
 
     thread_local! {
-        pub(super) static LOG: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        pub(super) static LOG: RefCell<Vec<(PathBuf, PathBuf)>> = const { RefCell::new(Vec::new()) };
         pub(super) static FAIL: Cell<bool> = const { Cell::new(false) };
     }
 
-    pub(super) fn reached(dir: &Path) -> Result<()> {
-        LOG.with(|log| log.borrow_mut().push(dir.to_path_buf()));
+    pub(super) fn reached(from: &Path, to: &Path) -> Result<()> {
+        LOG.with(|log| log.borrow_mut().push((from.to_path_buf(), to.to_path_buf())));
         if FAIL.with(Cell::get) {
             return Err(UpdateError::new(ErrorCode::Io, "injected barrier failure"));
         }
@@ -729,9 +748,10 @@ mod barrier_probe {
 }
 
 /// Windows: the verified file is moved aside through its own handle (no other
-/// process could rename or replace it meanwhile), then the new file is linked
-/// into the now-free name, which fails rather than overwrite anything that
-/// appeared. On failure the verified file is moved back without replacing.
+/// process could rename or replace it meanwhile), then the new file is moved
+/// into the now-free name with a write-through, no-replace move, which fails
+/// rather than overwrite anything that appeared. On failure the verified file
+/// is moved back without replacing.
 /// Whatever stays unresolved is left in the scratch directory, never deleted.
 #[cfg(windows)]
 fn place(
@@ -747,9 +767,9 @@ fn place(
             aside_name.push(".aside");
             let aside = scratch.join(aside_name);
             pin.rename_to(&aside)?;
-            if let Err(err) = std::fs::hard_link(temp, path) {
+            if let Err(err) = durable_move(temp, path) {
                 return match pin.rename_to(path) {
-                    Ok(()) => Err(err.into()),
+                    Ok(()) => Err(err),
                     Err(back) => Err(UpdateError::new(
                         ErrorCode::Io,
                         format!(
@@ -759,12 +779,10 @@ fn place(
                     )),
                 };
             }
-            // The rename aside and the link are namespace changes: both
-            // directories are flushed before the call can report success. On
-            // failure the aside file stays in the scratch directory, so the old
-            // content is still recoverable.
-            namespace_barrier(scratch)?;
-            namespace_barrier(parent_of(path)?)?;
+            // The write-through move above is the durable step: it returns
+            // only once the placement is on disk, and the ordered log commits
+            // the rename aside before it. If it fails, the old file is put
+            // back, or stays in the scratch directory when that is impossible.
             drop(pin);
             let _ = std::fs::remove_file(&aside);
             Ok(())
@@ -775,9 +793,8 @@ fn place(
                 format!("{} was not verified before replacement", path.display()),
             )),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::hard_link(temp, path)?;
-                namespace_barrier(parent_of(path)?)?;
-                Ok(())
+                // No-replace and write-through: fails if a file appeared.
+                durable_move(temp, path)
             }
             Err(err) => Err(err.into()),
         },
@@ -873,18 +890,32 @@ impl FileOps for FsFileOps {
         let (base, rest) = self.locate(rel_path)?;
         #[cfg(windows)]
         {
-            // Only the verified file, deleted through its own handle.
+            // Only the verified file, moved out of the install namespace
+            // through its own handle, then deleted.
             let pin = pin.ok_or_else(|| {
                 UpdateError::new(
                     ErrorCode::InstallModified,
                     format!("{rel_path} was not verified before removal"),
                 )
             })?;
-            pin.delete()?;
-            // The deletion takes effect when the handle closes; only then is
-            // the directory entry removed and can it be flushed.
-            drop(pin);
-            namespace_barrier(parent_of(&base.join(rest))?)?;
+            let path = base.join(rest);
+            let scratch = make_scratch_dir(parent_of(&path)?)?;
+            let aside = scratch.join("removed");
+            let result = (|| -> Result<()> {
+                pin.rename_to(&aside)?;
+                // The handle must close before the file can be moved again.
+                drop(pin);
+                // Windows documents no directory flush; a write-through move
+                // is the durable step. The log is ordered, so it also commits
+                // the rename out of the install directory. On failure the
+                // file stays in the scratch directory.
+                let settled = scratch.join("removed.done");
+                durable_move(&aside, &settled)?;
+                let _ = std::fs::remove_file(&settled);
+                Ok(())
+            })();
+            let _ = std::fs::remove_dir(&scratch);
+            result?;
         }
         #[cfg(not(windows))]
         {
@@ -1751,7 +1782,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn barrier_log() -> Vec<std::path::PathBuf> {
+    fn barrier_log() -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
         barrier_probe::LOG.with(|log| log.borrow().clone())
     }
 
@@ -1763,7 +1794,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_new_file_replacement_and_removal_each_flush_the_namespace() {
+    fn windows_new_file_replacement_and_removal_each_use_a_write_through_move() {
         let mut fx = race_fixture();
 
         reset_barrier(false);
@@ -1771,7 +1802,11 @@ mod tests {
         fx.ops
             .install_new("added.txt", &FileIdentity::of(NEW_ADDED))
             .unwrap();
-        assert!(barrier_log().contains(&fx.root), "new-file placement was not flushed");
+        assert!(
+            barrier_log().iter().any(|(_, to)| to == &fx.root.join("added.txt")),
+            "new-file placement was not a write-through move"
+        );
+        assert_eq!(fs::read(fx.root.join("added.txt")).unwrap(), NEW_ADDED);
 
         reset_barrier(false);
         fx.ops
@@ -1780,12 +1815,11 @@ mod tests {
         fx.ops
             .install_new("a.dll", &FileIdentity::of(NEW_DLL))
             .unwrap();
-        let log = barrier_log();
-        assert!(log.contains(&fx.root), "replacement was not flushed");
         assert!(
-            log.iter().any(|dir| dir != &fx.root),
-            "the scratch directory of the rename aside was not flushed"
+            barrier_log().iter().any(|(_, to)| to == &fx.root.join("a.dll")),
+            "replacement was not a write-through move"
         );
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), NEW_DLL);
 
         reset_barrier(false);
         fx.ops
@@ -1793,7 +1827,12 @@ mod tests {
             .unwrap();
         fx.ops.remove("a.dll").unwrap();
         assert!(!fx.root.join("a.dll").exists());
-        assert!(barrier_log().contains(&fx.root), "removal was not flushed");
+        assert!(
+            barrier_log().iter().any(|(_, to)| to
+                .file_name()
+                .is_some_and(|name| name == "removed.done")),
+            "removal was not a write-through move"
+        );
     }
 
     #[cfg(windows)]
@@ -1814,7 +1853,16 @@ mod tests {
             .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
             .unwrap();
         assert!(fx.ops.install_new("a.dll", &FileIdentity::of(NEW_DLL)).is_err());
-        // The displaced old file is still held in the scratch directory.
+        // The displaced old file was put back; nothing new was placed.
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+
+        let mut fx = race_fixture();
+        reset_barrier(true);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        assert!(fx.ops.remove("a.dll").is_err());
+        // The removed file is still held in the scratch directory.
         let kept: Vec<_> = fs::read_dir(&fx.root)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -1825,14 +1873,7 @@ mod tests {
             })
             .collect();
         assert_eq!(kept.len(), 1, "{kept:?}");
-        assert_eq!(fs::read(kept[0].join("a.dll.aside")).unwrap(), OLD_DLL);
-
-        let mut fx = race_fixture();
-        reset_barrier(true);
-        fx.ops
-            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
-            .unwrap();
-        assert!(fx.ops.remove("a.dll").is_err());
+        assert_eq!(fs::read(kept[0].join("removed")).unwrap(), OLD_DLL);
     }
 
     #[cfg(windows)]
