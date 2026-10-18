@@ -590,6 +590,15 @@ impl apply::FileOps for GuardedOps {
         self.inner.backup(rel_path, backup_rel)
     }
 
+    fn bind_target(
+        &mut self,
+        rel_path: &str,
+        expected: &Option<crate::identity::FileIdentity>,
+    ) -> Result<()> {
+        self.gate()?;
+        self.inner.bind_target(rel_path, expected)
+    }
+
     fn install_new(&mut self, rel_path: &str, expected: &crate::identity::FileIdentity) -> Result<()> {
         self.gate()?;
         self.inner.install_new(rel_path, expected)

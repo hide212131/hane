@@ -51,6 +51,7 @@ pub mod macos_apply;
 pub mod model;
 pub mod paths;
 pub mod platform;
+mod pinned;
 pub mod protocol;
 pub mod release;
 pub mod root_guard;

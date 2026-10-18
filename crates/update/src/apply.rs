@@ -23,6 +23,7 @@ use crate::journal::{
 };
 use crate::limits::MAX_ENTRY_BYTES;
 use crate::paths::validate_rel_path;
+use crate::pinned::PinnedFile;
 use crate::root_guard::RootGuard;
 
 /// Backups are addressed as `backup/<path>`; no owned file may live there.
@@ -39,6 +40,16 @@ pub trait FileOps: DiskView {
     fn remove(&mut self, rel_path: &str) -> Result<()>;
     /// Puts the backup (whose identity is `expected`) back at `rel_path`.
     fn restore(&mut self, rel_path: &str, backup_rel: &str, expected: &FileIdentity) -> Result<()>;
+    /// Binds the next `install_new` / `remove` / `restore` of `rel_path` to the
+    /// very file that has the `expected` identity (`None` = absent), failing
+    /// closed when it is something else. Called right before each mutation of
+    /// an install path. An adapter that can pin the verified file (Windows)
+    /// keeps it so the mutation cannot land on a file swapped in after the
+    /// check; the default has nothing to pin.
+    fn bind_target(&mut self, rel_path: &str, expected: &Option<FileIdentity>) -> Result<()> {
+        let _ = (rel_path, expected);
+        Ok(())
+    }
     /// Fails closed when the placement fixed at the start of the operation is
     /// no longer the one in use (moved or replaced). Checked before the health
     /// commit and before any recovery; the default has nothing to verify.
@@ -160,6 +171,7 @@ fn run_steps<S: JournalStore, O: FileOps>(
         // re-observed against its journaled old identity (absent when the file
         // is to be added) right before it is replaced or removed.
         ensure_live_old(ops, step)?;
+        ops.bind_target(&step.rel_path, &step.old)?;
         match &step.new {
             Some(identity) => ops.install_new(&step.rel_path, identity)?,
             None => ops.remove(&step.rel_path)?,
@@ -334,12 +346,14 @@ fn perform<S: JournalStore, O: FileOps>(
             if ops.observe(backup_rel)? != Observed::File(restore.clone()) {
                 return Ok(Some(format!("backup of {rel_path} is missing or damaged")));
             }
+            ops.bind_target(rel_path, expected_current)?;
             ops.restore(rel_path, backup_rel, restore)?;
         }
         RollbackAction::RemoveAdded { rel_path, expected } => {
             if ops.observe(rel_path)? != Observed::File(expected.clone()) {
                 return Ok(Some(format!("{rel_path} changed during recovery")));
             }
+            ops.bind_target(rel_path, &Some(expected.clone()))?;
             ops.remove(rel_path)?;
         }
     }
@@ -390,6 +404,11 @@ pub struct FsFileOps {
     backup_root: PathBuf,
     stage_root: PathBuf,
     guard: Result<RootGuard>,
+    /// The verified install file the next mutation is bound to (Windows).
+    pinned: Option<(String, PinnedFile)>,
+    /// Runs after the target is bound and before the mutation touches it.
+    #[cfg(test)]
+    before_mutation: Option<Box<dyn FnMut()>>,
 }
 
 impl FsFileOps {
@@ -400,6 +419,25 @@ impl FsFileOps {
             backup_root,
             stage_root,
             guard,
+            pinned: None,
+            #[cfg(test)]
+            before_mutation: None,
+        }
+    }
+
+    fn mutation_point(&mut self) {
+        #[cfg(test)]
+        if let Some(hook) = self.before_mutation.as_mut() {
+            hook();
+        }
+    }
+
+    /// The file verified by `bind_target` for exactly this path, if any. A pin
+    /// is single-use: any mutation attempt consumes it.
+    fn take_pin(&mut self, rel_path: &str) -> Option<PinnedFile> {
+        match self.pinned.take() {
+            Some((bound, pin)) if bound == rel_path => Some(pin),
+            _ => None,
         }
     }
 
@@ -435,7 +473,12 @@ impl FsFileOps {
         })
     }
 
-    fn write_atomic(&self, rel_path: &str, bytes: &[u8]) -> Result<()> {
+    fn write_atomic(
+        &self,
+        rel_path: &str,
+        bytes: &[u8],
+        pin: Option<PinnedFile>,
+    ) -> Result<()> {
         let (base, rest) = self.locate(rel_path)?;
         let path = base.join(rest);
         if let Some(parent) = path.parent() {
@@ -445,7 +488,7 @@ impl FsFileOps {
             // Transaction-owned backup area: the ordinary durable write.
             return durable_write(&path, bytes).map_err(UpdateError::from);
         }
-        install_write(&path, bytes)
+        install_write(&path, bytes, pin)
     }
 }
 
@@ -457,7 +500,10 @@ static INSTALL_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// replace an existing file or are hard-linked into place, which fails rather
 /// than overwrite a file that appeared in the meantime. Only the scratch
 /// directory and the file this call created are ever removed.
-fn install_write(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// On Windows an existing file is only ever displaced through the handle that
+/// verified it (`pin`); without one the call fails closed.
+fn install_write(path: &Path, bytes: &[u8], pin: Option<PinnedFile>) -> Result<()> {
     use std::io::Write;
 
     let parent = path.parent().ok_or_else(|| {
@@ -486,20 +532,80 @@ fn install_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => crate::fsutil::replace_file(&temp, path)?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Atomic no-replace: fails with AlreadyExists if a file showed up.
-                std::fs::hard_link(&temp, path)?;
-            }
-            Err(err) => return Err(err.into()),
-        }
-        Ok(())
+        place(&temp, &scratch, name, path, pin)
     })();
     // Remove only what this call created.
     let _ = std::fs::remove_file(&temp);
     let _ = std::fs::remove_dir(&scratch);
     result
+}
+
+#[cfg(not(windows))]
+fn place(
+    temp: &Path,
+    _scratch: &Path,
+    _name: &std::ffi::OsStr,
+    path: &Path,
+    _pin: Option<PinnedFile>,
+) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => crate::fsutil::replace_file(temp, path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Atomic no-replace: fails with AlreadyExists if a file showed up.
+            std::fs::hard_link(temp, path)?;
+        }
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+/// Windows: the verified file is moved aside through its own handle (no other
+/// process could rename or replace it meanwhile), then the new file is linked
+/// into the now-free name, which fails rather than overwrite anything that
+/// appeared. On failure the verified file is moved back without replacing.
+/// Whatever stays unresolved is left in the scratch directory, never deleted.
+#[cfg(windows)]
+fn place(
+    temp: &Path,
+    scratch: &Path,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    pin: Option<PinnedFile>,
+) -> Result<()> {
+    match pin {
+        Some(pin) => {
+            let mut aside_name = name.to_os_string();
+            aside_name.push(".aside");
+            let aside = scratch.join(aside_name);
+            pin.rename_to(&aside)?;
+            if let Err(err) = std::fs::hard_link(temp, path) {
+                return match pin.rename_to(path) {
+                    Ok(()) => Err(err.into()),
+                    Err(back) => Err(UpdateError::new(
+                        ErrorCode::Io,
+                        format!(
+                            "{} could not be put back after a failed install: {back}",
+                            path.display()
+                        ),
+                    )),
+                };
+            }
+            drop(pin);
+            let _ = std::fs::remove_file(&aside);
+            Ok(())
+        }
+        None => match std::fs::symlink_metadata(path) {
+            Ok(_) => Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} was not verified before replacement", path.display()),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::hard_link(temp, path)?;
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        },
+    }
 }
 
 impl DiskView for FsFileOps {
@@ -516,10 +622,42 @@ impl DiskView for FsFileOps {
 impl FileOps for FsFileOps {
     fn backup(&mut self, rel_path: &str, backup_rel: &str) -> Result<()> {
         let bytes = self.read_regular(rel_path)?;
-        self.write_atomic(backup_rel, &bytes)
+        self.write_atomic(backup_rel, &bytes, None)
+    }
+
+    fn bind_target(&mut self, rel_path: &str, expected: &Option<FileIdentity>) -> Result<()> {
+        self.pinned = None;
+        #[cfg(windows)]
+        {
+            let (base, rest) = self.locate(rel_path)?;
+            let path = base.join(rest);
+            let mismatch = || {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{rel_path} changed during the update"),
+                )
+            };
+            // Links on the way were rejected by the preceding observation; an
+            // open file also keeps its parent directories from being renamed.
+            match (PinnedFile::open(&path)?, expected) {
+                (None, None) => {}
+                (Some(pin), Some(old)) => {
+                    if &pin.identity()? != old {
+                        return Err(mismatch());
+                    }
+                    self.pinned = Some((rel_path.to_string(), pin));
+                }
+                _ => return Err(mismatch()),
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (rel_path, expected);
+        Ok(())
     }
 
     fn install_new(&mut self, rel_path: &str, expected: &FileIdentity) -> Result<()> {
+        let pin = self.take_pin(rel_path);
+        self.mutation_point();
         validate_rel_path(rel_path)?;
         let staged = self.stage_root.join(rel_path);
         let bytes = read_limited(&staged, MAX_ENTRY_BYTES)?.ok_or_else(|| {
@@ -531,16 +669,37 @@ impl FileOps for FsFileOps {
                 format!("staged {rel_path} differs from the plan"),
             ));
         }
-        self.write_atomic(rel_path, &bytes)
+        self.write_atomic(rel_path, &bytes, pin)
     }
 
     fn remove(&mut self, rel_path: &str) -> Result<()> {
+        let pin = self.take_pin(rel_path);
+        self.mutation_point();
         let (base, rest) = self.locate(rel_path)?;
-        std::fs::remove_file(base.join(rest))?;
+        #[cfg(windows)]
+        {
+            let _ = (base, rest);
+            // Only the verified file, deleted through its own handle.
+            let pin = pin.ok_or_else(|| {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{rel_path} was not verified before removal"),
+                )
+            })?;
+            pin.delete()?;
+            drop(pin);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pin;
+            std::fs::remove_file(base.join(rest))?;
+        }
         Ok(())
     }
 
     fn restore(&mut self, rel_path: &str, backup_rel: &str, expected: &FileIdentity) -> Result<()> {
+        let pin = self.take_pin(rel_path);
+        self.mutation_point();
         let bytes = self.read_regular(backup_rel)?;
         if &FileIdentity::of(&bytes) != expected {
             return Err(UpdateError::new(
@@ -548,7 +707,7 @@ impl FileOps for FsFileOps {
                 format!("backup of {rel_path} is damaged"),
             ));
         }
-        self.write_atomic(rel_path, &bytes)
+        self.write_atomic(rel_path, &bytes, pin)
     }
 }
 
@@ -1131,6 +1290,133 @@ mod tests {
         assert!(!root.join("added.txt").exists());
         // The refusal changed nothing, so the transaction stays pending.
         assert_eq!(journal.journal().phase, Phase::AwaitingHealth);
+    }
+
+    struct RaceFixture {
+        _dir: TempDir,
+        root: std::path::PathBuf,
+        ops: FsFileOps,
+    }
+
+    fn race_fixture() -> RaceFixture {
+        let dir = TempDir::new("apply-race");
+        let root = dir.path().join("install");
+        let backup = dir.path().join("backup");
+        let stage = dir.path().join("stage");
+        for sub in [&root, &backup, &stage] {
+            fs::create_dir_all(sub).unwrap();
+        }
+        fs::write(root.join("a.dll"), OLD_DLL).unwrap();
+        fs::write(root.join("third.tmp"), b"third party").unwrap();
+        fs::write(stage.join("a.dll"), NEW_DLL).unwrap();
+        fs::write(stage.join("added.txt"), NEW_ADDED).unwrap();
+        fs::write(backup.join("a.dll"), OLD_DLL).unwrap();
+        let ops = FsFileOps::new(root.clone(), backup, stage);
+        RaceFixture {
+            _dir: dir,
+            root,
+            ops,
+        }
+    }
+
+    /// Hook that, between the identity check and the mutation, tries to move
+    /// the target away and to rename a third-party file over it. Returns the
+    /// flag that is set when both attempts were refused.
+    #[cfg(windows)]
+    fn swap_attempt(root: &std::path::Path) -> (Box<dyn FnMut()>, Rc<Cell<bool>>) {
+        let refused = Rc::new(Cell::new(false));
+        let flag = refused.clone();
+        let target = root.join("a.dll");
+        let third = root.join("third.tmp");
+        let aside = root.join("a.dll.moved");
+        let hook = move || {
+            let moved = fs::rename(&target, &aside).is_err();
+            let replaced = fs::rename(&third, &target).is_err();
+            flag.set(moved && replaced);
+        };
+        (Box::new(hook), refused)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_keeps_the_verified_file_bound_against_a_swap() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        let (hook, refused) = swap_attempt(&fx.root);
+        fx.ops.before_mutation = Some(hook);
+        fx.ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap();
+        assert!(refused.get(), "the target could be swapped after verification");
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), NEW_DLL);
+        assert_eq!(fs::read(fx.root.join("third.tmp")).unwrap(), b"third party");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_remove_keeps_the_verified_file_bound_against_a_swap() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        let (hook, refused) = swap_attempt(&fx.root);
+        fx.ops.before_mutation = Some(hook);
+        fx.ops.remove("a.dll").unwrap();
+        assert!(refused.get(), "the target could be swapped after verification");
+        assert!(!fx.root.join("a.dll").exists());
+        assert_eq!(fs::read(fx.root.join("third.tmp")).unwrap(), b"third party");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_restore_keeps_the_verified_file_bound_against_a_swap() {
+        let mut fx = race_fixture();
+        fs::write(fx.root.join("a.dll"), NEW_DLL).unwrap();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL)))
+            .unwrap();
+        let (hook, refused) = swap_attempt(&fx.root);
+        fx.ops.before_mutation = Some(hook);
+        fx.ops
+            .restore("a.dll", "backup/a.dll", &FileIdentity::of(OLD_DLL))
+            .unwrap();
+        assert!(refused.get(), "the target could be swapped after verification");
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+        assert_eq!(fs::read(fx.root.join("third.tmp")).unwrap(), b"third party");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mutation_without_a_verified_binding_changes_nothing() {
+        let mut fx = race_fixture();
+        assert!(fx.ops.install_new("a.dll", &FileIdentity::of(NEW_DLL)).is_err());
+        assert!(fx.ops.remove("a.dll").is_err());
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+        // A binding whose identity differs is refused up front.
+        assert!(
+            fx.ops
+                .bind_target("a.dll", &Some(FileIdentity::of(b"other")))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+    }
+
+    #[test]
+    fn an_added_file_created_by_a_third_party_first_is_never_overwritten() {
+        let mut fx = race_fixture();
+        fx.ops.bind_target("added.txt", &None).unwrap();
+        let added = fx.root.join("added.txt");
+        fx.ops.before_mutation = Some(Box::new(move || {
+            fs::write(&added, b"third party").unwrap();
+        }));
+        assert!(
+            fx.ops
+                .install_new("added.txt", &FileIdentity::of(NEW_ADDED))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("added.txt")).unwrap(), b"third party");
     }
 
     #[test]
