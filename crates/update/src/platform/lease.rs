@@ -424,9 +424,13 @@ mod tests {
         let dir = TempDir::new("lease-foreign");
         let id = install_id();
         std::fs::write(dir.path().join(id.coordination_dir_name()), b"file").unwrap();
-        let err = Coordination::create(dir.path(), &id).unwrap_err();
-        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+        // The error class for creating a directory over a regular file differs by OS
+        // (`UnsupportedInstall` or `Io`), so only the refusal and non-mutation are pinned.
+        let entry = dir.path().join(id.coordination_dir_name());
+        assert!(Coordination::create(dir.path(), &id).is_err());
         assert!(Coordination::open_existing(dir.path(), &id).is_err());
+        assert!(entry.is_file());
+        assert_eq!(std::fs::read(&entry).unwrap(), b"file");
 
         let other = TempDir::new("lease-foreign-lock");
         let coord = coordination(&other);
