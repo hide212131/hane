@@ -1136,10 +1136,19 @@ mod tests {
             assert_eq!(view.status, None);
         });
 
-        view.update(cx, |view, cx| {
-            view.ai_prompts.draft[0].title = "保存できる指示".to_owned();
-            view.ai_prompts.save(cx, Some(LeaveTarget::Close));
-            cx.notify();
+        // `save` syncs the draft from the on-screen inputs first, so the
+        // title must be entered through the real input, not the draft.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                set_value(
+                    view.ai_prompts.title_input.as_ref().unwrap(),
+                    "保存できる指示",
+                    window,
+                    cx,
+                );
+                view.ai_prompts.save(cx, Some(LeaveTarget::Close));
+                cx.notify();
+            });
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
