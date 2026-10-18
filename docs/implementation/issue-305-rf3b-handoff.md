@@ -7,7 +7,7 @@
 
 採用設計を維持し、仕様書の作り直しは行わない。設計の正本は[短い入力欄の実装仕様書](../refactor-rf3b-short-text-input-implementation-spec.md)で、§3・§5〜§10を実装・受入契約とする。
 
-2026-10-19の確認時点でIssue #305はOPEN、受入条件5件はすべて未チェック。PR #497もOPEN / Draft。製品コードの確認済みheadは`a2b1062f573aa28a5117ba1d50e8a9db23b33e70`で、その後のPR更新は引き継ぎ文書だけ。baseは`fd894ff8136cfe0bcae903211b3b422713db8b54`。ClaudeのAADW実装依頼run `39139696316`は同製品headでprepare・worker・trusted finalizer・exact-result verifierがsuccess。Sonnet 5.5確認、workspace regression tests、lintもsuccess。PRの最新head・compare・CIはGitHub上の[PR #497](https://github.com/hide212131/hane/pull/497)を再取得する。CodeRabbitのsuccess statusだけではDraft PRのfull review完了を意味しない。
+2026-10-19の確認時点でIssue #305はOPEN、受入条件5件はすべて未チェック。PR #497もOPEN / Draft。製品コードの確認済みheadは`a2b1062f573aa28a5117ba1d50e8a9db23b33e70`。この引き継ぎ更新前のPR headは`b4937bd86ecd4f4befe641cf2379a39fbc4a76cb`、base/current mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`、33 commits ahead / 0 behind、mergeable CLEAN。current-head CI run `39148976572`はmacOS/Windows tests・Clippyを含めsuccess。ClaudeのAADW実装依頼run `39139696316`も同製品headでprepare・worker・trusted finalizer・exact-result verifier、Sonnet 5.5確認、workspace regression tests、lintがsuccess。PRの最新head・compare・CIはGitHub上の[PR #497](https://github.com/hide212131/hane/pull/497)を再取得する。CodeRabbitのsuccess statusだけではDraft PRのfull review完了を意味しない。
 
 このheadにはG04向けのbounds-origin変更通知が入った。Windows current-head確認ではrename行移動後の候補位置と変換確定後クリックを確認した。C05ではfilter composition中の再クリックによるcaret位置更新と、rename再クリック時の位置変更拒否を確認したが、filter blur後の文字列保持は未確認のためC05全体はPARTIAL。別のG04サブケースは2026-10-19にcurrent mainと候補を同条件で比較した。両方でcaretはクリック位置へ移った一方、日本語IME候補popupは旧座標に残った。したがってこの観測はPR固有の回帰とは判定できず、候補側もG04のpopup位置条件を満たしていない。Keyhacは一時状態不明となった後、利用者がread-onlyでOFFを再確認した。再開後はKeyhacを操作せず比較を完了し、試験用Haneを終了、fixture一致とcheckout cleanを確認した。macOS current-head release buildはできている。CUAではFinderの無害な操作まで一度復旧したが、検証アプリの起動承認待ちのためmacOS GUI試験は未実施。G06については、rename待ち中の入力→完了後Enter→遅延text callback破棄→次の通常入力を順序どおり固定する`ime_confirming_enter_after_rename_keeps_the_late_text_guard`などの制御GPUIテストがPRに残り、current-head CIで実行済み。一方、5秒遅延buildによるcurrent-candidateのOS別GUI確認は未実施であり、既存testは実OSのcallback順・IME popup表示の証拠とは区別する。#496/#495の採用済み内容は再設計しない。
 
@@ -35,6 +35,12 @@
 - **結果:** C05のfilter caret位置更新はmain/candidateともPASS。G04の「現在の文字位置付近」へのIME候補移動は両版ともFAIL。この同じ失敗がcurrent mainにもあるため、この証拠ではPR固有回帰とは判定できない。一方、候補版は該当するG04条件を満たしておらず、G04全体も未完了。
 - 両Hane processは通常終了し、残存processなし。main/candidateの専用fixtureはそれぞれ6件のpath・size・SHA-256が起動前manifestと一致。checkout head/statusも最終確認済み。証拠はWindows local tempの`evidence/g04-main-vs-candidate-20261019-0001/final-evidence.md`、`main-observation.json`、`candidate-observation.json`、`comparison-result.json`（GitHub未upload）。利用者のOFF read-only確認後に再開し、比較中もKeyhacへの操作・確認はしていない。
 
+### Windows CUA復旧後の追加試行（2026-10-19、受入確認は未実施）
+
+- current main `fd894ff8136cfe0bcae903211b3b422713db8b54`の`AGENTS.md`、`docs/gui-test-recovery.md`、`.agents/skills/hane-gui-test/SKILL.md`を読み、接続先Windows版ChatGPTからCUAを再確認した。ExplorerとChatGPTのwindow列挙ができ、Explorerへの文字入力は成功した。CUAの追加クリック確認中に、停止指示に反してWindows workerがデスクトップの`Keyhac フック OFF`ショートカットを右クリックメニューから一度実行し、リンク先`KeyhacHook.ahk off`のスクリプトを読み取っていた。実行後にエラーダイアログは見えず、トレイ状態は確認していない。`Keyhac フック状態 ON`ファイルは残っているがスクリプトは同ファイルを更新しないため、実行後のhook状態は**不明**。その後Keyhacへの操作はしていない。
+- 候補product head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、base `fd894ff8136cfe0bcae903211b3b422713db8b54`、exe SHA-256 `7F65B9587218546C0850A99F70C7E202F61F4EEF9FE878E8D7CB5583DA920399`を使い、隔離state/fixtureからHane PID `7600`を起動した。filter欄をクリックしただけで文字入力・IME操作はしていない。停止後、起動記録とProcessId/ExecutablePath/CommandLineが一致することを確認し、ウィンドウを通常終了してPID消失を確認した。G04 blur確認・G06は実施しておらず、この試行を受入evidenceには数えない。
+- 今回作成された6ファイルfixture `C:\Users\hide2\AppData\Local\Temp\hane-issue305-g04-main-retest-20261018-01\fixtures\g04-filter-blur-a2b106-20261019-0003`はコピー元fixtureと名前・サイズ・SHA-256が全件一致した。削除は実行前にpolicyで拒否されたため残置。evidenceは同rootの`evidence/g04-filter-blur-a2b106-20261019-0003/launch.json`と`cleanup.json`に残る。ユーザーデータ・製品コード・Issue/PR・Git branchには変更なし。
+
 ### macOS current-head build（GUI blocked）
 
 - head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`をmacOS ARM64 / Rust-Cargo 1.98.1でrelease build。candidate binary SHA-256 `da6b80a2b16ff0482f81bf8a7ade93a432266183bef08e3bacbbd6191feeab89`。専用fixture/state、固有bundle IDの検証appを用意した。
@@ -47,7 +53,7 @@
 - 2026-10-19の再確認でもcurrent mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`、Issue #305はOPEN、5つの受入条件はすべて未チェックのまま。
 - PR #496: MERGED、head `14def973e496c39b503c006db21fd187718ad683`。CodeRabbit full reviewは最終headで完了し、actionable commentなし。
 - PR #495: MERGED、head `76d53cbf5b33a51ed91dfa259ced76403064872a`。OS別の文書端選択挙動を受け入れ済み。#497のC09がその挙動を保護する。
-- PR #497はOPEN / Draft。product code headは`a2b1062f573aa28a5117ba1d50e8a9db23b33e70`。この文書編集前に再取得したPR headは`b259486a79acabbad356e3efb5985b38b85f8d19`、base/mainは`fd894ff8136cfe0bcae903211b3b422713db8b54`、32 ahead / 0 behind、mergeable CLEAN。その後の差分は引き継ぎ文書だけ。exact-head CI run `39148897275`のrelease-only分類は確認時点でin progressだった。この引き継ぎ更新も文書のみのcommitとなるため、最新head・ahead/behind・CIは次回作業前にGitHub metadataから再取得する。CodeRabbit full reviewは未完了（Draftはskip）；利用者指定のCodex代替レビューはproduct head `a2b1062`を対象に実施済み。
+- 2026-10-19のこの引き継ぎ更新前のsnapshot: PR #497はOPEN / Draft、product code head `a2b1062f573aa28a5117ba1d50e8a9db23b33e70`、PR head `b4937bd86ecd4f4befe641cf2379a39fbc4a76cb`、base/main `fd894ff8136cfe0bcae903211b3b422713db8b54`、33 ahead / 0 behind、mergeable CLEAN。exact-head CI run `39148976572`はsuccess。current-head Codex代替レビューはreview `5564037035`で完了し、P1のG04受入上の問題を残している。CodeRabbit full reviewは未完了（Draftでskip）。この引き継ぎ更新によってheadが変わった後はGitHubからmetadata・CI・review stateを再取得する。
 - GitHub上のIssue #305本文とPR #497本文は、current-main/candidate比較で両方ともpopup位置更新に失敗した結果、C05の部分確認、受入未完了を反映済み。IssueはOPEN、PRはDraftのまま。current headとCIは本書更新時点のlive stateを確認済み。
 - current main `fd894ff...`にはGUI失敗時の復旧runbook更新（#522）が含まれる。今回その文書と`AGENTS.md`を読み直し、Windows GUIは接続済みWindows版ChatGPTから直接操作し、Mac経由のVMware操作は使わないことを確認した。
 - 利用者からWindows環境を修復したとの連絡があり、papa-winのnative CUAでWindows再確認を完了した。Haneの`foreground window did not report a process id`はCUA session reset・`@oai/sky`再import・最新window再取得で解消し、その後のGUI操作を継続できた。復旧は確認したが、原因イベントは未特定。current main G04 baselineはrename行移動でFAIL、候補head `561c94d`のG01/G02/G03/G05/G06は確認済み、G04はfilter側の一部条件のみでPARTIAL。詳細を次節に記録する。
