@@ -509,13 +509,7 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         // A file that was deleted or moved was left out of the plan and does
         // not stop the others.
         let _ = window.update(cx, |view, _window, cx| {
-            for (index, path) in plan.files.iter().enumerate() {
-                if index == 0 {
-                    view.open_path(path, cx);
-                } else {
-                    view.open_work_folder_entry(path, cx);
-                }
-            }
+            view.restore_files(&plan.files, cx);
             if !plan.missing.is_empty() {
                 view.report_restore_skipped(plan.missing.len(), cx);
             }

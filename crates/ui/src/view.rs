@@ -83,7 +83,7 @@ use hane_session::{
     format_relative_date_label, local_today, next_modified_sequence, run_save_job,
     split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1070,6 +1070,12 @@ pub struct EditorView {
     /// finished loading yet. A load that lands after a newer request must
     /// not switch what is on screen away from that newer request.
     latest_open_target: Option<PathBuf>,
+    /// Files of an update restart still waiting to be opened. They are opened
+    /// one after another so a late completion of an earlier file can never be
+    /// discarded as stale by a newer request.
+    pending_restore: VecDeque<PathBuf>,
+    /// The restore file whose read is in flight; its completion opens the next.
+    restoring_path: Option<PathBuf>,
     /// Bumped every time `switch_to_work_folder` replaces `sessions` and
     /// `work_folder` wholesale. A background read started against the
     /// previous folder (or single-file state) carries the generation it was
@@ -1814,6 +1820,8 @@ impl EditorView {
             title_sync_deferred: HashSet::new(),
             loading_paths: HashSet::new(),
             latest_open_target: None,
+            pending_restore: VecDeque::new(),
+            restoring_path: None,
             work_folder_generation: 0,
             focus_handle: cx.focus_handle(),
             heights,
@@ -3071,6 +3079,8 @@ impl EditorView {
         self.title_sync_deferred.clear();
         self.loading_paths.clear();
         self.latest_open_target = None;
+        self.pending_restore.clear();
+        self.restoring_path = None;
         // The new `SessionSet` restarts ids (and each fresh session's own
         // generation) at the same values the old one used, so a tab context
         // menu, close confirmation, or pending "save then close" request
@@ -3269,7 +3279,40 @@ impl EditorView {
                 }
             }
         }
+        if self.restoring_path.as_deref() == Some(path) {
+            self.restoring_path = None;
+            self.open_next_restore_file(cx);
+        }
         cx.notify();
+    }
+
+    /// Reopens the saved files of an update restart, in order, so the last one
+    /// (the active file of the previous run) ends up on screen. The first file
+    /// takes the initial empty document; each later one gets a session of its
+    /// own, and is requested only after the previous read has finished.
+    pub fn restore_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let mut paths = paths.iter();
+        let Some(first) = paths.next() else {
+            return;
+        };
+        self.pending_restore = paths.cloned().collect();
+        self.restoring_path = None;
+        self.open_path(first, cx);
+        if self.loading_paths.contains(first) {
+            self.restoring_path = Some(first.clone());
+        } else {
+            self.open_next_restore_file(cx);
+        }
+    }
+
+    fn open_next_restore_file(&mut self, cx: &mut Context<Self>) {
+        while let Some(next) = self.pending_restore.pop_front() {
+            self.open_work_folder_entry(&next, cx);
+            if self.loading_paths.contains(&next) {
+                self.restoring_path = Some(next);
+                return;
+            }
+        }
     }
 
     pub(crate) fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
@@ -20178,6 +20221,66 @@ mod tests {
                     .as_ref()
                     .is_some_and(|rename| rename.pending)
             );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // PR #518 review: restoring several files used to start every read at
+    // once, and a late completion of the first (ReuseActive) read was
+    // discarded as stale. Files are now opened one after another, so every
+    // saved file gets a session, a missing one does not stop the others, no
+    // empty Untitled tab is left behind, and the last file is on screen.
+    #[gpui::test]
+    fn restoring_several_files_opens_every_file_and_selects_the_last(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("restore-several-files");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("A.md");
+        let missing = root.join("Gone.md");
+        let second = root.join("B.md");
+        let third = root.join("C.md");
+        std::fs::write(&first, "a").unwrap();
+        std::fs::write(&second, "b").unwrap();
+        std::fs::write(&third, "c").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.restore_files(
+                &[first.clone(), missing, second.clone(), third.clone()],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions().count(), 3, "no extra Untitled session");
+            for path in [&first, &second, &third] {
+                assert_eq!(
+                    view.sessions()
+                        .filter(|session| session.path() == Some(path.as_path()))
+                        .count(),
+                    1,
+                    "{} must be open exactly once",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                view.sessions.active().path(),
+                Some(third.as_path()),
+                "the last restored file is the selected one"
+            );
+            assert!(view.pending_restore.is_empty());
+            assert!(view.restoring_path.is_none());
         });
 
         std::fs::remove_dir_all(root).unwrap();
