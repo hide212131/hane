@@ -119,6 +119,39 @@ fn move_write_through_windows(temp: &Path, dest: &Path, flags: u32) -> io::Resul
     }
 }
 
+/// Removes the file at `path` and returns only after the removal is durable.
+/// A missing file is an error: the caller verified it exists.
+///
+/// Windows: the file is first renamed to a retired name with a write-through
+/// `MoveFileExW` (the record's own name is gone durably once that returns), then
+/// the retired file is deleted. Other platforms: unlink, then flush the parent
+/// directory.
+pub(crate) fn remove_file_durable(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    #[cfg(windows)]
+    {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+        let retired = parent.join(format!(".{name}.retired"));
+        match fs::remove_file(&retired) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        rename_new_durable(path, &retired)?;
+        fs::remove_file(&retired)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path)?;
+        sync_directory(parent)
+    }
+}
+
 /// Atomically replaces `path` with `bytes` via a sibling temp file.
 pub fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path

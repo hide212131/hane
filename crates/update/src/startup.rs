@@ -548,6 +548,18 @@ fn gate_with_relocation(
     runner: &dyn RecoveryRunner,
     wait: Duration,
 ) -> GateOutcome {
+    gate_with_relocation_using(install_dir, locate, runner, wait, &relocation::retire)
+}
+
+/// [`gate_with_relocation`] with the durable removal of a settled record
+/// injected, so a failing removal can be exercised.
+fn gate_with_relocation_using(
+    install_dir: Option<&Path>,
+    locate: &dyn Fn() -> Result<Placement>,
+    runner: &dyn RecoveryRunner,
+    wait: Duration,
+    retire: &dyn Fn(&Path) -> Result<()>,
+) -> GateOutcome {
     for attempt in 0..2 {
         let located = locate();
         let (dir, record) = match install_dir.map(|dir| (dir, relocation::read(dir))) {
@@ -558,9 +570,15 @@ fn gate_with_relocation(
         if let Ok(placement) = &located
             && placement.install_id == record.install_id
         {
+            // The install is where it was recorded. A record whose transaction
+            // already settled is retired now, so a later move of the install
+            // is not judged by it.
+            if let Some(outcome) = retire_settled_record(dir, &record, wait, retire) {
+                return outcome;
+            }
             return startup_gate(placement, runner, wait);
         }
-        match relocated_gate(dir, &record, located, runner, wait, attempt) {
+        match relocated_gate(dir, &record, located, runner, wait, attempt, retire) {
             Relocated::Done(outcome) => return outcome,
             Relocated::Recovered => {}
         }
@@ -590,6 +608,36 @@ fn open_recorded_coordination(
     Err("the coordination directory of the interrupted update is not reachable".to_owned())
 }
 
+/// Retires the record when its journal is terminal and the install matches the
+/// journal's identities. `None` means nothing was retired and the caller goes on
+/// as before (pending, unreadable or ambiguous states keep the record);
+/// `Some` is a stop because the removal could not be made durable.
+fn retire_settled_record(
+    dir: &Path,
+    record: &RelocationRecord,
+    wait: Duration,
+    retire: &dyn Fn(&Path) -> Result<()>,
+) -> Option<GateOutcome> {
+    let coordination = open_recorded_coordination(dir, record).ok()?;
+    let startup = coordination.acquire_within(LeaseKind::Startup, &[], wait).ok()?;
+    let journal = FileJournalStore::new(coordination.journal_path(&record.transaction))
+        .load()
+        .ok()??;
+    if journal.transaction_id != record.transaction
+        || journal.install_id != record.install_id
+        || !matches!(journal.phase, Phase::Committed | Phase::RolledBack)
+    {
+        return None;
+    }
+    let disk = FsDiskView::new(dir);
+    if check_terminal(&coordination, record.transaction.as_str(), &journal, &disk).is_some() {
+        return None;
+    }
+    let result = retire(dir);
+    startup.release();
+    result.err().map(|err| stop(&err))
+}
+
 fn relocated_gate(
     dir: &Path,
     record: &RelocationRecord,
@@ -597,6 +645,7 @@ fn relocated_gate(
     runner: &dyn RecoveryRunner,
     wait: Duration,
     attempt: usize,
+    retire: &dyn Fn(&Path) -> Result<()>,
 ) -> Relocated {
     use Relocated::Done;
     let required = |why: String| Done(GateOutcome::RecoveryRequired(why));
@@ -631,7 +680,13 @@ fn relocated_gate(
                 }
                 None => {}
             }
+            // The receipt is settled and matches the disk: the record has
+            // served its purpose. Without a durable removal the start stops.
+            let retired = retire(dir);
             startup.release();
+            if let Err(err) = retired {
+                return Done(stop(&err));
+            }
             match located {
                 Ok(placement) => Done(startup_gate(&placement, runner, wait)),
                 Err(err) => Done(stop(&err)),
@@ -1852,6 +1907,112 @@ mod tests {
             assert_eq!(matches!(outcome, GateOutcome::Proceed(_)), proceeds, "damaged={damaged}: {outcome:?}");
             assert_eq!(runner.calls.get(), 0);
         }
+    }
+
+    /// The files a terminal journal of `phase` leaves: the new content once
+    /// committed, the old one after a rollback.
+    fn settle_disk(placement: &Placement, phase: Phase) {
+        if phase == Phase::Committed {
+            fs::write(placement.install_root.join("a.dll"), b"new").unwrap();
+        }
+    }
+
+    fn record_present(placement: &Placement) -> bool {
+        matches!(relocation::read(&placement.install_root), Ok(Some(_)))
+    }
+
+    #[test]
+    fn a_settled_terminal_record_is_retired_before_normal_start() {
+        for phase in [Phase::Committed, Phase::RolledBack] {
+            // Moved install: the receipt is checked against the disk, then retired.
+            let dir = TempDir::new("gate-relocation-retire-moved");
+            let (placement, _coord, _transaction) = recorded(&dir, phase);
+            settle_disk(&placement, phase);
+            let moved = moved_to(&dir, &placement, None);
+            let located = || Ok(moved.clone());
+            let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+            let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+            assert!(matches!(outcome, GateOutcome::Proceed(_)), "{phase:?}: {outcome:?}");
+            assert!(!record_present(&moved), "{phase:?}");
+
+            // Unmoved install: the record is retired too.
+            let dir = TempDir::new("gate-relocation-retire-in-place");
+            let (placement, _coord, _transaction) = recorded(&dir, phase);
+            settle_disk(&placement, phase);
+            let located = || Ok(placement.clone());
+            let outcome = gate_with_relocation(Some(&placement.install_root), &located, &runner, GATE_WAIT);
+            assert!(matches!(outcome, GateOutcome::Proceed(_)), "{phase:?}: {outcome:?}");
+            assert!(!record_present(&placement), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_retirement_never_reaches_normal_start() {
+        let fail = |_: &Path| Err(UpdateError::new(ErrorCode::Io, "flush failed"));
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+
+        let dir = TempDir::new("gate-relocation-retire-fail-moved");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::Committed);
+        settle_disk(&placement, Phase::Committed);
+        let moved = moved_to(&dir, &placement, None);
+        let located = || Ok(moved.clone());
+        let outcome =
+            gate_with_relocation_using(Some(&moved.install_root), &located, &runner, GATE_WAIT, &fail);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert!(record_present(&moved));
+
+        let dir = TempDir::new("gate-relocation-retire-fail-in-place");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::RolledBack);
+        let located = || Ok(placement.clone());
+        let outcome = gate_with_relocation_using(
+            Some(&placement.install_root),
+            &located,
+            &runner,
+            GATE_WAIT,
+            &fail,
+        );
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert!(record_present(&placement));
+    }
+
+    #[test]
+    fn unsettled_or_mismatched_states_keep_the_record() {
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+
+        // A terminal journal whose disk differs.
+        let dir = TempDir::new("gate-relocation-keep-damaged");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::RolledBack);
+        let moved = moved_to(&dir, &placement, None);
+        fs::write(moved.install_root.join("a.dll"), b"???").unwrap();
+        let located = || Ok(moved.clone());
+        let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert!(record_present(&moved));
+
+        // A pending journal that recovery does not settle.
+        let dir = TempDir::new("gate-relocation-keep-pending");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::Applying);
+        let moved = moved_to(&dir, &placement, None);
+        let located = || Ok(moved.clone());
+        let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert!(record_present(&moved));
+
+        // A journal that needs recovery, or that is missing.
+        let dir = TempDir::new("gate-relocation-keep-recovery-required");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::RecoveryRequired);
+        let moved = moved_to(&dir, &placement, None);
+        let located = || Ok(moved.clone());
+        let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert!(record_present(&moved));
+
+        let dir = TempDir::new("gate-relocation-keep-nojournal");
+        let (placement, coord, transaction) = recorded(&dir, Phase::Committed);
+        fs::remove_dir_all(coord.transaction_dir(&transaction)).unwrap();
+        let located = || Ok(placement.clone());
+        let outcome = gate_with_relocation(Some(&placement.install_root), &located, &runner, GATE_WAIT);
+        assert!(record_present(&placement), "{outcome:?}");
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

@@ -198,6 +198,8 @@ pub const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "HOMEPATH",
     "TEMP",
     "TMP",
+    "XDG_RUNTIME_DIR",
+    "__CF_USER_TEXT_ENCODING",
     // Command execution environment the normal AI runtime allows, so the AI
     // tools of the first editor after an update can resolve and run commands.
     "PATH",
@@ -1089,6 +1091,33 @@ mod tests {
             assert!(vars.iter().all(|(key, _)| key != name), "{name} must stay out");
         }
         assert_eq!(vars.len(), execution.len());
+    }
+
+    #[test]
+    fn the_runtime_dir_and_text_encoding_reach_the_child_and_unlisted_ones_do_not() {
+        let fx = fixture();
+        let listed = [
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("__CF_USER_TEXT_ENCODING", "0x1F5:0x8000100:0x52"),
+        ];
+        let unlisted = ["CODEX_HOME", "OPENAI_API_KEY"];
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = listed
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .chain(unlisted.iter().map(|key| ((*key).into(), "secret".into())))
+            .collect();
+        publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        for (name, value) in listed {
+            assert!(
+                vars.contains(&(name.to_owned(), value.to_owned())),
+                "{name} must reach the limited child"
+            );
+        }
+        for name in unlisted {
+            assert!(vars.iter().all(|(key, _)| key != name), "{name} must stay out");
+        }
+        assert_eq!(vars.len(), listed.len());
     }
 
     #[cfg(unix)]

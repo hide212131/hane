@@ -148,11 +148,44 @@ pub fn read(install_root: &Path) -> Result<Option<RelocationRecord>> {
     }))
 }
 
+/// Retires the record of `install_root` once its transaction is verified
+/// terminal. `Ok` means the record is durably gone; any failure is an error so
+/// the caller does not start normally.
+pub fn retire(install_root: &Path) -> Result<()> {
+    retire_with(install_root, &crate::fsutil::remove_file_durable)
+}
+
+fn retire_with(
+    install_root: &Path,
+    remove: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    remove(&record_path(install_root)).map_err(|err| {
+        UpdateError::new(
+            ErrorCode::Io,
+            format!("the relocation record could not be retired durably: {err}"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::InstallFacts;
     use crate::testing::TempDir;
+
+    #[test]
+    fn retiring_removes_the_record_and_a_failure_is_an_error() {
+        let dir = TempDir::new("relocation-retire");
+        let root = dir.path().join("Hane");
+        fs::create_dir_all(&root).unwrap();
+        let coordination = Coordination::create(dir.path(), &install_id()).unwrap();
+        write(&root, &coordination, &TransactionId::generate().unwrap()).unwrap();
+        let err = retire_with(&root, &|_| Err(std::io::Error::other("flush failed"))).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(read(&root).unwrap().is_some());
+        retire(&root).unwrap();
+        assert_eq!(read(&root).unwrap(), None);
+    }
 
     fn install_id() -> InstallId {
         InstallId::derive(&InstallFacts {
