@@ -107,6 +107,71 @@ pub(crate) fn owner_from(principal: Result<String>) -> Result<String> {
     }
 }
 
+/// The install/bundle root must belong to the principal its `InstallId` is
+/// derived from. Otherwise a root owned by someone else (reached through a
+/// shared parent) would be updated, or checked through a coordination path of
+/// another `InstallId`, with a pending journal overlooked. A mismatch or an
+/// unreadable owner is never `UnsupportedInstall`, so startup stops instead of
+/// treating the install as unmanaged.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+pub(crate) fn require_root_owner(owner: Result<String>, principal: Result<String>) -> Result<()> {
+    let principal = owner_from(principal)?;
+    let owner = owner_from(owner)?;
+    if owner == principal {
+        Ok(())
+    } else {
+        Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the install root is not owned by the current user",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn require_install_root_owner(root: &Path) -> Result<()> {
+    require_root_owner(acl::directory_owner_id(root), acl::principal_id())
+}
+
+#[cfg(test)]
+mod root_owner_tests {
+    use super::*;
+
+    #[test]
+    fn a_root_owned_by_the_current_principal_continues() {
+        require_root_owner(Ok("uid:501".into()), Ok("uid:501".into())).unwrap();
+        require_root_owner(Ok("sid:0102".into()), Ok("sid:0102".into())).unwrap();
+    }
+
+    #[test]
+    fn a_root_owned_by_another_principal_is_refused_without_being_unmanaged() {
+        for (owner, principal) in [("uid:502", "uid:501"), ("sid:0a", "sid:0b")] {
+            let err = require_root_owner(Ok(owner.into()), Ok(principal.into())).unwrap_err();
+            assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_owner_or_principal_is_refused_without_being_unmanaged() {
+        let err = require_root_owner(Err(unsupported("no owner")), Ok("uid:1".into())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        let err = require_root_owner(Ok("uid:1".into()), Err(unsupported("no token"))).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        let err = require_root_owner(Ok(String::new()), Ok("uid:1".into())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_directory_is_owned_by_this_user_and_a_link_is_refused() {
+        let dir = crate::testing::TempDir::new("root-owner");
+        require_root_owner(acl::directory_owner_id(dir.path()), acl::principal_id()).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(acl::directory_owner_id(&link).is_err());
+        assert!(acl::directory_owner_id(&dir.path().join("absent")).is_err());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod owner_tests {
     use super::*;

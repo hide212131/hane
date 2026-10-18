@@ -45,6 +45,18 @@ pub(crate) fn principal_id() -> Result<String> {
     imp::principal_id()
 }
 
+/// The owner of a real (non-link) directory in the same text form as
+/// [`principal_id`]. A link, a non-directory or an unreadable owner is an
+/// error that is never `UnsupportedInstall`, so startup cannot read it as an
+/// unmanaged install.
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", test)),
+    allow(dead_code, reason = "only supported placements check the root owner")
+)]
+pub(crate) fn directory_owner_id(path: &Path) -> Result<String> {
+    imp::directory_owner_id(path)
+}
+
 /// Access to the extended (non-POSIX) ACL of a path, without following links.
 /// Any `Err` means the ACL could not be determined or changed.
 #[cfg_attr(
@@ -262,6 +274,17 @@ mod imp {
         Ok(format!("uid:{euid}"))
     }
 
+    pub fn directory_owner_id(path: &Path) -> Result<String> {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(crate::error::UpdateError::new(
+                crate::error::ErrorCode::IdentityMismatch,
+                format!("{} is not a plain directory", path.display()),
+            ));
+        }
+        Ok(format!("uid:{}", meta.uid()))
+    }
+
     pub fn secure_new(path: &Path, _is_dir: bool, mode: u32) -> Result<()> {
         // On macOS the ACL is removed and read back after the mode is set,
         // so nothing remains when this returns.
@@ -423,15 +446,57 @@ mod imp {
         unsafe { IsWellKnownSid(sid, kind) != 0 }
     }
 
-    pub fn principal_id() -> Result<String> {
-        let sid = token_sid(TOKEN_USER_CLASS)?;
-        // SAFETY: `token_sid` returned a valid, validated SID copy.
-        let len = unsafe { GetLengthSid(sid_ptr(&sid)) } as usize;
-        let bytes = unsafe { std::slice::from_raw_parts(sid.as_ptr().cast::<u8>(), len) };
-        Ok(format!(
+    fn sid_text(sid: *mut c_void) -> String {
+        // SAFETY: the caller passes a valid SID that outlives this call.
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) };
+        format!(
             "sid:{}",
             bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        ))
+        )
+    }
+
+    pub fn principal_id() -> Result<String> {
+        let sid = token_sid(TOKEN_USER_CLASS)?;
+        Ok(sid_text(sid_ptr(&sid)))
+    }
+
+    pub fn directory_owner_id(path: &Path) -> Result<String> {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink()
+            || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !meta.is_dir()
+        {
+            return Err(UpdateError::new(
+                crate::error::ErrorCode::IdentityMismatch,
+                format!("{} is not a plain directory", path.display()),
+            ));
+        }
+        let name = wide(path);
+        let mut owner: *mut c_void = std::ptr::null_mut();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated and every out-pointer is a live local.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        let _release = Local(descriptor);
+        // SAFETY: a non-null owner points into the descriptor kept alive above.
+        if rc != 0 || owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
+            return Err(UpdateError::new(
+                crate::error::ErrorCode::Io,
+                format!("the owner of {} could not be determined", path.display()),
+            ));
+        }
+        Ok(sid_text(owner))
     }
 
     pub fn secure_new(path: &Path, is_dir: bool, _mode: u32) -> Result<()> {
@@ -565,6 +630,10 @@ mod imp {
 
     pub fn principal_id() -> Result<String> {
         Err(refuse("the OS principal is unavailable on this OS"))
+    }
+
+    pub fn directory_owner_id(_path: &Path) -> Result<String> {
+        Err(refuse("ownership cannot be checked on this OS"))
     }
 
     pub fn secure_new(_path: &Path, _is_dir: bool, _mode: u32) -> Result<()> {

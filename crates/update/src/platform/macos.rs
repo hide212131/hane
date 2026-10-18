@@ -234,6 +234,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     if volume.read_only {
         return Err(unsupported("the install volume is read-only"));
     }
+    super::require_install_root_owner(bundle)?;
     // `volume.id` (st_dev) only identifies the mount for this boot; the durable
     // InstallId uses the persistent volume UUID and fails closed without it.
     let install_id = derive_install_id(

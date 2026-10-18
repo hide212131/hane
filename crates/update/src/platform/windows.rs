@@ -278,6 +278,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
             format!("{name} is missing from a managed install"),
         ));
     }
+    super::require_install_root_owner(&install_dir)?;
     let path_text = crate::identity::install_path_text(&install_dir)?;
     let path_text = path_text.strip_prefix(r"\\?\").unwrap_or(path_text).to_owned();
     let install_id = InstallId::derive(&InstallFacts {
