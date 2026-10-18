@@ -1,7 +1,9 @@
 //! Real-filesystem helpers behind the seams used by the core.
 //!
 //! Durability here is "write temp, fsync, rename, fsync parent directory" as
-//! far as `std` exposes it. Behaviour across a real power loss on Windows or
+//! far as `std` exposes it. On Windows the rename is a write-through
+//! `MoveFileExW` (see `replace_file`) instead of a directory flush. Behaviour
+//! across a real power loss on Windows or
 //! macOS is NOT verified by this crate; recovery therefore always reconciles
 //! the journal with the actual on-disk identity (see `journal`).
 
@@ -49,21 +51,21 @@ pub(crate) fn sync_renamed_file(path: &Path) -> io::Result<()> {
     sync_directory(parent)
 }
 
-/// Moves the already-flushed `temp` over `dest`.
+/// Moves the already-flushed `temp` over `dest`, whether or not `dest` exists.
 ///
-/// Windows cannot rely on a rename to replace an existing destination, so an
-/// existing file is swapped with `ReplaceFileW`, which keeps `dest` intact when
-/// it fails. A missing destination is a plain rename, which on Windows refuses
-/// to overwrite anything that appeared in the meantime (fail-closed). On other
-/// platforms `rename` replaces atomically.
+/// Windows: one `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING |
+/// MOVEFILE_WRITE_THROUGH`. The replace is an atomic same-volume rename (no
+/// copy fallback, because `MOVEFILE_COPY_ALLOWED` is not set), so on failure
+/// `dest` keeps its previous content or stays missing. The call returns only
+/// after the namespace change is flushed to disk. This guarantee covers the
+/// rename of `temp` onto `dest` itself; Windows has no supported directory
+/// flush, so `sync_directory` is not part of the success condition there.
+/// Other platforms: `rename` replaces atomically and the caller flushes the
+/// parent directory.
 pub(crate) fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        match fs::symlink_metadata(dest) {
-            Ok(_) => replace_existing_windows(temp, dest),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => fs::rename(temp, dest),
-            Err(err) => Err(err),
-        }
+        replace_write_through_windows(temp, dest)
     }
     #[cfg(not(windows))]
     {
@@ -71,28 +73,27 @@ pub(crate) fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
-/// The single `ReplaceFileW` call, isolated so the crate-wide
+/// The single `MoveFileExW` call, isolated so the crate-wide
 /// `deny(unsafe_code)` stays in force everywhere else.
 #[cfg(windows)]
-#[allow(unsafe_code, reason = "one ReplaceFileW call through windows-sys")]
-fn replace_existing_windows(temp: &Path, dest: &Path) -> io::Result<()> {
+#[allow(unsafe_code, reason = "one MoveFileExW call through windows-sys")]
+fn replace_write_through_windows(temp: &Path, dest: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
 
     let wide = |p: &Path| -> Vec<u16> {
         p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
     };
-    let dest_w = wide(dest);
     let temp_w = wide(temp);
-    // SAFETY: both buffers are NUL-terminated and outlive the call; the
-    // optional backup, exclude and reserved arguments are null.
+    let dest_w = wide(dest);
+    // SAFETY: both buffers are NUL-terminated and outlive the call.
     let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
-            dest_w.as_ptr(),
+        MoveFileExW(
             temp_w.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
+            dest_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
     if ok == 0 {
@@ -276,6 +277,73 @@ impl PartStore for DirPartStore {
 
     fn discard_part(&mut self) {
         let _ = fs::remove_file(&self.part);
+    }
+}
+
+#[cfg(test)]
+mod durable_write_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hane-fsutil-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn creates_missing_destination() {
+        let dir = scratch_dir("create");
+        let path = dir.join("journal.json");
+        durable_write(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(!dir.join(".journal.json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaces_existing_destination() {
+        let dir = scratch_dir("replace");
+        let path = dir.join("journal.json");
+        durable_write(&path, b"first").unwrap();
+        durable_write(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert!(!dir.join(".journal.json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_replace_keeps_existing_data_and_reports_error() {
+        let dir = scratch_dir("fail");
+        let path = dir.join("journal.json");
+        // A directory cannot be replaced by a file on any platform.
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), b"data").unwrap();
+        assert!(durable_write(&path, b"new").is_err());
+        assert_eq!(fs::read(path.join("keep")).unwrap(), b"data");
+        assert!(!dir.join(".journal.json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_file_overwrites_or_creates() {
+        let dir = scratch_dir("move");
+        let dest = dir.join("dest");
+        let temp = dir.join("temp");
+        fs::write(&temp, b"a").unwrap();
+        replace_file(&temp, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"a");
+        fs::write(&temp, b"b").unwrap();
+        replace_file(&temp, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"b");
+        assert!(!temp.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
