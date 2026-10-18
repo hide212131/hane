@@ -243,6 +243,11 @@ pub fn locate(exe: &Path) -> Result<Placement> {
         crate::identity::install_path_text(bundle)?,
         &owner_name()?,
     )?;
+    // A bundle swapped in by an update names the install it was swapped into.
+    // If it was moved, `install_id` differs and the pending transaction of the
+    // original location is consulted; unverifiable or pending stops (this is
+    // `InstallModified`/`Io`, never `UnsupportedInstall`, so it is not unmanaged).
+    crate::macos_apply::check_relocation(read_mark(bundle)?.as_deref(), &install_id)?;
     Ok(Placement {
         target: Target::MacosArm64,
         install_root: bundle.to_path_buf(),
@@ -321,6 +326,47 @@ fn exchange(first: &Path, second: &Path) -> Result<()> {
     }
 }
 
+/// The extended attribute carrying the relocation mark of a bundle.
+const MARK_XATTR: &std::ffi::CStr = c"io.github.hide212131.hane.update-mark";
+/// A mark is a few short lines; anything larger is damaged.
+const MAX_MARK_BYTES: usize = 4096;
+
+/// The relocation mark of `bundle`, `None` only if the attribute definitely
+/// does not exist. Every other failure is an error so startup stops.
+fn read_mark(bundle: &Path) -> Result<Option<Vec<u8>>> {
+    let path = c_path(bundle)?;
+    let mut buf = vec![0u8; MAX_MARK_BYTES + 1];
+    // SAFETY: the path and the name are NUL-terminated C strings; the buffer
+    // and its length describe `buf`, which the call writes within.
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            MARK_XATTR.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if size < 0 {
+        let err = std::io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::ENOATTR) {
+            Ok(None)
+        } else {
+            Err(err.into())
+        };
+    }
+    let size = size as usize;
+    if size > MAX_MARK_BYTES {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            "the bundle relocation mark is too large",
+        ));
+    }
+    buf.truncate(size);
+    Ok(Some(buf))
+}
+
 /// The real [`BundleHost`]: `statfs`, `renamex_np(RENAME_SWAP)`, `codesign`
 /// and `spctl`, each with fixed arguments and no shell.
 pub struct MacHost;
@@ -366,6 +412,46 @@ impl BundleHost for MacHost {
 
     fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()> {
         verify_developer_id(bundle, team_id)
+    }
+
+    fn bundle_mark(&self, bundle: &Path) -> Result<Option<Vec<u8>>> {
+        read_mark(bundle)
+    }
+
+    fn set_bundle_mark(&self, bundle: &Path, mark: &[u8]) -> Result<()> {
+        let path = c_path(bundle)?;
+        // SAFETY: the path and the attribute name are NUL-terminated C strings
+        // and the value pointer and length describe `mark`; nothing is kept.
+        let rc = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                MARK_XATTR.as_ptr(),
+                mark.as_ptr().cast(),
+                mark.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().into())
+        }
+    }
+
+    fn clear_bundle_mark(&self, bundle: &Path) -> Result<()> {
+        let path = c_path(bundle)?;
+        // SAFETY: both pointers refer to NUL-terminated C strings.
+        let rc = unsafe { libc::removexattr(path.as_ptr(), MARK_XATTR.as_ptr(), libc::XATTR_NOFOLLOW) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOATTR) {
+            Ok(())
+        } else {
+            Err(err.into())
+        }
     }
 
     fn assess_gatekeeper(&self, bundle: &Path) -> Result<()> {

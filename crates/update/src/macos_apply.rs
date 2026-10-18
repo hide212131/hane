@@ -52,10 +52,12 @@ use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{FileSeenStore, hash_regular_file, hash_regular_file_under, read_limited};
 use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, conclude_with_child};
-use crate::identity::{ApplyPlan, FileIdentity, PlanStep, ReleaseIdentity, TransactionId};
+use crate::identity::{
+    ApplyPlan, FileIdentity, InstallId, PlanStep, ReleaseIdentity, TransactionId,
+};
 use crate::journal::{
-    DiskView, DurableJournal, FileJournalStore, Observed, Phase, StepState, UpdateJournal,
-    identity_matches,
+    DiskView, DurableJournal, FileJournalStore, JournalStore, Observed, Phase, StepState,
+    UpdateJournal, identity_matches,
 };
 use crate::limits::{JOURNAL_RESERVE_BYTES, MAX_CATALOG_BYTES, MAX_SIGNATURE_BYTES};
 use crate::model::{MACOS_BUNDLE_ID, Target, UPDATER_PROTOCOL};
@@ -119,6 +121,121 @@ pub trait BundleHost {
     fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()>;
     /// The Gatekeeper assessment of the bundle, as the OS makes it.
     fn assess_gatekeeper(&self, bundle: &Path) -> Result<()>;
+    /// The relocation mark stored on the bundle directory itself (an extended
+    /// attribute, which follows the directory through a rename or a move), or
+    /// `None` if there is none. Any other failure is an error.
+    fn bundle_mark(&self, bundle: &Path) -> Result<Option<Vec<u8>>>;
+    /// Durably stores the relocation mark on the bundle directory. The mark is
+    /// not part of the sealed contents, so signatures and [`bundle_identity`]
+    /// are unaffected.
+    fn set_bundle_mark(&self, bundle: &Path, mark: &[u8]) -> Result<()>;
+    /// Removes the relocation mark; a bundle without one is not an error.
+    fn clear_bundle_mark(&self, bundle: &Path) -> Result<()>;
+}
+
+/// Written to the staged candidate before the exchange, so that the new bundle
+/// names the install it was swapped into wherever it is later launched from.
+/// The `InstallId` is derived from the bundle's path; a bundle moved (Finder)
+/// between the exchange and the identity check would otherwise start under a
+/// different `InstallId` and never see the pending journal of this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelocationMark {
+    pub install_id: InstallId,
+    pub transaction: TransactionId,
+    pub coordination_parent: PathBuf,
+}
+
+const MARK_MAGIC: &str = "hane-relocation-v1";
+
+impl RelocationMark {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let parent = crate::identity::install_path_text(&self.coordination_parent)?;
+        if parent.contains('\n') {
+            return Err(UpdateError::new(
+                ErrorCode::UnsupportedInstall,
+                "the coordination parent cannot be recorded",
+            ));
+        }
+        Ok(format!(
+            "{MARK_MAGIC}\n{}\n{}\n{parent}\n",
+            self.install_id.as_str(),
+            self.transaction.as_str()
+        )
+        .into_bytes())
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let damaged = || {
+            UpdateError::new(ErrorCode::InstallModified, "the bundle relocation mark is damaged")
+        };
+        let text = std::str::from_utf8(bytes).map_err(|_| damaged())?;
+        let mut lines = text.strip_suffix('\n').ok_or_else(damaged)?.split('\n');
+        if lines.next() != Some(MARK_MAGIC) {
+            return Err(damaged());
+        }
+        let install_id = InstallId::parse(lines.next().ok_or_else(damaged)?).map_err(|_| damaged())?;
+        let transaction =
+            TransactionId::parse(lines.next().ok_or_else(damaged)?).map_err(|_| damaged())?;
+        let parent = PathBuf::from(lines.next().ok_or_else(damaged)?);
+        if lines.next().is_some() || !parent.is_absolute() {
+            return Err(damaged());
+        }
+        Ok(Self {
+            install_id,
+            transaction,
+            coordination_parent: parent,
+        })
+    }
+}
+
+/// Startup check of a bundle carrying a relocation `mark`, given the
+/// `InstallId` derived from where it runs now. Where the bundle still is the
+/// marked install, the ordinary gate (same `InstallId`) handles its journal.
+/// Where it runs under another `InstallId` (it was moved), the journal of the
+/// install it was swapped into is consulted directly: anything but a definite
+/// "no journal" or a terminal one stops, so a moved bundle can never bypass a
+/// pending transaction. Unverifiable state is an error (fail closed).
+pub fn check_relocation(mark: Option<&[u8]>, current: &InstallId) -> Result<()> {
+    let Some(bytes) = mark else {
+        return Ok(());
+    };
+    let mark = RelocationMark::parse(bytes)?;
+    if &mark.install_id == current {
+        return Ok(());
+    }
+    // `UnsupportedInstall` would let startup treat the bundle as unmanaged, so
+    // no failure here may keep that code.
+    let stop = |err: UpdateError| {
+        if matches!(err.code, ErrorCode::UnsupportedInstall | ErrorCode::TargetUnsupported) {
+            UpdateError::new(ErrorCode::InstallModified, err.to_string())
+        } else {
+            err
+        }
+    };
+    let Some(coordination) =
+        Coordination::open_existing(&mark.coordination_parent, &mark.install_id).map_err(stop)?
+    else {
+        return Ok(());
+    };
+    let Some(journal) = FileJournalStore::new(coordination.journal_path(&mark.transaction))
+        .load()
+        .map_err(stop)?
+    else {
+        return Ok(());
+    };
+    if journal.transaction_id != mark.transaction || journal.install_id != mark.install_id {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the journal of the original install belongs to another transaction or install",
+        ));
+    }
+    match journal.phase {
+        Phase::Committed | Phase::RolledBack => Ok(()),
+        _ => Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            "the bundle was moved while its update is still pending at the original location",
+        )),
+    }
 }
 
 pub fn valid_team_id(team_id: &str) -> bool {
@@ -868,6 +985,17 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     // no file time is needed to order them.
     crate::startup::retire_prior_receipts(inputs.coordination, inputs.transaction)?;
 
+    // The new bundle is bound to this install and transaction before it can be
+    // exchanged in: wherever it is launched from afterwards, it finds this
+    // journal. If the mark cannot be written nothing has been exchanged and the
+    // update is refused.
+    let mark = RelocationMark {
+        install_id: inputs.coordination.install_id().clone(),
+        transaction: inputs.transaction.clone(),
+        coordination_parent: inputs.placement.coordination_parent.clone(),
+    };
+    inputs.host.set_bundle_mark(&verified.slot, &mark.encode()?)?;
+
     let journal = UpdateJournal::begin(&verified.plan, None)?;
     let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
     let mut journal = DurableJournal::create(store, journal)?;
@@ -957,7 +1085,13 @@ pub fn apply_and_settle(
         &mut *child,
         launcher.health_timeout(),
     )?;
-    settled_result(settled)
+    let result = settled_result(settled);
+    if result.is_ok() {
+        // Committed: the mark has done its job. A leftover is harmless (a
+        // terminal journal lets a moved bundle start).
+        let _ = inputs.host.clear_bundle_mark(&inputs.placement.install_root);
+    }
+    result
 }
 
 /// Settles a pending bundle journal from the disk (startup / helper recovery).
@@ -1086,6 +1220,25 @@ mod tests {
         journal_path: RefCell<Option<PathBuf>>,
         /// Journal phase and step state seen at each exchange.
         at_swap: RefCell<Vec<(Phase, StepState)>>,
+        /// Relocation marks by directory identity, like an extended attribute:
+        /// they follow the directory through a rename.
+        marks: RefCell<BTreeMap<String, Vec<u8>>>,
+        /// Runs right after a successful exchange, before anything observes it
+        /// (the Finder moving the live bundle).
+        after_swap: RefCell<Option<Box<dyn Fn()>>>,
+    }
+
+    fn mark_key(path: &Path) -> Result<String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::symlink_metadata(path)?;
+            Ok(format!("{}:{}", meta.dev(), meta.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(path.to_string_lossy().into_owned())
+        }
     }
 
     impl FakeHost {
@@ -1104,6 +1257,8 @@ mod tests {
                 bad_gatekeeper: RefCell::new(Vec::new()),
                 journal_path: RefCell::new(None),
                 at_swap: RefCell::new(Vec::new()),
+                marks: RefCell::new(BTreeMap::new()),
+                after_swap: RefCell::new(None),
             }
         }
     }
@@ -1143,6 +1298,23 @@ mod tests {
             if !self.noop_swap.get() {
                 rename_swap(first, second);
             }
+            if let Some(hook) = self.after_swap.borrow().as_ref() {
+                hook();
+            }
+            Ok(())
+        }
+
+        fn bundle_mark(&self, bundle: &Path) -> Result<Option<Vec<u8>>> {
+            Ok(self.marks.borrow().get(&mark_key(bundle)?).cloned())
+        }
+
+        fn set_bundle_mark(&self, bundle: &Path, mark: &[u8]) -> Result<()> {
+            self.marks.borrow_mut().insert(mark_key(bundle)?, mark.to_vec());
+            Ok(())
+        }
+
+        fn clear_bundle_mark(&self, bundle: &Path) -> Result<()> {
+            self.marks.borrow_mut().remove(&mark_key(bundle)?);
             Ok(())
         }
 
@@ -1626,6 +1798,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn moved_install_id() -> InstallId {
+        InstallId::derive(&InstallFacts {
+            os: "test",
+            volume_id: "v",
+            install_path: "/moved/Hane.app",
+            owner: "u",
+        })
+        .unwrap()
+    }
+
+    /// The Finder moves the live bundle right after the exchange, before the
+    /// helper can look at it. The moved bundle runs under another `InstallId`
+    /// (the path is part of it), yet it must still meet the pending journal.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_moved_right_after_the_exchange_cannot_bypass_the_pending_journal() {
+        let fx = fixture();
+        let live = fx.live().to_path_buf();
+        let moved = live.with_file_name("Moved.app");
+        let (hook_live, hook_moved) = (live.clone(), moved.clone());
+        *fx.host.after_swap.borrow_mut() =
+            Some(Box::new(move || fs::rename(&hook_live, &hook_moved).unwrap()));
+
+        let err = apply_bundle(&fx.inputs()).err().expect("the move is detected");
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(fx.host.swaps.get(), 1);
+        assert_eq!(fx.stored().phase, Phase::RecoveryRequired);
+        assert_eq!(tree(&moved), files_tree(&fx.new_files));
+
+        // The moved bundle carries the mark written before the exchange.
+        let mark = fx.host.bundle_mark(&moved).unwrap();
+        assert!(mark.is_some(), "the mark follows the bundle directory");
+        assert_ne!(&moved_install_id(), fx.coordination.install_id());
+        let err = check_relocation(mark.as_deref(), &moved_install_id()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified, "the moved bundle must stop");
+        // At the original location the ordinary gate handles the same journal.
+        check_relocation(mark.as_deref(), fx.coordination.install_id()).unwrap();
+        // An unreadable mark is never ignored.
+        let err = check_relocation(Some(b"garbage"), &moved_install_id()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_normal_swap_clears_the_mark_and_a_settled_journal_never_blocks_a_moved_bundle() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+        assert!(fx.live_is_new());
+        assert_eq!(fx.host.bundle_mark(fx.live()).unwrap(), None, "cleared once committed");
+
+        let mark = RelocationMark {
+            install_id: fx.coordination.install_id().clone(),
+            transaction: fx.transaction.clone(),
+            coordination_parent: fx.placement.coordination_parent.clone(),
+        };
+        let bytes = mark.encode().unwrap();
+        assert_eq!(RelocationMark::parse(&bytes).unwrap(), mark);
+        // A leftover mark of a Committed transaction lets a moved bundle start.
+        check_relocation(Some(&bytes), &moved_install_id()).unwrap();
+        check_relocation(None, &moved_install_id()).unwrap();
+    }
+
+    /// The mark sits on the candidate directory, so after the exchange it is the
+    /// new live bundle that carries it.
+    #[cfg(unix)]
+    #[test]
+    fn the_mark_is_written_to_the_candidate_before_the_exchange() {
+        let fx = fixture();
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        drop(applied);
+        let mark = fx.host.bundle_mark(fx.live()).unwrap().expect("marked");
+        let parsed = RelocationMark::parse(&mark).unwrap();
+        assert_eq!(&parsed.install_id, fx.coordination.install_id());
+        assert_eq!(parsed.transaction, fx.transaction);
+        assert_eq!(fx.host.bundle_mark(&fx.slot()).unwrap(), None, "the old bundle is unmarked");
     }
 
     #[test]
