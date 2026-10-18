@@ -94,7 +94,7 @@ fn query_available_bytes(path: &Path) -> Result<u64> {
     if rc != 0 {
         return Err(failed());
     }
-    u64::from(stat.f_bavail)
+    stat.f_bavail
         .checked_mul(u64::from(stat.f_bsize))
         .ok_or_else(|| UpdateError::new(ErrorCode::LimitExceeded, "the free space of the install volume overflows"))
 }
