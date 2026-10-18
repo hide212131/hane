@@ -12,8 +12,7 @@ use std::path::{Component, Path, Prefix};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    DRIVE_FIXED, GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
-    GetVolumePathNameW,
+    GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -32,6 +31,11 @@ use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target};
 use crate::trust::TrustPolicy;
 
 const EXE_NAME: &str = "hane.exe";
+
+/// `GetDriveTypeW` result for a local fixed disk (winbase.h `DRIVE_FIXED`).
+/// Defined here because windows-sys exposes it only behind the unrelated
+/// `Win32_System_WindowsProgramming` feature.
+const DRIVE_FIXED: u32 = 3;
 
 /// The volume that really holds a path, including directory mount points.
 #[derive(Debug, Clone, PartialEq, Eq)]

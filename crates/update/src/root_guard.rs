@@ -95,6 +95,7 @@ fn open_dir(path: &Path) -> Result<File> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "one GetFileInformationByHandle call through windows-sys")]
 fn dir_id(file: &File) -> Result<DirId> {
     use std::os::windows::io::AsRawHandle;
 

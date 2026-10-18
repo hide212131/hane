@@ -48,33 +48,8 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
 pub(crate) fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
         match fs::symlink_metadata(dest) {
-            Ok(_) => {
-                let wide = |p: &Path| -> Vec<u16> {
-                    p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-                };
-                let dest_w = wide(dest);
-                let temp_w = wide(temp);
-                // SAFETY: both buffers are NUL-terminated and outlive the call;
-                // the optional backup, exclude and reserved arguments are null.
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
-                        dest_w.as_ptr(),
-                        temp_w.as_ptr(),
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null(),
-                        std::ptr::null(),
-                    )
-                };
-                if ok == 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            }
+            Ok(_) => replace_existing_windows(temp, dest),
             Err(err) if err.kind() == io::ErrorKind::NotFound => fs::rename(temp, dest),
             Err(err) => Err(err),
         }
@@ -82,6 +57,37 @@ pub(crate) fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         fs::rename(temp, dest)
+    }
+}
+
+/// The single `ReplaceFileW` call, isolated so the crate-wide
+/// `deny(unsafe_code)` stays in force everywhere else.
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "one ReplaceFileW call through windows-sys")]
+fn replace_existing_windows(temp: &Path, dest: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let dest_w = wide(dest);
+    let temp_w = wide(temp);
+    // SAFETY: both buffers are NUL-terminated and outlive the call; the
+    // optional backup, exclude and reserved arguments are null.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
+            dest_w.as_ptr(),
+            temp_w.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
