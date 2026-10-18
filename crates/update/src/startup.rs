@@ -1216,7 +1216,7 @@ mod tests {
         let result = retire_receipt_dir(
             &coord.transaction_dir(&prior),
             &tombstone,
-            fs::rename,
+            |from, to| fs::rename(from, to),
             |_| Err(io::Error::other("cleanup failed")),
         );
         // The caller turns this error into a refused apply, so no new journal is created.
