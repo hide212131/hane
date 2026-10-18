@@ -434,9 +434,12 @@ mod tests {
 
         let other = TempDir::new("lease-foreign-lock");
         let coord = coordination(&other);
-        std::fs::create_dir(coord.dir().join(RUNTIME_LOCK)).unwrap();
-        let err = coord.try_acquire(LeaseKind::RuntimeShared, &[]).unwrap_err();
-        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+        let foreign_lock = coord.dir().join(RUNTIME_LOCK);
+        std::fs::create_dir(&foreign_lock).unwrap();
+        // Windows reports the refused `create_new` as `Io`, so the error class is not pinned.
+        assert!(coord.try_acquire(LeaseKind::RuntimeShared, &[]).is_err());
+        assert!(foreign_lock.is_dir());
+        assert_eq!(std::fs::read_dir(&foreign_lock).unwrap().count(), 0);
     }
 
     #[test]
