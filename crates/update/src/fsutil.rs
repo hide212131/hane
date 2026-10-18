@@ -280,6 +280,58 @@ impl PartStore for DirPartStore {
     }
 }
 
+/// File-backed sequence floor (`receipts/seen-catalog.json`).
+pub struct FileSeenStore {
+    path: PathBuf,
+}
+
+impl FileSeenStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+/// Holds the OS file lock until dropped (closing the handle releases it).
+struct SeenLockGuard {
+    file: File,
+}
+
+impl Drop for SeenLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl SeenStore for FileSeenStore {
+    fn lock(&self) -> Result<Box<dyn Send>> {
+        let lock_path = self.path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(UpdateError::from)?;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        private_options(&mut options);
+        let file = options.open(&lock_path).map_err(UpdateError::from)?;
+        file.lock().map_err(UpdateError::from)?;
+        Ok(Box::new(SeenLockGuard { file }))
+    }
+
+    fn load(&self) -> Result<Option<SeenCatalog>> {
+        let Some(bytes) = read_limited(&self.path, MAX_JOURNAL_BYTES)? else {
+            return Ok(None);
+        };
+        let seen: SeenCatalog = parse_strict(&bytes)?;
+        seen.validate()?;
+        Ok(Some(seen))
+    }
+
+    fn store(&mut self, seen: &SeenCatalog) -> Result<()> {
+        let bytes = serde_json::to_vec(seen)
+            .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
+        durable_write(&self.path, &bytes).map_err(UpdateError::from)
+    }
+}
+
 #[cfg(test)]
 mod durable_write_tests {
     use super::*;
@@ -344,57 +396,5 @@ mod durable_write_tests {
         assert_eq!(fs::read(&dest).unwrap(), b"b");
         assert!(!temp.exists());
         let _ = fs::remove_dir_all(&dir);
-    }
-}
-
-/// File-backed sequence floor (`receipts/seen-catalog.json`).
-pub struct FileSeenStore {
-    path: PathBuf,
-}
-
-impl FileSeenStore {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-/// Holds the OS file lock until dropped (closing the handle releases it).
-struct SeenLockGuard {
-    file: File,
-}
-
-impl Drop for SeenLockGuard {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-impl SeenStore for FileSeenStore {
-    fn lock(&self) -> Result<Box<dyn Send>> {
-        let lock_path = self.path.with_extension("lock");
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent).map_err(UpdateError::from)?;
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        private_options(&mut options);
-        let file = options.open(&lock_path).map_err(UpdateError::from)?;
-        file.lock().map_err(UpdateError::from)?;
-        Ok(Box::new(SeenLockGuard { file }))
-    }
-
-    fn load(&self) -> Result<Option<SeenCatalog>> {
-        let Some(bytes) = read_limited(&self.path, MAX_JOURNAL_BYTES)? else {
-            return Ok(None);
-        };
-        let seen: SeenCatalog = parse_strict(&bytes)?;
-        seen.validate()?;
-        Ok(Some(seen))
-    }
-
-    fn store(&mut self, seen: &SeenCatalog) -> Result<()> {
-        let bytes = serde_json::to_vec(seen)
-            .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
-        durable_write(&self.path, &bytes).map_err(UpdateError::from)
     }
 }
