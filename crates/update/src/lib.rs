@@ -54,6 +54,7 @@ pub mod platform;
 mod pinned;
 pub mod protocol;
 pub mod release;
+pub(crate) mod relocation;
 pub mod root_guard;
 #[cfg(windows)]
 pub(crate) mod scratch;

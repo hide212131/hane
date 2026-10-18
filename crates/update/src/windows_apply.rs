@@ -419,6 +419,18 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     #[cfg(windows)]
     let ops = ops.with_scratch_ledger(inputs.coordination, inputs.transaction);
     let mut ops = ops;
+    // Before the first install mutation: bind the original identities outside
+    // the inventory, so an interrupted update or a moved install still reaches
+    // this transaction's journal at startup. Without it nothing is mutated.
+    if let Err(err) = crate::relocation::write(
+        &inputs.placement.install_root,
+        inputs.coordination,
+        inputs.transaction,
+    ) {
+        let _ = apply::recover(&mut journal, &mut ops, &mut NoChild);
+        seal_if_root_lost(&mut journal, &ops);
+        return Err(err);
+    }
     match apply::apply(&mut journal, &mut ops, &parent, &mut NoChild) {
         Ok(ApplyOutcome::AwaitingHealth) => Ok(AppliedFiles { journal, ops }),
         Ok(ApplyOutcome::RolledBack(err)) => Err(err),
@@ -561,6 +573,10 @@ mod tests {
         fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
             for entry in fs::read_dir(dir).unwrap().flatten() {
                 let path = entry.path();
+                // The relocation record is bookkeeping, not install content.
+                if path.file_name().is_some_and(|name| name == crate::relocation::RELOCATION_FILE) {
+                    continue;
+                }
                 if path.is_dir() {
                     walk(base, &path, out);
                 } else {
@@ -738,7 +754,10 @@ mod tests {
         // Only inventory-owned paths changed; nothing else was added.
         for path in after.keys() {
             assert!(
-                fx.before.contains_key(path) || path.contains(NEW) || path == "hane.exe",
+                fx.before.contains_key(path)
+                    || path.contains(NEW)
+                    || path == "hane.exe"
+                    || path == crate::relocation::RELOCATION_FILE,
                 "unexpected file {path}"
             );
         }

@@ -239,6 +239,20 @@ pub fn find_install(coordination: &Coordination) -> Result<Placement> {
         {
             return Ok(placement);
         }
+        // An interrupted update can leave the managed files incomplete, and a
+        // moved install derives another `InstallId`. The relocation record,
+        // written before the first mutation, still names the original id.
+        let path = entry.path();
+        if let Ok(Some(record)) = crate::relocation::read(&path)
+            && &record.install_id == coordination.install_id()
+        {
+            return Ok(Placement {
+                target: Target::WindowsX64,
+                install_root: path,
+                coordination_parent: parent.to_path_buf(),
+                install_id: record.install_id,
+            });
+        }
     }
     Err(UpdateError::new(
         ErrorCode::NotFound,

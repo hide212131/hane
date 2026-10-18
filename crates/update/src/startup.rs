@@ -21,11 +21,13 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::helper::{HelloRequest, PREPARE_TIMEOUT, spawn_helper};
 use crate::identity::TransactionId;
 use crate::journal::{
-    DiskView, FileJournalStore, JournalStore, Phase, RecoveryDecision, UpdateJournal,
+    DiskView, FileJournalStore, FsDiskView, JournalStore, Phase, RecoveryDecision, UpdateJournal,
     decide_recovery,
 };
+use crate::model::Target;
 use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
 use crate::platform::{self, Placement};
+use crate::relocation::{self, RelocationRecord};
 use crate::protocol::{Mode, RecoveryReport, bounded_reason};
 use crate::state_root::TicketRestore;
 use crate::trust::TrustPolicy;
@@ -518,7 +520,147 @@ pub fn startup_gate_for_exe_within(
     runner: &dyn RecoveryRunner,
     wait: Duration,
 ) -> GateOutcome {
-    gate_for_located(platform::locate(exe), runner, wait)
+    // Only a Windows update writes a relocation record into the install root.
+    #[cfg(windows)]
+    let install_dir = fs::canonicalize(exe)
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    #[cfg(not(windows))]
+    let install_dir: Option<std::path::PathBuf> = None;
+    gate_with_relocation(install_dir.as_deref(), &|| platform::locate(exe), runner, wait)
+}
+
+/// What the relocation-aware pass decided.
+enum Relocated {
+    Done(GateOutcome),
+    /// The recorded transaction was handed to recovery; look again.
+    Recovered,
+}
+
+/// Like [`gate_for_located`], but a relocation record in the install root
+/// (written before the first mutation of a Windows update) is consulted when
+/// the path-derived placement is missing or names another `InstallId`: an
+/// incomplete managed install or a moved install must still reach the original
+/// transaction's journal, and when that is impossible the start stops.
+fn gate_with_relocation(
+    install_dir: Option<&Path>,
+    locate: &dyn Fn() -> Result<Placement>,
+    runner: &dyn RecoveryRunner,
+    wait: Duration,
+) -> GateOutcome {
+    for attempt in 0..2 {
+        let located = locate();
+        let (dir, record) = match install_dir.map(|dir| (dir, relocation::read(dir))) {
+            None | Some((_, Ok(None))) => return gate_for_located(located, runner, wait),
+            Some((dir, Ok(Some(record)))) => (dir, record),
+            Some((_, Err(err))) => return stop(&err),
+        };
+        if let Ok(placement) = &located
+            && placement.install_id == record.install_id
+        {
+            return startup_gate(placement, runner, wait);
+        }
+        match relocated_gate(dir, &record, located, runner, wait, attempt) {
+            Relocated::Done(outcome) => return outcome,
+            Relocated::Recovered => {}
+        }
+    }
+    GateOutcome::RecoveryRequired("recovery did not settle the pending transaction".to_owned())
+}
+
+/// The coordination directory of the recorded `InstallId`: at the recorded
+/// parent, or beside the install when both were moved together.
+fn open_recorded_coordination(
+    dir: &Path,
+    record: &RelocationRecord,
+) -> std::result::Result<Coordination, String> {
+    let mut parents = vec![record.coordination_parent.clone()];
+    if let Some(parent) = dir.parent()
+        && parent != record.coordination_parent
+    {
+        parents.push(parent.to_path_buf());
+    }
+    for parent in parents {
+        match Coordination::open_existing(&parent, &record.install_id) {
+            Ok(Some(coordination)) => return Ok(coordination),
+            Ok(None) => {}
+            Err(err) => return Err(bounded_reason(&err.to_string())),
+        }
+    }
+    Err("the coordination directory of the interrupted update is not reachable".to_owned())
+}
+
+fn relocated_gate(
+    dir: &Path,
+    record: &RelocationRecord,
+    located: Result<Placement>,
+    runner: &dyn RecoveryRunner,
+    wait: Duration,
+    attempt: usize,
+) -> Relocated {
+    use Relocated::Done;
+    let required = |why: String| Done(GateOutcome::RecoveryRequired(why));
+    let coordination = match open_recorded_coordination(dir, record) {
+        Ok(coordination) => coordination,
+        Err(why) => return required(why),
+    };
+    let startup = match coordination.acquire_within(LeaseKind::Startup, &[], wait) {
+        Ok(lease) => lease,
+        Err(err) if err.code == ErrorCode::Timeout => return Done(GateOutcome::UpdateInProgress),
+        Err(err) => return Done(stop(&err)),
+    };
+    let name = record.transaction.as_str();
+    let journal = match FileJournalStore::new(coordination.journal_path(&record.transaction)).load() {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return required("the journal of the recorded update is missing".to_owned()),
+        Err(err) => return Done(stop(&err)),
+    };
+    if journal.transaction_id != record.transaction || journal.install_id != record.install_id {
+        return required("the recorded journal belongs to another transaction or install".to_owned());
+    }
+    match journal.phase {
+        Phase::RecoveryRequired => required("an earlier recovery did not complete".to_owned()),
+        Phase::Committed | Phase::RolledBack => {
+            // A terminal receipt only lets the start go on while the files in
+            // the (possibly moved) install are exactly the journal's identities.
+            let disk = FsDiskView::new(dir);
+            match check_terminal(&coordination, name, &journal, &disk) {
+                Some(Pending::Stop(why)) => return required(why),
+                Some(Pending::Transaction(_)) => {
+                    return required("the recorded receipt is not settled".to_owned());
+                }
+                None => {}
+            }
+            startup.release();
+            match located {
+                Ok(placement) => Done(startup_gate(&placement, runner, wait)),
+                Err(err) => Done(stop(&err)),
+            }
+        }
+        _ => {
+            if attempt > 0 {
+                return required("recovery did not settle the pending transaction".to_owned());
+            }
+            startup.release();
+            let recovery = Placement {
+                target: Target::WindowsX64,
+                install_root: dir.to_path_buf(),
+                coordination_parent: coordination
+                    .dir()
+                    .parent()
+                    .unwrap_or(&record.coordination_parent)
+                    .to_path_buf(),
+                install_id: record.install_id.clone(),
+            };
+            match runner.recover(&recovery, &coordination, &record.transaction) {
+                Ok(RecoveryReport::Blocked(why) | RecoveryReport::RecoveryRequired(why)) => {
+                    required(bounded_reason(&why))
+                }
+                Ok(_) => Relocated::Recovered,
+                Err(err) => Done(stop(&err)),
+            }
+        }
+    }
 }
 
 fn gate_for_located(
@@ -1569,6 +1711,147 @@ mod tests {
         let swapped = TicketRestore::new(coord.clone(), committed.clone(), other);
         assert!(swapped.take().is_err());
         assert!(swapped.has_unclaimed_ticket());
+    }
+
+    const GATE_WAIT: Duration = Duration::from_millis(50);
+
+    /// A recorded update of `transaction` in `phase`, like a Windows apply
+    /// leaves it before the first install mutation.
+    fn recorded(dir: &TempDir, phase: Phase) -> (Placement, Coordination, TransactionId) {
+        let placement = placement(dir);
+        let coord = placement.coordination().unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        write_journal(&coord, &transaction, phase);
+        relocation::write(&placement.install_root, &coord, &transaction).unwrap();
+        (placement, coord, transaction)
+    }
+
+    /// The install as another path derives it: a different `InstallId`.
+    fn moved_to(dir: &TempDir, placement: &Placement, with_coordination: Option<&Coordination>) -> Placement {
+        let parent = dir.path().join("moved");
+        fs::create_dir_all(&parent).unwrap();
+        let root = parent.join("Hane");
+        fs::rename(&placement.install_root, &root).unwrap();
+        if let Some(coord) = with_coordination {
+            fs::rename(coord.dir(), parent.join(coord.dir().file_name().unwrap())).unwrap();
+        }
+        Placement {
+            target: Target::WindowsX64,
+            install_root: root,
+            coordination_parent: parent,
+            install_id: InstallId::derive(&InstallFacts {
+                os: "test",
+                volume_id: "v",
+                install_path: "/moved",
+                owner: "u",
+            })
+            .unwrap(),
+        }
+    }
+
+    fn missing_file() -> Result<Placement> {
+        Err(UpdateError::new(ErrorCode::InstallModified, "hane-updater.exe is missing"))
+    }
+
+    #[test]
+    fn a_missing_managed_file_with_a_pending_journal_reaches_recovery() {
+        let dir = TempDir::new("gate-relocation-partial");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::Applying);
+        let calls = Cell::new(0);
+        let locate = || {
+            calls.set(calls.get() + 1);
+            // The rollback restores the managed files, so the second look finds them.
+            if calls.get() == 1 { missing_file() } else { Ok(placement.clone()) }
+        };
+        let runner = Runner::new(true, Ok(RecoveryReport::RolledBack));
+        let outcome = gate_with_relocation(Some(&placement.install_root), &locate, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::Proceed(_)), "{outcome:?}");
+        assert_eq!(runner.calls.get(), 1);
+
+        // A recovery that settles nothing never starts normal editing.
+        let dir = TempDir::new("gate-relocation-partial-unsettled");
+        let (placement, coord, _transaction) = recorded(&dir, Phase::Applying);
+        let runner = Runner::new(false, Ok(RecoveryReport::RolledBack));
+        let outcome =
+            gate_with_relocation(Some(&placement.install_root), &missing_file, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert!(coord.try_acquire(LeaseKind::RuntimeExclusive, &[]).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_missing_journal_or_a_damaged_record_stops_a_partial_install() {
+        let runner = Runner::new(true, Ok(RecoveryReport::RolledBack));
+        let dir = TempDir::new("gate-relocation-nojournal");
+        let (placement, coord, transaction) = recorded(&dir, Phase::Applying);
+        fs::remove_dir_all(coord.transaction_dir(&transaction)).unwrap();
+        let outcome =
+            gate_with_relocation(Some(&placement.install_root), &missing_file, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+
+        let dir = TempDir::new("gate-relocation-damaged");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::Applying);
+        fs::write(placement.install_root.join(relocation::RELOCATION_FILE), b"garbage\n").unwrap();
+        let outcome =
+            gate_with_relocation(Some(&placement.install_root), &missing_file, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_moved_install_still_recovers_its_original_pending_transaction() {
+        for with_coordination in [false, true] {
+            let dir = TempDir::new("gate-relocation-moved");
+            let (placement, coord, _transaction) = recorded(&dir, Phase::Applying);
+            let moved = moved_to(&dir, &placement, with_coordination.then_some(&coord));
+            let located = || Ok(moved.clone());
+            let runner = Runner::new(true, Ok(RecoveryReport::RolledBack));
+            let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+            assert!(
+                matches!(outcome, GateOutcome::Proceed(_)),
+                "with_coordination={with_coordination}: {outcome:?}"
+            );
+            assert_eq!(runner.calls.get(), 1, "with_coordination={with_coordination}");
+        }
+    }
+
+    #[test]
+    fn a_moved_install_never_ignores_a_pending_transaction_it_cannot_recover() {
+        // Not settled by the helper.
+        let dir = TempDir::new("gate-relocation-moved-unsettled");
+        let (placement, _coord, _transaction) = recorded(&dir, Phase::Applying);
+        let moved = moved_to(&dir, &placement, None);
+        let located = || Ok(moved.clone());
+        let runner = Runner::new(false, Ok(RecoveryReport::RolledBack));
+        let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+
+        // The coordination cannot be reached from the current paths.
+        let dir = TempDir::new("gate-relocation-moved-unreachable");
+        let (placement, coord, _transaction) = recorded(&dir, Phase::Applying);
+        let moved = moved_to(&dir, &placement, None);
+        fs::remove_dir_all(coord.dir()).unwrap();
+        let located = || Ok(moved.clone());
+        let runner = Runner::new(true, Ok(RecoveryReport::RolledBack));
+        let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+        assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_eq!(runner.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_moved_install_with_a_terminal_journal_is_checked_against_the_journal() {
+        for (damaged, proceeds) in [(false, true), (true, false)] {
+            let dir = TempDir::new("gate-relocation-moved-terminal");
+            let (placement, _coord, _transaction) = recorded(&dir, Phase::RolledBack);
+            let moved = moved_to(&dir, &placement, None);
+            if damaged {
+                fs::write(moved.install_root.join("a.dll"), b"???").unwrap();
+            }
+            let located = || Ok(moved.clone());
+            let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+            let outcome = gate_with_relocation(Some(&moved.install_root), &located, &runner, GATE_WAIT);
+            assert_eq!(matches!(outcome, GateOutcome::Proceed(_)), proceeds, "damaged={damaged}: {outcome:?}");
+            assert_eq!(runner.calls.get(), 0);
+        }
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
