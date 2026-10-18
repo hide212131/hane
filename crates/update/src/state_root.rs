@@ -261,8 +261,12 @@ pub fn read_environment(
     transaction: &TransactionId,
 ) -> Result<Vec<(String, String)>> {
     let path = environment_path(coordination, transaction);
-    if fs::symlink_metadata(&path).is_err() {
-        return Ok(Vec::new());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        // Only a genuinely absent record means "no variables"; any other
+        // metadata failure (I/O, ACL) must not be mistaken for an empty one.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
     }
     let bytes = read_private(&path, ENVIRONMENT_LIMIT, "the child environment")?;
     let document: ChildEnvironment = parse_strict(&bytes)?;
@@ -839,6 +843,23 @@ mod tests {
         fx.write_private(ENVIRONMENT_FILE, &vec![b' '; 20_000]);
         assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
         fx.write_private(ENVIRONMENT_FILE, b"not json");
+        assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_environment_record_is_not_an_empty_one() {
+        let fx = fixture();
+        // Absent is the only "no variables" case.
+        assert!(read_environment(&fx.coordination, &fx.transaction).unwrap().is_empty());
+
+        // Make the record's metadata fail with something other than NotFound:
+        // its parent is a plain file, so the lookup ends in ENOTDIR.
+        let dir = fx.coordination.transaction_dir(&fx.transaction);
+        fs::remove_dir_all(&dir).unwrap();
+        fs::write(&dir, b"not a directory").unwrap();
+        let err = fs::symlink_metadata(dir.join(ENVIRONMENT_FILE)).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
     }
 
