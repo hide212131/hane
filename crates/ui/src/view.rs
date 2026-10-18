@@ -3423,6 +3423,10 @@ impl EditorView {
         }
         self.settings_category = category;
         self.pending_settings_drop = None;
+        // Moving on settles any save-then-leave intent that is still in
+        // flight; a late save completion must not route again.
+        self.ai_settings.cancel_pending_leave();
+        self.ai_prompts.cancel_pending_leave();
         window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }

@@ -331,7 +331,7 @@ impl AiSettingsPage {
                         if view
                             .update(cx, move |view, cx| {
                                 let snapshot = snapshot_service.snapshot();
-                                view.ai_settings.apply_snapshot(snapshot);
+                                view.ai_settings.apply_snapshot(snapshot, cx);
                                 cx.notify();
                             })
                             .is_err()
@@ -405,7 +405,11 @@ impl AiSettingsPage {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: AiSnapshot) {
+    /// A save that finished while the user kept editing must not be taken as
+    /// permission to leave: the current inputs are compared with the newly
+    /// saved settings, and leaving is only offered again (with the pending
+    /// drop kept by the view) when something unsaved remains.
+    fn apply_snapshot(&mut self, snapshot: AiSnapshot, cx: &App) {
         self.snapshot = snapshot;
         if let Some((operation, target)) = self.save_then_leave
             && self.snapshot.busy.is_none()
@@ -422,8 +426,17 @@ impl AiSettingsPage {
             )
         {
             self.save_then_leave = None;
-            self.route_ready = Some(target);
+            if self.is_dirty(cx) {
+                self.leave_prompt = Some(target);
+            } else {
+                self.route_ready = Some(target);
+            }
         }
+    }
+
+    /// Drops a save-then-leave intent that a newer decision superseded.
+    pub(super) fn cancel_pending_leave(&mut self) {
+        self.save_then_leave = None;
     }
 
     pub(super) fn is_dirty(&self, cx: &App) -> bool {
@@ -568,6 +581,7 @@ impl AiSettingsPage {
     }
 
     pub(super) fn confirm_leave(&mut self, target: LeaveTarget) {
+        self.save_then_leave = None;
         self.leave_prompt = Some(target);
     }
 
@@ -3441,6 +3455,7 @@ impl AiSettingsPage {
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| {
                     view.ai_settings.leave_prompt = None;
+                    view.ai_settings.cancel_pending_leave();
                     view.cancel_pending_settings_drop();
                     cx.notify();
                 })

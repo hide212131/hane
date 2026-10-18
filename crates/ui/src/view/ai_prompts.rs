@@ -407,8 +407,15 @@ impl AiPromptsPage {
                 }
                 self.selected = self.selected.min(self.draft.len().saturating_sub(1));
                 self.message = None;
+                // Saving is not permission to leave: edits made while the
+                // save was in flight are still unsaved, so ask again and
+                // keep the held drop instead of closing the settings.
                 if let Some(target) = self.pending_target.take() {
-                    self.route_ready = Some(target);
+                    if self.is_dirty(cx) {
+                        self.leave_prompt = Some(target);
+                    } else {
+                        self.route_ready = Some(target);
+                    }
                 }
             }
             Err(error) => {
@@ -418,7 +425,13 @@ impl AiPromptsPage {
         }
     }
 
+    /// Drops a save-then-leave intent that a newer decision superseded.
+    pub(super) fn cancel_pending_leave(&mut self) {
+        self.pending_target = None;
+    }
+
     pub(super) fn confirm_leave(&mut self, target: LeaveTarget) {
+        self.pending_target = None;
         self.leave_prompt = Some(target);
     }
 
@@ -693,6 +706,7 @@ impl AiPromptsPage {
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| {
                     view.ai_prompts.leave_prompt = None;
+                    view.ai_prompts.cancel_pending_leave();
                     view.cancel_pending_settings_drop();
                     cx.notify();
                 })
@@ -1181,6 +1195,92 @@ mod tests {
                 view.pending_settings_drop,
                 Some(ExternalDropTarget::Open(single[0].clone()))
             );
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn edits_made_during_a_save_then_leave_keep_settings_and_the_held_drop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-save-edit", true);
+        drop_two(&view, cx);
+        // Start 「保存して移動」, then keep typing before the save completes.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts.save(cx, Some(LeaveTarget::Close));
+                assert!(view.ai_prompts.busy, "the save must be in flight here");
+                set_value(
+                    view.ai_prompts.title_input.as_ref().unwrap(),
+                    "保存後に続けた編集",
+                    window,
+                    cx,
+                );
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, app| {
+            assert!(view.settings_open, "unsaved continued edits keep settings open");
+            assert_eq!(view.status, None, "the held drop must not be applied yet");
+            assert_eq!(
+                view.pending_settings_drop,
+                Some(ExternalDropTarget::TooMany),
+                "the held drop must survive"
+            );
+            assert_eq!(view.ai_prompts.leave_prompt, Some(LeaveTarget::Close));
+            assert!(view.ai_prompts.is_dirty(app));
+            assert_eq!(
+                value(view.ai_prompts.title_input.as_ref().unwrap(), app),
+                "保存後に続けた編集"
+            );
+        });
+
+        // Saving the latest edit now allows the leave, applying the drop once.
+        view.update(cx, |view, cx| {
+            view.ai_prompts.save(cx, Some(LeaveTarget::Close));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.settings_open);
+            assert_eq!(view.status.as_deref(), Some("Drop one item at a time"));
+            assert!(view.pending_settings_drop.is_none());
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn continue_editing_during_a_save_then_leave_does_not_close_later(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-save-stay", true);
+        drop_two(&view, cx);
+        cx.update(|_, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts.save(cx, Some(LeaveTarget::Close));
+                // Same steps as the 「編集を続ける」 button.
+                view.ai_prompts.leave_prompt = None;
+                view.ai_prompts.cancel_pending_leave();
+                view.cancel_pending_settings_drop();
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.settings_open, "a stale save must not close the settings");
+            assert!(view.ai_prompts.leave_prompt.is_none());
+            assert_eq!(view.status, None);
+        });
+
+        // An ordinary leave later must not revive the cancelled drop.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.close_settings(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.settings_open);
+            assert_eq!(view.status, None, "the cancelled drop must not apply");
         });
         let _ = std::fs::remove_dir_all(&root);
     }
