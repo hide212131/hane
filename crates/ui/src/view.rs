@@ -97,7 +97,7 @@ mod app_update;
 pub use app_update::{
     AiLifecycle, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, ExternalOpenOutcome,
     ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation, RestartPreparation,
-    RestartTicketFile, RestartTicketSnapshot,
+    RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
 };
 mod ai_settings;
 mod background_parse;
@@ -864,6 +864,8 @@ pub struct EditorView {
     /// Counts paths accepted through the shared external-open entrance, so a
     /// restart observation can tell an open arrived after it was taken.
     external_open_generation: u64,
+    /// Documents received from outside that the window has not accepted yet.
+    external_open_inbox: Option<SharedExternalOpenQueue>,
     /// Save As dialogs currently open (they outlive any single UI turn).
     save_as_dialogs_open: usize,
     /// The AI service handle the restart check reads busy state from.
@@ -1760,6 +1762,7 @@ impl EditorView {
             app_update_polling: false,
             restart_freeze: false,
             external_open_generation: 0,
+            external_open_inbox: None,
             save_as_dialogs_open: 0,
             restart_ai_service: None,
             #[cfg(test)]

@@ -29,7 +29,7 @@ pub use instrument::InstrumentationConfig;
 pub use view::{
     AiLifecycle, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
     ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
-    RestartPreparation, RestartTicketFile, RestartTicketSnapshot,
+    RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
 };
 
 /// Tracks the settings component setup once per GPUI application.

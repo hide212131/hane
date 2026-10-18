@@ -281,17 +281,21 @@ fn start_ai_service() -> Option<AiService> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) type FinderSender = std::sync::mpsc::Sender<PathBuf>;
+pub(crate) type FinderSender = hane_ui::SharedExternalOpenQueue;
 #[cfg(not(target_os = "macos"))]
 pub(crate) type FinderSender = ();
+// Both ends share one queue. The window reads it during the final update
+// restart check, so a document that arrives after the restart ticket was
+// written keeps the old process running instead of being dropped with it.
 #[cfg(target_os = "macos")]
-pub(crate) type FinderReceiver = std::sync::mpsc::Receiver<PathBuf>;
+pub(crate) type FinderReceiver = hane_ui::SharedExternalOpenQueue;
 #[cfg(not(target_os = "macos"))]
 pub(crate) type FinderReceiver = ();
 
 #[cfg(target_os = "macos")]
 pub(crate) fn finder_channel() -> (FinderSender, FinderReceiver) {
-    std::sync::mpsc::channel::<PathBuf>()
+    let queue = hane_ui::SharedExternalOpenQueue::new();
+    (queue.clone(), queue)
 }
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn finder_channel() -> (FinderSender, FinderReceiver) {
@@ -315,7 +319,13 @@ pub(crate) fn application_with_finder_open(
             .iter()
             .filter_map(|url| finder_open::markdown_path_from_url(url))
         {
-            let _ = sender.send(path);
+            // A folder is never opened from Finder: that would replace the
+            // sessions without the dirty-file guard `open_path` applies to
+            // documents.
+            if path.is_dir() {
+                continue;
+            }
+            sender.push(path);
         }
     });
     application
@@ -640,6 +650,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                     view.attach_ai_service(ai_service_handle.clone(), cx);
                     view.attach_ai_lifecycle(Some(ai_lifecycle.clone()));
                     view.attach_app_update(update_controller.clone());
+                    #[cfg(target_os = "macos")]
+                    view.attach_external_open_inbox(Some(finder_requests.clone()));
                     if let Some(version) = update_completed.as_deref() {
                         // Only a process started by a committed update gets
                         // this; an ordinary launch never shows it.
@@ -701,20 +713,16 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         // for an update restart check stays queued and is retried.
         let mut prompt_pending = needs_default_prompt && cfg!(not(feature = "instrument"));
         let started = std::time::Instant::now();
-        let mut pending = hane_ui::ExternalOpenQueue::new();
+        // The queue is shared with the view and a document leaves it only once
+        // the view accepted it, so the final restart check can see (and keep
+        // the process running for) a document that is still waiting.
+        let pending = finder_requests;
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(40))
                 .await;
-            while let Ok(path) = finder_requests.try_recv() {
+            if !pending.is_empty() {
                 prompt_pending = false;
-                // A folder is never opened from Finder: that would replace
-                // the sessions without the dirty-file guard `open_path`
-                // applies to documents.
-                if path.is_dir() {
-                    continue;
-                }
-                pending.push(path);
             }
             if !pending.is_empty()
                 && window

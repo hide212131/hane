@@ -415,7 +415,72 @@ impl ExternalOpenQueue {
     }
 }
 
+/// An [`ExternalOpenQueue`] shared between the platform callback that receives
+/// documents (Finder) and the window. The window also reads it during the final
+/// restart coordination, so a document that arrived after the restart ticket
+/// was written cannot be dropped with this process: the restart is given up
+/// while any request is still waiting here.
+#[derive(Clone, Debug, Default)]
+pub struct SharedExternalOpenQueue {
+    inner: Arc<std::sync::Mutex<ExternalOpenQueue>>,
+}
+
+impl SharedExternalOpenQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ExternalOpenQueue> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn push(&self, path: PathBuf) {
+        self.lock().push(path);
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Like [`ExternalOpenQueue::drain_into`], but the lock is not held while
+    /// `accept` runs (it may look at this queue again). A request leaves the
+    /// queue only after it was accepted.
+    pub fn drain_into(&self, mut accept: impl FnMut(&Path) -> ExternalOpenOutcome) -> usize {
+        let mut accepted = 0;
+        loop {
+            let Some(path) = self.lock().pending.front().cloned() else {
+                break;
+            };
+            match accept(&path) {
+                ExternalOpenOutcome::Accepted => {
+                    self.lock().pending.pop_front();
+                    accepted += 1;
+                }
+                ExternalOpenOutcome::Busy => break,
+            }
+        }
+        accepted
+    }
+}
+
 impl EditorView {
+    /// Installs the queue the platform fills with documents from outside
+    /// (Finder). The final restart check treats a waiting request as a reason
+    /// to keep this process running.
+    pub fn attach_external_open_inbox(&mut self, inbox: Option<SharedExternalOpenQueue>) {
+        self.external_open_inbox = inbox;
+    }
+
+    fn external_open_waiting(&self) -> bool {
+        self.external_open_inbox
+            .as_ref()
+            .is_some_and(|inbox| !inbox.is_empty())
+    }
+
     /// Installs the app-owned update service handle. Attaching sends no
     /// request; the service only communicates after an explicit button press.
     pub fn attach_app_update(&mut self, controller: Option<Arc<dyn AppUpdateController>>) {
@@ -997,7 +1062,11 @@ struct ViewExit<'a, 'c> {
 
 impl ExitSteps for ViewExit<'_, '_> {
     fn permit_is_fresh(&self) -> bool {
+        // A document that reached the queue after the ticket was written is
+        // not in the ticket and the old process cannot hand it over. Keep
+        // running; the request stays queued and opens once the freeze ends.
         self.view.restart_observation_is_current(self.observation)
+            && !self.view.external_open_waiting()
     }
 
     fn issue_ticket(&mut self) -> Result<(), String> {
@@ -1723,6 +1792,84 @@ mod tests {
         });
         assert_eq!(calls, ["abort"]);
         assert!(!frozen);
+    }
+
+    /// Stops the AI like [`LoggingAi`], and a Finder document arrives while it
+    /// waits (the UI thread is blocked, so nothing can drain the queue).
+    struct FinderOpenDuringStop {
+        log: CallLog,
+        inbox: SharedExternalOpenQueue,
+        path: PathBuf,
+    }
+
+    impl AiLifecycle for FinderOpenDuringStop {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            self.log.lock().unwrap().push("stop_ai");
+            self.inbox.push(self.path.clone());
+            Ok(())
+        }
+        fn resume(&self) -> Option<hane_ai::AiServiceHandle> {
+            self.log.lock().unwrap().push("resume_ai");
+            None
+        }
+    }
+
+    #[gpui::test]
+    fn a_finder_open_received_while_the_ai_stops_keeps_the_app_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "hane-app-update-finder-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, "double clicked\n").unwrap();
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let inbox = SharedExternalOpenQueue::new();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let ai: Arc<dyn AiLifecycle> = Arc::new(FinderOpenDuringStop {
+            log: log.clone(),
+            inbox: inbox.clone(),
+            path: path.clone(),
+        });
+        view.update(cx, |view, _| {
+            view.attach_ai_lifecycle(Some(ai));
+            view.attach_external_open_inbox(Some(inbox.clone()));
+        });
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        let prepared: Box<dyn PreparedUpdate> = Box::new(LoggingPrepared(log.clone()));
+        view.update(cx, |view, cx| {
+            view.restart_in_progress = true;
+            view.continue_update_restart(Ok(prepared), observation, ticket, cx);
+        });
+
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            !calls.contains(&"authorize"),
+            "the helper must not be released while a document is unhandled: {calls:?}"
+        );
+        assert!(calls.contains(&"abort"));
+        assert!(calls.contains(&"resume_ai"));
+        view.read_with(cx, |view, _| {
+            assert!(!view.restart_freeze_active(), "the user can retry");
+            assert!(!view.restart_in_progress);
+        });
+        assert_eq!(inbox.len(), 1, "the document is still waiting, not lost");
+
+        // Once the freeze is gone the waiting document opens in this process.
+        let accepted = view.update(cx, |view, cx| {
+            inbox.drain_into(|path| view.submit_external_open(path, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(accepted, 1);
+        assert!(inbox.is_empty());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "double clicked\n");
+        });
+        std::fs::remove_file(path).unwrap();
     }
 
     #[gpui::test]
