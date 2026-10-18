@@ -870,6 +870,10 @@ pub struct EditorView {
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
+    /// A drop held behind an unsaved-settings leave confirmation. It is
+    /// applied once, when the settings actually close (save succeeded or
+    /// discarded), and dropped on any other navigation.
+    pending_settings_drop: Option<ExternalDropTarget>,
     settings_error: Option<String>,
     recent: RecentFiles,
     /// The Markdown index of the directory this window was opened onto, if
@@ -1742,6 +1746,7 @@ impl EditorView {
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
+            pending_settings_drop: None,
             settings_error: None,
             recent,
             work_folder: None,
@@ -3111,13 +3116,17 @@ impl EditorView {
         if self.settings_open && target != ExternalDropTarget::Ignore {
             // Return to the editor first so the opened document or the
             // refusal is visible, through the same leave rule as the back
-            // button. Unsaved settings edits keep their leave confirmation
-            // and the drop is not applied behind it.
-            self.request_leave_settings(window, cx);
-            if self.settings_open {
-                return;
-            }
+            // button. Unsaved settings edits keep their leave confirmation;
+            // the latest drop is held and applied by `close_settings` once
+            // the leave really happens.
+            self.pending_settings_drop = Some(target);
+            self.leave_settings(window, cx);
+            return;
         }
+        self.apply_external_drop(target, cx);
+    }
+
+    fn apply_external_drop(&mut self, target: ExternalDropTarget, cx: &mut Context<Self>) {
         match target {
             ExternalDropTarget::Open(path) => self.open_path(&path, cx),
             ExternalDropTarget::TooMany => {
@@ -3384,6 +3393,9 @@ impl EditorView {
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle, cx);
         cx.notify();
+        if let Some(target) = self.pending_settings_drop.take() {
+            self.apply_external_drop(target, cx);
+        }
     }
 
     pub(crate) fn handle_settings_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3410,11 +3422,23 @@ impl EditorView {
             self.ai_settings.activate(cx);
         }
         self.settings_category = category;
+        self.pending_settings_drop = None;
         window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
 
+    /// Ordinary leave request (back button, Escape): any held drop belongs to
+    /// an earlier request and is cancelled.
     fn request_leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_settings_drop = None;
+        self.leave_settings(window, cx);
+    }
+
+    pub(crate) fn cancel_pending_settings_drop(&mut self) {
+        self.pending_settings_drop = None;
+    }
+
+    fn leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.settings_category {
             SettingsCategory::Connection if self.ai_settings.is_dirty(cx) => {
                 self.ai_settings
@@ -3436,6 +3460,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         if self.settings_category != category {
+            self.pending_settings_drop = None;
             match self.settings_category {
                 SettingsCategory::Connection if self.ai_settings.is_dirty(cx) => {
                     self.ai_settings

@@ -3441,6 +3441,7 @@ impl AiSettingsPage {
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| {
                     view.ai_settings.leave_prompt = None;
+                    view.cancel_pending_settings_drop();
                     cx.notify();
                 })
             });

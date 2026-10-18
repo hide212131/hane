@@ -693,6 +693,7 @@ impl AiPromptsPage {
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| {
                     view.ai_prompts.leave_prompt = None;
+                    view.cancel_pending_settings_drop();
                     cx.notify();
                 })
             });
@@ -818,7 +819,7 @@ impl EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view::SettingsCategory;
+    use crate::view::{ExternalDropTarget, SettingsCategory};
     use gpui::px;
 
     // Regression for a saved draft resetting `selected` to the first prompt
@@ -1018,6 +1019,160 @@ mod tests {
             Some(LeaveTarget::Category(SettingsCategory::Connection))
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn dirty_prompts_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        name: &str,
+        valid_title: bool,
+    ) -> (
+        gpui::Entity<EditorView>,
+        std::path::PathBuf,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let root = std::env::temp_dir().join(format!("hane-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+        let title = if valid_title { "編集中の指示" } else { "" };
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Prompts;
+            view.ai_prompts.root = Some(root.clone());
+            view.ai_prompts.loaded = true;
+            view.ai_prompts.load_error = None;
+            view.ai_prompts.revision = 0;
+            view.ai_prompts.baseline = vec![UserPromptDraft {
+                id: None,
+                title: "指示".to_owned(),
+                prompt: "指示の内容".to_owned(),
+            }];
+            view.ai_prompts.draft = vec![UserPromptDraft {
+                id: None,
+                title: title.to_owned(),
+                prompt: "指示の内容".to_owned(),
+            }];
+            view.ai_prompts.selected = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, root, cx)
+    }
+
+    fn drop_two(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) {
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/hane-drop-a.md"),
+            std::path::PathBuf::from("/tmp/hane-drop-b.md"),
+        ];
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.handle_external_drop(&paths, window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_drop_behind_dirty_prompts_is_applied_once_after_discard(cx: &mut gpui::TestAppContext) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-discard", true);
+        drop_two(&view, cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.settings_open);
+            assert_eq!(view.ai_prompts.leave_prompt, Some(LeaveTarget::Close));
+            assert_eq!(view.status, None);
+        });
+
+        // Same steps as the 「破棄して移動」 button.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts.leave_prompt = None;
+                view.ai_prompts.draft = view.ai_prompts.baseline.clone();
+                view.close_settings(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.settings_open);
+            assert_eq!(view.status.as_deref(), Some("Drop one item at a time"));
+            assert!(view.pending_settings_drop.is_none());
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn continue_editing_cancels_the_held_drop(cx: &mut gpui::TestAppContext) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-continue", true);
+        drop_two(&view, cx);
+        // Same steps as the 「編集を続ける」 button.
+        view.update(cx, |view, cx| {
+            view.ai_prompts.leave_prompt = None;
+            view.cancel_pending_settings_drop();
+            cx.notify();
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.close_settings(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.settings_open);
+            assert_eq!(view.status, None, "the cancelled drop must not apply");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_drop_behind_dirty_prompts_is_applied_after_save_and_not_on_validation_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-save-fail", false);
+        drop_two(&view, cx);
+        view.update(cx, |view, cx| {
+            view.ai_prompts.save(cx, Some(LeaveTarget::Close));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.settings_open, "validation failure keeps settings open");
+            assert_eq!(view.status, None);
+        });
+
+        view.update(cx, |view, cx| {
+            view.ai_prompts.draft[0].title = "保存できる指示".to_owned();
+            view.ai_prompts.save(cx, Some(LeaveTarget::Close));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.settings_open);
+            assert_eq!(view.status.as_deref(), Some("Drop one item at a time"));
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_later_drop_replaces_the_held_one_and_empty_is_ignored(cx: &mut gpui::TestAppContext) {
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-replace", true);
+        drop_two(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.handle_external_drop(&[], window, cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.pending_settings_drop,
+                Some(ExternalDropTarget::TooMany),
+                "an empty drop must not touch the held request"
+            );
+        });
+        let single = vec![std::path::PathBuf::from("/tmp/hane-drop-c.md")];
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.handle_external_drop(&single, window, cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.pending_settings_drop,
+                Some(ExternalDropTarget::Open(single[0].clone()))
+            );
+        });
         let _ = std::fs::remove_dir_all(&root);
     }
 
