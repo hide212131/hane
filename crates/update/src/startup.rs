@@ -640,18 +640,17 @@ fn retire_settled_record(
 
 /// Retires the verified-terminal record. A concurrent start may have retired the
 /// same record between our read and our startup lease; the terminal journal and
-/// the disk were already verified under the lease, so a record that is now
-/// absent is already retired. Any other failure keeps the start stopped.
+/// the disk were already verified under the lease, so a removal that finds the
+/// record missing (`NotFound`) means it is already retired. Any other failure,
+/// even when the record is no longer visible (e.g. a flush that failed after
+/// the removal), keeps the start stopped.
 fn retire_or_already_retired(
     dir: &Path,
     retire: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<()> {
     match retire(dir) {
-        Ok(()) => Ok(()),
-        Err(err) => match relocation::read(dir) {
-            Ok(None) => Ok(()),
-            _ => Err(err),
-        },
+        Err(err) if err.code != ErrorCode::NotFound => Err(err),
+        _ => Ok(()),
     }
 }
 
@@ -2004,7 +2003,7 @@ mod tests {
             // the removal finds nothing left to remove.
             let racing = |dir: &Path| {
                 relocation::retire(dir)?;
-                Err(UpdateError::new(ErrorCode::Io, "not found"))
+                Err(UpdateError::new(ErrorCode::NotFound, "not found"))
             };
             let located = || Ok(current.clone());
             let outcome = gate_with_relocation_using(
@@ -2015,6 +2014,32 @@ mod tests {
                 &racing,
             );
             assert!(matches!(outcome, GateOutcome::Proceed(_)), "moved={moved_install}: {outcome:?}");
+            assert!(!record_present(&current));
+        }
+    }
+
+    #[test]
+    fn a_retirement_failure_after_the_record_is_gone_still_stops_the_start() {
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        for moved_install in [true, false] {
+            let dir = TempDir::new("gate-relocation-retire-flush-fail");
+            let (placement, _coord, _transaction) = recorded(&dir, Phase::Committed);
+            settle_disk(&placement, Phase::Committed);
+            let current = if moved_install { moved_to(&dir, &placement, None) } else { placement.clone() };
+            // The removal happened, then the directory flush failed.
+            let flush_fails = |dir: &Path| {
+                relocation::retire(dir)?;
+                Err(UpdateError::new(ErrorCode::Io, "directory flush failed"))
+            };
+            let located = || Ok(current.clone());
+            let outcome = gate_with_relocation_using(
+                Some(&current.install_root),
+                &located,
+                &runner,
+                GATE_WAIT,
+                &flush_fails,
+            );
+            assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "moved={moved_install}: {outcome:?}");
             assert!(!record_present(&current));
         }
     }

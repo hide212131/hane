@@ -160,8 +160,15 @@ fn retire_with(
     remove: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> Result<()> {
     remove(&record_path(install_root)).map_err(|err| {
+        // A missing record stays distinguishable: only the removal itself
+        // finding nothing left (`NotFound`) can mean another start retired it.
+        let code = if err.kind() == std::io::ErrorKind::NotFound {
+            ErrorCode::NotFound
+        } else {
+            ErrorCode::Io
+        };
         UpdateError::new(
-            ErrorCode::Io,
+            code,
             format!("the relocation record could not be retired durably: {err}"),
         )
     })
@@ -183,6 +190,8 @@ mod tests {
         let err = retire_with(&root, &|_| Err(std::io::Error::other("flush failed"))).unwrap_err();
         assert_eq!(err.code, ErrorCode::Io);
         assert!(read(&root).unwrap().is_some());
+        let missing = retire_with(&root, &|_| Err(std::io::ErrorKind::NotFound.into())).unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
         retire(&root).unwrap();
         assert_eq!(read(&root).unwrap(), None);
     }
