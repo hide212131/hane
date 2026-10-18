@@ -445,12 +445,6 @@ impl AiSettingsPage {
         self.route_ready = None;
     }
 
-    /// Makes the form report unsaved changes (restart-check tests only).
-    #[cfg(test)]
-    pub(super) fn force_dirty_for_test(&mut self) {
-        self.forced_dirty_for_test = true;
-    }
-
     pub(super) fn is_dirty(&self, cx: &App) -> bool {
         #[cfg(test)]
         if self.forced_dirty_for_test {
@@ -3639,6 +3633,14 @@ fn models_hash(value: &str) -> u64 {
     value.bytes().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
     })
+}
+
+#[cfg(test)]
+impl AiSettingsPage {
+    /// Makes the form report unsaved changes (restart-check tests only).
+    pub(super) fn force_dirty_for_test(&mut self) {
+        self.forced_dirty_for_test = true;
+    }
 }
 
 #[cfg(test)]
