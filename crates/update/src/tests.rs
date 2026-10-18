@@ -579,7 +579,7 @@ fn concurrent_sequence_updates_never_lower_the_stored_floor() {
         );
         let mut writer = FileSeenStore::new(path.clone());
         writer
-            .store(&SeenCatalog::new(11, new.catalog_sha256.clone()))
+            .store(&SeenCatalog::new(11, new.catalog_sha256().to_owned()))
             .unwrap();
         drop(guard);
         let result = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
