@@ -633,9 +633,26 @@ fn retire_settled_record(
     if check_terminal(&coordination, record.transaction.as_str(), &journal, &disk).is_some() {
         return None;
     }
-    let result = retire(dir);
+    let result = retire_or_already_retired(dir, retire);
     startup.release();
     result.err().map(|err| stop(&err))
+}
+
+/// Retires the verified-terminal record. A concurrent start may have retired the
+/// same record between our read and our startup lease; the terminal journal and
+/// the disk were already verified under the lease, so a record that is now
+/// absent is already retired. Any other failure keeps the start stopped.
+fn retire_or_already_retired(
+    dir: &Path,
+    retire: &dyn Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    match retire(dir) {
+        Ok(()) => Ok(()),
+        Err(err) => match relocation::read(dir) {
+            Ok(None) => Ok(()),
+            _ => Err(err),
+        },
+    }
 }
 
 fn relocated_gate(
@@ -682,7 +699,7 @@ fn relocated_gate(
             }
             // The receipt is settled and matches the disk: the record has
             // served its purpose. Without a durable removal the start stops.
-            let retired = retire(dir);
+            let retired = retire_or_already_retired(dir, retire);
             startup.release();
             if let Err(err) = retired {
                 return Done(stop(&err));
@@ -1973,6 +1990,33 @@ mod tests {
         );
         assert!(matches!(outcome, GateOutcome::RecoveryRequired(_)), "{outcome:?}");
         assert!(record_present(&placement));
+    }
+
+    #[test]
+    fn a_record_retired_by_a_concurrent_start_is_already_retired() {
+        let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+        for moved_install in [true, false] {
+            let dir = TempDir::new("gate-relocation-retire-concurrent");
+            let (placement, _coord, _transaction) = recorded(&dir, Phase::Committed);
+            settle_disk(&placement, Phase::Committed);
+            let current = if moved_install { moved_to(&dir, &placement, None) } else { placement.clone() };
+            // The other start retired the record after this start had read it:
+            // the removal finds nothing left to remove.
+            let racing = |dir: &Path| {
+                relocation::retire(dir)?;
+                Err(UpdateError::new(ErrorCode::Io, "not found"))
+            };
+            let located = || Ok(current.clone());
+            let outcome = gate_with_relocation_using(
+                Some(&current.install_root),
+                &located,
+                &runner,
+                GATE_WAIT,
+                &racing,
+            );
+            assert!(matches!(outcome, GateOutcome::Proceed(_)), "moved={moved_install}: {outcome:?}");
+            assert!(!record_present(&current));
+        }
     }
 
     #[test]
