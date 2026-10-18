@@ -782,8 +782,9 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
 
 #[cfg(test)]
 mod ownership_claim_tests {
-    use super::claim_after_ownership;
+    use super::{claim_after_ownership, prioritize_explicit_file, update_restart};
     use std::cell::Cell;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn a_lost_ownership_race_leaves_the_ticket_unclaimed() {
