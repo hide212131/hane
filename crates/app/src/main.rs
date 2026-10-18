@@ -407,10 +407,13 @@ fn main() {
     }) else {
         return;
     };
-    if let Some((plan, version)) = recovered {
+    if let Some((mut plan, version)) = recovered {
         // Only a ticket this start claimed announces the committed version,
         // once; an explicit path argument keeps its own folder.
         if plan.is_some() {
+            if let (true, Some(plan), Some(path)) = (has_cli_path, plan.as_mut(), launch.path.as_deref()) {
+                prioritize_explicit_file(plan, path);
+            }
             if !has_cli_path
                 && let Some(folder) = plan.as_ref().and_then(|plan| plan.work_folder.clone())
             {
@@ -550,6 +553,17 @@ pub(crate) fn prepare_launch<T>(
         },
         claimed,
     ))
+}
+
+/// Makes an explicitly requested file the last restored one, so it is the
+/// file shown after the ticket's other files are restored. The other restored
+/// files are kept; a directory argument is its own work folder and is left alone.
+fn prioritize_explicit_file(plan: &mut update_restart::RestorePlan, explicit: &Path) {
+    if explicit.is_dir() {
+        return;
+    }
+    plan.files.retain(|file| file != explicit);
+    plan.files.push(explicit.to_path_buf());
 }
 
 /// Acquires `ownership` first and runs `claim` only if that succeeded.
@@ -783,6 +797,24 @@ mod ownership_claim_tests {
         );
         assert!(outcome.is_err());
         assert_eq!(claims.get(), 0, "the ticket stays for the owning instance");
+    }
+
+    #[test]
+    fn an_explicit_file_is_restored_last_over_the_ticket_files() {
+        let mut plan = update_restart::RestorePlan {
+            work_folder: None,
+            files: vec![PathBuf::from("/nope/a.md"), PathBuf::from("/nope/b.md")],
+            missing: Vec::new(),
+        };
+        prioritize_explicit_file(&mut plan, Path::new("/nope/a.md"));
+        assert_eq!(
+            plan.files,
+            vec![PathBuf::from("/nope/b.md"), PathBuf::from("/nope/a.md")],
+            "the explicit file is last (shown); other restored files are kept"
+        );
+        prioritize_explicit_file(&mut plan, Path::new("/nope/c.md"));
+        assert_eq!(plan.files.last(), Some(&PathBuf::from("/nope/c.md")));
+        assert_eq!(plan.files.len(), 3);
     }
 
     #[test]
