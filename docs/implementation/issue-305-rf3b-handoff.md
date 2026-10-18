@@ -15,7 +15,7 @@ Issue #305はOPENで、受入条件5件はすべて未チェック。設計PR #4
 - Issue #305本文はcurrent mainを古い`aab1dd5a...`と記載している。本文・チェック状態の更新はしていない。
 - PR #496: MERGED、head `14def973e496c39b503c006db21fd187718ad683`。CodeRabbit full reviewは最終headで完了し、actionable commentなし。
 - PR #495: MERGED、head `76d53cbf5b33a51ed91dfa259ced76403064872a`。OS別の文書端選択挙動を受け入れ済み。#497のC09がその挙動を保護する。
-- PR #497: OPEN / Draft、head `d2ebf5cfa98d9d35e470dde5f9d24cc20887da5f`、base `aab1dd5a28dc1383d34e09e0e2f01b634ad6301a`。current mainより14 commits behind / 24 ahead、GitHub merge state `CLEAN`。
+- PR #497: OPEN / Draft。GUI候補を確認したheadは`d2ebf5cfa98d9d35e470dde5f9d24cc20887da5f`、baseは`aab1dd5a28dc1383d34e09e0e2f01b634ad6301a`。そのheadではcurrent mainより14 commits behind / 24 ahead、GitHub merge state `CLEAN`だった。hand-off文書のcommitでPR headは進むため、次の作業前にGitHubのlive stateを読み直す。
 - `git merge-tree --write-tree origin/main HEAD` は競合なしでtree `e790e6a8247f1b5e809fc20ea74009e73edc5c78`を返した。
 - 前回確認したmain `71650a59...`からの差分は`docs/gui-test-recovery.md`の更新確認手順12行のみ（#522）。ChatGPTアプリの更新状態をGUI前に確認し、更新後はCUA接続を初期化してシナリオを再実行する文書変更で、製品コード変更はない。Windows側でもこの現行手順を確認した。
 - #501、#503、運用基盤専用PR #514もmainへmerge済み。
@@ -23,7 +23,7 @@ Issue #305はOPENで、受入条件5件はすべて未チェック。設計PR #4
 ## PR #497 の候補・レビュー・CI
 
 - 製品コード・テスト候補の基点: `a043ba76c9337eecbf1b78a88f8db8bac7cb502e`。ShortTextInputへのfilter/rename移行、M01〜M15、C01〜C09を含む。現在のPR head `d2ebf5c`には後続のhandoff文書更新があり、製品コード候補SHAは変わっていない。
-- current-head CI run [39082800146](https://github.com/hide212131/hane/actions/runs/39082800146) は`d2ebf5c`でmacOS / Windows workspace tests、OS別チェック、Clippyがsuccess。
+- GUI候補head `d2ebf5c`のCI run [39082800146](https://github.com/hide212131/hane/actions/runs/39082800146) はmacOS / Windows workspace tests、OS別チェック、Clippyがsuccess。handoff更新commit `38089b06bcae34a059a88a92fc30d34517abd038`に対するrun [39122500854](https://github.com/hide212131/hane/actions/runs/39122500854) も、両OSのworkspace tests・OS別check・Clippyがsuccess。この文書がさらに更新される場合、同runは新headのcurrent evidenceではなくなる。
 - 候補コードでの`view::input_routing::tests` 59件、`short_text_input::tests` 19件、および`cargo build --locked -p hane`成功記録がある。これらはnative GUI受入の代替ではない。
 - 利用者指定のCodex代替レビュー [5560801376](https://github.com/hide212131/hane/pull/497#pullrequestreview-5560801376) は`d2ebf5c`を対象に追加指摘なし。CodeRabbitはDraftのためskipで、CodeRabbit full reviewではない。
 
