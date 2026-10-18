@@ -732,9 +732,11 @@ mod tests {
 
     #[test]
     fn too_little_free_space_refuses_before_any_mutation() {
-        let fx = fixture();
-        let payload: u64 = fx.before.values().map(|data| data.len() as u64).sum();
+        let payload: u64 = fixture().before.values().map(|data| data.len() as u64).sum();
         for available in [Some(0), Some(JOURNAL_RESERVE_BYTES), Some(JOURNAL_RESERVE_BYTES + 1), None] {
+            // Each case gets its own fixture so a prior case's stage state
+            // cannot make the apply fail before the free-space check.
+            let fx = fixture();
             fx.space.0.set(available);
             let err = apply_owned_files(&fx.inputs()).err().unwrap();
             let expected = if available.is_some() { ErrorCode::InsufficientSpace } else { ErrorCode::Io };
@@ -747,6 +749,7 @@ mod tests {
             );
         }
         // Backups of everything plus the largest copy and the reserve suffice.
+        let fx = fixture();
         fx.space.0.set(Some(JOURNAL_RESERVE_BYTES + 2 * payload));
         let applied = apply_owned_files(&fx.inputs()).unwrap();
         assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
