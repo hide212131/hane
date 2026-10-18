@@ -234,6 +234,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
         crate::macos_apply::check_relocation_on_unsupported_volume(
             read_mark(bundle)?.as_deref(),
             &coordination_parent,
+            bundle,
         )?;
         return Err(if volume.read_only && volume.apfs && volume.local {
             unsupported("the install volume is read-only")
@@ -258,6 +259,7 @@ pub fn locate(exe: &Path) -> Result<Placement> {
         read_mark(bundle)?.as_deref(),
         &install_id,
         &coordination_parent,
+        bundle,
     )?;
     Ok(Placement {
         target: Target::MacosArm64,

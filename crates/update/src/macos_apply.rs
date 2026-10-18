@@ -213,6 +213,7 @@ pub fn check_relocation(
     mark: Option<&[u8]>,
     current: &InstallId,
     current_parent: &Path,
+    bundle: &Path,
 ) -> Result<()> {
     let Some(bytes) = mark else {
         return Ok(());
@@ -260,7 +261,9 @@ pub fn check_relocation(
         ));
     }
     match journal.phase {
-        Phase::Committed => Ok(()),
+        // The mark can outlive the commit, so the bundle that now runs must be
+        // exactly the one the committed journal recorded for `Hane.app`.
+        Phase::Committed => require_committed_bundle(&journal, bundle),
         // A rolled-back transaction was rejected by the health check, so the
         // marked bundle must still pass its recovery gate; it never authorizes
         // a normal start from another location.
@@ -275,6 +278,30 @@ pub fn check_relocation(
     }
 }
 
+/// A moved bundle may start on the strength of a `Committed` journal only if
+/// the journal has exactly one `Hane.app` step and the bundle at `bundle` is
+/// exactly that step's new identity. Anything else (no step, several steps, a
+/// different or unreadable bundle) fails closed.
+fn require_committed_bundle(journal: &UpdateJournal, bundle: &Path) -> Result<()> {
+    let refuse = |message: &'static str| UpdateError::new(ErrorCode::InstallModified, message);
+    let mut steps = journal.steps.iter().filter(|step| step.rel_path == BUNDLE_REL);
+    let (Some(step), None) = (steps.next(), steps.next()) else {
+        return Err(refuse(
+            "the committed journal does not name the bundle in exactly one step",
+        ));
+    };
+    let Some(expected) = &step.new else {
+        return Err(refuse("the committed journal records no new bundle identity"));
+    };
+    match bundle_identity(bundle) {
+        Ok(Observed::File(actual)) if &actual == expected => Ok(()),
+        Ok(_) => Err(refuse(
+            "the moved bundle differs from the bundle the committed journal recorded",
+        )),
+        Err(_) => Err(refuse("the identity of the moved bundle cannot be verified")),
+    }
+}
+
 /// Startup check for a bundle on a volume this updater does not support (not
 /// local APFS, or read-only). Such a placement is normally unmanaged, but a
 /// bundle carrying a relocation mark may have been moved off the volume in the
@@ -285,6 +312,7 @@ pub fn check_relocation(
 pub fn check_relocation_on_unsupported_volume(
     mark: Option<&[u8]>,
     current_parent: &Path,
+    bundle: &Path,
 ) -> Result<()> {
     let sentinel = InstallId::derive(&crate::identity::InstallFacts {
         os: "macos",
@@ -292,7 +320,7 @@ pub fn check_relocation_on_unsupported_volume(
         install_path: "unsupported-volume",
         owner: "unsupported-volume",
     })?;
-    check_relocation(mark, &sentinel, current_parent)
+    check_relocation(mark, &sentinel, current_parent, bundle)
 }
 
 pub fn valid_team_id(team_id: &str) -> bool {
@@ -1942,12 +1970,14 @@ mod tests {
         assert!(mark.is_some(), "the mark follows the bundle directory");
         assert_ne!(&moved_install_id(), fx.coordination.install_id());
         let parent = fx.placement.coordination_parent.clone();
-        let err = check_relocation(mark.as_deref(), &moved_install_id(), &parent).unwrap_err();
+        let err =
+            check_relocation(mark.as_deref(), &moved_install_id(), &parent, &moved).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified, "the moved bundle must stop");
         // At the original location the ordinary gate handles the same journal.
-        check_relocation(mark.as_deref(), fx.coordination.install_id(), &parent).unwrap();
+        check_relocation(mark.as_deref(), fx.coordination.install_id(), &parent, &moved).unwrap();
         // An unreadable mark is never ignored.
-        let err = check_relocation(Some(b"garbage"), &moved_install_id(), &parent).unwrap_err();
+        let err =
+            check_relocation(Some(b"garbage"), &moved_install_id(), &parent, &moved).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
     }
 
@@ -1978,12 +2008,14 @@ mod tests {
         .unwrap();
         assert!(!old_parent.exists());
 
-        let err = check_relocation(Some(&mark), &moved_install_id(), &current_parent).unwrap_err();
+        let err = check_relocation(Some(&mark), &moved_install_id(), &current_parent, &moved)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified, "the pending journal must stop it");
 
         // Nothing verifiable anywhere: refuse instead of treating it as safe.
         let empty = TempDir::new("relocation-empty");
-        let err = check_relocation(Some(&mark), &moved_install_id(), empty.path()).unwrap_err();
+        let err = check_relocation(Some(&mark), &moved_install_id(), empty.path(), &moved)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
     }
 
@@ -2004,20 +2036,23 @@ mod tests {
         .unwrap();
 
         // The journal is still pending (prepared, not terminal).
-        let err = check_relocation_on_unsupported_volume(Some(&mark), &parent).unwrap_err();
+        let live = fx.live().to_path_buf();
+        let err = check_relocation_on_unsupported_volume(Some(&mark), &parent, &live).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified, "pending must stop");
         // An unreadable mark and an unfindable journal fail closed too.
-        let err = check_relocation_on_unsupported_volume(Some(b"garbage"), &parent).unwrap_err();
+        let err =
+            check_relocation_on_unsupported_volume(Some(b"garbage"), &parent, &live).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
         let empty = TempDir::new("relocation-unsupported-empty");
-        let err = check_relocation_on_unsupported_volume(Some(&mark), empty.path()).unwrap_err();
+        let err =
+            check_relocation_on_unsupported_volume(Some(&mark), empty.path(), &live).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
         // No mark: a plainly unsupported placement is left to the caller.
-        check_relocation_on_unsupported_volume(None, &parent).unwrap();
+        check_relocation_on_unsupported_volume(None, &parent, &live).unwrap();
 
         // Once the transaction is terminal the marked bundle is no longer held.
         apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
-        check_relocation_on_unsupported_volume(Some(&mark), &parent).unwrap();
+        check_relocation_on_unsupported_volume(Some(&mark), &parent, &live).unwrap();
     }
 
     #[cfg(unix)]
@@ -2034,7 +2069,77 @@ mod tests {
         }
         .encode()
         .unwrap();
-        check_relocation(Some(&mark), &moved_install_id(), &current_parent).unwrap();
+        check_relocation(Some(&mark), &moved_install_id(), &current_parent, fx.live()).unwrap();
+    }
+
+    /// Builds the mark of the fixture's transaction for a committed update.
+    #[cfg(unix)]
+    fn committed_mark(fx: &Fixture) -> Vec<u8> {
+        RelocationMark {
+            install_id: fx.coordination.install_id().clone(),
+            transaction: fx.transaction.clone(),
+            coordination_parent: fx.placement.coordination_parent.clone(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// A leftover mark on a committed update lets a moved bundle start only
+    /// while it still is the bundle the journal recorded.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_bundle_with_a_committed_journal_must_match_the_journaled_identity() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+        assert_eq!(fx.stored().phase, Phase::Committed);
+        let parent = fx.placement.coordination_parent.clone();
+        let mark = committed_mark(&fx);
+
+        // The correct committed bundle starts.
+        check_relocation(Some(&mark), &moved_install_id(), &parent, fx.live()).unwrap();
+
+        // Damaged content (here: a changed seal file) after the move fails closed.
+        fs::write(fx.live().join(MAIN_EXE), b"tampered").unwrap();
+        let err = check_relocation(Some(&mark), &moved_install_id(), &parent, fx.live())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+
+        // A bundle whose identity cannot be computed fails closed too.
+        let missing = fx.live().with_file_name("Missing.app");
+        let err = check_relocation(Some(&mark), &moved_install_id(), &parent, &missing)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    /// A committed journal without exactly one `Hane.app` step authorizes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_journal_without_a_unique_bundle_step_fails_closed_after_relocation() {
+        let fx = fixture();
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+        let mark = committed_mark(&fx);
+        let parent = fx.placement.coordination_parent.clone();
+        let original = fx.stored();
+
+        let rewrite = |steps: Vec<crate::journal::JournalStep>| {
+            let mut journal = original.clone();
+            journal.steps = steps;
+            fs::write(fx.journal_path(), serde_json::to_vec(&journal).unwrap()).unwrap();
+            check_relocation(Some(&mark), &moved_install_id(), &parent, fx.live())
+        };
+
+        // Whether the journal itself or the relocation check refuses, it stops.
+        assert!(rewrite(Vec::new()).is_err(), "missing step");
+        let step = original.steps[0].clone();
+        assert!(rewrite(vec![step.clone(), step.clone()]).is_err(), "duplicate step");
+        let mut other = step.clone();
+        other.new = Some(crate::identity::FileIdentity::of(b"another bundle"));
+        assert!(rewrite(vec![other]).is_err(), "identity mismatch");
+        let mut none = step;
+        none.new = None;
+        assert!(rewrite(vec![none]).is_err(), "no new identity");
     }
 
     /// A rolled-back transaction was rejected by the health check; its marked
@@ -2054,9 +2159,11 @@ mod tests {
         }
         .encode()
         .unwrap();
-        let err = check_relocation(Some(&mark), &moved_install_id(), &parent).unwrap_err();
+        let err =
+            check_relocation(Some(&mark), &moved_install_id(), &parent, fx.live()).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
-        let err = check_relocation_on_unsupported_volume(Some(&mark), &parent).unwrap_err();
+        let err = check_relocation_on_unsupported_volume(Some(&mark), &parent, fx.live())
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
     }
 
@@ -2078,8 +2185,8 @@ mod tests {
         assert_eq!(RelocationMark::parse(&bytes).unwrap(), mark);
         // A leftover mark of a Committed transaction lets a moved bundle start.
         let parent = fx.placement.coordination_parent.clone();
-        check_relocation(Some(&bytes), &moved_install_id(), &parent).unwrap();
-        check_relocation(None, &moved_install_id(), &parent).unwrap();
+        check_relocation(Some(&bytes), &moved_install_id(), &parent, fx.live()).unwrap();
+        check_relocation(None, &moved_install_id(), &parent, fx.live()).unwrap();
     }
 
     /// The mark sits on the candidate directory, so after the exchange it is the
@@ -2178,7 +2285,8 @@ mod tests {
         assert_eq!(fx.host.syncs.get(), 1);
         let mark = fx.host.bundle_mark(fx.live()).unwrap();
         let parent = fx.placement.coordination_parent.clone();
-        let err = check_relocation(mark.as_deref(), &moved_install_id(), &parent).unwrap_err();
+        let err = check_relocation(mark.as_deref(), &moved_install_id(), &parent, fx.live())
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
     }
 
