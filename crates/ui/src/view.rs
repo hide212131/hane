@@ -38,6 +38,7 @@ use crate::line::{
     expected_block_disclosures, presented_block_with_table_projection, row_element,
 };
 use crate::shape::WindowShaper;
+use crate::short_text_input::{ShortTextInput, utf16_offset_from_byte};
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme, sync_component_theme};
 use gpui::{
     Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Edges,
@@ -89,7 +90,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use unicode_segmentation::UnicodeSegmentation;
 
 mod ai_prompts;
 mod ai_selection;
@@ -548,20 +548,9 @@ struct NewFolderOutcome {
 struct InlineRename {
     kind: InlineRenameKind,
     from: PathBuf,
-    text: String,
+    input: ShortTextInput,
     fixed_extension: Option<String>,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-    marked_range: Option<Range<usize>>,
-    composition: Option<InlineRenameComposition>,
     pending: bool,
-}
-
-#[derive(Clone, Debug)]
-struct InlineRenameComposition {
-    text: String,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
 }
 
 /// Snapshot of which document instance a tab-scoped action (the context
@@ -649,11 +638,26 @@ pub(crate) struct InlineRenameRenderState {
     pub(crate) marked_range: Option<Range<usize>>,
 }
 
-#[derive(Clone, Debug)]
-struct SidebarFilterComposition {
-    text: String,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
+/// Test fixture: a `ShortTextInput` holding `text` with `selected` (bytes on
+/// grapheme boundaries) selected in the given direction, prepared through the
+/// model's own operations only.
+#[cfg(test)]
+fn short_text_input_with(text: &str, selected: Range<usize>, reversed: bool) -> ShortTextInput {
+    let mut input = ShortTextInput::new(text.to_owned());
+    let (anchor, target) = if reversed {
+        (selected.end, selected.start)
+    } else {
+        (selected.start, selected.end)
+    };
+    input.set_caret_utf16(utf16_offset_from_byte(text, anchor));
+    for _ in 0..=text.len() {
+        if input.selected_range() == selected {
+            break;
+        }
+        input.move_horizontal(target > anchor, true);
+    }
+    assert_eq!(input.selected_range(), selected, "fixture selection");
+    input
 }
 
 fn inline_rename_parts(path: &Path, kind: InlineRenameKind) -> Option<(String, Option<String>)> {
@@ -719,97 +723,6 @@ fn stamp_ancestor_folders(
             (path.clone(), modified, sequence)
         })
         .collect()
-}
-
-fn byte_offset_from_utf16(text: &str, offset: usize) -> usize {
-    let mut utf16 = 0;
-    for (byte, character) in text.char_indices() {
-        if utf16 >= offset {
-            return byte;
-        }
-        utf16 += character.len_utf16();
-    }
-    text.len()
-}
-
-fn utf16_offset_from_byte(text: &str, offset: usize) -> usize {
-    let mut utf16 = 0;
-    for (byte, character) in text.char_indices() {
-        if byte >= offset {
-            break;
-        }
-        utf16 += character.len_utf16();
-    }
-    utf16
-}
-
-fn byte_range_from_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
-    byte_offset_from_utf16(text, range.start)..byte_offset_from_utf16(text, range.end)
-}
-
-fn inline_rename_selected_range(
-    replacement_start: usize,
-    replacement: &str,
-    selected_range_utf16: Option<Range<usize>>,
-    fallback: Range<usize>,
-) -> Range<usize> {
-    selected_range_utf16
-        .map(|selected| {
-            let selected_start = byte_offset_from_utf16(replacement, selected.start);
-            let selected_end = byte_offset_from_utf16(replacement, selected.end);
-            (replacement_start + selected_start)..(replacement_start + selected_end)
-        })
-        .unwrap_or(fallback)
-}
-
-fn range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
-    utf16_offset_from_byte(text, range.start)..utf16_offset_from_byte(text, range.end)
-}
-
-fn previous_inline_rename_boundary(text: &str, offset: usize) -> usize {
-    text[..offset]
-        .grapheme_indices(true)
-        .next_back()
-        .map_or(0, |(index, _)| index)
-}
-
-fn next_inline_rename_boundary(text: &str, offset: usize) -> usize {
-    text[offset..]
-        .grapheme_indices(true)
-        .nth(1)
-        .map_or(text.len(), |(index, _)| offset + index)
-}
-
-fn inline_rename_cursor(rename: &InlineRename) -> usize {
-    if rename.selection_reversed {
-        rename.selected_range.start
-    } else {
-        rename.selected_range.end
-    }
-}
-
-fn select_inline_rename_to(rename: &mut InlineRename, offset: usize) {
-    select_inline_rename_to_fields(
-        &mut rename.selected_range,
-        &mut rename.selection_reversed,
-        offset,
-    );
-}
-
-fn select_inline_rename_to_fields(
-    selected_range: &mut Range<usize>,
-    selection_reversed: &mut bool,
-    offset: usize,
-) {
-    if *selection_reversed {
-        selected_range.start = offset;
-    } else {
-        selected_range.end = offset;
-    }
-    if selected_range.end < selected_range.start {
-        *selection_reversed = !*selection_reversed;
-        *selected_range = selected_range.end..selected_range.start;
-    }
 }
 
 /// Which of the sidebar's two selection sources is currently shown
@@ -924,11 +837,7 @@ pub struct EditorView {
     /// The current file-name-only sidebar filter. It is deliberately kept as
     /// view state rather than in `WorkFolder`, because filtering is a display
     /// concern and must not change the discovered tree.
-    sidebar_filter: String,
-    sidebar_filter_selected_range: Range<usize>,
-    sidebar_filter_selection_reversed: bool,
-    sidebar_filter_marked_range: Option<Range<usize>>,
-    sidebar_filter_composition: Option<SidebarFilterComposition>,
+    sidebar_filter: ShortTextInput,
     /// The shared view focus handle is used by both the editor and sidebar
     /// inputs, so this bit identifies which text field currently owns it.
     sidebar_filter_focused: bool,
@@ -1603,26 +1512,36 @@ impl EditorView {
             return None;
         }
         Some(InlineRenameRenderState {
-            text: self.sidebar_filter.clone(),
+            text: self.sidebar_filter.text().to_owned(),
             selected_range: if self.sidebar_filter_focused {
-                self.sidebar_filter_selected_range.clone()
+                self.sidebar_filter.selected_range()
             } else {
                 0..0
             },
-            selection_reversed: self.sidebar_filter_selection_reversed,
+            selection_reversed: self.sidebar_filter.selection_reversed(),
             marked_range: self
                 .sidebar_filter_focused
-                .then(|| self.sidebar_filter_marked_range.clone())
+                .then(|| self.sidebar_filter.marked_range())
                 .flatten(),
         })
     }
 
-    pub(crate) fn set_text_input_bounds(&mut self, bounds: Bounds<Pixels>) {
+    /// Records the bounds the active short text field was laid out at and
+    /// returns whether its origin moved since the previous frame. The IME
+    /// candidate position derives from this origin, so the caller must ask the
+    /// platform to re-query it when it changes (sidebar resize, row move).
+    pub(crate) fn set_text_input_bounds(&mut self, bounds: Bounds<Pixels>) -> bool {
+        let previous = if self.inline_rename_active() {
+            self.inline_rename_input_bounds
+        } else {
+            self.sidebar_filter_input_bounds
+        };
         if self.inline_rename_active() {
             self.set_inline_rename_input_bounds(bounds);
-        } else if !self.inline_rename_active() {
+        } else {
             self.sidebar_filter_input_bounds = Some(bounds);
         }
+        previous.is_none_or(|previous| previous.origin != bounds.origin)
     }
 
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
@@ -1785,11 +1704,7 @@ impl EditorView {
             selected_folder: None,
             sidebar_focus: SidebarFocus::ActiveSession,
             expanded_folders: HashSet::new(),
-            sidebar_filter: String::new(),
-            sidebar_filter_selected_range: 0..0,
-            sidebar_filter_selection_reversed: false,
-            sidebar_filter_marked_range: None,
-            sidebar_filter_composition: None,
+            sidebar_filter: ShortTextInput::default(),
             sidebar_filter_focused: false,
             sidebar_filter_input_bounds: None,
             sidebar_keyboard_focus: false,
@@ -3072,11 +2987,7 @@ impl EditorView {
         self.work_folder_drafts.clear();
         self.selected_folder = None;
         self.expanded_folders.clear();
-        self.sidebar_filter.clear();
-        self.sidebar_filter_selected_range = 0..0;
-        self.sidebar_filter_selection_reversed = false;
-        self.sidebar_filter_marked_range = None;
-        self.sidebar_filter_composition = None;
+        self.sidebar_filter = ShortTextInput::default();
         self.sidebar_filter_focused = false;
         self.sidebar_filter_input_bounds = None;
         self.pending_new_folders.clear();
@@ -8493,49 +8404,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inline_rename_movement_uses_grapheme_boundaries() {
-        let text = "a\u{301}👩‍💻z";
-        let combining_end = "a\u{301}".len();
-        let emoji_end = "a\u{301}👩‍💻".len();
-
-        assert_eq!(next_inline_rename_boundary(text, 0), combining_end);
-        assert_eq!(previous_inline_rename_boundary(text, combining_end), 0);
-        assert_eq!(next_inline_rename_boundary(text, combining_end), emoji_end);
-        assert_eq!(
-            previous_inline_rename_boundary(text, emoji_end),
-            combining_end
-        );
-        assert_eq!(next_inline_rename_boundary(text, emoji_end), text.len());
-    }
-
-    #[test]
-    fn inline_rename_shift_home_and_end_extend_from_the_active_caret() {
-        let mut forward = InlineRename {
-            kind: InlineRenameKind::File,
-            from: PathBuf::from("note.md"),
-            text: "abcdef".to_owned(),
-            fixed_extension: Some(".md".to_owned()),
-            selected_range: 2..4,
-            selection_reversed: false,
-            marked_range: None,
-            composition: None,
-            pending: false,
-        };
-        select_inline_rename_to(&mut forward, 0);
-        assert_eq!(forward.selected_range, 0..2);
-        assert!(forward.selection_reversed);
-
-        let mut reversed = InlineRename {
-            selection_reversed: true,
-            ..forward
-        };
-        reversed.selected_range = 2..4;
-        select_inline_rename_to(&mut reversed, 6);
-        assert_eq!(reversed.selected_range, 4..6);
-        assert!(!reversed.selection_reversed);
-    }
-
     #[gpui::test]
     fn editor_view_uses_the_test_platform_for_input_mode(cx: &mut gpui::TestAppContext) {
         let (view, _) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
@@ -8758,18 +8626,6 @@ mod tests {
             assert!(!valid_inline_rename_name(name), "{name:?} must be rejected");
         }
         assert!(valid_inline_rename_name("Meeting 2026-09-19"));
-    }
-
-    #[test]
-    fn inline_rename_ime_selection_is_relative_to_the_inserted_text() {
-        assert_eq!(
-            inline_rename_selected_range(6, "かな", Some(1..2), 12..12),
-            9..12
-        );
-        assert_eq!(
-            inline_rename_selected_range(6, "かな", None, 12..12),
-            12..12
-        );
     }
 
     #[test]
@@ -16853,12 +16709,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "Alpha".to_owned(),
+                input: short_text_input_with("Alpha", 0..5, false),
                 fixed_extension: Some("md".to_owned()),
-                selected_range: 0..5,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -16884,12 +16736,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "Alpha".to_owned(),
+                input: short_text_input_with("Alpha", 0..5, false),
                 fixed_extension: Some("md".to_owned()),
-                selected_range: 0..5,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -16904,7 +16752,13 @@ mod tests {
         assert!(view.read_with(cx, |view, _| !view.content_search_sidebar_visible()));
         assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
         assert_eq!(
-            view.read_with(cx, |view, _| view.inline_rename.as_ref().unwrap().text.clone()),
+            view.read_with(cx, |view, _| view
+                .inline_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .text()
+                .to_owned()),
             "Alpha",
             "the rename text in progress must survive a rejected search-mode toggle"
         );
@@ -17216,12 +17070,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("pending.md"),
-                text: "pending".to_owned(),
+                input: short_text_input_with("pending", 0..0, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 0..0,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: true,
             });
             cx.notify();
@@ -20011,7 +19861,7 @@ mod tests {
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "target note");
+            assert_eq!(view.sidebar_filter.text(), "target note");
             assert_eq!(view.sidebar_scroll.offset().y, px(0.0));
             assert_eq!(view.sessions().count(), sessions_before);
             assert!(view.expanded_folders.contains(&archive));
@@ -20021,7 +19871,7 @@ mod tests {
             flatten_filtered_work_folder_tree(
                 view.work_folder.as_ref().unwrap().children(),
                 1,
-                &view.sidebar_filter,
+                view.sidebar_filter.text(),
                 &mut rows,
             );
             let paths: Vec<&Path> = rows.iter().map(|row| row.node.path()).collect();
@@ -20050,17 +19900,13 @@ mod tests {
             "ctrl-shift-z"
         });
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "target note");
+            assert_eq!(view.sidebar_filter.text(), "target note");
             assert_eq!(view.editor().document().full_text(), document_before_undo);
         });
 
         view.update(cx, |view, _| {
-            let text = view.sidebar_filter.clone();
-            view.sidebar_filter_composition = Some(SidebarFilterComposition {
-                text,
-                selected_range: view.sidebar_filter_selected_range.clone(),
-                selection_reversed: view.sidebar_filter_selection_reversed,
-            });
+            // A saved composition without a marked range, at the caret.
+            view.sidebar_filter.replace_and_mark(None, "", None);
         });
         cx.simulate_keystrokes("enter");
         view.read_with(cx, |view, _| {
@@ -20079,7 +19925,7 @@ mod tests {
         cx.simulate_keystrokes("backspace");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(view.sidebar_filter.is_empty());
+            assert!(view.sidebar_filter.text().is_empty());
             assert!(view.expanded_folders.contains(&archive));
             assert!(!view.expanded_folders.contains(&project));
             let mut rows = Vec::new();
@@ -20134,12 +19980,12 @@ mod tests {
         cx.simulate_input("MEETING");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "MEETING");
+            assert_eq!(view.sidebar_filter.text(), "MEETING");
             let mut rows = Vec::new();
             flatten_filtered_work_folder_tree(
                 view.work_folder.as_ref().unwrap().children(),
                 1,
-                &view.sidebar_filter.to_lowercase(),
+                &view.sidebar_filter.text().to_lowercase(),
                 &mut rows,
             );
             assert_eq!(
@@ -20151,7 +19997,7 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.active_session().path(), Some(target.as_path()));
-            assert_eq!(view.sidebar_filter, "MEETING");
+            assert_eq!(view.sidebar_filter.text(), "MEETING");
             assert!(!view.sidebar_filter_is_focused());
             let input = view.text_input_render_state().unwrap();
             assert_eq!(input.text, "MEETING");
@@ -20258,6 +20104,44 @@ mod tests {
                 view.inline_rename.as_ref().map(|rename| rename.kind),
                 Some(InlineRenameKind::Folder)
             );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn text_input_bounds_report_origin_moves_for_ime_position_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("text-input-bounds-origin-move");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("LongFileName.md"), "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let size = gpui::size(px(120.0), px(20.0));
+        let first = Bounds::new(point(px(10.0), px(30.0)), size);
+        let shifted = Bounds::new(point(px(50.0), px(30.0)), size);
+        view.update(cx, |view, _| {
+            // Sidebar filter (no rename active).
+            assert!(!view.inline_rename_active());
+            view.sidebar_filter_input_bounds = None;
+            assert!(view.set_text_input_bounds(first));
+            assert!(!view.set_text_input_bounds(first));
+            assert!(view.set_text_input_bounds(shifted));
+            assert_eq!(view.sidebar_filter_input_bounds, Some(shifted));
+        });
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert!(view.inline_rename_active());
+            // Rename row moved right after a sidebar width change.
+            assert!(view.set_text_input_bounds(first));
+            assert!(!view.set_text_input_bounds(first));
+            assert!(view.set_text_input_bounds(shifted));
+            assert_eq!(view.inline_rename_input_bounds, Some(shifted));
         });
 
         std::fs::remove_dir_all(root).unwrap();
@@ -20401,12 +20285,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::Folder,
                 from: project.clone(),
-                text: "RenamedProject".to_owned(),
+                input: short_text_input_with("RenamedProject", 0..0, false),
                 fixed_extension: None,
-                selected_range: 0..0,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: true,
             });
             view.latest_open_target = None;
@@ -21089,7 +20969,7 @@ mod tests {
             view.editor_mut()
                 .set_selection(Selection::caret(SourceOffset(3)))
                 .unwrap();
-            view.sidebar_filter = "stale-filter".to_owned();
+            view.sidebar_filter = ShortTextInput::new("stale-filter".to_owned());
             cx.notify();
         });
         cx.run_until_parked();
@@ -21216,7 +21096,8 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert_eq!(
-                view.sidebar_filter, "stale-filter",
+                view.sidebar_filter.text(),
+                "stale-filter",
                 "none of the 14 body-routed actions above may leak into the sidebar filter"
             );
             assert!(!view.sidebar_filter_focused);
@@ -21244,18 +21125,12 @@ mod tests {
         view.update(cx, |view, cx| {
             view.sidebar_filter_focused = true;
             view.sidebar_keyboard_focus = true;
-            view.sidebar_filter = "abcdef".to_owned();
-            view.sidebar_filter_selected_range = 3..3;
-            view.sidebar_filter_selection_reversed = false;
+            view.sidebar_filter = short_text_input_with("abcdef", 3..3, false);
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Stale.md"),
-                text: "stale-rename".to_owned(),
+                input: short_text_input_with("stale-rename", 0..12, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 0..12,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -21264,73 +21139,73 @@ mod tests {
 
         cx.simulate_keystrokes("right");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             4..4
         );
 
         cx.simulate_keystrokes("left");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             3..3
         );
 
         cx.simulate_keystrokes("shift-right");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             3..4
         );
 
         cx.simulate_keystrokes("left");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             3..3
         );
 
         cx.simulate_keystrokes("shift-left");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             2..3
         );
-        assert!(view.read_with(cx, |view, _| view.sidebar_filter_selection_reversed));
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter.selection_reversed()));
 
         cx.simulate_keystrokes("right");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             3..3
         );
 
         cx.simulate_keystrokes("home");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             0..0
         );
 
         cx.simulate_keystrokes("end");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             6..6
         );
 
         cx.simulate_keystrokes("shift-home");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             0..6
         );
-        assert!(view.read_with(cx, |view, _| view.sidebar_filter_selection_reversed));
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter.selection_reversed()));
 
         cx.simulate_keystrokes("shift-end");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             6..6
         );
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.text().to_owned()),
             "abcdef"
         );
 
         cx.simulate_keystrokes("secondary-a");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             0..6
         );
 
@@ -21340,7 +21215,7 @@ mod tests {
             Some("abcdef".to_owned())
         );
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.text().to_owned()),
             "abcdef",
             "Copy must not mutate the filter"
         );
@@ -21351,14 +21226,14 @@ mod tests {
             Some("abcdef".to_owned())
         );
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "");
-            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+            assert_eq!(view.sidebar_filter.text(), "");
+            assert_eq!(view.sidebar_filter.selected_range(), 0..0);
         });
 
         cx.simulate_keystrokes("secondary-v");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "abcdef");
-            assert_eq!(view.sidebar_filter_selected_range, 6..6);
+            assert_eq!(view.sidebar_filter.text(), "abcdef");
+            assert_eq!(view.sidebar_filter.selected_range(), 6..6);
         });
 
         view.read_with(cx, |view, _| {
@@ -21368,7 +21243,7 @@ mod tests {
                 "none of the 14 filter-routed actions above may leak into the body"
             );
             assert_eq!(
-                view.inline_rename.as_ref().unwrap().text,
+                view.inline_rename.as_ref().unwrap().input.text(),
                 "stale-rename",
                 "filter focus must win over a simultaneously-populated inline rename"
             );
@@ -21396,9 +21271,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.sidebar_filter_focused = true;
             view.sidebar_keyboard_focus = true;
-            view.sidebar_filter = "abc".to_owned();
-            view.sidebar_filter_selected_range = 3..3;
-            view.sidebar_filter_selection_reversed = false;
+            view.sidebar_filter = ShortTextInput::new("abc".to_owned());
             // Mirrors a real in-progress Japanese conversion: marks "abc" +
             // the composing kana rather than committing it outright.
             view.replace_and_mark_sidebar_filter_text(None, "か", None, cx);
@@ -21406,7 +21279,7 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.sidebar_filter_has_composition());
-            assert_eq!(view.sidebar_filter, "abcか");
+            assert_eq!(view.sidebar_filter.text(), "abcか");
         });
 
         cx.simulate_keystrokes("enter");
@@ -21418,7 +21291,8 @@ mod tests {
                 "Enter must commit the in-progress composition"
             );
             assert_eq!(
-                view.sidebar_filter, "abcか",
+                view.sidebar_filter.text(),
+                "abcか",
                 "committing must keep the composed text, not discard or extend it"
             );
             assert!(
@@ -21454,15 +21328,13 @@ mod tests {
         view.update(cx, |view, cx| {
             view.sidebar_filter_focused = true;
             view.sidebar_keyboard_focus = true;
-            view.sidebar_filter = "abc".to_owned();
-            view.sidebar_filter_selected_range = 3..3;
-            view.sidebar_filter_selection_reversed = false;
+            view.sidebar_filter = ShortTextInput::new("abc".to_owned());
             view.replace_and_mark_sidebar_filter_text(None, "か", None, cx);
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.sidebar_filter_has_composition());
-            assert_eq!(view.sidebar_filter, "abcか");
+            assert_eq!(view.sidebar_filter.text(), "abcか");
         });
 
         // The first Escape must cancel the composition only, reverting to
@@ -21473,7 +21345,8 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.sidebar_filter_has_composition());
             assert_eq!(
-                view.sidebar_filter, "abc",
+                view.sidebar_filter.text(),
+                "abc",
                 "cancelling must restore the pre-composition snapshot"
             );
             assert!(
@@ -21506,16 +21379,12 @@ mod tests {
         // rename (nothing clears `sidebar_filter` on `begin_inline_rename`);
         // seeding it here proves rename-routed keys never touch it either.
         view.update(cx, |view, cx| {
-            view.sidebar_filter = "stale-filter".to_owned();
+            view.sidebar_filter = ShortTextInput::new("stale-filter".to_owned());
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "abcdef".to_owned(),
+                input: short_text_input_with("abcdef", 3..3, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 3..3,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -21630,7 +21499,8 @@ mod tests {
                 "none of the 14 rename-routed actions above may leak into the body"
             );
             assert_eq!(
-                view.sidebar_filter, "stale-filter",
+                view.sidebar_filter.text(),
+                "stale-filter",
                 "none of the 14 rename-routed actions above may leak into the sidebar filter"
             );
             assert!(!view.sidebar_filter_focused);
@@ -21661,12 +21531,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Report.md"),
-                text: "Report".to_owned(),
+                input: short_text_input_with("Report", 0..6, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 0..6,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: true,
             });
             cx.notify();
@@ -21682,10 +21548,11 @@ mod tests {
         view.read_with(cx, |view, _| {
             let rename = view.inline_rename.as_ref().expect("rename stays active");
             assert_eq!(
-                rename.text, "Report",
+                rename.input.text(),
+                "Report",
                 "Cut must not shorten the name of a rename already in flight"
             );
-            assert_eq!(rename.selected_range, 0..6);
+            assert_eq!(rename.input.selected_range(), 0..6);
             assert!(rename.pending);
         });
     }
@@ -21693,13 +21560,13 @@ mod tests {
     // Issue #304 (RF3-A, P1): the body, filter, and rename paths resolve
     // "one character" with three different helpers today (`move_grapheme`'s
     // `previous_grapheme`/`next_grapheme` in `crates/editor`, vs.
-    // `previous_inline_rename_boundary`/`next_inline_rename_boundary` shared
+    // `previous_boundary`/`next_boundary` of `short_text_input.rs`, shared
     // by the filter and the rename field in `view.rs`); all three must keep
     // agreeing that a combining mark and a surrogate-pair emoji are each one
     // grapheme, through the actual key-dispatch path, not just the movement
     // unit tests already covering the helpers directly
     // (`grapheme_movement_keeps_combining_sequence_together`,
-    // `inline_rename_movement_uses_grapheme_boundaries`).
+    // `movement_uses_grapheme_boundaries` in `short_text_input.rs`).
     #[gpui::test]
     fn left_right_backspace_and_delete_treat_a_combining_mark_and_a_surrogate_pair_emoji_as_one_grapheme_in_the_body(
         cx: &mut gpui::TestAppContext,
@@ -21813,9 +21680,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.sidebar_filter_focused = true;
             view.sidebar_keyboard_focus = true;
-            view.sidebar_filter = text.to_owned();
-            view.sidebar_filter_selected_range = 0..0;
-            view.sidebar_filter_selection_reversed = false;
+            view.sidebar_filter = short_text_input_with(text, 0..0, false);
             cx.notify();
         });
         cx.run_until_parked();
@@ -21823,7 +21688,7 @@ mod tests {
         for expected in [combining_end, emoji_end, len] {
             cx.simulate_keystrokes("right");
             assert_eq!(
-                view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+                view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
                 expected..expected
             );
         }
@@ -21831,48 +21696,48 @@ mod tests {
         for expected in [emoji_end, combining_end, 0] {
             cx.simulate_keystrokes("left");
             assert_eq!(
-                view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+                view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
                 expected..expected
             );
         }
 
         cx.simulate_keystrokes("delete");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "👩\u{200d}💻z");
-            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+            assert_eq!(view.sidebar_filter.text(), "👩\u{200d}💻z");
+            assert_eq!(view.sidebar_filter.selected_range(), 0..0);
         });
 
         // Backspace at the start of the filter is a no-op.
         cx.simulate_keystrokes("backspace");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "👩\u{200d}💻z");
-            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+            assert_eq!(view.sidebar_filter.text(), "👩\u{200d}💻z");
+            assert_eq!(view.sidebar_filter.selected_range(), 0..0);
         });
 
         let emoji_len = "👩‍💻".len();
         cx.simulate_keystrokes("right");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             emoji_len..emoji_len
         );
 
         cx.simulate_keystrokes("backspace");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "z");
-            assert_eq!(view.sidebar_filter_selected_range, 0..0);
+            assert_eq!(view.sidebar_filter.text(), "z");
+            assert_eq!(view.sidebar_filter.selected_range(), 0..0);
         });
 
         cx.simulate_keystrokes("right");
         assert_eq!(
-            view.read_with(cx, |view, _| view.sidebar_filter_selected_range.clone()),
+            view.read_with(cx, |view, _| view.sidebar_filter.selected_range()),
             1..1
         );
 
         // Delete at the end of the filter is a no-op.
         cx.simulate_keystrokes("delete");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.sidebar_filter, "z");
-            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert_eq!(view.sidebar_filter.text(), "z");
+            assert_eq!(view.sidebar_filter.selected_range(), 1..1);
         });
     }
 
@@ -21894,12 +21759,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: text.to_owned(),
+                input: short_text_input_with(text, 0..0, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 0..0,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -21916,8 +21777,8 @@ mod tests {
                 .inline_rename
                 .as_ref()
                 .unwrap()
-                .selected_range
-                .clone()),
+                .input
+                .selected_range()),
             combining_end..combining_end
         );
 
@@ -21927,8 +21788,8 @@ mod tests {
                 .inline_rename
                 .as_ref()
                 .unwrap()
-                .selected_range
-                .clone()),
+                .input
+                .selected_range()),
             emoji_end..emoji_end
         );
 
@@ -21937,15 +21798,15 @@ mod tests {
         cx.simulate_keystrokes("backspace");
         view.read_with(cx, |view, _| {
             let rename = view.inline_rename.as_ref().unwrap();
-            assert_eq!(rename.text, "a\u{301}z");
-            assert_eq!(rename.selected_range, combining_end..combining_end);
+            assert_eq!(rename.input.text(), "a\u{301}z");
+            assert_eq!(rename.input.selected_range(), combining_end..combining_end);
         });
 
         cx.simulate_keystrokes("backspace");
         view.read_with(cx, |view, _| {
             let rename = view.inline_rename.as_ref().unwrap();
-            assert_eq!(rename.text, "z");
-            assert_eq!(rename.selected_range, 0..0);
+            assert_eq!(rename.input.text(), "z");
+            assert_eq!(rename.input.selected_range(), 0..0);
         });
 
         // Forward Delete from immediately after the combining grapheme must
@@ -21953,9 +21814,7 @@ mod tests {
         // at the same byte offset. Neither unrelated input target may change.
         view.update(cx, |view, cx| {
             let rename = view.inline_rename.as_mut().unwrap();
-            rename.text = text.to_owned();
-            rename.selected_range = combining_end..combining_end;
-            rename.selection_reversed = false;
+            rename.input = short_text_input_with(text, combining_end..combining_end, false);
             cx.notify();
         });
         cx.run_until_parked();
@@ -21963,10 +21822,10 @@ mod tests {
         cx.simulate_keystrokes("delete");
         view.read_with(cx, |view, _| {
             let rename = view.inline_rename.as_ref().unwrap();
-            assert_eq!(rename.text, "a\u{301}z");
-            assert_eq!(rename.selected_range, combining_end..combining_end);
+            assert_eq!(rename.input.text(), "a\u{301}z");
+            assert_eq!(rename.input.selected_range(), combining_end..combining_end);
             assert_eq!(view.editor().document().full_text(), "placeholder\n");
-            assert_eq!(view.sidebar_filter, "");
+            assert_eq!(view.sidebar_filter.text(), "");
         });
     }
 
@@ -22117,8 +21976,7 @@ mod tests {
                 .set_selection(Selection::caret(SourceOffset(6)))
                 .unwrap();
             view.sidebar_filter_focused = true;
-            view.sidebar_filter = "abc".to_owned();
-            view.sidebar_filter_selected_range = 1..1;
+            view.sidebar_filter = short_text_input_with("abc", 1..1, false);
             cx.notify();
         });
         cx.run_until_parked();
@@ -22127,7 +21985,7 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
-            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert_eq!(view.sidebar_filter.selected_range(), 1..1);
             assert!(view.sidebar_filter_is_focused());
         });
 
@@ -22135,7 +21993,7 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
-            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert_eq!(view.sidebar_filter.selected_range(), 1..1);
         });
     }
 
@@ -22157,12 +22015,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "abcdef".to_owned(),
+                input: short_text_input_with("abcdef", 3..3, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 3..3,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -22173,14 +22027,20 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
-            assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+            assert_eq!(
+                view.inline_rename.as_ref().unwrap().input.selected_range(),
+                3..3
+            );
         });
 
         cx.simulate_keystrokes("down");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
-            assert_eq!(view.inline_rename.as_ref().unwrap().selected_range, 3..3);
+            assert_eq!(
+                view.inline_rename.as_ref().unwrap().input.selected_range(),
+                3..3
+            );
         });
     }
 
@@ -22243,8 +22103,7 @@ mod tests {
                 .set_selection(Selection::caret(SourceOffset(6)))
                 .unwrap();
             view.sidebar_filter_focused = true;
-            view.sidebar_filter = "abc".to_owned();
-            view.sidebar_filter_selected_range = 1..1;
+            view.sidebar_filter = short_text_input_with("abc", 1..1, false);
             cx.notify();
         });
         cx.run_until_parked();
@@ -22253,8 +22112,8 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
-            assert_eq!(view.sidebar_filter, "abc");
-            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert_eq!(view.sidebar_filter.text(), "abc");
+            assert_eq!(view.sidebar_filter.selected_range(), 1..1);
             assert!(view.sidebar_filter_is_focused());
         });
 
@@ -22262,8 +22121,8 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
-            assert_eq!(view.sidebar_filter, "abc");
-            assert_eq!(view.sidebar_filter_selected_range, 1..1);
+            assert_eq!(view.sidebar_filter.text(), "abc");
+            assert_eq!(view.sidebar_filter.selected_range(), 1..1);
             assert!(view.sidebar_filter_is_focused());
         });
     }
@@ -22286,12 +22145,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "abcdef".to_owned(),
+                input: short_text_input_with("abcdef", 3..3, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 3..3,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -22303,8 +22158,8 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
             let rename = view.inline_rename.as_ref().unwrap();
-            assert_eq!(rename.text, "abcdef");
-            assert_eq!(rename.selected_range, 3..3);
+            assert_eq!(rename.input.text(), "abcdef");
+            assert_eq!(rename.input.selected_range(), 3..3);
         });
 
         cx.simulate_keystrokes("shift-down");
@@ -22312,8 +22167,8 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
             let rename = view.inline_rename.as_ref().unwrap();
-            assert_eq!(rename.text, "abcdef");
-            assert_eq!(rename.selected_range, 3..3);
+            assert_eq!(rename.input.text(), "abcdef");
+            assert_eq!(rename.input.selected_range(), 3..3);
         });
     }
 
@@ -22385,12 +22240,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "Alpha".to_owned(),
+                input: short_text_input_with("Alpha", 0..5, false),
                 fixed_extension: Some("md".to_owned()),
-                selected_range: 0..5,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -22456,8 +22307,7 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.sidebar_filter_focused = true;
-            view.sidebar_filter = "abc".to_owned();
-            view.sidebar_filter_selected_range = 1..1;
+            view.sidebar_filter = short_text_input_with("abc", 1..1, false);
             cx.notify();
         });
         cx.run_until_parked();
@@ -22512,13 +22362,13 @@ mod tests {
                     view.editor().can_redo(),
                     "{keystroke} must not consume redo history while the sidebar filter is focused"
                 );
-                assert_eq!(view.sidebar_filter, "abc");
+                assert_eq!(view.sidebar_filter.text(), "abc");
                 assert_eq!(
-                    view.sidebar_filter_selected_range, expected_range,
+                    view.sidebar_filter.selected_range(), expected_range,
                     "{keystroke} sidebar filter selection range"
                 );
                 assert_eq!(
-                    view.sidebar_filter_selection_reversed, expected_reversed,
+                    view.sidebar_filter.selection_reversed(), expected_reversed,
                     "{keystroke} sidebar filter selection direction"
                 );
                 assert!(view.sidebar_filter_is_focused());
@@ -22571,12 +22421,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "abcdef".to_owned(),
+                input: short_text_input_with("abcdef", 3..3, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 3..3,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
@@ -22633,14 +22479,14 @@ mod tests {
                     view.editor().can_redo(),
                     "{keystroke} must not consume redo history while an inline rename is active"
                 );
-                assert_eq!(view.inline_rename.as_ref().unwrap().text, "abcdef");
+                assert_eq!(view.inline_rename.as_ref().unwrap().input.text(), "abcdef");
                 let rename = view.inline_rename.as_ref().unwrap();
                 assert_eq!(
-                    rename.selected_range, expected_range,
+                    rename.input.selected_range(), expected_range,
                     "{keystroke} inline rename selection range"
                 );
                 assert_eq!(
-                    rename.selection_reversed, expected_reversed,
+                    rename.input.selection_reversed(), expected_reversed,
                     "{keystroke} inline rename selection direction"
                 );
                 assert!(view.inline_rename_active());

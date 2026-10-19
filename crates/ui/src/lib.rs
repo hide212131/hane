@@ -18,6 +18,7 @@ mod instrument;
 mod line;
 mod ranges;
 mod shape;
+mod short_text_input;
 
 mod theme;
 mod view;

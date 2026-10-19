@@ -26,6 +26,11 @@ jobs:
     outputs:
       target_sha: ${{ steps.preflight.outputs.target_sha }}
       head_ref: ${{ steps.preflight.outputs.head_ref }}
+      base_ref: ${{ steps.preflight.outputs.base_ref }}
+      actor_login: ${{ steps.preflight.outputs.actor_login }}
+      actor_permission: ${{ steps.preflight.outputs.actor_permission }}
+      root_cause: ${{ steps.preflight.outputs.root_cause }}
+      finalizer_environment: ${{ steps.preflight.outputs.finalizer_environment }}
       checkpoint_run_id: ${{ steps.preflight.outputs.checkpoint_run_id }}
       checkpoint_run_attempt: ${{ steps.preflight.outputs.checkpoint_run_attempt }}
 
@@ -102,6 +107,7 @@ jobs:
           state="$(jq -r '.state' <<< "$pr_json")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
           head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
           current_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
 
           if [[ "$state" != 'open' ]]; then
@@ -116,6 +122,10 @@ jobs:
             echo '::error::Could not resolve Pull Request head ref.'
             exit 1
           fi
+          if [[ -z "$base_ref" ]]; then
+            echo '::error::Could not resolve Pull Request base ref.'
+            exit 1
+          fi
           if [[ "$current_sha" != "$expected_sha" ]]; then
             echo "::error::Target head moved. expected=${expected_sha} current=${current_sha}. Create a new Commander handoff from current facts."
             exit 1
@@ -125,9 +135,29 @@ jobs:
           gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$RUNNER_TEMP/comments.json"
           python3 trusted-control/.github/scripts/aadw_action_contract.py request "$RUNNER_TEMP/pr.json" "$RUNNER_TEMP/comments.json" "$RUNNER_TEMP/request.json"
           jq -e '.action == "implement"' "$RUNNER_TEMP/request.json" >/dev/null
+          request_root_cause="$(jq -r '.root_cause' "$RUNNER_TEMP/request.json")"
+          finalizer_environment='hane-aadw-standard'
+          if [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-release-pipeline-after-finalizer-policy' ]]; then
+            finalizer_environment='hane-aadw-trusted-workflow-write'
+          elif [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-release-pipeline-custom-crypto' && "$expected_sha" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            finalizer_environment='hane-aadw-trusted-workflow-write'
+          elif [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-release-pipeline-secret-isolation' && "$expected_sha" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            finalizer_environment='hane-aadw-trusted-workflow-write'
+          elif [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-release-pipeline-protected-test-path' && "$expected_sha" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            finalizer_environment='hane-aadw-trusted-workflow-write'
+          elif [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-windows-versioned-dll-registration' && "$expected_sha" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            finalizer_environment='hane-aadw-trusted-workflow-write'
+          elif [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-catalog-sequence-monotonicity' && "$expected_sha" == '2a271832592c1668adc6c4c1ede15f8b09622176' ]]; then
+            finalizer_environment='hane-aadw-trusted-workflow-write'
+          fi
 
           echo "target_sha=$expected_sha" >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "actor_login=$ACTOR" >> "$GITHUB_OUTPUT"
+          echo "actor_permission=$permission" >> "$GITHUB_OUTPUT"
+          echo "root_cause=$request_root_cause" >> "$GITHUB_OUTPUT"
+          echo "finalizer_environment=$finalizer_environment" >> "$GITHUB_OUTPUT"
           echo "checkpoint_run_id=$checkpoint_run_id" >> "$GITHUB_OUTPUT"
           echo "checkpoint_run_attempt=$checkpoint_run_attempt" >> "$GITHUB_OUTPUT"
 
@@ -353,6 +383,27 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Summarize required review for workflow changes
+        if: ${{ needs.prepare.outputs.finalizer_environment == 'hane-aadw-trusted-workflow-write' && steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success' }}
+        shell: bash
+        env:
+          PATCH_FILE: aadw-worker.patch
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          patch_sha256="$(sha256sum "$PATCH_FILE" | cut -d' ' -f1)"
+          {
+            echo '## 配布workflow変更の確認が必要です'
+            echo
+            echo "確認対象artifact: \`aadw-worker-patch-${RUN_ID}\`"
+            echo 'artifactをダウンロードし、workflowのtrigger、権限、secret参照を含む差分全体を確認してください。'
+            echo '確認後、次の行をPRのConversationへ投稿し、その後にprotected Environmentのjobを承認してください。'
+            echo
+            echo "\`AADW_WORKFLOW_PATCH_APPROVED: run_id=${RUN_ID} sha256=${patch_sha256}\`"
+            echo
+            echo '承認前にartifactを確認してください。markerがない、run IDまたはhashが一致しない場合はfinalizerが停止します。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check out trusted diagnostic source after Claude failure
         if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
         uses: actions/checkout@v6
@@ -476,6 +527,9 @@ jobs:
       contents: write
       pull-requests: read
       issues: read
+    environment:
+      name: ${{ needs.prepare.outputs.finalizer_environment }}
+      deployment: false
     outputs:
       final_sha: ${{ steps.push.outputs.final_sha }}
     steps:
@@ -497,6 +551,15 @@ jobs:
         shell: bash
         env:
           EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
+          EXPECTED_HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+          EXPECTED_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          ACTOR_LOGIN: ${{ needs.prepare.outputs.actor_login }}
+          ACTOR_PERMISSION: ${{ needs.prepare.outputs.actor_permission }}
+          EXPECTED_ROOT_CAUSE: ${{ needs.prepare.outputs.root_cause }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
 
@@ -513,10 +576,70 @@ jobs:
 
           git -C final-head apply --index --whitespace=nowarn "$patch_file"
 
+          u2_release_exception=false
+          if [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-release-pipeline-after-finalizer-policy' ]]; then
+            u2_release_exception=true
+          elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-release-pipeline-custom-crypto' && "$EXPECTED_SHA" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            u2_release_exception=true
+          elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-release-pipeline-secret-isolation' && "$EXPECTED_SHA" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            u2_release_exception=true
+          elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-release-pipeline-protected-test-path' && "$EXPECTED_SHA" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            u2_release_exception=true
+          elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-windows-versioned-dll-registration' && "$EXPECTED_SHA" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            u2_release_exception=true
+          elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-catalog-sequence-monotonicity' && "$EXPECTED_SHA" == '2a271832592c1668adc6c4c1ede15f8b09622176' ]]; then
+            u2_release_exception=true
+          fi
+
           changed=false
           while IFS= read -r -d '' path; do
             changed=true
             case "$path" in
+              .github/RELEASE_AUTOMATION.md|.github/workflows/release-request.yml|.github/workflows/windows-release.yml)
+                # One-time, owner-only exception for the dedicated Issue #510 U2 release PR.
+                # All other .github paths, including this trusted workflow and its scripts, stay blocked.
+                if [[ "$u2_release_exception" != 'true' ]]; then
+                  echo "::error::Protected release path is only allowed for the owner on the dedicated Issue #510 U2 PR: $path"
+                  exit 1
+                fi
+                ;;
+              .github/workflows/ci.yml)
+                if [[ "$u2_release_exception" != 'true' ]]; then
+                  echo "::error::CI workflow changes are only allowed for the owner on the dedicated Issue #510 U2 PR: $path"
+                  exit 1
+                fi
+                mapfile -t ci_added < <(
+                  git -C final-head diff --cached --no-renames --unified=0 -- .github/workflows/ci.yml \
+                    | sed -n '/^+++/! /^+/p'
+                )
+                mapfile -t ci_removed < <(
+                  git -C final-head diff --cached --no-renames --unified=0 -- .github/workflows/ci.yml \
+                    | sed -n '/^---/! /^-/p'
+                )
+                if [[ "${#ci_added[@]}" -ne 2 || "${#ci_removed[@]}" -ne 0 || "${ci_added[0]:-}" != '+      - name: Test update distribution tooling' || "${ci_added[1]:-}" != '+        run: python3 scripts/tests/test_update_release.py' ]]; then
+                  echo '::error::CI workflow changes must add only the read-only update-distribution fixture test.'
+                  exit 1
+                fi
+                if ! git -C final-head show :.github/workflows/ci.yml | python3 -c '
+          import sys
+
+          workflow = sys.stdin.read()
+          expected = (
+              "      - name: Test release PR policy\n"
+              "        run: python3 .github/tests/test_release_pr.py\n"
+              "\n"
+              "      - name: Test update distribution tooling\n"
+              "        run: python3 scripts/tests/test_update_release.py\n"
+              "\n"
+              "      - name: Detect Rust CI inputs\n"
+          )
+          if workflow.count(expected) != 1:
+              raise SystemExit(1)
+          '; then
+                  echo '::error::The update-distribution fixture test must stay in the read-only rust_ci_changes job.'
+                  exit 1
+                fi
+                ;;
               .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.agents/skills/hane-issue-workflow/*|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
                 echo "::error::Claude worker attempted to modify trusted authority or workflow path: $path"
                 exit 1
@@ -527,6 +650,31 @@ jobs:
           if [[ "$changed" != 'true' ]]; then
             echo '::error::Worker patch has no staged repository change.'
             exit 1
+          fi
+
+          workflow_file_changed=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              .github/workflows/*) workflow_file_changed=true ;;
+            esac
+          done < <(git -C final-head diff --cached --no-renames --name-only -z)
+
+          if [[ "$workflow_file_changed" == 'true' ]]; then
+            if [[ "$u2_release_exception" != 'true' ]]; then
+              echo '::error::Workflow changes require the dedicated Issue #510 U2 exception.'
+              exit 1
+            fi
+
+            patch_sha256="$(sha256sum "$patch_file" | cut -d' ' -f1)"
+            approval_marker="AADW_WORKFLOW_PATCH_APPROVED: run_id=${RUN_ID} sha256=${patch_sha256}"
+            comments_file="$RUNNER_TEMP/aadw-pr-comments.json"
+            gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$comments_file"
+            if ! jq -e --arg actor "$ACTOR_LOGIN" --arg marker "$approval_marker" \
+              'any(.[][]?; .user.login == $actor and ((.body // "") | split("\n") | any(. == $marker)))' \
+              "$comments_file" >/dev/null; then
+              echo '::error::Workflow changes require an owner comment approving this exact worker patch hash before Environment approval.'
+              exit 1
+            fi
           fi
 
           git -C final-head config user.name 'claude[bot]'
@@ -547,6 +695,8 @@ jobs:
           PR_NUMBER: ${{ github.event.issue.number }}
           EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
           EXPECTED_HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+          EXPECTED_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          AADW_WORKFLOW_PUSH_TOKEN: ${{ secrets.AADW_WORKFLOW_PUSH_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -554,11 +704,12 @@ jobs:
           state="$(jq -r '.state' <<< "$pr_json")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
           head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
           current_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
           jq -e '((.body // "") | contains("<!-- AADW_PAUSED -->") | not) and ([.labels[]?.name] | index("aadw:paused") | not)' <<< "$pr_json" >/dev/null
 
-          if [[ "$state" != 'open' || "$head_repo" != "$REPOSITORY" || "$head_ref" != "$EXPECTED_HEAD_REF" || "$current_sha" != "$EXPECTED_SHA" ]]; then
-            echo "::error::Target Pull Request changed before final push. expected_ref=${EXPECTED_HEAD_REF} expected_sha=${EXPECTED_SHA} current_state=${state} current_repo=${head_repo:-unknown} current_ref=${head_ref:-unknown} current_sha=${current_sha:-unknown}."
+          if [[ "$state" != 'open' || "$head_repo" != "$REPOSITORY" || "$head_ref" != "$EXPECTED_HEAD_REF" || "$base_ref" != "$EXPECTED_BASE_REF" || "$current_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Target Pull Request changed before final push. expected_ref=${EXPECTED_HEAD_REF} expected_base=${EXPECTED_BASE_REF} expected_sha=${EXPECTED_SHA} current_state=${state} current_repo=${head_repo:-unknown} current_ref=${head_ref:-unknown} current_base=${base_ref:-unknown} current_sha=${current_sha:-unknown}."
             exit 1
           fi
 
@@ -567,9 +718,25 @@ jobs:
             exit 1
           fi
 
+          push_token="$GH_TOKEN"
+          workflow_file_changed=false
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/*) workflow_file_changed=true ;;
+            esac
+          done < <(git -C final-head diff-tree --no-renames --no-commit-id --name-only -r HEAD)
+
+          if [[ "$workflow_file_changed" == 'true' ]]; then
+            if [[ -z "${AADW_WORKFLOW_PUSH_TOKEN:-}" ]]; then
+              echo '::error::Workflow changes require AADW_WORKFLOW_PUSH_TOKEN in the protected hane-aadw-trusted-workflow-write environment.'
+              exit 1
+            fi
+            push_token="$AADW_WORKFLOW_PUSH_TOKEN"
+          fi
+
           git -C final-head remote set-url origin "https://github.com/${REPOSITORY}.git"
-          gh auth setup-git
-          git -C final-head -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${EXPECTED_HEAD_REF}"
+          GH_TOKEN="$push_token" gh auth setup-git
+          GH_TOKEN="$push_token" git -C final-head -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${EXPECTED_HEAD_REF}"
           echo "final_sha=$(git -C final-head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   verify:
