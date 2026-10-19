@@ -293,7 +293,7 @@ impl EditorView {
             .mb(px(SIDEBAR_TOOLBAR_GAP))
             .child(sort_button);
         let mut filter_input = div().relative().flex_1().min_w(px(0.0)).h_full();
-        if self.sidebar_filter.is_empty() {
+        if self.sidebar_filter.text().is_empty() {
             filter_input = filter_input.child(
                 div()
                     .absolute()
@@ -354,7 +354,7 @@ impl EditorView {
                 window.focus(&view.focus_handle, cx);
                 view.select_work_folder_root(cx);
             }));
-        let query = self.sidebar_filter.to_lowercase();
+        let query = self.sidebar_filter.text().to_lowercase();
         let filtering = !query.is_empty();
         let mut rows = Vec::new();
         if filtering {
@@ -526,7 +526,7 @@ impl EditorView {
                                     if let Some(position) = event.mouse_position() {
                                         view.move_inline_rename_to_point(position, window, cx);
                                     }
-                                } else if view.sidebar_filter.is_empty() {
+                                } else if view.sidebar_filter.text().is_empty() {
                                     view.toggle_and_select_work_folder_folder(path.clone(), cx);
                                 } else if view.cancel_inline_rename(cx) {
                                     view.blur_sidebar_filter(cx);

@@ -109,8 +109,14 @@ impl Element for InlineRenameInput {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.input
+        let moved = self
+            .input
             .update(cx, |view, _| view.set_text_input_bounds(bounds));
+        if moved {
+            // Only asks the platform to re-query the caret rectangle next
+            // frame; composition, selection, focus and text are untouched.
+            window.invalidate_character_coordinates();
+        }
         let input = self.input.read(cx);
         let Some(state) = input.text_input_render_state() else {
             return InlineRenamePrepaintState {
