@@ -554,6 +554,87 @@ fn stop(err: &UpdateError) -> GateOutcome {
     GateOutcome::RecoveryRequired(bounded_reason(&err.to_string()))
 }
 
+/// Where the unsettled transaction keeps what it set aside of the old version.
+/// The place is derived only from the verified placement and the one unfinished
+/// journal of this installation. It says nothing about whether the content is
+/// intact or restorable: nothing here verifies the backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupGuidance {
+    /// The transaction's backup location. `is_bundle` is set for a macOS
+    /// bundle slot, otherwise the location is a Windows backup directory.
+    Located {
+        path: std::path::PathBuf,
+        is_bundle: bool,
+    },
+    /// The placement, the journal or the location could not be verified.
+    Unknown,
+}
+
+/// The backup location of the unsettled transaction of the install that owns
+/// `exe`, or [`BackupGuidance::Unknown`] when anything is missing, ambiguous,
+/// foreign or not a plain directory. Read-only.
+pub fn recovery_backup_for_exe(exe: &Path) -> BackupGuidance {
+    let Ok(placement) = platform::locate(exe) else {
+        return BackupGuidance::Unknown;
+    };
+    let Ok(Some(coordination)) = placement.existing_coordination() else {
+        return BackupGuidance::Unknown;
+    };
+    recovery_backup(&coordination, placement.target == Target::MacosArm64)
+}
+
+fn recovery_backup(coordination: &Coordination, is_bundle: bool) -> BackupGuidance {
+    let Ok(entries) = fs::read_dir(coordination.dir().join(PRIVATE_DIR)) else {
+        return BackupGuidance::Unknown;
+    };
+    let mut unsettled: Option<TransactionId> = None;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return BackupGuidance::Unknown;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(transaction) = TransactionId::parse(&name) else {
+            continue;
+        };
+        match fs::symlink_metadata(entry.path()) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            _ => continue,
+        }
+        let journal = match FileJournalStore::new(coordination.journal_path(&transaction)).load() {
+            Ok(Some(journal)) => journal,
+            Ok(None) => continue,
+            Err(_) => return BackupGuidance::Unknown,
+        };
+        if journal.transaction_id != transaction || &journal.install_id != coordination.install_id()
+        {
+            return BackupGuidance::Unknown;
+        }
+        if matches!(journal.phase, Phase::Committed | Phase::RolledBack) {
+            continue;
+        }
+        if unsettled.replace(transaction).is_some() {
+            return BackupGuidance::Unknown;
+        }
+    }
+    let Some(transaction) = unsettled else {
+        return BackupGuidance::Unknown;
+    };
+    let txn_dir = coordination.transaction_dir(&transaction);
+    let path = if is_bundle {
+        crate::macos_apply::slot_path(&txn_dir)
+    } else {
+        txn_dir.join("backup")
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            BackupGuidance::Located { path, is_bundle }
+        }
+        _ => BackupGuidance::Unknown,
+    }
+}
+
 /// Convenience for the application: locate the running executable's placement,
 /// then run the gate. Only a placement that is clearly unsupported is
 /// `Unmanaged`; any other failure to resolve it (I/O errors, a partly missing
@@ -2251,6 +2332,50 @@ mod tests {
         let located = || Ok(placement.clone());
         let outcome = gate_with_relocation(Some(&placement.install_root), &located, &runner, GATE_WAIT);
         assert!(record_present(&placement), "{outcome:?}");
+    }
+
+    #[test]
+    fn the_backup_location_comes_from_the_one_unsettled_journal() {
+        let dir = TempDir::new("gate-backup-guidance");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        write_journal(&coord, &transaction, Phase::RecoveryRequired);
+        let backup = coord.transaction_dir(&transaction).join("backup");
+
+        // No backup directory: nothing is claimed.
+        assert_eq!(recovery_backup(&coord, false), BackupGuidance::Unknown);
+
+        fs::create_dir_all(&backup).unwrap();
+        assert_eq!(
+            recovery_backup(&coord, false),
+            BackupGuidance::Located { path: backup.clone(), is_bundle: false }
+        );
+
+        // A second unsettled transaction makes the answer ambiguous.
+        let other = TransactionId::generate().unwrap();
+        write_journal(&coord, &other, Phase::Applying);
+        assert_eq!(recovery_backup(&coord, false), BackupGuidance::Unknown);
+    }
+
+    #[test]
+    fn a_settled_or_damaged_journal_yields_no_backup_location() {
+        let dir = TempDir::new("gate-backup-guidance-settled");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        write_journal(&coord, &transaction, Phase::RolledBack);
+        fs::create_dir_all(coord.transaction_dir(&transaction).join("backup")).unwrap();
+        assert_eq!(recovery_backup(&coord, false), BackupGuidance::Unknown);
+
+        let dir = TempDir::new("gate-backup-guidance-damaged");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        write_journal(&coord, &transaction, Phase::RecoveryRequired);
+        fs::create_dir_all(coord.transaction_dir(&transaction).join("backup")).unwrap();
+        fs::write(coord.journal_path(&transaction), b"not a journal").unwrap();
+        assert_eq!(recovery_backup(&coord, false), BackupGuidance::Unknown);
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

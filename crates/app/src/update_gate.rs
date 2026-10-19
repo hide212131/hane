@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use hane_update::health::{COMMIT_WAIT, ChildEntry, VerifiedChild, detect_child};
 use hane_update::startup::{
-    GateOutcome, HelperRecoveryRunner, RuntimeGuard, STARTUP_WAIT, startup_gate_for_exe_within,
+    BackupGuidance, GateOutcome, HelperRecoveryRunner, RuntimeGuard, STARTUP_WAIT,
+    recovery_backup_for_exe, startup_gate_for_exe_within,
 };
 use hane_update::trust::TrustPolicy;
 
@@ -312,15 +313,43 @@ fn update_in_progress_notice() -> StopNotice {
 
 /// The notice for a launch stopped because an interrupted update is not settled.
 /// It does not claim the update succeeded.
-fn recovery_required_notice(reason: &str) -> StopNotice {
+///
+/// The backup location is shown only when it was derived from the verified
+/// install and its one unsettled transaction. Its content is never vouched for:
+/// the notice says it is unverified and asks the user not to overwrite or delete
+/// it. Without a verified location, the manual steps do not depend on any backup.
+fn recovery_required_notice(reason: &str, backup: &BackupGuidance) -> StopNotice {
+    let guidance = match backup {
+        BackupGuidance::Located { path, is_bundle } => {
+            let what = if *is_bundle {
+                "中断された更新が作業用に使っているアプリの置き場所（旧版または新版のHane.appがある可能性があります）"
+            } else {
+                "中断された更新が保存した旧版ファイルの置き場所"
+            };
+            format!(
+                "{what}:\n{}\n\n\
+                 この場所の内容は検証できていないため、復元できるとは限りません。\
+                 この場所のファイルを上書き・削除・移動しないでください。\
+                 調査や別の場所へのコピーが必要な場合も、元の場所のファイルは変更せず、\
+                 コピーに対して行ってください。\n\n\
+                 ",
+                path.display()
+            )
+        }
+        BackupGuidance::Unknown => "安全に復元できる旧版のバックアップは確認できませんでした。\
+             更新用の作業フォルダーにあるファイルは、検証できていないため、上書き・削除・復元をしないでください。\n\n"
+            .to_string(),
+    };
     StopNotice {
         title: "Haneの更新を完了または取り消せませんでした".to_string(),
         message: format!(
             "中断された更新の復旧が済んでいないため、起動操作や文書を開く操作を処理できませんでした。\
              文書・設定・AIのデータには変更を加えていません。\n\n\
              理由: {reason}\n\n\
-             署名済みのHane ZIPを手動でインストールするなど、復旧の案内に従ってください。\
-             復旧が済んだ後で、もう一度Haneを起動するか、開きたい文書を開き直してください。"
+             {guidance}\
+             復旧するには、公式サイトから署名済みのHane ZIPを入手し、現在のHaneを置き換える形で手動でインストールしてください。\
+             インストール後にもう一度Haneを起動し、開きたい文書があれば開き直してください。\
+             更新は完了していません。"
         ),
     }
 }
@@ -387,14 +416,22 @@ fn present_notice(notice: &StopNotice) {
 }
 
 /// Reports a recovery-required stop through `present` and stops.
-fn stop_for_recovery(reason: &str, present: impl FnOnce(&StopNotice)) -> Entry {
-    present(&recovery_required_notice(reason));
+fn stop_for_recovery(
+    reason: &str,
+    backup: impl FnOnce() -> BackupGuidance,
+    present: impl FnOnce(&StopNotice),
+) -> Entry {
+    present(&recovery_required_notice(reason, &backup()));
     Entry::Stop(EXIT_RECOVERY_REQUIRED)
 }
 
 /// Turns a terminal gate refusal into a visible notice and a stop. Admitting
-/// outcomes are not handled here.
-fn stop_for_refusal(outcome: GateOutcome, present: impl FnOnce(&StopNotice)) -> Entry {
+/// outcomes are not handled here. `backup` is read only for a recovery stop.
+fn stop_for_refusal(
+    outcome: GateOutcome,
+    backup: impl FnOnce() -> BackupGuidance,
+    present: impl FnOnce(&StopNotice),
+) -> Entry {
     match outcome {
         GateOutcome::Proceed(guard) => Entry::Start {
             guard: Some(guard),
@@ -408,7 +445,7 @@ fn stop_for_refusal(outcome: GateOutcome, present: impl FnOnce(&StopNotice)) -> 
             present(&update_in_progress_notice());
             Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
         }
-        GateOutcome::RecoveryRequired(reason) => stop_for_recovery(&reason, present),
+        GateOutcome::RecoveryRequired(reason) => stop_for_recovery(&reason, backup, present),
     }
 }
 
@@ -426,6 +463,7 @@ pub fn enter() -> Entry {
             // an interrupted update is pending: do not start normal editing.
             return stop_for_recovery(
                 &format!("実行中の実行ファイルの場所を特定できません: {err}"),
+                || BackupGuidance::Unknown,
                 present_notice,
             );
         }
@@ -439,6 +477,7 @@ pub fn enter() -> Entry {
         ChildEntry::Refused(reason) => {
             return stop_for_recovery(
                 &format!("起動対象の更新を確認できません: {reason}"),
+                || recovery_backup_for_exe(&exe),
                 present_notice,
             );
         }
@@ -454,6 +493,7 @@ pub fn enter() -> Entry {
                 Err(err) => {
                     stop_for_recovery(
                         &format!("起動対象の更新を確認できません: {err}"),
+                        || recovery_backup_for_exe(&exe),
                         present_notice,
                     )
                 }
@@ -518,7 +558,7 @@ pub fn enter() -> Entry {
         let err = reexec_current_image(&exe);
         return stop_after_failed_reexec(&err, present_notice);
     }
-    stop_for_refusal(outcome, present_notice)
+    stop_for_refusal(outcome, || recovery_backup_for_exe(&exe), present_notice)
 }
 
 #[cfg(test)]
@@ -703,7 +743,7 @@ mod tests {
     #[test]
     fn update_in_progress_refusal_is_shown_and_asks_to_retry_after_the_update() {
         let mut shown = Vec::new();
-        let entry = stop_for_refusal(GateOutcome::UpdateInProgress, |n| {
+        let entry = stop_for_refusal(GateOutcome::UpdateInProgress, || BackupGuidance::Unknown, |n| {
             shown.push((n.title.clone(), n.message.clone()));
         });
         assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
@@ -718,24 +758,68 @@ mod tests {
     #[test]
     fn recovery_refusal_is_shown_and_never_reads_as_a_successful_update() {
         let mut shown = Vec::new();
-        let entry = stop_for_refusal(GateOutcome::RecoveryRequired("broken".into()), |n| {
-            shown.push(n.message.clone());
-        });
+        let entry = stop_for_refusal(
+            GateOutcome::RecoveryRequired("broken".into()),
+            || BackupGuidance::Unknown,
+            |n| {
+                shown.push(n.message.clone());
+            },
+        );
         assert!(matches!(entry, Entry::Stop(EXIT_RECOVERY_REQUIRED)));
         assert_eq!(shown.len(), 1);
         let message = &shown[0];
         assert!(message.contains("broken"), "the reason is shown");
-        assert!(message.contains("復旧の案内に従"));
-        assert!(message.contains("復旧が済んだ後で"));
+        assert!(message.contains("手動でインストール"));
+        assert!(message.contains("もう一度Haneを起動"));
         assert!(message.contains("開く操作"));
         assert!(!message.contains("更新は完了しています"));
         assert!(!message.contains("更新が終わってから"));
     }
 
     #[test]
+    fn a_known_backup_location_is_shown_without_vouching_for_its_content() {
+        let path = PathBuf::from("/state/private/tx/backup");
+        let located = BackupGuidance::Located { path: path.clone(), is_bundle: false };
+        let notice = recovery_required_notice("broken", &located);
+        assert!(notice.message.contains(&path.display().to_string()));
+        assert!(notice.message.contains("上書き・削除・移動しないでください"));
+        assert!(notice.message.contains("検証できていない"));
+        assert!(notice.message.contains("手動でインストール"));
+        assert!(!notice.message.contains("復元できます"));
+        assert!(!notice.message.contains("更新は完了しています"));
+
+        let bundle = BackupGuidance::Located { path, is_bundle: true };
+        let notice = recovery_required_notice("broken", &bundle);
+        assert!(notice.message.contains("Hane.app"));
+        assert!(notice.message.contains("上書き・削除・移動しないでください"));
+    }
+
+    #[test]
+    fn an_unknown_backup_is_never_shown_as_restorable() {
+        let notice = recovery_required_notice("x", &BackupGuidance::Unknown);
+        assert!(notice.message.contains("確認できませんでした"));
+        assert!(notice.message.contains("上書き・削除・復元をしないでください"));
+        assert!(notice.message.contains("手動でインストール"));
+        assert!(!notice.message.contains("置き場所"));
+        assert!(!notice.message.contains("更新は完了しています"));
+    }
+
+    #[test]
+    fn the_backup_is_read_only_for_a_recovery_stop() {
+        let mut shown = 0;
+        let entry = stop_for_refusal(
+            GateOutcome::UpdateInProgress,
+            || panic!("the backup is not needed for an update in progress"),
+            |_| shown += 1,
+        );
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown, 1);
+    }
+
+    #[test]
     fn a_failed_child_confirmation_is_shown_not_left_on_stderr() {
         let mut shown = 0;
-        let entry = stop_for_recovery("x", |_| shown += 1);
+        let entry = stop_for_recovery("x", || BackupGuidance::Unknown, |_| shown += 1);
         assert!(matches!(entry, Entry::Stop(EXIT_RECOVERY_REQUIRED)));
         assert_eq!(shown, 1);
     }
