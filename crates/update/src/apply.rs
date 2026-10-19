@@ -19,7 +19,7 @@ use crate::fsutil::{durable_write, hash_regular_file_under, read_limited};
 use crate::identity::FileIdentity;
 use crate::journal::{
     DiskView, DurableJournal, JournalStore, Observed, Phase, RecoveryDecision, RollbackAction,
-    StepState, decide_recovery, identity_matches,
+    StepState, decide_recovery, first_unchanged_mismatch, identity_matches,
 };
 use crate::limits::MAX_ENTRY_BYTES;
 use crate::paths::validate_rel_path;
@@ -194,6 +194,14 @@ fn run_steps<S: JournalStore, O: FileOps>(
             ));
         }
     }
+    // The files the update leaves alone must still be the signed ones before
+    // the new version is allowed to run.
+    if let Some(path) = first_unchanged_mismatch(journal.journal(), &*ops)? {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{path} differs from the signed inventory"),
+        ));
+    }
     journal.advance_phase(Phase::AwaitingHealth)
 }
 
@@ -273,6 +281,12 @@ fn verify_before_commit<S: JournalStore, O: FileOps>(
                 format!("{} differs from the signed new version", step.rel_path),
             ));
         }
+    }
+    if let Some(path) = first_unchanged_mismatch(journal.journal(), ops)? {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{path} differs from the signed inventory"),
+        ));
     }
     ops.verify_commit_state()
 }
@@ -1512,6 +1526,111 @@ mod tests {
         assert!(matches!(health, HealthOutcome::RecoveryRequired(_)), "{health:?}");
         assert_eq!(journal.journal().phase, Phase::RecoveryRequired);
         assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    fn plan_with_unchanged() -> ApplyPlan {
+        let mut plan = plan();
+        plan.unchanged = vec![crate::identity::UnchangedFile {
+            rel_path: "user.md".to_string(),
+            identity: FileIdentity::of(b"user data"),
+        }];
+        plan
+    }
+
+    /// The journal alone carries the unchanged identities; `FakeOps` has none.
+    fn journaled_unchanged() -> (DurableJournal<FlakyStore>, FakeOps, Child) {
+        let journal = UpdateJournal::begin(&plan_with_unchanged(), None).unwrap();
+        (
+            DurableJournal::create(flaky(), journal).unwrap(),
+            FakeOps::new(),
+            Child::default(),
+        )
+    }
+
+    #[test]
+    fn a_matching_unchanged_file_lets_the_journaled_update_commit() {
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert_eq!(outcome, ApplyOutcome::AwaitingHealth);
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert_eq!(health, HealthOutcome::Committed);
+        assert_eq!(ops.files["user.md"], b"user data");
+    }
+
+    #[test]
+    fn an_unchanged_file_changed_during_apply_never_reaches_awaiting_health() {
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        // Three backups, then a.dll (4) and added.txt (5) are installed.
+        ops.inject_after = Some((5, "user.md".to_string(), b"third party".to_vec()));
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_ne!(journal.journal().phase, Phase::AwaitingHealth);
+        assert_ne!(journal.journal().phase, Phase::Committed);
+        assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    #[test]
+    fn an_unchanged_file_changed_after_apply_is_not_committed_from_the_journal_alone() {
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert_eq!(outcome, ApplyOutcome::AwaitingHealth);
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert!(matches!(health, HealthOutcome::RecoveryRequired(_)), "{health:?}");
+        assert_ne!(journal.journal().phase, Phase::Committed);
+        assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    #[test]
+    fn terminal_receipts_reject_a_changed_unchanged_file_and_keep_it() {
+        // Committed receipt.
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert_eq!(journal.journal().phase, Phase::Committed);
+        let install = journal.journal().install_id.clone();
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert_eq!(decision, RecoveryDecision::KeepNew);
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert!(matches!(decision, RecoveryDecision::RecoveryRequired(_)), "{decision:?}");
+        assert_eq!(ops.files["user.md"], b"third party");
+
+        // RolledBack receipt.
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        conclude_health(&mut journal, &mut ops, &mut child, false).unwrap();
+        assert_eq!(journal.journal().phase, Phase::RolledBack);
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert_eq!(decision, RecoveryDecision::KeepOld);
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert!(matches!(decision, RecoveryDecision::RecoveryRequired(_)), "{decision:?}");
+        assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    #[test]
+    fn the_journal_rejects_damaged_unchanged_identities_and_round_trips_valid_ones() {
+        let valid = UpdateJournal::begin(&plan_with_unchanged(), None).unwrap();
+        assert_eq!(valid.unchanged.len(), 1);
+        let bytes = serde_json::to_vec(&valid).unwrap();
+        let back: UpdateJournal = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, valid);
+        assert!(back.validate().is_ok());
+
+        let mut bad_hash = valid.clone();
+        bad_hash.unchanged[0].identity.sha256 = "zz".to_string();
+        let mut bad_path = valid.clone();
+        bad_path.unchanged[0].rel_path = "../escape".to_string();
+        let mut backup_path = valid.clone();
+        backup_path.unchanged[0].rel_path = "backup/user.md".to_string();
+        let mut duplicate = valid.clone();
+        duplicate.unchanged.push(duplicate.unchanged[0].clone());
+        let mut overlaps_step = valid.clone();
+        overlaps_step.unchanged[0].rel_path = "a.dll".to_string();
+        for journal in [bad_hash, bad_path, backup_path, duplicate, overlaps_step] {
+            assert!(journal.validate().is_err(), "{journal:?}");
+        }
     }
 
     #[test]
