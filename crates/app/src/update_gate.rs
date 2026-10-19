@@ -173,6 +173,65 @@ fn reexec_current_image(_exe: &std::path::Path) -> String {
     "re-execution is not supported on this platform".to_string()
 }
 
+/// A stop message that must reach the person who launched Hane. A Finder launch
+/// has no terminal, and the GUI is not initialised yet, so stderr alone is never
+/// seen.
+#[derive(Debug, PartialEq, Eq)]
+struct StopNotice {
+    title: String,
+    message: String,
+}
+
+/// The notice for a failed restart into the updated executable. It names the
+/// reason, says the request made during the update (a plain launch or a
+/// document to open) was not handled, and tells the user to start Hane again.
+fn reexec_failure_notice(reason: &str) -> StopNotice {
+    StopNotice {
+        title: "Haneを更新後の状態で再起動できませんでした".to_string(),
+        message: format!(
+            "更新中に行った起動操作や文書を開く操作は処理されませんでした。\
+             文書・設定・AIのデータには変更を加えていません。\n\n\
+             理由: {reason}\n\n\
+             更新は完了しています。Haneを終了した状態で、もう一度Haneを起動し、\
+             開きたい文書があれば開き直してください。"
+        ),
+    }
+}
+
+/// `osascript` arguments that show `notice` as an alert. The text is passed as
+/// script arguments, never spliced into the script source.
+fn osascript_alert_args(notice: &StopNotice) -> Vec<String> {
+    vec![
+        "-e".to_string(),
+        "on run argv".to_string(),
+        "-e".to_string(),
+        "display alert (item 1 of argv) message (item 2 of argv) as critical".to_string(),
+        "-e".to_string(),
+        "end run".to_string(),
+        "--".to_string(),
+        notice.title.clone(),
+        notice.message.clone(),
+    ]
+}
+
+/// Shows the notice in a native alert on macOS (blocking until dismissed, so
+/// the process does not exit before it is read). Other platforms keep stderr.
+fn present_notice(notice: &StopNotice) {
+    eprintln!("{}\n{}", notice.title, notice.message);
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .args(osascript_alert_args(notice))
+            .status();
+    }
+}
+
+/// Fails closed after a failed re-exec: reports through `present` and stops.
+fn stop_after_failed_reexec(reason: &str, present: impl FnOnce(&StopNotice)) -> Entry {
+    present(&reexec_failure_notice(reason));
+    Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
+}
+
 pub fn enter() -> Entry {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -252,11 +311,7 @@ pub fn enter() -> Entry {
         // cannot be done, fail closed rather than edit with the old image.
         drop(outcome);
         let err = reexec_current_image(&exe);
-        eprintln!(
-            "Hane could not restart itself after the update ({err}). \
-             Please start it again."
-        );
-        return Entry::Stop(EXIT_UPDATE_IN_PROGRESS);
+        return stop_after_failed_reexec(&err, present_notice);
     }
     match outcome {
         GateOutcome::Proceed(guard) => Entry::Start {
@@ -381,6 +436,31 @@ mod tests {
         assert!(observed.get(), "the lease wait must be observed");
         assert!(needs_fresh_image(observed.get(), &outcome, true));
         assert_eq!(waits.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_reexec_shows_a_user_visible_notice_and_stops() {
+        let mut shown = Vec::new();
+        let entry = stop_after_failed_reexec("No such file", |notice| {
+            shown.push((notice.title.clone(), notice.message.clone()));
+        });
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown.len(), 1, "the notice is presented exactly once");
+        let (title, message) = &shown[0];
+        assert!(!title.is_empty());
+        assert!(message.contains("No such file"), "the reason is shown");
+        assert!(message.contains("もう一度Haneを起動"), "restart steps are given");
+        assert!(message.contains("開く操作"), "the lost request is not hidden");
+    }
+
+    #[test]
+    fn the_alert_command_passes_the_text_as_arguments_not_script_source() {
+        let notice = reexec_failure_notice("bad \"quote\" \\ reason");
+        let args = osascript_alert_args(&notice);
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(args[separator + 1], notice.title);
+        assert_eq!(args[separator + 2], notice.message);
+        assert!(args[..separator].iter().all(|arg| !arg.contains("quote")));
     }
 
     #[test]
