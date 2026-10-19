@@ -139,6 +139,24 @@ fn needs_fresh_image(observed_update: bool, outcome: &GateOutcome, is_macos: boo
         && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
 }
 
+/// Takes the gate so that any wait for a held lease is observable here. The
+/// gate waits for the startup lease internally and may then return `Proceed`
+/// without ever reporting `UpdateInProgress`, which would hide that this image
+/// outlived an update. A non-waiting probe comes first: if the lease is held,
+/// that is recorded in `observed_update` before the waiting attempt is made.
+fn take_gate_observing_waits(
+    mut take_gate: impl FnMut(std::time::Duration) -> GateOutcome,
+    wait: std::time::Duration,
+    observed_update: &std::cell::Cell<bool>,
+) -> GateOutcome {
+    let probe = take_gate(std::time::Duration::ZERO);
+    if !matches!(probe, GateOutcome::UpdateInProgress) {
+        return probe;
+    }
+    observed_update.set(true);
+    take_gate(wait)
+}
+
 /// Replaces this process with the current on-disk executable and the original
 /// arguments. Only returns on failure, with the reason.
 #[cfg(unix)]
@@ -207,7 +225,11 @@ pub fn enter() -> Entry {
     let observed_update = std::cell::Cell::new(false);
     let outcome = gate_with_open_retry(
         |wait| {
-            let outcome = startup_gate_for_exe_within(&exe, &runner, wait);
+            let outcome = take_gate_observing_waits(
+                |attempt| startup_gate_for_exe_within(&exe, &runner, attempt),
+                wait,
+                &observed_update,
+            );
             if matches!(outcome, GateOutcome::UpdateInProgress) {
                 observed_update.set(true);
             }
@@ -326,6 +348,52 @@ mod tests {
         let recovery = GateOutcome::RecoveryRequired("x".into());
         assert!(!needs_fresh_image(true, &recovery, true));
         assert!(!needs_fresh_image(true, &GateOutcome::UpdateInProgress, true));
+    }
+
+    #[test]
+    fn a_lease_wait_inside_the_gate_that_then_proceeds_still_needs_a_fresh_image() {
+        // The update holds the startup lease: a non-waiting attempt times out,
+        // while a waiting one outlasts the update and returns Unmanaged
+        // directly, never reporting UpdateInProgress to the caller.
+        let observed = std::cell::Cell::new(false);
+        let mut waits = Vec::new();
+        let outcome = gate_with_open_retry(
+            |wait| {
+                take_gate_observing_waits(
+                    |attempt| {
+                        waits.push(attempt);
+                        if attempt.is_zero() {
+                            GateOutcome::UpdateInProgress
+                        } else {
+                            GateOutcome::Unmanaged
+                        }
+                    },
+                    wait,
+                    &observed,
+                )
+            },
+            true,
+            None,
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert!(observed.get(), "the lease wait must be observed");
+        assert!(needs_fresh_image(observed.get(), &outcome, true));
+        assert_eq!(waits.len(), 2);
+    }
+
+    #[test]
+    fn an_uncontended_gate_is_not_treated_as_an_observed_update() {
+        let observed = std::cell::Cell::new(false);
+        let outcome = take_gate_observing_waits(
+            |_| GateOutcome::Unmanaged,
+            STARTUP_WAIT,
+            &observed,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert!(!observed.get());
+        assert!(!needs_fresh_image(observed.get(), &outcome, true));
     }
 
     #[test]
