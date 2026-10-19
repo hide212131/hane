@@ -542,15 +542,57 @@ jobs:
 
           git -C final-head apply --index --whitespace=nowarn "$patch_file"
 
+          u2_release_exception=false
+          if [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-release-pipeline-after-finalizer-policy' ]]; then
+            u2_release_exception=true
+          fi
+
           changed=false
           while IFS= read -r -d '' path; do
             changed=true
             case "$path" in
-              .github/RELEASE_AUTOMATION.md|.github/workflows/ci.yml|.github/workflows/release-request.yml|.github/workflows/windows-release.yml)
+              .github/RELEASE_AUTOMATION.md|.github/workflows/release-request.yml|.github/workflows/windows-release.yml)
                 # One-time, owner-only exception for the dedicated Issue #510 U2 release PR.
                 # All other .github paths, including this trusted workflow and its scripts, stay blocked.
-                if [[ "$PR_NUMBER" != '526' || "$EXPECTED_HEAD_REF" != 'work/issue-510-u2-release-pipeline' || "$EXPECTED_BASE_REF" != 'work/issue-510-u4-apply-recovery' || "$ACTOR_LOGIN" != 'hide212131' || "$ACTOR_PERMISSION" != 'admin' || "$EXPECTED_ROOT_CAUSE" != 'issue-510-u2-release-pipeline-after-finalizer-policy' ]]; then
+                if [[ "$u2_release_exception" != 'true' ]]; then
                   echo "::error::Protected release path is only allowed for the owner on the dedicated Issue #510 U2 PR: $path"
+                  exit 1
+                fi
+                ;;
+              .github/workflows/ci.yml)
+                if [[ "$u2_release_exception" != 'true' ]]; then
+                  echo "::error::CI workflow changes are only allowed for the owner on the dedicated Issue #510 U2 PR: $path"
+                  exit 1
+                fi
+                mapfile -t ci_added < <(
+                  git -C final-head diff --cached --no-renames --unified=0 -- .github/workflows/ci.yml \
+                    | sed -n '/^+++/! /^+/p'
+                )
+                mapfile -t ci_removed < <(
+                  git -C final-head diff --cached --no-renames --unified=0 -- .github/workflows/ci.yml \
+                    | sed -n '/^---/! /^-/p'
+                )
+                if [[ "${#ci_added[@]}" -ne 2 || "${#ci_removed[@]}" -ne 0 || "${ci_added[0]:-}" != '+      - name: Test update distribution tooling' || "${ci_added[1]:-}" != '+        run: python3 scripts/tests/test_update_release.py' ]]; then
+                  echo '::error::CI workflow changes must add only the read-only update-distribution fixture test.'
+                  exit 1
+                fi
+                if ! git -C final-head show :.github/workflows/ci.yml | python3 -c '
+import sys
+
+workflow = sys.stdin.read()
+expected = (
+    "      - name: Test release PR policy\n"
+    "        run: python3 .github/tests/test_release_pr.py\n"
+    "\n"
+    "      - name: Test update distribution tooling\n"
+    "        run: python3 scripts/tests/test_update_release.py\n"
+    "\n"
+    "      - name: Detect Rust CI inputs\n"
+)
+if workflow.count(expected) != 1:
+    raise SystemExit(1)
+'; then
+                  echo '::error::The update-distribution fixture test must stay in the read-only rust_ci_changes job.'
                   exit 1
                 fi
                 ;;
