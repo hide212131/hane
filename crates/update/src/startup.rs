@@ -2361,16 +2361,16 @@ mod tests {
     #[test]
     fn a_settled_or_damaged_journal_yields_no_backup_location() {
         let dir = TempDir::new("gate-backup-guidance-settled");
-        let placement = placement(&dir);
-        let coord = placement.coordination().unwrap();
+        let settled_placement = placement(&dir);
+        let coord = settled_placement.coordination().unwrap();
         let transaction = TransactionId::generate().unwrap();
         write_journal(&coord, &transaction, Phase::RolledBack);
         fs::create_dir_all(coord.transaction_dir(&transaction).join("backup")).unwrap();
         assert_eq!(recovery_backup(&coord, false), BackupGuidance::Unknown);
 
         let dir = TempDir::new("gate-backup-guidance-damaged");
-        let placement = placement(&dir);
-        let coord = placement.coordination().unwrap();
+        let damaged_placement = placement(&dir);
+        let coord = damaged_placement.coordination().unwrap();
         let transaction = TransactionId::generate().unwrap();
         write_journal(&coord, &transaction, Phase::RecoveryRequired);
         fs::create_dir_all(coord.transaction_dir(&transaction).join("backup")).unwrap();
