@@ -139,6 +139,51 @@ fn needs_fresh_image(observed_update: bool, outcome: &GateOutcome, is_macos: boo
         && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
 }
 
+/// Set on the re-executed image so a still-mismatching disk cannot loop.
+const REEXEC_MARKER_ENV: &str = "HANE_UPDATE_GATE_REEXEC";
+
+/// Identity of this build's executable. It embeds the version, which every
+/// update changes; the same bytes are in the on-disk executable of the same
+/// build and absent from any other version's.
+#[used]
+static IMAGE_MARKER: &str = concat!("hane-image-generation=", env!("CARGO_PKG_VERSION"), ";");
+
+fn image_marker() -> &'static [u8] {
+    std::hint::black_box(IMAGE_MARKER).as_bytes()
+}
+
+/// Whether `reader` contains `needle`, read in bounded chunks.
+fn reader_contains(mut reader: impl std::io::Read, needle: &[u8]) -> std::io::Result<bool> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    let mut buf = vec![0u8; 1 << 20];
+    let mut window: Vec<u8> = Vec::new();
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        window.extend_from_slice(&buf[..n]);
+        if window.windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+        let keep = needle.len() - 1;
+        if window.len() > keep {
+            window.drain(..window.len() - keep);
+        }
+    }
+}
+
+/// Whether the executable at `exe` is the same build as the running image.
+/// An unreadable file counts as different: the caller then restarts or stops.
+fn disk_image_is_running_image(exe: &std::path::Path) -> bool {
+    match std::fs::File::open(exe) {
+        Ok(file) => reader_contains(file, image_marker()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 /// Takes the gate so that any wait for a held lease is observable here. The
 /// gate waits for the startup lease internally and may then return `Proceed`
 /// without ever reporting `UpdateInProgress`, which would hide that this image
@@ -164,6 +209,7 @@ fn reexec_current_image(exe: &std::path::Path) -> String {
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(exe)
         .args(std::env::args_os().skip(1))
+        .env(REEXEC_MARKER_ENV, "1")
         .exec();
     err.to_string()
 }
@@ -299,8 +345,14 @@ pub fn enter() -> Entry {
         std::thread::sleep,
         || started.elapsed(),
     );
+    // A momentary lease observation cannot prove that no update happened (the
+    // helper may release the lease before the probe), so on macOS the running
+    // image is also compared with the signed executable now on disk.
+    let disk_differs = cfg!(target_os = "macos")
+        && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
+        && !disk_image_is_running_image(&exe);
     if needs_fresh_image(
-        observed_update.get(),
+        observed_update.get() || disk_differs,
         &outcome,
         cfg!(target_os = "macos"),
     ) {
@@ -310,6 +362,13 @@ pub fn enter() -> Entry {
         // once, to the new image) with the current on-disk executable. If that
         // cannot be done, fail closed rather than edit with the old image.
         drop(outcome);
+        if disk_differs && std::env::var_os(REEXEC_MARKER_ENV).is_some() {
+            // Already restarted once and the disk still differs: never loop.
+            return stop_after_failed_reexec(
+                "再起動後も、実行中の版とディスク上の実行ファイルが一致しません",
+                present_notice,
+            );
+        }
         let err = reexec_current_image(&exe);
         return stop_after_failed_reexec(&err, present_notice);
     }
@@ -436,6 +495,35 @@ mod tests {
         assert!(observed.get(), "the lease wait must be observed");
         assert!(needs_fresh_image(observed.get(), &outcome, true));
         assert_eq!(waits.len(), 2);
+    }
+
+    #[test]
+    fn a_helper_that_released_the_lease_before_the_probe_still_leaves_a_stale_image_detected() {
+        // The probe sees no update and the gate proceeds directly, so nothing
+        // was observed; the on-disk executable is a different generation.
+        let observed = std::cell::Cell::new(false);
+        let outcome = take_gate_observing_waits(
+            |_| GateOutcome::Unmanaged,
+            STARTUP_WAIT,
+            &observed,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert!(!observed.get());
+        let mut new_image = vec![0u8; 3 << 20];
+        new_image.extend_from_slice(b"hane-image-generation=99.0.0;");
+        let disk_differs = !reader_contains(&new_image[..], image_marker()).unwrap();
+        assert!(disk_differs);
+        assert!(needs_fresh_image(observed.get() || disk_differs, &outcome, true));
+    }
+
+    #[test]
+    fn an_unchanged_image_on_disk_is_not_restarted() {
+        let mut same = vec![1u8; (1 << 20) - 5];
+        same.extend_from_slice(image_marker());
+        same.extend_from_slice(&[2u8; 100]);
+        assert!(reader_contains(&same[..], image_marker()).unwrap());
+        let outcome = GateOutcome::Unmanaged;
+        assert!(!needs_fresh_image(false, &outcome, true));
     }
 
     #[test]
