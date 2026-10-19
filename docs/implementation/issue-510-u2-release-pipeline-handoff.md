@@ -1,6 +1,16 @@
 # Issue #510 U2: 配布・署名パイプライン実装ハンドオフ
 
-状態: 実装前の依頼準備。配布workflow・署名・ZIPはまだ変更・発行していない。
+状態: U2の配布基盤の実装案をこのPRの差分として含める。未検証であり、current headのCI結果が確認されるまで動作済みとは扱わない。署名・notarization・実release発行・protected Environmentの承認は行っておらず、保守者の資格情報設定後の実run、U-13/U-14の実OS確認、U5は未実施・未公開である。fixture/CIの結果を実OSの更新成功や署名の証明として扱わない。
+
+実装の所在（いずれもこのPRの差分内の変更で、CIとレビューでの確認前）:
+
+- `scripts/release_catalog.py` — inventory/catalog生成、Ed25519署名（`cryptography==50.0.2`、`scripts/release-requirements.txt`）、全入口共通のverifier、公開済みcatalogからのsequence採番、tag/latest確認、Draft/公開assetの再取得。
+- `.github/workflows/windows-release.yml` — 署名設定のfail-closed確認、両OSのhelperビルドと実binaryのidentity検証、Windows inventory署名とAuthenticode `Valid` 確認、macOS Developer ID署名/notarize/staple/再展開検証、直列化された`release`ジョブ（plan → catalog生成/署名 → Draft → 再取得検証 → stable公開 → 公開後再検証）。
+- `.github/workflows/release-request.yml` — 公開後に両ZIPとcatalog/署名を同じverifierで検証。
+- `scripts/bundle-macos.sh` — `hane`と`hane-updater`の双方をビルドし、`Contents/Helpers/hane-updater`とInfo.plistの版/source SHA/protocolを設定。
+- `crates/updater/{build.rs,src/main.rs}` — version/target/source SHA/protocolを、起動時の整合確認で実際に参照される識別recordとして埋め込み。`black_box`や`#[used]`の採用だけでは完了とせず、`release_catalog.py binary-identity`が実際にbuildしたhelper（Windowsは`hane-updater.exe`、macOSは署名前のbundle内helper）を読み取り専用で検査し、`verify-windows-zip`/`verify-macos-zip`/`verify-release`がZIP内のhelperを同じ検査にかける。helper自体は実行せず、通常の安全境界は変えない。実行できないOS/runnerのhelperは検証済みと扱わない。
+- `crates/update/src/trust.rs` — 公開鍵とTeam IDをビルド時環境変数から埋め込む（未設定・不正値は何も埋め込まずfail-closed）。
+- `scripts/tests/test_release_catalog.py`, `scripts/tests/test_release_workflows.py` — fixture testとworkflow配線test。CIの`rust_ci_changes`から実行する。
 
 - 対象Issue: [#510](https://github.com/hide212131/hane/issues/510)
 - 対象フェーズ: U2（ZIP配布物とstable release pipeline）
@@ -8,7 +18,7 @@
 - 実装開始時の基準head: `00bf87fd529398d9ee7305f74fdea899065f8260`
 - 設計の正本: [ADR-0034](../adr/0034-zip-application-updates.md)、[実装仕様](../application-update-implementation-spec.md)、[実装引き継ぎ](../application-update-implementation-handoff.md)
 
-このPRはU2の実装先を用意するための準備commitだけを含む。実装依頼後は対象PR headを再確認し、基準headと異なる場合はpushしない。
+実装依頼後は対象PR headを再確認し、基準headと異なる場合はpushしない。保存済みの案はPRへの適用・承認とは別の判断であり、この文書は適用の事実を保証しない。
 
 ## 今回の目的
 

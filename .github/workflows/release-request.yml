@@ -172,6 +172,7 @@ jobs:
       pull-requests: read
     steps:
       - name: Wait for release PR CI and automatic merge
+        id: wait
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.create_release_pr.outputs.pr_number }}
@@ -244,8 +245,38 @@ jobs:
           gh run watch "$release_run_id" --repo "$GITHUB_REPOSITORY" --exit-status --compact
 
           release_tag="${{ needs.create_release_pr.outputs.release_tag }}"
-          assets="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]')"
-          jq -e 'index("hane-macos-arm64.zip") != null and index("hane-windows-x64.zip") != null' \
-            <<< "$assets" >/dev/null
-          echo "Release $release_tag is published with both platform ZIP files."
+          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      # The merged commit carries the verifier; check out exactly that commit so
+      # the published assets are judged by the code that built them.
+      - name: Check out the merged release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.wait.outputs.merge_sha }}
+          persist-credentials: false
+
+      - name: Install release tooling
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install release tooling requirements
+        run: python -m pip install -r scripts/release-requirements.txt
+
+      - name: Verify the published ZIP files, catalog and signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.wait.outputs.release_tag }}
+          SOURCE_SHA: ${{ steps.wait.outputs.merge_sha }}
+          HANE_UPDATE_KEY_ID: ${{ vars.HANE_UPDATE_KEY_ID }}
+          HANE_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.HANE_UPDATE_PUBLIC_KEY_BASE64 }}
+          HANE_MACOS_TEAM_ID: ${{ vars.HANE_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py fetch-assets \
+            --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --dest published-assets
+          python scripts/release_catalog.py verify-release \
+            --dir published-assets --tag "$RELEASE_TAG" --source-sha "$SOURCE_SHA"
+          echo "Release $RELEASE_TAG is published with verified Windows and macOS ZIP files, catalog and signature."
 

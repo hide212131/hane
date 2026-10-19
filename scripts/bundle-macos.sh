@@ -42,11 +42,36 @@ resize 1024 icon_512x512@2x.png
 /usr/bin/iconutil -c icns "$iconset" -o "$tmp/Hane.icns"
 
 cd "$workspace"
-cargo build --release --locked -p hane
+
+# The bundle carries the version, source commit and updater protocol that the
+# update helper compares with the signed catalog. The commit must be a full
+# SHA: the release workflows pass HANE_SOURCE_SHA, local builds use HEAD.
+version="$(sed -n 's/^version = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' Cargo.toml | head -n 1)"
+if [[ -z "$version" ]]; then
+  echo "Could not read the workspace package version from Cargo.toml" >&2
+  exit 1
+fi
+source_sha="${HANE_SOURCE_SHA:-$(git rev-parse HEAD 2>/dev/null || true)}"
+if ! [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "HANE_SOURCE_SHA (or a git checkout) must provide a 40-digit lowercase source commit" >&2
+  exit 1
+fi
+updater_protocol=1
+# hane-updater/build.rs embeds the same commit; both binaries are built here.
+export HANE_SOURCE_SHA="$source_sha"
+cargo build --release --locked -p hane -p hane-updater
+
+# The helper must report the identity the bundle claims. Release builds repeat
+# this check on the extracted notarized ZIP.
+python3 "$workspace/scripts/release_catalog.py" binary-identity \
+  --binary "$target_dir/release/hane-updater" \
+  --version "$version" --target aarch64-apple-darwin --source-sha "$source_sha"
 
 rm -rf "$bundle"
-mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Helpers" "$bundle/Contents/Resources"
 cp "$target_dir/release/hane" "$bundle/Contents/MacOS/hane"
+cp "$target_dir/release/hane-updater" "$bundle/Contents/Helpers/hane-updater"
+chmod 755 "$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"
 cp "$tmp/Hane.icns" "$bundle/Contents/Resources/Hane.icns"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -109,6 +134,14 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 PLIST
 /usr/bin/plutil -lint "$bundle/Contents/Info.plist" >/dev/null
 
+# Update identity read by hane-update (crates/update/src/macos_apply.rs).
+update_plist="$bundle/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $version" "$update_plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $version" "$update_plist"
+/usr/libexec/PlistBuddy -c "Add :HaneSourceCommit string $source_sha" "$update_plist"
+/usr/libexec/PlistBuddy -c "Add :HaneUpdaterProtocol integer $updater_protocol" "$update_plist"
+/usr/bin/plutil -lint "$update_plist" >/dev/null
+
 # Finder lists Hane under "Open With" only for the document types declared
 # here. Hane must offer exactly the system Markdown UTI (not generic text) and
 # must stay an alternate handler so the user, not the bundle, chooses the
@@ -169,5 +202,23 @@ if [[ "$(plist_value CFBundleDocumentTypes:0:LSHandlerRank)" != "Alternate" ]]; 
   exit 1
 fi
 
+for pair in \
+  "CFBundleIdentifier:io.github.hide212131.hane" \
+  "CFBundleShortVersionString:$version" \
+  "CFBundleVersion:$version" \
+  "HaneSourceCommit:$source_sha" \
+  "HaneUpdaterProtocol:$updater_protocol"; do
+  if [[ "$(plist_value "${pair%%:*}")" != "${pair#*:}" ]]; then
+    echo "Info.plist ${pair%%:*} must be ${pair#*:}" >&2
+    exit 1
+  fi
+done
+if [[ ! -x "$bundle/Contents/Helpers/hane-updater" || ! -x "$bundle/Contents/MacOS/hane" ]]; then
+  echo "Bundle must contain executable Contents/MacOS/hane and Contents/Helpers/hane-updater" >&2
+  exit 1
+fi
+
+# Signing, notarization and stapling are done by the release workflow with the
+# maintainer's credentials; this script never signs and must not run after it.
 touch "$bundle"
 echo "Built: $bundle"
