@@ -123,7 +123,8 @@ pub trait BundleHost {
     /// Strict verification of the complete bundle against the Developer ID
     /// requirement pinned to exactly `team_id`.
     fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()>;
-    /// The Gatekeeper assessment of the bundle, as the OS makes it.
+    /// The Gatekeeper assessment of the bundle, as the OS makes it. It succeeds
+    /// only if the assessment also reports a Notarized Developer ID source.
     fn assess_gatekeeper(&self, bundle: &Path) -> Result<()>;
     /// The relocation mark stored on the bundle directory itself (an extended
     /// attribute, which follows the directory through a rename or a move), or
@@ -796,6 +797,61 @@ fn require_local_apfs(host: &dyn BundleHost, path: &Path, what: &str) -> Result<
 fn require_signed(host: &dyn BundleHost, bundle: &Path, team_id: &str) -> Result<()> {
     host.verify_developer_id(bundle, team_id)?;
     host.assess_gatekeeper(bundle)
+}
+
+/// The line `spctl --assess --verbose=4` prints for an Apple-notarized
+/// Developer ID bundle.
+const NOTARIZED_SOURCE_LINE: &str = "source=Notarized Developer ID";
+
+/// Decides a Gatekeeper assessment. A zero exit status alone is not enough:
+/// a local override rule can accept an un-notarized bundle. The assessment
+/// must also report the Notarized Developer ID source; missing evidence is a
+/// rejection.
+pub fn gatekeeper_notarized_verdict(accepted: bool, report: &str) -> Result<()> {
+    if !accepted {
+        return Err(UpdateError::new(
+            ErrorCode::SignatureInvalid,
+            "Gatekeeper does not accept the bundle",
+        ));
+    }
+    if report.lines().any(|line| line.trim() == NOTARIZED_SOURCE_LINE) {
+        Ok(())
+    } else {
+        Err(UpdateError::new(
+            ErrorCode::SignatureInvalid,
+            "the bundle is not proven to be notarized by Apple",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod notarization_tests {
+    use super::*;
+
+    #[test]
+    fn an_accepted_bundle_without_notarization_evidence_is_rejected() {
+        let report = "/Applications/Hane.app: accepted\nsource=Developer ID\n";
+        let err = gatekeeper_notarized_verdict(true, report).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SignatureInvalid);
+        let err = gatekeeper_notarized_verdict(true, "").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SignatureInvalid);
+        let report = "/Applications/Hane.app: accepted\nsource=Unnotarized Developer ID\n";
+        assert!(gatekeeper_notarized_verdict(true, report).is_err());
+    }
+
+    #[test]
+    fn a_notarized_developer_id_assessment_is_accepted() {
+        let report = "/Applications/Hane.app: accepted\nsource=Notarized Developer ID\n\
+                      origin=Developer ID Application: Example (ABCDE12345)\n";
+        assert!(gatekeeper_notarized_verdict(true, report).is_ok());
+    }
+
+    #[test]
+    fn a_gatekeeper_rejection_stays_rejected_even_with_the_notarized_line() {
+        let report = "/Applications/Hane.app: rejected\nsource=Notarized Developer ID\n";
+        let err = gatekeeper_notarized_verdict(false, report).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SignatureInvalid);
+    }
 }
 
 /// Independently re-verifies placement, both bundles, the candidate and the

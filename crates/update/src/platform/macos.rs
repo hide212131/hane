@@ -28,7 +28,8 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{hash_regular_file, read_limited};
 use crate::identity::{FileIdentity, InstallFacts, InstallId};
 use crate::macos_apply::{
-    BundleHost, VolumeFacts, plist_string, required_team_id, valid_team_id,
+    BundleHost, VolumeFacts, gatekeeper_notarized_verdict, plist_string, required_team_id,
+    valid_team_id,
 };
 use crate::model::{MACOS_BUNDLE_ID, Target};
 use crate::trust::TrustPolicy;
@@ -511,21 +512,19 @@ impl BundleHost for MacHost {
     }
 
     fn assess_gatekeeper(&self, bundle: &Path) -> Result<()> {
-        let status = Command::new(SPCTL)
-            .args(["--assess", "--type", "execute"])
+        // `--verbose=4` makes spctl report the assessment source; the report
+        // goes to stderr. Exit status 0 alone does not prove notarization.
+        let output = Command::new(SPCTL)
+            .args(["--assess", "--type", "execute", "--verbose=4"])
             .arg(bundle)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(UpdateError::new(
-                ErrorCode::SignatureInvalid,
-                "Gatekeeper does not accept the bundle",
-            ))
-        }
+            .output()?;
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        gatekeeper_notarized_verdict(output.status.success(), &report)
     }
 }
 
