@@ -601,21 +601,21 @@ jobs:
                   exit 1
                 fi
                 if ! git -C final-head show :.github/workflows/ci.yml | python3 -c '
-import sys
+          import sys
 
-workflow = sys.stdin.read()
-expected = (
-    "      - name: Test release PR policy\n"
-    "        run: python3 .github/tests/test_release_pr.py\n"
-    "\n"
-    "      - name: Test update distribution tooling\n"
-    "        run: python3 scripts/tests/test_update_release.py\n"
-    "\n"
-    "      - name: Detect Rust CI inputs\n"
-)
-if workflow.count(expected) != 1:
-    raise SystemExit(1)
-'; then
+          workflow = sys.stdin.read()
+          expected = (
+              "      - name: Test release PR policy\n"
+              "        run: python3 .github/tests/test_release_pr.py\n"
+              "\n"
+              "      - name: Test update distribution tooling\n"
+              "        run: python3 scripts/tests/test_update_release.py\n"
+              "\n"
+              "      - name: Detect Rust CI inputs\n"
+          )
+          if workflow.count(expected) != 1:
+              raise SystemExit(1)
+          '; then
                   echo '::error::The update-distribution fixture test must stay in the read-only rust_ci_changes job.'
                   exit 1
                 fi
