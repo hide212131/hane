@@ -737,6 +737,10 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             if !plan.missing.is_empty() {
                 view.report_restore_skipped(plan.missing.len(), cx);
             }
+            if plan.explorer_failure.is_some() {
+                // After the restore notice so it is not hidden by it.
+                view.report_explorer_migration_failed(cx);
+            }
         });
     }
     #[cfg(feature = "instrument")]
@@ -889,6 +893,7 @@ mod ownership_claim_tests {
             work_folder: None,
             files: vec![PathBuf::from("/nope/a.md"), PathBuf::from("/nope/b.md")],
             missing: Vec::new(),
+            explorer_failure: None,
         };
         prioritize_explicit_file(&mut plan, Path::new("/nope/a.md"));
         assert_eq!(

@@ -795,6 +795,9 @@ pub struct EditorView {
     /// Version of the update this process was started for, shown once after
     /// the helper's durable commit.
     update_completed: Option<String>,
+    /// Set when the update committed but the Explorer integration could not be
+    /// carried to the new version; shown until the user acts on the update card.
+    explorer_migration_failed: bool,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -1690,6 +1693,7 @@ impl EditorView {
             restart_in_progress: false,
             restart_message: None,
             update_completed: None,
+            explorer_migration_failed: false,
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,

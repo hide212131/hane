@@ -1467,8 +1467,20 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            ["active", "files", "install_id", "schema", "state_root", "transaction_id", "work_folder"]
+            [
+                "active",
+                "explorer",
+                "files",
+                "install_id",
+                "schema",
+                "state_root",
+                "transaction_id",
+                "work_folder"
+            ]
         );
+        // Without an Explorer registration the key is present and null; the
+        // ticket still holds only paths and identifiers, never document text.
+        assert!(value["explorer"].is_null());
     }
 
     #[test]

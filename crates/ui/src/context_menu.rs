@@ -71,25 +71,35 @@ pub struct ExplorerRegistration {
 }
 
 /// Builds the registration to carry from what the trusted inspection read.
-/// `None` when neither verb is ON (nothing is turned on that was off) or when
-/// no installed package identity backs the markers (nothing to carry).
+/// `Ok(None)` only when neither verb is ON (nothing is turned on that was off).
+/// When a verb is ON but the package publisher is missing or empty, the
+/// registration cannot be inspected and that is an error: it is never read as
+/// "not registered".
 pub fn registration_from_inspection(
     owner: &str,
     package_name: &str,
     publisher: Option<String>,
     file_enabled: bool,
     folder_enabled: bool,
-) -> Option<ExplorerRegistration> {
+) -> io::Result<Option<ExplorerRegistration>> {
     if !file_enabled && !folder_enabled {
-        return None;
+        return Ok(None);
     }
-    Some(ExplorerRegistration {
+    let publisher = publisher
+        .map(|publisher| publisher.trim().to_owned())
+        .filter(|publisher| !publisher.is_empty())
+        .ok_or_else(|| {
+            io::Error::other(
+                "Explorer 連携が有効ですが、Explorer 拡張パッケージの所有者を確認できません",
+            )
+        })?;
+    Ok(Some(ExplorerRegistration {
         owner: owner.to_owned(),
         package_name: package_name.to_owned(),
-        publisher: publisher?,
+        publisher,
         file_enabled,
         folder_enabled,
-    })
+    }))
 }
 
 /// Reads the enabled Explorer integration of the current user. `Ok(None)` when
@@ -559,13 +569,13 @@ mod windows {
         if !file_enabled && !folder_enabled {
             return Ok(None);
         }
-        Ok(super::registration_from_inspection(
+        super::registration_from_inspection(
             OWNER_ID,
             PACKAGE_NAME,
             installed_package_publisher()?,
             file_enabled,
             folder_enabled,
-        ))
+        )
     }
 
     pub(super) fn migrate_registration(saved: &ExplorerRegistration) -> io::Result<()> {
@@ -771,6 +781,19 @@ mod windows {
     }
 }
 
+#[cfg(windows)]
+pub use windows::{inspect, register, register_file, unregister, unregister_file};
+
+#[cfg(not(windows))]
+pub fn register(_exe: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
+}
+
+#[cfg(not(windows))]
+pub fn unregister() -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
+}
+
 #[cfg(test)]
 mod migration_tests {
     use super::*;
@@ -829,6 +852,7 @@ mod migration_tests {
                 file,
                 folder,
             )
+            .unwrap()
             .expect("an enabled integration is captured");
             assert_eq!(captured, saved(file, folder));
         }
@@ -836,12 +860,24 @@ mod migration_tests {
 
     #[test]
     fn capture_is_none_for_a_user_without_the_integration() {
-        assert_eq!(
-            registration_from_inspection(OWNER, PACKAGE, Some(PUBLISHER.to_owned()), false, false),
-            None
-        );
-        // Markers without an installed package identity carry nothing.
-        assert_eq!(registration_from_inspection(OWNER, PACKAGE, None, true, true), None);
+        // Both markers OFF is "not registered", whatever the publisher read.
+        for publisher in [Some(PUBLISHER.to_owned()), Some(String::new()), None] {
+            assert_eq!(
+                registration_from_inspection(OWNER, PACKAGE, publisher, false, false).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn an_enabled_marker_without_a_publisher_is_an_error_not_unregistered() {
+        for (file, folder) in [(true, true), (true, false), (false, true)] {
+            for publisher in [None, Some(String::new()), Some("  ".to_owned())] {
+                assert!(
+                    registration_from_inspection(OWNER, PACKAGE, publisher, file, folder).is_err()
+                );
+            }
+        }
     }
 
     #[test]
@@ -897,17 +933,4 @@ mod migration_tests {
         assert!(migrate(&saved(false, false), Some(PUBLISHER), (false, false), &registered, true).is_err());
         assert_eq!(registered.get(), 0);
     }
-}
-
-#[cfg(windows)]
-pub use windows::{inspect, register, register_file, unregister, unregister_file};
-
-#[cfg(not(windows))]
-pub fn register(_exe: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
-}
-
-#[cfg(not(windows))]
-pub fn unregister() -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
 }

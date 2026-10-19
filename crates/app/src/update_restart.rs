@@ -257,6 +257,10 @@ pub struct RestorePlan {
     pub files: Vec<PathBuf>,
     /// Saved files that no longer exist (deleted or moved).
     pub missing: Vec<PathBuf>,
+    /// Why the Explorer integration could not be carried to the new version.
+    /// `None` when there was nothing to carry or it was carried. Shown to the
+    /// user: the update itself did succeed.
+    pub explorer_failure: Option<String>,
 }
 
 /// Turns a ticket into a plan. A file that is gone is recorded and skipped.
@@ -296,6 +300,7 @@ pub fn plan_restore(
         work_folder,
         files,
         missing,
+        explorer_failure: None,
     }
 }
 
@@ -327,14 +332,28 @@ pub(crate) fn restore_after_commit_with(
             return None;
         }
     };
-    if let Some(saved) = &ticket.explorer
-        && let Err(err) = migrate_explorer(saved)
-    {
-        eprintln!("Hane did not carry the Explorer integration over the update ({err}).");
-    }
-    let plan = plan_restore(&ticket, |path| path.is_file(), |path| path.is_dir());
+    let explorer_failure = carry_explorer(ticket.explorer.as_ref(), migrate_explorer);
+    let mut plan = plan_restore(&ticket, |path| path.is_file(), |path| path.is_dir());
+    plan.explorer_failure = explorer_failure;
     finish_cleanup(restore);
     Some(plan)
+}
+
+/// Runs the Explorer migration for a ticket that carries one. The failure
+/// reason is returned for the user-facing notice (and logged); nothing to carry
+/// or a successful migration is `None`.
+fn carry_explorer(
+    saved: Option<&ExplorerTicket>,
+    migrate: impl FnOnce(&ExplorerTicket) -> std::io::Result<()>,
+) -> Option<String> {
+    let saved = saved?;
+    match migrate(saved) {
+        Ok(()) => None,
+        Err(err) => {
+            eprintln!("Hane did not carry the Explorer integration over the update ({err}).");
+            Some(err.to_string())
+        }
+    }
 }
 
 /// The ticket is already used when this runs, so a failure only leaves the
@@ -608,6 +627,32 @@ mod tests {
             assert_eq!(ticket.folder_enabled, folder_enabled);
             assert_eq!(explorer_registration(&ticket), registration);
         }
+    }
+
+    #[test]
+    fn a_migration_failure_is_reported_and_a_success_or_nothing_is_not() {
+        let saved = explorer_ticket(ExplorerRegistration {
+            owner: "owner".to_owned(),
+            package_name: "Hane.ShellIntegration".to_owned(),
+            publisher: "CN=Hane".to_owned(),
+            file_enabled: true,
+            folder_enabled: false,
+        });
+        let ran = std::cell::Cell::new(0);
+        assert_eq!(
+            carry_explorer(Some(&saved), |_| {
+                ran.set(ran.get() + 1);
+                Ok(())
+            }),
+            None
+        );
+        assert_eq!(ran.get(), 1);
+        let failure = carry_explorer(Some(&saved), |_| Err(std::io::Error::other("登録に失敗")));
+        assert!(failure.expect("a failure is reported").contains("登録に失敗"));
+        assert_eq!(
+            carry_explorer(None, |_| panic!("nothing to carry is never migrated")),
+            None
+        );
     }
 
     #[test]
