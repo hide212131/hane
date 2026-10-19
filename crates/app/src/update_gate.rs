@@ -207,6 +207,7 @@ fn take_gate_observing_waits(
 /// against the pinned Team ID (Developer ID signature) and be accepted by
 /// Gatekeeper as notarized. `verify` performs that check; without a pinned Team
 /// ID nothing can be proven and the answer is a refusal.
+#[cfg(any(target_os = "macos", test))]
 fn reexec_trust_decision(
     team_id: Option<&str>,
     verify: impl FnOnce(&str) -> Result<(), String>,
@@ -283,6 +284,7 @@ fn reexec_failure_notice(reason: &str) -> StopNotice {
 
 /// `osascript` arguments that show `notice` as an alert. The text is passed as
 /// script arguments, never spliced into the script source.
+#[cfg(any(target_os = "macos", test))]
 fn osascript_alert_args(notice: &StopNotice) -> Vec<String> {
     vec![
         "-e".to_string(),
