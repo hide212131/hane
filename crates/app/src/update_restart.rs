@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use hane_ui::context_menu::{self, ExplorerRegistration};
-use hane_ui::{PreparedUpdate, RestartTicketSnapshot};
+use hane_ui::{ExplorerRepairScope, PreparedUpdate, RestartTicketSnapshot};
 use hane_update::helper::{PreparedRestart, prepare_restart};
 use hane_update::identity::TransactionId;
 use hane_update::platform::Placement;
@@ -261,6 +261,9 @@ pub struct RestorePlan {
     /// `None` when there was nothing to carry or it was carried. Shown to the
     /// user: the update itself did succeed.
     pub explorer_failure: Option<String>,
+    /// The registrations that were enabled before the update; the repair
+    /// guidance names only these. Meaningful only with `explorer_failure`.
+    pub explorer_repair: ExplorerRepairScope,
 }
 
 /// Turns a ticket into a plan. A file that is gone is recorded and skipped.
@@ -301,6 +304,7 @@ pub fn plan_restore(
         files,
         missing,
         explorer_failure: None,
+        explorer_repair: ExplorerRepairScope::default(),
     }
 }
 
@@ -334,6 +338,14 @@ pub(crate) fn restore_after_commit_with(
     };
     let explorer_failure = carry_explorer(ticket.explorer.as_ref(), migrate_explorer);
     let mut plan = plan_restore(&ticket, |path| path.is_file(), |path| path.is_dir());
+    if explorer_failure.is_some()
+        && let Some(saved) = ticket.explorer.as_ref()
+    {
+        plan.explorer_repair = ExplorerRepairScope {
+            file: saved.file_enabled,
+            folder: saved.folder_enabled,
+        };
+    }
     plan.explorer_failure = explorer_failure;
     finish_cleanup(restore);
     Some(plan)

@@ -29,7 +29,7 @@ pub use icons::{AppAssets, WorkFolderIcons};
 pub use instrument::InstrumentationConfig;
 pub use view::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
-    ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
+    ExplorerRepairScope, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
     RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
 };
 

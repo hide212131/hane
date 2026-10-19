@@ -739,7 +739,7 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             }
             if plan.explorer_failure.is_some() {
                 // After the restore notice so it is not hidden by it.
-                view.report_explorer_migration_failed(cx);
+                view.report_explorer_migration_failed(plan.explorer_repair, cx);
             }
         });
     }
@@ -894,6 +894,7 @@ mod ownership_claim_tests {
             files: vec![PathBuf::from("/nope/a.md"), PathBuf::from("/nope/b.md")],
             missing: Vec::new(),
             explorer_failure: None,
+            explorer_repair: Default::default(),
         };
         prioritize_explicit_file(&mut plan, Path::new("/nope/a.md"));
         assert_eq!(

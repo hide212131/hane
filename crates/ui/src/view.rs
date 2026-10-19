@@ -96,8 +96,9 @@ mod ai_selection;
 mod app_update;
 pub use app_update::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot,
-    ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
-    RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
+    ExplorerRepairScope, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker,
+    RestartObservation, RestartPreparation, RestartTicketFile, RestartTicketSnapshot,
+    SharedExternalOpenQueue,
 };
 mod ai_settings;
 mod background_parse;
@@ -797,7 +798,7 @@ pub struct EditorView {
     update_completed: Option<String>,
     /// Set when the update committed but the Explorer integration could not be
     /// carried to the new version; shown until the user acts on the update card.
-    explorer_migration_failed: bool,
+    explorer_migration_failed: Option<ExplorerRepairScope>,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -1693,7 +1694,7 @@ impl EditorView {
             restart_in_progress: false,
             restart_message: None,
             update_completed: None,
-            explorer_migration_failed: false,
+            explorer_migration_failed: None,
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
