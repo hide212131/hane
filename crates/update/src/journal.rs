@@ -105,7 +105,8 @@ pub struct UpdateJournal {
     /// Owned files the update leaves in place, with the identities fixed from
     /// the signed inventory. They must hold these identities at every point
     /// the install is accepted (before health, at commit, and in receipts).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The key is always written, even when empty, and a journal without it is
+    /// rejected: a missing list is never read as "nothing to verify".
     pub unchanged: Vec<UnchangedFile>,
     /// Incremented on every durable update; detects a stale writer.
     pub generation: u64,

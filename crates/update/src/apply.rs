@@ -1634,6 +1634,33 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_without_the_unchanged_key_is_rejected_and_an_empty_list_round_trips() {
+        // An explicitly empty list is written and read back as empty.
+        let mut empty = UpdateJournal::begin(&plan(), None).unwrap();
+        assert!(empty.unchanged.is_empty());
+        let value = serde_json::to_value(&empty).unwrap();
+        assert_eq!(value["unchanged"], serde_json::json!([]));
+        let back: UpdateJournal = serde_json::from_value(value).unwrap();
+        assert_eq!(back, empty);
+
+        // A missing key is never completed with an empty list, in any phase.
+        let mut non_empty = UpdateJournal::begin(&plan_with_unchanged(), None).unwrap();
+        for phase in [Phase::Prepared, Phase::Committed, Phase::RolledBack] {
+            empty.phase = phase;
+            non_empty.phase = phase;
+            for journal in [&empty, &non_empty] {
+                let mut value = serde_json::to_value(journal).unwrap();
+                assert!(value.as_object_mut().unwrap().remove("unchanged").is_some());
+                assert!(
+                    serde_json::from_value::<UpdateJournal>(value.clone()).is_err(),
+                    "{phase:?}: {value}"
+                );
+                assert!(serde_json::from_slice::<UpdateJournal>(value.to_string().as_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn begin_and_validate_reject_backup_paths_outside_the_canonical_backup() {
         let canonical = UpdateJournal::begin(&plan(), None).unwrap();
         assert!(canonical.validate().is_ok());
