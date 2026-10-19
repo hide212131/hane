@@ -202,6 +202,43 @@ fn take_gate_observing_waits(
     take_gate(wait)
 }
 
+/// Whether the on-disk executable may be re-executed. A version marker mismatch
+/// or an unreadable file alone never vouches for it: the bundle must verify
+/// against the pinned Team ID (Developer ID signature) and be accepted by
+/// Gatekeeper as notarized. `verify` performs that check; without a pinned Team
+/// ID nothing can be proven and the answer is a refusal.
+fn reexec_trust_decision(
+    team_id: Option<&str>,
+    verify: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let team_id = team_id.ok_or_else(|| {
+        "実行ファイルの署名を確認するTeam IDが設定されていないため、再起動しません".to_string()
+    })?;
+    verify(team_id).map_err(|reason| {
+        format!("ディスク上の実行ファイルの署名・配置を確認できないため、再起動しません（{reason}）")
+    })
+}
+
+/// Verifies, with the existing trust policy, that the bundle containing `exe`
+/// is a Developer ID signed (pinned Team ID), Gatekeeper-accepted install.
+#[cfg(target_os = "macos")]
+fn verify_exe_for_reexec(exe: &std::path::Path, policy: &TrustPolicy) -> Result<(), String> {
+    use hane_update::macos_apply::BundleHost;
+    use hane_update::platform::macos::{MacHost, locate, verify_developer_id};
+    reexec_trust_decision(policy.macos_team_id(), |team_id| {
+        let placement = locate(exe).map_err(|err| err.to_string())?;
+        verify_developer_id(&placement.install_root, team_id).map_err(|err| err.to_string())?;
+        MacHost
+            .assess_gatekeeper(&placement.install_root)
+            .map_err(|err| err.to_string())
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_exe_for_reexec(_exe: &std::path::Path, _policy: &TrustPolicy) -> Result<(), String> {
+    Err("この環境では実行ファイルの署名を確認できません".to_string())
+}
+
 /// Replaces this process with the current on-disk executable and the original
 /// arguments. Only returns on failure, with the reason.
 #[cfg(unix)]
@@ -369,6 +406,10 @@ pub fn enter() -> Entry {
                 present_notice,
             );
         }
+        // The file is run only if it is proven to be a signed, accepted install.
+        if let Err(reason) = verify_exe_for_reexec(&exe, &TrustPolicy::production()) {
+            return stop_after_failed_reexec(&reason, present_notice);
+        }
         let err = reexec_current_image(&exe);
         return stop_after_failed_reexec(&err, present_notice);
     }
@@ -524,6 +565,39 @@ mod tests {
         assert!(reader_contains(&same[..], image_marker()).unwrap());
         let outcome = GateOutcome::Unmanaged;
         assert!(!needs_fresh_image(false, &outcome, true));
+    }
+
+    #[test]
+    fn an_unverified_disk_executable_is_never_reexecuted() {
+        // No pinned Team ID: the verifier is not even consulted.
+        let mut consulted = false;
+        let result = reexec_trust_decision(None, |_| {
+            consulted = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!consulted);
+        // A failed signature/Gatekeeper check refuses and carries the reason.
+        let err = reexec_trust_decision(Some("TEAM123456"), |_| Err("bad signature".into()))
+            .unwrap_err();
+        assert!(err.contains("bad signature"));
+        // Only a verified bundle may be re-executed.
+        assert!(reexec_trust_decision(Some("TEAM123456"), |team| {
+            assert_eq!(team, "TEAM123456");
+            Ok(())
+        })
+        .is_ok());
+        // The refusal fails closed with a visible notice and no re-exec.
+        let mut shown = 0;
+        let entry = stop_after_failed_reexec(&err, |_| shown += 1);
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown, 1);
+    }
+
+    #[test]
+    fn an_unconfigured_production_policy_refuses_reexec() {
+        let policy = TrustPolicy::new(Vec::new(), None);
+        assert!(verify_exe_for_reexec(std::path::Path::new("/nonexistent/hane"), &policy).is_err());
     }
 
     #[test]
