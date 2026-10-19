@@ -5,10 +5,22 @@ $ErrorActionPreference = 'Stop'
 $directory = Split-Path -Parent $PSCommandPath
 $package = Join-Path $directory 'Hane.ShellIntegration.msix'
 $certificateFile = Join-Path $directory 'Hane.ShellIntegration.cer'
-$extension = Join-Path $directory 'hane_shell_extension.dll'
 $exe = Join-Path $directory 'hane.exe'
+# The Explorer DLL lives at shell-integration\<version>\hane_shell_extension.dll
+# so an updated build never replaces a DLL that Explorer still has loaded.
+$extensionRoot = Join-Path $directory 'shell-integration'
+$extensions = @()
+if (Test-Path -LiteralPath $extensionRoot -PathType Container) {
+    $extensions = @(Get-ChildItem -LiteralPath $extensionRoot -Directory |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+        ForEach-Object { Join-Path $_.FullName 'hane_shell_extension.dll' } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+}
+if ($extensions.Count -eq 0) {
+    throw "Hane's Windows Explorer bundle is incomplete: $extensionRoot\<version>\hane_shell_extension.dll"
+}
 
-foreach ($required in @($package, $certificateFile, $extension, $exe)) {
+foreach ($required in @($package, $certificateFile, $exe)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Hane's Windows Explorer bundle is incomplete: $required"
     }

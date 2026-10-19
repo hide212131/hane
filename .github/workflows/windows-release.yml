@@ -190,9 +190,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $staging = "staging/hane-windows-x64"
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          foreach ($file in @('hane.exe', 'hane_shell_extension.dll', 'Hane.ShellIntegration.msix', 'Hane.ShellIntegration.cer')) {
+          foreach ($file in @('hane.exe', 'Hane.ShellIntegration.msix', 'Hane.ShellIntegration.cer')) {
             Copy-Item -LiteralPath "target/release/$file" -Destination "$staging/$file" -ErrorAction Stop
           }
+          # The Explorer DLL is built into shell-integration/<version>/ and must keep that layout.
+          Copy-Item -LiteralPath 'target/release/shell-integration' -Destination "$staging/shell-integration" -Recurse -ErrorAction Stop
           Copy-Item -LiteralPath windows/shell-extension/Trust-HaneShellCertificate.ps1 -Destination "$staging/Trust-HaneShellCertificate.ps1"
           Copy-Item -LiteralPath README.md -Destination "$staging/README.md"
           Copy-Item LICENSE "$staging/LICENSE" -ErrorAction SilentlyContinue
