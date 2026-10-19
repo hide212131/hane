@@ -6,19 +6,159 @@
 //! one that is then moved aside or deleted *through that same handle*. Nothing
 //! here resolves the install path a second time for a destructive operation.
 //!
+//! On Unix (macOS) the verified file is held open and remembered by device and
+//! inode. A displacement moves whatever object currently has the install name
+//! aside with one atomic `rename`, and only then compares the moved object with
+//! the verified one. A different object is moved back without replacing
+//! anything and the mutation fails, so a file swapped in after the check is
+//! never overwritten or deleted.
+//!
 //! On other platforms the type exists only so the shared code compiles; it is
 //! never constructed.
 
 #[cfg(windows)]
 pub(crate) use imp::{PinnedDir, PinnedFile, move_write_through, replace_write_through};
 
+#[cfg(unix)]
+pub(crate) use unix_imp::PinnedFile;
+
 #[cfg(not(windows))]
 #[allow(dead_code, reason = "only the Windows adapter constructs a pin")]
 pub(crate) struct PinnedDir(());
 
-#[cfg(not(windows))]
-#[allow(dead_code, reason = "only the Windows adapter constructs a pin")]
+#[cfg(not(any(windows, unix)))]
+#[allow(dead_code, reason = "only the Windows and Unix adapters construct a pin")]
 pub(crate) struct PinnedFile(());
+
+#[cfg(unix)]
+mod unix_imp {
+    use std::fs::{self, File, Metadata};
+    use std::io;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::path::Path;
+
+    use crate::error::{ErrorCode, Result, UpdateError};
+    use crate::identity::FileIdentity;
+    use crate::util::{hex_encode, sha256_context};
+
+    /// An install file whose identity was verified through this very handle.
+    pub(crate) struct PinnedFile {
+        file: File,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl PinnedFile {
+        /// Opens the regular file at `path` (never a symlink). `Ok(None)` when
+        /// it does not exist.
+        pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
+            let not_regular = || {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{} is not a regular file", path.display()),
+                )
+            };
+            let before = match fs::symlink_metadata(path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            if !before.is_file() {
+                return Err(not_regular());
+            }
+            let file = match File::open(path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.dev() != before.dev() || meta.ino() != before.ino() {
+                return Err(UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{} changed while it was being opened", path.display()),
+                ));
+            }
+            Ok(Some(Self {
+                file,
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }))
+        }
+
+        /// Size and SHA-256 of the content behind this handle.
+        pub(crate) fn identity(&self) -> Result<FileIdentity> {
+            let mut context = sha256_context();
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut size = 0u64;
+            loop {
+                let n = self.file.read_at(&mut buffer, size)?;
+                if n == 0 {
+                    break;
+                }
+                size += n as u64;
+                context.update(&buffer[..n]);
+            }
+            Ok(FileIdentity {
+                size,
+                sha256: hex_encode(context.finish().as_ref()),
+            })
+        }
+
+        fn is_this(&self, meta: &Metadata) -> bool {
+            meta.is_file() && meta.dev() == self.dev && meta.ino() == self.ino
+        }
+
+        /// Moves whatever has the name `path` to `aside` (which must not
+        /// exist) in one atomic step and succeeds only when that is the
+        /// verified file. Any other object is moved back without replacing
+        /// and the call fails.
+        pub(crate) fn displace(&self, path: &Path, aside: &Path) -> Result<()> {
+            match fs::rename(path, aside) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    return Err(UpdateError::new(
+                        ErrorCode::InstallModified,
+                        format!("{} vanished before it could be replaced", path.display()),
+                    ));
+                }
+                Err(err) => return Err(err.into()),
+            }
+            let moved = fs::symlink_metadata(aside)?;
+            if self.is_this(&moved) {
+                return Ok(());
+            }
+            let restored = if moved.is_file() {
+                fs::hard_link(aside, path).and_then(|()| fs::remove_file(aside))
+            } else {
+                match fs::symlink_metadata(path) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => fs::rename(aside, path),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "the name was taken again",
+                    )),
+                }
+            };
+            Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                match restored {
+                    Ok(()) => format!("{} was replaced after it was verified", path.display()),
+                    Err(err) => format!(
+                        "{} was replaced after it was verified; the other file is kept at {}: {err}",
+                        path.display(),
+                        aside.display()
+                    ),
+                },
+            ))
+        }
+
+        /// Puts the displaced verified file back under `path`, failing rather
+        /// than replacing anything that took the name meanwhile.
+        pub(crate) fn put_back(aside: &Path, path: &Path) -> io::Result<()> {
+            fs::hard_link(aside, path)?;
+            fs::remove_file(aside)
+        }
+    }
+}
 
 #[cfg(windows)]
 mod imp {

@@ -783,7 +783,58 @@ fn finish_scratch(
     (result, None)
 }
 
-#[cfg(not(windows))]
+/// Unix: the verified file is moved aside with one atomic rename and the moved
+/// object is compared with the verified one; a different object is moved back
+/// untouched and the install fails. The new file is then hard-linked into the
+/// free name (fails rather than overwrite anything that appeared). On failure
+/// the verified file is put back without replacing. An existing file without a
+/// verified pin is never replaced.
+#[cfg(unix)]
+fn place(
+    temp: &Path,
+    scratch: &Path,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    pin: Option<PinnedFile>,
+) -> Result<()> {
+    match pin {
+        Some(pin) => {
+            let mut aside_name = name.to_os_string();
+            aside_name.push(".aside");
+            let aside = scratch.join(aside_name);
+            pin.displace(path, &aside)?;
+            if let Err(err) = std::fs::hard_link(temp, path) {
+                return match PinnedFile::put_back(&aside, path) {
+                    Ok(()) => Err(err.into()),
+                    Err(back) => Err(UpdateError::new(
+                        ErrorCode::Io,
+                        format!(
+                            "{} could not be put back after a failed install: {back}",
+                            path.display()
+                        ),
+                    )),
+                };
+            }
+            // The displaced file is ours; deleting it is cleanup.
+            let _ = std::fs::remove_file(&aside);
+            Ok(())
+        }
+        None => match std::fs::symlink_metadata(path) {
+            Ok(_) => Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} was not verified before replacement", path.display()),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Atomic no-replace: fails with AlreadyExists if a file showed up.
+                std::fs::hard_link(temp, path)?;
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        },
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 fn place(
     temp: &Path,
     _scratch: &Path,
@@ -955,13 +1006,14 @@ impl FileOps for FsFileOps {
         self.pinned = None;
         self.dir_pins = None;
         #[cfg(windows)]
+        if !rel_path.starts_with(BACKUP_PREFIX) {
+            // Bind the existing ancestors before the target itself, so a
+            // new file's parents are fixed from the moment it is validated.
+            let pins = self.pin_hierarchy(rel_path, false)?;
+            self.dir_pins = Some((rel_path.to_string(), pins));
+        }
+        #[cfg(any(windows, unix))]
         {
-            if !rel_path.starts_with(BACKUP_PREFIX) {
-                // Bind the existing ancestors before the target itself, so a
-                // new file's parents are fixed from the moment it is validated.
-                let pins = self.pin_hierarchy(rel_path, false)?;
-                self.dir_pins = Some((rel_path.to_string(), pins));
-            }
             let (base, rest) = self.locate(rel_path)?;
             let path = base.join(rest);
             let mismatch = || {
@@ -983,7 +1035,7 @@ impl FileOps for FsFileOps {
                 _ => return Err(mismatch()),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, unix)))]
         let _ = (rel_path, expected);
         Ok(())
     }
@@ -1052,7 +1104,33 @@ impl FileOps for FsFileOps {
                 })?;
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            // Only the verified file, moved out of the install namespace with
+            // one atomic rename and compared with the verified object; any
+            // other object is moved back and kept.
+            let pin = pin.ok_or_else(|| {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{rel_path} was not verified before removal"),
+                )
+            })?;
+            let path = base.join(rest);
+            let parent = path
+                .parent()
+                .ok_or_else(|| UpdateError::new(ErrorCode::Io, "install path has no parent directory"))?;
+            let scratch = make_scratch_dir(parent)?;
+            let aside = scratch.join("removed");
+            let result = pin.displace(&path, &aside);
+            if result.is_ok() {
+                // Deleting the displaced file is cleanup.
+                let _ = std::fs::remove_file(&aside);
+            }
+            // Nothing but an empty directory is ever removed here.
+            let _ = std::fs::remove_dir(&scratch);
+            result?;
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             let _ = pin;
             std::fs::remove_file(base.join(rest))?;
@@ -1717,14 +1795,14 @@ mod tests {
         assert_eq!(journal.journal().phase, Phase::AwaitingHealth);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     struct RaceFixture {
         _dir: TempDir,
         root: std::path::PathBuf,
         ops: FsFileOps,
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn race_fixture() -> RaceFixture {
         let dir = TempDir::new("apply-race");
         let root = dir.path().join("install");
@@ -1762,6 +1840,119 @@ mod tests {
             flag.set(moved && replaced);
         };
         (Box::new(hook), refused)
+    }
+
+    /// Hook that, between the identity check and the mutation, renames a
+    /// third-party file over the target.
+    #[cfg(unix)]
+    fn unix_swap(root: &std::path::Path) -> Box<dyn FnMut()> {
+        let target = root.join("a.dll");
+        let third = root.join("third.tmp");
+        Box::new(move || {
+            fs::rename(&third, &target).unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_install_never_overwrites_a_file_swapped_in_after_verification() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops.before_mutation = Some(unix_swap(&fx.root));
+        let err = fx
+            .ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_remove_never_deletes_a_file_swapped_in_after_verification() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops.before_mutation = Some(unix_swap(&fx.root));
+        assert!(fx.ops.remove("a.dll").is_err());
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_restore_never_overwrites_a_file_swapped_in_after_verification() {
+        let mut fx = race_fixture();
+        fs::write(fx.root.join("a.dll"), NEW_DLL).unwrap();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL)))
+            .unwrap();
+        fx.ops.before_mutation = Some(unix_swap(&fx.root));
+        assert!(
+            fx.ops
+                .restore("a.dll", "backup/a.dll", &FileIdentity::of(OLD_DLL))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_verified_file_is_still_replaced_removed_and_restored_when_unchanged() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap();
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), NEW_DLL);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL)))
+            .unwrap();
+        fx.ops
+            .restore("a.dll", "backup/a.dll", &FileIdentity::of(OLD_DLL))
+            .unwrap();
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops.remove("a.dll").unwrap();
+        assert!(!fx.root.join("a.dll").exists());
+        assert_eq!(fs::read(fx.root.join("third.tmp")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_mutation_without_a_verified_binding_or_with_a_wrong_one_changes_nothing() {
+        let mut fx = race_fixture();
+        assert!(fx.ops.install_new("a.dll", &FileIdentity::of(NEW_DLL)).is_err());
+        assert!(fx.ops.remove("a.dll").is_err());
+        assert!(
+            fx.ops
+                .bind_target("a.dll", &Some(FileIdentity::of(b"other")))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_an_added_file_created_by_a_third_party_first_is_never_overwritten() {
+        let mut fx = race_fixture();
+        fx.ops.bind_target("added.txt", &None).unwrap();
+        let added = fx.root.join("added.txt");
+        fx.ops.before_mutation = Some(Box::new(move || {
+            fs::write(&added, b"third party").unwrap();
+        }));
+        assert!(
+            fx.ops
+                .install_new("added.txt", &FileIdentity::of(NEW_ADDED))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("added.txt")).unwrap(), b"third party");
     }
 
     #[cfg(windows)]
@@ -2201,9 +2392,9 @@ mod tests {
         );
     }
 
-    /// Windows displaces an existing file only through a handle whose identity
-    /// was checked, so the pin is bound to the expected content first.
-    #[cfg(windows)]
+    /// Windows and Unix displace an existing file only through a handle whose
+    /// identity was checked, so the pin is bound to the expected content first.
+    #[cfg(any(windows, unix))]
     fn pin_existing_for_test(path: &Path, expected: &[u8]) -> Option<PinnedFile> {
         let pin = PinnedFile::open(path)
             .unwrap()
@@ -2213,7 +2404,7 @@ mod tests {
     }
 
     /// Elsewhere the existing file is replaced by path, so no pin is needed.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, unix)))]
     fn pin_existing_for_test(_path: &Path, _expected: &[u8]) -> Option<PinnedFile> {
         None
     }
