@@ -96,6 +96,9 @@ jobs:
       - name: Test Claude failure diagnostics
         run: python3 .github/tests/test_claude_failure_diagnostic.py
 
+      - name: Test AADW successful patch continuation provenance
+        run: python3 .github/tests/test_aadw_patch_resume.py
+
       - name: Test Claude model verification
         run: python3 .github/tests/test_claude_model_verification.py
 
