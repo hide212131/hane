@@ -12,7 +12,7 @@ Issue #510は、WindowsとmacOSの実配布物で旧版から新版への更新�
 
 ## 0. 進捗の要約
 
-下表の状態はこの文書の更新時点（PR #518 head `b83abe9be752d189139feaec700ee1e2f96be46c`）で確認した事実である。実装時はGitHub上のcurrent factsを読み直す。
+下表の状態はこの文書を更新した対象head（PR #518 head `acb545e80683e118b83bb42099fc1d3f92b06c7a`）を基準にしたスナップショットである。実装時はGitHub上のcurrent factsを読み直す。
 
 - 最新の公開Release v0.26.0にはWindows/Mac ZIPのみがあり、更新catalog/signatureは含まれない。更新対応の本番公開とU5は未完了。
 - Windows/macOS実機での二版更新・復旧の証拠（U-11, U-13, U-14など）と、本番の署名鍵・Developer ID・notarization設定は未了。fixtureの成功を実OSの成功へ読み替えない。
@@ -37,9 +37,9 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 |---|---|
 | U0 | merged。[PR #512](https://github.com/hide212131/hane/pull/512)（U0/U1/U3）に含まれてmerge済み。 |
 | U1 | merged。PR #512に含まれてmerge済み。Windows 11実機でのExplorer登録等の確認（U-11）は未了。 |
-| U2 | Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。baseは#518の古いhead `00bf87fd529398d9ee7305f74fdea899065f8260`のため、#518更新後の同期と再検証が必要。本番の署名設定は未完了。 |
+| U2 | Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。current headは`eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`、baseは#518の古いhead `00bf87fd529398d9ee7305f74fdea899065f8260`のため、#518同期後に再検証が必要。本番の署名設定は未完了。 |
 | U3 | merged。PR #512に含まれてmerge済み。実署名metadata未準備のため適用操作は有効化しない。 |
-| U4 | Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、head `b83abe9be752d189139feaec700ee1e2f96be46c`。exact verifier run 39294842985のworkspace tests/lintは成功、Codex Review #6273442408は重大な問題なし。Windows/macOS CI run 39295116467は`action_required`でジョブ未開始のため、成功扱いにしない。両OSのU-08〜14は未了。 |
+| U4 | Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、head `acb545e80683e118b83bb42099fc1d3f92b06c7a`。exact-result verifier run 39297710445のworkspace tests/lintは成功。Windows/macOS CI run 39297946283は`action_required`でジョブ0件のため未実行であり、成功扱いにしない。Codex Reviewはこのheadで本文書の進捗スナップショットとADR状態表現の2件を指摘した。両OSのU-08〜14は未了。 |
 | U5 | 未完了。bootstrap出荷と二版更新の実行証拠は未取得。 |
 
 | 段階 | 変更予定のpath／内容 | 先行条件と完了条件 |
