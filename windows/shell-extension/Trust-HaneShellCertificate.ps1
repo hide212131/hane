@@ -9,21 +9,56 @@ $exe = Join-Path $directory 'hane.exe'
 # The Explorer DLL lives at shell-integration\<version>\hane_shell_extension.dll
 # so an updated build never replaces a DLL that Explorer still has loaded.
 $extensionRoot = Join-Path $directory 'shell-integration'
-$extensions = @()
-if (Test-Path -LiteralPath $extensionRoot -PathType Container) {
-    $extensions = @(Get-ChildItem -LiteralPath $extensionRoot -Directory |
-        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
-        ForEach-Object { Join-Path $_.FullName 'hane_shell_extension.dll' } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
-}
-if ($extensions.Count -eq 0) {
-    throw "Hane's Windows Explorer bundle is incomplete: $extensionRoot\<version>\hane_shell_extension.dll"
-}
 
 foreach ($required in @($package, $certificateFile, $exe)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Hane's Windows Explorer bundle is incomplete: $required"
     }
+}
+
+# Only the DLL version named by the MSIX's own AppxManifest.xml counts; a DLL
+# left over from another version must not satisfy the check.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$manifestText = $null
+$archive = $null
+try {
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($package)
+    $entry = $archive.GetEntry('AppxManifest.xml')
+    if ($entry) {
+        $reader = [System.IO.StreamReader]::new($entry.Open())
+        try { $manifestText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    }
+}
+catch {
+    $manifestText = $null
+}
+finally {
+    if ($archive) { $archive.Dispose() }
+}
+$manifestVersions = @()
+if ($manifestText) {
+    try {
+        $manifest = [xml]$manifestText
+        $manifestVersions = @($manifest.GetElementsByTagName('*') |
+            Where-Object { $_.LocalName -eq 'Class' -and $_.HasAttribute('Path') } |
+            ForEach-Object {
+                if ($_.GetAttribute('Path') -match '^shell-integration\\(\d+\.\d+\.\d+)\\hane_shell_extension\.dll$') {
+                    $Matches[1]
+                } else {
+                    '<invalid>'
+                }
+            } | Select-Object -Unique)
+    }
+    catch {
+        $manifestVersions = @()
+    }
+}
+if ($manifestVersions.Count -ne 1 -or $manifestVersions[0] -eq '<invalid>') {
+    throw "The MSIX manifest does not name exactly one valid Explorer DLL version. Nothing was trusted: $package"
+}
+$extension = Join-Path (Join-Path $extensionRoot $manifestVersions[0]) 'hane_shell_extension.dll'
+if (-not (Test-Path -LiteralPath $extension -PathType Leaf)) {
+    throw "Hane's Windows Explorer bundle is incomplete: $extension"
 }
 
 $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateFile)

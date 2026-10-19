@@ -23,8 +23,16 @@ class WindowsZipLayoutTests(unittest.TestCase):
         self.assertIn("hane_shell_extension.dll", TRUST)
 
     def test_trust_script_validates_layout_before_trusting(self):
-        layout = TRUST.index("$extensions.Count -eq 0")
+        layout = TRUST.index("Test-Path -LiteralPath $extension -PathType Leaf")
         self.assertLess(layout, TRUST.index("Import-Certificate"))
+
+    def test_trust_script_requires_dll_version_named_by_msix_manifest(self):
+        self.assertIn("AppxManifest.xml", TRUST)
+        self.assertIn(r"hane_shell_extension\.dll$", TRUST)
+        # No directory scan: a leftover older-version DLL must not satisfy the check.
+        self.assertNotIn("Get-ChildItem", TRUST)
+        self.assertLess(TRUST.index("AppxManifest.xml"), TRUST.index("Import-Certificate"))
+        self.assertLess(TRUST.index("does not name exactly one valid"), TRUST.index("Import-Certificate"))
 
 
 if __name__ == "__main__":
