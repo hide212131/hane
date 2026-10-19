@@ -257,6 +257,40 @@ impl Coordination {
         Ok(true)
     }
 
+    /// Removes the retirement tombstone `.<TransactionId>.retired` of a terminal
+    /// receipt whose cleanup failed after the durable rename (Windows). Only a
+    /// plain directory of that exact name qualifies, below a verified root and
+    /// private directory; links, files and other names stay. Returns whether
+    /// it was removed.
+    pub fn remove_retired_receipt(&self, entry_name: &str) -> Result<bool> {
+        let Some(id) = entry_name
+            .strip_prefix('.')
+            .and_then(|rest| rest.strip_suffix(".retired"))
+        else {
+            return Ok(false);
+        };
+        if TransactionId::parse(id).is_err() {
+            return Ok(false);
+        }
+        let private = self.dir.join(PRIVATE_DIR);
+        for checked in [&self.dir, &private] {
+            require_plain_dir(checked)?;
+        }
+        let tombstone = private.join(entry_name);
+        let meta = match fs::symlink_metadata(&tombstone) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Ok(false);
+        }
+        require_plain_dir(&tombstone)?;
+        // `remove_dir_all` unlinks links inside instead of following them.
+        fs::remove_dir_all(&tombstone)?;
+        Ok(true)
+    }
+
     fn open_lock(&self, kind: LeaseKind) -> Result<File> {
         let path = self.dir.join(kind.file_name());
         // The root is re-checked so a directory swapped after `create` is not trusted.

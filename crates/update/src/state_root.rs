@@ -207,6 +207,10 @@ pub const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "COMSPEC",
     "WINDIR",
     "PROCESSOR_ARCHITECTURE",
+    // The editor discovery of the UI reads these to find a system-wide VS Code
+    // that is on neither PATH nor App Paths.
+    "ProgramFiles",
+    "ProgramFiles(x86)",
     // Connectivity and certificate settings the AI runtime passes to its own
     // child, so the limited child reaches the same network as a normal start.
     "ALL_PROXY",
@@ -1002,6 +1006,27 @@ mod tests {
         let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
         for (name, value) in within {
             assert!(vars.contains(&(name.to_owned(), value)));
+        }
+    }
+
+    #[test]
+    fn program_files_locations_are_stored_and_restored() {
+        let fx = fixture();
+        let program_files = [
+            ("ProgramFiles", "C:\\Program Files"),
+            ("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+        ];
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = program_files
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .collect();
+        publish_environment(&fx.coordination, &fx.transaction, ambient).unwrap();
+        let vars = read_environment(&fx.coordination, &fx.transaction).unwrap();
+        for (name, value) in program_files {
+            assert!(
+                vars.contains(&(name.to_owned(), value.to_owned())),
+                "{name} must reach the limited child"
+            );
         }
     }
 

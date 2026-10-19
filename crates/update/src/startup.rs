@@ -466,6 +466,12 @@ fn sweep_unjournaled(coordination: &Coordination) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
+        // A retirement tombstone left by a failed cleanup has no canonical
+        // receipt that would lead here; a failure keeps it for the next start.
+        if name.starts_with('.') {
+            let _ = coordination.remove_retired_receipt(&name);
+            continue;
+        }
         let Ok(id) = TransactionId::parse(&name) else {
             continue;
         };
@@ -1574,6 +1580,53 @@ mod tests {
         assert!(foreign.exists(), "identity unknown");
         assert!(coord.transaction_dir(&odd).exists(), "journal trace");
         assert!(!coord.transaction_dir(&live).exists(), "nothing alive: reclaimed");
+    }
+
+    #[test]
+    fn the_sweep_reclaims_a_retired_receipt_tombstone_without_a_canonical_receipt() {
+        let dir = TempDir::new("gate-sweep-tombstone");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let private = coord.private_dir().unwrap();
+        let retired = TransactionId::generate().unwrap();
+        let tombstone = receipt_tombstone(&private, retired.as_str());
+        fs::create_dir_all(tombstone.join("helper")).unwrap();
+        fs::write(tombstone.join("helper").join("staged.bin"), b"x").unwrap();
+
+        // Names that merely look similar, and a plain file of the right name.
+        let unrelated_dir = private.join(".not-a-transaction.retired");
+        fs::create_dir(&unrelated_dir).unwrap();
+        let other_dir = private.join(format!(".{}.tmp", retired.as_str()));
+        fs::create_dir(&other_dir).unwrap();
+        let other_id = TransactionId::generate().unwrap();
+        let file_tombstone = receipt_tombstone(&private, other_id.as_str());
+        fs::write(&file_tombstone, b"keep").unwrap();
+        let normal = abandoned(&coord);
+        fs::create_dir(coord.journal_path(&normal)).unwrap();
+
+        sweep_abandoned_transactions(&coord);
+        assert!(!tombstone.exists(), "the leftover tombstone is reclaimed");
+        assert!(unrelated_dir.exists());
+        assert!(other_dir.exists());
+        assert!(file_tombstone.exists());
+        assert!(coord.transaction_dir(&normal).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_keeps_a_symlinked_retired_tombstone_and_its_target() {
+        let dir = TempDir::new("gate-sweep-tombstone-link");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let private = coord.private_dir().unwrap();
+        let outside = TempDir::new("gate-sweep-tombstone-target");
+        fs::write(outside.path().join("keep.txt"), b"keep").unwrap();
+        let id = TransactionId::generate().unwrap();
+        let link = receipt_tombstone(&private, id.as_str());
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        sweep_abandoned_transactions(&coord);
+        assert!(outside.path().join("keep.txt").exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
     }
 
     #[cfg(unix)]
