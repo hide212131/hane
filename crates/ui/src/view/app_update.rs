@@ -678,12 +678,14 @@ impl EditorView {
                     .map(|version| {
                         div()
                             .id("settings-app-update-completed")
+                            .debug_selector(|| "settings-app-update-completed".to_owned())
                             .child(format!("Hane {version} に更新しました。"))
                     }),
             )
             .children(self.explorer_migration_failed.map(|scope| {
                 div()
                     .id("settings-app-update-explorer-failed")
+                    .debug_selector(|| "settings-app-update-explorer-failed".to_owned())
                     .child(explorer_migration_failed_message(scope))
             }))
             .children(self.restart_message.clone().map(|message| {
