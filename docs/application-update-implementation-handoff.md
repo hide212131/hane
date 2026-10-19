@@ -12,7 +12,7 @@ Issue #510は、WindowsとmacOSの実配布物で旧版から新版への更新�
 
 ## 0. 進捗の要約
 
-下表の状態はこの文書を更新した時点のスナップショットである。current main `08f659e0032ee377ca21e1cce060a8d517c884dc`、PR #518 head `92235af3ab443eeb545eb93bdb72e529a93d4df8`、PR #526 head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`（#518用branchをbaseにしている）を基準とする。実装時はGitHub上のcurrent factsを読み直す。
+下表の状態は、PR #518の親head `92235af3ab443eeb545eb93bdb72e529a93d4df8` 時点の過去snapshotであり、現在のPR head/statusを表さない（その後に文書更新commit `3a473563f541ee2ac4fc9d93104e69bd56ced8eb` が追加された）。表中の当時のrun/statusは歴史的記録として保持する。current factsはGitHub上のPRを読む。以下の基準値も当時のものである: current main `08f659e0032ee377ca21e1cce060a8d517c884dc`、PR #518 head `92235af3ab443eeb545eb93bdb72e529a93d4df8`、PR #526 head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`（#518用branchをbaseにしている）を基準とする。実装時はGitHub上のcurrent factsを読み直す。
 
 - 最新の公開Release v0.26.0にはWindows/Mac ZIPのみがあり、更新catalog/signatureは含まれない。更新対応の本番公開とU5は未完了。
 - Windows/macOS実機での二版更新・復旧の証拠（U-11, U-13, U-14など）と、本番の署名鍵・Developer ID・notarization設定は未了。fixtureの成功を実OSの成功へ読み替えない。
@@ -39,7 +39,7 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 | U1 | merged。PR #512に含まれてmerge済み。Windows 11実機でのExplorer登録等の確認（U-11）は未了。 |
 | U2 | Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。#518用branchをbaseにしているため、#518の変更後に同期と再検証が必要。本番の署名設定は未完了。 |
 | U3 | merged。PR #512に含まれてmerge済み。実署名metadata未準備のため適用操作は有効化しない。 |
-| U4 | Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、head `92235af3ab443eeb545eb93bdb72e529a93d4df8`。最新のexact verifier run `39309109627`はtests/lint成功。current-head CI `39309328198`はmaintainer approval待ちで未実行であり、成功扱いにしない。最新のCodex Reviewは返答待ち。両OSのU-08〜14は未了。 |
+| U4 | （`92235af...` 時点の履歴）Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、当時のhead `92235af3ab443eeb545eb93bdb72e529a93d4df8`。最新のexact verifier run `39309109627`はtests/lint成功。current-head CI `39309328198`はmaintainer approval待ちで未実行であり、成功扱いにしない。最新のCodex Reviewは返答待ち。両OSのU-08〜14は未了。 |
 | U5 | 未完了。本番ZIP、Windows/macOS実更新と復旧の実行証拠は未取得。 |
 
 | 段階 | 変更予定のpath／内容 | 先行条件と完了条件 |
@@ -73,7 +73,7 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 | U-12 | 各journal flush前後、各file置換前後、bundle swap直後、health前後、durable commit直後のprocess中断で、旧版復旧または新版commitを決定。未知hash/backup破損では停止。 | checkpointごとのhelper強制終了による故障注入。一般編集processをkillして保存を検証したと主張しない。新旧混在で通常editorを開かない。 |
 | U-13 | macOSの正しい署名/Team ID/Bundle ID/版/notarization、別Team・不正署名・translocation・unsupported FS・権限不足・交換失敗。 | 実macOS/APFS、隔離属性を保ったブラウザdownloadで新規/upgrade/別配置を確認。OS評価をfixtureで成功させただけで完了しない。 |
 | U-14 | 実二版のDownload→手動Restart→health→Commit、起動不能候補のrollback、ticket一回復元（保存済み文書・active path・work folderが対象で、scroll/caretの完全復元は含まない）、commit後cleanup失敗。 | Windows/macOS双方の版・source SHA・archive hash・配置・OS版付きlog/画面。文書、AI保存領域、ログイン、default folder、recent、Explorer登録を更新前後で比較。 |
-| U-15 | 通常の入力/IME/保存・再読込/undo-redo、複数tab、設定Escape、外部open（通常受付または利用者向け再操作案内）、AI選択処理の回帰と性能。 | 既存workspace test/Clippy/required CI＋focused GUI。本文入力中に通信/ZIP処理がなく、無操作起動のrequest数0。起動/入力遅延の変更前基準と同条件比較を残す。 |
+| U-15 | 通常の入力/IME/保存・再読込/undo-redo、複数tab、設定Escape、外部open（通常時はFinder/Explorerからのopen成功を維持する。案内だけで通常時のopen機能を代替してはならない。restart freeze中に受け取れない要求に限り、理由と更新後の再操作案内を許容する）、AI選択処理の回帰と性能。 | 既存workspace test/Clippy/required CI＋focused GUI。本文入力中に通信/ZIP処理がなく、無操作起動のrequest数0。起動/入力遅延の変更前基準と同条件比較を残す。 |
 
 ## 4. 受入判定
 
