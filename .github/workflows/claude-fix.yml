@@ -147,6 +147,8 @@ jobs:
             finalizer_environment='hane-aadw-trusted-workflow-write'
           elif [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-windows-versioned-dll-registration' && "$expected_sha" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
             finalizer_environment='hane-aadw-trusted-workflow-write'
+          elif [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' && "$request_root_cause" == 'issue-510-u2-catalog-sequence-monotonicity' && "$expected_sha" == '2a271832592c1668adc6c4c1ede15f8b09622176' ]]; then
+            finalizer_environment='hane-aadw-trusted-workflow-write'
           fi
 
           echo "target_sha=$expected_sha" >> "$GITHUB_OUTPUT"
@@ -584,6 +586,8 @@ jobs:
           elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-release-pipeline-protected-test-path' && "$EXPECTED_SHA" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
             u2_release_exception=true
           elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-windows-versioned-dll-registration' && "$EXPECTED_SHA" == 'b7b564469bdf7ece90d681fc878986f9242ef2b8' ]]; then
+            u2_release_exception=true
+          elif [[ "$PR_NUMBER" == '526' && "$EXPECTED_HEAD_REF" == 'work/issue-510-u2-release-pipeline' && "$EXPECTED_BASE_REF" == 'work/issue-510-u4-apply-recovery' && "$ACTOR_LOGIN" == 'hide212131' && "$ACTOR_PERMISSION" == 'admin' && "$EXPECTED_ROOT_CAUSE" == 'issue-510-u2-catalog-sequence-monotonicity' && "$EXPECTED_SHA" == '2a271832592c1668adc6c4c1ede15f8b09622176' ]]; then
             u2_release_exception=true
           fi
 
