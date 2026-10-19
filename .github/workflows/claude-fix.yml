@@ -26,6 +26,10 @@ jobs:
     outputs:
       target_sha: ${{ steps.preflight.outputs.target_sha }}
       head_ref: ${{ steps.preflight.outputs.head_ref }}
+      base_ref: ${{ steps.preflight.outputs.base_ref }}
+      actor_login: ${{ steps.preflight.outputs.actor_login }}
+      actor_permission: ${{ steps.preflight.outputs.actor_permission }}
+      root_cause: ${{ steps.preflight.outputs.root_cause }}
       checkpoint_run_id: ${{ steps.preflight.outputs.checkpoint_run_id }}
       checkpoint_run_attempt: ${{ steps.preflight.outputs.checkpoint_run_attempt }}
 
@@ -102,6 +106,7 @@ jobs:
           state="$(jq -r '.state' <<< "$pr_json")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
           head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
           current_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
 
           if [[ "$state" != 'open' ]]; then
@@ -116,6 +121,10 @@ jobs:
             echo '::error::Could not resolve Pull Request head ref.'
             exit 1
           fi
+          if [[ -z "$base_ref" ]]; then
+            echo '::error::Could not resolve Pull Request base ref.'
+            exit 1
+          fi
           if [[ "$current_sha" != "$expected_sha" ]]; then
             echo "::error::Target head moved. expected=${expected_sha} current=${current_sha}. Create a new Commander handoff from current facts."
             exit 1
@@ -125,9 +134,14 @@ jobs:
           gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$RUNNER_TEMP/comments.json"
           python3 trusted-control/.github/scripts/aadw_action_contract.py request "$RUNNER_TEMP/pr.json" "$RUNNER_TEMP/comments.json" "$RUNNER_TEMP/request.json"
           jq -e '.action == "implement"' "$RUNNER_TEMP/request.json" >/dev/null
+          request_root_cause="$(jq -r '.root_cause' "$RUNNER_TEMP/request.json")"
 
           echo "target_sha=$expected_sha" >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "actor_login=$ACTOR" >> "$GITHUB_OUTPUT"
+          echo "actor_permission=$permission" >> "$GITHUB_OUTPUT"
+          echo "root_cause=$request_root_cause" >> "$GITHUB_OUTPUT"
           echo "checkpoint_run_id=$checkpoint_run_id" >> "$GITHUB_OUTPUT"
           echo "checkpoint_run_attempt=$checkpoint_run_attempt" >> "$GITHUB_OUTPUT"
 
@@ -497,6 +511,12 @@ jobs:
         shell: bash
         env:
           EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
+          EXPECTED_HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+          EXPECTED_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          ACTOR_LOGIN: ${{ needs.prepare.outputs.actor_login }}
+          ACTOR_PERMISSION: ${{ needs.prepare.outputs.actor_permission }}
+          EXPECTED_ROOT_CAUSE: ${{ needs.prepare.outputs.root_cause }}
+          PR_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
 
@@ -517,6 +537,14 @@ jobs:
           while IFS= read -r -d '' path; do
             changed=true
             case "$path" in
+              .github/RELEASE_AUTOMATION.md|.github/workflows/ci.yml|.github/workflows/release-request.yml|.github/workflows/windows-release.yml)
+                # One-time, owner-only exception for the dedicated Issue #510 U2 release PR.
+                # All other .github paths, including this trusted workflow and its scripts, stay blocked.
+                if [[ "$PR_NUMBER" != '526' || "$EXPECTED_HEAD_REF" != 'work/issue-510-u2-release-pipeline' || "$EXPECTED_BASE_REF" != 'work/issue-510-u4-apply-recovery' || "$ACTOR_LOGIN" != 'hide212131' || "$ACTOR_PERMISSION" != 'admin' || "$EXPECTED_ROOT_CAUSE" != 'issue-510-u2-release-pipeline-after-finalizer-policy' ]]; then
+                  echo "::error::Protected release path is only allowed for the owner on the dedicated Issue #510 U2 PR: $path"
+                  exit 1
+                fi
+                ;;
               .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.agents/skills/hane-issue-workflow/*|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
                 echo "::error::Claude worker attempted to modify trusted authority or workflow path: $path"
                 exit 1
@@ -547,6 +575,7 @@ jobs:
           PR_NUMBER: ${{ github.event.issue.number }}
           EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
           EXPECTED_HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+          EXPECTED_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
         run: |
           set -euo pipefail
 
@@ -554,11 +583,12 @@ jobs:
           state="$(jq -r '.state' <<< "$pr_json")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
           head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
           current_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
           jq -e '((.body // "") | contains("<!-- AADW_PAUSED -->") | not) and ([.labels[]?.name] | index("aadw:paused") | not)' <<< "$pr_json" >/dev/null
 
-          if [[ "$state" != 'open' || "$head_repo" != "$REPOSITORY" || "$head_ref" != "$EXPECTED_HEAD_REF" || "$current_sha" != "$EXPECTED_SHA" ]]; then
-            echo "::error::Target Pull Request changed before final push. expected_ref=${EXPECTED_HEAD_REF} expected_sha=${EXPECTED_SHA} current_state=${state} current_repo=${head_repo:-unknown} current_ref=${head_ref:-unknown} current_sha=${current_sha:-unknown}."
+          if [[ "$state" != 'open' || "$head_repo" != "$REPOSITORY" || "$head_ref" != "$EXPECTED_HEAD_REF" || "$base_ref" != "$EXPECTED_BASE_REF" || "$current_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Target Pull Request changed before final push. expected_ref=${EXPECTED_HEAD_REF} expected_base=${EXPECTED_BASE_REF} expected_sha=${EXPECTED_SHA} current_state=${state} current_repo=${head_repo:-unknown} current_ref=${head_ref:-unknown} current_base=${base_ref:-unknown} current_sha=${current_sha:-unknown}."
             exit 1
           fi
 
