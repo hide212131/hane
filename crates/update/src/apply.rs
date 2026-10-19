@@ -783,10 +783,13 @@ fn finish_scratch(
     (result, None)
 }
 
-/// Test seam: runs right after the verified file was moved aside.
+// Test seam: runs right after the verified file was moved aside.
+#[cfg(all(unix, test))]
+type AfterDisplaceHook = Box<dyn FnMut(&Path)>;
+
 #[cfg(all(unix, test))]
 thread_local! {
-    static AFTER_DISPLACE: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+    static AFTER_DISPLACE: std::cell::RefCell<Option<AfterDisplaceHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
