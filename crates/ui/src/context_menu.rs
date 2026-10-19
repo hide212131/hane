@@ -191,6 +191,50 @@ pub fn migrate_registration_with(
     }
 }
 
+#[cfg(any(windows, test))]
+fn quote_ps(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// PowerShell script that prints the Publisher of the installed package
+/// `name` of exactly `version` (other versions are never consulted).
+#[cfg(any(windows, test))]
+fn installed_target_script(name: &str, version: &str) -> String {
+    format!(
+        "$p = Get-AppxPackage -Name {} -ErrorAction SilentlyContinue | Where-Object {{ $_.Version.ToString() -eq {} }} | Select-Object -First 1; if ($p) {{ [Console]::Out.Write($p.Publisher); exit 0 }} else {{ exit 3 }}",
+        quote_ps(name),
+        quote_ps(version),
+    )
+}
+
+/// PowerShell script that prints the Publisher declared by the
+/// AppxManifest.xml inside the MSIX at `package`, exiting 3 unless the
+/// package identity name is `name`.
+#[cfg(any(windows, test))]
+fn msix_manifest_script(package: &str, name: &str) -> String {
+    format!(
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem; $z = [System.IO.Compression.ZipFile]::OpenRead({}); try {{ $e = $z.GetEntry('AppxManifest.xml'); if (-not $e) {{ exit 3 }}; $r = New-Object System.IO.StreamReader($e.Open()); try {{ [xml]$x = $r.ReadToEnd() }} finally {{ $r.Dispose() }}; $i = $x.Package.Identity; if (-not $i -or $i.Name -ne {}) {{ exit 3 }}; [Console]::Out.Write($i.Publisher); exit 0 }} finally {{ $z.Dispose() }}",
+        quote_ps(package),
+        quote_ps(name),
+    )
+}
+
+/// Interprets the exit code and stdout of a Publisher query: 0 with output is
+/// the Publisher, 3 or empty output is "not found", anything else is an error.
+#[cfg(any(windows, test))]
+fn publisher_from_result(code: Option<i32>, stdout: &[u8]) -> io::Result<Option<String>> {
+    match code {
+        Some(0) => {
+            let publisher = String::from_utf8_lossy(stdout).trim().to_owned();
+            Ok((!publisher.is_empty()).then_some(publisher))
+        }
+        Some(3) => Ok(None),
+        _ => Err(io::Error::other(
+            "Explorer 拡張パッケージの発行元を確認できません",
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExplorerVerb {
     File,
@@ -199,7 +243,10 @@ pub enum ExplorerVerb {
 
 #[cfg(windows)]
 mod windows {
-    use super::{ExplorerRegistration, ExplorerVerb, FileContextMenuState, Path};
+    use super::{
+        ExplorerRegistration, ExplorerVerb, FileContextMenuState, Path, installed_target_script,
+        msix_manifest_script, publisher_from_result, quote_ps,
+    };
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write};
     use std::os::windows::process::CommandExt;
@@ -531,10 +578,6 @@ mod windows {
             .is_none_or(|build| build >= 22000)
     }
 
-    fn quote_ps(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
-    }
-
     fn powershell(script: &str) -> io::Result<std::process::Output> {
         Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -552,16 +595,7 @@ mod windows {
     }
 
     fn publisher_from_output(output: std::process::Output) -> io::Result<Option<String>> {
-        match output.status.code() {
-            Some(0) => {
-                let publisher = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                Ok((!publisher.is_empty()).then_some(publisher))
-            }
-            Some(3) => Ok(None),
-            _ => Err(io::Error::other(
-                "Explorer 拡張パッケージの発行元を確認できません",
-            )),
-        }
+        publisher_from_result(output.status.code(), &output.stdout)
     }
 
     /// Publisher of the installed package of this name for the current user,
@@ -577,22 +611,14 @@ mod windows {
     /// Publisher of the installed package of exactly `PACKAGE_VERSION`; other
     /// versions of the same name are never consulted.
     fn installed_target_publisher() -> io::Result<Option<String>> {
-        let script = format!(
-            "$p = Get-AppxPackage -Name {} -ErrorAction SilentlyContinue | Where-Object {{ $_.Version.ToString() -eq {} }} | Select-Object -First 1; if ($p) {{ [Console]::Out.Write($p.Publisher); exit 0 }} else {{ exit 3 }}",
-            quote_ps(PACKAGE_NAME),
-            quote_ps(PACKAGE_VERSION),
-        );
+        let script = installed_target_script(PACKAGE_NAME, PACKAGE_VERSION);
         publisher_from_output(powershell(&script)?)
     }
 
     /// Publisher declared by the AppxManifest.xml inside the MSIX that would be
     /// installed, with the package identity name checked as well.
     fn msix_manifest_publisher(package: &Path) -> io::Result<Option<String>> {
-        let script = format!(
-            "Add-Type -AssemblyName System.IO.Compression.FileSystem; $z = [System.IO.Compression.ZipFile]::OpenRead({}); try {{ $e = $z.GetEntry('AppxManifest.xml'); if (-not $e) {{ exit 3 }}; $r = New-Object System.IO.StreamReader($e.Open()); try {{ [xml]$x = $r.ReadToEnd() }} finally {{ $r.Dispose() }}; $i = $x.Package.Identity; if (-not $i -or $i.Name -ne {}) {{ exit 3 }}; [Console]::Out.Write($i.Publisher); exit 0 }} finally {{ $z.Dispose() }}",
-            quote_ps(&package.to_string_lossy()),
-            quote_ps(PACKAGE_NAME),
-        );
+        let script = msix_manifest_script(&package.to_string_lossy(), PACKAGE_NAME);
         publisher_from_output(powershell(&script)?)
     }
 
@@ -957,6 +983,91 @@ mod migration_tests {
             true,
         )
         .unwrap();
+    }
+
+    const MSIX: &str = r"C:\Program Files\Hane\Hane.ShellIntegration.msix";
+    const VERSION: &str = "1.2.3.0";
+
+    #[test]
+    fn the_manifest_query_uses_the_msix_path_and_package_identity_name() {
+        let script = msix_manifest_script(MSIX, PACKAGE);
+        assert!(script.contains(&format!("OpenRead({})", quote_ps(MSIX))));
+        assert!(script.contains("GetEntry('AppxManifest.xml')"));
+        assert!(script.contains(&format!("$i.Name -ne {}", quote_ps(PACKAGE))));
+        assert!(script.contains("$i.Publisher"));
+        let quoted = msix_manifest_script(r"C:\it's\Hane.msix", PACKAGE);
+        assert!(quoted.contains(r"OpenRead('C:\it''s\Hane.msix')"));
+    }
+
+    #[test]
+    fn the_installed_query_filters_by_the_exact_package_version() {
+        let script = installed_target_script(PACKAGE, VERSION);
+        assert!(script.contains(&format!("-Name {}", quote_ps(PACKAGE))));
+        assert!(script.contains(&format!("$_.Version.ToString() -eq {}", quote_ps(VERSION))));
+        assert!(script.contains("$p.Publisher"));
+    }
+
+    #[test]
+    fn publisher_query_results_are_interpreted_fail_closed() {
+        assert_eq!(
+            publisher_from_result(Some(0), b" CN=Hane \r\n").unwrap(),
+            Some("CN=Hane".to_owned())
+        );
+        assert_eq!(publisher_from_result(Some(0), b"  ").unwrap(), None);
+        assert_eq!(publisher_from_result(Some(3), b"").unwrap(), None);
+        assert!(publisher_from_result(Some(1), b"CN=Hane").is_err());
+        assert!(publisher_from_result(None, b"CN=Hane").is_err());
+    }
+
+    /// Runs the production scripts through a fake PowerShell that reports the
+    /// given (exit code, stdout) for the manifest and installed queries.
+    fn migrate_via_queries(
+        manifest: (Option<i32>, &'static [u8]),
+        installed: (Option<i32>, &'static [u8]),
+        registered: &Cell<u32>,
+    ) -> io::Result<()> {
+        let manifest_script = msix_manifest_script(MSIX, PACKAGE);
+        let installed_script = installed_target_script(PACKAGE, VERSION);
+        let fake = |script: &str, expected: &str, result: (Option<i32>, &'static [u8])| {
+            assert_eq!(script, expected, "the production script is executed");
+            publisher_from_result(result.0, result.1)
+        };
+        migrate_registration_with(
+            &saved(true, true),
+            OWNER,
+            PACKAGE,
+            || fake(&msix_manifest_script(MSIX, PACKAGE), &manifest_script, manifest),
+            |_| Ok(true),
+            || {
+                registered.set(registered.get() + 1);
+                Ok(())
+            },
+            || fake(&installed_target_script(PACKAGE, VERSION), &installed_script, installed),
+        )
+    }
+
+    #[test]
+    fn query_outcomes_gate_the_migration() {
+        let ok: (Option<i32>, &'static [u8]) = (Some(0), b"CN=Hane");
+        let refused: [(Option<i32>, &'static [u8]); 5] = [
+            (Some(3), b""),
+            (Some(0), b""),
+            (Some(0), b"CN=Other"),
+            (Some(1), b""),
+            (None, b""),
+        ];
+        for manifest in refused {
+            let registered = Cell::new(0);
+            assert!(migrate_via_queries(manifest, ok, &registered).is_err());
+            assert_eq!(registered.get(), 0);
+        }
+        for installed in refused {
+            let registered = Cell::new(0);
+            assert!(migrate_via_queries(ok, installed, &registered).is_err());
+            assert_eq!(registered.get(), 1);
+        }
+        let registered = Cell::new(0);
+        migrate_via_queries(ok, ok, &registered).unwrap();
     }
 
     #[test]
