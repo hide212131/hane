@@ -299,15 +299,116 @@ fn osascript_alert_args(notice: &StopNotice) -> Vec<String> {
     ]
 }
 
-/// Shows the notice in a native alert on macOS (blocking until dismissed, so
-/// the process does not exit before it is read). Other platforms keep stderr.
+/// The notice for a launch that cannot be handled while an update is applied.
+fn update_in_progress_notice() -> StopNotice {
+    StopNotice {
+        title: "Haneは更新中です".to_string(),
+        message: "更新中のため、起動操作や文書を開く操作を処理できませんでした。\
+                  文書・設定・AIのデータには変更を加えていません。\n\n\
+                  更新が終わってから、もう一度Haneを起動するか、開きたい文書を開き直してください。"
+            .to_string(),
+    }
+}
+
+/// The notice for a launch stopped because an interrupted update is not settled.
+/// It does not claim the update succeeded.
+fn recovery_required_notice(reason: &str) -> StopNotice {
+    StopNotice {
+        title: "Haneの更新を完了または取り消せませんでした".to_string(),
+        message: format!(
+            "中断された更新の復旧が済んでいないため、起動操作や文書を開く操作を処理できませんでした。\
+             文書・設定・AIのデータには変更を加えていません。\n\n\
+             理由: {reason}\n\n\
+             署名済みのHane ZIPを手動でインストールするなど、復旧の案内に従ってください。\
+             復旧が済んだ後で、もう一度Haneを起動するか、開きたい文書を開き直してください。"
+        ),
+    }
+}
+
+/// Where a stop notice is shown on a platform.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum NoticeSurface {
+    MacosAlert,
+    WindowsMessageBox,
+    StderrOnly,
+}
+
+fn notice_surface(is_macos: bool, is_windows: bool) -> NoticeSurface {
+    if is_macos {
+        NoticeSurface::MacosAlert
+    } else if is_windows {
+        NoticeSurface::WindowsMessageBox
+    } else {
+        NoticeSurface::StderrOnly
+    }
+}
+
+/// UTF-16, NUL-terminated, as `MessageBoxW` expects.
+#[cfg(any(target_os = "windows", test))]
+fn to_wide_nul(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Shows the notice in a native dialog (blocking until dismissed, so the
+/// process does not exit before it is read): an alert on macOS and a message
+/// box on Windows, whose GUI build has no console. Other platforms keep stderr.
 fn present_notice(notice: &StopNotice) {
     eprintln!("{}\n{}", notice.title, notice.message);
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("/usr/bin/osascript")
-            .args(osascript_alert_args(notice))
-            .status();
+    match notice_surface(cfg!(target_os = "macos"), cfg!(target_os = "windows")) {
+        NoticeSurface::MacosAlert => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("/usr/bin/osascript")
+                    .args(osascript_alert_args(notice))
+                    .status();
+            }
+        }
+        NoticeSurface::WindowsMessageBox => {
+            #[cfg(target_os = "windows")]
+            {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+                };
+                let title = to_wide_nul(&notice.title);
+                let message = to_wide_nul(&notice.message);
+                // SAFETY: both buffers are NUL-terminated and outlive the call.
+                unsafe {
+                    MessageBoxW(
+                        std::ptr::null_mut(),
+                        message.as_ptr(),
+                        title.as_ptr(),
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+                    );
+                }
+            }
+        }
+        NoticeSurface::StderrOnly => {}
+    }
+}
+
+/// Reports a recovery-required stop through `present` and stops.
+fn stop_for_recovery(reason: &str, present: impl FnOnce(&StopNotice)) -> Entry {
+    present(&recovery_required_notice(reason));
+    Entry::Stop(EXIT_RECOVERY_REQUIRED)
+}
+
+/// Turns a terminal gate refusal into a visible notice and a stop. Admitting
+/// outcomes are not handled here.
+fn stop_for_refusal(outcome: GateOutcome, present: impl FnOnce(&StopNotice)) -> Entry {
+    match outcome {
+        GateOutcome::Proceed(guard) => Entry::Start {
+            guard: Some(guard),
+            state_root: None,
+        },
+        GateOutcome::Unmanaged => Entry::Start {
+            guard: None,
+            state_root: None,
+        },
+        GateOutcome::UpdateInProgress => {
+            present(&update_in_progress_notice());
+            Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
+        }
+        GateOutcome::RecoveryRequired(reason) => stop_for_recovery(&reason, present),
     }
 }
 
@@ -323,12 +424,10 @@ pub fn enter() -> Entry {
         Err(err) => {
             // The placement cannot be resolved, so it cannot be ruled out that
             // an interrupted update is pending: do not start normal editing.
-            eprintln!(
-                "Hane could not finish or undo an interrupted update \
-                 (the running executable could not be located: {err}). \
-                 Install a signed Hane ZIP manually."
+            return stop_for_recovery(
+                &format!("実行中の実行ファイルの場所を特定できません: {err}"),
+                present_notice,
             );
-            return Entry::Stop(EXIT_RECOVERY_REQUIRED);
         }
     };
     // The limited-health child of an update helper is the only launch that may
@@ -338,8 +437,10 @@ pub fn enter() -> Entry {
     match detect_child(&exe, env!("CARGO_PKG_VERSION")) {
         ChildEntry::NotChild => {}
         ChildEntry::Refused(reason) => {
-            eprintln!("Hane could not confirm the update it was started for ({reason}).");
-            return Entry::Stop(EXIT_RECOVERY_REQUIRED);
+            return stop_for_recovery(
+                &format!("起動対象の更新を確認できません: {reason}"),
+                present_notice,
+            );
         }
         ChildEntry::Child(session) => {
             // The read-only inspection of the state root, the settings store
@@ -351,8 +452,10 @@ pub fn enter() -> Entry {
             return match session.verify(move || check.verify()) {
                 Ok(verified) => Entry::Limited(Box::new(verified)),
                 Err(err) => {
-                    eprintln!("Hane could not confirm the update it was started for ({err}).");
-                    Entry::Stop(EXIT_RECOVERY_REQUIRED)
+                    stop_for_recovery(
+                        &format!("起動対象の更新を確認できません: {err}"),
+                        present_notice,
+                    )
                 }
             };
         }
@@ -415,27 +518,7 @@ pub fn enter() -> Entry {
         let err = reexec_current_image(&exe);
         return stop_after_failed_reexec(&err, present_notice);
     }
-    match outcome {
-        GateOutcome::Proceed(guard) => Entry::Start {
-            guard: Some(guard),
-            state_root: None,
-        },
-        GateOutcome::Unmanaged => Entry::Start {
-            guard: None,
-            state_root: None,
-        },
-        GateOutcome::UpdateInProgress => {
-            eprintln!("Hane is being updated. Please start it again in a moment.");
-            Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
-        }
-        GateOutcome::RecoveryRequired(reason) => {
-            eprintln!(
-                "Hane could not finish or undo an interrupted update ({reason}). \
-                 Install a signed Hane ZIP manually."
-            );
-            Entry::Stop(EXIT_RECOVERY_REQUIRED)
-        }
-    }
+    stop_for_refusal(outcome, present_notice)
 }
 
 #[cfg(test)]
@@ -615,6 +698,61 @@ mod tests {
         assert!(message.contains("No such file"), "the reason is shown");
         assert!(message.contains("もう一度Haneを起動"), "restart steps are given");
         assert!(message.contains("開く操作"), "the lost request is not hidden");
+    }
+
+    #[test]
+    fn update_in_progress_refusal_is_shown_and_asks_to_retry_after_the_update() {
+        let mut shown = Vec::new();
+        let entry = stop_for_refusal(GateOutcome::UpdateInProgress, |n| {
+            shown.push((n.title.clone(), n.message.clone()));
+        });
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].0, update_in_progress_notice().title);
+        let message = &shown[0].1;
+        assert!(message.contains("更新中のため"));
+        assert!(message.contains("更新が終わってから"));
+        assert!(message.contains("開く操作"));
+    }
+
+    #[test]
+    fn recovery_refusal_is_shown_and_never_reads_as_a_successful_update() {
+        let mut shown = Vec::new();
+        let entry = stop_for_refusal(GateOutcome::RecoveryRequired("broken".into()), |n| {
+            shown.push(n.message.clone());
+        });
+        assert!(matches!(entry, Entry::Stop(EXIT_RECOVERY_REQUIRED)));
+        assert_eq!(shown.len(), 1);
+        let message = &shown[0];
+        assert!(message.contains("broken"), "the reason is shown");
+        assert!(message.contains("復旧の案内に従"));
+        assert!(message.contains("復旧が済んだ後で"));
+        assert!(message.contains("開く操作"));
+        assert!(!message.contains("更新は完了しています"));
+        assert!(!message.contains("更新が終わってから"));
+    }
+
+    #[test]
+    fn a_failed_child_confirmation_is_shown_not_left_on_stderr() {
+        let mut shown = 0;
+        let entry = stop_for_recovery("x", |_| shown += 1);
+        assert!(matches!(entry, Entry::Stop(EXIT_RECOVERY_REQUIRED)));
+        assert_eq!(shown, 1);
+    }
+
+    #[test]
+    fn notices_use_the_native_surface_of_each_os() {
+        assert_eq!(notice_surface(true, false), NoticeSurface::MacosAlert);
+        assert_eq!(notice_surface(false, true), NoticeSurface::WindowsMessageBox);
+        assert_eq!(notice_surface(false, false), NoticeSurface::StderrOnly);
+    }
+
+    #[test]
+    fn windows_message_text_is_nul_terminated_utf16() {
+        let wide = to_wide_nul("更新中A");
+        assert_eq!(wide.last(), Some(&0));
+        assert_eq!(String::from_utf16(&wide[..wide.len() - 1]).unwrap(), "更新中A");
+        assert_eq!(wide.iter().filter(|&&u| u == 0).count(), 1);
     }
 
     #[test]
