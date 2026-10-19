@@ -373,6 +373,27 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Summarize required review for workflow changes
+        if: ${{ needs.prepare.outputs.finalizer_environment == 'hane-aadw-trusted-workflow-write' && steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success' }}
+        shell: bash
+        env:
+          PATCH_FILE: aadw-worker.patch
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          patch_sha256="$(sha256sum "$PATCH_FILE" | cut -d' ' -f1)"
+          {
+            echo '## 配布workflow変更の確認が必要です'
+            echo
+            echo "確認対象artifact: \`aadw-worker-patch-${RUN_ID}\`"
+            echo 'artifactをダウンロードし、workflowのtrigger、権限、secret参照を含む差分全体を確認してください。'
+            echo '確認後、次の行をPRのConversationへ投稿し、その後にprotected Environmentのjobを承認してください。'
+            echo
+            echo "\`AADW_WORKFLOW_PATCH_APPROVED: run_id=${RUN_ID} sha256=${patch_sha256}\`"
+            echo
+            echo '承認前にartifactを確認してください。markerがない、run IDまたはhashが一致しない場合はfinalizerが停止します。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check out trusted diagnostic source after Claude failure
         if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
         uses: actions/checkout@v6
@@ -526,6 +547,9 @@ jobs:
           ACTOR_PERMISSION: ${{ needs.prepare.outputs.actor_permission }}
           EXPECTED_ROOT_CAUSE: ${{ needs.prepare.outputs.root_cause }}
           PR_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
 
@@ -606,6 +630,31 @@ if workflow.count(expected) != 1:
           if [[ "$changed" != 'true' ]]; then
             echo '::error::Worker patch has no staged repository change.'
             exit 1
+          fi
+
+          workflow_file_changed=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              .github/workflows/*) workflow_file_changed=true ;;
+            esac
+          done < <(git -C final-head diff --cached --no-renames --name-only -z)
+
+          if [[ "$workflow_file_changed" == 'true' ]]; then
+            if [[ "$u2_release_exception" != 'true' ]]; then
+              echo '::error::Workflow changes require the dedicated Issue #510 U2 exception.'
+              exit 1
+            fi
+
+            patch_sha256="$(sha256sum "$patch_file" | cut -d' ' -f1)"
+            approval_marker="AADW_WORKFLOW_PATCH_APPROVED: run_id=${RUN_ID} sha256=${patch_sha256}"
+            comments_file="$RUNNER_TEMP/aadw-pr-comments.json"
+            gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$comments_file"
+            if ! jq -e --arg actor "$ACTOR_LOGIN" --arg marker "$approval_marker" \
+              'any(.[][]?; .user.login == $actor and ((.body // "") | split("\n") | any(. == $marker)))' \
+              "$comments_file" >/dev/null; then
+              echo '::error::Workflow changes require an owner comment approving this exact worker patch hash before Environment approval.'
+              exit 1
+            fi
           fi
 
           git -C final-head config user.name 'claude[bot]'
