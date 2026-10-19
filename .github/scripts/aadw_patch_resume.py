@@ -273,13 +273,14 @@ def validate_patch_bundle(patch_path: Path, manifest_path: Path, source: dict) -
 
 
 def is_u2_release_path(path: str) -> bool:
-    normalized = path.replace("\\", "/")
-    parsed = PurePosixPath(normalized)
+    # Git uses "/" as its only directory separator. A literal backslash is a
+    # different filename on the Linux finalizer and must not alias an allowed path.
+    if "\\" in path:
+        return False
+    parsed = PurePosixPath(path)
     if parsed.is_absolute() or any(part in {"", ".", ".."} for part in parsed.parts):
         return False
-    if normalized in U2_ALLOWED_PATHS:
-        return True
-    return False
+    return path in U2_ALLOWED_PATHS
 
 
 def validate_u2_paths(paths: list[str]) -> None:

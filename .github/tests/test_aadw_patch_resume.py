@@ -248,6 +248,8 @@ class PatchAndScopeTests(unittest.TestCase):
             "docs/aadw-command-policy.md",
             "crates/updater/src/../.github/workflows/evil.yml",
             "src/unrelated.rs",
+            r".github\workflows\windows-release.yml",
+            r"crates\updater\src\main.rs",
         ]:
             with self.subTest(path=path):
                 with self.assertRaisesRegex(ValueError, "outside its allowlist"):
