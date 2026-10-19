@@ -6,13 +6,13 @@
 正本: [ADR-0034](adr/0034-zip-application-updates.md)、[詳細仕様](application-update-implementation-spec.md)
 実装の進捗の追跡: [Issue #510](https://github.com/hide212131/hane/issues/510)
 
-要求・受入条件の正本: [Issue #508](https://github.com/hide212131/hane/issues/508)
+要求・受入条件の正本: 製品実装の現在の契約は[Issue #510](https://github.com/hide212131/hane/issues/510)。[Issue #508](https://github.com/hide212131/hane/issues/508)は設計Issueとして完了済みで、実装の受入判定には使わない。仕様書の「要求の縮小記録」（外部openの利用者向け再操作案内、scroll/caret完全復元の後続化）も参照する。
 
 Issue #510は、WindowsとmacOSの実配布物で旧版から新版への更新と復旧を行い、U-01〜U-15の証拠がそろうまで完了扱いにしない。受入条件は縮小・弱化しない。
 
 ## 0. 進捗の要約
 
-下表の状態はこの文書を更新した対象head（PR #518 head `acb545e80683e118b83bb42099fc1d3f92b06c7a`）を基準にしたスナップショットである。実装時はGitHub上のcurrent factsを読み直す。
+下表の状態はこの文書を更新した時点のスナップショットである。current main `08f659e0032ee377ca21e1cce060a8d517c884dc`、PR #518 head `92235af3ab443eeb545eb93bdb72e529a93d4df8`、PR #526 head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`（#518用branchをbaseにしている）を基準とする。実装時はGitHub上のcurrent factsを読み直す。
 
 - 最新の公開Release v0.26.0にはWindows/Mac ZIPのみがあり、更新catalog/signatureは含まれない。更新対応の本番公開とU5は未完了。
 - Windows/macOS実機での二版更新・復旧の証拠（U-11, U-13, U-14など）と、本番の署名鍵・Developer ID・notarization設定は未了。fixtureの成功を実OSの成功へ読み替えない。
@@ -37,10 +37,10 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 |---|---|
 | U0 | merged。[PR #512](https://github.com/hide212131/hane/pull/512)（U0/U1/U3）に含まれてmerge済み。 |
 | U1 | merged。PR #512に含まれてmerge済み。Windows 11実機でのExplorer登録等の確認（U-11）は未了。 |
-| U2 | Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。current headは`eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`、baseは#518の古いhead `00bf87fd529398d9ee7305f74fdea899065f8260`のため、#518同期後に再検証が必要。本番の署名設定は未完了。 |
+| U2 | Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。#518用branchをbaseにしているため、#518の変更後に同期と再検証が必要。本番の署名設定は未完了。 |
 | U3 | merged。PR #512に含まれてmerge済み。実署名metadata未準備のため適用操作は有効化しない。 |
-| U4 | Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、head `acb545e80683e118b83bb42099fc1d3f92b06c7a`。exact-result verifier run 39297710445のworkspace tests/lintは成功。Windows/macOS CI run 39297946283は`action_required`でジョブ0件のため未実行であり、成功扱いにしない。Codex Reviewはこのheadで本文書の進捗スナップショットとADR状態表現の2件を指摘した。両OSのU-08〜14は未了。 |
-| U5 | 未完了。bootstrap出荷と二版更新の実行証拠は未取得。 |
+| U4 | Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、head `92235af3ab443eeb545eb93bdb72e529a93d4df8`。最新のexact verifier run `39309109627`はtests/lint成功。current-head CI `39309328198`はmaintainer approval待ちで未実行であり、成功扱いにしない。最新のCodex Reviewは返答待ち。両OSのU-08〜14は未了。 |
+| U5 | 未完了。本番ZIP、Windows/macOS実更新と復旧の実行証拠は未取得。 |
 
 | 段階 | 変更予定のpath／内容 | 先行条件と完了条件 |
 |---|---|---|
@@ -66,14 +66,14 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 | U-05 | 配置移動、別owner、別InstallId、別`HANE_STATE_DIR`、開発build、memory state、readonly/network filesystemで対象を誤認しない。 | 実一時配置でidentity変更・override分離。2配置の片方の更新で他方が不変。同じ配置のstate override変更で最大catalog sequenceが下がらない。 |
 | U-06 | app所有service、二重クリック、カテゴリ往復、window寿命、stale op/candidate、cancel、通常終了後のReady保持。 | service/UI state試験。再起動時はローカル検証のみ、適用は明示操作後だけ。 |
 | U-07 | ZIP→inventory→catalogの版/hash/source/署名整合、未知schema/protocol拒否、同tag ZIP不変、二target不足で公開しない。 | 発行しない配布fixture/構成テスト。実publishをtest代わりにしない。 |
-| U-08 | dirtyなnamed/untitled/work-folder draft、autosave OFF、別tab、未保存AI/Prompts、IME、Save As取消、save/rename/AI中、draft書込失敗でquit不可。 | 保存境界とUI試験。最後の打鍵、非active tab、stale DocumentInstance、freeze直前の外部openも含む。文書byte/draft/設定が失われないことを確認。 |
+| U-08 | dirtyなnamed/untitled/work-folder draft、autosave OFF、別tab、未保存AI/Prompts、IME、Save As取消、save/rename/AI中、draft書込失敗でquit不可。 | 保存境界とUI試験。最後の打鍵、非active tab、stale DocumentInstance、freeze直前の外部openも含む。freeze中の外部openは、通常受付または利用者向けの理由と再操作案内を確認する（Finder要求のprocess-image越しの完全復元は必須にしない）。文書byte/draft/設定が失われないことを確認。 |
 | U-09 | freeze後の編集/open競合、helper起動失敗、Preparedなし、permit後の世代変化、AI停止timeout、親未終了でmutationなし。 | private IPC偽装/切断fixtureとprocess試験。Abort後は編集と必要なAI serviceが戻る。 |
 | U-10 | 同一配置の別process、通常起動競合、別userの読取lease、異なるstate override、PID再利用。通常の外部open成功を偽装しない。 | 実OSの2process以上で検証。OS lockをmockだけで済ませない。 |
 | U-11 | Windowsで所有fileだけ更新。使用中旧shell DLLと未知の隣接Markdownは不変。既存marker別ON/OFF、未登録、他owner、Publisher変更、MSIX失敗を区別。 | Windows 11で実Explorer登録/選択/起動。古いDLLから新旧exeにfileとfolderを渡し、更新後の別version DLL登録も確認。 |
 | U-12 | 各journal flush前後、各file置換前後、bundle swap直後、health前後、durable commit直後のprocess中断で、旧版復旧または新版commitを決定。未知hash/backup破損では停止。 | checkpointごとのhelper強制終了による故障注入。一般編集processをkillして保存を検証したと主張しない。新旧混在で通常editorを開かない。 |
 | U-13 | macOSの正しい署名/Team ID/Bundle ID/版/notarization、別Team・不正署名・translocation・unsupported FS・権限不足・交換失敗。 | 実macOS/APFS、隔離属性を保ったブラウザdownloadで新規/upgrade/別配置を確認。OS評価をfixtureで成功させただけで完了しない。 |
-| U-14 | 実二版のDownload→手動Restart→health→Commit、起動不能候補のrollback、ticket一回復元、commit後cleanup失敗。 | Windows/macOS双方の版・source SHA・archive hash・配置・OS版付きlog/画面。文書、AI保存領域、ログイン、default folder、recent、Explorer登録を更新前後で比較。 |
-| U-15 | 通常の入力/IME/保存・再読込/undo-redo、複数tab、設定Escape、外部open、AI選択処理の回帰と性能。 | 既存workspace test/Clippy/required CI＋focused GUI。本文入力中に通信/ZIP処理がなく、無操作起動のrequest数0。起動/入力遅延の変更前基準と同条件比較を残す。 |
+| U-14 | 実二版のDownload→手動Restart→health→Commit、起動不能候補のrollback、ticket一回復元（保存済み文書・active path・work folderが対象で、scroll/caretの完全復元は含まない）、commit後cleanup失敗。 | Windows/macOS双方の版・source SHA・archive hash・配置・OS版付きlog/画面。文書、AI保存領域、ログイン、default folder、recent、Explorer登録を更新前後で比較。 |
+| U-15 | 通常の入力/IME/保存・再読込/undo-redo、複数tab、設定Escape、外部open（通常受付または利用者向け再操作案内）、AI選択処理の回帰と性能。 | 既存workspace test/Clippy/required CI＋focused GUI。本文入力中に通信/ZIP処理がなく、無操作起動のrequest数0。起動/入力遅延の変更前基準と同条件比較を残す。 |
 
 ## 4. 受入判定
 

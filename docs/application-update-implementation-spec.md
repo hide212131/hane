@@ -6,7 +6,12 @@
 判断: [ADR-0034](adr/0034-zip-application-updates.md)
 実装順序・受入: [引き継ぎ](application-update-implementation-handoff.md)
 
-要求・受入条件の正本: [Issue #508](https://github.com/hide212131/hane/issues/508)
+要求・受入条件の正本: 製品実装の現在の契約は[Issue #510](https://github.com/hide212131/hane/issues/510)。[Issue #508](https://github.com/hide212131/hane/issues/508)は設計Issueとして完了済みで、実装の受入判定には使わない。
+
+要求の縮小記録（Issue #510の現行条件への整合）:
+- restart freeze中に受け取れない外部openは、完全な再現ではなく、理由と再操作方法を利用者へ伝えることを必須とする。データ保護、更新中の安全な停止、誤った成功表示の禁止は維持する。
+- restart ticketのscroll/caret保存は初回公開の必須条件から外し、位置の完全復元は後続候補とする。保存済み文書・active path・work folderの復元と、設定・AIデータの保護は維持する。
+- 署名・hash・版・対象OS・配置・所有権の検査、未保存データ保護、限定health、durable commit、rollback/RecoveryRequired、Windows ExplorerとmacOS配布の制約は変更しない。
 
 ## 1. 要求と到達点
 
@@ -174,7 +179,7 @@ macOSでは`.app`外にhelper copyを置く。Windowsでも更新中の`hane-upd
 Download中は通常編集できる。「再起動して更新」は次の順序で行う。
 
 1. Readyを再検証し、配置・容量・権限と現在版identityを確認する。失敗時はまだ何も終了しない。
-2. UI thread上で短いrestart freezeを設け、新規編集、外部open、folder切替、設定変更、save/rename/AI開始を止める。既に届いたexternal openを失わず、開始前なら処理後に再判定、freeze後なら送信元へbusy/再試行を返す。新規キューを通常起動の成功として消費しない。
+2. UI thread上で短いrestart freezeを設け、新規編集、外部open、folder切替、設定変更、save/rename/AI開始を止める。既に届いたexternal openを失わず、開始前なら処理後に再判定する。freeze後に受け取れない外部openは、更新中で開けない理由と再操作方法（更新完了後にもう一度開く）を利用者へ伝える。送信元プロトコルが許す場合はbusy/再試行も返す。新規キューを通常起動の成功として消費せず、開けていないのに成功と見せない。
 3. 全ウィンドウ・全sessionについてidentity/revision、dirty、save/rename/autosaveのpending、modal/Save As、AIの選択文章処理/認証/導入/設定保存、AI/Prompts未保存フォームを検査する。IME composition中も保留。macOSで別processが同じ配置を使っていれば後述leaseで適用を拒否する。
 4. dirty文書や未保存フォームがあればfreezeを解除し、利用者が既存の保存操作へ戻れるようにする。強制保存、未保存内容の破棄、Save Asの自動決定をしない。v1にSave Allを新設しない。空で変更のない初期Untitledは妨げない。
 5. draft flushは新しい`Result`付きの更新用経路で全件成功を確認し、設定・recentの必要な永続化、下記ticketのatomic write/fsyncを確認する。既存のbest-effort通常quit処理の動作はこの機能で一律変更しない。書込失敗はfreezeを解除して保留。
@@ -182,7 +187,7 @@ Download中は通常編集できる。「再起動して更新」は次の順序
 7. quit直前にpermitの鮮度を確認する。AI serviceへ明示shutdown/join完了を要求し、draftの遅延jobをdrain/cancelする。停止が10秒以内に完了しなければhelperへAbortし、旧版を保持する。サービスを停止した場合は旧画面へ戻るときに再初期化する。process killで終了を達成しない。
 8. helperへ`ExitAuthorized`を送り、通常quit。helperは親processのOS handle/exit notificationを30秒まで待ち、単なるPIDの消滅推測では判定しない。親が残ればmutationせずAbortする。
 
-`restart-ticket.json`にはschema、TransactionId、InstallId、元のstate root、work folder、開いていた**保存済み**ファイルの順序、active path、scroll/caretの有界値を保存する。文書本文、秘密、任意コマンド、任意環境変数は保存しない。通常起動のdefault folder設定を書き換えない。再起動後は現在のdisk内容を既存open経路で読み、移動/削除済みは失敗を表示して残りを開く。未保存本文をticketで復元する設計にはしない。
+`restart-ticket.json`にはschema、TransactionId、InstallId、元のstate root、work folder、開いていた**保存済み**ファイルの順序、active pathを保存する。scroll/caretの保存・復元は初回公開の必須条件ではなく、後続候補とする。文書本文、秘密、任意コマンド、任意環境変数は保存しない。通常起動のdefault folder設定を書き換えない。再起動後は現在のdisk内容を既存open経路で読み、移動/削除済みは失敗を表示して残りを開く。未保存本文をticketで復元する設計にはしない。
 
 restart blockerが一つでもある場合、helperの起動・適用へ進まない。フリーズは短い検査と終了調停の間だけに限定し、通信・hash・ZIP展開をその中で行わない。
 
