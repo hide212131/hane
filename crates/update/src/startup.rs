@@ -1876,6 +1876,7 @@ mod tests {
                     caret_offset: 2,
                 }],
                 active: Some(0),
+                explorer: None,
             },
             || Ok(()),
         )

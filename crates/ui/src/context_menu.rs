@@ -58,9 +58,126 @@ pub fn set_file_context_menu(enabled: bool) -> io::Result<()> {
     }
 }
 
+/// The Explorer integration that is enabled for the current user: the owner and
+/// package identity, and which verbs (file / folder) are ON. Read before an
+/// update and carried to the new package version afterwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplorerRegistration {
+    pub owner: String,
+    pub package_name: String,
+    pub publisher: String,
+    pub file_enabled: bool,
+    pub folder_enabled: bool,
+}
+
+/// Builds the registration to carry from what the trusted inspection read.
+/// `None` when neither verb is ON (nothing is turned on that was off) or when
+/// no installed package identity backs the markers (nothing to carry).
+pub fn registration_from_inspection(
+    owner: &str,
+    package_name: &str,
+    publisher: Option<String>,
+    file_enabled: bool,
+    folder_enabled: bool,
+) -> Option<ExplorerRegistration> {
+    if !file_enabled && !folder_enabled {
+        return None;
+    }
+    Some(ExplorerRegistration {
+        owner: owner.to_owned(),
+        package_name: package_name.to_owned(),
+        publisher: publisher?,
+        file_enabled,
+        folder_enabled,
+    })
+}
+
+/// Reads the enabled Explorer integration of the current user. `Ok(None)` when
+/// it is off, was never registered, or this is not Windows 11.
+pub fn capture_explorer_registration() -> io::Result<Option<ExplorerRegistration>> {
+    #[cfg(windows)]
+    {
+        windows::capture_registration()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(None)
+    }
+}
+
+/// Carries `saved` to the newly installed version, after the update committed.
+/// Only the verbs that were ON are carried.
+pub fn migrate_explorer_registration(saved: &ExplorerRegistration) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::migrate_registration(saved)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = saved;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Explorer 拡張の登録はWindowsでのみ利用できます",
+        ))
+    }
+}
+
+/// The migration with its environment as seams. The ownership and package
+/// identity are re-confirmed first; only then is the package registered. A
+/// failed confirmation or registration is an error: success is never assumed,
+/// and nothing is written for a verb that was OFF.
+pub fn migrate_registration_with(
+    saved: &ExplorerRegistration,
+    expected_owner: &str,
+    expected_package: &str,
+    installed_publisher: impl FnOnce() -> io::Result<Option<String>>,
+    marker_owned: impl Fn(ExplorerVerb) -> io::Result<bool>,
+    register_package: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if !saved.file_enabled && !saved.folder_enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "引き継ぐ Explorer 登録に有効な項目がありません",
+        ));
+    }
+    if saved.owner != expected_owner || saved.package_name != expected_package {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "更新前の Explorer 登録の所有者が Hane のものと一致しません",
+        ));
+    }
+    match installed_publisher()? {
+        Some(publisher) if publisher == saved.publisher => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Explorer 拡張パッケージの所有者が更新前と一致しないため登録を引き継ぎません",
+            ));
+        }
+    }
+    for (enabled, verb) in [
+        (saved.file_enabled, ExplorerVerb::File),
+        (saved.folder_enabled, ExplorerVerb::Folder),
+    ] {
+        if enabled && !marker_owned(verb)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "更新前に有効だった Explorer 登録のマーカーが変更されているため引き継ぎません",
+            ));
+        }
+    }
+    register_package()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplorerVerb {
+    File,
+    Folder,
+}
+
 #[cfg(windows)]
 mod windows {
-    use super::{FileContextMenuState, Path};
+    use super::{ExplorerRegistration, ExplorerVerb, FileContextMenuState, Path};
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write};
     use std::os::windows::process::CommandExt;
@@ -412,6 +529,70 @@ mod windows {
         powershell(&script).is_ok_and(|output| output.status.success())
     }
 
+    /// Publisher of the installed package of this name for the current user,
+    /// whatever its version. `None` when it is not installed.
+    fn installed_package_publisher() -> io::Result<Option<String>> {
+        let script = format!(
+            "$p = Get-AppxPackage -Name {} -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) {{ [Console]::Out.Write($p.Publisher); exit 0 }} else {{ exit 3 }}",
+            quote_ps(PACKAGE_NAME),
+        );
+        let output = powershell(&script)?;
+        match output.status.code() {
+            Some(0) => {
+                let publisher = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                Ok((!publisher.is_empty()).then_some(publisher))
+            }
+            Some(3) => Ok(None),
+            _ => Err(io::Error::other(
+                "Explorer 拡張パッケージの所有者を確認できません",
+            )),
+        }
+    }
+
+    pub(super) fn capture_registration() -> io::Result<Option<ExplorerRegistration>> {
+        if !is_windows_11() {
+            return Ok(None);
+        }
+        let exe = std::env::current_exe()?;
+        let file_enabled = marker_enabled(&exe, FILE_ENABLED_MARKER)?;
+        let folder_enabled = marker_enabled(&exe, FOLDER_ENABLED_MARKER)?;
+        if !file_enabled && !folder_enabled {
+            return Ok(None);
+        }
+        Ok(super::registration_from_inspection(
+            OWNER_ID,
+            PACKAGE_NAME,
+            installed_package_publisher()?,
+            file_enabled,
+            folder_enabled,
+        ))
+    }
+
+    pub(super) fn migrate_registration(saved: &ExplorerRegistration) -> io::Result<()> {
+        if !is_windows_11() {
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        super::migrate_registration_with(
+            saved,
+            OWNER_ID,
+            PACKAGE_NAME,
+            installed_package_publisher,
+            |verb| {
+                let marker = match verb {
+                    ExplorerVerb::File => FILE_ENABLED_MARKER,
+                    ExplorerVerb::Folder => FOLDER_ENABLED_MARKER,
+                };
+                marker_enabled(&exe, marker)
+            },
+            || {
+                ensure_explorer_package(&exe)?;
+                notify_shell();
+                Ok(())
+            },
+        )
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     enum PackagePlan {
         /// Windows 10: no MSIX package is involved.
@@ -587,6 +768,134 @@ mod windows {
             assert!(FILE_MENU_KEY.contains(r"\*\shell\Hane.OpenFile"));
             assert!(FOLDER_MENU_KEY.contains(r"\Directory\shell\Hane"));
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const OWNER: &str = "owner-id";
+    const PACKAGE: &str = "Hane.ShellIntegration";
+    const PUBLISHER: &str = "CN=Hane";
+
+    fn saved(file: bool, folder: bool) -> ExplorerRegistration {
+        ExplorerRegistration {
+            owner: OWNER.to_owned(),
+            package_name: PACKAGE.to_owned(),
+            publisher: PUBLISHER.to_owned(),
+            file_enabled: file,
+            folder_enabled: folder,
+        }
+    }
+
+    fn migrate(
+        saved: &ExplorerRegistration,
+        publisher: Option<&str>,
+        markers: (bool, bool),
+        registered: &Cell<u32>,
+        register_ok: bool,
+    ) -> io::Result<()> {
+        migrate_registration_with(
+            saved,
+            OWNER,
+            PACKAGE,
+            || Ok(publisher.map(str::to_owned)),
+            |verb| {
+                Ok(match verb {
+                    ExplorerVerb::File => markers.0,
+                    ExplorerVerb::Folder => markers.1,
+                })
+            },
+            || {
+                registered.set(registered.get() + 1);
+                if register_ok {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("登録に失敗"))
+                }
+            },
+        )
+    }
+
+    #[test]
+    fn capture_keeps_each_file_and_folder_combination() {
+        for (file, folder) in [(true, true), (true, false), (false, true)] {
+            let captured = registration_from_inspection(
+                OWNER,
+                PACKAGE,
+                Some(PUBLISHER.to_owned()),
+                file,
+                folder,
+            )
+            .expect("an enabled integration is captured");
+            assert_eq!(captured, saved(file, folder));
+        }
+    }
+
+    #[test]
+    fn capture_is_none_for_a_user_without_the_integration() {
+        assert_eq!(
+            registration_from_inspection(OWNER, PACKAGE, Some(PUBLISHER.to_owned()), false, false),
+            None
+        );
+        // Markers without an installed package identity carry nothing.
+        assert_eq!(registration_from_inspection(OWNER, PACKAGE, None, true, true), None);
+    }
+
+    #[test]
+    fn every_enabled_combination_is_migrated_once() {
+        for (file, folder) in [(true, true), (true, false), (false, true)] {
+            let registered = Cell::new(0);
+            migrate(&saved(file, folder), Some(PUBLISHER), (file, folder), &registered, true)
+                .unwrap();
+            assert_eq!(registered.get(), 1);
+        }
+    }
+
+    #[test]
+    fn a_verb_that_was_off_is_not_required_or_turned_on() {
+        // The folder marker is absent and was OFF: the migration still succeeds
+        // and never asks for it.
+        let registered = Cell::new(0);
+        migrate(&saved(true, false), Some(PUBLISHER), (true, false), &registered, true).unwrap();
+        assert_eq!(registered.get(), 1);
+    }
+
+    #[test]
+    fn a_changed_owner_or_publisher_is_not_migrated() {
+        let registered = Cell::new(0);
+        let mut other_owner = saved(true, true);
+        other_owner.owner = "someone-else".to_owned();
+        assert!(migrate(&other_owner, Some(PUBLISHER), (true, true), &registered, true).is_err());
+        assert!(migrate(&saved(true, true), Some("CN=Other"), (true, true), &registered, true).is_err());
+        assert!(migrate(&saved(true, true), None, (true, true), &registered, true).is_err());
+        assert_eq!(registered.get(), 0, "no package is registered after a refusal");
+    }
+
+    #[test]
+    fn a_marker_that_is_no_longer_owned_is_not_migrated() {
+        let registered = Cell::new(0);
+        assert!(migrate(&saved(true, true), Some(PUBLISHER), (true, false), &registered, true).is_err());
+        assert!(migrate(&saved(true, false), Some(PUBLISHER), (false, true), &registered, true).is_err());
+        assert_eq!(registered.get(), 0);
+    }
+
+    #[test]
+    fn a_failed_registration_is_reported_not_swallowed() {
+        let registered = Cell::new(0);
+        let error = migrate(&saved(true, true), Some(PUBLISHER), (true, true), &registered, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("登録に失敗"));
+        assert_eq!(registered.get(), 1);
+    }
+
+    #[test]
+    fn a_registration_with_nothing_enabled_is_refused() {
+        let registered = Cell::new(0);
+        assert!(migrate(&saved(false, false), Some(PUBLISHER), (false, false), &registered, true).is_err());
+        assert_eq!(registered.get(), 0);
     }
 }
 

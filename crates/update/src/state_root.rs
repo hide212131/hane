@@ -362,6 +362,45 @@ pub struct TicketFile {
     pub caret_offset: u32,
 }
 
+/// The Windows Explorer integration that was enabled before the update: the
+/// owner and package identity read by the trusted inspection, and which of the
+/// file and folder verbs were ON. At least one verb is enabled; a user without
+/// the integration has no entry at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplorerTicket {
+    pub owner: String,
+    pub package_name: String,
+    pub publisher: String,
+    pub file_enabled: bool,
+    pub folder_enabled: bool,
+}
+
+const MAX_EXPLORER_FIELD_BYTES: usize = 256;
+
+impl ExplorerTicket {
+    fn validate(&self) -> Result<()> {
+        let field_ok = |text: &str| {
+            !text.is_empty()
+                && text.len() <= MAX_EXPLORER_FIELD_BYTES
+                && !text.chars().any(char::is_control)
+        };
+        if !field_ok(&self.owner) || !field_ok(&self.package_name) || !field_ok(&self.publisher) {
+            return Err(UpdateError::new(
+                ErrorCode::MalformedMetadata,
+                "the restart ticket has an invalid Explorer registration".to_owned(),
+            ));
+        }
+        if !self.file_enabled && !self.folder_enabled {
+            return Err(UpdateError::new(
+                ErrorCode::MalformedMetadata,
+                "the restart ticket records an Explorer registration with nothing enabled".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// `restart-ticket.json` in the transaction directory. It carries no document
 /// text, secret, command or environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +414,10 @@ pub struct RestartTicket {
     pub files: Vec<TicketFile>,
     /// Index into `files` of the file that was active.
     pub active: Option<u32>,
+    /// The Explorer integration to carry to the new package version. `None`
+    /// when the user had it off or never registered it.
+    #[serde(default)]
+    pub explorer: Option<ExplorerTicket>,
 }
 
 /// Whether `text` is acceptable as a path in a ticket: absolute, bounded, free
@@ -427,6 +470,9 @@ impl RestartTicket {
             && !usize::try_from(active).is_ok_and(|index| index < self.files.len())
         {
             return Err(malformed("the restart ticket's active file is not listed"));
+        }
+        if let Some(explorer) = &self.explorer {
+            explorer.validate()?;
         }
         Ok(())
     }
@@ -495,12 +541,14 @@ fn claimed_path(coordination: &Coordination, transaction: &TransactionId) -> Pat
 
 /// What the application contributes to a ticket. Paths and bounded positions
 /// only; every other field of the ticket is derived here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TicketContent {
     pub work_folder: Option<String>,
     pub files: Vec<TicketFile>,
     /// Index into `files` of the file that was active.
     pub active: Option<u32>,
+    /// The enabled Explorer integration, when there is one.
+    pub explorer: Option<ExplorerTicket>,
 }
 
 /// Parent side: writes `restart-ticket.json` into the transaction directory.
@@ -534,6 +582,7 @@ pub fn issue_ticket(
         work_folder: content.work_folder,
         files: content.files,
         active: content.active,
+        explorer: content.explorer,
     };
     ticket.validate(coordination.install_id(), transaction, &root)?;
     let bytes = serde_json::to_vec(&ticket)
@@ -752,6 +801,7 @@ mod tests {
                     caret_offset: 10,
                 }],
                 active: Some(0),
+                explorer: None,
             }
         }
 
@@ -1349,6 +1399,7 @@ mod tests {
             work_folder: ticket.work_folder,
             files: ticket.files,
             active: ticket.active,
+            explorer: ticket.explorer,
         }
     }
 
@@ -1508,6 +1559,63 @@ mod tests {
         // A second start (or a restart after a crash) restores nothing again.
         assert!(restore(&fx).take().unwrap().is_none());
         assert!(restore(&fx).take().unwrap().is_none());
+    }
+
+    fn explorer(file_enabled: bool, folder_enabled: bool) -> ExplorerTicket {
+        ExplorerTicket {
+            owner: "92b8fc05-dc63-44ed-9afc-fb10a36bee8a".to_owned(),
+            package_name: "Hane.ShellIntegration".to_owned(),
+            publisher: "CN=Hane".to_owned(),
+            file_enabled,
+            folder_enabled,
+        }
+    }
+
+    #[test]
+    fn the_explorer_registration_survives_the_ticket_for_each_enabled_combination() {
+        for (file, folder) in [(true, true), (true, false), (false, true)] {
+            let fx = fixture();
+            publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+            let mut content = content(&fx);
+            content.explorer = Some(explorer(file, folder));
+            issue_ticket(&fx.coordination, &fx.transaction, &fx.root, content, || Ok(())).unwrap();
+            journal_at(&fx, Phase::Committed);
+            let taken = restore(&fx).take().unwrap().expect("a ticket");
+            assert_eq!(taken.explorer, Some(explorer(file, folder)));
+        }
+    }
+
+    #[test]
+    fn a_user_without_the_integration_gets_a_ticket_without_it() {
+        let fx = fixture();
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        issue_ticket(&fx.coordination, &fx.transaction, &fx.root, content(&fx), || Ok(())).unwrap();
+        journal_at(&fx, Phase::Committed);
+        assert_eq!(restore(&fx).take().unwrap().expect("a ticket").explorer, None);
+    }
+
+    #[test]
+    fn an_explorer_registration_with_nothing_enabled_or_a_bad_field_is_not_issued() {
+        let fx = fixture();
+        publish_binding(&fx.coordination, &fx.transaction, &fx.root).unwrap();
+        for bad in [
+            explorer(false, false),
+            ExplorerTicket {
+                owner: String::new(),
+                ..explorer(true, true)
+            },
+            ExplorerTicket {
+                publisher: "x".repeat(MAX_EXPLORER_FIELD_BYTES + 1),
+                ..explorer(true, true)
+            },
+        ] {
+            let mut content = content(&fx);
+            content.explorer = Some(bad);
+            assert!(
+                issue_ticket(&fx.coordination, &fx.transaction, &fx.root, content, || Ok(())).is_err()
+            );
+        }
+        assert!(!restore(&fx).has_unclaimed_ticket());
     }
 
     #[test]
