@@ -129,6 +129,32 @@ fn is_cli_open_path(first_arg: Option<&std::ffi::OsStr>) -> bool {
     }
 }
 
+/// Whether a gate that admits normal startup must first be re-executed. A macOS
+/// launch that observed `UpdateInProgress` waited while the bundle was swapped,
+/// so its in-memory image may be the pre-update version; it must never go on to
+/// edit documents or state. Terminal stops are returned unchanged.
+fn needs_fresh_image(observed_update: bool, outcome: &GateOutcome, is_macos: bool) -> bool {
+    is_macos
+        && observed_update
+        && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
+}
+
+/// Replaces this process with the current on-disk executable and the original
+/// arguments. Only returns on failure, with the reason.
+#[cfg(unix)]
+fn reexec_current_image(exe: &std::path::Path) -> String {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    err.to_string()
+}
+
+#[cfg(not(unix))]
+fn reexec_current_image(_exe: &std::path::Path) -> String {
+    "re-execution is not supported on this platform".to_string()
+}
+
 pub fn enter() -> Entry {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -178,13 +204,38 @@ pub fn enter() -> Entry {
     let has_cli_path = is_cli_open_path(std::env::args_os().nth(1).as_deref());
     let has_explicit_open = may_carry_open_request(has_cli_path);
     let started = std::time::Instant::now();
+    let observed_update = std::cell::Cell::new(false);
     let outcome = gate_with_open_retry(
-        |wait| startup_gate_for_exe_within(&exe, &runner, wait),
+        |wait| {
+            let outcome = startup_gate_for_exe_within(&exe, &runner, wait);
+            if matches!(outcome, GateOutcome::UpdateInProgress) {
+                observed_update.set(true);
+            }
+            outcome
+        },
         has_explicit_open,
         open_request_wait(has_cli_path),
         std::thread::sleep,
         || started.elapsed(),
     );
+    if needs_fresh_image(
+        observed_update.get(),
+        &outcome,
+        cfg!(target_os = "macos"),
+    ) {
+        // This process image was started before the update and may be the old
+        // version. Release the runtime lease, then replace the image in place
+        // (same PID, so LaunchServices still delivers the pending Finder event
+        // once, to the new image) with the current on-disk executable. If that
+        // cannot be done, fail closed rather than edit with the old image.
+        drop(outcome);
+        let err = reexec_current_image(&exe);
+        eprintln!(
+            "Hane could not restart itself after the update ({err}). \
+             Please start it again."
+        );
+        return Entry::Stop(EXIT_UPDATE_IN_PROGRESS);
+    }
     match outcome {
         GateOutcome::Proceed(guard) => Entry::Start {
             guard: Some(guard),
@@ -246,6 +297,51 @@ mod tests {
         assert!(matches!(outcome, GateOutcome::Unmanaged));
         assert_eq!(admitted, 1, "the launch (and its path) is admitted exactly once");
         assert_eq!(sleeps, 3);
+    }
+
+    #[test]
+    fn an_old_image_that_waited_for_an_update_does_not_proceed_in_place() {
+        let observed = std::cell::Cell::new(false);
+        let mut inner = scripted(2);
+        let outcome = gate_with_open_retry(
+            |wait| {
+                let outcome = inner(wait);
+                if matches!(outcome, GateOutcome::UpdateInProgress) {
+                    observed.set(true);
+                }
+                outcome
+            },
+            true,
+            None,
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        // The update finished, but this image saw it in progress: re-exec.
+        assert!(needs_fresh_image(observed.get(), &outcome, true));
+        // A launch that never saw an update, or a non-macOS one, proceeds.
+        assert!(!needs_fresh_image(false, &outcome, true));
+        assert!(!needs_fresh_image(true, &outcome, false));
+        // Terminal stops are never turned into a restart.
+        let recovery = GateOutcome::RecoveryRequired("x".into());
+        assert!(!needs_fresh_image(true, &recovery, true));
+        assert!(!needs_fresh_image(true, &GateOutcome::UpdateInProgress, true));
+    }
+
+    #[test]
+    fn a_pending_finder_open_is_handed_over_once_across_the_restart() {
+        // The event stays with the OS (same PID after exec) and is queued only
+        // by the fresh image after admission, so it opens exactly once.
+        let queue = hane_ui::SharedExternalOpenQueue::new();
+        let mut opened = Vec::new();
+        queue.push(PathBuf::from("/notes/a.md"));
+        for _ in 0..2 {
+            queue.drain_into(|path| {
+                opened.push(path.to_path_buf());
+                hane_ui::ExternalOpenOutcome::Accepted
+            });
+        }
+        assert_eq!(opened, vec![PathBuf::from("/notes/a.md")]);
     }
 
     #[test]
