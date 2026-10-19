@@ -1,8 +1,8 @@
 # アプリ本体更新の実装仕様
 
 作成日: 2026-10-17
-状態: 設計案／製品・配布とも未実装、OS試験未実施
-調査基準: main `e82b9a9fe42280bfa78497746bcd7e21c73430c5`
+状態: 設計採用済み（PR #509）／製品は部分実装済み（U0/U1/U3はPR #512でmerge済み、U4はPR #518でDraft、U2はPR #526でDraft）／配布の有効化とOS実機試験は未完了。進捗は[引き継ぎ](application-update-implementation-handoff.md)と[Issue #510](https://github.com/hide212131/hane/issues/510)に従う
+調査基準: main `e82b9a9fe42280bfa78497746bcd7e21c73430c5`（設計時点のSHAであり、current mainではない。実装時はcurrent mainで再確認する）
 判断: [ADR-0034](adr/0034-zip-application-updates.md)
 実装順序・受入: [引き継ぎ](application-update-implementation-handoff.md)
 

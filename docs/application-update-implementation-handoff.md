@@ -1,11 +1,21 @@
 # アプリ本体更新の実装引き継ぎ
 
 作成日: 2026-10-17
-状態: 設計案。以下の実装・OS試験・配布有効化はすべて未着手。
-基準main: `e82b9a9fe42280bfa78497746bcd7e21c73430c5`
+状態: 設計はPR #509でreview後にmerge済み。実装は部分的に進行中で、OS実機検証・本番署名設定・配布有効化・U5は未完了。
+設計時の基準main: `e82b9a9fe42280bfa78497746bcd7e21c73430c5`（設計時点のSHAであり、current mainではない。着手時にcurrent mainを確認する）
 正本: [ADR-0034](adr/0034-zip-application-updates.md)、[詳細仕様](application-update-implementation-spec.md)
+実装の進捗の追跡: [Issue #510](https://github.com/hide212131/hane/issues/510)
 
 要求・受入条件の正本: [Issue #508](https://github.com/hide212131/hane/issues/508)
+
+Issue #510は、WindowsとmacOSの実配布物で旧版から新版への更新と復旧を行い、U-01〜U-15の証拠がそろうまで完了扱いにしない。受入条件は縮小・弱化しない。
+
+## 0. 進捗の要約
+
+下表の状態はこの文書の更新時点（PR #518 head `b83abe9be752d189139feaec700ee1e2f96be46c`）で確認した事実である。実装時はGitHub上のcurrent factsを読み直す。
+
+- 最新の公開Release v0.26.0にはWindows/Mac ZIPのみがあり、更新catalog/signatureは含まれない。更新対応の本番公開とU5は未完了。
+- Windows/macOS実機での二版更新・復旧の証拠（U-11, U-13, U-14など）と、本番の署名鍵・Developer ID・notarization設定は未了。fixtureの成功を実OSの成功へ読み替えない。
 
 ## 1. 着手前の確認
 
@@ -22,6 +32,15 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 設計中に確認したopen PRの番号は履歴であり、着手時の状態を推測しない。sourceや責務が移動したらpathを更新し、旧・新双方へ同じ更新判定を追加しない。
 
 ## 2. 実装単位と変更予定
+
+| 段階 | 現在の状態（証拠） |
+|---|---|
+| U0 | merged。[PR #512](https://github.com/hide212131/hane/pull/512)（U0/U1/U3）に含まれてmerge済み。 |
+| U1 | merged。PR #512に含まれてmerge済み。Windows 11実機でのExplorer登録等の確認（U-11）は未了。 |
+| U2 | Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。baseは#518の古いhead `00bf87fd529398d9ee7305f74fdea899065f8260`のため、#518更新後の同期と再検証が必要。本番の署名設定は未完了。 |
+| U3 | merged。PR #512に含まれてmerge済み。実署名metadata未準備のため適用操作は有効化しない。 |
+| U4 | Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、head `b83abe9be752d189139feaec700ee1e2f96be46c`。exact verifier run 39294842985のworkspace tests/lintは成功、Codex Review #6273442408は重大な問題なし。Windows/macOS CI run 39295116467は`action_required`でジョブ未開始のため、成功扱いにしない。両OSのU-08〜14は未了。 |
+| U5 | 未完了。bootstrap出荷と二版更新の実行証拠は未取得。 |
 
 | 段階 | 変更予定のpath／内容 | 先行条件と完了条件 |
 |---|---|---|

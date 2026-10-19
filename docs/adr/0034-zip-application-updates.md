@@ -1,8 +1,8 @@
 # ADR-0034: ZIP配布を継続したアプリ本体の更新
 
 日付: 2026-10-17
-状態: Proposed（設計案。製品・配布経路とも未実装）
-調査基準: `e82b9a9fe42280bfa78497746bcd7e21c73430c5`
+状態: Accepted（PR #509で採用）。実装の進捗は[Issue #510](https://github.com/hide212131/hane/issues/510)に従う。WindowsとmacOSの実配布物での二版更新・復旧とU-01〜U-15の証拠がそろうまで、#510は完了扱いにしない。
+調査基準: `e82b9a9fe42280bfa78497746bcd7e21c73430c5`（設計時点のSHAであり、current mainではない）
 
 要求・受入条件の正本: [Issue #508](https://github.com/hide212131/hane/issues/508)
 
