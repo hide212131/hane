@@ -783,6 +783,22 @@ fn finish_scratch(
     (result, None)
 }
 
+/// Test seam: runs right after the verified file was moved aside.
+#[cfg(all(unix, test))]
+thread_local! {
+    static AFTER_DISPLACE: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn after_displace_hook(path: &Path) {
+    AFTER_DISPLACE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+}
+
 /// Unix: the verified file is moved aside with one atomic rename and the moved
 /// object is compared with the verified one; a different object is moved back
 /// untouched and the install fails. The new file is then hard-linked into the
@@ -803,20 +819,41 @@ fn place(
             aside_name.push(".aside");
             let aside = scratch.join(aside_name);
             pin.displace(path, &aside)?;
+            #[cfg(test)]
+            after_displace_hook(path);
             if let Err(err) = std::fs::hard_link(temp, path) {
                 return match PinnedFile::put_back(&aside, path) {
                     Ok(()) => Err(err.into()),
+                    // The old file stays at `aside` (it is neither deleted
+                    // nor cleaned up) and the file now at `path` is not
+                    // touched: recovery is required, at the exact location.
                     Err(back) => Err(UpdateError::new(
                         ErrorCode::Io,
                         format!(
-                            "{} could not be put back after a failed install: {back}",
-                            path.display()
+                            "recovery required: {} could not be put back after a failed install ({back}); \
+                             the previous file is preserved at {}",
+                            path.display(),
+                            aside.display()
                         ),
                     )),
                 };
             }
-            // The displaced file is ours; deleting it is cleanup.
-            let _ = std::fs::remove_file(&aside);
+            // The displaced file is ours; deleting it is cleanup. If it
+            // cannot be removed it is not silently left untracked.
+            match std::fs::remove_file(&aside) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(UpdateError::new(
+                        ErrorCode::Io,
+                        format!(
+                            "recovery required: the previous file of {} remains at {} ({err})",
+                            path.display(),
+                            aside.display()
+                        ),
+                    ));
+                }
+            }
             Ok(())
         }
         None => match std::fs::symlink_metadata(path) {
@@ -2435,6 +2472,46 @@ mod tests {
             .filter(|n| n.starts_with(".hane-update-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_a_destination_filled_by_a_third_party_keeps_the_old_file_recoverable() {
+        let dir = TempDir::new("apply-displaced-kept");
+        let root = dir.path().join("install");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.dll"), OLD_DLL).unwrap();
+        let pin = pin_existing_for_test(&root.join("a.dll"), OLD_DLL);
+
+        // After the old file is moved aside, a third party takes its name.
+        AFTER_DISPLACE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|path: &Path| {
+                fs::write(path, b"third party").unwrap();
+            }));
+        });
+        let result = install_write(&root.join("a.dll"), NEW_DLL, pin);
+        AFTER_DISPLACE.with(|slot| *slot.borrow_mut() = None);
+
+        let err = result.unwrap_err();
+        assert!(err.detail.contains("recovery required"), "{}", err.detail);
+        assert_eq!(fs::read(root.join("a.dll")).unwrap(), b"third party");
+
+        // The old file is preserved exactly where the message says.
+        let scratch: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".hane-update-"))
+            })
+            .collect();
+        assert_eq!(scratch.len(), 1, "{scratch:?}");
+        let aside = scratch[0].join("a.dll.aside");
+        assert_eq!(fs::read(&aside).unwrap(), OLD_DLL);
+        assert!(err.detail.contains(&aside.display().to_string()), "{}", err.detail);
+        // Only the file the updater created was cleaned up.
+        assert!(!scratch[0].join("a.dll").exists());
     }
 
     /// Runs the real replace path on whatever OS executes the tests; on Windows
