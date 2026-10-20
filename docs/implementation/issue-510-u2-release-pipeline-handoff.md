@@ -1,8 +1,8 @@
 # Issue #510 U2: 配布・署名パイプライン実装ハンドオフ
 
-状態: U2の配布基盤の実装案をこのPRの差分として含める。未検証であり、current headのCI結果が確認されるまで動作済みとは扱わない。署名・notarization・実release発行・protected Environmentの承認は行っておらず、保守者の資格情報設定後の実run、U-13/U-14の実OS確認、U5は未実施・未公開である。fixture/CIの結果を実OSの更新成功や署名の証明として扱わない。
+状態: U2の配布基盤の実装をこのPRの差分として含める。実装head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d` について、Windows/macOS CI run 39278984279とexact-result verifier run 39277532943が成功し、Codex Review #6271746760が同じheadで重大な問題なしと報告している。これらが証明するのはPRコードの自動検査とreviewまでである。本番署名・notarization・実release発行・protected Environmentの承認は行っておらず、保守者の資格情報設定後の実run、U-13/U-14の実OS更新確認、U5は未実施・未公開である。fixture/CIの結果を実OSの更新成功や署名の証明として扱わない。
 
-実装の所在（いずれもこのPRの差分内の変更で、CIとレビューでの確認前）:
+実装の所在（いずれもこのPRの差分内の変更で、上記のCI・verifier・Codex Reviewによるcurrent headの自動検査とreviewは完了。本番署名・実release・実OS更新は未確認）:
 
 - `scripts/release_catalog.py` — inventory/catalog生成、Ed25519署名（`cryptography==50.0.2`、`scripts/release-requirements.txt`）、全入口共通のverifier、公開済みcatalogからのsequence採番、tag/latest確認、Draft/公開assetの再取得。
 - `.github/workflows/windows-release.yml` — 署名設定のfail-closed確認、両OSのhelperビルドと実binaryのidentity検証、Windows inventory署名とAuthenticode `Valid` 確認、macOS Developer ID署名/notarize/staple/再展開検証、直列化された`release`ジョブ（plan → catalog生成/署名 → Draft → 再取得検証 → stable公開 → 公開後再検証）。
@@ -15,7 +15,7 @@
 - 対象Issue: [#510](https://github.com/hide212131/hane/issues/510)
 - 対象フェーズ: U2（ZIP配布物とstable release pipeline）
 - 先行実装PR: [#518](https://github.com/hide212131/hane/pull/518)
-- 実装開始時の基準head: `00bf87fd529398d9ee7305f74fdea899065f8260`
+- U2実装開始時の基準head（履歴情報であり、current mainやcurrent PR baseではない）: `00bf87fd529398d9ee7305f74fdea899065f8260`
 - 設計の正本: [ADR-0034](../adr/0034-zip-application-updates.md)、[実装仕様](../application-update-implementation-spec.md)、[実装引き継ぎ](../application-update-implementation-handoff.md)
 
 実装依頼後は対象PR headを再確認し、基準headと異なる場合はpushしない。保存済みの案はPRへの適用・承認とは別の判断であり、この文書は適用の事実を保証しない。
