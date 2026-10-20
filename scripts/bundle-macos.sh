@@ -218,8 +218,123 @@ if [[ ! -x "$bundle/Contents/Helpers/hane-updater" || ! -x "$bundle/Contents/Mac
   exit 1
 fi
 
-# The release workflow adds the Ed25519-signed inventory (hane-install.json) to
-# the finished bundle; this script never signs and must not run after it.
-# No Apple Developer ID, notarization or stapling is part of the release.
+# The linker leaves an ad-hoc signature on each binary. Copying them into a
+# bundle with an Info.plist and resources, without sealing the bundle, makes
+# `codesign --verify` fail ("code has no resources but signature indicates they
+# must be present") and macOS report the app as damaged. Seal the finished
+# bundle once, ad hoc, at build time. No Apple Developer ID, Team ID,
+# notarization or stapling is involved, and nothing re-signs on update.
+#
+# The release workflow afterwards adds the Ed25519-signed inventory
+# (hane-install.json and .sig under Contents/Resources) and takes the inventory
+# over the sealed files, including _CodeSignature/CodeResources. Those two
+# files are therefore omitted from the seal so adding them keeps the seal valid;
+# every other file stays sealed and listed in the inventory. This script must
+# not run after the inventory is added, and nothing may modify the bundle
+# after the inventory is generated.
+rules="$tmp/resource-rules.plist"
+cat > "$rules" <<'RULES'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>rules</key>
+  <dict>
+    <key>^Resources/</key>
+    <true/>
+    <key>^Resources/.*\.lproj/</key>
+    <dict>
+      <key>optional</key>
+      <true/>
+      <key>weight</key>
+      <real>1000</real>
+    </dict>
+    <key>^Resources/hane-install\.json(\.sig)?$</key>
+    <dict>
+      <key>omit</key>
+      <true/>
+      <key>weight</key>
+      <real>2000</real>
+    </dict>
+  </dict>
+  <key>rules2</key>
+  <dict>
+    <key>^.*</key>
+    <true/>
+    <key>^(Frameworks|SharedFrameworks|PlugIns|Plug-ins|XPCServices|Helpers|MacOS)/</key>
+    <dict>
+      <key>nested</key>
+      <true/>
+      <key>weight</key>
+      <real>10</real>
+    </dict>
+    <key>^.*\.dSYM($|/)</key>
+    <dict>
+      <key>weight</key>
+      <real>11</real>
+    </dict>
+    <key>^(.*/)?\.DS_Store$</key>
+    <dict>
+      <key>omit</key>
+      <true/>
+      <key>weight</key>
+      <real>2000</real>
+    </dict>
+    <key>^Info\.plist$</key>
+    <dict>
+      <key>omit</key>
+      <true/>
+      <key>weight</key>
+      <real>20</real>
+    </dict>
+    <key>^PkgInfo$</key>
+    <dict>
+      <key>omit</key>
+      <true/>
+      <key>weight</key>
+      <real>20</real>
+    </dict>
+    <key>^Resources/</key>
+    <dict>
+      <key>weight</key>
+      <real>20</real>
+    </dict>
+    <key>^Resources/.*\.lproj/</key>
+    <dict>
+      <key>optional</key>
+      <true/>
+      <key>weight</key>
+      <real>1000</real>
+    </dict>
+    <key>^Resources/hane-install\.json(\.sig)?$</key>
+    <dict>
+      <key>omit</key>
+      <true/>
+      <key>weight</key>
+      <real>2000</real>
+    </dict>
+  </dict>
+</dict>
+</plist>
+RULES
+/usr/bin/plutil -lint "$rules" >/dev/null
+
+/usr/bin/codesign --force --sign - "$bundle/Contents/Helpers/hane-updater"
+/usr/bin/codesign --force --sign - --resource-rules "$rules" "$bundle"
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$bundle"
+
+# The same check must still pass after the workflow adds the inventory files.
+# Probe on a copy with placeholders of the two names; the bundle stays as built.
+probe="$tmp/probe/Hane.app"
+mkdir -p "$tmp/probe"
+/usr/bin/ditto "$bundle" "$probe"
+printf '{}' > "$probe/Contents/Resources/hane-install.json"
+printf 'sig' > "$probe/Contents/Resources/hane-install.json.sig"
+if ! /usr/bin/codesign --verify --deep --strict "$probe"; then
+  echo "Adding the signed inventory files must not invalidate the bundle signature" >&2
+  exit 1
+fi
+rm -rf "$tmp/probe"
+
 touch "$bundle"
 echo "Built: $bundle"
