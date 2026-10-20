@@ -91,14 +91,9 @@ const MAIN_EXE: &str = "Contents/MacOS/hane";
 /// The updater helper inside the bundle, relative to `Hane.app`.
 pub const HELPER_REL: &str = "Contents/Helpers/hane-updater";
 /// The files a complete bundle must contain. The identity itself covers every
-/// entry under `Hane.app`; `CodeResources` is only a static manifest and does not
-/// vouch for the bytes actually on disk.
-const IDENTITY_FILES: [&str; 4] = [
-    "Contents/Info.plist",
-    MAIN_EXE,
-    HELPER_REL,
-    "Contents/_CodeSignature/CodeResources",
-];
+/// entry under `Hane.app`, including `Contents/_CodeSignature/CodeResources`
+/// when present; it is not required because bundles carry no Apple signature.
+const IDENTITY_FILES: [&str; 3] = ["Contents/Info.plist", MAIN_EXE, HELPER_REL];
 
 // ------------------------------------------------------------- the OS seam
 
@@ -982,6 +977,33 @@ mod inventory_tests {
         write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
         let signed = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap();
         assert!(signed.inventory().files.iter().any(|file| file.path == HELPER_REL));
+    }
+
+    #[test]
+    fn code_resources_is_inventoried_when_present_and_optional_otherwise() {
+        let dir = TempDir::new("macos-inventory-seal");
+        let mut files = payload();
+        files.push(("Contents/_CodeSignature/CodeResources", b"seal".to_vec()));
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap();
+        // Present on disk but unlisted, or changed, is refused.
+        let seal = bundle(&dir).join("Contents/_CodeSignature/CodeResources");
+        fs::write(&seal, b"tampered").unwrap();
+        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+
+        let other = TempDir::new("macos-inventory-seal-unlisted");
+        write_signed_bundle(&bundle(&other), &payload(), &payload(), 1, TEST_SOURCE_SHA);
+        let seal = bundle(&other).join("Contents/_CodeSignature/CodeResources");
+        fs::create_dir_all(seal.parent().unwrap()).unwrap();
+        fs::write(&seal, b"seal").unwrap();
+        let err = verify_bundle_inventory(&bundle(&other), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+
+        // Without it, identity is still computed.
+        let bare = TempDir::new("macos-inventory-seal-absent");
+        write_signed_bundle(&bundle(&bare), &payload(), &payload(), 1, TEST_SOURCE_SHA);
+        assert!(matches!(bundle_identity(&bundle(&bare)).unwrap(), Observed::File(_)));
     }
 
     #[test]
@@ -1997,8 +2019,17 @@ mod tests {
             assert_ne!(bundle_identity(&bundle).unwrap(), base, "{rel}");
             fs::write(&path, original).unwrap();
         }
+        // CodeResources is covered when present but is not required.
+        let seal = bundle.join("Contents/_CodeSignature/CodeResources");
+        let original = fs::read(&seal).unwrap();
+        fs::write(&seal, b"changed").unwrap();
+        assert_ne!(bundle_identity(&bundle).unwrap(), base);
+        fs::write(&seal, original).unwrap();
+        fs::remove_file(&seal).unwrap();
+        assert!(matches!(bundle_identity(&bundle).unwrap(), Observed::File(_)));
+        assert_ne!(bundle_identity(&bundle).unwrap(), base);
         // An incomplete bundle is an error, not an identity.
-        fs::remove_file(bundle.join("Contents/_CodeSignature/CodeResources")).unwrap();
+        fs::remove_file(bundle.join(HELPER_REL)).unwrap();
         assert!(bundle_identity(&bundle).is_err());
     }
 
