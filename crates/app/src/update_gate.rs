@@ -559,7 +559,42 @@ pub fn enter() -> Entry {
         let err = reexec_current_image(&exe);
         return stop_after_failed_reexec(&err, present_notice);
     }
+    if needs_windows_restart(observed_update.get(), &outcome, cfg!(target_os = "windows")) {
+        // This image waited out an update, so it may be the pre-update version.
+        // The executable on disk is not proven trustworthy here, so it is not
+        // restarted: release the lease and ask the user to start Hane again.
+        drop(outcome);
+        return stop_for_stale_windows_image(present_notice);
+    }
     stop_for_refusal(outcome, || recovery_backup_for_exe(&exe), present_notice)
+}
+
+/// Whether a Windows launch that observed `UpdateInProgress` and was then
+/// admitted must stop instead of editing with its possibly pre-update image.
+/// Terminal stops are returned unchanged.
+fn needs_windows_restart(observed_update: bool, outcome: &GateOutcome, is_windows: bool) -> bool {
+    is_windows
+        && observed_update
+        && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
+}
+
+/// The notice for a Windows launch that outlived an update. It does not claim
+/// the update completed, and asks the user to start Hane again.
+fn windows_restart_notice() -> StopNotice {
+    StopNotice {
+        title: "Haneの再起動が必要です".to_string(),
+        message: "更新中のため、起動操作や文書を開く操作を処理しませんでした。\
+                  文書・設定・AIのデータには変更を加えていません。\n\n\
+                  更新が終わったことを確認できたら、Haneを終了した状態で、もう一度Haneを起動し、\
+                  開きたい文書があれば開き直してください。"
+            .to_string(),
+    }
+}
+
+/// Stops a Windows launch that must not continue with its old image.
+fn stop_for_stale_windows_image(present: impl FnOnce(&StopNotice)) -> Entry {
+    present(&windows_restart_notice());
+    Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
 }
 
 #[cfg(test)]
@@ -681,6 +716,30 @@ mod tests {
         let disk_differs = !reader_contains(&new_image[..], image_marker()).unwrap();
         assert!(disk_differs);
         assert!(needs_fresh_image(observed.get() || disk_differs, &outcome, true));
+    }
+
+    #[test]
+    fn a_windows_launch_that_waited_for_an_update_stops_with_a_restart_notice() {
+        let unmanaged = GateOutcome::Unmanaged;
+        assert!(needs_windows_restart(true, &unmanaged, true));
+        // No observed wait, a non-Windows launch and terminal stops are unchanged.
+        assert!(!needs_windows_restart(false, &unmanaged, true));
+        assert!(!needs_windows_restart(true, &unmanaged, false));
+        let recovery = GateOutcome::RecoveryRequired("x".into());
+        assert!(!needs_windows_restart(true, &recovery, true));
+        assert!(!needs_windows_restart(true, &GateOutcome::UpdateInProgress, true));
+        // macOS keeps its own signed re-exec path.
+        assert!(!needs_windows_restart(true, &unmanaged, false) || !cfg!(target_os = "macos"));
+
+        let mut shown = Vec::new();
+        let entry = stop_for_stale_windows_image(|n| shown.push(n.message.clone()));
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown.len(), 1);
+        let message = &shown[0];
+        assert!(message.contains("更新中のため"));
+        assert!(message.contains("もう一度Haneを起動"));
+        assert!(message.contains("開く操作"));
+        assert!(!message.contains("更新は完了しています"));
     }
 
     #[test]
