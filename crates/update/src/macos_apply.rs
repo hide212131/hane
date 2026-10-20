@@ -1350,7 +1350,12 @@ mod inventory_tests {
             match damage {
                 0 => fs::write(bundle(&dir).join(HELPER_REL), b"tampered").unwrap(),
                 1 => fs::write(bundle(&dir).join(SEAL), b"tampered").unwrap(),
-                2 => fs::write(bundle(&dir).join("Contents/Resources/extra.sh"), b"#!").unwrap(),
+                2 => {
+                    // The sidecar layout keeps no inventory in the app, so
+                    // the directory for the extra file may not exist yet.
+                    fs::create_dir_all(bundle(&dir).join("Contents/Resources")).unwrap();
+                    fs::write(bundle(&dir).join("Contents/Resources/extra.sh"), b"#!").unwrap();
+                }
                 3 => fs::remove_file(bundle(&dir).join(MAIN_EXE)).unwrap(),
                 _ => {
                     fs::create_dir_all(bundle(&dir).join("Contents/Resources")).unwrap();

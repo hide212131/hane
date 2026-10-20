@@ -21,6 +21,8 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 - macOS Apple Silicon — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-macos-arm64.zip` をダウンロードし、展開して `Hane.app` を開きます。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-macos-arm64.zip)することもできます。
 - Windows 11 x64 — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` をダウンロードし、展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-windows-x64.zip)することもできます。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
 
+macOS 版の ZIP を初めて置くときは、展開後の `Hane.app` と、その隣にある `Hane.app.update` を必ず一緒に、書き込み可能なローカルの場所（例: `/Applications`）へ移してから起動してください。`Hane.app.update` にはアプリ内更新が本体を検証するための更新用データが入っているため、`Hane.app` だけを移さないでください。ダウンロード場所から直接起動して App Translocation される配置では、アプリ内更新の対象外になります。
+
 macOS 版は Apple Developer ID の署名も notarization も付けていません。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
 
 「開発元を検証できない」などの警告で止まった場合は、`Hane.app` を一度開いて警告を閉じたあと、「システム設定」→「プライバシーとセキュリティ」の「セキュリティ」欄に表示される「このまま開く」を選び、確認画面で本人が許可してください。この許可はアプリごとに初回だけ必要です。「壊れているため開けません」と表示される場合は、この手順では解決しません。許可操作で進めず、ダウンロードし直すか、[Issue #510](https://github.com/hide212131/hane/issues/510) で報告してください。
