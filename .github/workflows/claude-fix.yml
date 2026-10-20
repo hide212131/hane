@@ -20,14 +20,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
       pull-requests: read
       issues: read
     outputs:
       target_sha: ${{ steps.preflight.outputs.target_sha }}
       head_ref: ${{ steps.preflight.outputs.head_ref }}
+      base_ref: ${{ steps.preflight.outputs.base_ref }}
+      actor_login: ${{ steps.preflight.outputs.actor_login }}
+      actor_permission: ${{ steps.preflight.outputs.actor_permission }}
+      root_cause: ${{ steps.preflight.outputs.root_cause }}
+      finalizer_environment: ${{ steps.preflight.outputs.finalizer_environment }}
       checkpoint_run_id: ${{ steps.preflight.outputs.checkpoint_run_id }}
       checkpoint_run_attempt: ${{ steps.preflight.outputs.checkpoint_run_attempt }}
+      patch_source: ${{ steps.preflight.outputs.patch_source }}
+      patch_source_run_id: ${{ steps.preflight.outputs.patch_source_run_id }}
+      patch_source_run_attempt: ${{ steps.preflight.outputs.patch_source_run_attempt }}
+      patch_source_artifact_id: ${{ steps.preflight.outputs.patch_source_artifact_id }}
+      u2_release_scope: ${{ steps.preflight.outputs.u2_release_scope }}
 
     steps:
       - name: Check out trusted request contract
@@ -81,6 +92,15 @@ jobs:
 
           checkpoint_run_id=''
           checkpoint_run_attempt=''
+          patch_source=''
+          printf '%s\n' "$COMMENT_BODY" > "$RUNNER_TEMP/commander-handoff.txt"
+          python3 trusted-control/.github/scripts/aadw_patch_resume.py parse-handoff \
+            "$RUNNER_TEMP/commander-handoff.txt" > "$RUNNER_TEMP/patch-source-request.json"
+          if jq -e 'has("run_id")' "$RUNNER_TEMP/patch-source-request.json" >/dev/null; then
+            patch_source_request="$RUNNER_TEMP/patch-source-request.json"
+          else
+            patch_source_request=''
+          fi
           if grep -qE '^AADW_CHECKPOINT_RUN_(ID|ATTEMPT):' <<< "$COMMENT_BODY"; then
             mapfile -t checkpoint_run_ids < <(
               printf '%s\n' "$COMMENT_BODY" \
@@ -102,6 +122,7 @@ jobs:
           state="$(jq -r '.state' <<< "$pr_json")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
           head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
           current_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
 
           if [[ "$state" != 'open' ]]; then
@@ -116,6 +137,10 @@ jobs:
             echo '::error::Could not resolve Pull Request head ref.'
             exit 1
           fi
+          if [[ -z "$base_ref" ]]; then
+            echo '::error::Could not resolve Pull Request base ref.'
+            exit 1
+          fi
           if [[ "$current_sha" != "$expected_sha" ]]; then
             echo "::error::Target head moved. expected=${expected_sha} current=${current_sha}. Create a new Commander handoff from current facts."
             exit 1
@@ -125,11 +150,59 @@ jobs:
           gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$RUNNER_TEMP/comments.json"
           python3 trusted-control/.github/scripts/aadw_action_contract.py request "$RUNNER_TEMP/pr.json" "$RUNNER_TEMP/comments.json" "$RUNNER_TEMP/request.json"
           jq -e '.action == "implement"' "$RUNNER_TEMP/request.json" >/dev/null
+          request_root_cause="$(jq -r '.root_cause' "$RUNNER_TEMP/request.json")"
+
+          u2_release_scope=false
+          finalizer_environment='hane-aadw-standard'
+          if [[ "$PR_NUMBER" == '526' && "$head_ref" == 'work/issue-510-u2-release-pipeline' && "$base_ref" == 'work/issue-510-u4-apply-recovery' && "$ACTOR" == 'hide212131' && "$permission" == 'admin' ]]; then
+            # The trusted-workflow permission is scoped to one dedicated PR,
+            # actor, branch pair, and file allowlist. Root-cause labels and
+            # source SHAs remain evidence, never authorization substitutes.
+            u2_release_scope=true
+            finalizer_environment='hane-aadw-trusted-workflow-write'
+          fi
+
+          if [[ -n "$patch_source_request" ]]; then
+            source_run_id="$(jq -r '.run_id' "$patch_source_request")"
+            source_run_attempt="$(jq -r '.run_attempt' "$patch_source_request")"
+            source_comment_id="$(jq -r '.source_comment_id' "$patch_source_request")"
+            attestation_comment_id="$(jq -r '.attestation_comment_id' "$patch_source_request")"
+            gh api "repos/${REPOSITORY}/actions/runs/${source_run_id}" > "$RUNNER_TEMP/patch-source-run.json"
+            gh api "repos/${REPOSITORY}/actions/runs/${source_run_id}/attempts/${source_run_attempt}/jobs?per_page=100" > "$RUNNER_TEMP/patch-source-jobs.json"
+            gh api "repos/${REPOSITORY}/actions/runs/${source_run_id}/artifacts?per_page=100" > "$RUNNER_TEMP/patch-source-artifacts.json"
+            gh api "repos/${REPOSITORY}/issues/comments/${source_comment_id}" > "$RUNNER_TEMP/patch-source-comment.json"
+            gh api "repos/${REPOSITORY}/issues/comments/${attestation_comment_id}" > "$RUNNER_TEMP/patch-source-attestation.json"
+            patch_source="$(python3 trusted-control/.github/scripts/aadw_patch_resume.py verify-source \
+              --request "$patch_source_request" \
+              --run "$RUNNER_TEMP/patch-source-run.json" \
+              --jobs "$RUNNER_TEMP/patch-source-jobs.json" \
+              --artifacts "$RUNNER_TEMP/patch-source-artifacts.json" \
+              --source-comment "$RUNNER_TEMP/patch-source-comment.json" \
+              --attestation-comment "$RUNNER_TEMP/patch-source-attestation.json" \
+              --repository "$REPOSITORY" --pr-number "$PR_NUMBER" \
+              --target-sha "$expected_sha" --actor "$ACTOR")"
+          fi
 
           echo "target_sha=$expected_sha" >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "actor_login=$ACTOR" >> "$GITHUB_OUTPUT"
+          echo "actor_permission=$permission" >> "$GITHUB_OUTPUT"
+          echo "root_cause=$request_root_cause" >> "$GITHUB_OUTPUT"
+          echo "finalizer_environment=$finalizer_environment" >> "$GITHUB_OUTPUT"
           echo "checkpoint_run_id=$checkpoint_run_id" >> "$GITHUB_OUTPUT"
           echo "checkpoint_run_attempt=$checkpoint_run_attempt" >> "$GITHUB_OUTPUT"
+          echo "patch_source=$patch_source" >> "$GITHUB_OUTPUT"
+          if [[ -n "$patch_source" ]]; then
+            echo "patch_source_run_id=$(jq -r '.run_id' <<< "$patch_source")" >> "$GITHUB_OUTPUT"
+            echo "patch_source_run_attempt=$(jq -r '.run_attempt' <<< "$patch_source")" >> "$GITHUB_OUTPUT"
+            echo "patch_source_artifact_id=$(jq -r '.artifact_id' <<< "$patch_source")" >> "$GITHUB_OUTPUT"
+          else
+            echo 'patch_source_run_id=' >> "$GITHUB_OUTPUT"
+            echo 'patch_source_run_attempt=' >> "$GITHUB_OUTPUT"
+            echo 'patch_source_artifact_id=' >> "$GITHUB_OUTPUT"
+          fi
+          echo "u2_release_scope=$u2_release_scope" >> "$GITHUB_OUTPUT"
 
   worker:
     needs: prepare
@@ -243,6 +316,55 @@ jobs:
           echo 'restored=true' >> "$GITHUB_OUTPUT"
           echo "Restored worker checkpoint from run ${CHECKPOINT_RUN_ID} attempt ${CHECKPOINT_RUN_ATTEMPT} for exact head ${EXPECTED_SHA}."
 
+      - name: Download requested completed worker patch
+        if: ${{ needs.prepare.outputs.patch_source_run_id != '' }}
+        uses: actions/download-artifact@v5
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.patch_source_artifact_id }}
+          path: continuation
+          run-id: ${{ needs.prepare.outputs.patch_source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Restore completed worker patch as untrusted work in progress
+        id: resume_patch
+        if: ${{ needs.prepare.outputs.patch_source_run_id != '' }}
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          PATCH_SOURCE_JSON: ${{ needs.prepare.outputs.patch_source }}
+          U2_RELEASE_SCOPE: ${{ needs.prepare.outputs.u2_release_scope }}
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/continuation/aadw-worker.patch"
+          manifest="$GITHUB_WORKSPACE/continuation/aadw-worker-manifest.json"
+          printf '%s\n' "$PATCH_SOURCE_JSON" > "$RUNNER_TEMP/patch-source-verified.json"
+          python3 .github/scripts/aadw_patch_resume.py verify-bundle \
+            --patch "$patch" --manifest "$manifest" --source "$RUNNER_TEMP/patch-source-verified.json"
+
+          if ! git -C pr-head apply --check --whitespace=nowarn "$patch"; then
+            echo '::error::Completed source patch does not apply cleanly to this exact PR head.'
+            exit 1
+          fi
+          git -C pr-head apply --index --whitespace=nowarn "$patch"
+          if [[ "$U2_RELEASE_SCOPE" == 'true' ]]; then
+            git -C pr-head diff --cached --no-renames --name-only -z \
+              | python3 .github/scripts/aadw_patch_resume.py u2-paths
+          else
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.agents/skills/hane-issue-workflow/*|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
+                  echo "::error::Completed source patch attempted to restore trusted authority or workflow path: $path"
+                  exit 1
+                  ;;
+              esac
+            done < <(git -C pr-head diff --cached --no-renames --name-only -z)
+          fi
+          git -C pr-head reset --quiet
+          echo 'restored=true' >> "$GITHUB_OUTPUT"
+          echo "Restored a provenance-checked patch as untrusted work in progress for exact head $EXPECTED_SHA."
+
       - name: Remove target checkout Git metadata from worker reach
         shell: bash
         run: rm -rf pr-head/.git
@@ -287,7 +409,8 @@ jobs:
             The target is Pull Request #${{ github.event.issue.number }} at exact starting head ${{ needs.prepare.outputs.target_sha }}.
 
             Checkpoint restore status: ${{ steps.restore.outputs.restored || 'false' }}.
-            If the status is true, pr-head/ already contains incomplete edits recovered from a prior failed Claude run for this exact PR head. Treat those edits as untrusted work in progress: preserve useful parts, verify them against the requested root-cause fix and current code, correct them where needed, and continue. Do not assume the checkpoint is complete or correct.
+            Successful-patch continuation status: ${{ steps.resume_patch.outputs.restored || 'false' }}.
+            If either status is true, pr-head/ contains untrusted edits restored from a provenance-checked source for this exact PR head. Treat those edits as untrusted work in progress: preserve useful parts, verify every changed file against the current request and code, correct them where needed, and continue. Do not assume a restored patch is complete or correct.
 
             The trusted workflow has already revalidated that exact target head immediately before this invocation. Shell execution is intentionally unavailable in this worker. Do not attempt Bash, shell commands, git, gh, tests, builds, CI, or any other command execution. Use only the permitted Read/Edit/Write/Glob/Grep tools to inspect the target tree, implement the focused source/test-file change, and stop. The isolated verification job runs tests and lint after the trusted push; review and GUI remain separate Commander actions.
 
@@ -344,14 +467,60 @@ jobs:
             --no-textconv \
             HEAD -- > "$GITHUB_WORKSPACE/aadw-worker.patch"
 
+      - name: Build trusted worker patch manifest
+        if: ${{ steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success' }}
+        shell: bash
+        env:
+          PATCH_FILE: aadw-worker.patch
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ROOT_CAUSE: ${{ needs.prepare.outputs.root_cause }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          python3 trusted-model-verifier/.github/scripts/aadw_patch_resume.py create-manifest \
+            --patch "$PATCH_FILE" --output aadw-worker-manifest.json \
+            --repository "$REPOSITORY" --pr-number "$PR_NUMBER" \
+            --target-sha "$TARGET_SHA" --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" --comment-id "$COMMENT_ID" \
+            --root-cause "$ROOT_CAUSE" --workflow-sha "$WORKFLOW_SHA" --actor "$ACTOR"
+
       - name: Upload completed worker patch
         if: ${{ steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: aadw-worker-patch-${{ github.run_id }}
-          path: aadw-worker.patch
+          path: |
+            aadw-worker.patch
+            aadw-worker-manifest.json
           if-no-files-found: error
           retention-days: 1
+
+      - name: Summarize required review for workflow changes
+        if: ${{ needs.prepare.outputs.finalizer_environment == 'hane-aadw-trusted-workflow-write' && steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success' }}
+        shell: bash
+        env:
+          PATCH_FILE: aadw-worker.patch
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          patch_sha256="$(sha256sum "$PATCH_FILE" | cut -d' ' -f1)"
+          {
+            echo '## 配布workflow変更の確認が必要です'
+            echo
+            echo "確認対象artifact: \`aadw-worker-patch-${RUN_ID}\`"
+            echo 'artifactをダウンロードし、workflowのtrigger、権限、secret参照を含む差分全体を確認してください。'
+            echo '確認後、次の行をPRのConversationへ投稿し、その後にprotected Environmentのjobを承認してください。'
+            echo
+            echo "\`AADW_WORKFLOW_PATCH_APPROVED: run_id=${RUN_ID} sha256=${patch_sha256}\`"
+            echo
+            echo '承認前にartifactを確認してください。markerがない、run IDまたはhashが一致しない場合はfinalizerが停止します。'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check out trusted diagnostic source after Claude failure
         if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
@@ -476,6 +645,9 @@ jobs:
       contents: write
       pull-requests: read
       issues: read
+    environment:
+      name: ${{ needs.prepare.outputs.finalizer_environment }}
+      deployment: false
     outputs:
       final_sha: ${{ steps.push.outputs.final_sha }}
     steps:
@@ -484,6 +656,14 @@ jobs:
         with:
           name: aadw-worker-patch-${{ github.run_id }}
           path: handoff
+
+      - name: Check out trusted mutation scope policy
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-control
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Check out exact expected head for trusted finalization
         uses: actions/checkout@v6
@@ -497,6 +677,15 @@ jobs:
         shell: bash
         env:
           EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
+          EXPECTED_HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+          EXPECTED_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          ACTOR_LOGIN: ${{ needs.prepare.outputs.actor_login }}
+          ACTOR_PERMISSION: ${{ needs.prepare.outputs.actor_permission }}
+          U2_RELEASE_SCOPE: ${{ needs.prepare.outputs.u2_release_scope }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
 
@@ -513,10 +702,44 @@ jobs:
 
           git -C final-head apply --index --whitespace=nowarn "$patch_file"
 
+          u2_release_scope="$U2_RELEASE_SCOPE"
+          if [[ "$u2_release_scope" == 'true' ]]; then
+            if [[ "$PR_NUMBER" != '526' || "$EXPECTED_HEAD_REF" != 'work/issue-510-u2-release-pipeline' || "$EXPECTED_BASE_REF" != 'work/issue-510-u4-apply-recovery' || "$ACTOR_LOGIN" != 'hide212131' || "$ACTOR_PERMISSION" != 'admin' ]]; then
+              echo '::error::Issue #510 U2 trusted scope no longer matches its dedicated PR, branch pair, and owner.'
+              exit 1
+            fi
+            git -C final-head diff --cached --no-renames --name-only -z \
+              | python3 trusted-control/.github/scripts/aadw_patch_resume.py u2-paths
+          fi
+
           changed=false
           while IFS= read -r -d '' path; do
             changed=true
             case "$path" in
+              .github/RELEASE_AUTOMATION.md|.github/workflows/release-request.yml|.github/workflows/windows-release.yml)
+                # One-time, owner-only exception for the dedicated Issue #510 U2 release PR.
+                # All other .github paths, including this trusted workflow and its scripts, stay blocked.
+                if [[ "$u2_release_scope" != 'true' ]]; then
+                  echo "::error::Protected release path is only allowed for the owner on the dedicated Issue #510 U2 PR: $path"
+                  exit 1
+                fi
+                ;;
+              .github/workflows/ci.yml)
+                if [[ "$u2_release_scope" != 'true' ]]; then
+                  echo "::error::CI workflow changes are only allowed for the owner on the dedicated Issue #510 U2 PR: $path"
+                  exit 1
+                fi
+                if ! git -C final-head diff --cached --no-renames --unified=0 -- .github/workflows/ci.yml \
+                  | python3 trusted-control/.github/scripts/aadw_patch_resume.py u2-ci-diff; then
+                  echo '::error::CI workflow changes must contain only the reviewed release fixture test setup and invocations.'
+                  exit 1
+                fi
+                if ! git -C final-head show :.github/workflows/ci.yml \
+                  | python3 trusted-control/.github/scripts/aadw_patch_resume.py u2-ci-workflow; then
+                  echo '::error::Release fixture tests must remain in the read-only rust_ci_changes job.'
+                  exit 1
+                fi
+                ;;
               .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.agents/skills/hane-issue-workflow/*|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
                 echo "::error::Claude worker attempted to modify trusted authority or workflow path: $path"
                 exit 1
@@ -527,6 +750,31 @@ jobs:
           if [[ "$changed" != 'true' ]]; then
             echo '::error::Worker patch has no staged repository change.'
             exit 1
+          fi
+
+          workflow_file_changed=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              .github/workflows/*) workflow_file_changed=true ;;
+            esac
+          done < <(git -C final-head diff --cached --no-renames --name-only -z)
+
+          if [[ "$workflow_file_changed" == 'true' ]]; then
+            if [[ "$u2_release_scope" != 'true' ]]; then
+              echo '::error::Workflow changes require the dedicated Issue #510 U2 exception.'
+              exit 1
+            fi
+
+            patch_sha256="$(sha256sum "$patch_file" | cut -d' ' -f1)"
+            approval_marker="AADW_WORKFLOW_PATCH_APPROVED: run_id=${RUN_ID} sha256=${patch_sha256}"
+            comments_file="$RUNNER_TEMP/aadw-pr-comments.json"
+            gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > "$comments_file"
+            if ! jq -e --arg actor "$ACTOR_LOGIN" --arg marker "$approval_marker" \
+              'any(.[][]?; .user.login == $actor and ((.body // "") | split("\n") | any(. == $marker)))' \
+              "$comments_file" >/dev/null; then
+              echo '::error::Workflow changes require an owner comment approving this exact worker patch hash before Environment approval.'
+              exit 1
+            fi
           fi
 
           git -C final-head config user.name 'claude[bot]'
@@ -547,6 +795,8 @@ jobs:
           PR_NUMBER: ${{ github.event.issue.number }}
           EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
           EXPECTED_HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+          EXPECTED_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          AADW_WORKFLOW_PUSH_TOKEN: ${{ secrets.AADW_WORKFLOW_PUSH_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -554,11 +804,12 @@ jobs:
           state="$(jq -r '.state' <<< "$pr_json")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
           head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
           current_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
           jq -e '((.body // "") | contains("<!-- AADW_PAUSED -->") | not) and ([.labels[]?.name] | index("aadw:paused") | not)' <<< "$pr_json" >/dev/null
 
-          if [[ "$state" != 'open' || "$head_repo" != "$REPOSITORY" || "$head_ref" != "$EXPECTED_HEAD_REF" || "$current_sha" != "$EXPECTED_SHA" ]]; then
-            echo "::error::Target Pull Request changed before final push. expected_ref=${EXPECTED_HEAD_REF} expected_sha=${EXPECTED_SHA} current_state=${state} current_repo=${head_repo:-unknown} current_ref=${head_ref:-unknown} current_sha=${current_sha:-unknown}."
+          if [[ "$state" != 'open' || "$head_repo" != "$REPOSITORY" || "$head_ref" != "$EXPECTED_HEAD_REF" || "$base_ref" != "$EXPECTED_BASE_REF" || "$current_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Target Pull Request changed before final push. expected_ref=${EXPECTED_HEAD_REF} expected_base=${EXPECTED_BASE_REF} expected_sha=${EXPECTED_SHA} current_state=${state} current_repo=${head_repo:-unknown} current_ref=${head_ref:-unknown} current_base=${base_ref:-unknown} current_sha=${current_sha:-unknown}."
             exit 1
           fi
 
@@ -567,9 +818,25 @@ jobs:
             exit 1
           fi
 
+          push_token="$GH_TOKEN"
+          workflow_file_changed=false
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/*) workflow_file_changed=true ;;
+            esac
+          done < <(git -C final-head diff-tree --no-renames --no-commit-id --name-only -r HEAD)
+
+          if [[ "$workflow_file_changed" == 'true' ]]; then
+            if [[ -z "${AADW_WORKFLOW_PUSH_TOKEN:-}" ]]; then
+              echo '::error::Workflow changes require AADW_WORKFLOW_PUSH_TOKEN in the protected hane-aadw-trusted-workflow-write environment.'
+              exit 1
+            fi
+            push_token="$AADW_WORKFLOW_PUSH_TOKEN"
+          fi
+
           git -C final-head remote set-url origin "https://github.com/${REPOSITORY}.git"
-          gh auth setup-git
-          git -C final-head -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${EXPECTED_HEAD_REF}"
+          GH_TOKEN="$push_token" gh auth setup-git
+          GH_TOKEN="$push_token" git -C final-head -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${EXPECTED_HEAD_REF}"
           echo "final_sha=$(git -C final-head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   verify:

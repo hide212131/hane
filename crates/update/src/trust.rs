@@ -18,18 +18,17 @@ pub struct TrustedKey {
     pub public_key: [u8; 32],
 }
 
-/// Embedded trust material: Ed25519 public keys and the pinned macOS Team ID.
+/// Embedded trust material: the Ed25519 update public keys. Both targets use
+/// them; no Apple identity (Developer ID, Team ID, notarization) is part of it.
 ///
-/// [`TrustPolicy::production`] contains only what the maintainer supplied to the
-/// release build through `HANE_UPDATE_KEY_ID`, `HANE_UPDATE_PUBLIC_KEY_BASE64`
-/// (raw 32-byte Ed25519 key) and `HANE_MACOS_TEAM_ID`. A build without them, or
-/// with a malformed value, embeds nothing: every verification then fails with
-/// `trust_unconfigured`, so no candidate can be made applicable. The unknown key
-/// IDs in a fetched signature file are never auto-registered.
+/// [`TrustPolicy::production`] embeds only the key supplied to the release
+/// build through `HANE_UPDATE_KEY_ID` and `HANE_UPDATE_PUBLIC_KEY_BASE64`
+/// (raw 32-byte Ed25519 key). A build without both values, or with malformed
+/// values, embeds no key; verification then fails closed with `trust_unconfigured`.
+/// The unknown key IDs in a fetched signature file are never auto-registered.
 #[derive(Debug, Clone, Default)]
 pub struct TrustPolicy {
     keys: Vec<TrustedKey>,
-    macos_team_id: Option<String>,
 }
 
 impl TrustPolicy {
@@ -37,24 +36,19 @@ impl TrustPolicy {
         Self::from_embedded(
             option_env!("HANE_UPDATE_KEY_ID"),
             option_env!("HANE_UPDATE_PUBLIC_KEY_BASE64"),
-            option_env!("HANE_MACOS_TEAM_ID"),
         )
     }
 
-    /// Fail-closed construction from build-time values: anything missing or
-    /// malformed yields no key (or no Team ID) instead of a guessed default.
-    pub fn from_embedded(
-        key_id: Option<&str>,
-        public_key_base64: Option<&str>,
-        macos_team_id: Option<&str>,
-    ) -> Self {
+    /// Fail-closed construction from build-time values: missing or malformed
+    /// values yield no key instead of a guessed default.
+    pub fn from_embedded(key_id: Option<&str>, public_key_base64: Option<&str>) -> Self {
         let key = match (key_id, public_key_base64) {
             (Some(id), Some(encoded))
                 if !id.is_empty()
                     && id.len() <= 64
-                    && id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') =>
+                    && id.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+                    }) =>
             {
                 STANDARD
                     .decode(encoded.trim())
@@ -67,28 +61,17 @@ impl TrustPolicy {
             }
             _ => None,
         };
-        let team = macos_team_id
-            .filter(|t| t.len() == 10 && t.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
-            .map(str::to_string);
         Self {
             keys: key.into_iter().collect(),
-            macos_team_id: team,
         }
     }
 
-    pub fn new(keys: Vec<TrustedKey>, macos_team_id: Option<String>) -> Self {
-        Self {
-            keys,
-            macos_team_id,
-        }
+    pub fn new(keys: Vec<TrustedKey>) -> Self {
+        Self { keys }
     }
 
     pub fn is_configured(&self) -> bool {
         !self.keys.is_empty()
-    }
-
-    pub fn macos_team_id(&self) -> Option<&str> {
-        self.macos_team_id.as_deref()
     }
 
     fn key(&self, key_id: &str) -> Option<&TrustedKey> {
@@ -169,23 +152,20 @@ mod embedded_tests {
     #[test]
     fn embedded_values_must_be_complete_and_well_formed() {
         let key = STANDARD.encode([7u8; 32]);
-        let ok = TrustPolicy::from_embedded(Some("hane-2026"), Some(&key), Some("ABCDE12345"));
+        let ok = TrustPolicy::from_embedded(Some("hane-2026"), Some(&key));
         assert!(ok.is_configured());
-        assert_eq!(ok.macos_team_id(), Some("ABCDE12345"));
 
-        for (id, key_b64, team) in [
-            (None, Some(key.as_str()), None),
-            (Some("hane-2026"), None, None),
-            (Some(""), Some(key.as_str()), None),
-            (Some("bad id"), Some(key.as_str()), None),
-            (Some("hane-2026"), Some("not base64!"), None),
+        for (id, key_b64) in [
+            (None, Some(key.as_str())),
+            (Some("hane-2026"), None),
+            (Some(""), Some(key.as_str())),
+            (Some("bad id"), Some(key.as_str())),
+            (Some("hane-2026"), Some("not base64!")),
         ] {
-            assert!(!TrustPolicy::from_embedded(id, key_b64, team).is_configured());
+            assert!(!TrustPolicy::from_embedded(id, key_b64).is_configured());
         }
         let short = STANDARD.encode([7u8; 31]);
-        assert!(!TrustPolicy::from_embedded(Some("k"), Some(&short), None).is_configured());
-        let bad_team = TrustPolicy::from_embedded(Some("k"), Some(&key), Some("abc"));
-        assert_eq!(bad_team.macos_team_id(), None);
+        assert!(!TrustPolicy::from_embedded(Some("k"), Some(&short)).is_configured());
     }
 }
 

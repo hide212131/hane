@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use hane_update::health::{COMMIT_WAIT, ChildEntry, VerifiedChild, detect_child};
 use hane_update::startup::{
-    GateOutcome, HelperRecoveryRunner, RuntimeGuard, STARTUP_WAIT, startup_gate_for_exe_within,
+    BackupGuidance, GateOutcome, HelperRecoveryRunner, RuntimeGuard, STARTUP_WAIT,
+    recovery_backup_for_exe, startup_gate_for_exe_within,
 };
 use hane_update::trust::TrustPolicy;
 
@@ -129,18 +130,343 @@ fn is_cli_open_path(first_arg: Option<&std::ffi::OsStr>) -> bool {
     }
 }
 
+/// Whether a gate that admits normal startup must first be re-executed. A macOS
+/// launch that observed `UpdateInProgress` waited while the bundle was swapped,
+/// so its in-memory image may be the pre-update version; it must never go on to
+/// edit documents or state. Terminal stops are returned unchanged.
+fn needs_fresh_image(observed_update: bool, outcome: &GateOutcome, is_macos: bool) -> bool {
+    is_macos
+        && observed_update
+        && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
+}
+
+/// Set on the re-executed image so a still-mismatching disk cannot loop.
+const REEXEC_MARKER_ENV: &str = "HANE_UPDATE_GATE_REEXEC";
+
+/// Identity of this build's executable. It embeds the version, which every
+/// update changes; the same bytes are in the on-disk executable of the same
+/// build and absent from any other version's.
+#[used]
+static IMAGE_MARKER: &str = concat!("hane-image-generation=", env!("CARGO_PKG_VERSION"), ";");
+
+fn image_marker() -> &'static [u8] {
+    std::hint::black_box(IMAGE_MARKER).as_bytes()
+}
+
+/// Whether `reader` contains `needle`, read in bounded chunks.
+fn reader_contains(mut reader: impl std::io::Read, needle: &[u8]) -> std::io::Result<bool> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    let mut buf = vec![0u8; 1 << 20];
+    let mut window: Vec<u8> = Vec::new();
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        window.extend_from_slice(&buf[..n]);
+        if window.windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+        let keep = needle.len() - 1;
+        if window.len() > keep {
+            window.drain(..window.len() - keep);
+        }
+    }
+}
+
+/// Whether the executable at `exe` is the same build as the running image.
+/// An unreadable file counts as different: the caller then restarts or stops.
+fn disk_image_is_running_image(exe: &std::path::Path) -> bool {
+    match std::fs::File::open(exe) {
+        Ok(file) => reader_contains(file, image_marker()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Takes the gate so that any wait for a held lease is observable here. The
+/// gate waits for the startup lease internally and may then return `Proceed`
+/// without ever reporting `UpdateInProgress`, which would hide that this image
+/// outlived an update. A non-waiting probe comes first: if the lease is held,
+/// that is recorded in `observed_update` before the waiting attempt is made.
+fn take_gate_observing_waits(
+    mut take_gate: impl FnMut(std::time::Duration) -> GateOutcome,
+    wait: std::time::Duration,
+    observed_update: &std::cell::Cell<bool>,
+) -> GateOutcome {
+    let probe = take_gate(std::time::Duration::ZERO);
+    if !matches!(probe, GateOutcome::UpdateInProgress) {
+        return probe;
+    }
+    observed_update.set(true);
+    take_gate(wait)
+}
+
+/// Whether the on-disk executable may be re-executed. A version marker mismatch
+/// or an unreadable file alone never vouches for it: every file of the bundle
+/// must match the inventory signed with the update key. Apple's signature,
+/// Team ID and notarization are not required. `verify` performs that check;
+/// without an update key nothing can be proven and the answer is a refusal.
+#[cfg(any(target_os = "macos", test))]
+fn reexec_trust_decision(
+    update_key_configured: bool,
+    verify: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if !update_key_configured {
+        return Err(
+            "実行ファイルを確認する更新用の署名鍵が設定されていないため、再起動しません".to_string(),
+        );
+    }
+    verify().map_err(|reason| {
+        format!("ディスク上の実行ファイルの署名・配置を確認できないため、再起動しません（{reason}）")
+    })
+}
+
+/// Verifies, with the existing trust policy, that the bundle containing `exe`
+/// matches the inventory signed with the update key.
+#[cfg(target_os = "macos")]
+fn verify_exe_for_reexec(exe: &std::path::Path, policy: &TrustPolicy) -> Result<(), String> {
+    use hane_update::macos_apply::verify_bundle_inventory;
+    use hane_update::platform::macos::locate;
+    reexec_trust_decision(policy.is_configured(), || {
+        let placement = locate(exe).map_err(|err| err.to_string())?;
+        verify_bundle_inventory(&placement.install_root, policy)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_exe_for_reexec(_exe: &std::path::Path, _policy: &TrustPolicy) -> Result<(), String> {
+    Err("この環境では実行ファイルの署名を確認できません".to_string())
+}
+
+/// Replaces this process with the current on-disk executable and the original
+/// arguments. Only returns on failure, with the reason.
+#[cfg(unix)]
+fn reexec_current_image(exe: &std::path::Path) -> String {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(REEXEC_MARKER_ENV, "1")
+        .exec();
+    err.to_string()
+}
+
+#[cfg(not(unix))]
+fn reexec_current_image(_exe: &std::path::Path) -> String {
+    "re-execution is not supported on this platform".to_string()
+}
+
+/// A stop message that must reach the person who launched Hane. A Finder launch
+/// has no terminal, and the GUI is not initialised yet, so stderr alone is never
+/// seen.
+#[derive(Debug, PartialEq, Eq)]
+struct StopNotice {
+    title: String,
+    message: String,
+}
+
+/// The notice for a failed restart into the updated executable. It names the
+/// reason, says the request made during the update (a plain launch or a
+/// document to open) was not handled, and tells the user to start Hane again.
+fn reexec_failure_notice(reason: &str) -> StopNotice {
+    StopNotice {
+        title: "Haneを更新後の状態で再起動できませんでした".to_string(),
+        message: format!(
+            "更新中に行った起動操作や文書を開く操作は処理されませんでした。\
+             文書・設定・AIのデータには変更を加えていません。\n\n\
+             理由: {reason}\n\n\
+             更新は完了しています。Haneを終了した状態で、もう一度Haneを起動し、\
+             開きたい文書があれば開き直してください。"
+        ),
+    }
+}
+
+/// `osascript` arguments that show `notice` as an alert. The text is passed as
+/// script arguments, never spliced into the script source.
+#[cfg(any(target_os = "macos", test))]
+fn osascript_alert_args(notice: &StopNotice) -> Vec<String> {
+    vec![
+        "-e".to_string(),
+        "on run argv".to_string(),
+        "-e".to_string(),
+        "display alert (item 1 of argv) message (item 2 of argv) as critical".to_string(),
+        "-e".to_string(),
+        "end run".to_string(),
+        "--".to_string(),
+        notice.title.clone(),
+        notice.message.clone(),
+    ]
+}
+
+/// The notice for a launch that cannot be handled while an update is applied.
+fn update_in_progress_notice() -> StopNotice {
+    StopNotice {
+        title: "Haneは更新中です".to_string(),
+        message: "更新中のため、起動操作や文書を開く操作を処理できませんでした。\
+                  文書・設定・AIのデータには変更を加えていません。\n\n\
+                  更新が終わってから、もう一度Haneを起動するか、開きたい文書を開き直してください。"
+            .to_string(),
+    }
+}
+
+/// The notice for a launch stopped because an interrupted update is not settled.
+/// It does not claim the update succeeded.
+///
+/// The backup location is shown only when it was derived from the verified
+/// install and its one unsettled transaction. Its content is never vouched for:
+/// the notice says it is unverified and asks the user not to overwrite or delete
+/// it. Without a verified location, the manual steps do not depend on any backup.
+fn recovery_required_notice(reason: &str, backup: &BackupGuidance) -> StopNotice {
+    let guidance = match backup {
+        BackupGuidance::Located { path, is_bundle } => {
+            let what = if *is_bundle {
+                "中断された更新が作業用に使っているアプリの置き場所（旧版または新版のHane.appがある可能性があります）"
+            } else {
+                "中断された更新が保存した旧版ファイルの置き場所"
+            };
+            format!(
+                "{what}:\n{}\n\n\
+                 この場所の内容は検証できていないため、復元できるとは限りません。\
+                 この場所のファイルを上書き・削除・移動しないでください。\
+                 調査や別の場所へのコピーが必要な場合も、元の場所のファイルは変更せず、\
+                 コピーに対して行ってください。\n\n\
+                 ",
+                path.display()
+            )
+        }
+        BackupGuidance::Unknown => "安全に復元できる旧版のバックアップは確認できませんでした。\
+             更新用の作業フォルダーにあるファイルは、検証できていないため、上書き・削除・復元をしないでください。\n\n"
+            .to_string(),
+    };
+    StopNotice {
+        title: "Haneの更新を完了または取り消せませんでした".to_string(),
+        message: format!(
+            "中断された更新の復旧が済んでいないため、起動操作や文書を開く操作を処理できませんでした。\
+             文書・設定・AIのデータには変更を加えていません。\n\n\
+             理由: {reason}\n\n\
+             {guidance}\
+             復旧するには、公式サイトから署名済みのHane ZIPを入手し、現在のHaneを置き換える形で手動でインストールしてください。\
+             インストール後にもう一度Haneを起動し、開きたい文書があれば開き直してください。\
+             更新は完了していません。"
+        ),
+    }
+}
+
+/// Where a stop notice is shown on a platform.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum NoticeSurface {
+    MacosAlert,
+    WindowsMessageBox,
+    StderrOnly,
+}
+
+fn notice_surface(is_macos: bool, is_windows: bool) -> NoticeSurface {
+    if is_macos {
+        NoticeSurface::MacosAlert
+    } else if is_windows {
+        NoticeSurface::WindowsMessageBox
+    } else {
+        NoticeSurface::StderrOnly
+    }
+}
+
+/// UTF-16, NUL-terminated, as `MessageBoxW` expects.
+#[cfg(any(target_os = "windows", test))]
+fn to_wide_nul(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Shows the notice in a native dialog (blocking until dismissed, so the
+/// process does not exit before it is read): an alert on macOS and a message
+/// box on Windows, whose GUI build has no console. Other platforms keep stderr.
+fn present_notice(notice: &StopNotice) {
+    eprintln!("{}\n{}", notice.title, notice.message);
+    match notice_surface(cfg!(target_os = "macos"), cfg!(target_os = "windows")) {
+        NoticeSurface::MacosAlert => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("/usr/bin/osascript")
+                    .args(osascript_alert_args(notice))
+                    .status();
+            }
+        }
+        NoticeSurface::WindowsMessageBox => {
+            #[cfg(target_os = "windows")]
+            {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+                };
+                let title = to_wide_nul(&notice.title);
+                let message = to_wide_nul(&notice.message);
+                // SAFETY: both buffers are NUL-terminated and outlive the call.
+                unsafe {
+                    MessageBoxW(
+                        std::ptr::null_mut(),
+                        message.as_ptr(),
+                        title.as_ptr(),
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+                    );
+                }
+            }
+        }
+        NoticeSurface::StderrOnly => {}
+    }
+}
+
+/// Reports a recovery-required stop through `present` and stops.
+fn stop_for_recovery(
+    reason: &str,
+    backup: impl FnOnce() -> BackupGuidance,
+    present: impl FnOnce(&StopNotice),
+) -> Entry {
+    present(&recovery_required_notice(reason, &backup()));
+    Entry::Stop(EXIT_RECOVERY_REQUIRED)
+}
+
+/// Turns a terminal gate refusal into a visible notice and a stop. Admitting
+/// outcomes are not handled here. `backup` is read only for a recovery stop.
+fn stop_for_refusal(
+    outcome: GateOutcome,
+    backup: impl FnOnce() -> BackupGuidance,
+    present: impl FnOnce(&StopNotice),
+) -> Entry {
+    match outcome {
+        GateOutcome::Proceed(guard) => Entry::Start {
+            guard: Some(guard),
+            state_root: None,
+        },
+        GateOutcome::Unmanaged => Entry::Start {
+            guard: None,
+            state_root: None,
+        },
+        GateOutcome::UpdateInProgress => {
+            present(&update_in_progress_notice());
+            Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
+        }
+        GateOutcome::RecoveryRequired(reason) => stop_for_recovery(&reason, backup, present),
+    }
+}
+
+/// Fails closed after a failed re-exec: reports through `present` and stops.
+fn stop_after_failed_reexec(reason: &str, present: impl FnOnce(&StopNotice)) -> Entry {
+    present(&reexec_failure_notice(reason));
+    Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
+}
+
 pub fn enter() -> Entry {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
             // The placement cannot be resolved, so it cannot be ruled out that
             // an interrupted update is pending: do not start normal editing.
-            eprintln!(
-                "Hane could not finish or undo an interrupted update \
-                 (the running executable could not be located: {err}). \
-                 Install a signed Hane ZIP manually."
+            return stop_for_recovery(
+                &format!("実行中の実行ファイルの場所を特定できません: {err}"),
+                || BackupGuidance::Unknown,
+                present_notice,
             );
-            return Entry::Stop(EXIT_RECOVERY_REQUIRED);
         }
     };
     // The limited-health child of an update helper is the only launch that may
@@ -150,8 +476,11 @@ pub fn enter() -> Entry {
     match detect_child(&exe, env!("CARGO_PKG_VERSION")) {
         ChildEntry::NotChild => {}
         ChildEntry::Refused(reason) => {
-            eprintln!("Hane could not confirm the update it was started for ({reason}).");
-            return Entry::Stop(EXIT_RECOVERY_REQUIRED);
+            return stop_for_recovery(
+                &format!("起動対象の更新を確認できません: {reason}"),
+                || recovery_backup_for_exe(&exe),
+                present_notice,
+            );
         }
         ChildEntry::Child(session) => {
             // The read-only inspection of the state root, the settings store
@@ -163,8 +492,11 @@ pub fn enter() -> Entry {
             return match session.verify(move || check.verify()) {
                 Ok(verified) => Entry::Limited(Box::new(verified)),
                 Err(err) => {
-                    eprintln!("Hane could not confirm the update it was started for ({err}).");
-                    Entry::Stop(EXIT_RECOVERY_REQUIRED)
+                    stop_for_recovery(
+                        &format!("起動対象の更新を確認できません: {err}"),
+                        || recovery_backup_for_exe(&exe),
+                        present_notice,
+                    )
                 }
             };
         }
@@ -178,34 +510,56 @@ pub fn enter() -> Entry {
     let has_cli_path = is_cli_open_path(std::env::args_os().nth(1).as_deref());
     let has_explicit_open = may_carry_open_request(has_cli_path);
     let started = std::time::Instant::now();
+    let observed_update = std::cell::Cell::new(false);
     let outcome = gate_with_open_retry(
-        |wait| startup_gate_for_exe_within(&exe, &runner, wait),
+        |wait| {
+            let outcome = take_gate_observing_waits(
+                |attempt| startup_gate_for_exe_within(&exe, &runner, attempt),
+                wait,
+                &observed_update,
+            );
+            if matches!(outcome, GateOutcome::UpdateInProgress) {
+                observed_update.set(true);
+            }
+            outcome
+        },
         has_explicit_open,
         open_request_wait(has_cli_path),
         std::thread::sleep,
         || started.elapsed(),
     );
-    match outcome {
-        GateOutcome::Proceed(guard) => Entry::Start {
-            guard: Some(guard),
-            state_root: None,
-        },
-        GateOutcome::Unmanaged => Entry::Start {
-            guard: None,
-            state_root: None,
-        },
-        GateOutcome::UpdateInProgress => {
-            eprintln!("Hane is being updated. Please start it again in a moment.");
-            Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
-        }
-        GateOutcome::RecoveryRequired(reason) => {
-            eprintln!(
-                "Hane could not finish or undo an interrupted update ({reason}). \
-                 Install a signed Hane ZIP manually."
+    // A momentary lease observation cannot prove that no update happened (the
+    // helper may release the lease before the probe), so on macOS the running
+    // image is also compared with the signed executable now on disk.
+    let disk_differs = cfg!(target_os = "macos")
+        && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
+        && !disk_image_is_running_image(&exe);
+    if needs_fresh_image(
+        observed_update.get() || disk_differs,
+        &outcome,
+        cfg!(target_os = "macos"),
+    ) {
+        // This process image was started before the update and may be the old
+        // version. Release the runtime lease, then replace the image in place
+        // (same PID, so LaunchServices still delivers the pending Finder event
+        // once, to the new image) with the current on-disk executable. If that
+        // cannot be done, fail closed rather than edit with the old image.
+        drop(outcome);
+        if disk_differs && std::env::var_os(REEXEC_MARKER_ENV).is_some() {
+            // Already restarted once and the disk still differs: never loop.
+            return stop_after_failed_reexec(
+                "再起動後も、実行中の版とディスク上の実行ファイルが一致しません",
+                present_notice,
             );
-            Entry::Stop(EXIT_RECOVERY_REQUIRED)
         }
+        // The file is run only if it is proven to be a signed, accepted install.
+        if let Err(reason) = verify_exe_for_reexec(&exe, &TrustPolicy::production()) {
+            return stop_after_failed_reexec(&reason, present_notice);
+        }
+        let err = reexec_current_image(&exe);
+        return stop_after_failed_reexec(&err, present_notice);
     }
+    stop_for_refusal(outcome, || recovery_backup_for_exe(&exe), present_notice)
 }
 
 #[cfg(test)]
@@ -246,6 +600,278 @@ mod tests {
         assert!(matches!(outcome, GateOutcome::Unmanaged));
         assert_eq!(admitted, 1, "the launch (and its path) is admitted exactly once");
         assert_eq!(sleeps, 3);
+    }
+
+    #[test]
+    fn an_old_image_that_waited_for_an_update_does_not_proceed_in_place() {
+        let observed = std::cell::Cell::new(false);
+        let mut inner = scripted(2);
+        let outcome = gate_with_open_retry(
+            |wait| {
+                let outcome = inner(wait);
+                if matches!(outcome, GateOutcome::UpdateInProgress) {
+                    observed.set(true);
+                }
+                outcome
+            },
+            true,
+            None,
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        // The update finished, but this image saw it in progress: re-exec.
+        assert!(needs_fresh_image(observed.get(), &outcome, true));
+        // A launch that never saw an update, or a non-macOS one, proceeds.
+        assert!(!needs_fresh_image(false, &outcome, true));
+        assert!(!needs_fresh_image(true, &outcome, false));
+        // Terminal stops are never turned into a restart.
+        let recovery = GateOutcome::RecoveryRequired("x".into());
+        assert!(!needs_fresh_image(true, &recovery, true));
+        assert!(!needs_fresh_image(true, &GateOutcome::UpdateInProgress, true));
+    }
+
+    #[test]
+    fn a_lease_wait_inside_the_gate_that_then_proceeds_still_needs_a_fresh_image() {
+        // The update holds the startup lease: a non-waiting attempt times out,
+        // while a waiting one outlasts the update and returns Unmanaged
+        // directly, never reporting UpdateInProgress to the caller.
+        let observed = std::cell::Cell::new(false);
+        let mut waits = Vec::new();
+        let outcome = gate_with_open_retry(
+            |wait| {
+                take_gate_observing_waits(
+                    |attempt| {
+                        waits.push(attempt);
+                        if attempt.is_zero() {
+                            GateOutcome::UpdateInProgress
+                        } else {
+                            GateOutcome::Unmanaged
+                        }
+                    },
+                    wait,
+                    &observed,
+                )
+            },
+            true,
+            None,
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert!(observed.get(), "the lease wait must be observed");
+        assert!(needs_fresh_image(observed.get(), &outcome, true));
+        assert_eq!(waits.len(), 2);
+    }
+
+    #[test]
+    fn a_helper_that_released_the_lease_before_the_probe_still_leaves_a_stale_image_detected() {
+        // The probe sees no update and the gate proceeds directly, so nothing
+        // was observed; the on-disk executable is a different generation.
+        let observed = std::cell::Cell::new(false);
+        let outcome = take_gate_observing_waits(
+            |_| GateOutcome::Unmanaged,
+            STARTUP_WAIT,
+            &observed,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert!(!observed.get());
+        let mut new_image = vec![0u8; 3 << 20];
+        new_image.extend_from_slice(b"hane-image-generation=99.0.0;");
+        let disk_differs = !reader_contains(&new_image[..], image_marker()).unwrap();
+        assert!(disk_differs);
+        assert!(needs_fresh_image(observed.get() || disk_differs, &outcome, true));
+    }
+
+    #[test]
+    fn an_unchanged_image_on_disk_is_not_restarted() {
+        let mut same = vec![1u8; (1 << 20) - 5];
+        same.extend_from_slice(image_marker());
+        same.extend_from_slice(&[2u8; 100]);
+        assert!(reader_contains(&same[..], image_marker()).unwrap());
+        let outcome = GateOutcome::Unmanaged;
+        assert!(!needs_fresh_image(false, &outcome, true));
+    }
+
+    #[test]
+    fn an_unverified_disk_executable_is_never_reexecuted() {
+        // No update key: the verifier is not even consulted.
+        let mut consulted = false;
+        let result = reexec_trust_decision(false, || {
+            consulted = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!consulted);
+        // A failed signed-inventory check refuses and carries the reason.
+        let err = reexec_trust_decision(true, || Err("bad signature".into())).unwrap_err();
+        assert!(err.contains("bad signature"));
+        // Only a verified bundle may be re-executed, with no Apple identity.
+        assert!(reexec_trust_decision(true, || Ok(())).is_ok());
+        // The refusal fails closed with a visible notice and no re-exec.
+        let mut shown = 0;
+        let entry = stop_after_failed_reexec(&err, |_| shown += 1);
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown, 1);
+    }
+
+    #[test]
+    fn an_unconfigured_production_policy_refuses_reexec() {
+        let policy = TrustPolicy::new(Vec::new());
+        assert!(verify_exe_for_reexec(std::path::Path::new("/nonexistent/hane"), &policy).is_err());
+    }
+
+    #[test]
+    fn a_failed_reexec_shows_a_user_visible_notice_and_stops() {
+        let mut shown = Vec::new();
+        let entry = stop_after_failed_reexec("No such file", |notice| {
+            shown.push((notice.title.clone(), notice.message.clone()));
+        });
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown.len(), 1, "the notice is presented exactly once");
+        let (title, message) = &shown[0];
+        assert!(!title.is_empty());
+        assert!(message.contains("No such file"), "the reason is shown");
+        assert!(message.contains("もう一度Haneを起動"), "restart steps are given");
+        assert!(message.contains("開く操作"), "the lost request is not hidden");
+    }
+
+    #[test]
+    fn update_in_progress_refusal_is_shown_and_asks_to_retry_after_the_update() {
+        let mut shown = Vec::new();
+        let entry = stop_for_refusal(GateOutcome::UpdateInProgress, || BackupGuidance::Unknown, |n| {
+            shown.push((n.title.clone(), n.message.clone()));
+        });
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].0, update_in_progress_notice().title);
+        let message = &shown[0].1;
+        assert!(message.contains("更新中のため"));
+        assert!(message.contains("更新が終わってから"));
+        assert!(message.contains("開く操作"));
+    }
+
+    #[test]
+    fn recovery_refusal_is_shown_and_never_reads_as_a_successful_update() {
+        let mut shown = Vec::new();
+        let entry = stop_for_refusal(
+            GateOutcome::RecoveryRequired("broken".into()),
+            || BackupGuidance::Unknown,
+            |n| {
+                shown.push(n.message.clone());
+            },
+        );
+        assert!(matches!(entry, Entry::Stop(EXIT_RECOVERY_REQUIRED)));
+        assert_eq!(shown.len(), 1);
+        let message = &shown[0];
+        assert!(message.contains("broken"), "the reason is shown");
+        assert!(message.contains("手動でインストール"));
+        assert!(message.contains("もう一度Haneを起動"));
+        assert!(message.contains("開く操作"));
+        assert!(!message.contains("更新は完了しています"));
+        assert!(!message.contains("更新が終わってから"));
+    }
+
+    #[test]
+    fn a_known_backup_location_is_shown_without_vouching_for_its_content() {
+        let path = PathBuf::from("/state/private/tx/backup");
+        let located = BackupGuidance::Located { path: path.clone(), is_bundle: false };
+        let notice = recovery_required_notice("broken", &located);
+        assert!(notice.message.contains(&path.display().to_string()));
+        assert!(notice.message.contains("上書き・削除・移動しないでください"));
+        assert!(notice.message.contains("検証できていない"));
+        assert!(notice.message.contains("手動でインストール"));
+        assert!(!notice.message.contains("復元できます"));
+        assert!(!notice.message.contains("更新は完了しています"));
+
+        let bundle = BackupGuidance::Located { path, is_bundle: true };
+        let notice = recovery_required_notice("broken", &bundle);
+        assert!(notice.message.contains("Hane.app"));
+        assert!(notice.message.contains("上書き・削除・移動しないでください"));
+    }
+
+    #[test]
+    fn an_unknown_backup_is_never_shown_as_restorable() {
+        let notice = recovery_required_notice("x", &BackupGuidance::Unknown);
+        assert!(notice.message.contains("確認できませんでした"));
+        assert!(notice.message.contains("上書き・削除・復元をしないでください"));
+        assert!(notice.message.contains("手動でインストール"));
+        assert!(!notice.message.contains("置き場所"));
+        assert!(!notice.message.contains("更新は完了しています"));
+    }
+
+    #[test]
+    fn the_backup_is_read_only_for_a_recovery_stop() {
+        let mut shown = 0;
+        let entry = stop_for_refusal(
+            GateOutcome::UpdateInProgress,
+            || panic!("the backup is not needed for an update in progress"),
+            |_| shown += 1,
+        );
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown, 1);
+    }
+
+    #[test]
+    fn a_failed_child_confirmation_is_shown_not_left_on_stderr() {
+        let mut shown = 0;
+        let entry = stop_for_recovery("x", || BackupGuidance::Unknown, |_| shown += 1);
+        assert!(matches!(entry, Entry::Stop(EXIT_RECOVERY_REQUIRED)));
+        assert_eq!(shown, 1);
+    }
+
+    #[test]
+    fn notices_use_the_native_surface_of_each_os() {
+        assert_eq!(notice_surface(true, false), NoticeSurface::MacosAlert);
+        assert_eq!(notice_surface(false, true), NoticeSurface::WindowsMessageBox);
+        assert_eq!(notice_surface(false, false), NoticeSurface::StderrOnly);
+    }
+
+    #[test]
+    fn windows_message_text_is_nul_terminated_utf16() {
+        let wide = to_wide_nul("更新中A");
+        assert_eq!(wide.last(), Some(&0));
+        assert_eq!(String::from_utf16(&wide[..wide.len() - 1]).unwrap(), "更新中A");
+        assert_eq!(wide.iter().filter(|&&u| u == 0).count(), 1);
+    }
+
+    #[test]
+    fn the_alert_command_passes_the_text_as_arguments_not_script_source() {
+        let notice = reexec_failure_notice("bad \"quote\" \\ reason");
+        let args = osascript_alert_args(&notice);
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(args[separator + 1], notice.title);
+        assert_eq!(args[separator + 2], notice.message);
+        assert!(args[..separator].iter().all(|arg| !arg.contains("quote")));
+    }
+
+    #[test]
+    fn an_uncontended_gate_is_not_treated_as_an_observed_update() {
+        let observed = std::cell::Cell::new(false);
+        let outcome = take_gate_observing_waits(
+            |_| GateOutcome::Unmanaged,
+            STARTUP_WAIT,
+            &observed,
+        );
+        assert!(matches!(outcome, GateOutcome::Unmanaged));
+        assert!(!observed.get());
+        assert!(!needs_fresh_image(observed.get(), &outcome, true));
+    }
+
+    #[test]
+    fn a_pending_finder_open_is_handed_over_once_across_the_restart() {
+        // The event stays with the OS (same PID after exec) and is queued only
+        // by the fresh image after admission, so it opens exactly once.
+        let queue = hane_ui::SharedExternalOpenQueue::new();
+        let mut opened = Vec::new();
+        queue.push(PathBuf::from("/notes/a.md"));
+        for _ in 0..2 {
+            queue.drain_into(|path| {
+                opened.push(path.to_path_buf());
+                hane_ui::ExternalOpenOutcome::Accepted
+            });
+        }
+        assert_eq!(opened, vec![PathBuf::from("/notes/a.md")]);
     }
 
     #[test]

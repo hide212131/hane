@@ -125,6 +125,14 @@ pub struct RestartTicketSnapshot {
     pub active: Option<usize>,
 }
 
+/// Which Explorer registrations were enabled before the update, and so which
+/// ones the repair guidance may mention.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExplorerRepairScope {
+    pub file: bool,
+    pub folder: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestartTicketFile {
     pub path: PathBuf,
@@ -606,6 +614,7 @@ impl EditorView {
         };
         // A new action ends the one-time "updated" notice.
         self.update_completed = None;
+        self.explorer_migration_failed = None;
         match action {
             CardAction::Check => controller.check(),
             CardAction::Download(candidate) => controller.download(&candidate),
@@ -662,10 +671,22 @@ impl EditorView {
                     .text_color(rgb(self.theme.quote_foreground))
                     .child(detail)
             }))
-            .children(self.update_completed.clone().map(|version| {
+            .children(
+                self.update_completed
+                    .clone()
+                    .filter(|_| self.explorer_migration_failed.is_none())
+                    .map(|version| {
+                        div()
+                            .id("settings-app-update-completed")
+                            .debug_selector(|| "settings-app-update-completed".to_owned())
+                            .child(format!("Hane {version} に更新しました。"))
+                    }),
+            )
+            .children(self.explorer_migration_failed.map(|scope| {
                 div()
-                    .id("settings-app-update-completed")
-                    .child(format!("Hane {version} に更新しました。"))
+                    .id("settings-app-update-explorer-failed")
+                    .debug_selector(|| "settings-app-update-explorer-failed".to_owned())
+                    .child(explorer_migration_failed_message(scope))
             }))
             .children(self.restart_message.clone().map(|message| {
                 div()
@@ -876,6 +897,27 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Tells the user that Hane itself was updated but the Explorer
+    /// integration was not carried over, and how to repair it. Never shown for
+    /// a successful migration.
+    pub fn report_explorer_migration_failed(
+        &mut self,
+        scope: ExplorerRepairScope,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_explorer_migration_failed(scope);
+        cx.notify();
+    }
+
+    /// The state change of [`Self::report_explorer_migration_failed`]. The
+    /// ordinary "updated" notice is dropped so only the partial failure shows;
+    /// the update itself and the restored documents are untouched.
+    fn apply_explorer_migration_failed(&mut self, scope: ExplorerRepairScope) {
+        self.update_completed = None;
+        self.explorer_migration_failed = Some(scope);
+        self.status = Some(explorer_migration_failed_message(scope));
+    }
+
     /// Tells the user that some files open before the update restart could not
     /// be reopened because they were deleted or moved.
     pub fn report_restore_skipped(&mut self, count: usize, cx: &mut Context<Self>) {
@@ -1059,6 +1101,32 @@ const RESTART_STALE_MESSAGE: &str =
 pub(crate) const AI_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often a stop that outlived [`AI_STOP_TIMEOUT`] is checked for completion.
+/// Shown when the update committed but the Explorer integration was not carried
+/// over. The new publisher is never trusted automatically; the user repairs it
+/// from the settings.
+/// The partial-failure notice with repair steps for only the registrations
+/// that were enabled before the update. A disabled kind is never mentioned, so
+/// the user is not led to turn it on.
+fn explorer_migration_failed_message(scope: ExplorerRepairScope) -> String {
+    let mut message = String::from(
+        "Hane本体は更新しましたが、Explorer連携の更新に失敗しました。",
+    );
+    if scope.file {
+        message.push_str(
+            "ファイルの右クリック登録は、設定画面の「ファイルを右クリックでHaneで開けるよう登録」をオフにしてから、もう一度オンにして修復してください。",
+        );
+    }
+    if scope.folder {
+        message.push_str(
+            "フォルダーの右クリック登録は、Haneを「--register-context-menu」付きで実行して再登録してください。",
+        );
+    }
+    message.push_str(
+        "発行元が変わって再登録できない場合は、アプリが自動で信頼することはないため、発行元を確認したうえで利用者が明示的に信頼してください。",
+    );
+    message
+}
+
 const AI_RESUME_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The steps of the final exit coordination, behind a seam so the order and
@@ -1260,6 +1328,61 @@ mod tests {
             candidate_version: Some("0.27.0".to_owned()),
             ..AppUpdateSnapshot::idle("0.26.0")
         }
+    }
+
+    #[test]
+    fn the_partial_failure_notice_repairs_only_the_registrations_that_were_enabled() {
+        const FILE_STEP: &str = "ファイルを右クリックでHaneで開けるよう登録";
+        const FOLDER_STEP: &str = "--register-context-menu";
+        for (file, folder) in [(true, false), (false, true), (true, true)] {
+            let text = explorer_migration_failed_message(ExplorerRepairScope { file, folder });
+            assert!(text.contains("Hane本体は更新しました"));
+            assert!(text.contains("Explorer連携の更新に失敗"));
+            assert_eq!(text.contains(FILE_STEP), file, "{text}");
+            assert_eq!(text.contains(FOLDER_STEP), folder, "{text}");
+            assert!(text.contains("発行元"));
+            assert!(text.contains("明示的に信頼"));
+            // It is not the plain success notice.
+            assert!(!text.contains("に更新しました。"));
+        }
+    }
+
+    #[gpui::test]
+    fn a_partial_failure_replaces_the_plain_updated_notice(cx: &mut gpui::TestAppContext) {
+        let controller = FakeController::new(AppUpdateSnapshot::idle("0.26.0"));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.show_update_completed("0.27.0", cx);
+        });
+        open_general_settings(&view, cx);
+        assert!(cx.debug_bounds("settings-app-update-completed").is_some());
+        assert!(
+            cx.debug_bounds("settings-app-update-explorer-failed")
+                .is_none()
+        );
+
+        let scope = ExplorerRepairScope {
+            file: false,
+            folder: true,
+        };
+        view.update(cx, |view, cx| {
+            view.report_explorer_migration_failed(scope, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("settings-app-update-completed").is_none());
+        assert!(
+            cx.debug_bounds("settings-app-update-explorer-failed")
+                .is_some()
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.update_completed, None);
+            assert_eq!(
+                view.status.as_deref(),
+                Some(explorer_migration_failed_message(scope).as_str())
+            );
+        });
     }
 
     fn labels(model: &CardModel) -> Vec<&'static str> {

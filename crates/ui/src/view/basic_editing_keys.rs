@@ -255,8 +255,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.sidebar_filter_focused = true;
             view.sidebar_keyboard_focus = true;
-            view.sidebar_filter = "abc def".to_owned();
-            view.sidebar_filter_selected_range = 7..7;
+            view.sidebar_filter = ShortTextInput::new("abc def".to_owned());
             cx.notify();
         });
         cx.run_until_parked();

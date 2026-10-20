@@ -1,12 +1,17 @@
 # アプリ本体更新の実装仕様
 
 作成日: 2026-10-17
-状態: 設計案／製品・配布とも未実装、OS試験未実施
-調査基準: main `e82b9a9fe42280bfa78497746bcd7e21c73430c5`
+状態: 設計採用済み（PR #509）／製品は部分実装済み（U0/U1/U3はPR #512でmerge済み、U4はPR #518でDraft、U2はPR #526でDraft）／配布の有効化とOS実機試験は未完了。進捗は[引き継ぎ](application-update-implementation-handoff.md)と[Issue #510](https://github.com/hide212131/hane/issues/510)に従う
+調査基準: main `e82b9a9fe42280bfa78497746bcd7e21c73430c5`（設計時点のSHAであり、current mainではない。実装時はcurrent mainで再確認する）
 判断: [ADR-0034](adr/0034-zip-application-updates.md)
 実装順序・受入: [引き継ぎ](application-update-implementation-handoff.md)
 
-要求・受入条件の正本: [Issue #508](https://github.com/hide212131/hane/issues/508)
+要求・受入条件の正本: 製品実装の現在の契約は[Issue #510](https://github.com/hide212131/hane/issues/510)。[Issue #508](https://github.com/hide212131/hane/issues/508)は設計Issueとして完了済みで、実装の受入判定には使わない。
+
+要求の縮小記録（Issue #510の現行条件への整合）:
+- restart freeze中に受け取れない外部openは、完全な再現ではなく、理由と再操作方法を利用者へ伝えることを必須とする。データ保護、更新中の安全な停止、誤った成功表示の禁止は維持する。
+- restart ticketのscroll/caret保存は初回公開の必須条件から外し、位置の完全復元は後続候補とする。保存済み文書・active path・work folderの復元と、設定・AIデータの保護は維持する。
+- 署名・hash・版・対象OS・配置・所有権の検査、未保存データ保護、限定health、durable commit、rollback/RecoveryRequired、Windows ExplorerとmacOS配布の制約は変更しない。
 
 ## 1. 要求と到達点
 
@@ -121,9 +126,9 @@ JSONはUTF-8、256 KiB以下、重複キーを拒否する。署名は**取得�
 | `targets.*.asset_name`, `archive_size`, `archive_sha256` | 正確な名前、実byte数、64桁lowercase hex。asset/API値とも整合。 |
 | `targets.*.unpacked_size`, `layout_revision` | 実展開byte総量、下記layout revision。上限以下か検査。 |
 | Windows `inventory_sha256` | ZIP内`hane-install.json` raw bytesのhash。catalogの版・targetとinventoryが一致。 |
-| macOS `bundle_id`, `team_id`, `bundle_version` | Bundle ID固定、bootstrapに固定したTeam ID、Cargo版に対応するbundle版。metadataだけで新Team IDを信頼しない。 |
+| macOS `bundle_id`, `bundle_version`, `inventory_sha256` | Bundle ID固定、Cargo版に対応するbundle版、`Hane.app/Contents/Resources/hane-install.json`のSHA-256。`team_id`は持たない（設定されたカタログは拒否）。 |
 
-署名鍵はHane本体更新専用とし、Codex runtime catalogの鍵/署名ドメインと共用しない。署名秘密鍵はコード・ZIP・ログへ入れず、配布用secretとして保管する。鍵値をこの設計PRでは発行しない。公開鍵とmacOS Team IDは最初の更新対応版へ組み込む。ローテーションは旧鍵で署名したbridge版に新公開鍵を同梱し、移行期間は両鍵の署名を配布する。旧鍵しか知らない版を支援する間は旧署名を残す。侵害・紛失時に安全なbridgeを出せない場合は手動導入とし、ネット上の新鍵を無条件採用しない。
+署名鍵はHane本体更新専用とし、Codex runtime catalogの鍵/署名ドメインと共用しない。署名秘密鍵はコード・ZIP・ログへ入れず、配布用secretとして保管する。鍵値をこの設計PRでは発行しない。公開鍵は最初の更新対応版へ組み込む（macOSでもApple Team IDは使わない）。ローテーションは旧鍵で署名したbridge版に新公開鍵を同梱し、移行期間は両鍵の署名を配布する。旧鍵しか知らない版を支援する間は旧署名を残す。侵害・紛失時に安全なbridgeを出せない場合は手動導入とし、ネット上の新鍵を無条件採用しない。
 
 最大sequenceは配置単位のprivate receiptsへ保存し、`HANE_STATE_DIR`変更で既知のsequenceを巻き戻せないようにする。保存失敗時はcandidateをReadyにしない。Readyを適用するときもcatalogの期限・sequenceと全取得物を再検証する。期限切れの古いReleaseは、同じZIP/hashのままsequenceを増やしてmetadataを再署名できる。これは配布基盤の明示操作とし、毎日起動する新しいautomationは作らない。
 
@@ -174,7 +179,7 @@ macOSでは`.app`外にhelper copyを置く。Windowsでも更新中の`hane-upd
 Download中は通常編集できる。「再起動して更新」は次の順序で行う。
 
 1. Readyを再検証し、配置・容量・権限と現在版identityを確認する。失敗時はまだ何も終了しない。
-2. UI thread上で短いrestart freezeを設け、新規編集、外部open、folder切替、設定変更、save/rename/AI開始を止める。既に届いたexternal openを失わず、開始前なら処理後に再判定、freeze後なら送信元へbusy/再試行を返す。新規キューを通常起動の成功として消費しない。
+2. UI thread上で短いrestart freezeを設け、新規編集、外部open、folder切替、設定変更、save/rename/AI開始を止める。既に届いたexternal openを失わず、開始前なら処理後に再判定する。freeze後に受け取れない外部openは、更新中で開けない理由と再操作方法（更新完了後にもう一度開く）を利用者へ伝える。送信元プロトコルが許す場合はbusy/再試行も返す。新規キューを通常起動の成功として消費せず、開けていないのに成功と見せない。
 3. 全ウィンドウ・全sessionについてidentity/revision、dirty、save/rename/autosaveのpending、modal/Save As、AIの選択文章処理/認証/導入/設定保存、AI/Prompts未保存フォームを検査する。IME composition中も保留。macOSで別processが同じ配置を使っていれば後述leaseで適用を拒否する。
 4. dirty文書や未保存フォームがあればfreezeを解除し、利用者が既存の保存操作へ戻れるようにする。強制保存、未保存内容の破棄、Save Asの自動決定をしない。v1にSave Allを新設しない。空で変更のない初期Untitledは妨げない。
 5. draft flushは新しい`Result`付きの更新用経路で全件成功を確認し、設定・recentの必要な永続化、下記ticketのatomic write/fsyncを確認する。既存のbest-effort通常quit処理の動作はこの機能で一律変更しない。書込失敗はfreezeを解除して保留。
@@ -182,7 +187,7 @@ Download中は通常編集できる。「再起動して更新」は次の順序
 7. quit直前にpermitの鮮度を確認する。AI serviceへ明示shutdown/join完了を要求し、draftの遅延jobをdrain/cancelする。停止が10秒以内に完了しなければhelperへAbortし、旧版を保持する。サービスを停止した場合は旧画面へ戻るときに再初期化する。process killで終了を達成しない。
 8. helperへ`ExitAuthorized`を送り、通常quit。helperは親processのOS handle/exit notificationを30秒まで待ち、単なるPIDの消滅推測では判定しない。親が残ればmutationせずAbortする。
 
-`restart-ticket.json`にはschema、TransactionId、InstallId、元のstate root、work folder、開いていた**保存済み**ファイルの順序、active path、scroll/caretの有界値を保存する。文書本文、秘密、任意コマンド、任意環境変数は保存しない。通常起動のdefault folder設定を書き換えない。再起動後は現在のdisk内容を既存open経路で読み、移動/削除済みは失敗を表示して残りを開く。未保存本文をticketで復元する設計にはしない。
+`restart-ticket.json`にはschema、TransactionId、InstallId、元のstate root、work folder、開いていた**保存済み**ファイルの順序、active pathを保存する。scroll/caretの保存・復元は初回公開の必須条件ではなく、後続候補とする。文書本文、秘密、任意コマンド、任意環境変数は保存しない。通常起動のdefault folder設定を書き換えない。再起動後は現在のdisk内容を既存open経路で読み、移動/削除済みは失敗を表示して残りを開く。未保存本文をticketで復元する設計にはしない。
 
 restart blockerが一つでもある場合、helperの起動・適用へ進まない。フリーズは短い検査と終了調停の間だけに限定し、通信・hash・ZIP展開をその中で行わない。
 
@@ -245,13 +250,13 @@ MSIX更新失敗は`本体は更新しましたが、Explorer連携の更新に�
 
 ## 10. macOS適用
 
-出荷前提は、`.app`内の`Contents/Helpers/hane-updater`を含めたDeveloper ID署名、Hardened Runtime、notarization、stapling。Info.plistに`CFBundleShortVersionString`/`CFBundleVersion`（Cargo版）、`HaneSourceCommit`（40桁source SHA）、`HaneUpdaterProtocol`（整数1）を設定する。現在版と候補のBundle ID、固定Team ID、OSの署名検証・Gatekeeper評価を確認する。署名されていない既存版は手動で`V_bootstrap`を導入する。
+出荷前提は、`.app`内の`Contents/Resources/hane-install.json`と`.sig`（更新用Ed25519鍵で署名したinventory。自身と`.sig`以外の全ファイルのパス・size・SHA-256を`Hane.app`相対で列挙）を含めること。Apple Developer ID・固定Team ID・notarizationは要求しない。Info.plistに`CFBundleShortVersionString`/`CFBundleVersion`（Cargo版）、`HaneSourceCommit`（40桁source SHA）、`HaneUpdaterProtocol`（整数1）を設定する。現在版と候補のBundle ID、版、source SHA、署名済みinventoryとbundle内ファイルの一致を確認する。inventoryのない既存版は手動で`V_bootstrap`を導入する。
 
-ZIP layout revision 1は`hane-macos-arm64/Hane.app`とREADME/LICENSEに限定する。署名後にbundleを加工しない。候補helper/実行fileも同じ署名検証でsealed bundle内にあることを確認する。カタログ署名とAppleの署名はそれぞれ検査し、一方だけで代替しない。
+ZIP layout revision 1は`hane-macos-arm64/Hane.app`とREADME/LICENSEに限定する。inventory署名後にbundleを加工しない。候補helper/実行fileも同じ署名済みinventoryで検証した内容と一致することを確認する。Appleの署名をカタログ・inventoryの署名の代わりにせず、Appleの署名がないことも拒否理由にしない。
 
-helperは`.app`外のprivate stageから、配置pathと同じAPFS volumeにある検証済みcandidateと現bundleを`renamex_np(RENAME_SWAP)`相当の原子的交換で入れ替える。APFSであることに加えてvolumeのswap-renaming capabilityを検査する。先に元bundleを消す二段階renameへfallbackしない。交換後の旧bundleをbackupとして保持し、限定起動失敗時は同じ交換で戻す。file IDとcatalog/Team ID/版をjournalに照合して方向を決め、journal更新直前に中断しても交換を二度適用しない。
+helperは`.app`外のprivate stageから、配置pathと同じAPFS volumeにある検証済みcandidateと現bundleを`renamex_np(RENAME_SWAP)`相当の原子的交換で入れ替える。APFSであることに加えてvolumeのswap-renaming capabilityを検査する。先に元bundleを消す二段階renameへfallbackしない。交換後の旧bundleをbackupとして保持し、限定起動失敗時は同じ交換で戻す。file IDとcatalog/版をjournalに照合して方向を決め、journal更新直前に中断しても交換を二度適用しない。
 
-APFS以外、交換非対応、App Translocation、読取専用や親の権限不足なら適用せず手動案内する。Gatekeeperを無効化したりquarantineを削除したりad hoc再署名したりしない。起動は正規配置のbundleから行い、private health channelを実childへ渡す。OSの起動拒否はhealth失敗として旧bundleを維持/復旧する。
+APFS以外、交換非対応、App Translocation、読取専用や親の権限不足なら適用せず手動案内する。Gatekeeperを無効化したりquarantineを削除したりad hoc再署名したりしない。OSが未署名・未公証のappの起動を確認する場合は、本人がアプリ単位で起動を許可して進める。起動は正規配置のbundleから行い、private health channelを実childへ渡す。OSの起動拒否はhealth失敗として旧bundleを維持/復旧する。
 
 ## 11. Journal、復旧、cleanup
 
@@ -279,11 +284,11 @@ Committed後にcandidate/backupを急いで消さず、次の正常起動を1回
 
 配布基盤専用PRは既存release入口・Cargo version整合・全workspace checksを維持し、以下を行う。
 
-1. 両OSでhelperをビルドし、version/source/target/protocolを実binaryから検査する。Windowsはinventoryを生成・署名し、macOSは正しい順序でnested codeを署名・notarize・stapleしてからZIPを作る。
-2. inventory/ZIP検査後に実size/hashを集計し、両targetを含むcatalogを生成・署名する。鍵ID・Team ID・notary credentialは保守者が実値を設定し、未設定ならrelease準備を失敗させる。空署名/開発鍵で代用しない。
+1. 両OSでhelperをビルドし、version/source/target/protocolを実binaryから検査する。Windowsはinventoryを生成・署名し、macOSも`Hane.app`内にinventoryを生成・署名してからZIPを作る（Apple署名・notarizationは要求しない）。
+2. inventory/ZIP検査後に実size/hashを集計し、両targetを含むcatalogを生成・署名する。更新用の鍵IDは保守者が実値を設定し、未設定ならrelease準備を失敗させる。空署名/開発鍵で代用しない。
 3. Draft Releaseへ両ZIP、catalog、signatureをuploadし、再取得して検証した後にstable公開する。公開済み同tagのZIPはclobberしない。修正は新しいCargo版で出す。metadataの期限更新だけは同じarchive hashで行える。
 4. `release-request.yml`の完了確認を、両ZIPの存在に加えてcatalog/signature/版/署名/hash一致まで拡張する。Releaseの公開とsource SHAの対応を保つ。
-5. bootstrapの手動導入、supported配置、macOSの署名、保存が必要なときの画面、手動復旧をREADMEへ反映する。現在のportable Windowsの方針をMSIX全体インストールへ読み替えない。
+5. bootstrapの手動導入、supported配置、macOSの起動許可、保存が必要なときの画面、手動復旧をREADMEへ反映する。現在のportable Windowsの方針をMSIX全体インストールへ読み替えない。
 
 通常product workerに`.github/`やtrusted policyを変更させない。署名secrets設定・Appleの外部審査・実配布を設計のチェック済み事項に含めない。
 

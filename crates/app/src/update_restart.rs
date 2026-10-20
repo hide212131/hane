@@ -20,14 +20,15 @@
 
 use std::path::{Path, PathBuf};
 
-use hane_ui::{PreparedUpdate, RestartTicketSnapshot};
+use hane_ui::context_menu::{self, ExplorerRegistration};
+use hane_ui::{ExplorerRepairScope, PreparedUpdate, RestartTicketSnapshot};
 use hane_update::helper::{PreparedRestart, prepare_restart};
 use hane_update::identity::TransactionId;
 use hane_update::platform::Placement;
 use hane_update::platform::lease::Coordination;
 use hane_update::state_root::{
-    self, Cleanup, MAX_POSITION, MAX_TICKET_FILES, RestartTicket, TicketContent, TicketFile,
-    TicketRestore, ticket_path_ok,
+    self, Cleanup, ExplorerTicket, MAX_POSITION, MAX_TICKET_FILES, RestartTicket, TicketContent,
+    TicketFile, TicketRestore, ticket_path_ok,
 };
 use hane_update::trust::TrustPolicy;
 use hane_update::windows_apply::CandidateSource;
@@ -97,6 +98,9 @@ pub(crate) struct HelperHandoff<S: HelperSession> {
     /// Re-confirms the Ready candidate and the install placement. Asked after
     /// the ticket was validated and before it is written.
     still_valid: Box<dyn Fn() -> Result<(), String> + Send>,
+    /// Reads the enabled Explorer integration before the update. A failure
+    /// keeps the ticket from being written.
+    explorer: Box<dyn Fn() -> Result<Option<ExplorerTicket>, String> + Send>,
 }
 
 impl<S: HelperSession> HelperHandoff<S> {
@@ -111,7 +115,44 @@ impl<S: HelperSession> HelperHandoff<S> {
             coordination,
             state_root,
             still_valid,
+            explorer: Box::new(capture_explorer),
         }
+    }
+
+    #[cfg(test)]
+    fn with_explorer(
+        mut self,
+        explorer: Box<dyn Fn() -> Result<Option<ExplorerTicket>, String> + Send>,
+    ) -> Self {
+        self.explorer = explorer;
+        self
+    }
+}
+
+/// The Explorer integration the user has ON, read by the trusted inspection.
+fn capture_explorer() -> Result<Option<ExplorerTicket>, String> {
+    context_menu::capture_explorer_registration()
+        .map(|registration| registration.map(explorer_ticket))
+        .map_err(|err| format!("Explorer 連携の現在の状態を確認できません: {err}"))
+}
+
+fn explorer_ticket(registration: ExplorerRegistration) -> ExplorerTicket {
+    ExplorerTicket {
+        owner: registration.owner,
+        package_name: registration.package_name,
+        publisher: registration.publisher,
+        file_enabled: registration.file_enabled,
+        folder_enabled: registration.folder_enabled,
+    }
+}
+
+fn explorer_registration(ticket: &ExplorerTicket) -> ExplorerRegistration {
+    ExplorerRegistration {
+        owner: ticket.owner.clone(),
+        package_name: ticket.package_name.clone(),
+        publisher: ticket.publisher.clone(),
+        file_enabled: ticket.file_enabled,
+        folder_enabled: ticket.folder_enabled,
     }
 }
 
@@ -127,11 +168,13 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
             .ok_or_else(|| "the update helper is gone".to_owned())?;
         let transaction = session.transaction();
         let still_valid = &self.still_valid;
+        let mut content = ticket_content(ticket);
+        content.explorer = (self.explorer)()?;
         state_root::issue_ticket(
             &self.coordination,
             &transaction,
             &self.state_root,
-            ticket_content(ticket),
+            content,
             || {
                 still_valid().map_err(|why| UpdateError::new(ErrorCode::IdentityMismatch, why))?;
                 if permit_is_fresh() {
@@ -198,6 +241,7 @@ pub(crate) fn ticket_content(snapshot: &RestartTicketSnapshot) -> TicketContent 
         work_folder: snapshot.work_folder.as_deref().and_then(ticket_text),
         files,
         active,
+        explorer: None,
     }
 }
 
@@ -213,6 +257,13 @@ pub struct RestorePlan {
     pub files: Vec<PathBuf>,
     /// Saved files that no longer exist (deleted or moved).
     pub missing: Vec<PathBuf>,
+    /// Why the Explorer integration could not be carried to the new version.
+    /// `None` when there was nothing to carry or it was carried. Shown to the
+    /// user: the update itself did succeed.
+    pub explorer_failure: Option<String>,
+    /// The registrations that were enabled before the update; the repair
+    /// guidance names only these. Meaningful only with `explorer_failure`.
+    pub explorer_repair: ExplorerRepairScope,
 }
 
 /// Turns a ticket into a plan. A file that is gone is recorded and skipped.
@@ -252,6 +303,8 @@ pub fn plan_restore(
         work_folder,
         files,
         missing,
+        explorer_failure: None,
+        explorer_repair: ExplorerRepairScope::default(),
     }
 }
 
@@ -261,6 +314,20 @@ const CLEANUP_ATTEMPTS: usize = 3;
 /// nothing to restore, the ticket was already used, or it is unusable; an
 /// unusable ticket never blocks the start.
 pub fn restore_after_commit(restore: &TicketRestore) -> Option<RestorePlan> {
+    restore_after_commit_with(restore, |saved| {
+        context_menu::migrate_explorer_registration(&explorer_registration(saved))
+    })
+}
+
+/// [`restore_after_commit`] with the Explorer migration as a seam. The
+/// migration runs only for a ticket this call claimed after the durable
+/// commit. A failure is reported and leaves the integration as the ordinary
+/// inspection sees it (Stale), never as a success; it does not stop the
+/// document restore.
+pub(crate) fn restore_after_commit_with(
+    restore: &TicketRestore,
+    migrate_explorer: impl FnOnce(&ExplorerTicket) -> std::io::Result<()>,
+) -> Option<RestorePlan> {
     let ticket = match restore.take() {
         Ok(Some(ticket)) => ticket,
         Ok(None) => return None,
@@ -269,9 +336,36 @@ pub fn restore_after_commit(restore: &TicketRestore) -> Option<RestorePlan> {
             return None;
         }
     };
-    let plan = plan_restore(&ticket, |path| path.is_file(), |path| path.is_dir());
+    let explorer_failure = carry_explorer(ticket.explorer.as_ref(), migrate_explorer);
+    let mut plan = plan_restore(&ticket, |path| path.is_file(), |path| path.is_dir());
+    if explorer_failure.is_some()
+        && let Some(saved) = ticket.explorer.as_ref()
+    {
+        plan.explorer_repair = ExplorerRepairScope {
+            file: saved.file_enabled,
+            folder: saved.folder_enabled,
+        };
+    }
+    plan.explorer_failure = explorer_failure;
     finish_cleanup(restore);
     Some(plan)
+}
+
+/// Runs the Explorer migration for a ticket that carries one. The failure
+/// reason is returned for the user-facing notice (and logged); nothing to carry
+/// or a successful migration is `None`.
+fn carry_explorer(
+    saved: Option<&ExplorerTicket>,
+    migrate: impl FnOnce(&ExplorerTicket) -> std::io::Result<()>,
+) -> Option<String> {
+    let saved = saved?;
+    match migrate(saved) {
+        Ok(()) => None,
+        Err(err) => {
+            eprintln!("Hane did not carry the Explorer integration over the update ({err}).");
+            Some(err.to_string())
+        }
+    }
 }
 
 /// The ticket is already used when this runs, so a failure only leaves the
@@ -380,6 +474,7 @@ mod tests {
                 })
                 .collect(),
             active,
+            explorer: None,
         }
     }
 
@@ -511,5 +606,74 @@ mod tests {
         // The permit went stale: no ticket.
         let (mut stale, _log) = handoff(&dir, false, Ok(()));
         assert!(stale.issue_ticket(&snapshot, &|| false).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_explorer_state_keeps_the_ticket_from_being_written() {
+        let dir = TempDir::new("handoff-explorer");
+        let snapshot = RestartTicketSnapshot {
+            work_folder: None,
+            files: vec![file("a.md")],
+            active: Some(0),
+        };
+        let (handoff, _log) = handoff(&dir, false, Ok(()));
+        let mut handoff =
+            handoff.with_explorer(Box::new(|| Err("Explorer 連携の状態を確認できません".to_owned())));
+        let err = handoff.issue_ticket(&snapshot, &|| true).unwrap_err();
+        assert!(err.contains("Explorer"));
+    }
+
+    #[test]
+    fn the_explorer_registration_converts_without_losing_owner_or_verbs() {
+        for (file_enabled, folder_enabled) in [(true, true), (true, false), (false, true)] {
+            let registration = ExplorerRegistration {
+                owner: "owner".to_owned(),
+                package_name: "Hane.ShellIntegration".to_owned(),
+                publisher: "CN=Hane".to_owned(),
+                file_enabled,
+                folder_enabled,
+            };
+            let ticket = explorer_ticket(registration.clone());
+            assert_eq!(ticket.owner, "owner");
+            assert_eq!(ticket.file_enabled, file_enabled);
+            assert_eq!(ticket.folder_enabled, folder_enabled);
+            assert_eq!(explorer_registration(&ticket), registration);
+        }
+    }
+
+    #[test]
+    fn a_migration_failure_is_reported_and_a_success_or_nothing_is_not() {
+        let saved = explorer_ticket(ExplorerRegistration {
+            owner: "owner".to_owned(),
+            package_name: "Hane.ShellIntegration".to_owned(),
+            publisher: "CN=Hane".to_owned(),
+            file_enabled: true,
+            folder_enabled: false,
+        });
+        let ran = std::cell::Cell::new(0);
+        assert_eq!(
+            carry_explorer(Some(&saved), |_| {
+                ran.set(ran.get() + 1);
+                Ok(())
+            }),
+            None
+        );
+        assert_eq!(ran.get(), 1);
+        let failure = carry_explorer(Some(&saved), |_| Err(std::io::Error::other("登録に失敗")));
+        assert!(failure.expect("a failure is reported").contains("登録に失敗"));
+        assert_eq!(
+            carry_explorer(None, |_| panic!("nothing to carry is never migrated")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_document_ticket_content_carries_no_explorer_state_by_itself() {
+        let snapshot = RestartTicketSnapshot {
+            work_folder: None,
+            files: vec![file("a.md")],
+            active: Some(0),
+        };
+        assert_eq!(ticket_content(&snapshot).explorer, None);
     }
 }

@@ -3284,7 +3284,7 @@ mod tests {
         cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
         view.update(cx, |view, cx| {
-            view.sidebar_filter = "needle".to_owned();
+            view.sidebar_filter = ShortTextInput::new("needle".to_owned());
             view.sidebar_filter_focused = true;
             cx.notify();
         });
@@ -3299,7 +3299,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(!view.sidebar_filter_focused);
             assert!(view.content_search_input_is_focused());
-            assert_eq!(view.sidebar_filter, "needle");
+            assert_eq!(view.sidebar_filter.text(), "needle");
         });
 
         cx.simulate_keystrokes("escape");
@@ -3321,7 +3321,7 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().document().full_text(), "on\n");
-            assert_eq!(view.sidebar_filter, "needle");
+            assert_eq!(view.sidebar_filter.text(), "needle");
         });
     }
 

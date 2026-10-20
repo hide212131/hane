@@ -1,23 +1,26 @@
 //! macOS bundle apply path of the helper (Issue #510, U4 increment 4).
 //!
 //! Everything here is OS-neutral so it can be tested anywhere. Each OS fact the
-//! swap depends on (volume kind, `RENAME_SWAP` support and call, the Developer
-//! ID signature check and the Gatekeeper assessment) comes from a
-//! [`BundleHost`]; `platform::macos::MacHost` is the only real one and it is
-//! compiled on macOS only.
+//! swap depends on (volume kind, `RENAME_SWAP` support and call, the bundle
+//! check) comes from a [`BundleHost`]; `platform::macos::MacHost` is the only
+//! real one and it is compiled on macOS only.
+//!
+//! Trust comes from the Ed25519 update key alone: the catalog and the
+//! inventory inside the bundle are signed with it. No Apple Developer ID, Team
+//! ID or notarization is required, and none of Apple's protections is turned
+//! off (no quarantine removal, no re-signing, no Gatekeeper bypass).
 //!
 //! The helper accepts no path, command or environment. Like the Windows path it
 //! reads only `Coordination::transaction_dir(<its own transaction>)/candidate/`
 //! and derives everything else itself:
 //!
 //! 1. the current bundle: fixed Bundle ID, Info.plist version / source SHA /
-//!    updater protocol, the pinned Team ID's Developer ID signature under
-//!    strict verification, and the Gatekeeper assessment,
+//!    updater protocol, and every file matching the signed inventory it carries,
 //! 2. the candidate catalog and signature (verified again, bound to the
-//!    requested candidate id) and the archive hash, inspection and extraction
-//!    into the transaction's own `stage/`,
+//!    requested candidate id) and the archive hash, inspection (including the
+//!    signed inventory) and extraction into the transaction's own `stage/`,
 //! 3. the staged candidate bundle: the same Info.plist facts, now also bound to
-//!    the signed catalog, and the same signature and Gatekeeper checks,
+//!    the signed catalog, and the same signed-inventory check,
 //! 4. that the install bundle and the staged candidate are on the same local,
 //!    writable APFS volume and that this volume really swaps (a probe swap of
 //!    two scratch directories between the two parents).
@@ -37,10 +40,11 @@
 //! recorded old nor new identity, a damaged or missing backup, or a journal that
 //! does not match ends as `RecoveryRequired` with nothing written.
 //!
-//! Not verified here: the real `renamex_np`, `codesign` and `spctl` calls and
-//! the power-loss durability of APFS. They need a real macOS volume and a real
-//! Developer ID signed candidate (U2 / U5 evidence).
+//! Not verified here: the real `renamex_np` call and the power-loss durability
+//! of APFS. They need a real macOS volume and a real two-version candidate
+//! (U2 / U5 evidence).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -53,14 +57,18 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{FileSeenStore, hash_regular_file, hash_regular_file_under, read_limited};
 use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, conclude_with_child};
 use crate::identity::{
-    ApplyPlan, FileIdentity, InstallId, PlanStep, ReleaseIdentity, TransactionId,
+    ApplyPlan, FileIdentity, InstallId, PlanStep, ReleaseIdentity, SignedInventory, TransactionId,
 };
 use crate::journal::{
     DiskView, DurableJournal, FileJournalStore, JournalStore, Observed, Phase, StepState,
     UpdateJournal, identity_matches,
 };
-use crate::limits::{JOURNAL_RESERVE_BYTES, MAX_CATALOG_BYTES, MAX_SIGNATURE_BYTES};
-use crate::model::{MACOS_BUNDLE_ID, Target, UPDATER_PROTOCOL};
+use crate::limits::{
+    JOURNAL_RESERVE_BYTES, MAX_CATALOG_BYTES, MAX_INVENTORY_BYTES, MAX_SIGNATURE_BYTES,
+};
+use crate::model::{
+    MACOS_BUNDLE_ID, MACOS_INVENTORY_REL, MACOS_INVENTORY_SIGNATURE_REL, Target, UPDATER_PROTOCOL,
+};
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
 use crate::trust::{SeenStore, TrustPolicy};
@@ -80,15 +88,12 @@ const MAX_PLIST_BYTES: u64 = 256 << 10;
 const STAGE_DIR: &str = "stage";
 const STAGED_APP: [&str; 2] = ["hane-macos-arm64", "Hane.app"];
 const MAIN_EXE: &str = "Contents/MacOS/hane";
+/// The updater helper inside the bundle, relative to `Hane.app`.
+pub const HELPER_REL: &str = "Contents/Helpers/hane-updater";
 /// The files a complete bundle must contain. The identity itself covers every
-/// entry under `Hane.app`; `CodeResources` is only a static manifest and does not
-/// vouch for the bytes actually on disk.
-const IDENTITY_FILES: [&str; 4] = [
-    "Contents/Info.plist",
-    MAIN_EXE,
-    "Contents/Helpers/hane-updater",
-    "Contents/_CodeSignature/CodeResources",
-];
+/// entry under `Hane.app`, including `Contents/_CodeSignature/CodeResources`
+/// when present; it is not required because bundles carry no Apple signature.
+const IDENTITY_FILES: [&str; 3] = ["Contents/Info.plist", MAIN_EXE, HELPER_REL];
 
 // ------------------------------------------------------------- the OS seam
 
@@ -120,11 +125,11 @@ pub trait BundleHost {
     /// storage, so the exchanged directory entries survive a power loss. An
     /// error means the exchange is not known to be durable.
     fn sync_swap(&self, first: &Path, second: &Path) -> Result<()>;
-    /// Strict verification of the complete bundle against the Developer ID
-    /// requirement pinned to exactly `team_id`.
-    fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()>;
-    /// The Gatekeeper assessment of the bundle, as the OS makes it.
-    fn assess_gatekeeper(&self, bundle: &Path) -> Result<()>;
+    /// Verification of the complete bundle against the Ed25519-signed
+    /// inventory it carries ([`verify_bundle_inventory`]). It is the only
+    /// content check: no Apple identity, notarization or Gatekeeper verdict is
+    /// asked for, and none is bypassed.
+    fn verify_bundle_inventory(&self, bundle: &Path, policy: &TrustPolicy) -> Result<()>;
     /// The relocation mark stored on the bundle directory itself (an extended
     /// attribute, which follows the directory through a rename or a move), or
     /// `None` if there is none. Any other failure is an error.
@@ -323,19 +328,105 @@ pub fn check_relocation_on_unsupported_volume(
     check_relocation(mark, &sentinel, current_parent, bundle)
 }
 
-pub fn valid_team_id(team_id: &str) -> bool {
-    team_id.len() == 10 && team_id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+/// Every regular file below `dir` with its size and hash, keyed by the path
+/// relative to the bundle. The signed inventory lists no link, so a symlink,
+/// any other kind of entry or a non-UTF-8 name is an error.
+fn collect_bundle_files(
+    dir: &Path,
+    prefix: &str,
+    out: &mut BTreeMap<String, (u64, String)>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("a name in {} is not UTF-8", dir.display()),
+            )
+        })?;
+        let path = dir.join(&name);
+        let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+        let kind = fs::symlink_metadata(&path)?.file_type();
+        if kind.is_dir() {
+            collect_bundle_files(&path, &rel, out)?;
+        } else if kind.is_file() {
+            let hashed = hash_regular_file(&path)?.ok_or_else(|| {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{} vanished while being read", path.display()),
+                )
+            })?;
+            out.insert(rel, hashed);
+        } else {
+            return Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} is not a plain file or directory", path.display()),
+            ));
+        }
+    }
+    Ok(())
 }
 
-/// The pinned Team ID, or `TrustUnconfigured` when this build embeds none.
-/// There is deliberately no fallback to "any Developer ID".
-pub fn required_team_id(policy: &TrustPolicy) -> Result<&str> {
-    policy.macos_team_id().ok_or_else(|| {
+/// Verifies `bundle` against the inventory it carries, signed with the
+/// embedded Ed25519 update key: the signature, the target / protocol / layout,
+/// the version and source SHA against the Info.plist, and that the files on
+/// disk are exactly the listed ones (no missing, extra or changed file). An
+/// unconfigured or wrong key, a bad signature or any difference fails closed.
+pub fn verify_bundle_inventory(bundle: &Path, policy: &TrustPolicy) -> Result<SignedInventory> {
+    ensure_real_dir(bundle)?;
+    let missing = |what: &str| UpdateError::new(ErrorCode::NotFound, format!("{what} is missing"));
+    let raw = read_limited(&bundle.join(MACOS_INVENTORY_REL), MAX_INVENTORY_BYTES)?
+        .ok_or_else(|| missing("the bundle inventory"))?;
+    let signature = read_limited(&bundle.join(MACOS_INVENTORY_SIGNATURE_REL), MAX_SIGNATURE_BYTES)?
+        .ok_or_else(|| missing("the bundle inventory signature"))?;
+    let signed = SignedInventory::verify(&raw, &signature, policy)?;
+    let inventory = signed.inventory();
+    let mismatch = |what: &str| {
         UpdateError::new(
-            ErrorCode::TrustUnconfigured,
-            "no macOS Team ID is embedded in this build",
+            ErrorCode::IdentityMismatch,
+            format!("the bundle inventory {what} does not describe this bundle"),
         )
-    })
+    };
+    if inventory.target != Target::MacosArm64.triple() {
+        return Err(mismatch("target"));
+    }
+    if inventory.updater_protocol != UPDATER_PROTOCOL {
+        return Err(UpdateError::new(
+            ErrorCode::ProtocolUnsupported,
+            "the bundle inventory updater protocol is not supported",
+        ));
+    }
+    if inventory.layout_revision != Target::MacosArm64.layout_revision() {
+        return Err(mismatch("layout revision"));
+    }
+    let facts = read_bundle_facts(bundle)?;
+    if inventory.version != facts.short_version {
+        return Err(mismatch("version"));
+    }
+    if inventory.source_sha != facts.source_commit {
+        return Err(mismatch("source SHA"));
+    }
+
+    let mut on_disk = BTreeMap::new();
+    collect_bundle_files(bundle, "", &mut on_disk)?;
+    on_disk.remove(MACOS_INVENTORY_REL);
+    on_disk.remove(MACOS_INVENTORY_SIGNATURE_REL);
+    let changed = || {
+        UpdateError::new(
+            ErrorCode::InstallModified,
+            "the bundle files differ from the signed inventory",
+        )
+    };
+    if on_disk.len() != inventory.files.len() {
+        return Err(changed());
+    }
+    for file in &inventory.files {
+        match on_disk.get(&file.path) {
+            Some((size, sha256)) if *size == file.size && *sha256 == file.sha256 => {}
+            _ => return Err(changed()),
+        }
+    }
+    Ok(signed)
 }
 
 // -------------------------------------------------------------- the bundle
@@ -553,14 +644,14 @@ pub struct BundleOps<'a> {
     /// Fixed before the exchange; `None` for startup recovery, which has no
     /// earlier placement to compare with.
     guard: Option<PlacementGuard>,
-    /// The bundle version and pinned Team ID taken from the signed candidate
-    /// and the policy; re-verified against the live bundle before the commit.
+    /// The bundle version taken from the signed candidate and the update-key
+    /// policy; re-verified against the live bundle before the commit.
     commit_check: Option<CommitCheck>,
 }
 
 struct CommitCheck {
     version: String,
-    team_id: String,
+    policy: TrustPolicy,
 }
 
 /// Directory identity (device, inode) of the install parent and of the two
@@ -651,9 +742,10 @@ impl<'a> BundleOps<'a> {
     }
 
     /// Fixes what the live bundle must be (version from the signed candidate,
-    /// the pinned Team ID) when the update is about to be committed.
-    pub fn with_commit_check(mut self, version: String, team_id: String) -> Self {
-        self.commit_check = Some(CommitCheck { version, team_id });
+    /// the signed inventory under the update key) when the update is about to
+    /// be committed.
+    pub fn with_commit_check(mut self, version: String, policy: TrustPolicy) -> Self {
+        self.commit_check = Some(CommitCheck { version, policy });
         self
     }
 
@@ -728,7 +820,7 @@ impl FileOps for BundleOps<'_> {
                 "the live bundle is not the signed candidate version",
             ));
         }
-        require_signed(self.host, &self.live, &check.team_id)
+        require_verified(self.host, &self.live, &check.policy)
     }
 
     /// Rolls back by exchanging again. The slot must still hold exactly the
@@ -793,9 +885,172 @@ fn require_local_apfs(host: &dyn BundleHost, path: &Path, what: &str) -> Result<
     Ok(volume)
 }
 
-fn require_signed(host: &dyn BundleHost, bundle: &Path, team_id: &str) -> Result<()> {
-    host.verify_developer_id(bundle, team_id)?;
-    host.assess_gatekeeper(bundle)
+fn require_verified(host: &dyn BundleHost, bundle: &Path, policy: &TrustPolicy) -> Result<()> {
+    host.verify_bundle_inventory(bundle, policy)
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    use crate::identity::{Inventory, InventoryFile};
+    use crate::model::{INVENTORY_DOMAIN, INVENTORY_SCHEMA};
+    use crate::testing::{TEST_KEY_ID, TEST_SOURCE_SHA, TempDir, sign, sign_with, test_policy};
+    use crate::util::sha256_hex;
+
+    const VERSION: &str = "0.26.0";
+
+    fn plist() -> String {
+        format!(
+            "<?xml version=\"1.0\"?>\n<plist version=\"1.0\"><dict>\n\
+             <key>CFBundleIdentifier</key>\n<string>{MACOS_BUNDLE_ID}</string>\n\
+             <key>CFBundleShortVersionString</key>\n<string>{VERSION}</string>\n\
+             <key>CFBundleVersion</key>\n<string>{VERSION}</string>\n\
+             <key>HaneSourceCommit</key>\n<string>{TEST_SOURCE_SHA}</string>\n\
+             <key>HaneUpdaterProtocol</key>\n<integer>1</integer>\n\
+             </dict></plist>\n"
+        )
+    }
+
+    fn payload() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("Contents/Info.plist", plist().into_bytes()),
+            ("Contents/MacOS/hane", b"hane".to_vec()),
+            (HELPER_REL, b"updater".to_vec()),
+        ]
+    }
+
+    /// Writes `files` plus a signed inventory over `listed` (by default the
+    /// same files). No Apple signature, Team ID or notarization data exists in
+    /// this bundle.
+    fn write_signed_bundle(
+        root: &Path,
+        files: &[(&'static str, Vec<u8>)],
+        listed: &[(&'static str, Vec<u8>)],
+        signer_seed: u8,
+        source_sha: &str,
+    ) {
+        for (rel, data) in files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        }
+        let inventory = Inventory {
+            schema: INVENTORY_SCHEMA,
+            version: VERSION.to_owned(),
+            target: Target::MacosArm64.triple().to_owned(),
+            source_sha: source_sha.to_owned(),
+            updater_protocol: UPDATER_PROTOCOL,
+            layout_revision: Target::MacosArm64.layout_revision(),
+            files: listed
+                .iter()
+                .map(|(path, data)| InventoryFile {
+                    path: (*path).to_owned(),
+                    size: data.len() as u64,
+                    sha256: sha256_hex(data),
+                })
+                .collect(),
+        };
+        let raw = serde_json::to_vec(&inventory).unwrap();
+        let signature = if signer_seed == 1 {
+            sign(INVENTORY_DOMAIN, &raw)
+        } else {
+            sign_with(signer_seed, TEST_KEY_ID, INVENTORY_DOMAIN, &raw)
+        };
+        for (rel, data) in [
+            (MACOS_INVENTORY_REL, raw),
+            (MACOS_INVENTORY_SIGNATURE_REL, signature),
+        ] {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        }
+    }
+
+    fn bundle(dir: &TempDir) -> PathBuf {
+        dir.path().join("Hane.app")
+    }
+
+    #[test]
+    fn a_bundle_without_any_apple_identity_verifies_under_the_update_key() {
+        let dir = TempDir::new("macos-inventory-ok");
+        let files = payload();
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        let signed = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap();
+        assert!(signed.inventory().files.iter().any(|file| file.path == HELPER_REL));
+    }
+
+    #[test]
+    fn code_resources_is_inventoried_when_present_and_optional_otherwise() {
+        let dir = TempDir::new("macos-inventory-seal");
+        let mut files = payload();
+        files.push(("Contents/_CodeSignature/CodeResources", b"seal".to_vec()));
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap();
+        // Present on disk but unlisted, or changed, is refused.
+        let seal = bundle(&dir).join("Contents/_CodeSignature/CodeResources");
+        fs::write(&seal, b"tampered").unwrap();
+        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+
+        let other = TempDir::new("macos-inventory-seal-unlisted");
+        write_signed_bundle(&bundle(&other), &payload(), &payload(), 1, TEST_SOURCE_SHA);
+        let seal = bundle(&other).join("Contents/_CodeSignature/CodeResources");
+        fs::create_dir_all(seal.parent().unwrap()).unwrap();
+        fs::write(&seal, b"seal").unwrap();
+        let err = verify_bundle_inventory(&bundle(&other), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+
+        // Without it, identity is still computed.
+        let bare = TempDir::new("macos-inventory-seal-absent");
+        write_signed_bundle(&bundle(&bare), &payload(), &payload(), 1, TEST_SOURCE_SHA);
+        assert!(matches!(bundle_identity(&bundle(&bare)).unwrap(), Observed::File(_)));
+    }
+
+    #[test]
+    fn an_unconfigured_or_foreign_update_key_is_refused() {
+        let dir = TempDir::new("macos-inventory-key");
+        let files = payload();
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        let err = verify_bundle_inventory(&bundle(&dir), &TrustPolicy::production()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TrustUnconfigured);
+
+        let other = TempDir::new("macos-inventory-forged");
+        write_signed_bundle(&bundle(&other), &files, &files, 2, TEST_SOURCE_SHA);
+        let err = verify_bundle_inventory(&bundle(&other), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SignatureInvalid);
+    }
+
+    #[test]
+    fn a_changed_extra_or_missing_file_is_refused() {
+        let files = payload();
+
+        let dir = TempDir::new("macos-inventory-changed");
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        fs::write(bundle(&dir).join(HELPER_REL), b"tampered").unwrap();
+        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+
+        let dir = TempDir::new("macos-inventory-extra");
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        fs::write(bundle(&dir).join("Contents/Resources/extra.sh"), b"#!").unwrap();
+        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+
+        let dir = TempDir::new("macos-inventory-missing");
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        fs::remove_file(bundle(&dir).join(MAIN_EXE)).unwrap();
+        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    #[test]
+    fn an_inventory_for_another_source_is_refused() {
+        let dir = TempDir::new("macos-inventory-source");
+        let files = payload();
+        write_signed_bundle(&bundle(&dir), &files, &files, 1, &"a".repeat(40));
+        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+    }
 }
 
 /// Independently re-verifies placement, both bundles, the candidate and the
@@ -820,17 +1075,11 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
     if !valid_candidate_id(inputs.candidate_id) {
         return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed candidate id"));
     }
-    // No pinned Team ID: nothing below can be trusted, so nothing is read.
-    let team_id = required_team_id(inputs.policy)?.to_owned();
-    if !valid_team_id(&team_id) {
-        return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed Team ID"));
-    }
-
     let live = &placement.install_root;
     let install_volume = require_local_apfs(host, live, "the installed bundle")?;
     let current = read_bundle_facts(live)?;
     check_bundle_facts(&current, "the installed bundle")?;
-    require_signed(host, live, &team_id)?;
+    require_verified(host, live, inputs.policy)?;
 
     let txn_dir = coordination.transaction_dir(inputs.transaction);
     let candidate_dir = txn_dir.join(CANDIDATE_DIR);
@@ -915,7 +1164,7 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
             "the candidate bundle was not built from the cataloged source",
         ));
     }
-    require_signed(host, &slot, &team_id)?;
+    require_verified(host, &slot, inputs.policy)?;
 
     // Same volume, and a volume that really swaps. A candidate somewhere else
     // is refused before anything is changed.
@@ -962,7 +1211,7 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
             catalog_sha256: None,
             inventory_sha256: None,
             bundle_id: Some(MACOS_BUNDLE_ID.to_owned()),
-            team_id: Some(team_id),
+            team_id: None,
         },
         destination: ReleaseIdentity::from_candidate(&candidate),
         steps: vec![PlanStep {
@@ -1118,9 +1367,8 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     let mut journal = DurableJournal::create(store, journal)?;
     // The placement is fixed before the first mutation; a bundle that cannot be
     // pinned is refused here, with nothing written.
-    let team_id = required_team_id(inputs.policy)?.to_owned();
     let mut ops = BundleOps::pinned(inputs.host, live, &verified.slot)?
-        .with_commit_check(verified.plan.destination.version.clone(), team_id);
+        .with_commit_check(verified.plan.destination.version.clone(), inputs.policy.clone());
     match swap_bundle(&mut journal, &mut ops) {
         Ok(()) => Ok(AppliedBundle { journal, ops }),
         Err(err) => match apply::recover(&mut journal, &mut ops, &mut NoChild) {
@@ -1144,8 +1392,8 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
 }
 
 /// The executable the limited-health child starts from: the live bundle, which
-/// must still be exactly the journaled new bundle and still verify against the
-/// pinned Team ID after the exchange.
+/// must still be exactly the journaled new bundle and still verify against its
+/// signed inventory after the exchange.
 fn verified_child(inputs: &BundleApplyInputs<'_>, applied: &AppliedBundle<'_>) -> Result<(PathBuf, String)> {
     let live = &inputs.placement.install_root;
     applied.ops.check_placement()?;
@@ -1159,8 +1407,7 @@ fn verified_child(inputs: &BundleApplyInputs<'_>, applied: &AppliedBundle<'_>) -
             "the live bundle differs from the journaled new bundle",
         ));
     }
-    let team_id = required_team_id(inputs.policy)?;
-    require_signed(inputs.host, live, team_id)?;
+    require_verified(inputs.host, live, inputs.policy)?;
     let exe = live.join(MAIN_EXE);
     hash_regular_file(&exe)?
         .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the bundle executable is missing"))?;
@@ -1247,7 +1494,7 @@ mod tests {
     use crate::journal::JournalStore;
     use crate::testing::{
         FixedClock, TEST_SOURCE_SHA, TempDir, ZipEntry, build_zip, catalog_doc, macos_entry,
-        sign_catalog, test_now, test_policy,
+        macos_inventory, sign_catalog, test_now, test_policy,
     };
     use crate::windows_apply::{CandidateSource, stage_candidate};
 
@@ -1336,7 +1583,6 @@ mod tests {
         /// `None` makes the free-space query fail.
         available: Cell<Option<u64>>,
         bad_signature: RefCell<Vec<PathBuf>>,
-        bad_gatekeeper: RefCell<Vec<PathBuf>>,
         journal_path: RefCell<Option<PathBuf>>,
         /// Journal phase and step state seen at each exchange.
         at_swap: RefCell<Vec<(Phase, StepState)>>,
@@ -1383,7 +1629,6 @@ mod tests {
                 slot_on_other_volume: Cell::new(false),
                 available: Cell::new(Some(u64::MAX)),
                 bad_signature: RefCell::new(Vec::new()),
-                bad_gatekeeper: RefCell::new(Vec::new()),
                 journal_path: RefCell::new(None),
                 at_swap: RefCell::new(Vec::new()),
                 marks: RefCell::new(BTreeMap::new()),
@@ -1481,17 +1726,9 @@ mod tests {
             Ok(())
         }
 
-        fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()> {
-            assert_eq!(team_id, crate::testing::TEST_TEAM_ID);
+        fn verify_bundle_inventory(&self, bundle: &Path, _policy: &TrustPolicy) -> Result<()> {
             if self.bad_signature.borrow().iter().any(|bad| bundle.starts_with(bad)) {
                 return Err(UpdateError::new(ErrorCode::SignatureInvalid, "bad signature"));
-            }
-            Ok(())
-        }
-
-        fn assess_gatekeeper(&self, bundle: &Path) -> Result<()> {
-            if self.bad_gatekeeper.borrow().iter().any(|bad| bundle.starts_with(bad)) {
-                return Err(UpdateError::new(ErrorCode::SignatureInvalid, "Gatekeeper rejected"));
             }
             Ok(())
         }
@@ -1532,7 +1769,14 @@ mod tests {
         let transaction = TransactionId::generate().unwrap();
         coordination.ensure_helper_dir(&transaction).unwrap();
 
-        let new_files = bundle_files(NEW, candidate_info);
+        let mut new_files = bundle_files(NEW, candidate_info);
+        // The archive carries the inventory signed with the update key, as the
+        // release does; there is no Apple signature, Team ID or notarization.
+        let listed: Vec<(String, Vec<u8>)> =
+            new_files.iter().map(|(rel, data)| ((*rel).to_owned(), data.clone())).collect();
+        let (inventory_raw, inventory_sig) = macos_inventory(NEW, &listed);
+        new_files.push((MACOS_INVENTORY_REL, inventory_raw.clone()));
+        new_files.push((MACOS_INVENTORY_SIGNATURE_REL, inventory_sig));
         let mut entries = vec![
             ZipEntry::dir("hane-macos-arm64/"),
             ZipEntry::dir("hane-macos-arm64/Hane.app/"),
@@ -1549,7 +1793,7 @@ mod tests {
         entries.push(ZipEntry::file("hane-macos-arm64/README.md", b"readme"));
         let unpacked: u64 = entries.iter().map(ZipEntry::declared).sum();
         let zip = build_zip(&entries);
-        let doc = catalog_doc(NEW, 2, Target::MacosArm64, macos_entry(NEW, &zip, unpacked));
+        let doc = catalog_doc(NEW, 2, Target::MacosArm64, macos_entry(NEW, &zip, unpacked, &inventory_raw));
         let (catalog, catalog_sig) = sign_catalog(&doc);
 
         let ready = dir.path().join("ready");
@@ -1775,8 +2019,17 @@ mod tests {
             assert_ne!(bundle_identity(&bundle).unwrap(), base, "{rel}");
             fs::write(&path, original).unwrap();
         }
+        // CodeResources is covered when present but is not required.
+        let seal = bundle.join("Contents/_CodeSignature/CodeResources");
+        let original = fs::read(&seal).unwrap();
+        fs::write(&seal, b"changed").unwrap();
+        assert_ne!(bundle_identity(&bundle).unwrap(), base);
+        fs::write(&seal, original).unwrap();
+        fs::remove_file(&seal).unwrap();
+        assert!(matches!(bundle_identity(&bundle).unwrap(), Observed::File(_)));
+        assert_ne!(bundle_identity(&bundle).unwrap(), base);
         // An incomplete bundle is an error, not an identity.
-        fs::remove_file(bundle.join("Contents/_CodeSignature/CodeResources")).unwrap();
+        fs::remove_file(bundle.join(HELPER_REL)).unwrap();
         assert!(bundle_identity(&bundle).is_err());
     }
 
@@ -1878,8 +2131,8 @@ mod tests {
         assert_eq!(step.backup_rel.as_deref(), Some(BACKUP_REL));
         assert_eq!(Some(Observed::File(step.new.clone().unwrap())), Some(bundle_identity(fx.live()).unwrap()));
         assert_eq!(Observed::File(step.old.clone().unwrap()), bundle_identity(&fx.slot()).unwrap());
-        assert_eq!(journal.source.team_id.as_deref(), Some(crate::testing::TEST_TEAM_ID));
-        assert_eq!(journal.destination.team_id.as_deref(), Some(crate::testing::TEST_TEAM_ID));
+        assert_eq!(journal.source.team_id, None);
+        assert_eq!(journal.destination.team_id, None);
         assert_eq!(journal.source.version, OLD);
         assert_eq!(journal.destination.version, NEW);
     }
@@ -2483,11 +2736,39 @@ mod tests {
     // ------------------------------------------------- refused before mutation
 
     #[test]
-    fn a_build_without_a_team_id_cannot_apply() {
+    fn a_build_without_an_update_key_cannot_apply() {
         let mut fx = fixture();
-        fx.policy = TrustPolicy::new(Vec::new(), None);
+        fx.policy = TrustPolicy::production();
         let err = apply_bundle(&fx.inputs()).err().unwrap();
         assert_eq!(err.code, ErrorCode::TrustUnconfigured);
+        assert!(fx.untouched());
+    }
+
+    /// The fixture has no Apple Developer ID, Team ID or notarization anywhere
+    /// (the fake host asks for none), and the update still applies.
+    #[test]
+    fn an_update_applies_without_any_apple_identity() {
+        let fx = fixture();
+        let applied = apply_bundle(&fx.inputs()).ok().unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+        assert!(fx.live_is_new());
+    }
+
+    #[test]
+    fn a_modified_archive_is_refused_before_any_mutation() {
+        let fx = fixture();
+        let archive = fx
+            .coordination
+            .transaction_dir(&fx.transaction)
+            .join(CANDIDATE_DIR)
+            .join(CANDIDATE_ARCHIVE);
+        let mut bytes = fs::read(&archive).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::remove_file(&archive).unwrap();
+        fs::write(&archive, bytes).unwrap();
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::HashMismatch);
         assert!(fx.untouched());
     }
 
@@ -2528,18 +2809,6 @@ mod tests {
         let err = apply_bundle(&fx.inputs()).err().unwrap();
         assert_eq!(err.code, ErrorCode::SignatureInvalid);
         assert!(fx.untouched());
-    }
-
-    #[test]
-    fn a_gatekeeper_rejection_of_either_bundle_is_refused() {
-        for rejected in [true, false] {
-            let fx = fixture();
-            let path = if rejected { fx.slot() } else { fx.live().to_path_buf() };
-            fx.host.bad_gatekeeper.borrow_mut().push(path);
-            let err = apply_bundle(&fx.inputs()).err().unwrap();
-            assert_eq!(err.code, ErrorCode::SignatureInvalid, "candidate rejected: {rejected}");
-            assert!(fx.untouched(), "candidate rejected: {rejected}");
-        }
     }
 
     #[test]

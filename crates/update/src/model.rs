@@ -25,6 +25,14 @@ pub const MACOS_BUNDLE_ID: &str = "io.github.hide212131.hane";
 pub const INVENTORY_FILE_NAME: &str = "hane-install.json";
 pub const INVENTORY_SIGNATURE_FILE_NAME: &str = "hane-install.json.sig";
 
+/// macOS: the signed inventory lives inside `Hane.app` (paths relative to the
+/// bundle), so the installed bundle can be verified against the same Ed25519
+/// update key as the catalog, without any Apple identity.
+pub const MACOS_INVENTORY_REL: &str = "Contents/Resources/hane-install.json";
+pub const MACOS_INVENTORY_SIGNATURE_REL: &str = "Contents/Resources/hane-install.json.sig";
+/// The bundle's directory inside the macOS archive, with a trailing slash.
+pub const MACOS_APP_PREFIX: &str = "hane-macos-arm64/Hane.app/";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Target {
     MacosArm64,
@@ -111,12 +119,14 @@ pub struct TargetEntry {
     pub archive_sha256: String,
     pub unpacked_size: u64,
     pub layout_revision: u64,
-    /// Windows: SHA-256 of the raw `hane-install.json` inside the ZIP.
+    /// SHA-256 of the raw signed inventory inside the ZIP (both targets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_sha256: Option<String>,
     /// macOS only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
+    /// No target carries a Team ID any more; a catalog that sets one is
+    /// rejected. The field stays so such a catalog parses and fails explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

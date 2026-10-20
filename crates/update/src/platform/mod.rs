@@ -3,7 +3,7 @@
 //! This stage covers what must exist before any file is replaced: confirming
 //! that an install is a supported placement, process-lifetime leases, and the
 //! verified current-version helper copy. Windows is portable x64 on a local
-//! fixed NTFS volume; macOS is a Developer ID `.app` bundle on APFS. Every
+//! fixed NTFS volume; macOS is a `.app` bundle on APFS. Every
 //! other placement is `UnsupportedInstall` (fail closed); ordinary editing
 //! still works there, it just never offers an update.
 //!

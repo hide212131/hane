@@ -19,7 +19,7 @@ use crate::fsutil::{durable_write, hash_regular_file_under, read_limited};
 use crate::identity::FileIdentity;
 use crate::journal::{
     DiskView, DurableJournal, JournalStore, Observed, Phase, RecoveryDecision, RollbackAction,
-    StepState, decide_recovery, identity_matches,
+    StepState, decide_recovery, first_unchanged_mismatch, identity_matches,
 };
 use crate::limits::MAX_ENTRY_BYTES;
 use crate::paths::validate_rel_path;
@@ -58,7 +58,7 @@ pub trait FileOps: DiskView {
     }
     /// Re-verifies, right before `Committed`, everything the install must be
     /// beyond the journaled steps (Windows: the unchanged owned files; macOS:
-    /// the bundle facts and the Developer ID signature). The expectation was
+    /// the bundle facts and the signed inventory). The expectation was
     /// fixed from the signed candidate, never learned from the live install.
     /// An error (mismatch or failed query) prevents the commit.
     fn verify_commit_state(&self) -> Result<()> {
@@ -194,6 +194,14 @@ fn run_steps<S: JournalStore, O: FileOps>(
             ));
         }
     }
+    // The files the update leaves alone must still be the signed ones before
+    // the new version is allowed to run.
+    if let Some(path) = first_unchanged_mismatch(journal.journal(), &*ops)? {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{path} differs from the signed inventory"),
+        ));
+    }
     journal.advance_phase(Phase::AwaitingHealth)
 }
 
@@ -273,6 +281,12 @@ fn verify_before_commit<S: JournalStore, O: FileOps>(
                 format!("{} differs from the signed new version", step.rel_path),
             ));
         }
+    }
+    if let Some(path) = first_unchanged_mismatch(journal.journal(), ops)? {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{path} differs from the signed inventory"),
+        ));
     }
     ops.verify_commit_state()
 }
@@ -783,7 +797,98 @@ fn finish_scratch(
     (result, None)
 }
 
-#[cfg(not(windows))]
+// Test seam: runs right after the verified file was moved aside.
+#[cfg(all(unix, test))]
+type AfterDisplaceHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static AFTER_DISPLACE: std::cell::RefCell<Option<AfterDisplaceHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn after_displace_hook(path: &Path) {
+    AFTER_DISPLACE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+}
+
+/// Unix: the verified file is moved aside with one atomic rename and the moved
+/// object is compared with the verified one; a different object is moved back
+/// untouched and the install fails. The new file is then hard-linked into the
+/// free name (fails rather than overwrite anything that appeared). On failure
+/// the verified file is put back without replacing. An existing file without a
+/// verified pin is never replaced.
+#[cfg(unix)]
+fn place(
+    temp: &Path,
+    scratch: &Path,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    pin: Option<PinnedFile>,
+) -> Result<()> {
+    match pin {
+        Some(pin) => {
+            let mut aside_name = name.to_os_string();
+            aside_name.push(".aside");
+            let aside = scratch.join(aside_name);
+            pin.displace(path, &aside)?;
+            #[cfg(test)]
+            after_displace_hook(path);
+            if let Err(err) = std::fs::hard_link(temp, path) {
+                return match PinnedFile::put_back(&aside, path) {
+                    Ok(()) => Err(err.into()),
+                    // The old file stays at `aside` (it is neither deleted
+                    // nor cleaned up) and the file now at `path` is not
+                    // touched: recovery is required, at the exact location.
+                    Err(back) => Err(UpdateError::new(
+                        ErrorCode::Io,
+                        format!(
+                            "recovery required: {} could not be put back after a failed install ({back}); \
+                             the previous file is preserved at {}",
+                            path.display(),
+                            aside.display()
+                        ),
+                    )),
+                };
+            }
+            // The displaced file is ours; deleting it is cleanup. If it
+            // cannot be removed it is not silently left untracked.
+            match std::fs::remove_file(&aside) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(UpdateError::new(
+                        ErrorCode::Io,
+                        format!(
+                            "recovery required: the previous file of {} remains at {} ({err})",
+                            path.display(),
+                            aside.display()
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        None => match std::fs::symlink_metadata(path) {
+            Ok(_) => Err(UpdateError::new(
+                ErrorCode::InstallModified,
+                format!("{} was not verified before replacement", path.display()),
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Atomic no-replace: fails with AlreadyExists if a file showed up.
+                std::fs::hard_link(temp, path)?;
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        },
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 fn place(
     temp: &Path,
     _scratch: &Path,
@@ -955,13 +1060,14 @@ impl FileOps for FsFileOps {
         self.pinned = None;
         self.dir_pins = None;
         #[cfg(windows)]
+        if !rel_path.starts_with(BACKUP_PREFIX) {
+            // Bind the existing ancestors before the target itself, so a
+            // new file's parents are fixed from the moment it is validated.
+            let pins = self.pin_hierarchy(rel_path, false)?;
+            self.dir_pins = Some((rel_path.to_string(), pins));
+        }
+        #[cfg(any(windows, unix))]
         {
-            if !rel_path.starts_with(BACKUP_PREFIX) {
-                // Bind the existing ancestors before the target itself, so a
-                // new file's parents are fixed from the moment it is validated.
-                let pins = self.pin_hierarchy(rel_path, false)?;
-                self.dir_pins = Some((rel_path.to_string(), pins));
-            }
             let (base, rest) = self.locate(rel_path)?;
             let path = base.join(rest);
             let mismatch = || {
@@ -983,7 +1089,7 @@ impl FileOps for FsFileOps {
                 _ => return Err(mismatch()),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, unix)))]
         let _ = (rel_path, expected);
         Ok(())
     }
@@ -1052,7 +1158,33 @@ impl FileOps for FsFileOps {
                 })?;
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            // Only the verified file, moved out of the install namespace with
+            // one atomic rename and compared with the verified object; any
+            // other object is moved back and kept.
+            let pin = pin.ok_or_else(|| {
+                UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!("{rel_path} was not verified before removal"),
+                )
+            })?;
+            let path = base.join(rest);
+            let parent = path
+                .parent()
+                .ok_or_else(|| UpdateError::new(ErrorCode::Io, "install path has no parent directory"))?;
+            let scratch = make_scratch_dir(parent)?;
+            let aside = scratch.join("removed");
+            let result = pin.displace(&path, &aside);
+            if result.is_ok() {
+                // Deleting the displaced file is cleanup.
+                let _ = std::fs::remove_file(&aside);
+            }
+            // Nothing but an empty directory is ever removed here.
+            let _ = std::fs::remove_dir(&scratch);
+            result?;
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             let _ = pin;
             std::fs::remove_file(base.join(rest))?;
@@ -1396,6 +1528,138 @@ mod tests {
         assert_eq!(ops.files["user.md"], b"third party");
     }
 
+    fn plan_with_unchanged() -> ApplyPlan {
+        let mut plan = plan();
+        plan.unchanged = vec![crate::identity::UnchangedFile {
+            rel_path: "user.md".to_string(),
+            identity: FileIdentity::of(b"user data"),
+        }];
+        plan
+    }
+
+    /// The journal alone carries the unchanged identities; `FakeOps` has none.
+    fn journaled_unchanged() -> (DurableJournal<FlakyStore>, FakeOps, Child) {
+        let journal = UpdateJournal::begin(&plan_with_unchanged(), None).unwrap();
+        (
+            DurableJournal::create(flaky(), journal).unwrap(),
+            FakeOps::new(),
+            Child::default(),
+        )
+    }
+
+    #[test]
+    fn a_matching_unchanged_file_lets_the_journaled_update_commit() {
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert_eq!(outcome, ApplyOutcome::AwaitingHealth);
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert_eq!(health, HealthOutcome::Committed);
+        assert_eq!(ops.files["user.md"], b"user data");
+    }
+
+    #[test]
+    fn an_unchanged_file_changed_during_apply_never_reaches_awaiting_health() {
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        // Three backups, then a.dll (4) and added.txt (5) are installed.
+        ops.inject_after = Some((5, "user.md".to_string(), b"third party".to_vec()));
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::RecoveryRequired(_)), "{outcome:?}");
+        assert_ne!(journal.journal().phase, Phase::AwaitingHealth);
+        assert_ne!(journal.journal().phase, Phase::Committed);
+        assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    #[test]
+    fn an_unchanged_file_changed_after_apply_is_not_committed_from_the_journal_alone() {
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        let outcome = apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        assert_eq!(outcome, ApplyOutcome::AwaitingHealth);
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let health = conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert!(matches!(health, HealthOutcome::RecoveryRequired(_)), "{health:?}");
+        assert_ne!(journal.journal().phase, Phase::Committed);
+        assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    #[test]
+    fn terminal_receipts_reject_a_changed_unchanged_file_and_keep_it() {
+        // Committed receipt.
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        conclude_health(&mut journal, &mut ops, &mut child, true).unwrap();
+        assert_eq!(journal.journal().phase, Phase::Committed);
+        let install = journal.journal().install_id.clone();
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert_eq!(decision, RecoveryDecision::KeepNew);
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert!(matches!(decision, RecoveryDecision::RecoveryRequired(_)), "{decision:?}");
+        assert_eq!(ops.files["user.md"], b"third party");
+
+        // RolledBack receipt.
+        let (mut journal, mut ops, mut child) = journaled_unchanged();
+        apply(&mut journal, &mut ops, &Parent(true), &mut child).unwrap();
+        conclude_health(&mut journal, &mut ops, &mut child, false).unwrap();
+        assert_eq!(journal.journal().phase, Phase::RolledBack);
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert_eq!(decision, RecoveryDecision::KeepOld);
+        ops.files.insert("user.md".to_string(), b"third party".to_vec());
+        let decision = decide_recovery(Some(journal.journal()), &install, &ops).unwrap();
+        assert!(matches!(decision, RecoveryDecision::RecoveryRequired(_)), "{decision:?}");
+        assert_eq!(ops.files["user.md"], b"third party");
+    }
+
+    #[test]
+    fn the_journal_rejects_damaged_unchanged_identities_and_round_trips_valid_ones() {
+        let valid = UpdateJournal::begin(&plan_with_unchanged(), None).unwrap();
+        assert_eq!(valid.unchanged.len(), 1);
+        let bytes = serde_json::to_vec(&valid).unwrap();
+        let back: UpdateJournal = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, valid);
+        assert!(back.validate().is_ok());
+
+        let mut bad_hash = valid.clone();
+        bad_hash.unchanged[0].identity.sha256 = "zz".to_string();
+        let mut bad_path = valid.clone();
+        bad_path.unchanged[0].rel_path = "../escape".to_string();
+        let mut backup_path = valid.clone();
+        backup_path.unchanged[0].rel_path = "backup/user.md".to_string();
+        let mut duplicate = valid.clone();
+        duplicate.unchanged.push(duplicate.unchanged[0].clone());
+        let mut overlaps_step = valid.clone();
+        overlaps_step.unchanged[0].rel_path = "a.dll".to_string();
+        for journal in [bad_hash, bad_path, backup_path, duplicate, overlaps_step] {
+            assert!(journal.validate().is_err(), "{journal:?}");
+        }
+    }
+
+    #[test]
+    fn a_journal_without_the_unchanged_key_is_rejected_and_an_empty_list_round_trips() {
+        // An explicitly empty list is written and read back as empty.
+        let mut empty = UpdateJournal::begin(&plan(), None).unwrap();
+        assert!(empty.unchanged.is_empty());
+        let value = serde_json::to_value(&empty).unwrap();
+        assert_eq!(value["unchanged"], serde_json::json!([]));
+        let back: UpdateJournal = serde_json::from_value(value).unwrap();
+        assert_eq!(back, empty);
+
+        // A missing key is never completed with an empty list, in any phase.
+        let mut non_empty = UpdateJournal::begin(&plan_with_unchanged(), None).unwrap();
+        for phase in [Phase::Prepared, Phase::Committed, Phase::RolledBack] {
+            empty.phase = phase;
+            non_empty.phase = phase;
+            for journal in [&empty, &non_empty] {
+                let mut value = serde_json::to_value(journal).unwrap();
+                assert!(value.as_object_mut().unwrap().remove("unchanged").is_some());
+                assert!(
+                    serde_json::from_value::<UpdateJournal>(value.clone()).is_err(),
+                    "{phase:?}: {value}"
+                );
+                assert!(serde_json::from_slice::<UpdateJournal>(value.to_string().as_bytes()).is_err());
+            }
+        }
+    }
+
     #[test]
     fn begin_and_validate_reject_backup_paths_outside_the_canonical_backup() {
         let canonical = UpdateJournal::begin(&plan(), None).unwrap();
@@ -1717,14 +1981,14 @@ mod tests {
         assert_eq!(journal.journal().phase, Phase::AwaitingHealth);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     struct RaceFixture {
         _dir: TempDir,
         root: std::path::PathBuf,
         ops: FsFileOps,
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn race_fixture() -> RaceFixture {
         let dir = TempDir::new("apply-race");
         let root = dir.path().join("install");
@@ -1762,6 +2026,119 @@ mod tests {
             flag.set(moved && replaced);
         };
         (Box::new(hook), refused)
+    }
+
+    /// Hook that, between the identity check and the mutation, renames a
+    /// third-party file over the target.
+    #[cfg(unix)]
+    fn unix_swap(root: &std::path::Path) -> Box<dyn FnMut()> {
+        let target = root.join("a.dll");
+        let third = root.join("third.tmp");
+        Box::new(move || {
+            fs::rename(&third, &target).unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_install_never_overwrites_a_file_swapped_in_after_verification() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops.before_mutation = Some(unix_swap(&fx.root));
+        let err = fx
+            .ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_remove_never_deletes_a_file_swapped_in_after_verification() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops.before_mutation = Some(unix_swap(&fx.root));
+        assert!(fx.ops.remove("a.dll").is_err());
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_restore_never_overwrites_a_file_swapped_in_after_verification() {
+        let mut fx = race_fixture();
+        fs::write(fx.root.join("a.dll"), NEW_DLL).unwrap();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL)))
+            .unwrap();
+        fx.ops.before_mutation = Some(unix_swap(&fx.root));
+        assert!(
+            fx.ops
+                .restore("a.dll", "backup/a.dll", &FileIdentity::of(OLD_DLL))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_verified_file_is_still_replaced_removed_and_restored_when_unchanged() {
+        let mut fx = race_fixture();
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops
+            .install_new("a.dll", &FileIdentity::of(NEW_DLL))
+            .unwrap();
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), NEW_DLL);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL)))
+            .unwrap();
+        fx.ops
+            .restore("a.dll", "backup/a.dll", &FileIdentity::of(OLD_DLL))
+            .unwrap();
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+        fx.ops
+            .bind_target("a.dll", &Some(FileIdentity::of(OLD_DLL)))
+            .unwrap();
+        fx.ops.remove("a.dll").unwrap();
+        assert!(!fx.root.join("a.dll").exists());
+        assert_eq!(fs::read(fx.root.join("third.tmp")).unwrap(), b"third party");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_mutation_without_a_verified_binding_or_with_a_wrong_one_changes_nothing() {
+        let mut fx = race_fixture();
+        assert!(fx.ops.install_new("a.dll", &FileIdentity::of(NEW_DLL)).is_err());
+        assert!(fx.ops.remove("a.dll").is_err());
+        assert!(
+            fx.ops
+                .bind_target("a.dll", &Some(FileIdentity::of(b"other")))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("a.dll")).unwrap(), OLD_DLL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_an_added_file_created_by_a_third_party_first_is_never_overwritten() {
+        let mut fx = race_fixture();
+        fx.ops.bind_target("added.txt", &None).unwrap();
+        let added = fx.root.join("added.txt");
+        fx.ops.before_mutation = Some(Box::new(move || {
+            fs::write(&added, b"third party").unwrap();
+        }));
+        assert!(
+            fx.ops
+                .install_new("added.txt", &FileIdentity::of(NEW_ADDED))
+                .is_err()
+        );
+        assert_eq!(fs::read(fx.root.join("added.txt")).unwrap(), b"third party");
     }
 
     #[cfg(windows)]
@@ -2201,9 +2578,9 @@ mod tests {
         );
     }
 
-    /// Windows displaces an existing file only through a handle whose identity
-    /// was checked, so the pin is bound to the expected content first.
-    #[cfg(windows)]
+    /// Windows and Unix displace an existing file only through a handle whose
+    /// identity was checked, so the pin is bound to the expected content first.
+    #[cfg(any(windows, unix))]
     fn pin_existing_for_test(path: &Path, expected: &[u8]) -> Option<PinnedFile> {
         let pin = PinnedFile::open(path)
             .unwrap()
@@ -2213,7 +2590,7 @@ mod tests {
     }
 
     /// Elsewhere the existing file is replaced by path, so no pin is needed.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, unix)))]
     fn pin_existing_for_test(_path: &Path, _expected: &[u8]) -> Option<PinnedFile> {
         None
     }
@@ -2244,6 +2621,46 @@ mod tests {
             .filter(|n| n.starts_with(".hane-update-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_a_destination_filled_by_a_third_party_keeps_the_old_file_recoverable() {
+        let dir = TempDir::new("apply-displaced-kept");
+        let root = dir.path().join("install");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.dll"), OLD_DLL).unwrap();
+        let pin = pin_existing_for_test(&root.join("a.dll"), OLD_DLL);
+
+        // After the old file is moved aside, a third party takes its name.
+        AFTER_DISPLACE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|path: &Path| {
+                fs::write(path, b"third party").unwrap();
+            }));
+        });
+        let result = install_write(&root.join("a.dll"), NEW_DLL, pin);
+        AFTER_DISPLACE.with(|slot| *slot.borrow_mut() = None);
+
+        let err = result.unwrap_err();
+        assert!(err.detail.contains("recovery required"), "{}", err.detail);
+        assert_eq!(fs::read(root.join("a.dll")).unwrap(), b"third party");
+
+        // The old file is preserved exactly where the message says.
+        let scratch: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".hane-update-"))
+            })
+            .collect();
+        assert_eq!(scratch.len(), 1, "{scratch:?}");
+        let aside = scratch[0].join("a.dll.aside");
+        assert_eq!(fs::read(&aside).unwrap(), OLD_DLL);
+        assert!(err.detail.contains(&aside.display().to_string()), "{}", err.detail);
+        // Only the file the updater created was cleaned up.
+        assert!(!scratch[0].join("a.dll").exists());
     }
 
     /// Runs the real replace path on whatever OS executes the tests; on Windows

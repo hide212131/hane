@@ -37,7 +37,7 @@ use crate::testing::{
     default_payload, macos_entry, release_json, sign, sign_catalog, sign_with, test_now,
     test_policy, windows_release, windows_release_with,
 };
-use crate::trust::{SeenCatalog, SeenStore, TrustPolicy, TrustedKey};
+use crate::trust::{SeenCatalog, SeenStore, TrustPolicy};
 use crate::util::{parse_rfc3339_utc, sha256_hex};
 use crate::version::{
     VersionRelation, parse_current_version, parse_release_tag, parse_stable_version, relation,
@@ -613,7 +613,7 @@ fn file_seen_store_round_trips_and_rejects_corruption() {
 }
 
 #[test]
-fn macos_candidates_need_the_pinned_identity() {
+fn macos_candidates_need_the_update_key_and_bundle_identity_but_no_apple_identity() {
     let zip = build_zip(&[ZipEntry::file("hane-macos-arm64/README.md", b"x")]);
     let verify = |entry: crate::model::TargetEntry, policy: &TrustPolicy| {
         let doc = catalog_doc(NEW_VERSION, 3, Target::MacosArm64, entry);
@@ -628,28 +628,26 @@ fn macos_candidates_need_the_pinned_identity() {
             None,
         )
     };
-    let good = macos_entry(NEW_VERSION, &zip, 1);
+    let good = macos_entry(NEW_VERSION, &zip, 1, b"inventory");
+    // No Apple Developer ID, Team ID or notarization is needed.
     assert!(verify(good.clone(), &test_policy()).unwrap().is_applicable());
+    assert_eq!(
+        code(verify(good.clone(), &TrustPolicy::production())),
+        ErrorCode::TrustUnconfigured
+    );
 
-    let keys = vec![TrustedKey {
-        key_id: crate::testing::TEST_KEY_ID.to_string(),
-        public_key: crate::testing::public_key(1),
-    }];
-    let no_team = TrustPolicy::new(keys, None);
-    assert_eq!(code(verify(good.clone(), &no_team)), ErrorCode::TrustUnconfigured);
-
-    let mut other_team = good.clone();
-    other_team.team_id = Some("EVILTEAM99".into());
-    assert_eq!(code(verify(other_team, &test_policy())), ErrorCode::IdentityMismatch);
+    let mut with_team = good.clone();
+    with_team.team_id = Some("EVILTEAM99".into());
+    assert_eq!(code(verify(with_team, &test_policy())), ErrorCode::MalformedMetadata);
     let mut other_bundle = good.clone();
     other_bundle.bundle_id = Some("com.example.fake".into());
     assert_eq!(code(verify(other_bundle, &test_policy())), ErrorCode::IdentityMismatch);
     let mut other_version = good.clone();
     other_version.bundle_version = Some("9.9.9".into());
     assert_eq!(code(verify(other_version, &test_policy())), ErrorCode::IdentityMismatch);
-    let mut with_inventory = good;
-    with_inventory.inventory_sha256 = Some(sha256_hex(b"x"));
-    assert_eq!(code(verify(with_inventory, &test_policy())), ErrorCode::MalformedMetadata);
+    let mut no_inventory = good;
+    no_inventory.inventory_sha256 = None;
+    assert_eq!(code(verify(no_inventory, &test_policy())), ErrorCode::MalformedMetadata);
 }
 
 #[test]
@@ -1623,6 +1621,11 @@ fn macos_zip(extra: Vec<ZipEntry>, with_helper: bool) -> Vec<u8> {
         ZipEntry::dir("hane-macos-arm64/Hane.app/"),
         ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Info.plist", b"plist"),
         ZipEntry::file("hane-macos-arm64/Hane.app/Contents/MacOS/hane", b"bin").executable(),
+        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json", b"{}"),
+        ZipEntry::file(
+            "hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json.sig",
+            b"{}",
+        ),
         ZipEntry::file("hane-macos-arm64/README.md", b"readme"),
     ];
     if with_helper {

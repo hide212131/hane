@@ -58,9 +58,195 @@ pub fn set_file_context_menu(enabled: bool) -> io::Result<()> {
     }
 }
 
+/// The Explorer integration that is enabled for the current user: the owner and
+/// package identity, and which verbs (file / folder) are ON. Read before an
+/// update and carried to the new package version afterwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplorerRegistration {
+    pub owner: String,
+    pub package_name: String,
+    pub publisher: String,
+    pub file_enabled: bool,
+    pub folder_enabled: bool,
+}
+
+/// Builds the registration to carry from what the trusted inspection read.
+/// `Ok(None)` only when neither verb is ON (nothing is turned on that was off).
+/// When a verb is ON but the package publisher is missing or empty, the
+/// registration cannot be inspected and that is an error: it is never read as
+/// "not registered".
+pub fn registration_from_inspection(
+    owner: &str,
+    package_name: &str,
+    publisher: Option<String>,
+    file_enabled: bool,
+    folder_enabled: bool,
+) -> io::Result<Option<ExplorerRegistration>> {
+    if !file_enabled && !folder_enabled {
+        return Ok(None);
+    }
+    let publisher = publisher
+        .map(|publisher| publisher.trim().to_owned())
+        .filter(|publisher| !publisher.is_empty())
+        .ok_or_else(|| {
+            io::Error::other(
+                "Explorer 連携が有効ですが、Explorer 拡張パッケージの所有者を確認できません",
+            )
+        })?;
+    Ok(Some(ExplorerRegistration {
+        owner: owner.to_owned(),
+        package_name: package_name.to_owned(),
+        publisher,
+        file_enabled,
+        folder_enabled,
+    }))
+}
+
+/// Reads the enabled Explorer integration of the current user. `Ok(None)` when
+/// it is off, was never registered, or this is not Windows 11.
+pub fn capture_explorer_registration() -> io::Result<Option<ExplorerRegistration>> {
+    #[cfg(windows)]
+    {
+        windows::capture_registration()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(None)
+    }
+}
+
+/// Carries `saved` to the newly installed version, after the update committed.
+/// Only the verbs that were ON are carried.
+pub fn migrate_explorer_registration(saved: &ExplorerRegistration) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::migrate_registration(saved)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = saved;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Explorer 拡張の登録はWindowsでのみ利用できます",
+        ))
+    }
+}
+
+/// The migration with its environment as seams. The ownership and package
+/// identity are re-confirmed first. The Publisher of the package that is about
+/// to be installed (`package_publisher`, read from its manifest) must equal the
+/// saved one before anything is installed, and the Publisher of the installed
+/// target version (`installed_target_publisher`) must equal it afterwards. A
+/// failed confirmation or registration is an error: success is never assumed,
+/// a new Publisher is never trusted automatically, and nothing is written for
+/// a verb that was OFF.
+pub fn migrate_registration_with(
+    saved: &ExplorerRegistration,
+    expected_owner: &str,
+    expected_package: &str,
+    package_publisher: impl FnOnce() -> io::Result<Option<String>>,
+    marker_owned: impl Fn(ExplorerVerb) -> io::Result<bool>,
+    register_package: impl FnOnce() -> io::Result<()>,
+    installed_target_publisher: impl FnOnce() -> io::Result<Option<String>>,
+) -> io::Result<()> {
+    if !saved.file_enabled && !saved.folder_enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "引き継ぐ Explorer 登録に有効な項目がありません",
+        ));
+    }
+    if saved.owner != expected_owner || saved.package_name != expected_package {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "更新前の Explorer 登録の所有者が Hane のものと一致しません",
+        ));
+    }
+    match package_publisher()? {
+        Some(publisher) if !publisher.trim().is_empty() && publisher == saved.publisher => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "導入する Explorer 拡張パッケージの発行元が更新前と一致しないため登録を引き継ぎません",
+            ));
+        }
+    }
+    for (enabled, verb) in [
+        (saved.file_enabled, ExplorerVerb::File),
+        (saved.folder_enabled, ExplorerVerb::Folder),
+    ] {
+        if enabled && !marker_owned(verb)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "更新前に有効だった Explorer 登録のマーカーが変更されているため引き継ぎません",
+            ));
+        }
+    }
+    register_package()?;
+    match installed_target_publisher()? {
+        Some(publisher) if publisher == saved.publisher => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "導入後の Explorer 拡張パッケージの発行元が更新前と一致しません",
+        )),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn quote_ps(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// PowerShell script that prints the Publisher of the installed package
+/// `name` of exactly `version` (other versions are never consulted).
+#[cfg(any(windows, test))]
+fn installed_target_script(name: &str, version: &str) -> String {
+    format!(
+        "$p = Get-AppxPackage -Name {} -ErrorAction SilentlyContinue | Where-Object {{ $_.Version.ToString() -eq {} }} | Select-Object -First 1; if ($p) {{ [Console]::Out.Write($p.Publisher); exit 0 }} else {{ exit 3 }}",
+        quote_ps(name),
+        quote_ps(version),
+    )
+}
+
+/// PowerShell script that prints the Publisher declared by the
+/// AppxManifest.xml inside the MSIX at `package`, exiting 3 unless the
+/// package identity name is `name`.
+#[cfg(any(windows, test))]
+fn msix_manifest_script(package: &str, name: &str) -> String {
+    format!(
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem; $z = [System.IO.Compression.ZipFile]::OpenRead({}); try {{ $e = $z.GetEntry('AppxManifest.xml'); if (-not $e) {{ exit 3 }}; $r = New-Object System.IO.StreamReader($e.Open()); try {{ [xml]$x = $r.ReadToEnd() }} finally {{ $r.Dispose() }}; $i = $x.Package.Identity; if (-not $i -or $i.Name -ne {}) {{ exit 3 }}; [Console]::Out.Write($i.Publisher); exit 0 }} finally {{ $z.Dispose() }}",
+        quote_ps(package),
+        quote_ps(name),
+    )
+}
+
+/// Interprets the exit code and stdout of a Publisher query: 0 with output is
+/// the Publisher, 3 or empty output is "not found", anything else is an error.
+#[cfg(any(windows, test))]
+fn publisher_from_result(code: Option<i32>, stdout: &[u8]) -> io::Result<Option<String>> {
+    match code {
+        Some(0) => {
+            let publisher = String::from_utf8_lossy(stdout).trim().to_owned();
+            Ok((!publisher.is_empty()).then_some(publisher))
+        }
+        Some(3) => Ok(None),
+        _ => Err(io::Error::other(
+            "Explorer 拡張パッケージの発行元を確認できません",
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplorerVerb {
+    File,
+    Folder,
+}
+
 #[cfg(windows)]
 mod windows {
-    use super::{FileContextMenuState, Path};
+    use super::{
+        ExplorerRegistration, ExplorerVerb, FileContextMenuState, Path, installed_target_script,
+        msix_manifest_script, publisher_from_result, quote_ps,
+    };
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write};
     use std::os::windows::process::CommandExt;
@@ -392,10 +578,6 @@ mod windows {
             .is_none_or(|build| build >= 22000)
     }
 
-    fn quote_ps(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
-    }
-
     fn powershell(script: &str) -> io::Result<std::process::Output> {
         Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -410,6 +592,89 @@ mod windows {
             quote_ps(PACKAGE_VERSION),
         );
         powershell(&script).is_ok_and(|output| output.status.success())
+    }
+
+    fn publisher_from_output(output: std::process::Output) -> io::Result<Option<String>> {
+        publisher_from_result(output.status.code(), &output.stdout)
+    }
+
+    /// Publisher of the installed package of this name for the current user,
+    /// whatever its version. `None` when it is not installed.
+    fn installed_package_publisher() -> io::Result<Option<String>> {
+        let script = format!(
+            "$p = Get-AppxPackage -Name {} -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) {{ [Console]::Out.Write($p.Publisher); exit 0 }} else {{ exit 3 }}",
+            quote_ps(PACKAGE_NAME),
+        );
+        publisher_from_output(powershell(&script)?)
+    }
+
+    /// Publisher of the installed package of exactly `PACKAGE_VERSION`; other
+    /// versions of the same name are never consulted.
+    fn installed_target_publisher() -> io::Result<Option<String>> {
+        let script = installed_target_script(PACKAGE_NAME, PACKAGE_VERSION);
+        publisher_from_output(powershell(&script)?)
+    }
+
+    /// Publisher declared by the AppxManifest.xml inside the MSIX that would be
+    /// installed, with the package identity name checked as well.
+    fn msix_manifest_publisher(package: &Path) -> io::Result<Option<String>> {
+        let script = msix_manifest_script(&package.to_string_lossy(), PACKAGE_NAME);
+        publisher_from_output(powershell(&script)?)
+    }
+
+    fn msix_path(exe: &Path) -> io::Result<PathBuf> {
+        let directory = exe.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Hane.exe のディレクトリを確認できません",
+            )
+        })?;
+        Ok(directory.join("Hane.ShellIntegration.msix"))
+    }
+
+    pub(super) fn capture_registration() -> io::Result<Option<ExplorerRegistration>> {
+        if !is_windows_11() {
+            return Ok(None);
+        }
+        let exe = std::env::current_exe()?;
+        let file_enabled = marker_enabled(&exe, FILE_ENABLED_MARKER)?;
+        let folder_enabled = marker_enabled(&exe, FOLDER_ENABLED_MARKER)?;
+        if !file_enabled && !folder_enabled {
+            return Ok(None);
+        }
+        super::registration_from_inspection(
+            OWNER_ID,
+            PACKAGE_NAME,
+            installed_package_publisher()?,
+            file_enabled,
+            folder_enabled,
+        )
+    }
+
+    pub(super) fn migrate_registration(saved: &ExplorerRegistration) -> io::Result<()> {
+        if !is_windows_11() {
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        super::migrate_registration_with(
+            saved,
+            OWNER_ID,
+            PACKAGE_NAME,
+            || msix_manifest_publisher(&msix_path(&exe)?),
+            |verb| {
+                let marker = match verb {
+                    ExplorerVerb::File => FILE_ENABLED_MARKER,
+                    ExplorerVerb::Folder => FOLDER_ENABLED_MARKER,
+                };
+                marker_enabled(&exe, marker)
+            },
+            || {
+                ensure_explorer_package(&exe)?;
+                notify_shell();
+                Ok(())
+            },
+            installed_target_publisher,
+        )
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -601,4 +866,299 @@ pub fn register(_exe: &Path) -> io::Result<()> {
 #[cfg(not(windows))]
 pub fn unregister() -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const OWNER: &str = "owner-id";
+    const PACKAGE: &str = "Hane.ShellIntegration";
+    const PUBLISHER: &str = "CN=Hane";
+
+    fn saved(file: bool, folder: bool) -> ExplorerRegistration {
+        ExplorerRegistration {
+            owner: OWNER.to_owned(),
+            package_name: PACKAGE.to_owned(),
+            publisher: PUBLISHER.to_owned(),
+            file_enabled: file,
+            folder_enabled: folder,
+        }
+    }
+
+    fn migrate(
+        saved: &ExplorerRegistration,
+        publisher: Option<&str>,
+        markers: (bool, bool),
+        registered: &Cell<u32>,
+        register_ok: bool,
+    ) -> io::Result<()> {
+        migrate_after(saved, Ok(publisher), Ok(Some(PUBLISHER)), markers, registered, register_ok)
+    }
+
+    fn migrate_after(
+        saved: &ExplorerRegistration,
+        manifest_publisher: Result<Option<&str>, ()>,
+        installed_publisher: Result<Option<&str>, ()>,
+        markers: (bool, bool),
+        registered: &Cell<u32>,
+        register_ok: bool,
+    ) -> io::Result<()> {
+        let read = |value: Result<Option<&str>, ()>| match value {
+            Ok(publisher) => Ok(publisher.map(str::to_owned)),
+            Err(()) => Err(io::Error::other("検査に失敗")),
+        };
+        migrate_registration_with(
+            saved,
+            OWNER,
+            PACKAGE,
+            || read(manifest_publisher),
+            |verb| {
+                Ok(match verb {
+                    ExplorerVerb::File => markers.0,
+                    ExplorerVerb::Folder => markers.1,
+                })
+            },
+            || {
+                registered.set(registered.get() + 1);
+                if register_ok {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("登録に失敗"))
+                }
+            },
+            || read(installed_publisher),
+        )
+    }
+
+    #[test]
+    fn a_new_package_publisher_that_is_missing_empty_or_failed_is_refused_before_install() {
+        let cases: [Result<Option<&str>, ()>; 5] = [
+            Ok(Some("CN=Other")),
+            Ok(None),
+            Ok(Some("")),
+            Ok(Some("  ")),
+            Err(()),
+        ];
+        for manifest in cases {
+            let registered = Cell::new(0);
+            let result = migrate_after(
+                &saved(true, true),
+                manifest,
+                Ok(Some(PUBLISHER)),
+                (true, true),
+                &registered,
+                true,
+            );
+            assert!(result.is_err());
+            assert_eq!(registered.get(), 0, "nothing is installed after a refusal");
+        }
+    }
+
+    #[test]
+    fn the_installed_target_publisher_is_verified_after_install() {
+        let cases: [Result<Option<&str>, ()>; 4] =
+            [Ok(Some("CN=Other")), Ok(None), Ok(Some("")), Err(())];
+        for installed in cases {
+            let registered = Cell::new(0);
+            let result = migrate_after(
+                &saved(true, true),
+                Ok(Some(PUBLISHER)),
+                installed,
+                (true, true),
+                &registered,
+                true,
+            );
+            assert!(result.is_err());
+            assert_eq!(registered.get(), 1);
+        }
+        let registered = Cell::new(0);
+        migrate_after(
+            &saved(true, true),
+            Ok(Some(PUBLISHER)),
+            Ok(Some(PUBLISHER)),
+            (true, true),
+            &registered,
+            true,
+        )
+        .unwrap();
+    }
+
+    const MSIX: &str = r"C:\Program Files\Hane\Hane.ShellIntegration.msix";
+    const VERSION: &str = "1.2.3.0";
+
+    #[test]
+    fn the_manifest_query_uses_the_msix_path_and_package_identity_name() {
+        let script = msix_manifest_script(MSIX, PACKAGE);
+        assert!(script.contains(&format!("OpenRead({})", quote_ps(MSIX))));
+        assert!(script.contains("GetEntry('AppxManifest.xml')"));
+        assert!(script.contains(&format!("$i.Name -ne {}", quote_ps(PACKAGE))));
+        assert!(script.contains("$i.Publisher"));
+        let quoted = msix_manifest_script(r"C:\it's\Hane.msix", PACKAGE);
+        assert!(quoted.contains(r"OpenRead('C:\it''s\Hane.msix')"));
+    }
+
+    #[test]
+    fn the_installed_query_filters_by_the_exact_package_version() {
+        let script = installed_target_script(PACKAGE, VERSION);
+        assert!(script.contains(&format!("-Name {}", quote_ps(PACKAGE))));
+        assert!(script.contains(&format!("$_.Version.ToString() -eq {}", quote_ps(VERSION))));
+        assert!(script.contains("$p.Publisher"));
+    }
+
+    #[test]
+    fn publisher_query_results_are_interpreted_fail_closed() {
+        assert_eq!(
+            publisher_from_result(Some(0), b" CN=Hane \r\n").unwrap(),
+            Some("CN=Hane".to_owned())
+        );
+        assert_eq!(publisher_from_result(Some(0), b"  ").unwrap(), None);
+        assert_eq!(publisher_from_result(Some(3), b"").unwrap(), None);
+        assert!(publisher_from_result(Some(1), b"CN=Hane").is_err());
+        assert!(publisher_from_result(None, b"CN=Hane").is_err());
+    }
+
+    /// Runs the production scripts through a fake PowerShell that reports the
+    /// given (exit code, stdout) for the manifest and installed queries.
+    fn migrate_via_queries(
+        manifest: (Option<i32>, &'static [u8]),
+        installed: (Option<i32>, &'static [u8]),
+        registered: &Cell<u32>,
+    ) -> io::Result<()> {
+        let manifest_script = msix_manifest_script(MSIX, PACKAGE);
+        let installed_script = installed_target_script(PACKAGE, VERSION);
+        let fake = |script: &str, expected: &str, result: (Option<i32>, &'static [u8])| {
+            assert_eq!(script, expected, "the production script is executed");
+            publisher_from_result(result.0, result.1)
+        };
+        migrate_registration_with(
+            &saved(true, true),
+            OWNER,
+            PACKAGE,
+            || fake(&msix_manifest_script(MSIX, PACKAGE), &manifest_script, manifest),
+            |_| Ok(true),
+            || {
+                registered.set(registered.get() + 1);
+                Ok(())
+            },
+            || fake(&installed_target_script(PACKAGE, VERSION), &installed_script, installed),
+        )
+    }
+
+    #[test]
+    fn query_outcomes_gate_the_migration() {
+        let ok: (Option<i32>, &'static [u8]) = (Some(0), b"CN=Hane");
+        let refused: [(Option<i32>, &'static [u8]); 5] = [
+            (Some(3), b""),
+            (Some(0), b""),
+            (Some(0), b"CN=Other"),
+            (Some(1), b""),
+            (None, b""),
+        ];
+        for manifest in refused {
+            let registered = Cell::new(0);
+            assert!(migrate_via_queries(manifest, ok, &registered).is_err());
+            assert_eq!(registered.get(), 0);
+        }
+        for installed in refused {
+            let registered = Cell::new(0);
+            assert!(migrate_via_queries(ok, installed, &registered).is_err());
+            assert_eq!(registered.get(), 1);
+        }
+        let registered = Cell::new(0);
+        migrate_via_queries(ok, ok, &registered).unwrap();
+    }
+
+    #[test]
+    fn capture_keeps_each_file_and_folder_combination() {
+        for (file, folder) in [(true, true), (true, false), (false, true)] {
+            let captured = registration_from_inspection(
+                OWNER,
+                PACKAGE,
+                Some(PUBLISHER.to_owned()),
+                file,
+                folder,
+            )
+            .unwrap()
+            .expect("an enabled integration is captured");
+            assert_eq!(captured, saved(file, folder));
+        }
+    }
+
+    #[test]
+    fn capture_is_none_for_a_user_without_the_integration() {
+        // Both markers OFF is "not registered", whatever the publisher read.
+        for publisher in [Some(PUBLISHER.to_owned()), Some(String::new()), None] {
+            assert_eq!(
+                registration_from_inspection(OWNER, PACKAGE, publisher, false, false).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn an_enabled_marker_without_a_publisher_is_an_error_not_unregistered() {
+        for (file, folder) in [(true, true), (true, false), (false, true)] {
+            for publisher in [None, Some(String::new()), Some("  ".to_owned())] {
+                assert!(
+                    registration_from_inspection(OWNER, PACKAGE, publisher, file, folder).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_enabled_combination_is_migrated_once() {
+        for (file, folder) in [(true, true), (true, false), (false, true)] {
+            let registered = Cell::new(0);
+            migrate(&saved(file, folder), Some(PUBLISHER), (file, folder), &registered, true)
+                .unwrap();
+            assert_eq!(registered.get(), 1);
+        }
+    }
+
+    #[test]
+    fn a_verb_that_was_off_is_not_required_or_turned_on() {
+        // The folder marker is absent and was OFF: the migration still succeeds
+        // and never asks for it.
+        let registered = Cell::new(0);
+        migrate(&saved(true, false), Some(PUBLISHER), (true, false), &registered, true).unwrap();
+        assert_eq!(registered.get(), 1);
+    }
+
+    #[test]
+    fn a_changed_owner_or_publisher_is_not_migrated() {
+        let registered = Cell::new(0);
+        let mut other_owner = saved(true, true);
+        other_owner.owner = "someone-else".to_owned();
+        assert!(migrate(&other_owner, Some(PUBLISHER), (true, true), &registered, true).is_err());
+        assert!(migrate(&saved(true, true), Some("CN=Other"), (true, true), &registered, true).is_err());
+        assert!(migrate(&saved(true, true), None, (true, true), &registered, true).is_err());
+        assert_eq!(registered.get(), 0, "no package is registered after a refusal");
+    }
+
+    #[test]
+    fn a_marker_that_is_no_longer_owned_is_not_migrated() {
+        let registered = Cell::new(0);
+        assert!(migrate(&saved(true, true), Some(PUBLISHER), (true, false), &registered, true).is_err());
+        assert!(migrate(&saved(true, false), Some(PUBLISHER), (false, true), &registered, true).is_err());
+        assert_eq!(registered.get(), 0);
+    }
+
+    #[test]
+    fn a_failed_registration_is_reported_not_swallowed() {
+        let registered = Cell::new(0);
+        let error = migrate(&saved(true, true), Some(PUBLISHER), (true, true), &registered, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("登録に失敗"));
+        assert_eq!(registered.get(), 1);
+    }
+
+    #[test]
+    fn a_registration_with_nothing_enabled_is_refused() {
+        let registered = Cell::new(0);
+        assert!(migrate(&saved(false, false), Some(PUBLISHER), (false, false), &registered, true).is_err());
+        assert_eq!(registered.get(), 0);
+    }
 }

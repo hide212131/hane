@@ -17,18 +17,17 @@
 //! re-verifies a transaction-local candidate and replaces only the files of the
 //! signed inventories, journal first. Increment 3 adds the limited-health child
 //! and the durable commit (`health`). Increment 4 connects the macOS bundle
-//! exchange (`macos_apply`): the pinned Team ID's Developer ID signature, the
-//! bundle identity and a same-volume `RENAME_SWAP` of the live bundle and the
+//! exchange (`macos_apply`): the bundle's inventory signed with the update key
+//! (no Apple Developer ID, Team ID or notarization), the bundle identity and a same-volume `RENAME_SWAP` of the live bundle and the
 //! staged candidate, journaled intent first, with the same health and commit
 //! boundary and a rollback by the same exchange.
 //!
 //! Deliberately **not** here: UI, GPUI, document or AI credential access, real
-//! HTTP transport, the restart UI, and any production signing key or Team ID.
+//! HTTP transport, the restart UI, and any production signing key.
 //! [`trust::TrustPolicy::production`] carries no key material until a
 //! maintainer embeds one, so no candidate can become applicable from a
 //! production build today. OS-specific locking, crash durability, the real
-//! `renamex_np` / `codesign` / `spctl` behavior and Gatekeeper are not claimed
-//! to be verified by this crate.
+//! `renamex_np` behavior is not claimed to be verified by this crate.
 
 // Everything is safe Rust except the volume queries in `platform::windows` and
 // `platform::macos` (and the macOS `renamex_np` exchange), which opt in locally

@@ -2089,12 +2089,8 @@ mod tests {
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("Alpha.md"),
-                text: "Alpha".to_owned(),
+                input: short_text_input_with("Alpha", 0..5, false),
                 fixed_extension: Some(".md".to_owned()),
-                selected_range: 0..5,
-                selection_reversed: false,
-                marked_range: None,
-                composition: None,
                 pending: false,
             });
             cx.notify();
