@@ -282,26 +282,31 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertIn("export HANE_SOURCE_SHA", BUNDLE)
         self.assertRegex(BUNDLE, r"\^\[0-9a-f\]\{40\}\$")
 
-    def test_bundle_removes_only_the_linker_signatures_before_the_inventory_is_added(self):
+    def test_bundle_is_sealed_ad_hoc_from_the_inside_out_before_the_inventory_exists(self):
         code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
-        # Only the two Hane executables lose their linker ad-hoc signature.
-        self.assertEqual(code.count("codesign"), 1)
-        self.assertIn('codesign --remove-signature "$binary"', code)
-        self.assertIn('"$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"; do', code)
-        self.assertIn("macho-unsigned", code)
-        # The helper identity is checked again after the removal, before touch.
-        removal = code.index("--remove-signature")
-        self.assertGreater(code.index("binary-identity", removal), removal)
-        self.assertLess(code.index("binary-identity", removal), code.index('touch "$bundle"'))
-        # No Apple signing, sealing, verification or Gatekeeper handling.
-        for banned in ("--sign", "--resource-rules", "--verify", "Developer ID", "notarytool", "stapler",
-                       "xattr", "spctl", "--options runtime", "TEAM_ID"):
+        # Helper first, then the main executable, then the bundle; local ad-hoc identity only.
+        signs = [line.strip() for line in code.splitlines() if "codesign --force" in line]
+        self.assertEqual(signs, [
+            '/usr/bin/codesign --force --sign - --timestamp=none "$bundle/Contents/Helpers/hane-updater"',
+            '/usr/bin/codesign --force --sign - --timestamp=none "$bundle/Contents/MacOS/hane"',
+            '/usr/bin/codesign --force --sign - --timestamp=none "$bundle"',
+        ])
+        self.assertNotIn("--remove-signature", code)
+        self.assertNotIn("macho-unsigned", code)
+        self.assertIn("macho-signed", code)
+        self.assertIn('codesign --verify --deep --strict --verbose=2 "$bundle"', code)
+        # The seal is verified, and the helper identity checked again, before the bundle is final.
+        seal = code.index('codesign --force --sign - --timestamp=none "$bundle"')
+        self.assertGreater(code.index("binary-identity", seal), seal)
+        self.assertGreater(code.index("--verify --deep --strict", seal), seal)
+        self.assertLess(code.index("--verify --deep --strict", seal), code.index('touch "$bundle"'))
+        # Nothing from Apple's trust chain beyond the local seal, and nothing is bypassed.
+        for banned in ("Developer ID", "notarytool", "stapler", "xattr", "spctl", "--options runtime", "TEAM_ID",
+                       "--entitlements"):
             self.assertNotIn(banned, code)
-        # The workflow keeps adding the inventory after the bundle is built.
-        workflow = read(".github/workflows/windows-release.yml")
-        self.assertLess(workflow.index("./scripts/bundle-macos.sh"),
-                        workflow.index("Generate and sign macOS inventory"))
-        self.assertNotIn("codesign", workflow)
+        # The inventory is never stored inside the sealed app.
+        self.assertIn("hane-install.json", code)  # only as a guard that it is absent
+        self.assertIn("must not be stored inside Hane.app", code)
 
     def test_helper_embeds_identity_in_a_control_flow_that_uses_it(self):
         main = read("crates/updater/src/main.rs")

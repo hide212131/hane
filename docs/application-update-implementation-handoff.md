@@ -17,6 +17,7 @@
 下表の状態は、PR #518の親head `92235af3ab443eeb545eb93bdb72e529a93d4df8` 時点の過去snapshotであり、現在のPR head/statusを表さない（その後に文書更新commit `3a473563f541ee2ac4fc9d93104e69bd56ced8eb` が追加された）。表中の当時のrun/statusは歴史的記録として保持する。current factsはGitHub上のPRを読む。以下の基準値も当時のものである: current main `08f659e0032ee377ca21e1cce060a8d517c884dc`、PR #518 head `92235af3ab443eeb545eb93bdb72e529a93d4df8`、PR #526 head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`（#518用branchをbaseにしている）を基準とする。実装時はGitHub上のcurrent factsを読み直す。
 
 - 現在の最新Releaseはv0.27.0（Release builds run `39450369467`）で、Windows/Mac ZIP、`hane-update.json`、`hane-update.json.sig`を含む。更新用署名鍵の本番設定と初回配布は完了している（旧v0.26.0はZIPのみで更新catalog/signatureを持たなかったが、これは履歴）。
+- PR #535の現在の設計（Mac ZIP layout revision 2）: 完成した`Hane.app`をad-hoc署名で封印し（Apple Siliconは署名のないコードを起動しない）、Ed25519 inventory/署名をアプリの外の`Hane.app.update/<version>-<source_sha>/`に置く。インストール後はアプリごとの`inventories/`（なければbundleの隣）から版・source SHAが指す世代を読み、不正なら旧データへfallbackせず拒否する。v0.27.0のアプリ内inventory（layout 1）だけを移行用に1回読み、新版の更新が新sidecarを交換前に準備する。詳細は[実装note](implementation/issue-510-u2-macos-launch.md)と仕様§10。release workflow（`.github/**`）の接続変更は未反映で、noteに必要な差分を記録した。この変更のCI・実Mac署名検証・Finder起動・実更新は未確認で、Issue #510の完了ではない。
 - 未完了: PR #535のMac起動修正の取り込みと次の配布、Windows/macOS実機での二版更新・復旧の証拠（U-11, U-13, U-14など）、U5（Apple Developer ID・notarizationは要求しない）。fixtureの成功を実OSの成功へ読み替えない。
 
 ## 1. 着手前の確認

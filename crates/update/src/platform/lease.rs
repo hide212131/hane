@@ -27,6 +27,9 @@ pub const JOURNAL_FILE: &str = "journal.json";
 pub const HELPER_DIR: &str = "helper";
 pub const RECEIPTS_DIR: &str = "receipts";
 pub const SEEN_CATALOG_FILE: &str = "seen-catalog.json";
+/// Per-install home of the external bundle inventories (macOS layout 2), one
+/// `<version>-<source_sha>/` generation per installed or staged release.
+pub const INVENTORIES_DIR: &str = "inventories";
 
 const POLL: Duration = Duration::from_millis(20);
 
@@ -200,6 +203,28 @@ impl Coordination {
         parent
             .join(install_id.coordination_dir_name())
             .join(RECEIPTS_DIR)
+    }
+
+    /// Where the sidecar inventories of an install under `parent` live. Both the
+    /// application and the helper derive it from the placement alone; the
+    /// directory may not exist yet.
+    pub fn inventories_dir_for(parent: &Path, install_id: &InstallId) -> PathBuf {
+        parent
+            .join(install_id.coordination_dir_name())
+            .join(INVENTORIES_DIR)
+    }
+
+    pub fn inventories_dir(&self) -> PathBuf {
+        self.dir.join(INVENTORIES_DIR)
+    }
+
+    /// `inventories/` below the verified coordination directory, created on
+    /// first use. Readable by every launch, writable only by the owner.
+    pub fn ensure_inventories_dir(&self) -> Result<PathBuf> {
+        require_plain_dir(&self.dir)?;
+        let dir = self.inventories_dir();
+        ensure_dir(&dir, 0o755)?;
+        Ok(dir)
     }
 
     /// The durable highest-seen catalog receipt of this placement.

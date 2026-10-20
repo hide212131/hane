@@ -27,7 +27,7 @@ fn private_options(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn private_options(_options: &mut OpenOptions) {}
 
-fn sync_directory(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         File::open(dir)?.sync_all()

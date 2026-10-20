@@ -1615,19 +1615,32 @@ fn extraction_does_not_enter_a_symlinked_stage() {
     assert_eq!(fs::read_dir(real.as_path()).unwrap().count(), 0);
 }
 
-fn macos_zip(extra: Vec<ZipEntry>, with_helper: bool) -> Vec<u8> {
+fn mac_generation() -> String {
+    format!("0.27.1-{}", "a".repeat(40))
+}
+
+fn mac_sidecar(file: &str) -> String {
+    format!("hane-macos-arm64/Hane.app.update/{}/{file}", mac_generation())
+}
+
+/// A layout 2 archive: the sealed app, and the inventory beside it.
+/// `with_helper` and `with_sidecar` leave the helper / the sidecar out.
+fn macos_zip_with(extra: Vec<ZipEntry>, with_helper: bool, with_sidecar: bool) -> Vec<u8> {
     let mut entries = vec![
         ZipEntry::dir("hane-macos-arm64/"),
         ZipEntry::dir("hane-macos-arm64/Hane.app/"),
         ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Info.plist", b"plist"),
         ZipEntry::file("hane-macos-arm64/Hane.app/Contents/MacOS/hane", b"bin").executable(),
-        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json", b"{}"),
         ZipEntry::file(
-            "hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json.sig",
-            b"{}",
+            "hane-macos-arm64/Hane.app/Contents/_CodeSignature/CodeResources",
+            b"seal",
         ),
         ZipEntry::file("hane-macos-arm64/README.md", b"readme"),
     ];
+    if with_sidecar {
+        entries.push(ZipEntry::file(&mac_sidecar("hane-install.json"), b"{}"));
+        entries.push(ZipEntry::file(&mac_sidecar("hane-install.json.sig"), b"{}"));
+    }
     if with_helper {
         entries.push(
             ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Helpers/hane-updater", b"h")
@@ -1636,6 +1649,10 @@ fn macos_zip(extra: Vec<ZipEntry>, with_helper: bool) -> Vec<u8> {
     }
     entries.extend(extra);
     build_zip(&entries)
+}
+
+fn macos_zip(extra: Vec<ZipEntry>, with_helper: bool) -> Vec<u8> {
+    macos_zip_with(extra, with_helper, true)
 }
 
 fn macos_layout(zip: Vec<u8>) -> Result<()> {
@@ -1661,6 +1678,67 @@ fn macos_layout_allows_only_the_bundle_and_documents() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn macos_layout_requires_exactly_one_sidecar_outside_the_app() {
+    // Both the inventory and its signature are needed.
+    assert_eq!(
+        code(macos_layout(macos_zip_with(vec![], true, false))),
+        ErrorCode::ArchiveRejected
+    );
+    let only_inventory = macos_zip_with(
+        vec![ZipEntry::file(&mac_sidecar("hane-install.json"), b"{}")],
+        true,
+        false,
+    );
+    assert_eq!(code(macos_layout(only_inventory)), ErrorCode::ArchiveRejected);
+
+    let rejected = [
+        // A second generation, a stray file in the generation, a nested path.
+        ZipEntry::file(
+            &format!("hane-macos-arm64/Hane.app.update/0.27.2-{}/hane-install.json", "b".repeat(40)),
+            b"{}",
+        ),
+        ZipEntry::file(&mac_sidecar("run.sh"), b"#!"),
+        ZipEntry::file(&mac_sidecar("nested/hane-install.json"), b"{}"),
+        // A generation that is not `<version>-<40 hex>`, and a look-alike root.
+        ZipEntry::file("hane-macos-arm64/Hane.app.update/latest/hane-install.json", b"{}"),
+        ZipEntry::file("hane-macos-arm64/Hane.app.update/hane-install.json", b"{}"),
+        ZipEntry::file(
+            &format!("hane-macos-arm64/Hane.app.update2/0.27.1-{}/hane-install.json", "a".repeat(40)),
+            b"{}",
+        ),
+        // The v0.27.0 place would break the seal and is not a layout 2 file.
+        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json", b"{}"),
+        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json.sig", b"{}"),
+    ];
+    for extra in rejected {
+        let name = String::from_utf8_lossy(&extra.name).into_owned();
+        assert_eq!(
+            code(macos_layout(macos_zip(vec![extra], true))),
+            ErrorCode::ArchiveRejected,
+            "{name}"
+        );
+    }
+    // The sidecar is data: an executable bit anywhere outside the app's
+    // executable directories is refused.
+    let executable = macos_zip_with(
+        vec![ZipEntry::file(&mac_sidecar("hane-install.json.sig"), b"{}").executable()],
+        true,
+        false,
+    );
+    assert_eq!(code(macos_layout(executable)), ErrorCode::ArchiveRejected);
+
+    // An unsealed app (no CodeResources) is not a release.
+    let unsealed = build_zip(&[
+        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Info.plist", b"plist"),
+        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/MacOS/hane", b"bin").executable(),
+        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Helpers/hane-updater", b"h").executable(),
+        ZipEntry::file(&mac_sidecar("hane-install.json"), b"{}"),
+        ZipEntry::file(&mac_sidecar("hane-install.json.sig"), b"{}"),
+    ]);
+    assert_eq!(code(macos_layout(unsealed)), ErrorCode::ArchiveRejected);
 }
 
 #[test]

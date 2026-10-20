@@ -76,7 +76,7 @@ Windows 11向けの新しい配布ZIPには `Hane.ShellIntegration.msix`、署�
 アプリ本体の更新（Issue #510、[ADR-0034](docs/adr/0034-zip-application-updates.md)）に使うため、各Releaseは次の4ファイルをそろえて公開します。`hane-update.json` と `hane-update.json.sig` は、両ZIPの実サイズ・SHA-256・Windowsの所有ファイル一覧・macOSのBundle ID/版/署名済みinventoryのhashから生成し、Hane更新専用のEd25519鍵で署名します。
 
 - `hane-windows-x64.zip` — 上記の構成に加え、署名済みの `hane-install.json` / `hane-install.json.sig`。
-- `hane-macos-arm64.zip` — 更新用Ed25519鍵で署名した `Contents/Resources/hane-install.json` / `.sig` を含む `Hane.app`（`Contents/Helpers/hane-updater` を含む）。Apple Developer ID・notarizationは使わず、2つの実行ファイルのリンカー署名を取り除いたbundleからinventoryを生成し、その後はbundleを変更せずZIP化します。
+- `hane-macos-arm64.zip` — ローカルのad-hoc署名で封印した `Hane.app`（`Contents/Helpers/hane-updater` を含む。Apple Siliconは署名のない実行コードを起動しないため、helper → 本体 → bundleの順に内側から署名し、`codesign --verify --deep --strict` で確認します）と、その隣の `Hane.app.update/<バージョン>-<source SHA>/hane-install.json` / `.sig`（更新用Ed25519鍵で署名したinventory。`_CodeSignature/CodeResources` を含む全ファイルを列挙し、アプリの外に置くので封印を壊しません）。Apple Developer ID・Team ID・notarizationは使いません。`Hane.app` と `Hane.app.update` は同じ場所に並べて置いてください。更新で入れ替えた後のinventoryはアプリごとの `.hane-update-*` 内に保存されます。v0.27.0のようにinventoryがアプリ内にある旧形式は、次の更新までの移行用に一度だけ読み取ります。
 - `hane-update.json`, `hane-update.json.sig` — 検証済みcatalogとその署名。
 
 更新対応版の最初の導入は、これまでどおり手動でZIPを展開します。更新用の署名鍵・公開鍵・MSIX署名証明書が未設定の間は、リリースは失敗し、更新対応のReleaseは公開されません。手順と必要な設定は [リリース手順](.github/RELEASE_AUTOMATION.md) と [Windows署名手順](docs/windows-release-signing.md) を参照してください。

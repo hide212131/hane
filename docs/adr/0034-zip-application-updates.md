@@ -18,7 +18,7 @@ Windowsでは任意の展開先に利用者ファイルが混在でき、Explore
 2. GitHub Releasesを発見・配信に使い、アプリに埋め込んだ公開鍵による署名済みカタログとZIP全体のSHA-256で取得物を検証する。公開GitHub APIの認証情報を要求しない。APIの`digest`や同梱証明書だけを更新の信頼の根にしない。
 3. 更新用の独立したRust libraryとhelperを設ける。アプリが確認・取得・編集状態の調停を担当し、現在インストール済みの信頼できるhelperのコピーが、親の終了後にローカルの検証済み候補を適用する。helperはネットワーク取得、文書保存、権限昇格、任意コマンド実行をしない。
 4. Windowsは署名された所有ファイル一覧に限定した置換を行う。展開先フォルダ全体を入れ替えない。Explorer DLLをバージョン別のパスへ変更し、使用中の旧DLLを残して更新する。
-5. macOSは同じBundle IDで、埋め込んだ更新用Ed25519鍵が署名したカタログと`.app`内のinventoryに一致する`.app`を、対応するローカルファイルシステム上で原子的に交換する。Apple Developer ID・固定Team ID・notarizationは更新の必須条件にしない。AppleのOS保護（quarantine、Gatekeeper）を無効化・迂回せず、必要なら本人によるアプリ単位の起動許可で進める。
+5. macOSは同じBundle IDで、埋め込んだ更新用Ed25519鍵が署名したカタログと、その鍵が署名したinventoryに一致する`.app`を、対応するローカルファイルシステム上で原子的に交換する。Apple Siliconは有効なコード署名のない実行コードを起動しないため、完成した`.app`はリリース時にローカルのad-hoc署名で封印する（Developer ID・固定Team ID・notarization・stapleは更新の必須条件にせず、追加しない）。封印したbundleへファイルを足すと署名が壊れるため、Ed25519 inventoryと署名は`.app`の外（ZIPの`Hane.app.update/<version>-<source_sha>/`、インストール後はアプリごとの外部データ）に置き、封印後の全ファイル（`_CodeSignature/CodeResources`を含む）を列挙する。ZIP layout revisionは2。v0.27.0（inventoryがアプリ内のlayout 1）は移行用に一度だけ読み取り、新版の更新で新しい外部sidecarへ移す。AppleのOS保護（quarantine、Gatekeeper）を無効化・迂回せず、必要なら本人によるアプリ単位の起動許可で進める。
 6. 未保存文書、未保存設定、保存・rename・AI処理等の未確定操作があれば再起動を保留する。通常終了の既存draft flushを、更新の保存成功の証拠として流用しない。更新用の確認可能な永続化境界を設ける。
 7. 再起動中はインストール単位で起動を調停し、新版が永続データを書き始める前の限定した起動確認でcommitする。それ以前の失敗では旧版へ戻す。commit後の任意の製品不具合まで、自動rollbackの保証には含めない。
 8. アプリ本体更新とHane専用Codex runtime更新を別の所有者・保存先・署名ドメインにする。AIのログイン・秘密・runtime・Skillsを本体更新の置換対象にしない。
@@ -39,7 +39,7 @@ Windowsでは任意の展開先に利用者ファイルが混在でき、Explore
 
 - 更新機能を持たない既存版からは、一度だけ更新対応ZIPを手動導入する。初回から既存バイナリを遠隔で更新できるとはしない。
 - 書込不能・共有/ネットワークドライブ・移動中の配置・未対応CPU・開発ビルド・署名未準備などには、理由と手動ダウンロードの導線を表示する。一般の編集機能は使える。
-- 署名鍵の発行・保管、macOS inventoryの生成・署名、配布workflowの改訂はリリース有効化の実作業であり、本ADRの保存で完了しない。Apple Developer IDとnotarizationは要求しない。
+- 署名鍵の発行・保管、macOSのad-hoc封印と外部inventoryの生成・署名、配布workflowの改訂はリリース有効化の実作業であり、本ADRの保存で完了しない。Apple Developer IDとnotarizationは要求しない。
 - 配布workflow等の保護パス変更は、明示した配布基盤専用PRで行う。製品workerの保護制限を緩めない。
 - 既存データ形式を旧版が読めなくなる更新はv1の自動適用から除外する。将来それを可能にする場合は、データ移行とrollback方針を別途改訂する。
 - 独自のhelper、復旧journal、起動調停を保守する費用を受け入れる。通常の本文編集・描画経路にネットワーク確認やZIP解析を追加しない。

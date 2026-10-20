@@ -25,13 +25,42 @@ pub const MACOS_BUNDLE_ID: &str = "io.github.hide212131.hane";
 pub const INVENTORY_FILE_NAME: &str = "hane-install.json";
 pub const INVENTORY_SIGNATURE_FILE_NAME: &str = "hane-install.json.sig";
 
-/// macOS: the signed inventory lives inside `Hane.app` (paths relative to the
-/// bundle), so the installed bundle can be verified against the same Ed25519
-/// update key as the catalog, without any Apple identity.
-pub const MACOS_INVENTORY_REL: &str = "Contents/Resources/hane-install.json";
-pub const MACOS_INVENTORY_SIGNATURE_REL: &str = "Contents/Resources/hane-install.json.sig";
+/// macOS layout 1 (v0.27.0 only): the signed inventory lived inside `Hane.app`
+/// (paths relative to the bundle). Apple Silicon cannot run a bundle without a
+/// valid code signature, and any file added inside a sealed bundle breaks that
+/// seal, so layout 2 moved the inventory out. These paths are now read only to
+/// recognise an already installed v0.27.0 bundle; a layout 2 archive or bundle
+/// must not contain them.
+pub const MACOS_LEGACY_INVENTORY_REL: &str = "Contents/Resources/hane-install.json";
+pub const MACOS_LEGACY_INVENTORY_SIGNATURE_REL: &str = "Contents/Resources/hane-install.json.sig";
+/// The only version that ever shipped layout 1.
+pub const MACOS_LEGACY_VERSION: &str = "0.27.0";
+pub const MACOS_LEGACY_LAYOUT_REVISION: u64 = 1;
+/// The ad-hoc seal of a finished bundle; it is an ordinary inventoried file.
+pub const MACOS_CODE_RESOURCES_REL: &str = "Contents/_CodeSignature/CodeResources";
 /// The bundle's directory inside the macOS archive, with a trailing slash.
 pub const MACOS_APP_PREFIX: &str = "hane-macos-arm64/Hane.app/";
+/// macOS layout 2: the Ed25519 inventory and its signature sit next to the
+/// bundle in `Hane.app.update/<version>-<source_sha>/`, never inside it.
+pub const MACOS_ARCHIVE_ROOT: &str = "hane-macos-arm64";
+pub const MACOS_SIDECAR_DIR: &str = "Hane.app.update";
+
+/// Name of one sidecar generation: the release it describes.
+pub fn macos_generation(version: &str, source_sha: &str) -> String {
+    format!("{version}-{source_sha}")
+}
+
+/// Splits a generation name into version and source SHA. Only names made of
+/// version characters and a 40-digit lowercase source SHA qualify, so a name
+/// taken from an untrusted Info.plist can never act as a path.
+pub fn parse_macos_generation(name: &str) -> Option<(&str, &str)> {
+    let (version, source_sha) = name.rsplit_once('-')?;
+    let version_ok = !version.is_empty()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'));
+    (version_ok && crate::util::is_lower_hex(source_sha, 40)).then_some((version, source_sha))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Target {
@@ -56,10 +85,11 @@ impl Target {
         }
     }
 
-    /// ZIP layout revision the v1 protocol expects for this target.
+    /// ZIP layout revision the v1 protocol expects for this target. macOS is at
+    /// revision 2: a sealed `Hane.app` plus an external sidecar inventory.
     pub fn layout_revision(self) -> u64 {
         match self {
-            Target::MacosArm64 => 1,
+            Target::MacosArm64 => 2,
             Target::WindowsX64 => 2,
         }
     }

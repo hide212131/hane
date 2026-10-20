@@ -2,7 +2,9 @@
 """Release-side half of Hane's ZIP application update (Issue #510, stage U2).
 
 Builds and verifies what `crates/update` consumes: the Windows inventory, the
-update catalog and their Ed25519 signatures, over the real ZIP files. The same
+macOS inventory (kept outside the ad-hoc sealed `Hane.app`, in the sidecar
+`Hane.app.update/<version>-<source_sha>/`), the update catalog and their Ed25519
+signatures, over the real ZIP files. The same
 verifier runs in the release workflow (on the Draft's re-downloaded assets), in
 the release-request workflow (on the published assets) and in the CI fixtures.
 
@@ -57,7 +59,11 @@ MACOS_ASSET = "hane-macos-arm64.zip"
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
 MACOS_TARGET = "aarch64-apple-darwin"
 WINDOWS_LAYOUT = 2
-MACOS_LAYOUT = 1
+# Layout 1 (v0.27.0) kept the Ed25519 inventory inside Hane.app and removed the
+# Apple signature. Layout 2 seals Hane.app with a valid ad-hoc code signature
+# and keeps the inventory outside the app, so the two never invalidate each
+# other. The release only ever produces layout 2.
+MACOS_LAYOUT = 2
 MACOS_BUNDLE_ID = "io.github.hide212131.hane"
 RELEASE_ASSETS = (WINDOWS_ASSET, MACOS_ASSET, CATALOG_NAME, SIGNATURE_NAME)
 
@@ -96,15 +102,18 @@ WINDOWS_OPTIONAL = ("LICENSE",)
 MACOS_ROOT = "hane-macos-arm64"
 MACOS_APP = f"{MACOS_ROOT}/Hane.app"
 MACOS_HELPER_REL = "Contents/Helpers/hane-updater"
-MACOS_INVENTORY_REL = f"Contents/Resources/{INVENTORY_NAME}"
-MACOS_INVENTORY_SIGNATURE_REL = f"Contents/Resources/{INVENTORY_SIGNATURE_NAME}"
-# CodeResources is deliberately not required: trust is the Ed25519 inventory.
+# The ad-hoc seal of the finished bundle. It is an ordinary inventoried file.
+MACOS_CODE_RESOURCES_REL = "Contents/_CodeSignature/CodeResources"
+# The v0.27.0 location of the inventory. A layout 2 bundle must not contain it.
+MACOS_LEGACY_INVENTORY_REL = f"Contents/Resources/{INVENTORY_NAME}"
+MACOS_LEGACY_INVENTORY_SIGNATURE_REL = f"Contents/Resources/{INVENTORY_SIGNATURE_NAME}"
+# The Ed25519 inventory and its signature live next to Hane.app, never inside.
+MACOS_SIDECAR_ROOT = f"{MACOS_ROOT}/Hane.app.update"
 MACOS_REQUIRED = (
     f"{MACOS_APP}/Contents/Info.plist",
     f"{MACOS_APP}/Contents/MacOS/hane",
     f"{MACOS_APP}/{MACOS_HELPER_REL}",
-    f"{MACOS_APP}/{MACOS_INVENTORY_REL}",
-    f"{MACOS_APP}/{MACOS_INVENTORY_SIGNATURE_REL}",
+    f"{MACOS_APP}/{MACOS_CODE_RESOURCES_REL}",
     f"{MACOS_ROOT}/README.md",
 )
 MACOS_EXECUTABLE_PREFIXES = (f"{MACOS_APP}/Contents/MacOS/", f"{MACOS_APP}/Contents/Helpers/")
@@ -324,13 +333,8 @@ LC_CODE_SIGNATURE = 0x1D
 MACHO64_HEADER_BYTES = 32
 
 
-def check_macho_unsigned(data: bytes, what: str) -> None:
-    """Rejects a 64-bit little-endian Mach-O that still has a code signature.
-
-    The app is intentionally not Apple-signed. A linker-made ad-hoc signature
-    left on a bundle that has resources makes macOS report the app as damaged,
-    so the release carries no signature load command at all.
-    """
+def macho_load_commands(data: bytes, what: str) -> list[int]:
+    """Load command numbers of a 64-bit little-endian Mach-O; malformed is an error."""
     if data[:4] != b"\xcf\xfa\xed\xfe" or len(data) < MACHO64_HEADER_BYTES:
         raise fail(f"{what} is not a 64-bit Mach-O executable")
     ncmds = int.from_bytes(data[16:20], "little")
@@ -339,6 +343,7 @@ def check_macho_unsigned(data: bytes, what: str) -> None:
     if end > len(data):
         raise fail(f"{what} has load commands beyond the end of the file")
     offset = MACHO64_HEADER_BYTES
+    commands = []
     for _ in range(ncmds):
         if offset + 8 > end:
             raise fail(f"{what} has a truncated Mach-O load command")
@@ -346,12 +351,53 @@ def check_macho_unsigned(data: bytes, what: str) -> None:
         size = int.from_bytes(data[offset + 4:offset + 8], "little")
         if size < 8 or offset + size > end:
             raise fail(f"{what} has a malformed Mach-O load command")
-        if cmd == LC_CODE_SIGNATURE:
-            raise fail(f"{what} still carries a code signature")
+        commands.append(cmd)
         offset += size
+    return commands
+
+
+def check_macho_signed(data: bytes, what: str) -> None:
+    """Rejects a Mach-O without a code signature load command.
+
+    Apple Silicon refuses to run unsigned code, so every executable of the
+    release must carry the (ad-hoc) signature the final bundle seal covers. This
+    is a portable structural check; `verify_macos_codesign` asks Apple's tool.
+    """
+    if LC_CODE_SIGNATURE not in macho_load_commands(data, what):
+        raise fail(f"{what} carries no code signature; Apple Silicon would not run it")
+
+
+def verify_macos_codesign(app: Path, runner: Callable[[list[str]], "subprocess.CompletedProcess"] | None = None) -> None:
+    """Asks Apple's `codesign` to verify the sealed bundle (macOS only).
+
+    The bundle must verify as a whole (`--deep --strict`) and must be signed
+    ad hoc with no Team Identifier: no Developer ID or notarization is involved.
+    """
+    run = runner or (lambda args: subprocess.run(args, capture_output=True, check=False))
+    if runner is None and sys.platform != "darwin":
+        raise fail("the Apple code signature can only be verified on macOS")
+    verify = run(["/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)])
+    if verify.returncode != 0:
+        raise fail(f"codesign --verify failed for {app}: {verify.stderr.decode(errors='replace').strip()}")
+    display = run(["/usr/bin/codesign", "--display", "--verbose=2", str(app)])
+    text = (display.stdout + display.stderr).decode(errors="replace")
+    if display.returncode != 0 or "Signature=adhoc" not in text:
+        raise fail(f"{app} is not signed ad hoc")
+    if "TeamIdentifier=not set" not in text:
+        raise fail(f"{app} carries a Team Identifier; Hane is not signed with an Apple identity")
 
 
 # ------------------------------------------------------------ ZIP inspection
+
+
+def macos_sidecar_dir(version: str, source_sha: str) -> str:
+    """ZIP directory of this release's external inventory generation."""
+    return f"{MACOS_SIDECAR_ROOT}/{version}-{source_sha}"
+
+
+def macos_sidecar_paths(version: str, source_sha: str) -> tuple[str, str]:
+    directory = macos_sidecar_dir(version, source_sha)
+    return f"{directory}/{INVENTORY_NAME}", f"{directory}/{INVENTORY_SIGNATURE_NAME}"
 
 
 def collision_key(path: str) -> str:
@@ -529,14 +575,23 @@ def build_inventory(root: Path, version: str, source_sha: str) -> bytes:
 
 
 def build_macos_inventory(app: Path, version: str, source_sha: str) -> bytes:
-    """Raw bundle inventory covering every file below `Hane.app`.
+    """Raw bundle inventory covering every file below the finished `Hane.app`.
 
-    Paths are relative to the bundle. Any `_CodeSignature/CodeResources` is just
-    another listed file; no Apple signature is required or consulted.
+    Paths are relative to the bundle. The bundle must already carry its ad-hoc
+    seal: `Contents/_CodeSignature/CodeResources` is listed like any other file,
+    so the inventory describes exactly the bytes macOS will verify. The
+    inventory itself lives outside the app (the sidecar), so a v0.27.0-style
+    inventory inside the bundle is refused.
     """
     if not SHA1_RE.match(source_sha):
         raise fail("source SHA must be 40 lowercase hex digits")
-    files = _inventory_files(app, (MACOS_INVENTORY_REL, MACOS_INVENTORY_SIGNATURE_REL))
+    files = _inventory_files(app, ())
+    listed = {entry["path"] for entry in files}
+    if listed & {MACOS_LEGACY_INVENTORY_REL, MACOS_LEGACY_INVENTORY_SIGNATURE_REL}:
+        raise fail("the bundle must not carry the inventory inside Hane.app; it belongs in the sidecar")
+    if MACOS_CODE_RESOURCES_REL not in listed:
+        raise fail("the bundle is not sealed (Contents/_CodeSignature/CodeResources is missing); "
+                   "sign it before the inventory is made")
     helper = Path(app) / MACOS_HELPER_REL
     if not helper.is_file():
         raise fail("Contents/Helpers/hane-updater is missing from the macOS bundle")
@@ -616,7 +671,7 @@ def verify_windows_zip(path: Path, *, version: str, source_sha: str, trust: Trus
         msix_check(archive.read("Hane.ShellIntegration.msix"), version)
 
         inventory_sha256 = verify_archive_inventory(
-            archive, prefix="", inventory_rel=INVENTORY_NAME, signature_rel=INVENTORY_SIGNATURE_NAME,
+            archive, prefix="", inventory_path=INVENTORY_NAME, signature_path=INVENTORY_SIGNATURE_NAME,
             version=version, target=WINDOWS_TARGET, source_sha=source_sha, layout=WINDOWS_LAYOUT, trust=trust)
         return {
             "inventory_sha256": inventory_sha256,
@@ -624,15 +679,20 @@ def verify_windows_zip(path: Path, *, version: str, source_sha: str, trust: Trus
         }
 
 
-def verify_archive_inventory(archive: Archive, *, prefix: str, inventory_rel: str, signature_rel: str,
+def verify_archive_inventory(archive: Archive, *, prefix: str, inventory_path: str, signature_path: str,
                              version: str, target: str, source_sha: str, layout: int, trust: Trust) -> str:
     """Checks the Ed25519-signed inventory against the real ZIP content.
 
     Inventory paths are relative to `prefix`; files outside it are not owned.
+    `inventory_path` / `signature_path` are full ZIP names: inside `prefix` for
+    Windows (the inventory is then not owned) and in the sidecar for macOS.
     Returns the SHA-256 of the raw inventory bytes (the value the catalog binds).
     """
-    raw = archive.read(prefix + inventory_rel, MAX_INVENTORY_BYTES)
-    verify_signature(INVENTORY_DOMAIN, raw, archive.read(prefix + signature_rel, MAX_SIGNATURE_BYTES), trust)
+    for name in (inventory_path, signature_path):
+        if name not in archive.files:
+            raise fail(f"ZIP is missing {name!r}")
+    raw = archive.read(inventory_path, MAX_INVENTORY_BYTES)
+    verify_signature(INVENTORY_DOMAIN, raw, archive.read(signature_path, MAX_SIGNATURE_BYTES), trust)
     inventory = strict_json(raw, "inventory")
     fields = {"schema", "version", "target", "source_sha", "updater_protocol", "layout_revision", "files"}
     if not isinstance(inventory, dict) or set(inventory) != fields:
@@ -652,8 +712,9 @@ def verify_archive_inventory(archive: Archive, *, prefix: str, inventory_rel: st
     if not isinstance(listed, list) or not listed or len(listed) > MAX_ENTRIES:
         raise fail("inventory file list is out of range")
     owned = {
-        name[len(prefix):] for name in archive.files if name.startswith(prefix)
-    } - {inventory_rel, signature_rel}
+        name[len(prefix):] for name in archive.files
+        if name.startswith(prefix) and name not in (inventory_path, signature_path)
+    }
     paths = []
     for entry in listed:
         if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}:
@@ -678,8 +739,10 @@ def verify_archive_inventory(archive: Archive, *, prefix: str, inventory_rel: st
 
 
 def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust) -> dict:
+    inventory_path, signature_path = macos_sidecar_paths(version, source_sha)
+    sidecar_dir = macos_sidecar_dir(version, source_sha)
     with Archive(path) as archive:
-        allowed_files = {f"{MACOS_ROOT}/README.md", f"{MACOS_ROOT}/LICENSE"}
+        allowed_files = {f"{MACOS_ROOT}/README.md", f"{MACOS_ROOT}/LICENSE", inventory_path, signature_path}
         for name in archive.files:
             if not name.startswith(f"{MACOS_APP}/") and name not in allowed_files:
                 raise fail(f"macOS ZIP has unexpected entry {name!r}")
@@ -687,10 +750,14 @@ def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust)
                 raise fail(f"macOS ZIP contains Finder/AppleDouble metadata {name!r}")
             if archive.executable(name) != name.startswith(MACOS_EXECUTABLE_PREFIXES):
                 raise fail(f"{name!r} has an unexpected executable bit")
+        allowed_dirs = {MACOS_ROOT, MACOS_SIDECAR_ROOT, sidecar_dir}
         for directory in archive.dirs:
-            if directory != MACOS_ROOT and not directory.startswith(MACOS_APP):
+            if directory not in allowed_dirs and directory != MACOS_APP and not directory.startswith(f"{MACOS_APP}/"):
                 raise fail(f"macOS ZIP has unexpected directory {directory!r}")
-        missing = [name for name in MACOS_REQUIRED if name not in archive.files]
+        for legacy in (MACOS_LEGACY_INVENTORY_REL, MACOS_LEGACY_INVENTORY_SIGNATURE_REL):
+            if f"{MACOS_APP}/{legacy}" in archive.files:
+                raise fail(f"macOS ZIP carries the inventory inside Hane.app ({legacy}); it belongs in the sidecar")
+        missing = [name for name in (*MACOS_REQUIRED, inventory_path, signature_path) if name not in archive.files]
         if missing:
             raise fail(f"macOS ZIP is missing {missing}")
         try:
@@ -710,16 +777,17 @@ def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust)
             found = info.get(key)
             if found != value or isinstance(found, bool) or type(found) is not type(value):
                 raise fail(f"Info.plist {key} is {found!r}, expected {value!r}")
+        # Apple Silicon only runs signed code: both executables carry the ad-hoc
+        # signature and the finished bundle is sealed by CodeResources. This is
+        # the structural half; the release job also runs `verify-macos-codesign`
+        # on the extracted app with Apple's own tool.
         for binary in ("Contents/MacOS/hane", "Contents/Helpers/hane-updater"):
-            check_macho_unsigned(archive.read(f"{MACOS_APP}/{binary}"), binary)
-        if any(name.startswith(f"{MACOS_APP}/Contents/_CodeSignature/") for name in archive.files):
-            raise fail("macOS ZIP must not contain a _CodeSignature directory")
+            check_macho_signed(archive.read(f"{MACOS_APP}/{binary}"), binary)
         check_identity(archive.read(f"{MACOS_APP}/Contents/Helpers/hane-updater"), version=version,
                        target=MACOS_TARGET, source_sha=source_sha, what="Contents/Helpers/hane-updater")
         inventory_sha256 = verify_archive_inventory(
-            archive, prefix=f"{MACOS_APP}/", inventory_rel=MACOS_INVENTORY_REL,
-            signature_rel=MACOS_INVENTORY_SIGNATURE_REL, version=version, target=MACOS_TARGET,
-            source_sha=source_sha, layout=MACOS_LAYOUT, trust=trust)
+            archive, prefix=f"{MACOS_APP}/", inventory_path=inventory_path, signature_path=signature_path,
+            version=version, target=MACOS_TARGET, source_sha=source_sha, layout=MACOS_LAYOUT, trust=trust)
         return {"bundle_id": info["CFBundleIdentifier"], "bundle_version": info["CFBundleShortVersionString"],
                 "inventory_sha256": inventory_sha256, "unpacked_size": archive.unpacked_size}
 
@@ -1074,7 +1142,9 @@ def main(argv: list[str] | None = None) -> int:
 
     add("require-env").add_argument("names", nargs="+")
     add("binary-identity", "binary", "version", "target", "source-sha")
-    add("macho-unsigned", "binary")
+    add("macho-signed", "binary")
+    add("verify-macos-codesign", "app")
+    add("macos-sidecar-dir", "version", "source-sha")
     add("windows-inventory", "root", "version", "source-sha", "output")
     add("macos-inventory", "app", "version", "source-sha", "output")
     sign = add("sign", "input", "output")
@@ -1110,8 +1180,15 @@ def _dispatch(args: argparse.Namespace) -> int:
     elif cmd == "binary-identity":
         check_identity(Path(args.binary).read_bytes(), version=args.version, target=args.target,
                        source_sha=args.source_sha, what=args.binary)
-    elif cmd == "macho-unsigned":
-        check_macho_unsigned(Path(args.binary).read_bytes(), args.binary)
+    elif cmd == "macho-signed":
+        check_macho_signed(Path(args.binary).read_bytes(), args.binary)
+    elif cmd == "verify-macos-codesign":
+        verify_macos_codesign(Path(args.app))
+    elif cmd == "macos-sidecar-dir":
+        if not SHA1_RE.match(args.source_sha):
+            raise fail("source SHA must be 40 lowercase hex digits")
+        # Relative to the directory that holds Hane.app (the ZIP's top folder).
+        print(macos_sidecar_dir(args.version, args.source_sha).removeprefix(f"{MACOS_ROOT}/"))
     elif cmd == "windows-inventory":
         Path(args.output).write_bytes(build_inventory(Path(args.root), args.version, args.source_sha))
     elif cmd == "macos-inventory":

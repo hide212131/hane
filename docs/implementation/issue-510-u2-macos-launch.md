@@ -1,59 +1,45 @@
 # Issue #510 U2: macOS ZIPの起動時署名検証
 
-状態: PR #535 はDraft・未merge。対象head `ebd40fb8521ec8a3fae1b8bed617fcf20155fc20` の修正候補は、GitHub Actions run 39462624048で回帰テスト・lintが成功し、ローカルのリリース検査84件も成功した。v0.27.0 ZIPから取り出した実行ファイル2つでは、署名除去後のMach-O検査に成功した。ただしCI成功はIssue #510の完了ではない。実Finderでの起動、およびMac/Windowsの実更新と復旧は未確認。
+状態: PR #535 はDraft・未merge。実装はこの文書の「現在の設計」に変更済みだが、この変更に対するCI・実Macでの署名検証・Finder起動・更新はまだ確認していない。CIの成功はIssue #510の完了ではない。実Finderでの起動、およびMac/Windowsの実更新と復旧は未確認。
 
-方針変更: ad-hoc署名の再付与とcustom resource rules方式は、実Macの配布ZIPでmacOSのcodesignが「resource envelope is obsolete (custom omit rules)」として拒否したため撤回した。現在は、`scripts/bundle-macos.sh` が `Contents/MacOS/hane` と `Contents/Helpers/hane-updater` のリンカー由来ad-hoc署名だけを `codesign --remove-signature` で取り除く。実ファイルの一時コピーでは両方が「code object is not signed at all」になり、helperのversion/target/source SHA identity checkは成功し、quarantine付きコピーのspctl assessmentは「rejected / source=no usable signature」だった。これはGatekeeper回避ではなく、Issue #510が許容する本人によるアプリ単位の初回許可を維持する。`codesign --verify` の成功は受入条件にしない。現時点で実際に起動できるとは扱わず、最終ZIPでの検査と本人による起動確認は別に記録する。
+## 設計の変遷
 
-## 対象と基準
+1. 初期案: ad-hoc署名の再付与とcustom resource rules方式。実Macの配布ZIPでmacOSのcodesignが「resource envelope is obsolete (custom omit rules)」として拒否したため撤回した。
+2. 前の案（このPRの以前のhead）: `codesign --remove-signature` で2つの実行ファイルの署名を除き、bundleを未署名にしてinventoryをアプリ内に置く。Apple Siliconは有効なコード署名のない実行コードを起動しないため、これは誤りだった。署名を外したarm64実行ファイルは実Macで起動せず、ad-hoc署名を付け直すと起動することを確認した。
+3. **現在の設計**: 完成した`Hane.app`を内側からad-hoc署名で封印し、Hane自身のEd25519 inventoryと署名はアプリの**外**に置く。署名（Apple）とinventory（Ed25519）が互いのファイルを変更しないため、両方が成立する。
 
-- 対象Issue: #510。完成条件はIssue本文を変更せず、そのまま適用する。
-- 対象: macOS Apple Silicon ZIP内の `Hane.app` と、通常のZIP展開後にmacOSが行うコード署名検証。
-- 基準main: `97c279acc063ef51ad5d5ee12af51a0edee174d2`。
-- 関連済み実装: #518（U4の適用・復旧）、#526（U2の配布・更新署名）。どちらも現在mainへ取り込み済み。
-- 関連する準備PR #517 は古いU0 branchをbaseとした文書のみのDraftであり、この修正へ転用しない。
+## 現在の設計
 
-## 観測した問題
-
-GitHub Release `v0.27.0` の `hane-macos-arm64.zip` を取得し、ZIPのCRC検査に成功した。ZIP内の `Hane.app` では、macOSの `codesign --verify --deep --strict` が次のエラーを返した。
-
-```text
-code has no resources but signature indicates they must be present
-```
-
-これは利用者が報告した「壊れているため開けません」というmacOS表示と整合する。したがって、単なる初回起動許可の不足として扱わず、配布bundleの署名状態を修正する。
-
-配布ZIPから作った一時コピーでad-hoc bundle signingを行うと、同じコード署名検査は成功した。一方、Gatekeeperのassessmentは依然としてrejectedだった。これはDeveloper ID・Apple公証を含まない場合にユーザー操作による個別の起動許可がなお必要になり得ることを示す。これは製品要求を変更する根拠ではない。
-
-検査対象の公開ZIP SHA-256:
-`3c5f075c5e36ebefe5abfe2a99faa30679fda4c8be03ba480f4c07f768fba8f5`
-
-## 今回直す範囲
-
-macOS release workflowで、最終的に公開するアプリbundleがmacOSの署名整合性検査を通るようにする。通常のZIP生成、GitHub Release、Ed25519更新catalog・bundle inventoryは再利用する。
-
-実装では次の両方を同時に保つこと。
-
-1. bundle内のHane本体とupdater helperに署名が残っておらず、`_CodeSignature` もない。bundle作成時にhelper identityも再検証する。
-2. 最終ZIPの全内容が既存のEd25519 inventory / catalog検証に一致し、version・target・source commitも一致する。署名除去後にファイルを追加・変更した状態を成功扱いにしない。
-
-既存のworkflow順（bundle → inventory → ZIP）を使い、inventoryは署名除去後の最終bundleの全ファイルから生成する。既存の安全な検証を省いたり弱めたりしない。
-
-リリースCIでは、既存の `verify-macos-zip` が実際にZIPへ格納した後の再展開bundleを検査し、2つの実行ファイルに `LC_CODE_SIGNATURE` が残っていないことと、Ed25519 inventoryの全件一致を確認する。`.github/**` は変更しない。
-
-利用者向けREADMEには、未確認開発元に対する本人の一度限りの許可だけを案内する。「壊れている」警告を突破させる案内にはしない。
+- `scripts/bundle-macos.sh` はInfo.plistなどをすべて置いた後、helper → `Contents/MacOS/hane` → bundle の順に `codesign --force --sign - --timestamp=none` で封印し、`codesign --verify --deep --strict` が成功することを確認する。`Contents/_CodeSignature/CodeResources` ができる。Developer ID・Team ID・notarization・stapleは追加しない。quarantineの削除やGatekeeperの迂回もしない。
+- inventory（`hane-install.json`/`.sig`）は封印後の`Hane.app`の全ファイル（`CodeResources`を含む）から生成し、ZIPの `hane-macos-arm64/Hane.app.update/<version>-<source_sha>/` に置く。アプリ内（`Contents/Resources`）には置かない。ZIP layout revisionは2。
+- release verifier（`scripts/release_catalog.py`）は新layoutの許可済みsidecarだけを受け入れ、未知file・余分な実行物・パス逸脱・別版/複数世代・欠落・改変・`CodeResources`なし・Mach-Oの署名なし・アプリ内の旧位置のinventoryを拒否する。ZIP展開後は `verify-macos-codesign` がAppleの `codesign --verify --deep --strict` を実行し、ad-hocかつTeam IDなしを確認する。
+- 更新側（`crates/update`）は、インストール済みbundleのInfo.plistの版/source SHAが指すsidecar世代を、アプリごとの外部データ `.hane-update-<InstallId>/inventories/` と、bundleの隣の `Hane.app.update/` の順に探す。見つかった世代が不正なら拒否し、旧データへfallbackしない。
+- 公開済みv0.27.0（inventoryがアプリ内、layout 1）は、どこにも世代がない場合に限り、旧inventoryとして読む。新版の更新が新世代を `inventories/` に作ることで、新layoutへ1回移行する。旧世代・旧inventoryはhealth commitまで、そのあとも削除しない。
+- 適用では、新sidecarを交換前に `inventories/` へ書く（既存世代は上書きせず、完全一致のときだけ再利用、不一致なら停止）。bundleの原子的交換、限定health、commit前の再検証、rollbackは変えていない。
 
 ## 維持する条件・対象外
 
 - Issue #510の方針どおり、Apple Developer ID、有料Developer Program、Team ID、公証、stapleを必須化しない。
 - AppleのOS全体の保護を弱めない。quarantineを削除したり、Gatekeeperを迂回する処理は追加しない。
 - Ed25519による更新catalog・inventory検証、ZIP中身・OS・版の検査、利用者データ保護、Windows配布を変えない。
-- #518で決めた更新時の「ad-hoc再署名しない」方針を変えない。この作業はリリース時に作るMac配布bundleだけを扱う。
-- v0.27.0の既存Release assetは上書きしない。修正は次の新しいpatch releaseとして公開する。
-- このPRと実装CIの成功だけでIssue #510全体を完了としない。MacとWindowsの実更新・通常編集・データ保持・代表的な失敗復旧は別途実機確認する。
+- 更新時にad-hoc再署名しない。ad-hoc署名はリリースbuild時に1回だけ付ける。
+- 現在のCargo version（0.27.1）を維持し、公開v0.27.0のassetは変更しない。
+- このPRと実装CIの成功だけでIssue #510全体を完了としない。
 
-## PR単位の完了条件
+## release workflowの接続変更（未反映）
 
-- macOS release pathが、同梱実行ファイルに署名が残る場合を検出して公開を止める。
-- 最終ZIPを検査し、署名が残っていないこととEd25519 inventory/catalogの両方が成功する。
-- READMEに初回起動の必要な操作が短く説明されている。
-- #510全体の未実施実機確認は未完了として記録される。
+`.github/**` は保護対象のためこのPRの作業者は変更していない。新layoutにするには `.github/workflows/windows-release.yml` の `build-macos` job で次を変える必要がある。これが反映されるまで、リリースのmacOS部分は新layoutで公開できない（`verify-macos-zip` は旧layoutのZIPを拒否する）。
+
+1. 「Generate and sign macOS inventory」: 署名したinventoryを `$app/Contents/Resources/` ではなく、ZIPのstagingの `hane-macos-arm64/Hane.app.update/<version>-<source_sha>/hane-install.json(.sig)` へ置く（`python scripts/release_catalog.py macos-sidecar-dir --version … --source-sha …` が相対パスを出力する）。`macos-inventory` は封印済みのbundleから実行する。
+2. 「Package macOS app zip」: `Hane.app` と並べてその `Hane.app.update/…` を同じstagingに入れ、`ditto` でZIP化する。
+3. 「Verify extracted macOS zip」: 展開した `Hane.app` に `python scripts/release_catalog.py verify-macos-codesign --app "$app"` を実行し、`macos-inventory` を再生成して展開済みsidecarと `cmp` する。
+4. `scripts/tests/test_release_workflows.py` のうち旧layoutを前提にするworkflow検査（`Contents/Resources/hane-install.json.sig`、workflowに `codesign` を含めない検査）は、上記の変更と同時に更新する。
+
+## 実Macでの確認（未実施）
+
+次はすべて未確認で、完了として扱わない。
+
+- 新しいrelease ZIPをFinderで展開し、`codesign --verify --deep --strict` が成功し、Apple Siliconで起動できること。
+- 展開後の `Hane.app` と `Hane.app.update` がEd25519検査に成功すること。
+- v0.27.0 → 新版の実更新、health失敗時のrollback、保存データの保持。
+- Windowsを含む#510全体の実機確認。

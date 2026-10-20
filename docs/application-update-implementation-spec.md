@@ -126,7 +126,7 @@ JSONはUTF-8、256 KiB以下、重複キーを拒否する。署名は**取得�
 | `targets.*.asset_name`, `archive_size`, `archive_sha256` | 正確な名前、実byte数、64桁lowercase hex。asset/API値とも整合。 |
 | `targets.*.unpacked_size`, `layout_revision` | 実展開byte総量、下記layout revision。上限以下か検査。 |
 | Windows `inventory_sha256` | ZIP内`hane-install.json` raw bytesのhash。catalogの版・targetとinventoryが一致。 |
-| macOS `bundle_id`, `bundle_version`, `inventory_sha256` | Bundle ID固定、Cargo版に対応するbundle版、`Hane.app/Contents/Resources/hane-install.json`のSHA-256。`team_id`は持たない（設定されたカタログは拒否）。 |
+| macOS `bundle_id`, `bundle_version`, `inventory_sha256` | Bundle ID固定、Cargo版に対応するbundle版、`Hane.app.update/<version>-<source_sha>/hane-install.json`（アプリの外のsidecar）のSHA-256。`team_id`は持たない（設定されたカタログは拒否）。 |
 
 署名鍵はHane本体更新専用とし、Codex runtime catalogの鍵/署名ドメインと共用しない。署名秘密鍵はコード・ZIP・ログへ入れず、配布用secretとして保管する。鍵値をこの設計PRでは発行しない。公開鍵は最初の更新対応版へ組み込む（macOSでもApple Team IDは使わない）。ローテーションは旧鍵で署名したbridge版に新公開鍵を同梱し、移行期間は両鍵の署名を配布する。旧鍵しか知らない版を支援する間は旧署名を残す。侵害・紛失時に安全なbridgeを出せない場合は手動導入とし、ネット上の新鍵を無条件採用しない。
 
@@ -250,13 +250,29 @@ MSIX更新失敗は`本体は更新しましたが、Explorer連携の更新に�
 
 ## 10. macOS適用
 
-出荷前提は、`.app`内の`Contents/Resources/hane-install.json`と`.sig`（更新用Ed25519鍵で署名したinventory。自身と`.sig`以外の全ファイルのパス・size・SHA-256を`Hane.app`相対で列挙）を含めること。Apple Developer ID・固定Team ID・notarizationは要求しない。Info.plistに`CFBundleShortVersionString`/`CFBundleVersion`（Cargo版）、`HaneSourceCommit`（40桁source SHA）、`HaneUpdaterProtocol`（整数1）を設定する。現在版と候補のBundle ID、版、source SHA、署名済みinventoryとbundle内ファイルの一致を確認する。inventoryのない既存版は手動で`V_bootstrap`を導入する。
+出荷前提は次のとおり。Apple Silicon は有効なコード署名のない実行コードを起動しないため、完成した`Hane.app`（`Contents/Helpers/hane-updater`を含む）を、内側（helper → 本体 → bundle）の順にローカルのad-hoc署名（identity `-`）で封印する。`codesign --verify --deep --strict`が成功し、`Contents/_CodeSignature/CodeResources`ができる。Apple Developer ID・固定Team ID・notarization・stapleは要求せず、追加しない。Info.plistに`CFBundleShortVersionString`/`CFBundleVersion`（Cargo版）、`HaneSourceCommit`（40桁source SHA）、`HaneUpdaterProtocol`（整数1）を設定する。
 
-ZIP layout revision 1は`hane-macos-arm64/Hane.app`とREADME/LICENSEに限定する。inventory署名後にbundleを加工しない。候補helper/実行fileも同じ署名済みinventoryで検証した内容と一致することを確認する。Appleの署名をカタログ・inventoryの署名の代わりにせず、Appleの署名がないことも拒否理由にしない。
+署名済みbundleに1ファイルでも足すと封印が壊れるため、更新用Ed25519鍵で署名したinventory（`hane-install.json`/`.sig`）は**アプリの外**に置く。inventoryは封印後の`Hane.app`の全ファイル（`CodeResources`を含む）のパス・size・SHA-256を`Hane.app`相対で列挙する。現在版と候補のBundle ID、版、source SHA、署名済みinventoryとbundle内ファイルの一致を確認する。AppleのコードをEd25519検査の代わりにせず、Ed25519検査をAppleの署名の代わりにもしない（両方を別の目的で満たす）。
+
+ZIP layout revision 2（macOS）:
+
+```text
+hane-macos-arm64/Hane.app/...                                        # ad-hoc封印済み。inventoryは含まない
+hane-macos-arm64/Hane.app.update/<version>-<source_sha>/hane-install.json
+hane-macos-arm64/Hane.app.update/<version>-<source_sha>/hane-install.json.sig
+hane-macos-arm64/README.md
+hane-macos-arm64/LICENSE
+```
+
+許可するのは上記だけで、未知file・余分な実行物・パス逸脱・別版や複数世代のsidecar・欠落・`CodeResources`なしのbundle・アプリ内の旧位置（`Contents/Resources/hane-install.json(.sig)`）を拒否する。catalogの`layout_revision`は2、`inventory_sha256`はsidecarの`hane-install.json`のSHA-256。release側では`scripts/release_catalog.py`の`verify-macos-zip`（構造・Ed25519・全ファイル）に加え、macOSで展開した`Hane.app`に`verify-macos-codesign`（Appleの`codesign --verify --deep --strict`と、ad-hocかつTeam IDなしの確認）を実行する。
+
+インストール済みbundleのinventoryは、そのInfo.plistの版とsource SHAが指す世代`<version>-<source_sha>`を、順に(1) インストールごとのapp-specific外部データ`.hane-update-<InstallId>/inventories/`、(2) bundleの隣の`Hane.app.update/`（ZIPから新規導入した直後）で探す。世代名はInfo.plistの値から作るため、版文字列と40桁hexの形式を満たさなければ拒否する。最初に世代が見つかった場所が決定的で、sidecarが欠落・不正・別版・別layout・署名不正・ファイルと不一致なら拒否し、古いデータや別の場所へ緩くfallbackしない。どの場所にも世代がなく、bundle内に旧位置のinventoryがあり、版が公開済みv0.27.0で、それがlayout 1と明記している場合に限り、移行用の旧inventoryとして読む。それ以外はinventoryなしとして拒否する。`.app`を別の場所へ移動するとInstallIdが変わるため、移動先でsidecarを見つけられるのは`Hane.app.update/`を一緒に移動した場合だけで、そうでなければ更新を無効にして再導入を案内する。
+
+適用前に、候補ZIPのsidecarを検査・展開した後、`inventories/<version>-<source_sha>/`へ交換前に準備する。private一時ディレクトリへ両fileを書いてflush後に名前を付けて入れ替えるため、世代は存在しないか完全かのどちらか。既存世代は上書きせず、同じ版・source SHAの既存世代は2 fileが完全一致するときだけ再利用し、不一致・不完全なら更新を停止する。他の世代（旧appが使う世代、またはv0.27.0のアプリ内旧inventory）は削除も変更もしないため、health commit前のrollback後も旧appを検証できる。commit直前には新bundleがこの外部sidecarで検証できることを再確認し、旧inventoryからの移行（v0.27.0 → 新layout）は、この更新が新世代を作ることで1回だけ行われる。失敗したattemptが残した完全な新世代は害がなく、同じ内容の次回attemptで再利用される。世代の削除（古い世代の整理）は今回行わない。
 
 helperは`.app`外のprivate stageから、配置pathと同じAPFS volumeにある検証済みcandidateと現bundleを`renamex_np(RENAME_SWAP)`相当の原子的交換で入れ替える。APFSであることに加えてvolumeのswap-renaming capabilityを検査する。先に元bundleを消す二段階renameへfallbackしない。交換後の旧bundleをbackupとして保持し、限定起動失敗時は同じ交換で戻す。file IDとcatalog/版をjournalに照合して方向を決め、journal更新直前に中断しても交換を二度適用しない。
 
-APFS以外、交換非対応、App Translocation、読取専用や親の権限不足なら適用せず手動案内する。Gatekeeperを無効化したりquarantineを削除したりad hoc再署名したりしない。OSが未署名・未公証のappの起動を確認する場合は、本人がアプリ単位で起動を許可して進める。起動は正規配置のbundleから行い、private health channelを実childへ渡す。OSの起動拒否はhealth失敗として旧bundleを維持/復旧する。
+APFS以外、交換非対応、App Translocation、読取専用や親の権限不足なら適用せず手動案内する。Gatekeeperを無効化したりquarantineを削除したり、更新時にad hoc再署名したりしない（ad-hoc署名はリリースbuild時に1回だけ付ける）。OSが未署名・未公証のappの起動を確認する場合は、本人がアプリ単位で起動を許可して進める。起動は正規配置のbundleから行い、private health channelを実childへ渡す。OSの起動拒否はhealth失敗として旧bundleを維持/復旧する。
 
 ## 11. Journal、復旧、cleanup
 
@@ -284,7 +300,7 @@ Committed後にcandidate/backupを急いで消さず、次の正常起動を1回
 
 配布基盤専用PRは既存release入口・Cargo version整合・全workspace checksを維持し、以下を行う。
 
-1. 両OSでhelperをビルドし、version/source/target/protocolを実binaryから検査する。Windowsはinventoryを生成・署名し、macOSも`Hane.app`内にinventoryを生成・署名してからZIPを作る（Apple署名・notarizationは要求しない）。
+1. 両OSでhelperをビルドし、version/source/target/protocolを実binaryから検査する。Windowsはinventoryを生成・署名する。macOSは`Hane.app`をad-hoc署名で封印し（`scripts/bundle-macos.sh`）、封印後の全ファイルからinventoryを生成・署名して`Hane.app.update/<version>-<source_sha>/`に置いてからZIPを作る（Developer ID・Team ID・notarizationは要求しない）。ZIP展開後にもAppleの`codesign --verify --deep --strict`で検証する。
 2. inventory/ZIP検査後に実size/hashを集計し、両targetを含むcatalogを生成・署名する。更新用の鍵IDは保守者が実値を設定し、未設定ならrelease準備を失敗させる。空署名/開発鍵で代用しない。
 3. Draft Releaseへ両ZIP、catalog、signatureをuploadし、再取得して検証した後にstable公開する。公開済み同tagのZIPはclobberしない。修正は新しいCargo版で出す。metadataの期限更新だけは同じarchive hashで行える。
 4. `release-request.yml`の完了確認を、両ZIPの存在に加えてcatalog/signature/版/署名/hash一致まで拡張する。Releaseの公開とsource SHAの対応を保つ。

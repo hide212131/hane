@@ -227,11 +227,11 @@ fn reexec_trust_decision(
 /// matches the inventory signed with the update key.
 #[cfg(target_os = "macos")]
 fn verify_exe_for_reexec(exe: &std::path::Path, policy: &TrustPolicy) -> Result<(), String> {
-    use hane_update::macos_apply::verify_bundle_inventory;
+    use hane_update::macos_apply::{installed_sidecar_roots, verify_bundle_inventory};
     use hane_update::platform::macos::locate;
     reexec_trust_decision(policy.is_configured(), || {
         let placement = locate(exe).map_err(|err| err.to_string())?;
-        verify_bundle_inventory(&placement.install_root, policy)
+        verify_bundle_inventory(&placement.install_root, &installed_sidecar_roots(&placement), policy)
             .map(|_| ())
             .map_err(|err| err.to_string())
     })
