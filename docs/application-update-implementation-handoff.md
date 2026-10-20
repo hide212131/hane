@@ -39,10 +39,10 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 |---|---|
 | U0 | merged。[PR #512](https://github.com/hide212131/hane/pull/512)（U0/U1/U3）に含まれてmerge済み。 |
 | U1 | merged。PR #512に含まれてmerge済み。Windows 11実機でのExplorer登録等の確認（U-11）は未了。 |
-| U2 | （履歴。現在はPR #526がmerge済み）Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。#518用branchをbaseにしているため、#518の変更後に同期と再検証が必要。当時は本番の署名設定が未完了だったが、現在は設定済みでv0.27.0が公開済み（上記参照）。 |
-| U3 | merged。PR #512に含まれてmerge済み。実署名metadata未準備のため適用操作は有効化しない。 |
-| U4 | （`92235af...` 時点の履歴）Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、当時のhead `92235af3ab443eeb545eb93bdb72e529a93d4df8`。最新のexact verifier run `39309109627`はtests/lint成功。current-head CI `39309328198`はmaintainer approval待ちで未実行であり、成功扱いにしない。最新のCodex Reviewは返答待ち。両OSのU-08〜14は未了。 |
-| U5 | 未完了。本番ZIP、Windows/macOS実更新と復旧の実行証拠は未取得。 |
+| U2 | merged。[PR #526](https://github.com/hide212131/hane/pull/526)（merge commit `e5b6d5f1e354514969ec7e1039db3a6b49263c37`）。更新用署名鍵の本番設定は完了し、v0.27.0が公開済み（Release builds run `39450369467`）。 |
+| U3 | merged。PR #512に含まれてmerge済み。署名metadataはv0.27.0の公開で準備済み。実OSでの二版更新・復旧の確認は未完了。 |
+| U4 | merged。[PR #518](https://github.com/hide212131/hane/pull/518)（merge commit `2cce69618791feaec7ab8743002733d11f3e98dd`）。両OSの実更新・復旧（U-08〜14）の実機証拠は未了。 |
+| U5 | 未完了。v0.27.0の本番ZIP・更新catalog・署名は公開済みだが、Windows/macOSでの二版実更新と復旧の実行証拠は未取得。Issue #510の受入条件4件が正本であり、U-01〜U-15を全件の完了ゲートにしない。Issue #510は完了していない。 |
 
 | 段階 | 変更予定のpath／内容 | 先行条件と完了条件 |
 |---|---|---|
