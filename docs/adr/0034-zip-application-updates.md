@@ -1,10 +1,10 @@
 # ADR-0034: ZIP配布を継続したアプリ本体の更新
 
 日付: 2026-10-17
-状態: Accepted（PR #509で採用）。実装の進捗は[Issue #510](https://github.com/hide212131/hane/issues/510)に従う。WindowsとmacOSの実配布物での二版更新・復旧とU-01〜U-15の証拠がそろうまで、#510は完了扱いにしない。
+状態: Accepted（PR #509で採用）。実装の進捗と現行の受入条件は[Issue #510](https://github.com/hide212131/hane/issues/510)の本文に従う（現行スコープは本人用のmacOS/Windows）。#518・#526はmerge済みだが、実機での更新・復旧の確認は未完了のため、#510は完了扱いにしない。旧設計のU-01〜U-15は履歴・参考であり、Issue #510の必須条件より広い完了ゲートではない。
 調査基準: `e82b9a9fe42280bfa78497746bcd7e21c73430c5`（設計時点のSHAであり、current mainではない）
 
-要求・受入条件の正本: [Issue #508](https://github.com/hide212131/hane/issues/508)
+要求・受入条件の正本: [Issue #510](https://github.com/hide212131/hane/issues/510)。[Issue #508](https://github.com/hide212131/hane/issues/508)は完了した設計Issueであり、現行の受入条件ではない。
 
 ## 背景
 

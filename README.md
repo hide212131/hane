@@ -21,11 +21,9 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 - macOS Apple Silicon — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-macos-arm64.zip` をダウンロードし、展開して `Hane.app` を開きます。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-macos-arm64.zip)することもできます。
 - Windows 11 x64 — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` をダウンロードし、展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-windows-x64.zip)することもできます。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
 
-macOS 版は Apple の署名（Developer ID・ad-hoc）も notarization も付けていません。配布するアプリ本体と更新用ヘルパーからは、リンカーが付ける署名も取り除いてあり、`codesign --verify` は成功しません。これは意図した状態です。整合性は更新用のEd25519署名付きinventoryで確認します。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
+macOS 版は Apple Developer ID の署名も notarization も付けていません。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
 
-「開発元を検証できない」などの警告で止まった場合は、`Hane.app` を一度開いて警告を閉じたあと、「システム設定」→「プライバシーとセキュリティ」の「セキュリティ」欄に表示される「このまま開く」を選び、確認画面で本人が許可してください。この許可はアプリごとに初回だけ必要です。「壊れているため開けません」と表示される場合は、この手順では解決しません。ダウンロードし直すか、[Issue #510](https://github.com/hide212131/hane/issues/510) で報告してください。
-
-現在この方針は PR #535（Draft・未完了）で検証中で、実際の Mac での起動許可と、Issue #510 の Mac / Windows の実更新確認は未完了です。
+「開発元を検証できない」などの警告で止まった場合は、`Hane.app` を一度開いて警告を閉じたあと、「システム設定」→「プライバシーとセキュリティ」の「セキュリティ」欄に表示される「このまま開く」を選び、確認画面で本人が許可してください。この許可はアプリごとに初回だけ必要です。「壊れているため開けません」と表示される場合は、この手順では解決しません。許可操作で進めず、ダウンロードし直すか、[Issue #510](https://github.com/hide212131/hane/issues/510) で報告してください。
 
 Windows版は [最新のGitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。v0.19.1以降のZIPにはWindows 11のExplorer拡張も同梱します（v0.19.0のZIPには含まれません）。CLI の使い方とエクスプローラーへの統合については [Windows CLI / Explorer 統合](#windows-cli--explorer-統合) を参照してください。
 

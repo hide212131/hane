@@ -1,7 +1,7 @@
 # アプリ本体更新の実装仕様
 
 作成日: 2026-10-17
-状態: 設計採用済み（PR #509）／製品は部分実装済み（U0/U1/U3はPR #512でmerge済み、U4はPR #518でDraft、U2はPR #526でDraft）／配布の有効化とOS実機試験は未完了。進捗は[引き継ぎ](application-update-implementation-handoff.md)と[Issue #510](https://github.com/hide212131/hane/issues/510)に従う
+状態: 設計採用済み（PR #509）／製品は部分実装済み（U0/U1/U3はPR #512、U4はPR #518（head `2cce69618791feaec7ab8743002733d11f3e98dd`）、U2はPR #526（head `e5b6d5f1e354514969ec7e1039db3a6b49263c37`）でmerge済み）／latest Releaseはv0.27.0で、Mac ZIPの起動問題の修正はPR #535（Draft・未merge）で扱う／実Finder起動とMac/Windowsの実更新・復旧は未確認。旧U-01〜U-15は履歴・参考であり、現行Issueの必須条件より広い完了ゲートではない。進捗は[引き継ぎ](application-update-implementation-handoff.md)と[Issue #510](https://github.com/hide212131/hane/issues/510)に従う
 調査基準: main `e82b9a9fe42280bfa78497746bcd7e21c73430c5`（設計時点のSHAであり、current mainではない。実装時はcurrent mainで再確認する）
 判断: [ADR-0034](adr/0034-zip-application-updates.md)
 実装順序・受入: [引き継ぎ](application-update-implementation-handoff.md)

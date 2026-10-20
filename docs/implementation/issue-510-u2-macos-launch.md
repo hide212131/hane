@@ -1,6 +1,6 @@
 # Issue #510 U2: macOS ZIPの起動時署名検証
 
-状態: PR #535 はDraftで未完了。署名除去方式の実装後のCI検証、実Macでの起動許可、Issue #510 の実Mac/Windows更新確認は未完了。
+状態: PR #535 はDraft・未merge。対象head `ebd40fb8521ec8a3fae1b8bed617fcf20155fc20` の修正候補は、GitHub Actions run 39462624048で回帰テスト・lintが成功し、ローカルのリリース検査84件も成功した。v0.27.0 ZIPから取り出した実行ファイル2つでは、署名除去後のMach-O検査に成功した。ただしCI成功はIssue #510の完了ではない。実Finderでの起動、およびMac/Windowsの実更新と復旧は未確認。
 
 方針変更: ad-hoc署名の再付与とcustom resource rules方式は、実Macの配布ZIPでmacOSのcodesignが「resource envelope is obsolete (custom omit rules)」として拒否したため撤回した。現在は、`scripts/bundle-macos.sh` が `Contents/MacOS/hane` と `Contents/Helpers/hane-updater` のリンカー由来ad-hoc署名だけを `codesign --remove-signature` で取り除く。実ファイルの一時コピーでは両方が「code object is not signed at all」になり、helperのversion/target/source SHA identity checkは成功し、quarantine付きコピーのspctl assessmentは「rejected / source=no usable signature」だった。これはGatekeeper回避ではなく、Issue #510が許容する本人によるアプリ単位の初回許可を維持する。`codesign --verify` の成功は受入条件にしない。現時点で実際に起動できるとは扱わず、最終ZIPでの検査と本人による起動確認は別に記録する。
 

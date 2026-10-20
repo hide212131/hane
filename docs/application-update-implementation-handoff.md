@@ -1,16 +1,18 @@
 # アプリ本体更新の実装引き継ぎ
 
 作成日: 2026-10-17
-状態: 設計はPR #509でreview後にmerge済み。実装は部分的に進行中で、OS実機検証・本番署名設定・配布有効化・U5は未完了。
+状態: 設計はPR #509でreview後にmerge済み。U0〜U4相当はPR #512・#518・#526でmerge済み。latest Releaseはv0.27.0で、Mac ZIPの起動問題の修正はPR #535（Draft・未merge）で扱う。OS実機検証（実Finder起動、Mac/Windowsの実更新・復旧）・本番署名設定・配布有効化・U5は未完了。
 設計時の基準main: `e82b9a9fe42280bfa78497746bcd7e21c73430c5`（設計時点のSHAであり、current mainではない。着手時にcurrent mainを確認する）
 正本: [ADR-0034](adr/0034-zip-application-updates.md)、[詳細仕様](application-update-implementation-spec.md)
 実装の進捗の追跡: [Issue #510](https://github.com/hide212131/hane/issues/510)
 
 要求・受入条件の正本: 製品実装の現在の契約は[Issue #510](https://github.com/hide212131/hane/issues/510)。[Issue #508](https://github.com/hide212131/hane/issues/508)は設計Issueとして完了済みで、実装の受入判定には使わない。仕様書の「要求の縮小記録」（外部openの利用者向け再操作案内、scroll/caret完全復元の後続化）も参照する。
 
-Issue #510は、WindowsとmacOSの実配布物で旧版から新版への更新と復旧を行い、U-01〜U-15の証拠がそろうまで完了扱いにしない。受入条件は縮小・弱化しない。
+現行スコープは本人用のMac/Windowsである。Issue #510は、Issue本文の完成条件（4項目）を実配布物で満たすまで完了扱いにしない。本文のU-01〜U-15と下の進捗表は履歴・参考であり、Issue #510の必須条件より広い完了ゲートではない（全件・全組合せを一律必須にしない）。ただし、必要な安全性、文書・設定・AIデータ保護、Windows Explorer連携、失敗復旧は弱めない。
 
 ## 0. 進捗の要約
+
+現在の事実: PR #518（head `2cce69618791feaec7ab8743002733d11f3e98dd`）とPR #526（head `e5b6d5f1e354514969ec7e1039db3a6b49263c37`）はmerge済み。以下の表のDraft/open記述は履歴であり現在の状態ではない。
 
 下表の状態は、PR #518の親head `92235af3ab443eeb545eb93bdb72e529a93d4df8` 時点の過去snapshotであり、現在のPR head/statusを表さない（その後に文書更新commit `3a473563f541ee2ac4fc9d93104e69bd56ced8eb` が追加された）。表中の当時のrun/statusは歴史的記録として保持する。current factsはGitHub上のPRを読む。以下の基準値も当時のものである: current main `08f659e0032ee377ca21e1cce060a8d517c884dc`、PR #518 head `92235af3ab443eeb545eb93bdb72e529a93d4df8`、PR #526 head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`（#518用branchをbaseにしている）を基準とする。実装時はGitHub上のcurrent factsを読み直す。
 
@@ -37,7 +39,7 @@ current main、追跡Issue、関連PRと同対象の実行中runを読み直す�
 |---|---|
 | U0 | merged。[PR #512](https://github.com/hide212131/hane/pull/512)（U0/U1/U3）に含まれてmerge済み。 |
 | U1 | merged。PR #512に含まれてmerge済み。Windows 11実機でのExplorer登録等の確認（U-11）は未了。 |
-| U2 | Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。#518用branchをbaseにしているため、#518の変更後に同期と再検証が必要。本番の署名設定は未完了。 |
+| U2 | （履歴。現在はPR #526がmerge済み）Draft/open。[PR #526](https://github.com/hide212131/hane/pull/526)、head `eb988f8405dd8fc542b6b5aa9394a8707a0aa67d`。#518用branchをbaseにしているため、#518の変更後に同期と再検証が必要。本番の署名設定は未完了。 |
 | U3 | merged。PR #512に含まれてmerge済み。実署名metadata未準備のため適用操作は有効化しない。 |
 | U4 | （`92235af...` 時点の履歴）Draft/open。[PR #518](https://github.com/hide212131/hane/pull/518)、当時のhead `92235af3ab443eeb545eb93bdb72e529a93d4df8`。最新のexact verifier run `39309109627`はtests/lint成功。current-head CI `39309328198`はmaintainer approval待ちで未実行であり、成功扱いにしない。最新のCodex Reviewは返答待ち。両OSのU-08〜14は未了。 |
 | U5 | 未完了。本番ZIP、Windows/macOS実更新と復旧の実行証拠は未取得。 |
