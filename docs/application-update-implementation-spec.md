@@ -272,7 +272,7 @@ journalはschema、TransactionId、InstallId、source/destinationの署名identi
 | Applying途中 | lease確保後、intentとfile hashを照合して旧版へrollback。新版の通常起動をしない。 |
 | AwaitingHealth、commitなし | 対象childの終了を確認しrollback。新版に永続書込を許さない。 |
 | durable Committedあり | 新版を維持しticketを一回だけ処理。確認後の再起動で勝手に旧版へ戻さない。 |
-| backup破損、未知hash、root移動、復元不可 | `RecoveryRequired`。追加削除・旧新どちらかの推測による上書きをしない。手動の署名済みZIP導入へ案内。 |
+| backup破損、未知hash、root移動、復元不可 | `RecoveryRequired`。追加削除・旧新どちらかの推測による上書きをしない。公式GitHub Releasesの署名済みZIPを、現在のインストール先とは異なる書き込み可能な場所／名前へ展開する手動導入へ案内する（同じ場所への上書きはInstallIdとjournalが残り再び止まるため案内しない）。元のフォルダー、`.hane-update-*`、journal、表示されたbackupは変更しない。カスタム`HANE_STATE_DIR`は引き継ぎ、Explorer連携は設定画面で確認する。 |
 
 pendingを見た最初の起動は同じtransactionの現在版helper copyを検証して復旧し、必要なら独立helperの進捗/復旧画面を出す。起動側はruntime leaseをまだ取らず、startup gateを解放してからrecovery helperへ渡し、そのhelperが順序どおりtransaction/startup/runtimeを取る。gateを保持した親がhelperのgate取得を待つdeadlockを作らない。同時に複数の復旧要求が来てもtransaction leaseを取った一つだけが操作する。rootにアプリが残ることを前提にし、起動可能な場所を消す設計にしない。helper入口は対話のない任意ディレクトリ置換toolにしない。
 

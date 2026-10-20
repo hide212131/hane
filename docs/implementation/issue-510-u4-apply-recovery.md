@@ -42,7 +42,7 @@
 
 - アプリは `prepare_restart` で、Ready候補のcatalog・署名・archiveだけを `Coordination::transaction_dir/<TransactionId>/candidate/` へcopyする。helperのprotocolには候補ID以外を追加していない（任意のsource/destination path、CLI引数、環境変数、commandなし）。
 - helperは親終了後に排他的runtime leaseを取ってから、自分の位置から導出した `Coordination` と `find_install` で配置を決め、現在のsigned inventory、候補catalog/署名（候補IDと照合）、archive hash、archive検査と展開（`stage/`）、新inventoryを独立して再検証する。適用planは署名確認済みinventory同士から `ApplyPlan::for_inventories` で作り、precondition違反は書込み前に停止する。
-- journal intentをdurable化してから既存の `apply::apply` で所有ファイルだけを置換し、`hane.exe` は最後になる。inventory外のfile、user state、Explorer登録、版別shell DLLは変更しない。曖昧なhashや壊れたbackupは既存engineがRecoveryRequiredにする。
+- journal intentをdurable化してから既存の `apply::apply` で所有ファイルだけを置換し、`hane.exe` は最後になる。inventory外のfile、user state、Explorer登録、版別shell DLLは変更しない。曖昧なhashや壊れたbackupは既存engineがRecoveryRequiredにする。RecoveryRequired後の起動時案内は、署名済みZIPを現在のインストール先とは異なる書き込み可能な場所へ展開して起動するよう示す（絶対pathが変わると別InstallIdになりjournalのgateを踏まない）。元のフォルダー・`.hane-update-*`・journal・表示されたbackupは変更せず、検証できないbackupを復元可能と扱わない。
 - increment 2 時点では限定healthとdurable commitがなく、`apply_and_settle` は置換後に直ちに旧版へ戻していた。increment 3 で限定health childとdurable commitに接続した（下記）。再起動ボタンへは接続していない。
 - 未実施: macOS bundle swap、restart UI有効化、実Windowsでの二版適用証拠（U5）。ここまでの検証はfake/temp directoryによるunit testのみで、実OSのpower-loss耐性は主張しない。
 
