@@ -27,7 +27,10 @@ use crate::limits::{
     MAX_ENTRY_BYTES, MAX_INVENTORY_BYTES, MAX_SIGNATURE_BYTES, MAX_UNPACKED_BYTES,
     RATIO_CHECK_MIN_BYTES,
 };
-use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target};
+use crate::model::{
+    INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, MACOS_APP_PREFIX, MACOS_INVENTORY_REL,
+    MACOS_INVENTORY_SIGNATURE_REL, Target,
+};
 use crate::paths::{ancestors, collision_key, validate_rel_path};
 use crate::trust::TrustPolicy;
 use crate::util::{hex_encode, sha256_context};
@@ -483,10 +486,12 @@ const WINDOWS_REQUIRED: [&str; 4] = [
 ];
 const MACOS_ROOT: &str = "hane-macos-arm64";
 const MACOS_APP: &str = "hane-macos-arm64/Hane.app";
-const MACOS_REQUIRED: [&str; 3] = [
+const MACOS_REQUIRED: [&str; 5] = [
     "hane-macos-arm64/Hane.app/Contents/Info.plist",
     "hane-macos-arm64/Hane.app/Contents/MacOS/hane",
     "hane-macos-arm64/Hane.app/Contents/Helpers/hane-updater",
+    "hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json",
+    "hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json.sig",
 ];
 
 fn windows_file_allowed(path: &str) -> bool {
@@ -660,8 +665,28 @@ pub fn inspect_archive<R: Read + Seek>(
         entry.sha256 = stream_entry(reader, &entry_ro, &mut |_| Ok(()))?;
     }
     let inventory = match candidate.target() {
-        Target::WindowsX64 => Some(verify_windows_inventory(reader, &entries, candidate, policy)?),
-        Target::MacosArm64 => None,
+        Target::WindowsX64 => Some(verify_inventory(
+            reader,
+            &entries,
+            candidate,
+            policy,
+            &InventoryLocation {
+                prefix: "",
+                inventory: INVENTORY_FILE_NAME,
+                signature: INVENTORY_SIGNATURE_FILE_NAME,
+            },
+        )?),
+        Target::MacosArm64 => Some(verify_inventory(
+            reader,
+            &entries,
+            candidate,
+            policy,
+            &InventoryLocation {
+                prefix: MACOS_APP_PREFIX,
+                inventory: MACOS_INVENTORY_REL,
+                signature: MACOS_INVENTORY_SIGNATURE_REL,
+            },
+        )?),
     };
     Ok(InspectedArchive {
         entries,
@@ -670,17 +695,29 @@ pub fn inspect_archive<R: Read + Seek>(
     })
 }
 
-fn verify_windows_inventory<R: Read + Seek>(
+/// Where a target keeps its signed inventory inside the archive. Inventory
+/// paths are relative to `prefix`; files outside `prefix` (the macOS README and
+/// LICENSE) are not owned and not listed.
+struct InventoryLocation {
+    prefix: &'static str,
+    inventory: &'static str,
+    signature: &'static str,
+}
+
+fn verify_inventory<R: Read + Seek>(
     reader: &mut R,
     entries: &[EntryInfo],
     candidate: &VerifiedCandidate,
     policy: &TrustPolicy,
+    location: &InventoryLocation,
 ) -> Result<SignedInventory> {
+    let inventory_path = format!("{}{}", location.prefix, location.inventory);
+    let signature_path = format!("{}{}", location.prefix, location.signature);
     let find = |name: &str| entries.iter().find(|e| !e.is_dir && e.path == name);
     let inventory_entry =
-        find(INVENTORY_FILE_NAME).ok_or_else(|| reject("archive has no signed inventory"))?;
-    let signature_entry = find(INVENTORY_SIGNATURE_FILE_NAME)
-        .ok_or_else(|| reject("archive has no inventory signature"))?;
+        find(&inventory_path).ok_or_else(|| reject("archive has no signed inventory"))?;
+    let signature_entry =
+        find(&signature_path).ok_or_else(|| reject("archive has no inventory signature"))?;
     let raw = read_entry(reader, inventory_entry, MAX_INVENTORY_BYTES)?;
     let signature = read_entry(reader, signature_entry, MAX_SIGNATURE_BYTES)?;
     // The catalog binds the exact inventory bytes (check_candidate compares
@@ -696,10 +733,8 @@ fn verify_windows_inventory<R: Read + Seek>(
         .collect();
     let present: BTreeMap<&str, &EntryInfo> = entries
         .iter()
-        .filter(|e| {
-            !e.is_dir && e.path != INVENTORY_FILE_NAME && e.path != INVENTORY_SIGNATURE_FILE_NAME
-        })
-        .map(|e| (e.path.as_str(), e))
+        .filter(|e| !e.is_dir && e.path != inventory_path && e.path != signature_path)
+        .filter_map(|e| Some((e.path.strip_prefix(location.prefix)?, e)))
         .collect();
     if listed.len() != present.len() || !listed.keys().all(|p| present.contains_key(p)) {
         return Err(reject("archive files differ from the signed inventory"));

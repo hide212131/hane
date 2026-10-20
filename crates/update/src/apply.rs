@@ -58,7 +58,7 @@ pub trait FileOps: DiskView {
     }
     /// Re-verifies, right before `Committed`, everything the install must be
     /// beyond the journaled steps (Windows: the unchanged owned files; macOS:
-    /// the bundle facts and the Developer ID signature). The expectation was
+    /// the bundle facts and the signed inventory). The expectation was
     /// fixed from the signed candidate, never learned from the live install.
     /// An error (mismatch or failed query) prevents the commit.
     fn verify_commit_state(&self) -> Result<()> {

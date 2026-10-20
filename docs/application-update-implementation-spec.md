@@ -126,9 +126,9 @@ JSONはUTF-8、256 KiB以下、重複キーを拒否する。署名は**取得�
 | `targets.*.asset_name`, `archive_size`, `archive_sha256` | 正確な名前、実byte数、64桁lowercase hex。asset/API値とも整合。 |
 | `targets.*.unpacked_size`, `layout_revision` | 実展開byte総量、下記layout revision。上限以下か検査。 |
 | Windows `inventory_sha256` | ZIP内`hane-install.json` raw bytesのhash。catalogの版・targetとinventoryが一致。 |
-| macOS `bundle_id`, `team_id`, `bundle_version` | Bundle ID固定、bootstrapに固定したTeam ID、Cargo版に対応するbundle版。metadataだけで新Team IDを信頼しない。 |
+| macOS `bundle_id`, `bundle_version`, `inventory_sha256` | Bundle ID固定、Cargo版に対応するbundle版、`Hane.app/Contents/Resources/hane-install.json`のSHA-256。`team_id`は持たない（設定されたカタログは拒否）。 |
 
-署名鍵はHane本体更新専用とし、Codex runtime catalogの鍵/署名ドメインと共用しない。署名秘密鍵はコード・ZIP・ログへ入れず、配布用secretとして保管する。鍵値をこの設計PRでは発行しない。公開鍵とmacOS Team IDは最初の更新対応版へ組み込む。ローテーションは旧鍵で署名したbridge版に新公開鍵を同梱し、移行期間は両鍵の署名を配布する。旧鍵しか知らない版を支援する間は旧署名を残す。侵害・紛失時に安全なbridgeを出せない場合は手動導入とし、ネット上の新鍵を無条件採用しない。
+署名鍵はHane本体更新専用とし、Codex runtime catalogの鍵/署名ドメインと共用しない。署名秘密鍵はコード・ZIP・ログへ入れず、配布用secretとして保管する。鍵値をこの設計PRでは発行しない。公開鍵は最初の更新対応版へ組み込む（macOSでもApple Team IDは使わない）。ローテーションは旧鍵で署名したbridge版に新公開鍵を同梱し、移行期間は両鍵の署名を配布する。旧鍵しか知らない版を支援する間は旧署名を残す。侵害・紛失時に安全なbridgeを出せない場合は手動導入とし、ネット上の新鍵を無条件採用しない。
 
 最大sequenceは配置単位のprivate receiptsへ保存し、`HANE_STATE_DIR`変更で既知のsequenceを巻き戻せないようにする。保存失敗時はcandidateをReadyにしない。Readyを適用するときもcatalogの期限・sequenceと全取得物を再検証する。期限切れの古いReleaseは、同じZIP/hashのままsequenceを増やしてmetadataを再署名できる。これは配布基盤の明示操作とし、毎日起動する新しいautomationは作らない。
 
@@ -250,13 +250,13 @@ MSIX更新失敗は`本体は更新しましたが、Explorer連携の更新に�
 
 ## 10. macOS適用
 
-出荷前提は、`.app`内の`Contents/Helpers/hane-updater`を含めたDeveloper ID署名、Hardened Runtime、notarization、stapling。Info.plistに`CFBundleShortVersionString`/`CFBundleVersion`（Cargo版）、`HaneSourceCommit`（40桁source SHA）、`HaneUpdaterProtocol`（整数1）を設定する。現在版と候補のBundle ID、固定Team ID、OSの署名検証・Gatekeeper評価を確認する。署名されていない既存版は手動で`V_bootstrap`を導入する。
+出荷前提は、`.app`内の`Contents/Resources/hane-install.json`と`.sig`（更新用Ed25519鍵で署名したinventory。自身と`.sig`以外の全ファイルのパス・size・SHA-256を`Hane.app`相対で列挙）を含めること。Apple Developer ID・固定Team ID・notarizationは要求しない。Info.plistに`CFBundleShortVersionString`/`CFBundleVersion`（Cargo版）、`HaneSourceCommit`（40桁source SHA）、`HaneUpdaterProtocol`（整数1）を設定する。現在版と候補のBundle ID、版、source SHA、署名済みinventoryとbundle内ファイルの一致を確認する。inventoryのない既存版は手動で`V_bootstrap`を導入する。
 
-ZIP layout revision 1は`hane-macos-arm64/Hane.app`とREADME/LICENSEに限定する。署名後にbundleを加工しない。候補helper/実行fileも同じ署名検証でsealed bundle内にあることを確認する。カタログ署名とAppleの署名はそれぞれ検査し、一方だけで代替しない。
+ZIP layout revision 1は`hane-macos-arm64/Hane.app`とREADME/LICENSEに限定する。inventory署名後にbundleを加工しない。候補helper/実行fileも同じ署名済みinventoryで検証した内容と一致することを確認する。Appleの署名をカタログ・inventoryの署名の代わりにせず、Appleの署名がないことも拒否理由にしない。
 
-helperは`.app`外のprivate stageから、配置pathと同じAPFS volumeにある検証済みcandidateと現bundleを`renamex_np(RENAME_SWAP)`相当の原子的交換で入れ替える。APFSであることに加えてvolumeのswap-renaming capabilityを検査する。先に元bundleを消す二段階renameへfallbackしない。交換後の旧bundleをbackupとして保持し、限定起動失敗時は同じ交換で戻す。file IDとcatalog/Team ID/版をjournalに照合して方向を決め、journal更新直前に中断しても交換を二度適用しない。
+helperは`.app`外のprivate stageから、配置pathと同じAPFS volumeにある検証済みcandidateと現bundleを`renamex_np(RENAME_SWAP)`相当の原子的交換で入れ替える。APFSであることに加えてvolumeのswap-renaming capabilityを検査する。先に元bundleを消す二段階renameへfallbackしない。交換後の旧bundleをbackupとして保持し、限定起動失敗時は同じ交換で戻す。file IDとcatalog/版をjournalに照合して方向を決め、journal更新直前に中断しても交換を二度適用しない。
 
-APFS以外、交換非対応、App Translocation、読取専用や親の権限不足なら適用せず手動案内する。Gatekeeperを無効化したりquarantineを削除したりad hoc再署名したりしない。起動は正規配置のbundleから行い、private health channelを実childへ渡す。OSの起動拒否はhealth失敗として旧bundleを維持/復旧する。
+APFS以外、交換非対応、App Translocation、読取専用や親の権限不足なら適用せず手動案内する。Gatekeeperを無効化したりquarantineを削除したりad hoc再署名したりしない。OSが未署名・未公証のappの起動を確認する場合は、本人がアプリ単位で起動を許可して進める。起動は正規配置のbundleから行い、private health channelを実childへ渡す。OSの起動拒否はhealth失敗として旧bundleを維持/復旧する。
 
 ## 11. Journal、復旧、cleanup
 
@@ -284,11 +284,11 @@ Committed後にcandidate/backupを急いで消さず、次の正常起動を1回
 
 配布基盤専用PRは既存release入口・Cargo version整合・全workspace checksを維持し、以下を行う。
 
-1. 両OSでhelperをビルドし、version/source/target/protocolを実binaryから検査する。Windowsはinventoryを生成・署名し、macOSは正しい順序でnested codeを署名・notarize・stapleしてからZIPを作る。
-2. inventory/ZIP検査後に実size/hashを集計し、両targetを含むcatalogを生成・署名する。鍵ID・Team ID・notary credentialは保守者が実値を設定し、未設定ならrelease準備を失敗させる。空署名/開発鍵で代用しない。
+1. 両OSでhelperをビルドし、version/source/target/protocolを実binaryから検査する。Windowsはinventoryを生成・署名し、macOSも`Hane.app`内にinventoryを生成・署名してからZIPを作る（Apple署名・notarizationは要求しない）。
+2. inventory/ZIP検査後に実size/hashを集計し、両targetを含むcatalogを生成・署名する。更新用の鍵IDは保守者が実値を設定し、未設定ならrelease準備を失敗させる。空署名/開発鍵で代用しない。
 3. Draft Releaseへ両ZIP、catalog、signatureをuploadし、再取得して検証した後にstable公開する。公開済み同tagのZIPはclobberしない。修正は新しいCargo版で出す。metadataの期限更新だけは同じarchive hashで行える。
 4. `release-request.yml`の完了確認を、両ZIPの存在に加えてcatalog/signature/版/署名/hash一致まで拡張する。Releaseの公開とsource SHAの対応を保つ。
-5. bootstrapの手動導入、supported配置、macOSの署名、保存が必要なときの画面、手動復旧をREADMEへ反映する。現在のportable Windowsの方針をMSIX全体インストールへ読み替えない。
+5. bootstrapの手動導入、supported配置、macOSの起動許可、保存が必要なときの画面、手動復旧をREADMEへ反映する。現在のportable Windowsの方針をMSIX全体インストールへ読み替えない。
 
 通常product workerに`.github/`やtrusted policyを変更させない。署名secrets設定・Appleの外部審査・実配布を設計のチェック済み事項に含めない。
 

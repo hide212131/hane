@@ -1,14 +1,14 @@
-//! macOS placement checks: a Developer ID signed `Hane.app` on a local,
-//! writable APFS volume, running from its normal location.
+//! macOS placement checks: `Hane.app` on a local, writable APFS volume,
+//! running from its normal location.
 //!
 //! Two `unsafe` spots live here: the read-only volume file-system query and
 //! the `renamex_np(RENAME_SWAP)` exchange of the bundle-swap increment.
-//! Signature checking and the Gatekeeper assessment are delegated to the OS
-//! `codesign` and `spctl` tools with fixed arguments (no shell); the catalog
-//! signature and Apple's signature are separate checks and neither replaces the
-//! other. [`MacHost`] is the real [`BundleHost`] behind the
-//! `crate::macos_apply` bundle swap; it never falls back to a two-step rename.
-//! None of this has run against a real signed candidate yet (U2 / U5).
+//! The bundle is verified against the inventory signed with the Ed25519 update
+//! key; no Apple Developer ID, Team ID or notarization is required, and no OS
+//! protection (quarantine, Gatekeeper) is removed or bypassed. [`MacHost`] is
+//! the real [`BundleHost`] behind the `crate::macos_apply` bundle swap; it
+//! never falls back to a two-step rename. None of this has run against a real
+//! candidate yet (U2 / U5).
 
 #![allow(
     unsafe_code,
@@ -20,22 +20,18 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{HELPER_FILE_NAME, HelperSource, Placement, owner_name, unsupported};
+use super::{HelperSource, Placement, owner_name, unsupported};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{hash_regular_file, read_limited};
 use crate::identity::{FileIdentity, InstallFacts, InstallId};
 use crate::macos_apply::{
-    BundleHost, VolumeFacts, gatekeeper_notarized_verdict, plist_string, required_team_id,
-    valid_team_id,
+    BundleHost, HELPER_REL, VolumeFacts, plist_string, verify_bundle_inventory,
 };
 use crate::model::{MACOS_BUNDLE_ID, Target};
 use crate::trust::TrustPolicy;
 
-const CODESIGN: &str = "/usr/bin/codesign";
-const SPCTL: &str = "/usr/sbin/spctl";
 const MAIN_EXECUTABLE: &str = "hane";
 const MAX_PLIST_BYTES: u64 = 256 << 10;
 /// `RENAME_SWAP` of `<sys/stdio.h>`: exchange the two names atomically.
@@ -270,51 +266,30 @@ pub fn locate(exe: &Path) -> Result<Placement> {
     })
 }
 
-/// Asks the OS to verify the complete bundle against the Developer ID
-/// requirement pinned to exactly `team_id` (leaf certificate OU).
-pub fn verify_developer_id(bundle: &Path, team_id: &str) -> Result<()> {
-    if !valid_team_id(team_id) {
-        return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed Team ID"));
-    }
-    let requirement = format!(
-        "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
-         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
-         and certificate leaf[subject.OU] = \"{team_id}\""
-    );
-    let status = Command::new(CODESIGN)
-        .arg("--verify")
-        .arg("--deep")
-        .arg("--strict")
-        .arg(format!("--test-requirement={requirement}"))
-        .arg(bundle)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(UpdateError::new(
-            ErrorCode::SignatureInvalid,
-            "the bundle is not validly signed with Developer ID",
-        ))
-    }
-}
-
-/// The helper inside the sealed bundle, accepted only if the bundle verifies
-/// against the pinned Team ID. A build without one provides no helper recovery
-/// (intended fail-closed behavior).
+/// The helper inside the bundle, accepted only if the whole bundle matches the
+/// inventory signed with the update key and that inventory lists the helper
+/// with exactly the bytes on disk. A build without an update key provides no
+/// helper recovery (intended fail-closed behavior).
 pub fn installed_helper(placement: &Placement, policy: &TrustPolicy) -> Result<HelperSource> {
-    let team_id = required_team_id(policy)?;
-    verify_developer_id(&placement.install_root, team_id)?;
-    let path = placement
-        .install_root
-        .join("Contents")
-        .join("Helpers")
-        .join(HELPER_FILE_NAME);
+    let signed = verify_bundle_inventory(&placement.install_root, policy)?;
+    let listed = signed
+        .inventory()
+        .files
+        .iter()
+        .find(|file| file.path == HELPER_REL)
+        .ok_or_else(|| {
+            UpdateError::new(ErrorCode::IdentityMismatch, "the inventory does not list the helper")
+        })?;
+    let path = placement.install_root.join(HELPER_REL);
     let (size, sha256) = hash_regular_file(&path)?.ok_or_else(|| {
         UpdateError::new(ErrorCode::NotFound, "the bundled helper is missing")
     })?;
+    if size != listed.size || sha256 != listed.sha256 {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            "the bundled helper differs from the signed inventory",
+        ));
+    }
     Ok(HelperSource {
         path,
         identity: FileIdentity { size, sha256 },
@@ -381,8 +356,8 @@ fn read_mark(bundle: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
-/// The real [`BundleHost`]: `statfs`, `renamex_np(RENAME_SWAP)`, `codesign`
-/// and `spctl`, each with fixed arguments and no shell.
+/// The real [`BundleHost`]: `statfs`, `renamex_np(RENAME_SWAP)` and the
+/// signed-inventory bundle check.
 pub struct MacHost;
 
 impl BundleHost for MacHost {
@@ -449,8 +424,8 @@ impl BundleHost for MacHost {
         Ok(())
     }
 
-    fn verify_developer_id(&self, bundle: &Path, team_id: &str) -> Result<()> {
-        verify_developer_id(bundle, team_id)
+    fn verify_bundle_inventory(&self, bundle: &Path, policy: &TrustPolicy) -> Result<()> {
+        verify_bundle_inventory(bundle, policy).map(|_| ())
     }
 
     fn bundle_mark(&self, bundle: &Path) -> Result<Option<Vec<u8>>> {
@@ -510,22 +485,6 @@ impl BundleHost for MacHost {
             Err(err.into())
         }
     }
-
-    fn assess_gatekeeper(&self, bundle: &Path) -> Result<()> {
-        // `--verbose=4` makes spctl report the assessment source; the report
-        // goes to stderr. Exit status 0 alone does not prove notarization.
-        let output = Command::new(SPCTL)
-            .args(["--assess", "--type", "execute", "--verbose=4"])
-            .arg(bundle)
-            .stdin(Stdio::null())
-            .output()?;
-        let report = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        );
-        gatekeeper_notarized_verdict(output.status.success(), &report)
-    }
 }
 
 #[cfg(test)]
@@ -544,21 +503,22 @@ mod tests {
     }
 
     #[test]
-    fn team_ids_are_validated_before_they_reach_the_requirement() {
-        assert!(valid_team_id("ABCDE12345"));
-        assert!(!valid_team_id("abcde12345"));
-        assert!(!valid_team_id("ABCDE\"1234"));
-        let err = verify_developer_id(Path::new("/nonexistent"), "bad").unwrap_err();
-        assert_eq!(err.code, ErrorCode::IdentityMismatch);
-    }
-
-    #[test]
-    fn a_missing_team_id_is_rejected_before_any_os_command() {
-        let policy = TrustPolicy::new(Vec::new(), None);
-        let err = required_team_id(&policy).unwrap_err();
-        assert_eq!(err.code, ErrorCode::TrustUnconfigured);
-        let policy = TrustPolicy::new(Vec::new(), Some("ABCDE12345".to_owned()));
-        assert_eq!(required_team_id(&policy).unwrap(), "ABCDE12345");
+    fn a_bundle_without_a_signed_inventory_has_no_trusted_helper() {
+        let dir = TempDir::new("macos-no-inventory");
+        let placement = Placement {
+            target: Target::MacosArm64,
+            install_root: dir.path().to_path_buf(),
+            coordination_parent: dir.path().to_path_buf(),
+            install_id: InstallId::derive(&InstallFacts {
+                os: "macos",
+                volume_id: "v",
+                install_path: "/x",
+                owner: "u",
+            })
+            .unwrap(),
+        };
+        let err = installed_helper(&placement, &TrustPolicy::production()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
     }
 
     /// Runs the real `renamex_np` on the test volume. On APFS the names are

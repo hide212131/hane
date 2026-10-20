@@ -18,17 +18,17 @@ pub struct TrustedKey {
     pub public_key: [u8; 32],
 }
 
-/// Embedded trust material: Ed25519 public keys and the pinned macOS Team ID.
+/// Embedded trust material: the Ed25519 update public keys. Both targets use
+/// them; no Apple identity (Developer ID, Team ID, notarization) is part of it.
 ///
 /// [`TrustPolicy::production`] intentionally contains nothing. Until a
-/// maintainer embeds the real public key (and Team ID) in a dedicated change,
-/// every verification fails with `trust_unconfigured`, so no candidate can be
-/// made applicable. The unknown key IDs in a fetched signature file are never
+/// maintainer embeds the real public key in a dedicated change, every
+/// verification fails with `trust_unconfigured`, so no candidate can be made
+/// applicable. The unknown key IDs in a fetched signature file are never
 /// auto-registered.
 #[derive(Debug, Clone, Default)]
 pub struct TrustPolicy {
     keys: Vec<TrustedKey>,
-    macos_team_id: Option<String>,
 }
 
 impl TrustPolicy {
@@ -36,19 +36,12 @@ impl TrustPolicy {
         Self::default()
     }
 
-    pub fn new(keys: Vec<TrustedKey>, macos_team_id: Option<String>) -> Self {
-        Self {
-            keys,
-            macos_team_id,
-        }
+    pub fn new(keys: Vec<TrustedKey>) -> Self {
+        Self { keys }
     }
 
     pub fn is_configured(&self) -> bool {
         !self.keys.is_empty()
-    }
-
-    pub fn macos_team_id(&self) -> Option<&str> {
-        self.macos_team_id.as_deref()
     }
 
     fn key(&self, key_id: &str) -> Option<&TrustedKey> {

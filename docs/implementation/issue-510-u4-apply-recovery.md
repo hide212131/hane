@@ -4,7 +4,7 @@
 採用済み設計: `docs/adr/0034-zip-application-updates.md`、`docs/application-update-implementation-spec.md`、`docs/application-update-implementation-handoff.md`
 前段の実装: [#512 U0/U1/U3](https://github.com/hide212131/hane/pull/512)
 準備時の基点: `f9da614d93158fba95b5939ffdb44c67f06b8657`（#512 head）
-状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）、increment 2（Windows x64 所有ファイル適用のhelper接続）、increment 3（限定health起動とdurable commit/rollback）、increment 4（macOS bundle swapとjournal/recovery）、increment 5（再起動ticket・Settingsの再起動操作・commit後の一回復元）をコードに追加済み。実macOS・実Developer ID署名・実Gatekeeperでの二版適用は未実施。`TrustPolicy::production()` は未設定のため、production buildでは「再起動して更新」は表示も実行もされない（fail-closed）。
+状態: 実装中。increment 1（process lifetime lease、配置確認、helper private protocol、起動gate）、increment 2（Windows x64 所有ファイル適用のhelper接続）、increment 3（限定health起動とdurable commit/rollback）、increment 4（macOS bundle swapとjournal/recovery）、increment 5（再起動ticket・Settingsの再起動操作・commit後の一回復元）をコードに追加済み。実macOSでの二版適用は未実施（Apple Developer ID・notarizationは要求しない）。`TrustPolicy::production()` は未設定のため、production buildでは「再起動して更新」は表示も実行もされない（fail-closed）。
 
 ### Increment 5: 再起動ticket、再起動操作、commit後の復元（`state_root.rs`、`app/src/update_restart.rs`、`ui/src/view/app_update.rs`）
 
@@ -18,15 +18,15 @@
 
 ### Increment 4: macOS bundle適用と復旧（`crates/update/src/macos_apply.rs`、`platform/macos.rs`）
 
-- OS固有の操作は `BundleHost` trait（volume照会、swap対応のprobe、`RENAME_SWAP`相当の交換、Developer ID署名のstrict検証、Gatekeeper評価）に閉じる。実装 `platform::macos::MacHost` は macOS ビルドだけに存在し、他OSでは `PlatformBackend` が `NotApplicable` で拒否する。journal / 復旧は `Placement::target` で選ぶ `DiskView`（macOSは `BundleView`）を使い、Windows の所有ファイル用 view と混ざらない。
-- helperは親終了後（排他runtime lease保持後）に、現在の `Hane.app` と候補の両方について、固定Bundle ID、Info.plistの版・source SHA（catalogの `source_sha`）・updater protocol、固定Team IDのDeveloper ID署名（`codesign --verify --deep --strict` と要件指定）、Gatekeeper評価（`spctl --assess`）を検査する。Team ID未設定は `TrustUnconfigured`、署名不一致は `SignatureInvalid`で、mutation前に停止する。任意のDeveloper ID、ad-hoc再署名、quarantine除去、Translocation回避はしない。
+- OS固有の操作は `BundleHost` trait（volume照会、swap対応のprobe、`RENAME_SWAP`相当の交換、更新用Ed25519鍵で署名したinventoryによるbundle検証）に閉じる。実装 `platform::macos::MacHost` は macOS ビルドだけに存在し、他OSでは `PlatformBackend` が `NotApplicable` で拒否する。journal / 復旧は `Placement::target` で選ぶ `DiskView`（macOSは `BundleView`）を使い、Windows の所有ファイル用 view と混ざらない。
+- helperは親終了後（排他runtime lease保持後）に、現在の `Hane.app` と候補の両方について、固定Bundle ID、Info.plistの版・source SHA（catalogの `source_sha`）・updater protocol、bundle内の署名済みinventory（`Contents/Resources/hane-install.json`と`.sig`、更新用Ed25519鍵）とbundle内の全ファイルの一致を検査する。候補のinventoryはarchive検査でもcatalogの`inventory_sha256`に結び付ける。更新鍵未設定は `TrustUnconfigured`、署名不正は `SignatureInvalid`、ファイルの不足・追加・改変は `InstallModified`で、mutation前に停止する。Apple Developer ID・Team ID・notarizationは要求しない。ad-hoc再署名、quarantine除去、Gatekeeper迂回、Translocation回避はしない。
 - 候補はアプリが `transaction_dir/candidate/` へcopyしたcatalog/署名/archiveをhelperが再検証して `transaction_dir/stage/` へ展開したものだけを使う。`transaction_dir` はinstallと同じ親（coordination directory）の下にあるため、候補はもともと同じvolumeのprivate領域にある。それでもinstallとstaged candidateのvolume idが同一で、両方がローカルの書込可能なAPFSであることを確認し、さらにinstallの親とstageの親にそれぞれ作った一時directoryを実際に交換して swap-renaming 対応を確かめる。条件を満たさなければ journal 作成前に `UnsupportedInstall` で拒否する。
 - bundle identity は、まず `Info.plist`、`Contents/MacOS/hane`、`Contents/Helpers/hane-updater`、`Contents/_CodeSignature/CodeResources` をbundleの必須項目として検査し、その後 `collect_identity_entries` でbundle内のすべてのdirectory、file内容、symlink targetを再帰的にidentityへ含めたもの。`CodeResources` だけには依存せず、bundle内のどの資源の変更もidentityを変える。journalは `Hane.app` という一つのstepを持ち、旧identity、新identity、backup（`backup/Hane.app` = swap後に旧bundleが置かれるstaged slot）を記録する。
 - 手順は ExitAuthorized → Applying → step Intent（durable）→ 旧/新identityを再観測 → 一回の交換 → 交換後の両identityを観測 → step Applied（durable）→ AwaitingHealth。先に既存bundleを消す二段階renameは使わない。
-- health起動は既存の `ProcessLauncher` / `conclude_with_child` を使い、正規配置の `Contents/MacOS/hane` を限定childとして起動する。起動前に生きたbundleがjournalの新identityと一致し、Team IDで再検証できることを確認する。`Committed` がdurableになるまで `Commit` は送らず、成功の戻りは `settled_result`（Windowsと共通）を通る。
+- health起動は既存の `ProcessLauncher` / `conclude_with_child` を使い、正規配置の `Contents/MacOS/hane` を限定childとして起動する。起動前に生きたbundleがjournalの新identityと一致し、署名済みinventoryで再検証できることを確認する。`Committed` がdurableになるまで `Commit` は送らず、成功の戻りは `settled_result`（Windowsと共通）を通る。
 - health失敗・timeout・crash・不一致では、childの終了とlease解放を確認してから、同じ交換（`BundleOps::restore`）で旧bundleへ戻す。復旧は journal だけでなく実diskのlive/slot identityで方向を決める（live=旧なら交換しない、live=新かつslot=旧なら一回交換、それ以外は未知として `RecoveryRequired`）。この判定は既存の `apply::recover` / `decide_recovery` をそのまま使うため、各中断点（intent前、交換後・Applied前、AwaitingHealth、RollingBack途中、rollback交換後・journal更新前）で二重に交換しない。未知identity、損傷したbundle、消えたbackup、intentなしの交換は何も上書きせず `RecoveryRequired` にする。
-- 検証範囲: fake `BundleHost` と一時directoryによる決定的なunit testのみ（成功commitで新bundleが残る、health失敗で旧bundleへ戻る、intentがswap前にdurable、各境界のrecovery、unknown identityで交換しない、非APFS・非ローカル・読取専用・swap非対応・別volume・署名不一致・Gatekeeper拒否・Team ID未設定の拒否）。`MacHost` の `renamex_np` は macOS CI の一時volume上で「交換するか何も変えない」ことを確認するtestだけを持つ。**実macOS上の実Developer ID署名候補・実`codesign`/`spctl`評価・実二版適用・電源断耐性は未検証**で、U2/U5のevidenceとして別に行う。
-- 本番信頼鍵・Team IDは埋め込んでいない。`TrustPolicy::production()` は引き続き未設定で、production buildはmacOSでも適用不能のまま。U2のrelease workflow/secrets、再起動UI、state-root/ticket復元、実二版配布証拠はこの増分に含めない。
+- 検証範囲: fake `BundleHost` と一時directoryによる決定的なunit testのみ（成功commitで新bundleが残る、health失敗で旧bundleへ戻る、intentがswap前にdurable、各境界のrecovery、unknown identityで交換しない、非APFS・非ローカル・読取専用・swap非対応・別volume・署名不一致・更新鍵未設定・ZIP改変の拒否、Apple identityなしでの適用成功、署名済みinventoryの検証）。`MacHost` の `renamex_np` は macOS CI の一時volume上で「交換するか何も変えない」ことを確認するtestだけを持つ。**実macOS上の実二版適用・電源断耐性は未検証**で、U2/U5のevidenceとして別に行う。
+- 本番信頼鍵は埋め込んでいない（Team IDは不要）。`TrustPolicy::production()` は引き続き未設定で、production buildはmacOSでも適用不能のまま。U2のrelease workflow/secrets、再起動UI、state-root/ticket復元、実二版配布証拠はこの増分に含めない。
 
 ### Increment 3: 限定health起動とdurable commit（`crates/update/src/health.rs`）
 
@@ -56,7 +56,7 @@
 - `crates/updater/` に現在版から検証済みcopyを作り、private IPC/nonceとprocess handleを使うhelperを追加する。公開CLIや任意path置換toolは作らない。
 - `crates/app/` の起動最前段と更新serviceをつなぎ、pending journalがある場合は通常の文書・AI・設定初期化より先に復旧を判定する。
 - Windowsではinventoryが列挙する所有ファイルだけをjournal付きで置換する。実行中のexeは最後に扱い、未知ファイル、user data、marker、旧version shell DLLは更新対象に含めない。
-- macOSでは署名・Team ID・Bundle ID・配置・APFS swap-renaming対応を確認し、対応する場合だけ同一volume上でbundleを原子的に交換する。非対応配置では手動案内にする。
+- macOSでは署名済みinventory・Bundle ID・配置・APFS swap-renaming対応を確認し、対応する場合だけ同一volume上でbundleを原子的に交換する。非対応配置では手動案内にする。
 - 新版を通常起動せずに行う限定health handshake、durable commit、限定ticket復元、失敗時rollback、回復不能時の明示状態を実装する。
 - 直接関連するfake/process seamによる故障点テストを実装する。新しい再起動操作は全U4境界がつながり、成功表示をdurable commit後に限定できる状態まで有効化しない。
 
@@ -66,7 +66,7 @@
 2. helperのprivate IPCは実parent/child identityと一回限りのnonceで認証する。古いticket、偽装要求、切断、stale operationは適用を進めない。
 3. journalは各mutation前にintentをdurable化する。再起動後は実hash/file identityとjournalを照合し、途中適用は旧一覧へrollbackする。未知hash、壊れたbackup、曖昧なbundle swapでは追加上書きをせずRecoveryRequiredにする。
 4. Windowsは署名済みinventory所有fileだけをatomic replacementで適用し、未知の隣接Markdown、user state、Explorer marker、ロード中の旧shell DLLを変更しない。hane.exeは最後に置換する。
-5. macOSはvalid Developer ID/Team ID/Bundle ID/versionとnotarizationを確認し、APFSのswap-renaming capabilityと対応配置がある場合だけ交換する。二段階rename、quarantine除去、ad-hoc再署名、Translocation回避は行わない。
+5. macOSは更新用鍵で署名したinventory/Bundle ID/versionを確認し（Developer ID・Team ID・notarizationは不要）、APFSのswap-renaming capabilityと対応配置がある場合だけ交換する。二段階rename、quarantine除去、ad-hoc再署名、Translocation回避は行わない。
 6. 限定起動の実childから45秒内のHealthyを受け、helperがCommittedをflushするまでは通常編集・AI・autosave・外部openを開始しない。成功表示はdurable commit後だけにする。
 7. health失敗時はchild停止とruntime lease解放後に旧版へ戻す。安全な停止や復旧ができなければ成功を示さずRecoveryRequiredにする。
 8. restart ticketは保存済みfile pathや有界な表示位置など必要最小限だけを持ち、本文・token・任意command/environmentは持たない。復元はtransactionが一度だけ処理し、cleanup失敗はcleanup_pendingとして再試行できる。
@@ -74,7 +74,7 @@
 
 ## 対象外
 
-- 配布workflow、署名key/Team ID/notary credentials、release publication、ZIP layout生成（U2）。
+- 配布workflow、署名key、release publication、ZIP layout生成（U2）。
 - bootstrap版の発行、両OSの実二版download-to-commit GUI証拠とIssue #510全体の完了（U5）。
 - 管理者権限による昇格、強制終了、自動更新/起動時通信、delta更新、任意file/command実行。
 - #500/#507のPR branch。freeze中の共通open入口は#512で導入済みの境界を使い、両PRの変更を複製しない。

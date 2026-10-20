@@ -33,7 +33,6 @@ use crate::trust::{SeenCatalog, SeenStore, TrustPolicy, TrustedKey};
 use crate::util::{parse_rfc3339_utc, sha256_hex};
 
 pub const TEST_KEY_ID: &str = "test-key-1";
-pub const TEST_TEAM_ID: &str = "TESTTEAM01";
 pub const TEST_SOURCE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn key_pair(seed: u8) -> Ed25519KeyPair {
@@ -46,15 +45,12 @@ pub fn public_key(seed: u8) -> [u8; 32] {
     out
 }
 
-/// Policy trusting only the test key (seed byte 1) and a test Team ID.
+/// Policy trusting only the test key (seed byte 1).
 pub fn test_policy() -> TrustPolicy {
-    TrustPolicy::new(
-        vec![TrustedKey {
-            key_id: TEST_KEY_ID.to_string(),
-            public_key: public_key(1),
-        }],
-        Some(TEST_TEAM_ID.to_string()),
-    )
+    TrustPolicy::new(vec![TrustedKey {
+        key_id: TEST_KEY_ID.to_string(),
+        public_key: public_key(1),
+    }])
 }
 
 /// Signature file over `domain || payload` made with `seed` under `key_id`.
@@ -751,18 +747,44 @@ pub fn sign_catalog(doc: &CatalogDocument) -> (Vec<u8>, Vec<u8>) {
     (bytes, signature)
 }
 
-pub fn macos_entry(version: &str, zip: &[u8], unpacked_size: u64) -> TargetEntry {
+/// Catalog entry of a macOS archive. `inventory_raw` is the signed inventory
+/// inside the archive; the catalog binds its hash. There is no Team ID.
+pub fn macos_entry(version: &str, zip: &[u8], unpacked_size: u64, inventory_raw: &[u8]) -> TargetEntry {
     TargetEntry {
         asset_name: Target::MacosArm64.asset_name().to_string(),
         archive_size: zip.len() as u64,
         archive_sha256: sha256_hex(zip),
         unpacked_size,
         layout_revision: Target::MacosArm64.layout_revision(),
-        inventory_sha256: None,
+        inventory_sha256: Some(sha256_hex(inventory_raw)),
         bundle_id: Some(MACOS_BUNDLE_ID.to_string()),
-        team_id: Some(TEST_TEAM_ID.to_string()),
+        team_id: None,
         bundle_version: Some(version.to_string()),
     }
+}
+
+/// Signed inventory (raw bytes and signature) over `files`, whose paths are
+/// relative to `Hane.app`.
+pub fn macos_inventory(version: &str, files: &[(String, Vec<u8>)]) -> (Vec<u8>, Vec<u8>) {
+    let inventory = Inventory {
+        schema: INVENTORY_SCHEMA,
+        version: version.to_string(),
+        target: Target::MacosArm64.triple().to_string(),
+        source_sha: TEST_SOURCE_SHA.to_string(),
+        updater_protocol: UPDATER_PROTOCOL,
+        layout_revision: Target::MacosArm64.layout_revision(),
+        files: files
+            .iter()
+            .map(|(path, data)| InventoryFile {
+                path: path.clone(),
+                size: data.len() as u64,
+                sha256: sha256_hex(data),
+            })
+            .collect(),
+    };
+    let raw = serde_json::to_vec(&inventory).expect("serialize inventory");
+    let signature = sign(INVENTORY_DOMAIN, &raw);
+    (raw, signature)
 }
 
 pub struct WindowsRelease {
