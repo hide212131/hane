@@ -272,6 +272,29 @@ func tabBackground(_ path: String, _ pattern: String) {
     ])
 }
 
+// Dominant background of a settings button, sampled from the padding just
+// left of its label (inside the button), so a selected button can be told
+// apart from its unselected siblings by pixels alone.
+func buttonBackground(_ path: String, _ pattern: String) {
+    let match = findTextMatch(path, pattern)
+    let image = raster(path)
+    let text = pixelRect(match.box, width: image.width, height: image.height)
+    let sampleX0 = max(0, text.x0 - 8)
+    let sampleX1 = max(0, text.x0 - 2)
+    let sampleY0 = max(0, text.y0)
+    let sampleY1 = min(image.height, text.y1)
+    guard sampleX0 < sampleX1, sampleY0 < sampleY1 else {
+        fail("invalid button background sample rect")
+    }
+    let color = dominantColor(image, x0: sampleX0, x1: sampleX1, y0: sampleY0, y1: sampleY1)
+    jsonPrint([
+        "matched_text": match.matchedText,
+        "bounding_box": boundingBoxJSON(match.box),
+        "sample_rect": ["x0": sampleX0, "y0": sampleY0, "x1": sampleX1, "y1": sampleY1],
+        "background_color": colorString(color),
+    ])
+}
+
 // The HoverCard's absolute-path text can wrap across more than one visual
 // line (it is a whitespace_normal flex_1 div under a 560px max width), so a
 // single-observation regex match (as findTextMatch uses) cannot locate it
@@ -440,7 +463,7 @@ func readClipboard() {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_file_tabs_gui.swift <activate|find-text|click-text|hover-text|tab-background|find-path-fragments|copy-icon-probe|click-fraction|read-clipboard> ...")
+    fail("usage: hosted_file_tabs_gui.swift <activate|find-text|click-text|hover-text|tab-background|button-background|find-path-fragments|copy-icon-probe|click-fraction|read-clipboard> ...")
 }
 
 switch command {
@@ -459,6 +482,9 @@ case "hover-text":
 case "tab-background":
     guard arguments.count == 3 else { fail("tab-background requires screenshot path and pattern") }
     tabBackground(arguments[1], arguments[2])
+case "button-background":
+    guard arguments.count == 3 else { fail("button-background requires screenshot path and pattern") }
+    buttonBackground(arguments[1], arguments[2])
 case "find-path-fragments":
     guard arguments.count == 3 else { fail("find-path-fragments requires screenshot path and expected whitespace-stripped path") }
     findPathFragments(arguments[1], arguments[2])

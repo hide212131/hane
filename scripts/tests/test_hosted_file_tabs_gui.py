@@ -74,6 +74,61 @@ class ValidBackgroundTests(unittest.TestCase):
             self.assertFalse(mod.is_valid_background(bad))
 
 
+class SelectedThemeOptionTests(unittest.TestCase):
+    PLAIN = "#f0f0f0"
+    HIGHLIGHT = "#c8d4f0"
+
+    def _backgrounds(self, selected: str | None) -> dict:
+        return {
+            key: self.HIGHLIGHT if key == selected else self.PLAIN
+            for key in mod.THEME_OPTION_KEYS
+        }
+
+    def test_option_keys_cover_system_light_and_dark(self):
+        self.assertEqual(mod.THEME_OPTION_KEYS, ("system", "light", "dark"))
+        self.assertEqual(set(mod.THEME_OPTION_PATTERNS), set(mod.THEME_OPTION_KEYS))
+
+    def test_identifies_each_selected_option(self):
+        for key in mod.THEME_OPTION_KEYS:
+            self.assertEqual(mod.selected_theme_option(self._backgrounds(key)), key)
+
+    def test_none_when_no_option_stands_out(self):
+        self.assertIsNone(mod.selected_theme_option(self._backgrounds(None)))
+
+    def test_none_when_two_options_are_highlighted(self):
+        backgrounds = self._backgrounds("light")
+        backgrounds["dark"] = self.HIGHLIGHT
+        self.assertIsNone(mod.selected_theme_option(backgrounds))
+
+    def test_none_for_unreadable_or_incomplete_samples(self):
+        backgrounds = self._backgrounds("light")
+        backgrounds["dark"] = None
+        self.assertIsNone(mod.selected_theme_option(backgrounds))
+        del backgrounds["dark"]
+        self.assertIsNone(mod.selected_theme_option(backgrounds))
+
+
+class ThemeSelectionVerificationTests(unittest.TestCase):
+    """The scenario must verify the selected theme, not just a hex colour."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = SCRIPT.read_text(encoding="utf-8")
+
+    def test_scenario_checks_system_current_value_and_light_dark_selection(self):
+        self.assertIn('selected_theme_before"] != "system"', self.source)
+        self.assertIn('selected_theme_after"] == "light"', self.source)
+        self.assertIn('selected_theme_before"] == "light"', self.source)
+        self.assertIn('selected_theme_after"] == "dark"', self.source)
+
+    def test_scenario_keeps_light_dark_tab_background_checks(self):
+        for name in (
+            "dark_selected_tab_background_rejects_near_white",
+            "light_dark_selected_tab_background_differs",
+        ):
+            self.assertIn(name, self.source)
+
+
 class PathFragmentCoverageTests(unittest.TestCase):
     def test_full_coverage_for_single_unwrapped_fragment(self):
         path = "/Users/runner/work/file-tabs-focus.md"

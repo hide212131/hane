@@ -54,6 +54,12 @@ FIXTURE_CONTENT = (
 THEME_SYSTEM_PATTERN = r"システムに合わせる"
 THEME_LIGHT_PATTERN = r"ライト"
 THEME_DARK_PATTERN = r"ダーク"
+THEME_OPTION_KEYS = ("system", "light", "dark")
+THEME_OPTION_PATTERNS = {
+    "system": THEME_SYSTEM_PATTERN,
+    "light": THEME_LIGHT_PATTERN,
+    "dark": THEME_DARK_PATTERN,
+}
 SETTINGS_ENTRY_PATTERN = r"設定"
 FOOTER_MORE_PATTERN = r"その他"
 SETTINGS_BACK_PATTERN = r"アプリに戻る"
@@ -148,6 +154,25 @@ def is_valid_background(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+def selected_theme_option(backgrounds: dict[str, object]) -> str | None:
+    """The one theme option whose button background differs from both others.
+
+    Takes the sampled backgrounds keyed by "system" / "light" / "dark" and
+    returns the key of the selected button, or None when no single button
+    stands out (none selected, several selected, or unreadable samples).
+    """
+    if set(backgrounds) != set(THEME_OPTION_KEYS):
+        return None
+    if not all(is_valid_background(value) for value in backgrounds.values()):
+        return None
+    odd = []
+    for key in THEME_OPTION_KEYS:
+        others = [backgrounds[other] for other in THEME_OPTION_KEYS if other != key]
+        if all(colors_differ(backgrounds[key], other) for other in others) and not colors_differ(*others):
+            odd.append(key)
+    return odd[0] if len(odd) == 1 else None
 
 
 def strip_whitespace(text: str) -> str:
@@ -285,17 +310,33 @@ def run_focused_scenario(
                 time.sleep(0.5)
                 return evidence
 
-            def choose_theme_in_settings(base_image: Path, option_pattern: str, label: str) -> tuple[Path, str | None, dict]:
+            def read_theme_selection(image: Path) -> tuple[str | None, dict]:
+                """The theme option shown as selected in a settings screenshot,
+                judged from the three theme buttons' sampled backgrounds."""
+                backgrounds = {
+                    key: helper_json(
+                        interaction, helper, ["button-background", str(image), pattern], helper_timeout
+                    ).get("background_color")
+                    for key, pattern in THEME_OPTION_PATTERNS.items()
+                }
+                return selected_theme_option(backgrounds), backgrounds
+
+            def choose_theme_in_settings(
+                base_image: Path, option_key: str, label: str
+            ) -> tuple[Path, str | None, dict]:
                 """Settings -> theme option -> back to the document; returns the
-                document screenshot, its selected-tab background and evidence."""
+                document screenshot, its selected-tab background and evidence,
+                including the theme option shown as selected before and after."""
                 open_event = open_general_settings(base_image, label)
                 settings_image = capture(f"settings-{label}")
                 controls = helper_json(
                     interaction, helper, ["find-text", str(settings_image), THEME_SYSTEM_PATTERN], helper_timeout
                 )
-                click_event = click(settings_image, option_pattern)
+                selected_before, backgrounds_before = read_theme_selection(settings_image)
+                click_event = click(settings_image, THEME_OPTION_PATTERNS[option_key])
                 time.sleep(0.4)
                 selected_image = capture(f"settings-{label}-selected")
+                selected_after, backgrounds_after = read_theme_selection(selected_image)
                 back_event = click(selected_image, SETTINGS_BACK_PATTERN)
                 time.sleep(0.5)
                 document_image = capture(f"theme-{label}")
@@ -304,22 +345,40 @@ def run_focused_scenario(
                 )
                 return document_image, tab.get("background_color"), {
                     "open_settings_event": open_event, "theme_controls_text": controls.get("matched_text"),
-                    "choose_theme_event": click_event, "back_event": back_event,
+                    "selected_theme_before": selected_before, "button_backgrounds_before": backgrounds_before,
+                    "choose_theme_event": click_event,
+                    "selected_theme_after": selected_after, "button_backgrounds_after": backgrounds_after,
+                    "back_event": back_event,
                 }
 
             try:
                 light_image, light_background, light_evidence = choose_theme_in_settings(
-                    initial_image, THEME_LIGHT_PATTERN, "light"
+                    initial_image, "light", "light"
+                )
+                controls_reason = None
+                if not light_evidence["theme_controls_text"]:
+                    controls_reason = "一般設定にテーマの選択肢を確認できない"
+                elif light_evidence["selected_theme_before"] != "system":
+                    controls_reason = (
+                        "一般設定を開いた時点の現在値が System ではない: "
+                        f"{light_evidence['selected_theme_before']!r}"
+                    )
+                steps.append(step(
+                    "settings_theme_controls_visible", "fail" if controls_reason else "pass", controls_reason,
+                    matched_text=light_evidence["theme_controls_text"],
+                    selected_theme=light_evidence["selected_theme_before"],
+                    button_backgrounds=light_evidence["button_backgrounds_before"],
+                ))
+                valid_light = (
+                    is_valid_background(light_background)
+                    and light_evidence["selected_theme_after"] == "light"
                 )
                 steps.append(step(
-                    "settings_theme_controls_visible", "pass" if light_evidence["theme_controls_text"] else "fail",
-                    None if light_evidence["theme_controls_text"] else "一般設定にテーマの選択肢を確認できない",
-                    matched_text=light_evidence["theme_controls_text"],
-                ))
-                valid_light = is_valid_background(light_background)
-                steps.append(step(
                     "switch_theme_to_light", "pass" if valid_light else "fail",
-                    None if valid_light else f"ライト選択後に選択タブ背景を取得できない: {light_background!r}",
+                    None if valid_light else (
+                        "ライト選択後に設定画面でライトが選択状態になり、選択タブ背景を取得できることを確認できない: "
+                        f"selected={light_evidence['selected_theme_after']!r} background={light_background!r}"
+                    ),
                     selected_tab_background=light_background, **light_evidence,
                 ))
                 if not valid_light:
@@ -331,12 +390,20 @@ def run_focused_scenario(
             if light_background is not None and light_image is not None:
                 try:
                     dark_image, dark_background, dark_evidence = choose_theme_in_settings(
-                        light_image, THEME_DARK_PATTERN, "dark"
+                        light_image, "dark", "dark"
                     )
-                    valid_dark = is_valid_background(dark_background)
+                    valid_dark = (
+                        is_valid_background(dark_background)
+                        and dark_evidence["selected_theme_before"] == "light"
+                        and dark_evidence["selected_theme_after"] == "dark"
+                    )
                     steps.append(step(
                         "switch_theme_to_dark", "pass" if valid_dark else "fail",
-                        None if valid_dark else f"ダーク選択後に選択タブ背景を取得できない: {dark_background!r}",
+                        None if valid_dark else (
+                            "ダーク選択前がライト、選択後に設定画面でダークが選択状態になり、選択タブ背景を取得できることを確認できない: "
+                            f"before={dark_evidence['selected_theme_before']!r} "
+                            f"after={dark_evidence['selected_theme_after']!r} background={dark_background!r}"
+                        ),
                         selected_tab_background=dark_background, **dark_evidence,
                     ))
                     if not valid_dark:

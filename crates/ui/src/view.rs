@@ -15289,12 +15289,12 @@ mod tests {
                     .contains_key(&view.sessions.active_id()),
                 "a refused save must drop the close request rather than retry it blindly"
             );
-            assert!(
-                view.status
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("changed on disk")
+            assert_eq!(
+                view.active_save_display(),
+                footer::SaveDisplay::Conflict,
+                "the conflict must stay in the document's footer warning"
             );
+            assert_eq!(view.footer_warnings().len(), 1);
         });
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -15384,12 +15384,12 @@ mod tests {
                 !view.tab_close_after_save.contains_key(&id),
                 "a refused save must drop the close request rather than let a coincidentally clean document close it"
             );
-            assert!(
-                view.status
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("changed on disk")
+            assert_eq!(
+                view.active_save_display(),
+                footer::SaveDisplay::Conflict,
+                "the conflict must stay in the document's footer warning"
             );
+            assert_eq!(view.footer_warnings().len(), 1);
         });
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
