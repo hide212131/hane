@@ -18,9 +18,14 @@ class ProcedureIdentityTests(unittest.TestCase):
         self.assertEqual(mod.PROCEDURE_VERSION, "hosted-file-tabs/1")
         self.assertEqual(mod.VERIFICATION_KIND, "file_tabs_focused")
 
-    def test_theme_pattern_matches_all_three_states(self):
-        for label in ("System", "Light", "Dark"):
-            self.assertRegex(f"Theme {label}", mod.THEME_PATTERN)
+    def test_theme_is_chosen_in_the_general_settings_not_the_footer(self):
+        self.assertFalse(hasattr(mod, "THEME_PATTERN"))
+        self.assertRegex("システムに合わせる", mod.THEME_SYSTEM_PATTERN)
+        self.assertRegex("ライト", mod.THEME_LIGHT_PATTERN)
+        self.assertRegex("ダーク", mod.THEME_DARK_PATTERN)
+        self.assertRegex("設定", mod.SETTINGS_ENTRY_PATTERN)
+        self.assertRegex("その他", mod.FOOTER_MORE_PATTERN)
+        self.assertRegex("アプリに戻る", mod.SETTINGS_BACK_PATTERN)
 
     def test_visible_tab_label_uses_fixture_stem(self):
         self.assertEqual(mod.FIXTURE_FILENAME, "file-tabs-focus.md")
@@ -60,19 +65,13 @@ class ColorHelperTests(unittest.TestCase):
         self.assertFalse(mod.colors_differ("#303030", "#313131"))
 
 
-class ThemeLabelTests(unittest.TestCase):
-    def test_extracts_lowercase_label(self):
-        self.assertEqual(mod.theme_label_from_text("Theme System"), "system")
-        self.assertEqual(mod.theme_label_from_text("Theme Light"), "light")
-        self.assertEqual(mod.theme_label_from_text("Theme Dark"), "dark")
+class ValidBackgroundTests(unittest.TestCase):
+    def test_accepts_a_sampled_hex_color(self):
+        self.assertTrue(mod.is_valid_background("#1e1e1e"))
 
-    def test_extracts_label_embedded_in_longer_ocr_line(self):
-        self.assertEqual(
-            mod.theme_label_from_text("Autosave on Theme Dark Recent:"), "dark"
-        )
-
-    def test_returns_none_when_absent(self):
-        self.assertIsNone(mod.theme_label_from_text("Autosave on"))
+    def test_rejects_missing_or_malformed_values(self):
+        for bad in (None, "", "1e1e1e", "#12345", 7):
+            self.assertFalse(mod.is_valid_background(bad))
 
 
 class PathFragmentCoverageTests(unittest.TestCase):

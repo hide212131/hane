@@ -623,13 +623,28 @@ impl EditorView {
         };
         match decision {
             SaveDecision::NeedsPath => {
-                self.status = Some("Use Save As for an untitled document".to_owned());
+                // Guidance, not a save state: the footer's save display is
+                // derived from the document itself. Another document's
+                // request names its target.
+                let target = (id != self.sessions.active_id())
+                    .then(|| self.sessions.get(id).map(DocumentSession::label))
+                    .flatten();
+                self.status = Some(match target {
+                    Some(label) => {
+                        format!("{label}: 保存先が決まっていません。名前を付けて保存してください")
+                    }
+                    None => "保存先が決まっていません。名前を付けて保存してください".to_owned(),
+                });
             }
-            SaveDecision::Queued => {
-                self.status = Some("Save queued…".to_owned());
-            }
+            // The footer derives "保存処理中…" from the document's own
+            // `save_in_flight()`, so queued and started writes need no
+            // message of their own.
+            SaveDecision::Queued => {}
             SaveDecision::Write(job) => {
-                self.status = Some("Saving…".to_owned());
+                // A started write replaces any older transient message, the
+                // way the former "Saving…" text did; the save problem of the
+                // document is deliberately left alone until a save succeeds.
+                self.status = None;
                 let files = self.files.clone();
                 let path = job.path.clone();
                 let ticket = job.ticket;
@@ -740,7 +755,8 @@ impl EditorView {
         let saved = matches!(outcome, SaveOutcome::Saved);
         match outcome {
             SaveOutcome::Saved => {
-                self.status = Some("Saved".to_owned());
+                self.status = None;
+                self.save_problems.remove(&id);
                 self.remember_recent(path);
                 cx.add_recent_document(path);
                 self.retire_work_folder_draft(id, cx);
@@ -749,7 +765,10 @@ impl EditorView {
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::SavedStale => {
-                self.status = Some("Saved snapshot; newer edits pending".to_owned());
+                // The snapshot landed, so the earlier problem is resolved;
+                // the edits that arrived meanwhile show as "未保存".
+                self.status = None;
+                self.save_problems.remove(&id);
                 self.remember_recent(path);
                 cx.add_recent_document(path);
                 self.schedule_autosave(cx);
@@ -759,16 +778,29 @@ impl EditorView {
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::Conflict => {
-                self.status = Some(
-                    "Save refused: the file changed on disk. Save As, or save again to overwrite"
-                        .to_owned(),
-                );
+                self.status = None;
+                if let Some(instance) = instance {
+                    self.record_save_problem(
+                        id,
+                        instance,
+                        Some(path.to_path_buf()),
+                        DocumentSaveProblem::Conflict,
+                    );
+                }
                 // The candidate name this was for was raced away; drop it
                 // rather than let a later, unrelated write consume it.
                 self.title_sync_pending.remove(&id);
             }
             SaveOutcome::Failed(error) => {
-                self.status = Some(format!("Save failed: {error}"));
+                self.status = None;
+                if let Some(instance) = instance {
+                    self.record_save_problem(
+                        id,
+                        instance,
+                        Some(path.to_path_buf()),
+                        DocumentSaveProblem::Failed(error.to_string()),
+                    );
+                }
                 self.title_sync_pending.remove(&id);
             }
             // The document this write belonged to is gone; nothing to report.
@@ -868,7 +900,17 @@ impl EditorView {
                 self.save_session(id, SaveIntent::To(path), cx);
             }
             SaveAsResponse::Failed(error) => {
-                self.status = Some(format!("Save As failed: {error}"));
+                // Only recorded for the document the dialog was opened for
+                // (the instance gate above); no problem is raised by a
+                // cancel, and an earlier unresolved one is not cleared.
+                if let Some(instance) = instance {
+                    self.record_save_problem(
+                        id,
+                        instance,
+                        None,
+                        DocumentSaveProblem::SaveAsDialogFailed(error),
+                    );
+                }
                 cx.notify();
             }
             SaveAsResponse::Canceled => {}
