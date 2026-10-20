@@ -80,7 +80,6 @@ U64_MAX = (1 << 64) - 1
 ENV_SIGNING_KEY = "HANE_UPDATE_SIGNING_KEY_BASE64"
 ENV_KEY_ID = "HANE_UPDATE_KEY_ID"
 ENV_PUBLIC_KEY = "HANE_UPDATE_PUBLIC_KEY_BASE64"
-ENV_TEAM_ID = "HANE_MACOS_TEAM_ID"
 
 WINDOWS_ROOT_FILES = (
     "hane.exe",
@@ -96,11 +95,16 @@ WINDOWS_ROOT_FILES = (
 WINDOWS_OPTIONAL = ("LICENSE",)
 MACOS_ROOT = "hane-macos-arm64"
 MACOS_APP = f"{MACOS_ROOT}/Hane.app"
+MACOS_HELPER_REL = "Contents/Helpers/hane-updater"
+MACOS_INVENTORY_REL = f"Contents/Resources/{INVENTORY_NAME}"
+MACOS_INVENTORY_SIGNATURE_REL = f"Contents/Resources/{INVENTORY_SIGNATURE_NAME}"
+# CodeResources is deliberately not required: trust is the Ed25519 inventory.
 MACOS_REQUIRED = (
     f"{MACOS_APP}/Contents/Info.plist",
     f"{MACOS_APP}/Contents/MacOS/hane",
-    f"{MACOS_APP}/Contents/Helpers/hane-updater",
-    f"{MACOS_APP}/Contents/_CodeSignature/CodeResources",
+    f"{MACOS_APP}/{MACOS_HELPER_REL}",
+    f"{MACOS_APP}/{MACOS_INVENTORY_REL}",
+    f"{MACOS_APP}/{MACOS_INVENTORY_SIGNATURE_REL}",
     f"{MACOS_ROOT}/README.md",
 )
 MACOS_EXECUTABLE_PREFIXES = (f"{MACOS_APP}/Contents/MacOS/", f"{MACOS_APP}/Contents/Helpers/")
@@ -112,7 +116,6 @@ IDENTITY_RE = re.compile(
 TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-TEAM_RE = re.compile(r"^[A-Z0-9]{10}$")
 KEY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
@@ -453,14 +456,11 @@ def walk_files(root: Path) -> list[str]:
     return sorted(found)
 
 
-def build_inventory(root: Path, version: str, source_sha: str) -> bytes:
-    """Raw `hane-install.json` covering every owned file below `root`."""
-    if not SHA1_RE.match(source_sha):
-        raise fail("source SHA must be 40 lowercase hex digits")
+def _inventory_files(root: Path, skip: tuple[str, ...]) -> list[dict]:
     files = []
     seen: set[str] = set()
     for rel in walk_files(root):
-        if rel in (INVENTORY_NAME, INVENTORY_SIGNATURE_NAME):
+        if rel in skip:
             continue
         validate_member_name(rel)
         if collision_key(rel) in seen:
@@ -468,21 +468,51 @@ def build_inventory(root: Path, version: str, source_sha: str) -> bytes:
         seen.add(collision_key(rel))
         size, digest = file_sha256(Path(root) / rel)
         files.append({"path": rel, "size": size, "sha256": digest})
+    return files
+
+
+def _inventory_document(files: list[dict], *, version: str, target: str, source_sha: str, layout: int) -> bytes:
+    return canonical_json({
+        "schema": SCHEMA,
+        "version": version,
+        "target": target,
+        "source_sha": source_sha,
+        "updater_protocol": UPDATER_PROTOCOL,
+        "layout_revision": layout,
+        "files": files,
+    })
+
+
+def build_inventory(root: Path, version: str, source_sha: str) -> bytes:
+    """Raw `hane-install.json` covering every owned file below `root`."""
+    if not SHA1_RE.match(source_sha):
+        raise fail("source SHA must be 40 lowercase hex digits")
+    files = _inventory_files(root, (INVENTORY_NAME, INVENTORY_SIGNATURE_NAME))
     helper = Path(root) / "hane-updater.exe"
     if not helper.is_file():
         raise fail("hane-updater.exe is missing from the Windows staging directory")
     check_identity(helper.read_bytes(), version=version, target=WINDOWS_TARGET, source_sha=source_sha,
                    what="hane-updater.exe")
-    document = {
-        "schema": SCHEMA,
-        "version": version,
-        "target": WINDOWS_TARGET,
-        "source_sha": source_sha,
-        "updater_protocol": UPDATER_PROTOCOL,
-        "layout_revision": WINDOWS_LAYOUT,
-        "files": files,
-    }
-    return canonical_json(document)
+    return _inventory_document(files, version=version, target=WINDOWS_TARGET, source_sha=source_sha,
+                               layout=WINDOWS_LAYOUT)
+
+
+def build_macos_inventory(app: Path, version: str, source_sha: str) -> bytes:
+    """Raw bundle inventory covering every file below `Hane.app`.
+
+    Paths are relative to the bundle. Any `_CodeSignature/CodeResources` is just
+    another listed file; no Apple signature is required or consulted.
+    """
+    if not SHA1_RE.match(source_sha):
+        raise fail("source SHA must be 40 lowercase hex digits")
+    files = _inventory_files(app, (MACOS_INVENTORY_REL, MACOS_INVENTORY_SIGNATURE_REL))
+    helper = Path(app) / MACOS_HELPER_REL
+    if not helper.is_file():
+        raise fail("Contents/Helpers/hane-updater is missing from the macOS bundle")
+    check_identity(helper.read_bytes(), version=version, target=MACOS_TARGET, source_sha=source_sha,
+                   what=MACOS_HELPER_REL)
+    return _inventory_document(files, version=version, target=MACOS_TARGET, source_sha=source_sha,
+                               layout=MACOS_LAYOUT)
 
 
 def make_zip(root: Path, output: Path) -> None:
@@ -554,54 +584,69 @@ def verify_windows_zip(path: Path, *, version: str, source_sha: str, trust: Trus
                        source_sha=source_sha, what="hane-updater.exe")
         msix_check(archive.read("Hane.ShellIntegration.msix"), version)
 
-        raw = archive.read(INVENTORY_NAME, MAX_INVENTORY_BYTES)
-        verify_signature(INVENTORY_DOMAIN, raw, archive.read(INVENTORY_SIGNATURE_NAME, MAX_SIGNATURE_BYTES), trust)
-        inventory = strict_json(raw, "inventory")
-        fields = {"schema", "version", "target", "source_sha", "updater_protocol", "layout_revision", "files"}
-        if not isinstance(inventory, dict) or set(inventory) != fields:
-            raise fail("inventory has unexpected fields")
-        expected = {
-            "schema": SCHEMA,
-            "version": version,
-            "target": WINDOWS_TARGET,
-            "source_sha": source_sha,
-            "updater_protocol": UPDATER_PROTOCOL,
-            "layout_revision": WINDOWS_LAYOUT,
-        }
-        for key, value in expected.items():
-            if inventory[key] != value or isinstance(inventory[key], bool):
-                raise fail(f"inventory {key} is {inventory[key]!r}, expected {value!r}")
-        listed = inventory["files"]
-        if not isinstance(listed, list) or not listed or len(listed) > MAX_ENTRIES:
-            raise fail("inventory file list is out of range")
-        owned = set(archive.files) - {INVENTORY_NAME, INVENTORY_SIGNATURE_NAME}
-        paths = []
-        for entry in listed:
-            if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}:
-                raise fail("inventory entry has unexpected fields")
-            rel = entry["path"]
-            if not isinstance(rel, str) or rel not in owned:
-                raise fail(f"inventory lists {rel!r}, which is not in the ZIP")
-            if not is_uint(entry["size"], 0, MAX_ENTRY_BYTES) or not (
-                isinstance(entry["sha256"], str) and SHA256_RE.match(entry["sha256"])
-            ):
-                raise fail(f"inventory entry {rel!r} has an invalid size or hash")
-            size, digest = archive.digest(rel)
-            if (size, digest) != (entry["size"], entry["sha256"]):
-                raise fail(f"inventory size/hash for {rel!r} differs from the ZIP content")
-            paths.append(rel)
-        if len(set(paths)) != len(paths) or set(paths) != owned:
-            raise fail("inventory must list every owned file in the ZIP exactly once")
+        inventory_sha256 = verify_archive_inventory(
+            archive, prefix="", inventory_rel=INVENTORY_NAME, signature_rel=INVENTORY_SIGNATURE_NAME,
+            version=version, target=WINDOWS_TARGET, source_sha=source_sha, layout=WINDOWS_LAYOUT, trust=trust)
         return {
-            "inventory_sha256": sha256_hex(raw),
+            "inventory_sha256": inventory_sha256,
             "unpacked_size": archive.unpacked_size,
         }
+
+
+def verify_archive_inventory(archive: Archive, *, prefix: str, inventory_rel: str, signature_rel: str,
+                             version: str, target: str, source_sha: str, layout: int, trust: Trust) -> str:
+    """Checks the Ed25519-signed inventory against the real ZIP content.
+
+    Inventory paths are relative to `prefix`; files outside it are not owned.
+    Returns the SHA-256 of the raw inventory bytes (the value the catalog binds).
+    """
+    raw = archive.read(prefix + inventory_rel, MAX_INVENTORY_BYTES)
+    verify_signature(INVENTORY_DOMAIN, raw, archive.read(prefix + signature_rel, MAX_SIGNATURE_BYTES), trust)
+    inventory = strict_json(raw, "inventory")
+    fields = {"schema", "version", "target", "source_sha", "updater_protocol", "layout_revision", "files"}
+    if not isinstance(inventory, dict) or set(inventory) != fields:
+        raise fail("inventory has unexpected fields")
+    expected = {
+        "schema": SCHEMA,
+        "version": version,
+        "target": target,
+        "source_sha": source_sha,
+        "updater_protocol": UPDATER_PROTOCOL,
+        "layout_revision": layout,
+    }
+    for key, value in expected.items():
+        if inventory[key] != value or isinstance(inventory[key], bool):
+            raise fail(f"inventory {key} is {inventory[key]!r}, expected {value!r}")
+    listed = inventory["files"]
+    if not isinstance(listed, list) or not listed or len(listed) > MAX_ENTRIES:
+        raise fail("inventory file list is out of range")
+    owned = {
+        name[len(prefix):] for name in archive.files if name.startswith(prefix)
+    } - {inventory_rel, signature_rel}
+    paths = []
+    for entry in listed:
+        if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}:
+            raise fail("inventory entry has unexpected fields")
+        rel = entry["path"]
+        if not isinstance(rel, str) or rel not in owned:
+            raise fail(f"inventory lists {rel!r}, which is not in the ZIP")
+        if not is_uint(entry["size"], 0, MAX_ENTRY_BYTES) or not (
+            isinstance(entry["sha256"], str) and SHA256_RE.match(entry["sha256"])
+        ):
+            raise fail(f"inventory entry {rel!r} has an invalid size or hash")
+        size, digest = archive.digest(prefix + rel)
+        if (size, digest) != (entry["size"], entry["sha256"]):
+            raise fail(f"inventory size/hash for {rel!r} differs from the ZIP content")
+        paths.append(rel)
+    if len(set(paths)) != len(paths) or set(paths) != owned:
+        raise fail("inventory must list every owned file in the ZIP exactly once")
+    return sha256_hex(raw)
 
 
 # ------------------------------------------------------------ macOS ZIP
 
 
-def verify_macos_zip(path: Path, *, version: str, source_sha: str) -> dict:
+def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust) -> dict:
     with Archive(path) as archive:
         allowed_files = {f"{MACOS_ROOT}/README.md", f"{MACOS_ROOT}/LICENSE"}
         for name in archive.files:
@@ -639,14 +684,18 @@ def verify_macos_zip(path: Path, *, version: str, source_sha: str) -> dict:
                 raise fail(f"{binary} is not a 64-bit Mach-O executable")
         check_identity(archive.read(f"{MACOS_APP}/Contents/Helpers/hane-updater"), version=version,
                        target=MACOS_TARGET, source_sha=source_sha, what="Contents/Helpers/hane-updater")
+        inventory_sha256 = verify_archive_inventory(
+            archive, prefix=f"{MACOS_APP}/", inventory_rel=MACOS_INVENTORY_REL,
+            signature_rel=MACOS_INVENTORY_SIGNATURE_REL, version=version, target=MACOS_TARGET,
+            source_sha=source_sha, layout=MACOS_LAYOUT, trust=trust)
         return {"bundle_id": info["CFBundleIdentifier"], "bundle_version": info["CFBundleShortVersionString"],
-                "unpacked_size": archive.unpacked_size}
+                "inventory_sha256": inventory_sha256, "unpacked_size": archive.unpacked_size}
 
 
 # ------------------------------------------------------------ catalog
 
 
-def build_catalog(release_dir: Path, *, tag: str, source_sha: str, sequence: int, team_id: str,
+def build_catalog(release_dir: Path, *, tag: str, source_sha: str, sequence: int,
                   trust: Trust, published: dt.datetime | None = None,
                   validity: dt.timedelta = DEFAULT_VALIDITY) -> bytes:
     version = version_of(tag)
@@ -654,11 +703,9 @@ def build_catalog(release_dir: Path, *, tag: str, source_sha: str, sequence: int
         raise fail("source SHA must be 40 lowercase hex digits")
     if not is_uint(sequence, 1):
         raise fail("catalog_sequence must be an integer from 1 to 2^64-1")
-    if not TEAM_RE.match(team_id or ""):
-        raise fail(f"{ENV_TEAM_ID} must be a 10-character Apple Team ID")
     release_dir = Path(release_dir)
     windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust)
-    macos = verify_macos_zip(release_dir / MACOS_ASSET, version=version, source_sha=source_sha)
+    macos = verify_macos_zip(release_dir / MACOS_ASSET, version=version, source_sha=source_sha, trust=trust)
     w_size, w_sha = file_sha256(release_dir / WINDOWS_ASSET)
     m_size, m_sha = file_sha256(release_dir / MACOS_ASSET)
     published = (published or now_utc()).replace(microsecond=0)
@@ -690,8 +737,8 @@ def build_catalog(release_dir: Path, *, tag: str, source_sha: str, sequence: int
                 "archive_sha256": m_sha,
                 "unpacked_size": macos["unpacked_size"],
                 "layout_revision": MACOS_LAYOUT,
+                "inventory_sha256": macos["inventory_sha256"],
                 "bundle_id": macos["bundle_id"],
-                "team_id": team_id,
                 "bundle_version": macos["bundle_version"],
             },
         },
@@ -709,7 +756,7 @@ CATALOG_FIELDS = {
 WINDOWS_ENTRY_FIELDS = {"asset_name", "archive_size", "archive_sha256", "unpacked_size", "layout_revision",
                         "inventory_sha256"}
 MACOS_ENTRY_FIELDS = {"asset_name", "archive_size", "archive_sha256", "unpacked_size", "layout_revision",
-                      "bundle_id", "team_id", "bundle_version"}
+                      "inventory_sha256", "bundle_id", "bundle_version"}
 
 
 def parse_catalog(raw: bytes) -> dict:
@@ -738,7 +785,7 @@ def verify_catalog_bytes(raw: bytes, signature_file: bytes, trust: Trust) -> dic
     return parse_catalog(raw)
 
 
-def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, team_id: str, trust: Trust,
+def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, trust: Trust,
                        now: dt.datetime | None = None, sequence: int | None = None) -> dict:
     """The single verifier: signature, catalog fields and both real ZIPs."""
     release_dir = Path(release_dir)
@@ -749,8 +796,6 @@ def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, team_id:
     for name in RELEASE_ASSETS:
         if (release_dir / name).is_symlink() or not (release_dir / name).is_file():
             raise fail(f"{name} is not a regular file")
-    if not TEAM_RE.match(team_id or ""):
-        raise fail(f"{ENV_TEAM_ID} must be a 10-character Apple Team ID")
     raw = (release_dir / CATALOG_NAME).read_bytes()
     catalog = verify_catalog_bytes(raw, (release_dir / SIGNATURE_NAME).read_bytes(), trust)
     now = now or now_utc()
@@ -774,7 +819,7 @@ def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, team_id:
         raise fail("catalog must contain exactly the Windows x64 and macOS arm64 targets")
 
     windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust)
-    macos = verify_macos_zip(release_dir / MACOS_ASSET, version=version, source_sha=source_sha)
+    macos = verify_macos_zip(release_dir / MACOS_ASSET, version=version, source_sha=source_sha, trust=trust)
     expected = {
         WINDOWS_TARGET: (WINDOWS_ASSET, WINDOWS_LAYOUT, WINDOWS_ENTRY_FIELDS, windows),
         MACOS_TARGET: (MACOS_ASSET, MACOS_LAYOUT, MACOS_ENTRY_FIELDS, macos),
@@ -799,8 +844,8 @@ def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, team_id:
     if targets[WINDOWS_TARGET]["inventory_sha256"] != windows["inventory_sha256"]:
         raise fail("Windows inventory_sha256 differs from the ZIP's hane-install.json")
     mac_entry = targets[MACOS_TARGET]
-    for key, value in {"bundle_id": macos["bundle_id"], "bundle_version": macos["bundle_version"],
-                       "team_id": team_id}.items():
+    for key, value in {"inventory_sha256": macos["inventory_sha256"], "bundle_id": macos["bundle_id"],
+                       "bundle_version": macos["bundle_version"]}.items():
         if mac_entry[key] != value:
             raise fail(f"macOS {key} is {mac_entry[key]!r}, expected {value!r}")
     return catalog
@@ -998,6 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
     add("require-env").add_argument("names", nargs="+")
     add("binary-identity", "binary", "version", "target", "source-sha")
     add("windows-inventory", "root", "version", "source-sha", "output")
+    add("macos-inventory", "app", "version", "source-sha", "output")
     sign = add("sign", "input", "output")
     sign.add_argument("--domain", choices=("catalog", "inventory"), required=True)
     add("make-zip", "root", "output")
@@ -1033,6 +1079,8 @@ def _dispatch(args: argparse.Namespace) -> int:
                        source_sha=args.source_sha, what=args.binary)
     elif cmd == "windows-inventory":
         Path(args.output).write_bytes(build_inventory(Path(args.root), args.version, args.source_sha))
+    elif cmd == "macos-inventory":
+        Path(args.output).write_bytes(build_macos_inventory(Path(args.app), args.version, args.source_sha))
     elif cmd == "sign":
         seed = signing_seed()
         trust = Trust.from_env()
@@ -1054,19 +1102,17 @@ def _dispatch(args: argparse.Namespace) -> int:
     elif cmd == "verify-windows-zip":
         verify_windows_zip(Path(args.zip), version=args.version, source_sha=args.source_sha, trust=Trust.from_env())
     elif cmd == "verify-macos-zip":
-        verify_macos_zip(Path(args.zip), version=args.version, source_sha=args.source_sha)
+        verify_macos_zip(Path(args.zip), version=args.version, source_sha=args.source_sha, trust=Trust.from_env())
     elif cmd == "build-catalog":
         trust = Trust.from_env()
         out = Path(args.output)
         if out.exists():
             raise fail(f"{out} already exists; refusing to overwrite")
         out.write_bytes(build_catalog(Path(args.dir), tag=args.tag, source_sha=args.source_sha,
-                                      sequence=args.sequence, team_id=os.environ.get(ENV_TEAM_ID, ""),
-                                      trust=trust))
+                                      sequence=args.sequence, trust=trust))
     elif cmd == "verify-release":
         verify_release_dir(Path(args.dir), tag=args.tag, source_sha=args.source_sha,
-                           team_id=os.environ.get(ENV_TEAM_ID, ""), trust=Trust.from_env(),
-                           sequence=args.sequence)
+                           trust=Trust.from_env(), sequence=args.sequence)
     elif cmd == "plan":
         plan = plan_release(Gh(), args.repo, args.tag, tag_push=args.tag_push, initial=args.initial,
                             trust=Trust.from_env())

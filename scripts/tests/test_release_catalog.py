@@ -1,7 +1,7 @@
 """Fixture tests for scripts/release_catalog.py (Issue #510, stage U2).
 
-Everything runs with throwaway keys generated here. No production key, Team ID
-or certificate is used, read or needed; the fixtures are never published.
+Everything runs with throwaway keys generated here. No production key, Apple
+identity or certificate is used, read or needed; the fixtures are never published.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 OTHER_SHA = "89abcdef0123456789abcdef0123456789abcdef"
 TAG = "v0.27.0"
 VERSION = "0.27.0"
-TEAM = "ABCDE12345"
+TEAM = "ABCDE12345"  # only used to show a catalog carrying a Team ID is refused
 KEY_ID = "hane-update-test"
 REPO = rc.REPOSITORY
 NOW = dt.datetime(2026, 10, 19, tzinfo=dt.timezone.utc)
@@ -136,7 +136,9 @@ class Fixture:
         return path
 
     def macos_zip(self, path: Path, *, version=VERSION, source=SHA, plist_updates=None, drop=(), extra=(),
-                  helper=None, bundle_id=rc.MACOS_BUNDLE_ID) -> Path:
+                  helper=None, bundle_id=rc.MACOS_BUNDLE_ID, code_resources=False, tweak=None, tamper=None,
+                  inventory=True, signer=None) -> Path:
+        """No Apple signature: trust is the Ed25519-signed inventory inside the bundle."""
         info = {
             "CFBundleIdentifier": bundle_id,
             "CFBundleExecutable": "hane",
@@ -154,12 +156,32 @@ class Fixture:
             f"{app}/Contents/Info.plist": (plistlib.dumps(info), 0o644),
             f"{app}/Contents/MacOS/hane": (macho(version, source), 0o755),
             f"{app}/Contents/Helpers/hane-updater": (helper if helper is not None else macho(version, source), 0o755),
-            f"{app}/Contents/_CodeSignature/CodeResources": (b"<plist/>", 0o644),
             f"{app}/Contents/Resources/Hane.icns": (b"icns", 0o644),
             f"{rc.MACOS_ROOT}/README.md": (b"readme", 0o644),
         }
+        if code_resources:
+            entries[f"{app}/Contents/_CodeSignature/CodeResources"] = (b"<plist/>", 0o644)
         for name in drop:
             entries.pop(f"{app}/{name}", None)
+        if inventory:
+            staging = Path(tempfile.mkdtemp(dir=self.dir))
+            for name, (data, _) in entries.items():
+                if name.startswith(f"{app}/"):
+                    target = staging / name[len(app) + 1:]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+            files = rc._inventory_files(staging, ())
+            raw = rc._inventory_document(files, version=version, target=rc.MACOS_TARGET, source_sha=source,
+                                         layout=rc.MACOS_LAYOUT)
+            if tweak:
+                document = json.loads(raw)
+                tweak(document)
+                raw = rc.canonical_json(document)
+            sign = (signer or self).sign
+            entries[f"{app}/{rc.MACOS_INVENTORY_REL}"] = (raw, 0o644)
+            entries[f"{app}/{rc.MACOS_INVENTORY_SIGNATURE_REL}"] = (sign(rc.INVENTORY_DOMAIN, raw), 0o644)
+        for name, data in (tamper or {}).items():  # changed after the inventory was made
+            entries[f"{app}/{name}"] = (data, entries.get(f"{app}/{name}", (b"", 0o644))[1])
         write_zip(path, [(n, d, m) for n, (d, m) in entries.items()] + list(extra))
         return path
 
@@ -170,7 +192,7 @@ class Fixture:
         macos = macos or self.macos_zip(self.dir / f"{name}-m.zip")
         (directory / rc.WINDOWS_ASSET).write_bytes(Path(windows).read_bytes())
         (directory / rc.MACOS_ASSET).write_bytes(Path(macos).read_bytes())
-        raw = rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=sequence, team_id=TEAM,
+        raw = rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=sequence,
                                trust=self.trust, published=NOW)
         (directory / rc.CATALOG_NAME).write_bytes(raw)
         (directory / rc.SIGNATURE_NAME).write_bytes(self.sign(rc.CATALOG_DOMAIN, raw))
@@ -184,7 +206,7 @@ class Fixture:
         (directory / rc.SIGNATURE_NAME).write_bytes(self.sign(rc.CATALOG_DOMAIN, raw))
 
     def verify(self, directory: Path, **kwargs):
-        defaults = dict(tag=TAG, source_sha=SHA, team_id=TEAM, trust=self.trust, now=LATER)
+        defaults = dict(tag=TAG, source_sha=SHA, trust=self.trust, now=LATER)
         defaults.update(kwargs)
         return rc.verify_release_dir(directory, **defaults)
 
@@ -212,9 +234,12 @@ class CatalogAndSignatureTests(TempCase):
         self.assertEqual(windows["archive_size"], (directory / rc.WINDOWS_ASSET).stat().st_size)
         self.assertEqual(windows["layout_revision"], 2)
         mac = catalog["targets"][rc.MACOS_TARGET]
-        self.assertEqual((mac["bundle_id"], mac["bundle_version"], mac["team_id"]),
-                         (rc.MACOS_BUNDLE_ID, VERSION, TEAM))
+        self.assertEqual((mac["bundle_id"], mac["bundle_version"]), (rc.MACOS_BUNDLE_ID, VERSION))
+        self.assertNotIn("team_id", mac)
         self.assertEqual(mac["layout_revision"], 1)
+        with zipfile.ZipFile(directory / rc.MACOS_ASSET) as archive:
+            inventory = archive.read(f"{rc.MACOS_APP}/{rc.MACOS_INVENTORY_REL}")
+        self.assertEqual(mac["inventory_sha256"], rc.sha256_hex(inventory))
 
     def test_catalog_bytes_are_signed_raw_and_tampering_is_rejected(self):
         directory = self.fx.release(sequence=5)
@@ -332,25 +357,35 @@ class CatalogAndSignatureTests(TempCase):
         with self.assertRaisesRegex(ReleaseError, "validity window"):
             self.fx.verify(directory)
 
-    def test_team_id_and_bundle_metadata_must_match(self):
+    def test_bundle_metadata_and_inventory_hash_must_match(self):
         directory = self.fx.release()
-        with self.assertRaisesRegex(ReleaseError, "team_id"):
-            self.fx.verify(directory, team_id="ZZZZZ99999")
-        with self.assertRaisesRegex(ReleaseError, "Team ID"):
-            self.fx.verify(directory, team_id="")
         self.fx.resign(directory, lambda c: c["targets"][rc.MACOS_TARGET].update(bundle_version="0.0.1"))
         with self.assertRaisesRegex(ReleaseError, "bundle_version"):
             self.fx.verify(directory)
+        directory = self.fx.release("r-inv")
+        self.fx.resign(directory, lambda c: c["targets"][rc.MACOS_TARGET].update(inventory_sha256="0" * 64))
+        with self.assertRaisesRegex(ReleaseError, "inventory_sha256"):
+            self.fx.verify(directory)
 
-    def test_catalog_generation_requires_team_id_and_valid_sequence(self):
+    def test_a_catalog_with_a_team_id_is_not_accepted(self):
+        directory = self.fx.release()
+        self.fx.resign(directory, lambda c: c["targets"][rc.MACOS_TARGET].update(team_id=TEAM))
+        with self.assertRaisesRegex(ReleaseError, "unexpected fields"):
+            self.fx.verify(directory)
+
+    def test_catalog_generation_requires_a_valid_sequence(self):
         directory = self.fx.release()
         for sequence in (0, -1, 2**64, True):
             with self.assertRaises(ReleaseError):
-                rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=sequence, team_id=TEAM,
-                                 trust=self.fx.trust)
-        with self.assertRaisesRegex(ReleaseError, "Team ID"):
-            rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=2, team_id="", trust=self.fx.trust)
-        rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=2**64 - 1, team_id=TEAM, trust=self.fx.trust)
+                rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=sequence, trust=self.fx.trust)
+        rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=2**64 - 1, trust=self.fx.trust)
+
+    def test_catalog_is_not_built_for_an_unsigned_or_foreign_signed_macos_bundle(self):
+        other = self.other_fixture()
+        for name, kwargs in (("foreign", dict(signer=other)), ("noinv", dict(inventory=False))):
+            macos = self.fx.macos_zip(self.tmp / f"{name}.zip", **kwargs)
+            with self.assertRaises(ReleaseError, msg=name):
+                self.fx.release(name=f"r-{name}", macos=macos)
 
 
 class WindowsZipTests(TempCase):
@@ -454,9 +489,65 @@ class WindowsZipTests(TempCase):
 
 class MacosZipTests(TempCase):
     def verify(self, path, **kwargs):
-        args = dict(version=VERSION, source_sha=SHA)
+        args = dict(version=VERSION, source_sha=SHA, trust=self.fx.trust)
         args.update(kwargs)
         return rc.verify_macos_zip(path, **args)
+
+    def test_bundle_is_trusted_by_the_signed_inventory_without_any_apple_signature(self):
+        plain = self.fx.macos_zip(self.tmp / "plain.zip")
+        with zipfile.ZipFile(plain) as archive:
+            self.assertFalse([n for n in archive.namelist() if "_CodeSignature" in n])
+        self.verify(plain)
+        sealed = self.fx.macos_zip(self.tmp / "sealed.zip", code_resources=True)  # inspected when present
+        self.verify(sealed)
+
+    def test_real_generator_inventory_matches_the_verifier(self):
+        staging = self.tmp / "Hane.app"
+        for name, data in (("Contents/Info.plist", b"x"), ("Contents/MacOS/hane", macho()),
+                           ("Contents/Helpers/hane-updater", macho()), ("Contents/Resources/Hane.icns", b"i")):
+            (staging / name).parent.mkdir(parents=True, exist_ok=True)
+            (staging / name).write_bytes(data)
+        raw = rc.build_macos_inventory(staging, VERSION, SHA)
+        document = json.loads(raw)
+        self.assertEqual((document["target"], document["layout_revision"], document["version"]),
+                         (rc.MACOS_TARGET, rc.MACOS_LAYOUT, VERSION))
+        self.assertEqual([f["path"] for f in document["files"]],
+                         sorted(["Contents/Info.plist", "Contents/MacOS/hane", "Contents/Helpers/hane-updater",
+                                 "Contents/Resources/Hane.icns"]))
+        (staging / rc.MACOS_INVENTORY_REL).write_bytes(raw)
+        self.assertEqual(rc.build_macos_inventory(staging, VERSION, SHA), raw)  # its own files are skipped
+        with self.assertRaises(ReleaseError):
+            rc.build_macos_inventory(staging, VERSION, OTHER_SHA)
+
+    def test_inventory_is_required_signed_by_a_trusted_key_and_exact(self):
+        with self.assertRaisesRegex(ReleaseError, "missing"):
+            self.verify(self.fx.macos_zip(self.tmp / "none.zip", inventory=False))
+        other = self.other_fixture()
+        with self.assertRaisesRegex(ReleaseError, "no valid signature"):
+            self.verify(self.fx.macos_zip(self.tmp / "foreign.zip", signer=other))
+        with self.assertRaisesRegex(ReleaseError, "differs from the ZIP"):
+            self.verify(self.fx.macos_zip(self.tmp / "tampered.zip",
+                                          tamper={"Contents/Resources/Hane.icns": b"evil"}))
+        with self.assertRaises(ReleaseError):
+            self.verify(self.fx.macos_zip(self.tmp / "unlisted.zip",
+                                          extra=[(f"{rc.MACOS_APP}/Contents/Resources/new.png", b"x", 0o644)]))
+
+        def omit_icon(doc):
+            doc["files"] = [f for f in doc["files"] if not f["path"].endswith("Hane.icns")]
+
+        def alter(doc):
+            doc["files"][0]["sha256"] = "0" * 64
+
+        for tweak in (omit_icon, alter):
+            with self.assertRaises(ReleaseError, msg=tweak.__name__):
+                self.verify(self.fx.macos_zip(self.tmp / f"{tweak.__name__}.zip", tweak=tweak))
+
+    def test_inventory_identity_fields_are_checked(self):
+        for field, value in (("version", "0.27.1"), ("target", rc.WINDOWS_TARGET), ("source_sha", OTHER_SHA),
+                             ("updater_protocol", 2), ("layout_revision", 2)):
+            path = self.fx.macos_zip(self.tmp / f"{field}.zip", tweak=lambda d, f=field, v=value: d.update({f: v}))
+            with self.assertRaisesRegex(ReleaseError, field, msg=field):
+                self.verify(path)
 
     def test_layout_and_info_plist_identity(self):
         path = self.fx.macos_zip(self.tmp / "m.zip")
@@ -747,7 +838,6 @@ class CommandLineTests(TempCase):
             rc.ENV_KEY_ID: KEY_ID,
             rc.ENV_PUBLIC_KEY: base64.b64encode(self.fx.public).decode(),
             rc.ENV_SIGNING_KEY: base64.b64encode(self.fx.seed).decode(),
-            rc.ENV_TEAM_ID: TEAM,
         }
         values.update(extra)
         return mock.patch.dict(os.environ, values, clear=False)

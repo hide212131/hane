@@ -62,7 +62,7 @@ export HANE_SOURCE_SHA="$source_sha"
 cargo build --release --locked -p hane -p hane-updater
 
 # The helper must report the identity the bundle claims. Release builds repeat
-# this check on the extracted notarized ZIP.
+# this check on the extracted ZIP.
 python3 "$workspace/scripts/release_catalog.py" binary-identity \
   --binary "$target_dir/release/hane-updater" \
   --version "$version" --target aarch64-apple-darwin --source-sha "$source_sha"
@@ -218,7 +218,8 @@ if [[ ! -x "$bundle/Contents/Helpers/hane-updater" || ! -x "$bundle/Contents/Mac
   exit 1
 fi
 
-# Signing, notarization and stapling are done by the release workflow with the
-# maintainer's credentials; this script never signs and must not run after it.
+# The release workflow adds the Ed25519-signed inventory (hane-install.json) to
+# the finished bundle; this script never signs and must not run after it.
+# No Apple Developer ID, notarization or stapling is part of the release.
 touch "$bundle"
 echo "Built: $bundle"

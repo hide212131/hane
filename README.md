@@ -71,13 +71,13 @@ Windows 11向けの新しい配布ZIPには `Hane.ShellIntegration.msix`、署�
 
 ### ZIP更新の配布物（保守者向け）
 
-アプリ本体の更新（Issue #510、[ADR-0034](docs/adr/0034-zip-application-updates.md)）に使うため、各Releaseは次の4ファイルをそろえて公開します。`hane-update.json` と `hane-update.json.sig` は、両ZIPの実サイズ・SHA-256・Windowsの所有ファイル一覧・macOSのBundle ID/版/Team IDから生成し、Hane更新専用のEd25519鍵で署名します。
+アプリ本体の更新（Issue #510、[ADR-0034](docs/adr/0034-zip-application-updates.md)）に使うため、各Releaseは次の4ファイルをそろえて公開します。`hane-update.json` と `hane-update.json.sig` は、両ZIPの実サイズ・SHA-256・Windowsの所有ファイル一覧・macOSのBundle ID/版/署名済みinventoryのhashから生成し、Hane更新専用のEd25519鍵で署名します。
 
 - `hane-windows-x64.zip` — 上記の構成に加え、署名済みの `hane-install.json` / `hane-install.json.sig`。
-- `hane-macos-arm64.zip` — Developer ID署名・Hardened Runtime・notarization・staple済みの `Hane.app`（`Contents/Helpers/hane-updater` を含む）。署名後はbundleを変更せずZIP化します。
+- `hane-macos-arm64.zip` — 更新用Ed25519鍵で署名した `Contents/Resources/hane-install.json` / `.sig` を含む `Hane.app`（`Contents/Helpers/hane-updater` を含む）。Apple Developer ID・notarizationは使わず、署名後はbundleを変更せずZIP化します。
 - `hane-update.json`, `hane-update.json.sig` — 検証済みcatalogとその署名。
 
-更新対応版の最初の導入は、これまでどおり手動でZIPを展開します。署名鍵・Developer ID・notary資格情報が未設定の間は、リリースは失敗し、更新対応のReleaseは公開されません。手順と必要な設定は [リリース手順](.github/RELEASE_AUTOMATION.md) と [Windows署名手順](docs/windows-release-signing.md) を参照してください。
+更新対応版の最初の導入は、これまでどおり手動でZIPを展開します。更新用の署名鍵・公開鍵・MSIX署名証明書が未設定の間は、リリースは失敗し、更新対応のReleaseは公開されません。手順と必要な設定は [リリース手順](.github/RELEASE_AUTOMATION.md) と [Windows署名手順](docs/windows-release-signing.md) を参照してください。
 
 Windows 11 のメニュー表示状態は実行ファイルと同じディレクトリの `Hane.ShellIntegration.enabled`（ファイル）または `Hane.ShellIntegration.folder.enabled`（フォルダ）で管理します。パッケージ化された Explorer 拡張やそこから起動した Hane では通常の HKCU\Software\Classes キーが仮想化されるため、Windows 11 のファイル登録はこのキーを新規作成しません。旧版が作成した Hane 所有のキーが現在のプロセスから見える場合だけ削除します。無効化時には対応するマーカーを削除します。署名済みパッケージ自体は再有効化を速くするため残りますが、マーカーがない項目は Explorer に表示されません。パッケージを更新した直後に新しい項目が見えない場合は Explorer ウィンドウを開き直してください。
 

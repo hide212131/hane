@@ -271,7 +271,6 @@ jobs:
           SOURCE_SHA: ${{ steps.wait.outputs.merge_sha }}
           HANE_UPDATE_KEY_ID: ${{ vars.HANE_UPDATE_KEY_ID }}
           HANE_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.HANE_UPDATE_PUBLIC_KEY_BASE64 }}
-          HANE_MACOS_TEAM_ID: ${{ vars.HANE_MACOS_TEAM_ID }}
         run: |
           set -euo pipefail
           python scripts/release_catalog.py fetch-assets \

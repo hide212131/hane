@@ -44,10 +44,10 @@ Release PRではCodeRabbit reviewを省略する。`main` にrequired approval r
 
 ## 更新対応Releaseの署名設定と初回発行
 
-`Release builds` は、更新用Ed25519鍵・Apple Developer ID/notary資格情報・MSIX署名証明書が全てそろわないと失敗し、未署名のReleaseを作らない。必要な名前と用途は [Windows署名手順](../docs/windows-release-signing.md) にまとめている。値は保守者が設定し、リポジトリ・ログ・Issueへ出さない。
+`Release builds` は、更新用Ed25519鍵・MSIX署名証明書が全てそろわないと失敗し、未署名のReleaseを作らない。Apple Developer ID・Team ID・notarizationの設定は要求しない。必要な名前と用途は [Windows署名手順](../docs/windows-release-signing.md) にまとめている。値は保守者が設定し、リポジトリ・ログ・Issueへ出さない。
 
 - Releaseは Draft として作成し、4つのアセット（2つのZIP、catalog、署名）を再取得して検証した後にだけstable公開する。既存のtag・Release・アセットは上書きしない。
 - `catalog_sequence` は公開済みcatalogの最大値 + 1 で、読み取りから公開までを共通のconcurrency group（`hane-release-publish`）で直列化する。公開済みcatalogが無いときだけ、`Release builds` を `workflow_dispatch` で `initial_catalog` を指定して起動し sequence 1 を発行する。`Request release` 経由の自動起動は初回扱いにならず、この場合は失敗する。その時はmerge後のmainから手動で起動し直す。
 - 既存tagの再実行を含め、版が既存の最新stableより新しくない場合は公開しない。
-- 実署名・notarization・二版更新の実機確認（Issue #510 U5）はこの設定だけでは完了しない。
+- 実署名・二版更新の実機確認（Issue #510 U5）はこの設定だけでは完了しない。
 

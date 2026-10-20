@@ -34,20 +34,16 @@ Windows ZIPには `hane.exe`、`hane-updater.exe`、署名済み `Hane.ShellInte
 
 ## 更新用の署名資格情報（保守者が設定する値）
 
-次の値は保守者だけが設定する。値を推測・生成・commitしない。`prepare` は**存在の真偽値だけ**を評価し、値は署名・notarizationを行うstepにだけ渡る。1つでも欠けるとリリースは失敗し、未署名のReleaseは作られない。
+次の値は保守者だけが設定する。値を推測・生成・commitしない。`prepare` は**存在の真偽値だけ**を評価し、値は署名を行うstepにだけ渡る。1つでも欠けるとリリースは失敗し、未署名のReleaseは作られない。Apple Developer ID・Team ID・notarization・stapleに関する設定は不要で、未設定でもmacOS ZIPの作成やWindows配布は止まらない。macOS ZIPの信頼根拠は、更新用Ed25519鍵で署名した `Hane.app/Contents/Resources/hane-install.json` と、catalogの `inventory_sha256` である。
 
 | 種別 | 名前 | 用途 |
 |---|---|---|
 | secret | `HANE_UPDATE_SIGNING_KEY_BASE64` | Hane更新専用Ed25519鍵の32バイト秘密鍵（Base64）。inventory・catalogの署名step専用。Codex runtime catalogの鍵とは共用しない |
 | variable | `HANE_UPDATE_KEY_ID` | 署名ファイルの `key_id`（英数字と `.` `_` `-`、64文字以内） |
 | variable | `HANE_UPDATE_PUBLIC_KEY_BASE64` | 上記秘密鍵に対応する公開鍵32バイト（Base64）。本体へ埋め込まれ、署名step・検証が秘密鍵との一致を確認する |
-| variable | `HANE_MACOS_TEAM_ID` | Apple Team ID（10桁の英大文字・数字）。本体へ固定され、catalogの `team_id` と署名済みbundleの `TeamIdentifier` を照合する |
-| secret | `APPLE_DEVELOPER_ID_P12_BASE64`, `APPLE_DEVELOPER_ID_P12_PASSWORD` | Developer ID Application証明書（.p12）とそのパスワード。macOS署名step専用の一時keychainに取り込む |
-| secret | `APPLE_NOTARY_API_KEY_P8_BASE64` | App Store Connect APIキー（.p8、Base64）。notarization step専用 |
-| variable | `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` | 上記APIキーのKey IDとIssuer ID |
 | secret | `HANE_MSIX_PFX_BASE64`, `HANE_MSIX_PFX_PASSWORD` | 前節のMSIX署名用PFX |
 
-公開鍵とTeam IDはビルド時の環境変数として `crates/update` の `TrustPolicy::production()` に埋め込まれる。未設定・不正な値の場合は何も埋め込まれず、更新候補は `trust_unconfigured` で拒否される。
+公開鍵はビルド時の環境変数として `crates/update` の `TrustPolicy::production()` に埋め込まれる。未設定・不正な値の場合は何も埋め込まれず、更新候補は `trust_unconfigured` で拒否される。
 
 ## 更新catalogの発行と順序
 
@@ -58,6 +54,6 @@ Windows ZIPには `hane.exe`、`hane-updater.exe`、署名済み `Hane.ShellInte
 3. 実ZIPのサイズ・SHA-256・unpacked size・inventory hash・bundle IDから `hane-update.json` を生成し、署名する。
 4. Draftを作り、4アセットをuploadし、再取得して同じ検証（署名、版、source SHA、target、ZIP hash、inventory、bundle metadata）を行う。成功した場合だけstableへ公開し、公開後にもう一度検証する。検証に失敗したDraftは削除され、既存のtag/Release/assetは上書きしない。
 
-期限更新だけの再署名や秘密鍵のローテーションはこの自動処理の対象外で、保守者が明示的に行う。この基盤だけでは実署名・notarization・二版更新の実機確認は完了しない（Issue #510のU5）。
+期限更新だけの再署名や秘密鍵のローテーションはこの自動処理の対象外で、保守者が明示的に行う。この基盤だけでは実署名・二版更新の実機確認は完了しない（Issue #510のU5）。
 
 自己署名証明書なので、配布先のWindows 11ではREADMEに従って**新しい公開証明書**を `LocalMachine\TrustedPeople` に信頼登録する必要がある。配布先で秘密鍵を作成・配布する必要はない。旧証明書の信頼や旧パッケージはこの作業で自動削除しない。

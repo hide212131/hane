@@ -53,12 +53,10 @@ def step_text(job: str, name_prefix: str) -> str:
 
 class SecretScopingTests(unittest.TestCase):
     ALLOWED = {
-        "HANE_UPDATE_SIGNING_KEY_BASE64": {"Generate and sign Windows inventory", "Sign catalog"},
+        "HANE_UPDATE_SIGNING_KEY_BASE64": {"Generate and sign Windows inventory",
+                                           "Generate and sign macOS inventory", "Sign catalog"},
         "HANE_MSIX_PFX_BASE64": {"Prepare Windows Explorer package signing certificate"},
         "HANE_MSIX_PFX_PASSWORD": {"Prepare Windows Explorer package signing certificate"},
-        "APPLE_DEVELOPER_ID_P12_BASE64": {"Sign, notarize and staple macOS app"},
-        "APPLE_DEVELOPER_ID_P12_PASSWORD": {"Sign, notarize and staple macOS app"},
-        "APPLE_NOTARY_API_KEY_P8_BASE64": {"Sign, notarize and staple macOS app"},
     }
 
     def test_each_secret_reaches_only_its_signing_step(self):
@@ -86,9 +84,9 @@ class SecretScopingTests(unittest.TestCase):
         prepare = jobs(RELEASE)["prepare"]
         text = step_text(prepare, "Require release signing configuration")
         for name in ("HANE_UPDATE_SIGNING_KEY_BASE64", "HANE_UPDATE_KEY_ID", "HANE_UPDATE_PUBLIC_KEY_BASE64",
-                     "HANE_MACOS_TEAM_ID", "APPLE_DEVELOPER_ID_P12_BASE64", "APPLE_NOTARY_API_KEY_P8_BASE64",
                      "HANE_MSIX_PFX_BASE64"):
             self.assertIn(f"HAS_{name}", text)
+        self.assertNotRegex(text, r"APPLE|TEAM_ID")
         for job in ("build-windows", "build-macos", "release"):
             self.assertIn("needs.prepare.outputs.should_release == 'true'", jobs(RELEASE)[job])
 
@@ -196,46 +194,46 @@ class BuildJobTests(unittest.TestCase):
         self.assertIn("-p hane-updater", step_text(job, "Build release binaries"))
         self.assertIn("--target x86_64-pc-windows-msvc", step_text(job, "Verify helper identity"))
 
-    def test_macos_signing_notarization_and_packaging_order(self):
+    def test_macos_inventory_signing_and_packaging_order(self):
         job = jobs(RELEASE)["build-macos"]
         order = [
             "Build macOS app bundle",
             "Verify macOS app bundle",
-            "Sign, notarize and staple macOS app",
+            "Generate and sign macOS inventory",
             "Package macOS app zip",
             "Verify extracted macOS zip",
             "Upload portable build artifact",
         ]
         indexes = [step_index(job, name) for name in order]
         self.assertEqual(indexes, sorted(indexes))
-        sign = step_text(job, "Sign, notarize and staple macOS app")
-        self.assertLess(sign.index("Contents/Helpers/hane-updater\""), sign.index('--sign "$identity" "$app"'))
-        self.assertIn("--options runtime", sign)
-        self.assertIn("--timestamp", sign)
-        self.assertLess(sign.index("notarytool submit"), sign.index("stapler staple"))
-        self.assertIn('"Accepted"', sign)
-        self.assertLess(sign.rindex("codesign --force"), sign.index("stapler staple"))
+        sign = step_text(job, "Generate and sign macOS inventory")
+        self.assertLess(sign.index("macos-inventory"), sign.index("sign --domain inventory"))
+        self.assertIn("Contents/Resources/hane-install.json.sig", sign)
         package = step_text(job, "Package macOS app zip")
         self.assertNotIn("codesign", package)
-        self.assertNotIn("xattr", package)
+        self.assertNotIn("xattr -d", package)
         self.assertNotIn("sequesterRsrc", package)
         verify = step_text(job, "Verify extracted macOS zip")
-        for needle in ("ditto -x -k", "codesign --verify --deep --strict", "TeamIdentifier=$HANE_MACOS_TEAM_ID",
-                       "Developer ID Application", "runtime", "stapler validate", "spctl --assess",
-                       "verify-macos-zip", "Contents/Helpers/hane-updater"):
+        for needle in ("ditto -x -k", "verify-macos-zip", "macos-inventory", "cmp ", "Contents/Resources/hane-install.json"):
             self.assertIn(needle, verify)
+
+    def test_no_workflow_asks_for_apple_credentials_or_bypasses_gatekeeper(self):
+        for name, text in (("windows-release", RELEASE), ("release-request", REQUEST)):
+            for banned in ("APPLE_", "HANE_MACOS_TEAM_ID", "notarytool", "stapler", "codesign", "spctl",
+                           "Developer ID", "xattr"):
+                self.assertNotIn(banned, text, f"{name}: {banned}")
 
     def test_unit_tests_run_without_embedded_production_trust(self):
         for name in ("build-windows", "build-macos"):
             text = step_text(jobs(RELEASE)[name], "Run workspace tests")
-            for variable in ("HANE_UPDATE_KEY_ID", "HANE_UPDATE_PUBLIC_KEY_BASE64", "HANE_MACOS_TEAM_ID"):
+            for variable in ("HANE_UPDATE_KEY_ID", "HANE_UPDATE_PUBLIC_KEY_BASE64"):
                 self.assertRegex(text, rf'{variable}: ""')
 
     def test_release_builds_embed_the_public_trust_and_source_commit(self):
         for name in ("build-windows", "build-macos", "release"):
             header = jobs(RELEASE)[name].split("\n    steps:\n", 1)[0]
             for variable in ("HANE_SOURCE_SHA: ${{ github.sha }}", "vars.HANE_UPDATE_KEY_ID",
-                             "vars.HANE_UPDATE_PUBLIC_KEY_BASE64", "vars.HANE_MACOS_TEAM_ID"):
+                             "vars.HANE_UPDATE_PUBLIC_KEY_BASE64"):
                 self.assertIn(variable, header, f"{name}: {variable}")
 
 
@@ -299,8 +297,9 @@ class HelperAndBundleTests(unittest.TestCase):
 
     def test_production_trust_comes_only_from_build_configuration(self):
         trust = read("crates/update/src/trust.rs")
-        for variable in ("HANE_UPDATE_KEY_ID", "HANE_UPDATE_PUBLIC_KEY_BASE64", "HANE_MACOS_TEAM_ID"):
+        for variable in ("HANE_UPDATE_KEY_ID", "HANE_UPDATE_PUBLIC_KEY_BASE64"):
             self.assertIn(f'option_env!("{variable}")', trust)
+        self.assertNotIn("HANE_MACOS_TEAM_ID", trust)
         self.assertNotRegex(trust, r'"[A-Za-z0-9+/]{43}="')
 
     def test_rust_identity_constants_match_the_python_pipeline(self):
