@@ -348,8 +348,18 @@ fn recovery_required_notice(reason: &str, backup: &BackupGuidance) -> StopNotice
              文書・設定・AIのデータには変更を加えていません。\n\n\
              理由: {reason}\n\n\
              {guidance}\
-             復旧するには、公式サイトから署名済みのHane ZIPを入手し、現在のHaneを置き換える形で手動でインストールしてください。\
-             インストール後にもう一度Haneを起動し、開きたい文書があれば開き直してください。\
+             復旧するには、公式GitHub Releasesから署名済みのHane ZIPを入手し、\
+             現在のインストール先とは異なる、書き込み可能な別の場所または別のフォルダー名へ展開して、手動でインストールしてください。\
+             同じ場所へ上書きすると、中断した更新の記録が残り、次回も同じ画面で止まります。\
+             場所の絶対パスが変わると別のインストールとして扱われ、中断した更新の記録の影響を受けずに起動できます。\n\n\
+             元のHaneフォルダー、.hane-update-で始まる更新用のフォルダーやファイル、更新の記録（journal）、上に表示した場所は、上書き・移動・削除しないでください。\
+             内容を検証できていないバックアップは、復元できるものとして使わないでください。\n\n\
+             既定の保存場所の文書・設定・AIのデータはそのまま使われます。\
+             HANE_STATE_DIRを独自に設定している場合は、新しい場所でも同じ値を設定して起動してください。\
+             Windowsのエクスプローラー連携は、新しい場所では再設定が必要な場合があります。\
+             起動後にHaneの設定画面で状態を確認してください。\n\n\
+             展開後、新しい場所に展開したものから、もう一度Haneを起動し、開きたい文書があれば開き直してください。\
+             安全に使える新しい場所がない場合は、操作を続けず、状況を確認してから判断してください。\
              更新は完了していません。"
         ),
     }
@@ -531,7 +541,9 @@ pub fn enter() -> Entry {
     // A momentary lease observation cannot prove that no update happened (the
     // helper may release the lease before the probe), so on macOS the running
     // image is also compared with the signed executable now on disk.
-    let disk_differs = cfg!(target_os = "macos")
+    // Windows has the same blind spot: an old image loaded before the update can
+    // see an already-finished update and never observe a wait.
+    let disk_differs = cfg!(any(target_os = "macos", target_os = "windows"))
         && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
         && !disk_image_is_running_image(&exe);
     if needs_fresh_image(
@@ -559,7 +571,46 @@ pub fn enter() -> Entry {
         let err = reexec_current_image(&exe);
         return stop_after_failed_reexec(&err, present_notice);
     }
+    if needs_windows_restart(
+        observed_update.get() || disk_differs,
+        &outcome,
+        cfg!(target_os = "windows"),
+    ) {
+        // This image waited out an update, so it may be the pre-update version.
+        // The executable on disk is not proven trustworthy here, so it is not
+        // restarted: release the lease and ask the user to start Hane again.
+        drop(outcome);
+        return stop_for_stale_windows_image(present_notice);
+    }
     stop_for_refusal(outcome, || recovery_backup_for_exe(&exe), present_notice)
+}
+
+/// Whether a Windows launch that observed `UpdateInProgress` and was then
+/// admitted must stop instead of editing with its possibly pre-update image.
+/// Terminal stops are returned unchanged.
+fn needs_windows_restart(observed_update: bool, outcome: &GateOutcome, is_windows: bool) -> bool {
+    is_windows
+        && observed_update
+        && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
+}
+
+/// The notice for a Windows launch that outlived an update. It does not claim
+/// the update completed, and asks the user to start Hane again.
+fn windows_restart_notice() -> StopNotice {
+    StopNotice {
+        title: "Haneの再起動が必要です".to_string(),
+        message: "更新中のため、起動操作や文書を開く操作を処理しませんでした。\
+                  文書・設定・AIのデータには変更を加えていません。\n\n\
+                  更新が終わったことを確認できたら、Haneを終了した状態で、もう一度Haneを起動し、\
+                  開きたい文書があれば開き直してください。"
+            .to_string(),
+    }
+}
+
+/// Stops a Windows launch that must not continue with its old image.
+fn stop_for_stale_windows_image(present: impl FnOnce(&StopNotice)) -> Entry {
+    present(&windows_restart_notice());
+    Entry::Stop(EXIT_UPDATE_IN_PROGRESS)
 }
 
 #[cfg(test)]
@@ -684,6 +735,53 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_launch_that_waited_for_an_update_stops_with_a_restart_notice() {
+        let unmanaged = GateOutcome::Unmanaged;
+        assert!(needs_windows_restart(true, &unmanaged, true));
+        // No observed wait, a non-Windows launch and terminal stops are unchanged.
+        assert!(!needs_windows_restart(false, &unmanaged, true));
+        assert!(!needs_windows_restart(true, &unmanaged, false));
+        let recovery = GateOutcome::RecoveryRequired("x".into());
+        assert!(!needs_windows_restart(true, &recovery, true));
+        assert!(!needs_windows_restart(true, &GateOutcome::UpdateInProgress, true));
+        // macOS keeps its own signed re-exec path.
+        assert!(!needs_windows_restart(true, &unmanaged, false) || !cfg!(target_os = "macos"));
+
+        let mut shown = Vec::new();
+        let entry = stop_for_stale_windows_image(|n| shown.push(n.message.clone()));
+        assert!(matches!(entry, Entry::Stop(EXIT_UPDATE_IN_PROGRESS)));
+        assert_eq!(shown.len(), 1);
+        let message = &shown[0];
+        assert!(message.contains("更新中のため"));
+        assert!(message.contains("もう一度Haneを起動"));
+        assert!(message.contains("開く操作"));
+        assert!(!message.contains("更新は完了しています"));
+    }
+
+    #[test]
+    fn a_windows_launch_with_a_different_disk_image_stops_without_an_observed_wait() {
+        let observed = std::cell::Cell::new(false);
+        let outcome = take_gate_observing_waits(
+            |_| GateOutcome::Unmanaged,
+            Duration::from_secs(1),
+            &observed,
+        );
+        assert!(!observed.get());
+        // The on-disk executable is another generation than the running image.
+        let disk_differs = !reader_contains(&b"other-generation"[..], image_marker()).unwrap();
+        assert!(disk_differs);
+        assert!(needs_windows_restart(observed.get() || disk_differs, &outcome, true));
+        // The same image on disk with no observed wait keeps the normal launch.
+        let mut same = b"x".to_vec();
+        same.extend_from_slice(image_marker());
+        let disk_differs = !reader_contains(&same[..], image_marker()).unwrap();
+        assert!(!needs_windows_restart(observed.get() || disk_differs, &outcome, true));
+        // Terminal stops are unchanged.
+        let recovery = GateOutcome::RecoveryRequired("x".into());
+        assert!(!needs_windows_restart(true, &recovery, true));
+    }
+
+    #[test]
     fn an_unchanged_image_on_disk_is_not_restarted() {
         let mut same = vec![1u8; (1 << 20) - 5];
         same.extend_from_slice(image_marker());
@@ -751,6 +849,39 @@ mod tests {
         assert!(message.contains("開く操作"));
     }
 
+    /// The manual steps must not tell the user to overwrite the current install
+    /// (the same path keeps the InstallId and the journal, so the gate would stop
+    /// again). They point to a different location and keep the originals.
+    fn assert_manual_recovery_uses_a_different_location(message: &str) {
+        assert!(message.contains("現在のインストール先とは異なる"));
+        assert!(message.contains("絶対パスが変わると別のインストール"));
+        assert!(message.contains("同じ場所へ上書きすると"));
+        assert!(message.contains("公式GitHub Releases"));
+        assert!(message.contains("元のHaneフォルダー"));
+        assert!(message.contains(".hane-update-"));
+        assert!(message.contains("journal"));
+        assert!(message.contains("上書き・移動・削除しないでください"));
+        assert!(message.contains("HANE_STATE_DIR"));
+        assert!(message.contains("エクスプローラー連携"));
+        assert!(message.contains("設定画面"));
+        assert!(!message.contains("現在のHaneを置き換える"));
+        assert!(message.contains("更新は完了していません"));
+    }
+
+    #[test]
+    fn every_recovery_notice_directs_to_a_different_location() {
+        let located = BackupGuidance::Located {
+            path: PathBuf::from("/state/private/tx/backup"),
+            is_bundle: false,
+        };
+        assert_manual_recovery_uses_a_different_location(
+            &recovery_required_notice("x", &located).message,
+        );
+        assert_manual_recovery_uses_a_different_location(
+            &recovery_required_notice("x", &BackupGuidance::Unknown).message,
+        );
+    }
+
     #[test]
     fn recovery_refusal_is_shown_and_never_reads_as_a_successful_update() {
         let mut shown = Vec::new();
@@ -766,6 +897,7 @@ mod tests {
         let message = &shown[0];
         assert!(message.contains("broken"), "the reason is shown");
         assert!(message.contains("手動でインストール"));
+        assert_manual_recovery_uses_a_different_location(message);
         assert!(message.contains("もう一度Haneを起動"));
         assert!(message.contains("開く操作"));
         assert!(!message.contains("更新は完了しています"));

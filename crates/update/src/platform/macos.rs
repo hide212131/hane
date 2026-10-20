@@ -122,6 +122,44 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
+/// The mount point (volume root) of the volume holding `path`, from
+/// `statfs`'s `f_mntonname`. Volume attributes can only be queried on the
+/// volume root, so a path inside the app bundle is not enough. A failed query
+/// or an empty / non-absolute name is an error.
+fn volume_mount_point(path: &Path) -> Result<CString> {
+    let failed = || {
+        UpdateError::new(
+            ErrorCode::Io,
+            "the install volume mount point could not be determined",
+        )
+    };
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| failed())?;
+    // SAFETY: `statfs` is plain data, so the zeroed value is valid storage; the
+    // path is NUL-terminated and the out-pointer refers to that local.
+    let (rc, stat) = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        let rc = libc::statfs(c_path.as_ptr(), &mut stat);
+        (rc, stat)
+    };
+    if rc != 0 {
+        return Err(failed());
+    }
+    let name: Vec<u8> = stat
+        .f_mntonname
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    mount_point_from_bytes(name).ok_or_else(failed)
+}
+
+fn mount_point_from_bytes(name: Vec<u8>) -> Option<CString> {
+    if name.first() != Some(&b'/') {
+        return None;
+    }
+    CString::new(name).ok()
+}
+
 /// The persistent UUID of the volume holding `path`, lowercase hex. Any
 /// failure (including an all-zero UUID) is an error, never a fallback value.
 fn volume_uuid(path: &Path) -> Result<String> {
@@ -131,7 +169,7 @@ fn volume_uuid(path: &Path) -> Result<String> {
             "the install volume UUID could not be determined",
         )
     };
-    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| failed())?;
+    let c_path = volume_mount_point(path)?;
     let mut list = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -582,6 +620,33 @@ mod tests {
         assert!(uuid_to_hex(&[0u8; 16]).is_none());
         assert!(uuid_to_hex(&[1u8; 15]).is_none());
         assert_eq!(uuid_to_hex(&[0xab; 16]).unwrap(), "ab".repeat(16));
+    }
+
+    #[test]
+    fn the_volume_uuid_is_read_from_the_mount_point_of_an_inner_path() {
+        let dir = TempDir::new("macos-mount-point");
+        let inner = dir.path().join("Hane.app").join("Contents");
+        fs::create_dir_all(&inner).unwrap();
+        let mount = volume_mount_point(&inner).unwrap();
+        let mount = Path::new(std::ffi::OsStr::from_bytes(mount.to_bytes()));
+        assert!(mount.is_absolute());
+        // firmlink等の別名pathは文字列prefixで比較できないため、volume identityで確かめる。
+        assert_eq!(
+            fs::metadata(mount).unwrap().dev(),
+            fs::metadata(&inner).unwrap().dev()
+        );
+        // The query on the inner path succeeds only through the volume root.
+        assert!(volume_uuid(&inner).is_ok());
+    }
+
+    #[test]
+    fn a_failed_mount_point_query_is_rejected() {
+        let dir = TempDir::new("macos-mount-point-absent");
+        let err = volume_uuid(&dir.path().join("absent")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(mount_point_from_bytes(Vec::new()).is_none());
+        assert!(mount_point_from_bytes(b"relative".to_vec()).is_none());
+        assert!(mount_point_from_bytes(b"/Volumes/x".to_vec()).is_some());
     }
 
     #[test]
