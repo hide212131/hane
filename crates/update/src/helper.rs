@@ -1691,12 +1691,17 @@ mod tests {
         let _ = thread.join().unwrap();
 
         // Another test's child spawn can briefly duplicate this fixture's
-        // transaction lock descriptor, so a refusal with StaleJournal is
-        // retried; any other outcome is used as is.
+        // transaction lock descriptor, so a helper refusal whose reason is
+        // exactly `stale_journal:` (surfaced as NotApplicable) is retried;
+        // any other outcome is used as is.
         let started = Instant::now();
         let (link, thread, to_helper) = loop {
             let (link, thread, to_helper) = connect(&fx, Mode::Prepare, Some(4242));
-            let transient = matches!(&link, Err(err) if err.code == ErrorCode::StaleJournal);
+            let transient = matches!(
+                &link,
+                Err(err) if err.code == ErrorCode::NotApplicable
+                    && err.detail.starts_with("the helper refused: stale_journal:")
+            );
             if !transient || started.elapsed() >= Duration::from_secs(10) {
                 break (link, thread, to_helper);
             }
