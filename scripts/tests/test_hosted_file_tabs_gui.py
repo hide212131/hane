@@ -88,24 +88,43 @@ class SelectedThemeOptionTests(unittest.TestCase):
         self.assertEqual(mod.THEME_OPTION_KEYS, ("system", "light", "dark"))
         self.assertEqual(set(mod.THEME_OPTION_PATTERNS), set(mod.THEME_OPTION_KEYS))
 
+    def _surrounds(self) -> dict:
+        return {key: self.PLAIN for key in mod.THEME_OPTION_KEYS}
+
     def test_identifies_each_selected_option(self):
         for key in mod.THEME_OPTION_KEYS:
-            self.assertEqual(mod.selected_theme_option(self._backgrounds(key)), key)
+            self.assertEqual(
+                mod.selected_theme_option(self._backgrounds(key), self._surrounds()), key
+            )
 
     def test_none_when_no_option_stands_out(self):
-        self.assertIsNone(mod.selected_theme_option(self._backgrounds(None)))
+        self.assertIsNone(
+            mod.selected_theme_option(self._backgrounds(None), self._surrounds())
+        )
 
     def test_none_when_two_options_are_highlighted(self):
         backgrounds = self._backgrounds("light")
         backgrounds["dark"] = self.HIGHLIGHT
-        self.assertIsNone(mod.selected_theme_option(backgrounds))
+        self.assertIsNone(mod.selected_theme_option(backgrounds, self._surrounds()))
+
+    def test_none_when_all_options_are_highlighted(self):
+        backgrounds = {key: self.HIGHLIGHT for key in mod.THEME_OPTION_KEYS}
+        self.assertIsNone(mod.selected_theme_option(backgrounds, self._surrounds()))
 
     def test_none_for_unreadable_or_incomplete_samples(self):
         backgrounds = self._backgrounds("light")
         backgrounds["dark"] = None
-        self.assertIsNone(mod.selected_theme_option(backgrounds))
+        self.assertIsNone(mod.selected_theme_option(backgrounds, self._surrounds()))
         del backgrounds["dark"]
-        self.assertIsNone(mod.selected_theme_option(backgrounds))
+        self.assertIsNone(mod.selected_theme_option(backgrounds, self._surrounds()))
+
+    def test_none_for_unreadable_or_incomplete_surrounds(self):
+        backgrounds = self._backgrounds("light")
+        surrounds = self._surrounds()
+        surrounds["system"] = None
+        self.assertIsNone(mod.selected_theme_option(backgrounds, surrounds))
+        del surrounds["system"]
+        self.assertIsNone(mod.selected_theme_option(backgrounds, surrounds))
 
 
 class ThemeSelectionVerificationTests(unittest.TestCase):

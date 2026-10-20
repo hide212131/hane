@@ -287,11 +287,16 @@ func buttonBackground(_ path: String, _ pattern: String) {
         fail("invalid button background sample rect")
     }
     let color = dominantColor(image, x0: sampleX0, x1: sampleX1, y0: sampleY0, y1: sampleY1)
+    // Independent reference: the dominant color of the full-width band at the
+    // label's rows, which is the surrounding (unselected) settings surface
+    // rather than any single button.
+    let surround = dominantColor(image, x0: 0, x1: image.width, y0: sampleY0, y1: sampleY1)
     jsonPrint([
         "matched_text": match.matchedText,
         "bounding_box": boundingBoxJSON(match.box),
         "sample_rect": ["x0": sampleX0, "y0": sampleY0, "x1": sampleX1, "y1": sampleY1],
         "background_color": colorString(color),
+        "surround_color": colorString(surround),
     ])
 }
 

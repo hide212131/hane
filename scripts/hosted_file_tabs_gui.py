@@ -156,23 +156,27 @@ def is_valid_background(value: object) -> bool:
     return True
 
 
-def selected_theme_option(backgrounds: dict[str, object]) -> str | None:
-    """The one theme option whose button background differs from both others.
+def selected_theme_option(
+    backgrounds: dict[str, object], surrounds: dict[str, object]
+) -> str | None:
+    """The one theme option whose button background differs from its surround.
 
-    Takes the sampled backgrounds keyed by "system" / "light" / "dark" and
-    returns the key of the selected button, or None when no single button
-    stands out (none selected, several selected, or unreadable samples).
+    Takes the sampled button backgrounds and the independent surrounding
+    surface colors, both keyed by "system" / "light" / "dark". A button is
+    selected when its background differs from the surround; the result is the
+    key of the single selected button, or None when none, several, or
+    unreadable/missing samples are found.
     """
-    if set(backgrounds) != set(THEME_OPTION_KEYS):
-        return None
-    if not all(is_valid_background(value) for value in backgrounds.values()):
-        return None
-    odd = []
-    for key in THEME_OPTION_KEYS:
-        others = [backgrounds[other] for other in THEME_OPTION_KEYS if other != key]
-        if all(colors_differ(backgrounds[key], other) for other in others) and not colors_differ(*others):
-            odd.append(key)
-    return odd[0] if len(odd) == 1 else None
+    for samples in (backgrounds, surrounds):
+        if set(samples) != set(THEME_OPTION_KEYS):
+            return None
+        if not all(is_valid_background(value) for value in samples.values()):
+            return None
+    selected = [
+        key for key in THEME_OPTION_KEYS
+        if colors_differ(backgrounds[key], surrounds[key])
+    ]
+    return selected[0] if len(selected) == 1 else None
 
 
 def strip_whitespace(text: str) -> str:
@@ -313,13 +317,17 @@ def run_focused_scenario(
             def read_theme_selection(image: Path) -> tuple[str | None, dict]:
                 """The theme option shown as selected in a settings screenshot,
                 judged from the three theme buttons' sampled backgrounds."""
-                backgrounds = {
+                samples = {
                     key: helper_json(
                         interaction, helper, ["button-background", str(image), pattern], helper_timeout
-                    ).get("background_color")
+                    )
                     for key, pattern in THEME_OPTION_PATTERNS.items()
                 }
-                return selected_theme_option(backgrounds), backgrounds
+                backgrounds = {key: sample.get("background_color") for key, sample in samples.items()}
+                surrounds = {key: sample.get("surround_color") for key, sample in samples.items()}
+                return selected_theme_option(backgrounds, surrounds), {
+                    **backgrounds, "surround": surrounds,
+                }
 
             def choose_theme_in_settings(
                 base_image: Path, option_key: str, label: str
