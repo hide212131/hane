@@ -282,21 +282,21 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertIn("export HANE_SOURCE_SHA", BUNDLE)
         self.assertRegex(BUNDLE, r"\^\[0-9a-f\]\{40\}\$")
 
-    def test_bundle_is_sealed_ad_hoc_and_verified_before_the_inventory_is_added(self):
+    def test_bundle_removes_only_the_linker_signatures_before_the_inventory_is_added(self):
         code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
-        # Sealed once at build time with the ad-hoc identity, then verified strictly.
-        self.assertIn('codesign --force --sign - --resource-rules "$rules" "$bundle"', code)
-        self.assertIn('codesign --verify --deep --strict --verbose=2 "$bundle"', code)
-        # The Ed25519 inventory files are the only unsealed files and are probed.
-        self.assertEqual(code.count(r"hane-install\.json(\.sig)?$"), 2)
-        self.assertIn('hane-install.json.sig"', code)
-        self.assertIn('codesign --verify --deep --strict "$probe"', code)
-        # Sealing precedes the final touch and never needs Apple credentials.
-        self.assertLess(code.index("--resource-rules"), code.index('touch "$bundle"'))
-        for banned in ("Developer ID", "notarytool", "stapler", "xattr", "spctl", "--options runtime",
-                       "TEAM_ID"):
+        # Only the two Hane executables lose their linker ad-hoc signature.
+        self.assertEqual(code.count("codesign"), 1)
+        self.assertIn('codesign --remove-signature "$binary"', code)
+        self.assertIn('"$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"; do', code)
+        self.assertIn("macho-unsigned", code)
+        # The helper identity is checked again after the removal, before touch.
+        removal = code.index("--remove-signature")
+        self.assertGreater(code.index("binary-identity", removal), removal)
+        self.assertLess(code.index("binary-identity", removal), code.index('touch "$bundle"'))
+        # No Apple signing, sealing, verification or Gatekeeper handling.
+        for banned in ("--sign", "--resource-rules", "--verify", "Developer ID", "notarytool", "stapler",
+                       "xattr", "spctl", "--options runtime", "TEAM_ID"):
             self.assertNotIn(banned, code)
-        self.assertNotIn("codesign --force --sign - --deep", code)
         # The workflow keeps adding the inventory after the bundle is built.
         workflow = read(".github/workflows/windows-release.yml")
         self.assertLess(workflow.index("./scripts/bundle-macos.sh"),

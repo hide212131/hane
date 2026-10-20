@@ -320,6 +320,37 @@ def check_identity(data: bytes, *, version: str, target: str, source_sha: str, w
         )
 
 
+LC_CODE_SIGNATURE = 0x1D
+MACHO64_HEADER_BYTES = 32
+
+
+def check_macho_unsigned(data: bytes, what: str) -> None:
+    """Rejects a 64-bit little-endian Mach-O that still has a code signature.
+
+    The app is intentionally not Apple-signed. A linker-made ad-hoc signature
+    left on a bundle that has resources makes macOS report the app as damaged,
+    so the release carries no signature load command at all.
+    """
+    if data[:4] != b"\xcf\xfa\xed\xfe" or len(data) < MACHO64_HEADER_BYTES:
+        raise fail(f"{what} is not a 64-bit Mach-O executable")
+    ncmds = int.from_bytes(data[16:20], "little")
+    sizeofcmds = int.from_bytes(data[20:24], "little")
+    end = MACHO64_HEADER_BYTES + sizeofcmds
+    if end > len(data):
+        raise fail(f"{what} has load commands beyond the end of the file")
+    offset = MACHO64_HEADER_BYTES
+    for _ in range(ncmds):
+        if offset + 8 > end:
+            raise fail(f"{what} has a truncated Mach-O load command")
+        cmd = int.from_bytes(data[offset:offset + 4], "little")
+        size = int.from_bytes(data[offset + 4:offset + 8], "little")
+        if size < 8 or offset + size > end:
+            raise fail(f"{what} has a malformed Mach-O load command")
+        if cmd == LC_CODE_SIGNATURE:
+            raise fail(f"{what} still carries a code signature")
+        offset += size
+
+
 # ------------------------------------------------------------ ZIP inspection
 
 
@@ -680,8 +711,9 @@ def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust)
             if found != value or isinstance(found, bool) or type(found) is not type(value):
                 raise fail(f"Info.plist {key} is {found!r}, expected {value!r}")
         for binary in ("Contents/MacOS/hane", "Contents/Helpers/hane-updater"):
-            if archive.read(f"{MACOS_APP}/{binary}")[:4] != b"\xcf\xfa\xed\xfe":
-                raise fail(f"{binary} is not a 64-bit Mach-O executable")
+            check_macho_unsigned(archive.read(f"{MACOS_APP}/{binary}"), binary)
+        if any(name.startswith(f"{MACOS_APP}/Contents/_CodeSignature/") for name in archive.files):
+            raise fail("macOS ZIP must not contain a _CodeSignature directory")
         check_identity(archive.read(f"{MACOS_APP}/Contents/Helpers/hane-updater"), version=version,
                        target=MACOS_TARGET, source_sha=source_sha, what="Contents/Helpers/hane-updater")
         inventory_sha256 = verify_archive_inventory(
@@ -1042,6 +1074,7 @@ def main(argv: list[str] | None = None) -> int:
 
     add("require-env").add_argument("names", nargs="+")
     add("binary-identity", "binary", "version", "target", "source-sha")
+    add("macho-unsigned", "binary")
     add("windows-inventory", "root", "version", "source-sha", "output")
     add("macos-inventory", "app", "version", "source-sha", "output")
     sign = add("sign", "input", "output")
@@ -1077,6 +1110,8 @@ def _dispatch(args: argparse.Namespace) -> int:
     elif cmd == "binary-identity":
         check_identity(Path(args.binary).read_bytes(), version=args.version, target=args.target,
                        source_sha=args.source_sha, what=args.binary)
+    elif cmd == "macho-unsigned":
+        check_macho_unsigned(Path(args.binary).read_bytes(), args.binary)
     elif cmd == "windows-inventory":
         Path(args.output).write_bytes(build_inventory(Path(args.root), args.version, args.source_sha))
     elif cmd == "macos-inventory":

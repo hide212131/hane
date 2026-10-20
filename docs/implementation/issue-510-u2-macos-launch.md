@@ -1,6 +1,8 @@
 # Issue #510 U2: macOS ZIPの起動時署名検証
 
-状態: 実装担当への準備中。製品コードの変更・CI検証・v0.27.0の実機更新確認は未完了。
+状態: PR #535 はDraftで未完了。署名除去方式の実装後のCI検証、実Macでの起動許可、Issue #510 の実Mac/Windows更新確認は未完了。
+
+方針変更: ad-hoc署名の再付与とcustom resource rules方式は、実Macの配布ZIPでmacOSのcodesignが「resource envelope is obsolete (custom omit rules)」として拒否したため撤回した。現在は、`scripts/bundle-macos.sh` が `Contents/MacOS/hane` と `Contents/Helpers/hane-updater` のリンカー由来ad-hoc署名だけを `codesign --remove-signature` で取り除く。実ファイルの一時コピーでは両方が「code object is not signed at all」になり、helperのversion/target/source SHA identity checkは成功し、quarantine付きコピーのspctl assessmentは「rejected / source=no usable signature」だった。これはGatekeeper回避ではなく、Issue #510が許容する本人によるアプリ単位の初回許可を維持する。`codesign --verify` の成功は受入条件にしない。現時点で実際に起動できるとは扱わず、最終ZIPでの検査と本人による起動確認は別に記録する。
 
 ## 対象と基準
 
@@ -31,14 +33,14 @@ macOS release workflowで、最終的に公開するアプリbundleがmacOSの�
 
 実装では次の両方を同時に保つこと。
 
-1. ZIPを通常の方法で展開した `Hane.app` に対して、`codesign --verify --deep --strict` が成功する。
-2. 最終ZIPの全内容が既存のEd25519 inventory / catalog検証に一致し、version・target・source commitも一致する。署名後にファイルを追加・変更した状態を成功扱いにしない。
+1. bundle内のHane本体とupdater helperに署名が残っておらず、`_CodeSignature` もない。bundle作成時にhelper identityも再検証する。
+2. 最終ZIPの全内容が既存のEd25519 inventory / catalog検証に一致し、version・target・source commitも一致する。署名除去後にファイルを追加・変更した状態を成功扱いにしない。
 
-コード署名とEd25519 inventoryが相互に更新対象を含み、署名順により整合が崩れないよう、生成順序・inventory対象・OS署名情報の扱いを検証する。既存の安全な検証を省いたり、署名データを除外して弱めたりしない。
+既存のworkflow順（bundle → inventory → ZIP）を使い、inventoryは署名除去後の最終bundleの全ファイルから生成する。既存の安全な検証を省いたり弱めたりしない。
 
-リリースCIでは、署名済みinventoryを含む最終bundleと、実際にZIPへ格納した後の再展開bundleを検証する。検証対象はリリースへ載せる実ファイルとする。
+リリースCIでは、既存の `verify-macos-zip` が実際にZIPへ格納した後の再展開bundleを検査し、2つの実行ファイルに `LC_CODE_SIGNATURE` が残っていないことと、Ed25519 inventoryの全件一致を確認する。`.github/**` は変更しない。
 
-利用者向けREADMEには、初回起動でmacOSの個別許可が必要な場合の短い案内を追加する。正しい署名検査に失敗する「壊れている」状態を、個別許可で突破させる案内にはしない。
+利用者向けREADMEには、未確認開発元に対する本人の一度限りの許可だけを案内する。「壊れている」警告を突破させる案内にはしない。
 
 ## 維持する条件・対象外
 
@@ -51,7 +53,7 @@ macOS release workflowで、最終的に公開するアプリbundleがmacOSの�
 
 ## PR単位の完了条件
 
-- macOS release workflowが署名整合性の失敗を検出して公開を止める。
-- 最終ZIPを検査し、署名整合性とEd25519 inventory/catalogの両方が成功する。
+- macOS release pathが、同梱実行ファイルに署名が残る場合を検出して公開を止める。
+- 最終ZIPを検査し、署名が残っていないこととEd25519 inventory/catalogの両方が成功する。
 - READMEに初回起動の必要な操作が短く説明されている。
 - #510全体の未実施実機確認は未完了として記録される。

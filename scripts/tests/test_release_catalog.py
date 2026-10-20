@@ -137,7 +137,7 @@ class Fixture:
 
     def macos_zip(self, path: Path, *, version=VERSION, source=SHA, plist_updates=None, drop=(), extra=(),
                   helper=None, bundle_id=rc.MACOS_BUNDLE_ID, code_resources=False, tweak=None, tamper=None,
-                  inventory=True, signer=None) -> Path:
+                  inventory=True, signer=None, app_binary=None) -> Path:
         """No Apple signature: trust is the Ed25519-signed inventory inside the bundle."""
         info = {
             "CFBundleIdentifier": bundle_id,
@@ -154,7 +154,7 @@ class Fixture:
         app = rc.MACOS_APP
         entries = {
             f"{app}/Contents/Info.plist": (plistlib.dumps(info), 0o644),
-            f"{app}/Contents/MacOS/hane": (macho(version, source), 0o755),
+            f"{app}/Contents/MacOS/hane": (app_binary if app_binary is not None else macho(version, source), 0o755),
             f"{app}/Contents/Helpers/hane-updater": (helper if helper is not None else macho(version, source), 0o755),
             f"{app}/Contents/Resources/Hane.icns": (b"icns", 0o644),
             f"{rc.MACOS_ROOT}/README.md": (b"readme", 0o644),
@@ -498,8 +498,9 @@ class MacosZipTests(TempCase):
         with zipfile.ZipFile(plain) as archive:
             self.assertFalse([n for n in archive.namelist() if "_CodeSignature" in n])
         self.verify(plain)
-        sealed = self.fx.macos_zip(self.tmp / "sealed.zip", code_resources=True)  # inspected when present
-        self.verify(sealed)
+        sealed = self.fx.macos_zip(self.tmp / "sealed.zip", code_resources=True)
+        with self.assertRaisesRegex(ReleaseError, "_CodeSignature"):
+            self.verify(sealed)
 
     def test_real_generator_inventory_matches_the_verifier(self):
         staging = self.tmp / "Hane.app"
@@ -585,6 +586,21 @@ class MacosZipTests(TempCase):
             path = self.fx.macos_zip(self.tmp / f"{name}.zip", helper=helper)
             with self.assertRaises(ReleaseError, msg=name):
                 self.verify(path)
+
+    def test_executables_that_keep_a_code_signature_are_rejected(self):
+        # Header: magic, cputype, cpusubtype, filetype, ncmds=1, sizeofcmds=16, flags, reserved.
+        header = b"\xcf\xfa\xed\xfe" + b"\0" * 12 + (1).to_bytes(4, "little") + (16).to_bytes(4, "little") + b"\0" * 8
+        signature = (0x1D).to_bytes(4, "little") + (16).to_bytes(4, "little") + b"\0" * 8
+        signed = header + signature + identity(VERSION, rc.MACOS_TARGET, SHA)
+        for name, kwargs in (("helper", {"helper": signed}), ("app", {"app_binary": signed})):
+            path = self.fx.macos_zip(self.tmp / f"{name}.zip", **kwargs)
+            with self.assertRaisesRegex(ReleaseError, "code signature", msg=name):
+                self.verify(path)
+        with self.assertRaisesRegex(ReleaseError, "code signature"):
+            rc.check_macho_unsigned(signed, "hane")
+        rc.check_macho_unsigned(macho(), "hane")
+        with self.assertRaises(ReleaseError):
+            rc.check_macho_unsigned(header[:-8] + (4096).to_bytes(4, "little") + b"\0" * 4, "hane")
 
     def test_finder_metadata_and_stray_files_are_rejected(self):
         for extra in ([("__MACOSX/._x", b"x", 0o644)], [(f"{rc.MACOS_ROOT}/.DS_Store", b"x", 0o644)],
