@@ -183,7 +183,7 @@ pub fn verify_catalog(
                 format!("catalog has no entry for {}", ctx.target.triple()),
             )
         })?;
-    check_target_entry(&entry, ctx.target, &version, ctx.policy)?;
+    check_target_entry(&entry, ctx.target, &version)?;
 
     let catalog_sha256 = sha256_hex(catalog_bytes);
     if let Some(seen) = ctx.seen {
@@ -249,7 +249,6 @@ fn check_target_entry(
     entry: &TargetEntry,
     target: Target,
     version: &Version,
-    policy: &TrustPolicy,
 ) -> Result<()> {
     if entry.asset_name != target.asset_name() {
         return Err(UpdateError::new(
@@ -290,8 +289,9 @@ fn check_target_entry(
             }
         }
         Target::MacosArm64 => {
-            if entry.inventory_sha256.is_some() {
-                return Err(malformed("macOS target must not carry an inventory hash"));
+            match entry.inventory_sha256.as_deref() {
+                Some(hash) if is_sha256_hex(hash) => {}
+                _ => return Err(malformed("macOS target needs a valid inventory_sha256")),
             }
             if entry.bundle_id.as_deref() != Some(MACOS_BUNDLE_ID) {
                 return Err(UpdateError::new(
@@ -299,18 +299,10 @@ fn check_target_entry(
                     "bundle id differs from the pinned Hane bundle id",
                 ));
             }
-            // Metadata alone never introduces a new Team ID.
-            let Some(pinned) = policy.macos_team_id() else {
-                return Err(UpdateError::new(
-                    ErrorCode::TrustUnconfigured,
-                    "no macOS Team ID is pinned in this build",
-                ));
-            };
-            if entry.team_id.as_deref() != Some(pinned) {
-                return Err(UpdateError::new(
-                    ErrorCode::IdentityMismatch,
-                    "team id differs from the pinned Team ID",
-                ));
+            // Trust comes from the Ed25519 update key only; no Apple identity
+            // is part of the catalog.
+            if entry.team_id.is_some() {
+                return Err(malformed("macOS target must not carry a Team ID"));
             }
             let expected_bundle_version = version.to_string();
             if entry.bundle_version.as_deref() != Some(expected_bundle_version.as_str()) {
@@ -351,6 +343,9 @@ pub fn record_seen(store: &mut dyn SeenStore, candidate: &VerifiedCandidate) -> 
             format!("cannot persist the catalog sequence: {err}"),
         )
     };
+    // Held across load, compare and store (not the download) so a concurrent
+    // process cannot lower the floor with a stale read.
+    let _guard = store.lock().map_err(unwritable)?;
     let existing = store.load().map_err(unwritable)?;
     if let Some(existing) = &existing {
         existing.validate()?;

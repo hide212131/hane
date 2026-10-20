@@ -17,9 +17,9 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use hane_ui::{AppUpdateController, AppUpdatePhase, AppUpdateSnapshot};
+use hane_ui::{AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, PreparedUpdate};
 use hane_update::archive::{ArchiveLimits, stage_archive};
 use hane_update::catalog::{
     CandidateId, VerifiedCandidate, VerifyContext, confirm_selection, record_seen, verify_catalog,
@@ -34,12 +34,14 @@ use hane_update::trust::{SeenStore, TrustPolicy};
 use hane_update::version::{VersionRelation, parse_current_version};
 use hane_update::{ErrorCode, UpdateError};
 
-const CATALOG_FILE: &str = "hane-update.json";
-const SIGNATURE_FILE: &str = "hane-update.json.sig";
-const ARCHIVE_FILE: &str = "archive.zip";
+use crate::update_restart::{self, HelperHandoff};
+
+pub(crate) const CATALOG_FILE: &str = "hane-update.json";
+pub(crate) const SIGNATURE_FILE: &str = "hane-update.json.sig";
+pub(crate) const ARCHIVE_FILE: &str = "archive.zip";
 const STAGE_DIR: &str = "stage";
 const READY_MARKER: &str = "ready";
-const SEEN_FILE: &str = "seen-catalog.json";
+const SEEN_FILE: &str = hane_update::platform::lease::SEEN_CATALOG_FILE;
 
 pub type Task = Box<dyn FnOnce() + Send>;
 /// Runs a task on a background thread. Returns false when it cannot be run.
@@ -55,6 +57,17 @@ pub struct UpdateServiceConfig {
     pub updates_root: PathBuf,
     /// Private directory for the highest-seen catalog sequence.
     pub receipts_dir: PathBuf,
+}
+
+/// What the service needs to hand a Ready update to the helper. A service
+/// without it (tests, unsupported placements) never offers a restart.
+pub struct RestartWiring {
+    /// The supported placement of the running install.
+    pub placement: hane_update::platform::Placement,
+    /// The running executable, used to re-locate the install before a ticket.
+    pub exe: PathBuf,
+    /// The running application's own state root.
+    pub state_root: PathBuf,
 }
 
 /// Everything about one verified, signed release candidate.
@@ -148,7 +161,35 @@ struct Inner {
     clock: Arc<dyn Clock>,
     runner: Runner,
     state: Mutex<State>,
+    restart: OnceLock<RestartWiring>,
+    /// Unique per service instance (process and instance), so work and trash
+    /// directories of different processes never collide.
+    owner: String,
+    /// Exclusive lock on `leases/<owner>.lock`, held while this service may
+    /// use its work or trash directory. The OS releases it when the process
+    /// ends, which is what lets another process recognise stale directories.
+    lease: Mutex<Option<File>>,
+    /// Exclusive lock on `leases/candidate-<id>.candidate`, held while this
+    /// service's Ready (or Discarding) candidate lives in the shared
+    /// `candidates/<id>` directory. It serialises publication, discard and
+    /// the helper handoff across processes.
+    candidate_lease: Mutex<Option<File>>,
 }
+
+fn new_owner_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+const LEASE_SUFFIX: &str = ".lock";
+const CANDIDATE_LEASE_SUFFIX: &str = ".candidate";
 
 pub struct AppUpdateService {
     inner: Arc<Inner>,
@@ -261,8 +302,19 @@ impl AppUpdateService {
                     restoring: false,
                     restore_started: false,
                 }),
+                restart: OnceLock::new(),
+                owner: new_owner_id(),
+                lease: Mutex::new(None),
+                candidate_lease: Mutex::new(None),
             }),
         }
+    }
+
+    /// Lets the service hand a Ready update to the helper. Called once at
+    /// startup, and only for a supported placement; the restart is still
+    /// offered only when the trust policy is configured.
+    pub fn enable_restart(&self, wiring: RestartWiring) {
+        let _ = self.inner.restart.set(wiring);
     }
 }
 
@@ -281,6 +333,94 @@ impl Inner {
 
     fn trash_root(&self) -> PathBuf {
         self.config.updates_root.join("trash")
+    }
+
+    fn leases_dir(&self) -> PathBuf {
+        self.config.updates_root.join("leases")
+    }
+
+    /// This service's own work directory; no other service uses it.
+    fn work_dir(&self) -> PathBuf {
+        self.work_root().join(&self.owner)
+    }
+
+    /// This service's own trash directory; no other service uses it.
+    fn trash_dir(&self) -> PathBuf {
+        self.trash_root().join(&self.owner)
+    }
+
+    /// Takes the exclusive lease for this service's work and trash directories.
+    /// Must succeed before either directory is created.
+    fn ensure_lease(&self) -> io::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(PoisonError::into_inner);
+        if lease.is_some() {
+            return Ok(());
+        }
+        let dir = self.leases_dir();
+        create_private_dir(&dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{}{LEASE_SUFFIX}", self.owner)))?;
+        file.try_lock().map_err(|error| match error {
+            fs::TryLockError::Error(error) => error,
+            fs::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, "update lease is held")
+            }
+        })?;
+        *lease = Some(file);
+        Ok(())
+    }
+
+    /// Takes the exclusive lease for one shared candidate directory. `None`
+    /// means another service (in any process) currently holds it.
+    fn acquire_candidate_lease(&self, id: &str) -> io::Result<Option<File>> {
+        let dir = self.leases_dir();
+        create_private_dir(&dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("candidate-{id}{CANDIDATE_LEASE_SUFFIX}")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Removes work and trash directories of owners whose lease can be taken,
+    /// i.e. owners that are no longer running. A directory whose lease is
+    /// held (an active download or discard in any process) is never touched.
+    fn remove_stale_work(&self) {
+        let Ok(entries) = fs::read_dir(self.leases_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(owner) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(LEASE_SUFFIX))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if owner == self.owner {
+                continue;
+            }
+            let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+                continue;
+            };
+            if file.try_lock().is_err() {
+                continue;
+            }
+            remove_dir_if_present(&self.work_root().join(&owner));
+            remove_dir_if_present(&self.trash_root().join(&owner));
+            drop(file);
+            let _ = fs::remove_file(&path);
+        }
     }
 
     fn seen_store(&self) -> FileSeenStore {
@@ -442,7 +582,7 @@ impl Inner {
 
     fn run_download(&self, op: u64, offer: &Arc<Offer>, cancel: &CancelToken, received: &Arc<AtomicU64>) {
         let work = self
-            .work_root()
+            .work_dir()
             .join(format!("{op}-{}", offer.id().as_str()));
         let outcome = self.download_into(op, offer, cancel, received, &work);
 
@@ -462,9 +602,7 @@ impl Inner {
         match outcome {
             Ok(()) => {
                 let target = self.candidates_dir().join(offer.id().as_str());
-                remove_dir_if_present(&target);
-                let moved = create_private_dir(&self.candidates_dir())
-                    .and_then(|()| fs::rename(&work, &target));
+                let moved = self.publish_candidate(offer.id().as_str(), &work, &target);
                 state.stage = match moved {
                     Ok(()) => Stage::Ready {
                         offer: Arc::clone(offer),
@@ -485,6 +623,28 @@ impl Inner {
                 };
             }
         }
+    }
+
+    /// Moves the verified work directory to the shared candidate directory.
+    /// The candidate lease is taken first, so a candidate that another
+    /// process still holds (Ready, restarting or being discarded) is never
+    /// replaced or deleted. On success this service keeps the lease for as
+    /// long as the candidate is Ready or being discarded.
+    fn publish_candidate(&self, id: &str, work: &Path, target: &Path) -> io::Result<()> {
+        let Some(lease) = self.acquire_candidate_lease(id)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "candidate is held by another process",
+            ));
+        };
+        remove_dir_if_present(target);
+        create_private_dir(&self.candidates_dir())?;
+        fs::rename(work, target)?;
+        *self
+            .candidate_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(lease);
+        Ok(())
     }
 
     fn mark_verifying(&self, op: u64, offer: &Offer) {
@@ -513,6 +673,7 @@ impl Inner {
     ) -> Result<(), UpdateError> {
         let entry = offer.candidate.target_entry();
         let tag = &offer.candidate.catalog().tag;
+        self.ensure_lease()?;
         create_private_dir(work)?;
         durable_write(&work.join(CATALOG_FILE), &offer.catalog)?;
         durable_write(&work.join(SIGNATURE_FILE), &offer.signature)?;
@@ -617,8 +778,19 @@ impl Inner {
     }
 
     fn run_discard(&self, op: u64, dir: &Path) {
-        let trash = self.trash_root().join(op.to_string());
-        let moved = create_private_dir(&self.trash_root()).and_then(|()| fs::rename(dir, &trash));
+        let trash = self.trash_dir().join(op.to_string());
+        let moved = self
+            .ensure_lease()
+            .and_then(|()| create_private_dir(&self.trash_dir()))
+            .and_then(|()| fs::rename(dir, &trash));
+        if moved.is_ok() {
+            // The candidate directory is out of the way; only now may another
+            // process publish the same CandidateId.
+            *self
+                .candidate_lease
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+        }
         {
             let mut state = self.lock();
             let live = matches!(&state.stage, Stage::Discarding { op: live, .. } if *live == op);
@@ -661,14 +833,21 @@ impl Inner {
     /// Local re-validation only: no request is made. Anything that does not
     /// verify exactly is removed rather than offered.
     fn run_restore(&self) {
-        remove_dir_if_present(&self.work_root());
-        remove_dir_if_present(&self.trash_root());
-        let mut found: Option<(Offer, PathBuf)> = None;
+        self.remove_stale_work();
+        let mut found: Option<(Offer, PathBuf, File)> = None;
         if let Ok(entries) = fs::read_dir(self.candidates_dir()) {
             for entry in entries.flatten() {
                 let dir = entry.path();
+                let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                // A candidate held by another process is in use there: it is
+                // neither adopted nor removed.
+                let Ok(Some(lease)) = self.acquire_candidate_lease(name) else {
+                    continue;
+                };
                 match (found.is_none(), self.restore_candidate(&dir)) {
-                    (true, Ok(offer)) => found = Some((offer, dir)),
+                    (true, Ok(offer)) => found = Some((offer, dir, lease)),
                     _ => remove_dir_if_present(&dir),
                 }
             }
@@ -676,7 +855,11 @@ impl Inner {
         let mut state = self.lock();
         state.restoring = false;
         let idle = matches!(state.stage, Stage::Idle);
-        if let (true, Some((offer, dir))) = (idle, found) {
+        if let (true, Some((offer, dir, lease))) = (idle, found) {
+            *self
+                .candidate_lease
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(lease);
             state.stage = Stage::Ready {
                 offer: Arc::new(offer),
                 dir,
@@ -741,10 +924,89 @@ impl Inner {
         })
     }
 
+    /// Whether this build can really apply a Ready update: trust material is
+    /// embedded, this OS/CPU has a distribution and the install is at a
+    /// supported placement. Everything else stays fail-closed.
+    fn restart_supported(&self) -> bool {
+        self.config.policy.is_configured()
+            && self.config.target.is_some()
+            && self.restart.get().is_some()
+    }
+
+    /// True while `candidate_id` is still the Ready update and nothing is
+    /// restoring it.
+    fn is_ready(&self, candidate_id: &str) -> bool {
+        let state = self.lock();
+        matches!(
+            &state.stage,
+            Stage::Ready { offer, .. } if !state.restoring && offer.id().as_str() == candidate_id
+        )
+    }
+
+    /// Re-confirms the Ready candidate and the install location. The ticket is
+    /// written only if this still holds.
+    fn confirm_restart(&self, candidate_id: &str) -> Result<(), String> {
+        if !self.is_ready(candidate_id) {
+            return Err("the prepared update changed".to_owned());
+        }
+        let wiring = self
+            .restart
+            .get()
+            .ok_or_else(|| "restart is not enabled".to_owned())?;
+        let placement = hane_update::platform::locate(&wiring.exe).map_err(|err| err.to_string())?;
+        if placement.install_id != wiring.placement.install_id {
+            return Err("the install location changed".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Starts the helper for the Ready candidate. The lock is not held while
+    /// the helper starts. Nothing is stopped or quit here.
+    fn prepare_restart(self: &Arc<Self>, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
+        let unsupported = || "この環境では更新を適用できません".to_owned();
+        if !self.restart_supported() {
+            return Err(unsupported());
+        }
+        let wiring = self.restart.get().ok_or_else(unsupported)?;
+        let dir = {
+            let state = self.lock();
+            match &state.stage {
+                Stage::Ready { offer, dir }
+                    if !state.restoring && offer.id().as_str() == candidate_id =>
+                {
+                    dir.clone()
+                }
+                _ => return Err("準備した更新が変わりました。もう一度お試しください".to_owned()),
+            }
+        };
+        let prepared = update_restart::start_helper(
+            &wiring.placement,
+            &self.config.policy,
+            candidate_id,
+            &dir,
+            &wiring.state_root,
+        )
+        .map_err(|err| err.to_string())?;
+        // A failure from here on drops `prepared`, which aborts the helper.
+        let coordination = wiring
+            .placement
+            .coordination()
+            .map_err(|err| err.to_string())?;
+        let inner = Arc::clone(self);
+        let candidate = candidate_id.to_owned();
+        Ok(Box::new(HelperHandoff::new(
+            prepared,
+            coordination,
+            wiring.state_root.clone(),
+            Box::new(move || inner.confirm_restart(&candidate)),
+        )))
+    }
+
     fn snapshot(&self) -> AppUpdateSnapshot {
         let state = self.lock();
         let mut snapshot = AppUpdateSnapshot::idle(self.config.current_version.clone());
         snapshot.restoring = state.restoring;
+        snapshot.restart_supported = self.restart_supported();
         let describe = |snapshot: &mut AppUpdateSnapshot, offer: &Offer| {
             snapshot.candidate_id = Some(offer.id().as_str().to_owned());
             snapshot.candidate_version = Some(offer.candidate.version().to_string());
@@ -818,6 +1080,10 @@ impl AppUpdateController for AppUpdateService {
 
     fn restore_local(&self) {
         self.inner.start_restore();
+    }
+
+    fn prepare_restart(&self, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
+        self.inner.prepare_restart(candidate_id)
     }
 }
 
@@ -1007,6 +1273,22 @@ mod tests {
         run_queued(&queue);
         assert!(transport.requests().is_empty());
         assert_eq!(service.snapshot().phase, AppUpdatePhase::Unavailable);
+        assert!(!snapshot.restart_supported);
+        assert!(service.prepare_restart(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn a_service_without_a_wired_placement_never_offers_or_starts_a_restart() {
+        let dir = TempDir::new("app-update-unwired");
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        assert!(!service.snapshot().restart_supported);
+        assert!(service.prepare_restart(&"a".repeat(64)).is_err());
     }
 
     #[test]
@@ -1115,8 +1397,9 @@ mod tests {
         assert_eq!(fixture.requests(), 4);
         assert!(
             fixture
-                .updates_root()
-                .join("work")
+                .service
+                .inner
+                .work_dir()
                 .read_dir()
                 .is_ok_and(|mut entries| entries.next().is_none()),
             "the work directory must be emptied by the move to candidates"
@@ -1186,6 +1469,8 @@ mod tests {
         assert_eq!(fixture.requests(), requests);
 
         // "Restart": a new service over the same directories, local checks only.
+        // The previous process is gone, so its candidate lease is released.
+        *fixture.service.inner.candidate_lease.lock().unwrap() = None;
         let queue = Arc::new(Mutex::new(Vec::new()));
         let transport = Arc::new(ScriptedTransport::new());
         let reopened = AppUpdateService::with_runner(
@@ -1216,6 +1501,7 @@ mod tests {
         let mut bytes = fs::read(&archive).unwrap();
         bytes[0] ^= 0xff;
         fs::write(&archive, bytes).unwrap();
+        *fixture.service.inner.candidate_lease.lock().unwrap() = None;
 
         let queue = Arc::new(Mutex::new(Vec::new()));
         let reopened = AppUpdateService::with_runner(
@@ -1234,6 +1520,7 @@ mod tests {
     fn a_prepared_update_for_another_target_is_not_restored() {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.prepare_ready();
+        *fixture.service.inner.candidate_lease.lock().unwrap() = None;
         let queue = Arc::new(Mutex::new(Vec::new()));
         let reopened = AppUpdateService::with_runner(
             config(&fixture.dir, "0.26.0", test_policy(), Some(Target::MacosArm64)),
@@ -1272,7 +1559,94 @@ mod tests {
         run_queued(&fixture.queue);
         assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
         assert!(candidates.read_dir().unwrap().next().is_none());
-        assert!(!fixture.updates_root().join("trash").exists() || fixture.updates_root().join("trash").read_dir().unwrap().next().is_none());
+        let trash = fixture.service.inner.trash_dir();
+        assert!(!trash.exists() || trash.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn restore_in_another_service_does_not_touch_an_active_download() {
+        let first = fixture("0.26.0", "0.27.0", 5);
+        // The archive route is scripted below with a hook, so the plain
+        // `script_archive` response must not be queued ahead of it.
+        first.script_check();
+        first.check_now();
+        let id = first.candidate_id();
+
+        // A second, independent service over the same directories.
+        let second_queue = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(AppUpdateService::with_runner(
+            config(&first.dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&second_queue),
+        ));
+
+        // While the first download is in flight (its archive request is being
+        // served), the second service starts and finishes its restore.
+        let work_seen = Arc::new(Mutex::new(None));
+        let zip = first.release.zip.clone();
+        {
+            let second = Arc::clone(&second);
+            let second_queue = Arc::clone(&second_queue);
+            let first_work = first.service.inner.work_dir();
+            let first_trash = first.service.inner.trash_dir();
+            let work_seen = Arc::clone(&work_seen);
+            first.transport.push(
+                &asset_url(&first.tag, ARCHIVE_NAME),
+                Scripted::Custom(Box::new(move || {
+                    let existed_before = first_work.is_dir();
+                    fs::create_dir_all(&first_trash).unwrap();
+                    second.restore_local();
+                    run_queued(&second_queue);
+                    *work_seen.lock().unwrap() =
+                        Some((existed_before, first_work.is_dir(), first_trash.is_dir()));
+                    Ok(hane_update::download::Response {
+                        status: 200,
+                        location: None,
+                        content_length: Some(zip.len() as u64),
+                        body: Box::new(hane_update::testing::ChunkReader::new(zip, None)),
+                    })
+                })),
+            );
+        }
+        first.service.download(&id);
+        run_queued(&first.queue);
+
+        assert_eq!(
+            *work_seen.lock().unwrap(),
+            Some((true, true, true)),
+            "restore in another service must keep the active work and trash"
+        );
+        assert_eq!(first.phase(), AppUpdatePhase::Ready);
+        assert_eq!(second.snapshot().phase, AppUpdatePhase::Idle);
+    }
+
+    #[test]
+    fn restore_removes_work_of_a_service_that_is_gone() {
+        let first = fixture("0.26.0", "0.27.0", 5);
+        first.script_check();
+        first.script_archive();
+        first.check_now();
+        first.service.download(&first.candidate_id());
+        let stale_work = first.service.inner.work_dir();
+        let stale_trash = first.service.inner.trash_dir();
+        run_queued(&first.queue);
+        // Leave leftovers as a crashed process would, then release its lease.
+        fs::create_dir_all(stale_work.join("leftover")).unwrap();
+        fs::create_dir_all(&stale_trash).unwrap();
+        *first.service.inner.lease.lock().unwrap() = None;
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let second = AppUpdateService::with_runner(
+            config(&first.dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        second.restore_local();
+        run_queued(&queue);
+        assert!(!stale_work.exists());
+        assert!(!stale_trash.exists());
     }
 
     #[test]
@@ -1283,6 +1657,7 @@ mod tests {
         let dir = fixture.updates_root().join("candidates").join(&id);
 
         // Reopen over the same directories with a runner that can be told to refuse.
+        *fixture.service.inner.candidate_lease.lock().unwrap() = None;
         let accept = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let queue = Arc::new(Mutex::new(Vec::new()));
         let runner: Runner = {
@@ -1325,6 +1700,90 @@ mod tests {
         assert!(!service.snapshot().is_busy());
         assert_eq!(service.snapshot().phase, AppUpdatePhase::Idle);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_second_service_finishing_the_same_candidate_never_removes_the_active_one() {
+        let first = fixture("0.26.0", "0.27.0", 5);
+        first.prepare_ready();
+        let id = first.candidate_id();
+        let dir = first.updates_root().join("candidates").join(&id);
+
+        // An independent service over the same directories downloads the
+        // same CandidateId while the first one holds it as Ready.
+        let second_queue = Arc::new(Mutex::new(Vec::new()));
+        let second_transport = Arc::new(ScriptedTransport::new());
+        let second = AppUpdateService::with_runner(
+            config(&first.dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            second_transport.clone(),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&second_queue),
+        );
+        let json = release_json_sized(
+            &first.tag,
+            &[
+                (CATALOG_ASSET_NAME, first.release.catalog.len() as u64),
+                (SIGNATURE_ASSET_NAME, first.release.catalog_sig.len() as u64),
+                (ARCHIVE_NAME, first.release.zip.len() as u64),
+            ],
+            false,
+            false,
+        );
+        second_transport.push(&latest_release_url(), Scripted::body(200, json));
+        second_transport.push(
+            &asset_url(&first.tag, CATALOG_ASSET_NAME),
+            Scripted::body(200, first.release.catalog.clone()),
+        );
+        second_transport.push(
+            &asset_url(&first.tag, SIGNATURE_ASSET_NAME),
+            Scripted::body(200, first.release.catalog_sig.clone()),
+        );
+        second_transport.push(
+            &asset_url(&first.tag, ARCHIVE_NAME),
+            Scripted::body(200, first.release.zip.clone()),
+        );
+        second.check();
+        run_queued(&second_queue);
+        assert_eq!(second.snapshot().phase, AppUpdatePhase::Available);
+
+        // The first service starts discarding; the second download completes
+        // before the discard task runs.
+        first.service.discard_ready();
+        second.download(&id);
+        run_queued(&second_queue);
+        assert_eq!(second.snapshot().phase, AppUpdatePhase::Failed);
+        assert!(dir.join("archive.zip").is_file());
+        assert!(dir.join("stage").join("hane.exe").is_file());
+        assert!(dir.join("ready").is_file());
+        assert_eq!(first.phase(), AppUpdatePhase::Discarding);
+
+        // Ready state is also untouched by a completed download elsewhere.
+        run_queued(&first.queue);
+        assert_eq!(first.phase(), AppUpdatePhase::Idle);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn restore_in_another_service_leaves_a_candidate_held_elsewhere() {
+        let first = fixture("0.26.0", "0.27.0", 5);
+        first.prepare_ready();
+        let dir = first
+            .updates_root()
+            .join("candidates")
+            .join(first.candidate_id());
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let second = AppUpdateService::with_runner(
+            config(&first.dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        second.restore_local();
+        run_queued(&queue);
+        assert_eq!(second.snapshot().phase, AppUpdatePhase::Idle);
+        assert!(dir.join("ready").is_file());
+        assert_eq!(first.phase(), AppUpdatePhase::Ready);
     }
 
     #[test]

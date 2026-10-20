@@ -53,6 +53,10 @@ pub struct AppUpdateSnapshot {
     pub error_code: Option<String>,
     /// A local re-validation of a previously prepared update is running.
     pub restoring: bool,
+    /// The service can really apply a Ready update in this build: the trust
+    /// policy is configured and the install is at a supported placement. Only
+    /// then is "再起動して更新" offered; `false` keeps the card fail-closed.
+    pub restart_supported: bool,
 }
 
 impl AppUpdateSnapshot {
@@ -66,6 +70,7 @@ impl AppUpdateSnapshot {
             total_bytes: 0,
             error_code: None,
             restoring: false,
+            restart_supported: false,
         }
     }
 
@@ -99,6 +104,79 @@ pub trait AppUpdateController: Send + Sync {
     /// Re-validates a prepared update left by an earlier run, locally only.
     /// Idempotent; never communicates.
     fn restore_local(&self);
+    /// Re-verifies the Ready candidate `candidate_id` and the install, starts
+    /// the update helper and returns once it answered `Prepared`. It may take
+    /// a while and is therefore called off the UI thread. Nothing is stopped,
+    /// replaced or quit: the application stays open and unchanged until the
+    /// caller authorizes the exit. The default refuses.
+    fn prepare_restart(&self, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
+        let _ = candidate_id;
+        Err("この環境では更新を適用できません".to_owned())
+    }
+}
+
+/// The saved files of the window, as the restart ticket will carry them. Paths
+/// and bounded positions only; never document text.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RestartTicketSnapshot {
+    pub work_folder: Option<PathBuf>,
+    pub files: Vec<RestartTicketFile>,
+    /// Index into `files` of the active document.
+    pub active: Option<usize>,
+}
+
+/// Which Explorer registrations were enabled before the update, and so which
+/// ones the repair guidance may mention.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExplorerRepairScope {
+    pub file: bool,
+    pub folder: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestartTicketFile {
+    pub path: PathBuf,
+    pub scroll_line: u32,
+    pub caret_offset: u32,
+}
+
+/// A helper that has answered `Prepared`. Dropping it without
+/// [`PreparedUpdate::authorize_exit`] must abort the helper and leave the
+/// install untouched.
+pub trait PreparedUpdate: Send {
+    /// Writes the restart ticket. `permit_is_fresh` is asked last, right
+    /// before the write, and a stale permit must leave no ticket behind.
+    fn issue_ticket(
+        &mut self,
+        ticket: &RestartTicketSnapshot,
+        permit_is_fresh: &dyn Fn() -> bool,
+    ) -> Result<(), String>;
+    /// Lets the helper proceed once this process has exited.
+    fn authorize_exit(self: Box<Self>) -> Result<(), String>;
+    /// Gives the helper up and removes the ticket.
+    fn abort(self: Box<Self>);
+}
+
+/// Explicit stop and restart of the app-owned AI service around a restart.
+pub trait AiLifecycle: Send + Sync {
+    /// Stops the service and waits (up to `timeout`) until it is gone.
+    fn stop(&self, timeout: Duration) -> Result<(), String>;
+    /// Starts the service again after an abandoned restart. This is the one
+    /// explicit request: a stop still in flight keeps the start pending.
+    fn resume(&self) -> AiResume;
+    /// Asks how a resume that is waiting on a stop went. It never starts a
+    /// service, so repeating it cannot repeat a start.
+    fn poll_resume(&self) -> AiResume;
+}
+
+/// How a resume request went.
+pub enum AiResume<H = hane_ai::AiServiceHandle> {
+    /// The service is running; attach this handle.
+    Started(H),
+    /// The old service is still stopping and the start is pending.
+    Stopping,
+    /// The new service could not be started. A later explicit resume may retry.
+    Failed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +184,7 @@ pub(crate) enum CardAction {
     Check,
     Download(String),
     Cancel,
+    Restart,
     DiscardReady,
 }
 
@@ -149,9 +228,9 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / MIB)
 }
 
-/// Maps a snapshot to the card text and the buttons it offers. There is no
-/// restart action yet: applying a prepared update is wired in a later stage,
-/// and an unusable "再起動して更新" must not be shown.
+/// Maps a snapshot to the card text and the buttons it offers. "再起動して更新"
+/// is offered only for a Ready update of a service that reports
+/// `restart_supported`; an action that cannot work is never shown.
 pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
     let version = snapshot.candidate_version.as_deref().unwrap_or("?");
     let code = snapshot.error_code.as_deref().unwrap_or("unknown");
@@ -199,9 +278,16 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             model.actions.push((CardAction::Cancel, "キャンセル"));
         }
         AppUpdatePhase::Ready => {
-            model.detail = Some(format!(
-                "更新の準備ができました ({version})。適用機能はこのバージョンではまだ利用できません。"
-            ));
+            if snapshot.restart_supported {
+                model.detail = Some(format!("更新の準備ができました ({version})。"));
+                model
+                    .actions
+                    .push((CardAction::Restart, "再起動して更新"));
+            } else {
+                model.detail = Some(format!(
+                    "更新の準備ができました ({version})。この環境では適用できません。"
+                ));
+            }
             model
                 .actions
                 .push((CardAction::DiscardReady, "準備した更新を削除"));
@@ -315,6 +401,10 @@ pub enum ExternalOpenOutcome {
 #[derive(Debug, Default)]
 pub struct ExternalOpenQueue {
     pending: std::collections::VecDeque<PathBuf>,
+    /// Set by [`Self::seal_if_empty`] right before the helper is allowed to
+    /// replace this process. A sealed queue refuses `try_push`, so the sender
+    /// learns that this process can no longer open the request.
+    sealed: bool,
 }
 
 impl ExternalOpenQueue {
@@ -324,6 +414,32 @@ impl ExternalOpenQueue {
 
     pub fn push(&mut self, path: PathBuf) {
         self.pending.push_back(path);
+    }
+
+    /// Queues `path` unless the queue is sealed; a sealed queue hands the path
+    /// back so the sender can deliver it to the next process.
+    pub fn try_push(&mut self, path: PathBuf) -> Result<(), PathBuf> {
+        if self.sealed {
+            return Err(path);
+        }
+        self.pending.push_back(path);
+        Ok(())
+    }
+
+    /// Atomically closes the queue if nothing is waiting. Every request is
+    /// either already queued (this returns `false` and the restart is given
+    /// up) or refused by `try_push` afterwards; none falls between the two.
+    pub fn seal_if_empty(&mut self) -> bool {
+        if !self.pending.is_empty() {
+            return false;
+        }
+        self.sealed = true;
+        true
+    }
+
+    /// Reopens the queue after the restart was given up.
+    pub fn unseal(&mut self) {
+        self.sealed = false;
     }
 
     pub fn len(&self) -> usize {
@@ -351,7 +467,100 @@ impl ExternalOpenQueue {
     }
 }
 
+/// An [`ExternalOpenQueue`] shared between the platform callback that receives
+/// documents (Finder) and the window. The window also reads it during the final
+/// restart coordination, so a document that arrived after the restart ticket
+/// was written cannot be dropped with this process: the restart is given up
+/// while any request is still waiting here.
+#[derive(Clone, Debug, Default)]
+pub struct SharedExternalOpenQueue {
+    inner: Arc<std::sync::Mutex<ExternalOpenQueue>>,
+}
+
+impl SharedExternalOpenQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ExternalOpenQueue> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn push(&self, path: PathBuf) {
+        self.lock().push(path);
+    }
+
+    /// See [`ExternalOpenQueue::try_push`].
+    pub fn try_push(&self, path: PathBuf) -> Result<(), PathBuf> {
+        self.lock().try_push(path)
+    }
+
+    /// See [`ExternalOpenQueue::seal_if_empty`].
+    pub fn seal_if_empty(&self) -> bool {
+        self.lock().seal_if_empty()
+    }
+
+    pub fn unseal(&self) {
+        self.lock().unseal();
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Like [`ExternalOpenQueue::drain_into`], but the lock is not held while
+    /// `accept` runs (it may look at this queue again). A request leaves the
+    /// queue only after it was accepted.
+    pub fn drain_into(&self, mut accept: impl FnMut(&Path) -> ExternalOpenOutcome) -> usize {
+        let mut accepted = 0;
+        loop {
+            let Some(path) = self.lock().pending.front().cloned() else {
+                break;
+            };
+            match accept(&path) {
+                ExternalOpenOutcome::Accepted => {
+                    self.lock().pending.pop_front();
+                    accepted += 1;
+                }
+                ExternalOpenOutcome::Busy => break,
+            }
+        }
+        accepted
+    }
+}
+
 impl EditorView {
+    /// Installs the queue the platform fills with documents from outside
+    /// (Finder). The final restart check treats a waiting request as a reason
+    /// to keep this process running.
+    pub fn attach_external_open_inbox(&mut self, inbox: Option<SharedExternalOpenQueue>) {
+        self.external_open_inbox = inbox;
+    }
+
+    /// Closes the external-open entrance if nothing is waiting. Without an
+    /// inbox there is nothing to close.
+    fn seal_external_open(&self) -> bool {
+        self.external_open_inbox
+            .as_ref()
+            .is_none_or(|inbox| inbox.seal_if_empty())
+    }
+
+    fn unseal_external_open(&self) {
+        if let Some(inbox) = &self.external_open_inbox {
+            inbox.unseal();
+        }
+    }
+
+    fn external_open_waiting(&self) -> bool {
+        self.external_open_inbox
+            .as_ref()
+            .is_some_and(|inbox| !inbox.is_empty())
+    }
+
     /// Installs the app-owned update service handle. Attaching sends no
     /// request; the service only communicates after an explicit button press.
     pub fn attach_app_update(&mut self, controller: Option<Arc<dyn AppUpdateController>>) {
@@ -403,10 +612,17 @@ impl EditorView {
         let Some(controller) = self.app_update.clone() else {
             return;
         };
+        // A new action ends the one-time "updated" notice.
+        self.update_completed = None;
+        self.explorer_migration_failed = None;
         match action {
             CardAction::Check => controller.check(),
             CardAction::Download(candidate) => controller.download(&candidate),
             CardAction::Cancel => controller.cancel(),
+            CardAction::Restart => {
+                self.start_update_restart(cx);
+                return;
+            }
             CardAction::DiscardReady => controller.discard_ready(),
         }
         self.poll_app_update(cx);
@@ -418,9 +634,11 @@ impl EditorView {
     pub(super) fn app_update_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let controller = self.app_update.as_ref()?;
         let model = card_model(&controller.snapshot());
+        let restarting = self.restart_in_progress;
         let buttons: Vec<_> = model
             .actions
             .into_iter()
+            .filter(|(action, _)| !(restarting && *action == CardAction::Restart))
             .enumerate()
             .map(|(index, (action, label))| {
                 let view = cx.entity();
@@ -452,6 +670,29 @@ impl EditorView {
                     .id("settings-app-update-detail")
                     .text_color(rgb(self.theme.quote_foreground))
                     .child(detail)
+            }))
+            .children(
+                self.update_completed
+                    .clone()
+                    .filter(|_| self.explorer_migration_failed.is_none())
+                    .map(|version| {
+                        div()
+                            .id("settings-app-update-completed")
+                            .debug_selector(|| "settings-app-update-completed".to_owned())
+                            .child(format!("Hane {version} に更新しました。"))
+                    }),
+            )
+            .children(self.explorer_migration_failed.map(|scope| {
+                div()
+                    .id("settings-app-update-explorer-failed")
+                    .debug_selector(|| "settings-app-update-explorer-failed".to_owned())
+                    .child(explorer_migration_failed_message(scope))
+            }))
+            .children(self.restart_message.clone().map(|message| {
+                div()
+                    .id("settings-app-update-restart-message")
+                    .text_color(rgb(self.theme.quote_foreground))
+                    .child(message)
             }))
             .child(
                 div()
@@ -572,6 +813,10 @@ impl EditorView {
         if !self.loading_paths.is_empty() {
             blockers.push(RestartBlocker::OpenInFlight);
         }
+        #[cfg(test)]
+        if self.restart_test_ai_busy {
+            blockers.push(RestartBlocker::AiBusy);
+        }
         if let Some(service) = &self.restart_ai_service {
             let snapshot = service.snapshot();
             let login_running = !matches!(
@@ -639,6 +884,436 @@ impl EditorView {
         }
         RestartPreparation::Clear(observed)
     }
+
+    /// Installs the explicit stop/restart handle of the app-owned AI service.
+    pub fn attach_ai_lifecycle(&mut self, lifecycle: Option<Arc<dyn AiLifecycle>>) {
+        self.ai_lifecycle = lifecycle;
+    }
+
+    /// Shows, once, that this process is the version an update just installed.
+    /// The caller passes the version only after the helper's durable commit.
+    pub fn show_update_completed(&mut self, version: &str, cx: &mut Context<Self>) {
+        self.update_completed = Some(version.to_owned());
+        cx.notify();
+    }
+
+    /// Tells the user that Hane itself was updated but the Explorer
+    /// integration was not carried over, and how to repair it. Never shown for
+    /// a successful migration.
+    pub fn report_explorer_migration_failed(
+        &mut self,
+        scope: ExplorerRepairScope,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_explorer_migration_failed(scope);
+        cx.notify();
+    }
+
+    /// The state change of [`Self::report_explorer_migration_failed`]. The
+    /// ordinary "updated" notice is dropped so only the partial failure shows;
+    /// the update itself and the restored documents are untouched.
+    fn apply_explorer_migration_failed(&mut self, scope: ExplorerRepairScope) {
+        self.update_completed = None;
+        self.explorer_migration_failed = Some(scope);
+        self.status = Some(explorer_migration_failed_message(scope));
+    }
+
+    /// Tells the user that some files open before the update restart could not
+    /// be reopened because they were deleted or moved.
+    pub fn report_restore_skipped(&mut self, count: usize, cx: &mut Context<Self>) {
+        self.status = Some(format!(
+            "再起動前に開いていた {count} 件のファイルが見つからないため開けませんでした"
+        ));
+        cx.notify();
+    }
+
+    /// The saved files of this window for the restart ticket. Unsaved
+    /// documents are not part of it (a restart is blocked while any exist).
+    pub(super) fn restart_ticket_snapshot(&self) -> RestartTicketSnapshot {
+        let active_id = self.sessions.active_id();
+        let mut files = Vec::new();
+        let mut active = None;
+        for session in self.sessions.sessions() {
+            let Some(path) = session.path() else {
+                continue;
+            };
+            if session.is_dirty() {
+                continue;
+            }
+            if session.id() == active_id {
+                active = Some(files.len());
+            }
+            files.push(RestartTicketFile {
+                path: path.to_path_buf(),
+                scroll_line: 0,
+                caret_offset: 0,
+            });
+        }
+        RestartTicketSnapshot {
+            work_folder: self
+                .work_folder
+                .as_ref()
+                .map(|folder| folder.root().to_path_buf()),
+            files,
+            active,
+        }
+    }
+
+    /// "再起動して更新". Every blocker is checked first; the helper is then
+    /// prepared in the background and the exit is decided only when it has
+    /// answered `Prepared`.
+    fn start_update_restart(&mut self, cx: &mut Context<Self>) {
+        if self.restart_in_progress {
+            return;
+        }
+        let Some(controller) = self.app_update.clone() else {
+            return;
+        };
+        let snapshot = controller.snapshot();
+        let (AppUpdatePhase::Ready, true, Some(candidate)) = (
+            snapshot.phase,
+            snapshot.restart_supported,
+            snapshot.candidate_id.clone(),
+        ) else {
+            return;
+        };
+        self.restart_message = None;
+        let observation = match self.prepare_update_restart(cx) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(blockers) => {
+                let reasons: Vec<String> = blockers.iter().map(RestartBlocker::message).collect();
+                self.restart_message = Some(reasons.join(" "));
+                cx.notify();
+                return;
+            }
+        };
+        let ticket = self.restart_ticket_snapshot();
+        self.restart_in_progress = true;
+        self.restart_message = Some("再起動の準備をしています…".to_owned());
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let prepared = cx
+                .background_executor()
+                .spawn(async move { controller.prepare_restart(&candidate) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.continue_update_restart(prepared, observation, ticket, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// With the restart freeze already held, re-runs the full blocker check
+    /// (documents, sessions, settings/prompt forms, IME, save, rename, open,
+    /// AI operations, persistence) and compares against the first observation.
+    /// Nothing is stopped or written to the helper here.
+    fn recheck_restart_under_freeze(
+        &mut self,
+        observation: &RestartObservation,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match self.prepare_update_restart_frozen(cx) {
+            RestartPreparation::Blocked(blockers) => {
+                let reasons: Vec<String> = blockers.iter().map(RestartBlocker::message).collect();
+                Err(reasons.join(" "))
+            }
+            RestartPreparation::Clear(_) => {
+                if self.restart_observation_is_current(observation) {
+                    Ok(())
+                } else {
+                    Err(RESTART_STALE_MESSAGE.to_owned())
+                }
+            }
+        }
+    }
+
+    fn keep_running_after_restart_attempt(&mut self, message: String, cx: &mut Context<Self>) {
+        self.end_restart_freeze();
+        self.restart_in_progress = false;
+        self.restart_message = Some(message);
+        cx.notify();
+    }
+
+    /// Runs on the UI thread once the helper preparation finished. The exit is
+    /// authorized only by [`run_exit_sequence`] and only after a `Prepared`.
+    fn continue_update_restart(
+        &mut self,
+        prepared: Result<Box<dyn PreparedUpdate>, String>,
+        observation: RestartObservation,
+        ticket: RestartTicketSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                self.keep_running_after_restart_attempt(
+                    format!("更新を開始できませんでした。アプリはそのまま使えます: {reason}"),
+                    cx,
+                );
+                return;
+            }
+        };
+        if !self.begin_restart_freeze() {
+            prepared.abort();
+            self.restart_in_progress = false;
+            self.restart_message = Some("再起動の準備中です。".to_owned());
+            cx.notify();
+            return;
+        }
+        // The window was editable while the helper prepared. With the freeze
+        // held, look at every blocker again and at whether anything the first
+        // check observed has moved, before a ticket or the AI stop.
+        if let Err(message) = self.recheck_restart_under_freeze(&observation, cx) {
+            prepared.abort();
+            self.keep_running_after_restart_attempt(message, cx);
+            return;
+        }
+        let ai = self.ai_lifecycle.clone();
+        let outcome = {
+            let mut steps = ViewExit {
+                view: &mut *self,
+                cx: &mut *cx,
+                prepared: Some(prepared),
+                observation: &observation,
+                ticket: &ticket,
+                ai,
+                ai_stopped: false,
+            };
+            run_exit_sequence(&mut steps)
+        };
+        match outcome {
+            ExitOutcome::Quit => {
+                // The freeze stays held: a request arriving now is answered
+                // `Busy` and kept by its sender instead of being lost.
+                cx.quit();
+            }
+            ExitOutcome::Kept(message) => {
+                self.keep_running_after_restart_attempt(message, cx);
+            }
+        }
+    }
+}
+
+const RESTART_STALE_MESSAGE: &str =
+    "文書または設定が変更されたため、更新を中止しました。もう一度お試しください。";
+
+/// How long the AI service may take to stop before the restart is given up.
+pub(crate) const AI_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a stop that outlived [`AI_STOP_TIMEOUT`] is checked for completion.
+/// Shown when the update committed but the Explorer integration was not carried
+/// over. The new publisher is never trusted automatically; the user repairs it
+/// from the settings.
+/// The partial-failure notice with repair steps for only the registrations
+/// that were enabled before the update. A disabled kind is never mentioned, so
+/// the user is not led to turn it on.
+fn explorer_migration_failed_message(scope: ExplorerRepairScope) -> String {
+    let mut message = String::from(
+        "Hane本体は更新しましたが、Explorer連携の更新に失敗しました。",
+    );
+    if scope.file {
+        message.push_str(
+            "ファイルの右クリック登録は、設定画面の「ファイルを右クリックでHaneで開けるよう登録」をオフにしてから、もう一度オンにして修復してください。",
+        );
+    }
+    if scope.folder {
+        message.push_str(
+            "フォルダーの右クリック登録は、Haneを「--register-context-menu」付きで実行して再登録してください。",
+        );
+    }
+    message.push_str(
+        "発行元が変わって再登録できない場合は、アプリが自動で信頼することはないため、発行元を確認したうえで利用者が明示的に信頼してください。",
+    );
+    message
+}
+
+const AI_RESUME_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The steps of the final exit coordination, behind a seam so the order and
+/// every failure path can be tested without a window or a helper process.
+pub(crate) trait ExitSteps {
+    /// The restart permit (every session identity/revision and generation of
+    /// the check) is still current.
+    fn permit_is_fresh(&self) -> bool;
+    fn issue_ticket(&mut self) -> Result<(), String>;
+    /// Writes every pending draft and reports any failure.
+    fn drain_drafts(&mut self) -> Result<(), String>;
+    fn stop_ai(&mut self) -> Result<(), String>;
+    /// Closes the external-open queue atomically with its emptiness check.
+    /// `false` means a request is waiting and the restart must be given up.
+    /// From here on a request is refused by the queue and handed to the next
+    /// process by the sender, never queued where this process cannot open it.
+    fn seal_open_queue(&mut self) -> bool;
+    /// Reopens the queue after the restart was given up.
+    fn unseal_open_queue(&mut self);
+    /// Lets the helper proceed. After this returns `Ok` the caller quits.
+    fn authorize_exit(&mut self) -> Result<(), String>;
+    fn abort_helper(&mut self);
+    fn resume_ai(&mut self);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ExitOutcome {
+    /// The helper was authorized; the caller quits normally.
+    Quit,
+    /// The restart was given up. The helper was aborted, the AI service
+    /// started again if it had been stopped, and nothing was lost.
+    Kept(String),
+}
+
+/// Quit coordination (spec section 7, steps 6-8). Nothing here may change the
+/// install: the helper does that only after `authorize_exit` and this
+/// process's exit. Any failure aborts the helper and keeps the old window.
+pub(crate) fn run_exit_sequence(steps: &mut dyn ExitSteps) -> ExitOutcome {
+    const STALE: &str = RESTART_STALE_MESSAGE;
+    if !steps.permit_is_fresh() {
+        steps.abort_helper();
+        return ExitOutcome::Kept(STALE.to_owned());
+    }
+    if let Err(reason) = steps.issue_ticket() {
+        steps.abort_helper();
+        return ExitOutcome::Kept(format!("再起動の準備に失敗しました: {reason}"));
+    }
+    if let Err(reason) = steps.drain_drafts() {
+        steps.abort_helper();
+        return ExitOutcome::Kept(format!("下書きを書き込めなかったため中止しました: {reason}"));
+    }
+    if let Err(reason) = steps.stop_ai() {
+        steps.abort_helper();
+        steps.resume_ai();
+        return ExitOutcome::Kept(format!("AIサービスを停止できなかったため中止しました: {reason}"));
+    }
+    if !steps.permit_is_fresh() {
+        steps.abort_helper();
+        steps.resume_ai();
+        return ExitOutcome::Kept(STALE.to_owned());
+    }
+    if !steps.seal_open_queue() {
+        steps.abort_helper();
+        steps.resume_ai();
+        return ExitOutcome::Kept(STALE.to_owned());
+    }
+    if let Err(reason) = steps.authorize_exit() {
+        // The handle is consumed (and the helper aborted) by the failure.
+        steps.unseal_open_queue();
+        steps.resume_ai();
+        return ExitOutcome::Kept(format!("更新ヘルパーへの終了許可に失敗しました: {reason}"));
+    }
+    ExitOutcome::Quit
+}
+
+/// [`ExitSteps`] on the real window.
+struct ViewExit<'a, 'c> {
+    view: &'a mut EditorView,
+    cx: &'a mut Context<'c, EditorView>,
+    prepared: Option<Box<dyn PreparedUpdate>>,
+    observation: &'a RestartObservation,
+    ticket: &'a RestartTicketSnapshot,
+    ai: Option<Arc<dyn AiLifecycle>>,
+    ai_stopped: bool,
+}
+
+impl ExitSteps for ViewExit<'_, '_> {
+    fn permit_is_fresh(&self) -> bool {
+        // A document that reached the queue after the ticket was written is
+        // not in the ticket and the old process cannot hand it over. Keep
+        // running; the request stays queued and opens once the freeze ends.
+        self.view.restart_observation_is_current(self.observation)
+            && !self.view.external_open_waiting()
+    }
+
+    fn issue_ticket(&mut self) -> Result<(), String> {
+        let Some(prepared) = self.prepared.as_mut() else {
+            return Err("更新ヘルパーがありません".to_owned());
+        };
+        let view = &*self.view;
+        let observation = self.observation;
+        prepared.issue_ticket(self.ticket, &|| view.restart_observation_is_current(observation))
+    }
+
+    fn drain_drafts(&mut self) -> Result<(), String> {
+        self.view
+            .flush_pending_drafts_checked()
+            .map(|_| ())
+            .map_err(|failures| failures.join("; "))
+    }
+
+    fn stop_ai(&mut self) -> Result<(), String> {
+        let Some(ai) = self.ai.clone() else {
+            return Ok(());
+        };
+        self.ai_stopped = true;
+        ai.stop(AI_STOP_TIMEOUT)
+    }
+
+    fn seal_open_queue(&mut self) -> bool {
+        self.view.seal_external_open()
+    }
+
+    fn unseal_open_queue(&mut self) {
+        self.view.unseal_external_open();
+    }
+
+    fn authorize_exit(&mut self) -> Result<(), String> {
+        match self.prepared.take() {
+            Some(prepared) => prepared.authorize_exit(),
+            None => Err("更新ヘルパーがありません".to_owned()),
+        }
+    }
+
+    fn abort_helper(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            prepared.abort();
+        }
+    }
+
+    fn resume_ai(&mut self) {
+        if !self.ai_stopped {
+            return;
+        }
+        // The service is started again and the window gets its new handle; a
+        // service that cannot be started leaves the AI features unavailable
+        // until the next launch, but the editor itself is unaffected.
+        let outcome = self.ai.as_ref().map(|ai| ai.resume());
+        let (handle, still_stopping) = match outcome {
+            Some(AiResume::Started(handle)) => (Some(handle), false),
+            Some(AiResume::Stopping) => (None, true),
+            Some(AiResume::Failed) | None => (None, false),
+        };
+        self.view.attach_ai_service(handle, self.cx);
+        self.ai_stopped = false;
+        if still_stopping && let Some(ai) = self.ai.clone() {
+            spawn_ai_resume_wait(ai, self.cx);
+        }
+    }
+}
+
+/// The old service is still stopping, so the owner keeps the start pending and
+/// runs it once the stop completes. Poll only the state of that one pending
+/// start and attach the new handle instead of leaving the AI detached. There is
+/// no poll limit, because a stop can finish arbitrarily late; the wait ends
+/// when the handle is attached, when the start failed, or when the view is gone.
+fn spawn_ai_resume_wait(ai: Arc<dyn AiLifecycle>, cx: &mut Context<EditorView>) {
+    cx.spawn(async move |view, cx| {
+        loop {
+            cx.background_executor().timer(AI_RESUME_POLL_INTERVAL).await;
+            // A released view ends the wait; nothing is left to attach to.
+            if view.update(cx, |_, _| ()).is_err() {
+                return;
+            }
+            match ai.poll_resume() {
+                AiResume::Started(handle) => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.attach_ai_service(Some(handle), cx);
+                    });
+                    return;
+                }
+                AiResume::Stopping => {}
+                AiResume::Failed => return,
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -653,6 +1328,61 @@ mod tests {
             candidate_version: Some("0.27.0".to_owned()),
             ..AppUpdateSnapshot::idle("0.26.0")
         }
+    }
+
+    #[test]
+    fn the_partial_failure_notice_repairs_only_the_registrations_that_were_enabled() {
+        const FILE_STEP: &str = "ファイルを右クリックでHaneで開けるよう登録";
+        const FOLDER_STEP: &str = "--register-context-menu";
+        for (file, folder) in [(true, false), (false, true), (true, true)] {
+            let text = explorer_migration_failed_message(ExplorerRepairScope { file, folder });
+            assert!(text.contains("Hane本体は更新しました"));
+            assert!(text.contains("Explorer連携の更新に失敗"));
+            assert_eq!(text.contains(FILE_STEP), file, "{text}");
+            assert_eq!(text.contains(FOLDER_STEP), folder, "{text}");
+            assert!(text.contains("発行元"));
+            assert!(text.contains("明示的に信頼"));
+            // It is not the plain success notice.
+            assert!(!text.contains("に更新しました。"));
+        }
+    }
+
+    #[gpui::test]
+    fn a_partial_failure_replaces_the_plain_updated_notice(cx: &mut gpui::TestAppContext) {
+        let controller = FakeController::new(AppUpdateSnapshot::idle("0.26.0"));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.show_update_completed("0.27.0", cx);
+        });
+        open_general_settings(&view, cx);
+        assert!(cx.debug_bounds("settings-app-update-completed").is_some());
+        assert!(
+            cx.debug_bounds("settings-app-update-explorer-failed")
+                .is_none()
+        );
+
+        let scope = ExplorerRepairScope {
+            file: false,
+            folder: true,
+        };
+        view.update(cx, |view, cx| {
+            view.report_explorer_migration_failed(scope, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("settings-app-update-completed").is_none());
+        assert!(
+            cx.debug_bounds("settings-app-update-explorer-failed")
+                .is_some()
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(view.update_completed, None);
+            assert_eq!(
+                view.status.as_deref(),
+                Some(explorer_migration_failed_message(scope).as_str())
+            );
+        });
     }
 
     fn labels(model: &CardModel) -> Vec<&'static str> {
@@ -747,9 +1477,212 @@ mod tests {
     }
 
     #[test]
-    fn a_ready_update_can_only_be_discarded_for_now() {
+    fn an_unsupported_build_can_only_discard_a_ready_update() {
         let model = card_model(&snapshot(AppUpdatePhase::Ready));
         assert_eq!(labels(&model), ["準備した更新を削除"]);
+    }
+
+    #[test]
+    fn restart_is_offered_only_for_a_ready_update_of_a_supporting_service() {
+        for phase in [
+            AppUpdatePhase::Idle,
+            AppUpdatePhase::Checking,
+            AppUpdatePhase::UpToDate,
+            AppUpdatePhase::Available,
+            AppUpdatePhase::Downloading,
+            AppUpdatePhase::Verifying,
+            AppUpdatePhase::Discarding,
+            AppUpdatePhase::Failed,
+            AppUpdatePhase::Unavailable,
+        ] {
+            let mut input = snapshot(phase);
+            input.restart_supported = true;
+            let model = card_model(&input);
+            assert!(
+                !model.actions.iter().any(|(action, _)| *action == CardAction::Restart),
+                "{phase:?}"
+            );
+        }
+        let mut input = snapshot(AppUpdatePhase::Ready);
+        input.restart_supported = true;
+        assert_eq!(
+            labels(&card_model(&input)),
+            ["再起動して更新", "準備した更新を削除"]
+        );
+        input.restoring = true;
+        assert!(card_model(&input).actions.is_empty());
+    }
+
+    #[derive(Default)]
+    struct FakeExit {
+        calls: Vec<&'static str>,
+        stale_after: Option<usize>,
+        permit_checks: std::cell::Cell<usize>,
+        fail: Option<&'static str>,
+        /// A request reached the queue before it was sealed.
+        open_waiting_at_seal: bool,
+    }
+
+    impl FakeExit {
+        fn failing(step: &'static str) -> Self {
+            Self {
+                fail: Some(step),
+                ..Self::default()
+            }
+        }
+
+        fn step(&mut self, name: &'static str) -> Result<(), String> {
+            self.calls.push(name);
+            if self.fail == Some(name) {
+                Err(format!("{name} failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ExitSteps for FakeExit {
+        fn permit_is_fresh(&self) -> bool {
+            let seen = self.permit_checks.get();
+            self.permit_checks.set(seen + 1);
+            self.stale_after.is_none_or(|limit| seen < limit)
+        }
+        fn issue_ticket(&mut self) -> Result<(), String> {
+            self.step("ticket")
+        }
+        fn drain_drafts(&mut self) -> Result<(), String> {
+            self.step("drain")
+        }
+        fn stop_ai(&mut self) -> Result<(), String> {
+            self.step("stop_ai")
+        }
+        fn seal_open_queue(&mut self) -> bool {
+            self.calls.push("seal");
+            !self.open_waiting_at_seal
+        }
+        fn unseal_open_queue(&mut self) {
+            self.calls.push("unseal");
+        }
+        fn authorize_exit(&mut self) -> Result<(), String> {
+            self.step("authorize")
+        }
+        fn abort_helper(&mut self) {
+            self.calls.push("abort");
+        }
+        fn resume_ai(&mut self) {
+            self.calls.push("resume_ai");
+        }
+    }
+
+    #[test]
+    fn the_exit_is_authorized_last_after_the_ticket_drain_and_ai_stop() {
+        let mut steps = FakeExit::default();
+        assert_eq!(run_exit_sequence(&mut steps), ExitOutcome::Quit);
+        assert_eq!(
+            steps.calls,
+            ["ticket", "drain", "stop_ai", "seal", "authorize"]
+        );
+    }
+
+    #[test]
+    fn a_request_queued_before_the_seal_gives_up_the_restart_without_authorizing() {
+        let mut steps = FakeExit {
+            open_waiting_at_seal: true,
+            ..FakeExit::default()
+        };
+        assert!(matches!(run_exit_sequence(&mut steps), ExitOutcome::Kept(_)));
+        assert_eq!(
+            steps.calls,
+            ["ticket", "drain", "stop_ai", "seal", "abort", "resume_ai"]
+        );
+    }
+
+    #[test]
+    fn the_queue_is_sealed_only_when_empty_and_refuses_later_requests() {
+        let mut queue = ExternalOpenQueue::new();
+        queue.push(PathBuf::from("a.md"));
+        assert!(!queue.seal_if_empty(), "a waiting request keeps the queue open");
+        assert_eq!(queue.try_push(PathBuf::from("b.md")), Ok(()));
+        queue.drain_into(|_| ExternalOpenOutcome::Accepted);
+        assert!(queue.seal_if_empty());
+        // After the seal (authorization, quit) nothing is queued where this
+        // process cannot open it; the sender gets the path back.
+        assert_eq!(
+            queue.try_push(PathBuf::from("c.md")),
+            Err(PathBuf::from("c.md"))
+        );
+        assert!(queue.is_empty());
+        queue.unseal();
+        assert_eq!(queue.try_push(PathBuf::from("c.md")), Ok(()));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn the_shared_queue_seal_is_atomic_with_the_emptiness_check() {
+        let queue = SharedExternalOpenQueue::new();
+        let sender = queue.clone();
+        // Arrived after the final check but before the seal: kept, restart
+        // given up.
+        sender.push(PathBuf::from("late.md"));
+        assert!(!queue.seal_if_empty());
+        queue.drain_into(|_| ExternalOpenOutcome::Accepted);
+        assert!(queue.seal_if_empty());
+        // Arrived after the seal (authorization / just before quit).
+        assert_eq!(
+            sender.try_push(PathBuf::from("quit.md")),
+            Err(PathBuf::from("quit.md"))
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_stale_permit_before_anything_aborts_without_a_ticket() {
+        let mut steps = FakeExit {
+            stale_after: Some(0),
+            ..FakeExit::default()
+        };
+        assert!(matches!(run_exit_sequence(&mut steps), ExitOutcome::Kept(_)));
+        assert_eq!(steps.calls, ["abort"]);
+    }
+
+    #[test]
+    fn a_permit_that_goes_stale_during_the_ai_stop_aborts_and_restarts_the_service() {
+        let mut steps = FakeExit {
+            stale_after: Some(1),
+            ..FakeExit::default()
+        };
+        assert!(matches!(run_exit_sequence(&mut steps), ExitOutcome::Kept(_)));
+        assert_eq!(steps.calls, ["ticket", "drain", "stop_ai", "abort", "resume_ai"]);
+        assert!(!steps.calls.contains(&"authorize"));
+    }
+
+    #[test]
+    fn a_ticket_or_draft_failure_aborts_before_the_ai_service_is_touched() {
+        for failing in ["ticket", "drain"] {
+            let mut steps = FakeExit::failing(failing);
+            assert!(matches!(run_exit_sequence(&mut steps), ExitOutcome::Kept(_)));
+            assert_eq!(steps.calls.last(), Some(&"abort"), "{failing}");
+            assert!(!steps.calls.contains(&"stop_ai"), "{failing}");
+            assert!(!steps.calls.contains(&"authorize"), "{failing}");
+        }
+    }
+
+    #[test]
+    fn an_ai_stop_timeout_aborts_the_helper_and_brings_the_service_back() {
+        let mut steps = FakeExit::failing("stop_ai");
+        let outcome = run_exit_sequence(&mut steps);
+        assert!(matches!(outcome, ExitOutcome::Kept(ref why) if why.contains("AI")));
+        assert_eq!(steps.calls, ["ticket", "drain", "stop_ai", "abort", "resume_ai"]);
+    }
+
+    #[test]
+    fn a_failed_exit_authorization_keeps_the_window_and_the_ai_service() {
+        let mut steps = FakeExit::failing("authorize");
+        assert!(matches!(run_exit_sequence(&mut steps), ExitOutcome::Kept(_)));
+        assert_eq!(
+            steps.calls,
+            ["ticket", "drain", "stop_ai", "seal", "authorize", "unseal", "resume_ai"]
+        );
     }
 
     #[test]
@@ -1043,6 +1976,380 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), "from outside\n");
         });
         std::fs::remove_file(path).unwrap();
+    }
+
+    type CallLog = Arc<Mutex<Vec<&'static str>>>;
+
+    struct LoggingPrepared(CallLog);
+
+    impl PreparedUpdate for LoggingPrepared {
+        fn issue_ticket(
+            &mut self,
+            _: &RestartTicketSnapshot,
+            _: &dyn Fn() -> bool,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push("ticket");
+            Ok(())
+        }
+        fn authorize_exit(self: Box<Self>) -> Result<(), String> {
+            self.0.lock().unwrap().push("authorize");
+            Ok(())
+        }
+        fn abort(self: Box<Self>) {
+            self.0.lock().unwrap().push("abort");
+        }
+    }
+
+    struct LoggingAi(CallLog);
+
+    impl AiLifecycle for LoggingAi {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push("stop_ai");
+            Ok(())
+        }
+        fn resume(&self) -> AiResume {
+            self.0.lock().unwrap().push("resume_ai");
+            AiResume::Failed
+        }
+        fn poll_resume(&self) -> AiResume {
+            self.0.lock().unwrap().push("poll_resume");
+            AiResume::Failed
+        }
+    }
+
+    /// Stays in `Stopping` (never a handle), and counts the wait's polls.
+    struct NeverResumes(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl AiLifecycle for NeverResumes {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&self) -> AiResume {
+            AiResume::Stopping
+        }
+        fn poll_resume(&self) -> AiResume {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            AiResume::Stopping
+        }
+    }
+
+    /// The pending start failed: counts explicit resumes and polls.
+    struct FailsToStart {
+        resumes: std::sync::atomic::AtomicUsize,
+        polls: std::sync::atomic::AtomicUsize,
+        resume_result_is_stopping: bool,
+    }
+
+    impl AiLifecycle for FailsToStart {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&self) -> AiResume {
+            self.resumes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.resume_result_is_stopping {
+                AiResume::Stopping
+            } else {
+                AiResume::Failed
+            }
+        }
+        fn poll_resume(&self) -> AiResume {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            AiResume::Failed
+        }
+    }
+
+    #[gpui::test]
+    fn a_failed_pending_start_ends_the_wait_without_starting_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let ai = Arc::new(FailsToStart {
+            resumes: std::sync::atomic::AtomicUsize::new(0),
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            resume_result_is_stopping: true,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let lifecycle: Arc<dyn AiLifecycle> = ai.clone();
+        view.update(cx, |_, cx| spawn_ai_resume_wait(lifecycle, cx));
+        for _ in 0..50 {
+            cx.executor().advance_clock(AI_RESUME_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        let order = std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(ai.polls.load(order), 1, "the wait ends at the failure");
+        assert_eq!(ai.resumes.load(order), 0, "the wait never starts a service");
+    }
+
+    #[gpui::test]
+    fn an_immediate_start_failure_does_not_begin_a_wait(cx: &mut gpui::TestAppContext) {
+        let ai = Arc::new(FailsToStart {
+            resumes: std::sync::atomic::AtomicUsize::new(0),
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            resume_result_is_stopping: false,
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let lifecycle: Arc<dyn AiLifecycle> = ai.clone();
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        view.update(cx, |view, cx| {
+            let mut exit = ViewExit {
+                view,
+                cx,
+                prepared: None,
+                observation: &observation,
+                ticket: &ticket,
+                ai: Some(lifecycle),
+                ai_stopped: true,
+            };
+            exit.resume_ai();
+        });
+        for _ in 0..50 {
+            cx.executor().advance_clock(AI_RESUME_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        let order = std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(ai.resumes.load(order), 1, "one explicit resume");
+        assert_eq!(ai.polls.load(order), 0, "no wait after an immediate failure");
+    }
+
+    #[gpui::test]
+    fn the_ai_resume_wait_keeps_polling_past_the_old_limit(cx: &mut gpui::TestAppContext) {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let ai: Arc<dyn AiLifecycle> = Arc::new(NeverResumes(polls.clone()));
+        view.update(cx, |_, cx| spawn_ai_resume_wait(ai, cx));
+        // The old limit was 300 polls (about a minute); the clock is virtual,
+        // so going well past it costs no real time.
+        for _ in 0..400 {
+            cx.executor().advance_clock(AI_RESUME_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 300,
+            "the wait must outlive the old poll limit"
+        );
+    }
+
+    /// Runs the post-`Prepared` step after `change` altered the window once
+    /// the first check had passed, and returns what the helper/AI saw.
+    fn restart_after_change(
+        cx: &mut gpui::TestAppContext,
+        change: impl FnOnce(&mut EditorView),
+    ) -> (Vec<&'static str>, bool, Option<String>) {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let ai: Arc<dyn AiLifecycle> = Arc::new(LoggingAi(log.clone()));
+        view.update(cx, |view, _| view.attach_ai_lifecycle(Some(ai)));
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        view.update(cx, |view, _| {
+            view.restart_in_progress = true;
+            change(view);
+        });
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        let prepared: Box<dyn PreparedUpdate> = Box::new(LoggingPrepared(log.clone()));
+        view.update(cx, |view, cx| {
+            view.continue_update_restart(Ok(prepared), observation, ticket, cx);
+        });
+        let (frozen, message) = view.read_with(cx, |view, _| {
+            assert!(!view.restart_in_progress);
+            (view.restart_freeze_active(), view.restart_message.clone())
+        });
+        let calls = log.lock().unwrap().clone();
+        (calls, frozen, message)
+    }
+
+    #[gpui::test]
+    fn prompts_made_dirty_while_the_helper_prepared_abort_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, message) =
+            restart_after_change(cx, |view| view.ai_prompts.force_dirty_for_test());
+        assert_eq!(calls, ["abort"], "no ticket, AI stop or authorization");
+        assert!(!frozen, "the freeze must be released");
+        assert!(message.is_some_and(|m| m.contains("AIプロンプト")));
+    }
+
+    #[gpui::test]
+    fn ai_settings_made_dirty_while_the_helper_prepared_abort_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, message) =
+            restart_after_change(cx, |view| view.ai_settings.force_dirty_for_test());
+        assert_eq!(calls, ["abort"], "no ticket, AI stop or authorization");
+        assert!(!frozen, "the freeze must be released");
+        assert!(message.is_some_and(|m| m.contains("AI設定")));
+    }
+
+    #[gpui::test]
+    fn an_ai_operation_started_while_the_helper_prepared_aborts_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, message) =
+            restart_after_change(cx, |view| view.restart_test_ai_busy = true);
+        assert_eq!(calls, ["abort"], "no ticket, AI stop or authorization");
+        assert!(!frozen);
+        assert!(message.is_some_and(|m| m.contains("AIの処理")));
+    }
+
+    #[gpui::test]
+    fn an_open_that_started_while_the_helper_prepared_aborts_the_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (calls, frozen, _) = restart_after_change(cx, |view| {
+            view.loading_paths.insert(PathBuf::from("late.md"));
+        });
+        assert_eq!(calls, ["abort"]);
+        assert!(!frozen);
+    }
+
+    /// Stops the AI like [`LoggingAi`], and a Finder document arrives while it
+    /// waits (the UI thread is blocked, so nothing can drain the queue).
+    struct FinderOpenDuringStop {
+        log: CallLog,
+        inbox: SharedExternalOpenQueue,
+        path: PathBuf,
+    }
+
+    impl AiLifecycle for FinderOpenDuringStop {
+        fn stop(&self, _: Duration) -> Result<(), String> {
+            self.log.lock().unwrap().push("stop_ai");
+            self.inbox.push(self.path.clone());
+            Ok(())
+        }
+        fn resume(&self) -> AiResume {
+            self.log.lock().unwrap().push("resume_ai");
+            AiResume::Failed
+        }
+        fn poll_resume(&self) -> AiResume {
+            AiResume::Failed
+        }
+    }
+
+    #[gpui::test]
+    fn a_finder_open_received_while_the_ai_stops_keeps_the_app_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "hane-app-update-finder-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, "double clicked\n").unwrap();
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let inbox = SharedExternalOpenQueue::new();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        let ai: Arc<dyn AiLifecycle> = Arc::new(FinderOpenDuringStop {
+            log: log.clone(),
+            inbox: inbox.clone(),
+            path: path.clone(),
+        });
+        view.update(cx, |view, _| {
+            view.attach_ai_lifecycle(Some(ai));
+            view.attach_external_open_inbox(Some(inbox.clone()));
+        });
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        let prepared: Box<dyn PreparedUpdate> = Box::new(LoggingPrepared(log.clone()));
+        view.update(cx, |view, cx| {
+            view.restart_in_progress = true;
+            view.continue_update_restart(Ok(prepared), observation, ticket, cx);
+        });
+
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            !calls.contains(&"authorize"),
+            "the helper must not be released while a document is unhandled: {calls:?}"
+        );
+        assert!(calls.contains(&"abort"));
+        assert!(calls.contains(&"resume_ai"));
+        view.read_with(cx, |view, _| {
+            assert!(!view.restart_freeze_active(), "the user can retry");
+            assert!(!view.restart_in_progress);
+        });
+        assert_eq!(inbox.len(), 1, "the document is still waiting, not lost");
+
+        // Once the freeze is gone the waiting document opens in this process.
+        let accepted = view.update(cx, |view, cx| {
+            inbox.drain_into(|path| view.submit_external_open(path, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(accepted, 1);
+        assert!(inbox.is_empty());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "double clicked\n");
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Records what the sender of a Finder request sees while the helper is
+    /// being authorized (and, afterwards, just before the quit).
+    struct FinderOpenDuringAuthorize {
+        log: CallLog,
+        inbox: SharedExternalOpenQueue,
+        refused: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl PreparedUpdate for FinderOpenDuringAuthorize {
+        fn issue_ticket(
+            &mut self,
+            _: &RestartTicketSnapshot,
+            _: &dyn Fn() -> bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn authorize_exit(self: Box<Self>) -> Result<(), String> {
+            self.log.lock().unwrap().push("authorize");
+            if let Err(path) = self.inbox.try_push(PathBuf::from("during-authorize.md")) {
+                self.refused.lock().unwrap().push(path);
+            }
+            Ok(())
+        }
+        fn abort(self: Box<Self>) {
+            self.log.lock().unwrap().push("abort");
+        }
+    }
+
+    #[gpui::test]
+    fn a_finder_open_during_authorization_is_refused_to_the_sender_not_queued(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(Mutex::new(Vec::new()));
+        let inbox = SharedExternalOpenQueue::new();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        view.update(cx, |view, _| {
+            view.attach_external_open_inbox(Some(inbox.clone()));
+        });
+        let observation = match view.update(cx, |view, cx| view.prepare_update_restart(cx)) {
+            RestartPreparation::Clear(observation) => observation,
+            RestartPreparation::Blocked(_) => panic!("a clean window must be clear"),
+        };
+        let ticket = view.read_with(cx, |view, _| view.restart_ticket_snapshot());
+        let prepared: Box<dyn PreparedUpdate> = Box::new(FinderOpenDuringAuthorize {
+            log: log.clone(),
+            inbox: inbox.clone(),
+            refused: refused.clone(),
+        });
+        view.update(cx, |view, cx| {
+            view.restart_in_progress = true;
+            view.continue_update_restart(Ok(prepared), observation, ticket, cx);
+        });
+        assert_eq!(log.lock().unwrap().clone(), ["authorize"]);
+        assert_eq!(
+            refused.lock().unwrap().clone(),
+            vec![PathBuf::from("during-authorize.md")],
+            "the sender must get the request back to hand to the next process"
+        );
+        assert!(inbox.is_empty(), "nothing is stranded in the exiting process");
+        // Just before the quit (after authorization) the queue stays closed.
+        assert!(inbox.try_push(PathBuf::from("before-quit.md")).is_err());
     }
 
     #[gpui::test]

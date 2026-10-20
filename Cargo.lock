@@ -3156,11 +3156,20 @@ version = "0.26.0"
 dependencies = [
  "base64",
  "flate2",
+ "libc",
  "ring",
  "semver",
  "serde",
  "serde_json",
  "url",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "hane-updater"
+version = "0.26.0"
+dependencies = [
+ "hane-update",
 ]
 
 [[package]]

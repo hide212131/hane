@@ -28,8 +28,9 @@ pub use icons::{AppAssets, WorkFolderIcons};
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
 pub use view::{
-    AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView, ExternalOpenOutcome,
-    ExternalOpenQueue, RestartBlocker, RestartObservation, RestartPreparation,
+    AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
+    ExplorerRepairScope, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
+    RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
 };
 
 /// Tracks the settings component setup once per GPUI application.

@@ -11,6 +11,7 @@ members = [
     "crates/session",
     "crates/ui",
     "crates/update",
+    "crates/updater",
 ]
 resolver = "2"
 exclude = ["vendor/gpui", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows"]

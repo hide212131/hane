@@ -62,7 +62,7 @@ pub use session::{
 };
 pub use store::{
     FileStateStore, MemoryStateStore, RecentFiles, RecentFilesRepository, Settings,
-    SettingsRepository, StateStores, ThemePreference,
+    SettingsRepository, StateStores, ThemePreference, pin_state_root,
 };
 pub use workfolder::{
     OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderFolder, WorkFolderNode,

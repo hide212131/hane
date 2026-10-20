@@ -805,23 +805,44 @@ mod tests {
     #[test]
     fn call_times_out_and_a_late_response_is_dropped_not_delivered_to_a_new_call() {
         let handler = Arc::new(RejectAllServerRequests);
-        let (transport, mut server_write, mut server_read, events_rx, _closed) =
+        let (transport, mut server_write, server_read, events_rx, _closed) =
             spawn_transport_over_pipes(handler);
         let core = transport.handle();
 
+        let (timed_out_tx, timed_out_rx) = std::sync::mpsc::channel::<()>();
         let responder = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let n = server_read.read(&mut buf).unwrap();
-            let request: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            // A pipe `read` may return only part of a request (notably on
+            // Windows), so read each newline-delimited request as a full line.
+            let mut server_read = BufReader::new(server_read);
+            let mut line = String::new();
+            server_read.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(line.trim()).unwrap();
             let id = request["id"].clone();
-            // Reply only after the caller has already timed out.
-            thread::sleep(Duration::from_millis(150));
+            // Reply only after the caller has observed the timeout. Waiting on
+            // an explicit signal (not a sleep) keeps this independent of
+            // scheduling delays on loaded CI machines.
+            timed_out_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let resp = serde_json::json!({"id": id, "result": "late"});
+            writeln!(server_write, "{}", resp).unwrap();
+
+            // Then answer the subsequent call with its own response only.
+            line.clear();
+            server_read.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(line.trim()).unwrap();
+            let id = request["id"].clone();
+            let resp = serde_json::json!({"id": id, "result": "fresh"});
             writeln!(server_write, "{}", resp).unwrap();
         });
 
         let result = core.call("slow", None, Duration::from_millis(20));
         assert!(matches!(result, Err(RpcError::Timeout)));
+        timed_out_tx.send(()).unwrap();
+
+        // The late response must not satisfy the new call.
+        let second = core
+            .call("next", None, Duration::from_secs(10))
+            .expect("second call should receive its own response");
+        assert_eq!(second, Value::String("fresh".to_string()));
         responder.join().unwrap();
 
         match events_rx.recv_timeout(Duration::from_secs(5)).unwrap() {

@@ -37,7 +37,7 @@ use crate::testing::{
     default_payload, macos_entry, release_json, sign, sign_catalog, sign_with, test_now,
     test_policy, windows_release, windows_release_with,
 };
-use crate::trust::{SeenCatalog, SeenStore, TrustPolicy, TrustedKey};
+use crate::trust::{SeenCatalog, SeenStore, TrustPolicy};
 use crate::util::{parse_rfc3339_utc, sha256_hex};
 use crate::version::{
     VersionRelation, parse_current_version, parse_release_tag, parse_stable_version, relation,
@@ -555,6 +555,51 @@ fn candidate_is_not_ready_unless_the_sequence_floor_is_stored() {
 }
 
 #[test]
+fn concurrent_sequence_updates_never_lower_the_stored_floor() {
+    let dir = TempDir::new("seen-race");
+    let path = dir.path().join("receipts").join("seen-catalog.json");
+    let old = candidate(&windows_release(NEW_VERSION, 10, default_payload(NEW_VERSION)));
+    let new = candidate(&windows_release(NEW_VERSION, 11, default_payload(NEW_VERSION)));
+
+    // Process A holds the placement lock while it stores sequence 11; process B
+    // (a separate store on the same path) tries 10 and must wait for it.
+    let holder = FileSeenStore::new(path.clone());
+    let guard = holder.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let old = &old;
+        let other_path = path.clone();
+        scope.spawn(move || {
+            let mut other = FileSeenStore::new(other_path);
+            tx.send(record_seen(&mut other, old)).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the stale writer must wait for the lock"
+        );
+        let mut writer = FileSeenStore::new(path.clone());
+        writer
+            .store(&SeenCatalog::new(11, new.catalog_sha256().to_owned()))
+            .unwrap();
+        drop(guard);
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(code(result), ErrorCode::SequenceRegression);
+    });
+    let stored = FileSeenStore::new(path).load().unwrap().unwrap();
+    assert_eq!(stored.sequence, 11);
+}
+
+#[test]
+fn sequence_locks_of_different_installs_do_not_block_each_other() {
+    let dir = TempDir::new("seen-installs");
+    let first = FileSeenStore::new(dir.path().join("a").join("seen-catalog.json"));
+    let _held = first.lock().unwrap();
+    let mut second = FileSeenStore::new(dir.path().join("b").join("seen-catalog.json"));
+    let release = windows_release(NEW_VERSION, 10, default_payload(NEW_VERSION));
+    record_seen(&mut second, &candidate(&release)).unwrap();
+}
+
+#[test]
 fn file_seen_store_round_trips_and_rejects_corruption() {
     let dir = TempDir::new("seen");
     let path = dir.path().join("seen-catalog.json");
@@ -568,7 +613,7 @@ fn file_seen_store_round_trips_and_rejects_corruption() {
 }
 
 #[test]
-fn macos_candidates_need_the_pinned_identity() {
+fn macos_candidates_need_the_update_key_and_bundle_identity_but_no_apple_identity() {
     let zip = build_zip(&[ZipEntry::file("hane-macos-arm64/README.md", b"x")]);
     let verify = |entry: crate::model::TargetEntry, policy: &TrustPolicy| {
         let doc = catalog_doc(NEW_VERSION, 3, Target::MacosArm64, entry);
@@ -583,28 +628,26 @@ fn macos_candidates_need_the_pinned_identity() {
             None,
         )
     };
-    let good = macos_entry(NEW_VERSION, &zip, 1);
+    let good = macos_entry(NEW_VERSION, &zip, 1, b"inventory");
+    // No Apple Developer ID, Team ID or notarization is needed.
     assert!(verify(good.clone(), &test_policy()).unwrap().is_applicable());
+    assert_eq!(
+        code(verify(good.clone(), &TrustPolicy::production())),
+        ErrorCode::TrustUnconfigured
+    );
 
-    let keys = vec![TrustedKey {
-        key_id: crate::testing::TEST_KEY_ID.to_string(),
-        public_key: crate::testing::public_key(1),
-    }];
-    let no_team = TrustPolicy::new(keys, None);
-    assert_eq!(code(verify(good.clone(), &no_team)), ErrorCode::TrustUnconfigured);
-
-    let mut other_team = good.clone();
-    other_team.team_id = Some("EVILTEAM99".into());
-    assert_eq!(code(verify(other_team, &test_policy())), ErrorCode::IdentityMismatch);
+    let mut with_team = good.clone();
+    with_team.team_id = Some("EVILTEAM99".into());
+    assert_eq!(code(verify(with_team, &test_policy())), ErrorCode::MalformedMetadata);
     let mut other_bundle = good.clone();
     other_bundle.bundle_id = Some("com.example.fake".into());
     assert_eq!(code(verify(other_bundle, &test_policy())), ErrorCode::IdentityMismatch);
     let mut other_version = good.clone();
     other_version.bundle_version = Some("9.9.9".into());
     assert_eq!(code(verify(other_version, &test_policy())), ErrorCode::IdentityMismatch);
-    let mut with_inventory = good;
-    with_inventory.inventory_sha256 = Some(sha256_hex(b"x"));
-    assert_eq!(code(verify(with_inventory, &test_policy())), ErrorCode::MalformedMetadata);
+    let mut no_inventory = good;
+    no_inventory.inventory_sha256 = None;
+    assert_eq!(code(verify(no_inventory, &test_policy())), ErrorCode::MalformedMetadata);
 }
 
 #[test]
@@ -1578,6 +1621,11 @@ fn macos_zip(extra: Vec<ZipEntry>, with_helper: bool) -> Vec<u8> {
         ZipEntry::dir("hane-macos-arm64/Hane.app/"),
         ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Info.plist", b"plist"),
         ZipEntry::file("hane-macos-arm64/Hane.app/Contents/MacOS/hane", b"bin").executable(),
+        ZipEntry::file("hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json", b"{}"),
+        ZipEntry::file(
+            "hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json.sig",
+            b"{}",
+        ),
         ZipEntry::file("hane-macos-arm64/README.md", b"readme"),
     ];
     if with_helper {
@@ -1673,6 +1721,58 @@ fn install_id_depends_on_every_fact() {
     assert!(InstallId::parse("XYZ").is_err());
     assert!(InstallId::parse(id.as_str()).is_ok());
     assert_ne!(TransactionId::generate().unwrap(), TransactionId::generate().unwrap());
+}
+
+#[test]
+fn install_path_text_keeps_unicode_and_rejects_lossy_paths() {
+    use std::path::Path;
+    assert_eq!(
+        crate::identity::install_path_text(Path::new("/Applications/Hane.app")).unwrap(),
+        "/Applications/Hane.app"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn distinct_invalid_byte_paths_never_share_an_install_id() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    let a = Path::new(OsStr::from_bytes(b"/Apps/\xff/Hane.app"));
+    let b = Path::new(OsStr::from_bytes(b"/Apps/\xfe/Hane.app"));
+    // The lossy form collides; the contract must reject instead of adopting it.
+    assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+    assert_eq!(
+        code(crate::identity::install_path_text(a)),
+        ErrorCode::UnsupportedInstall
+    );
+    assert_eq!(
+        code(crate::identity::install_path_text(b)),
+        ErrorCode::UnsupportedInstall
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn distinct_invalid_utf16_paths_never_share_an_install_id() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+    let wide = |unit: u16| {
+        let mut units: Vec<u16> = "C:\\Apps\\".encode_utf16().collect();
+        units.push(unit);
+        PathBuf::from(OsString::from_wide(&units))
+    };
+    let (a, b) = (wide(0xD800), wide(0xD801));
+    assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+    assert_eq!(
+        code(crate::identity::install_path_text(&a)),
+        ErrorCode::UnsupportedInstall
+    );
+    assert_eq!(
+        code(crate::identity::install_path_text(&b)),
+        ErrorCode::UnsupportedInstall
+    );
 }
 
 fn old_payload() -> Vec<ZipEntry> {
@@ -2039,6 +2139,113 @@ fn file_journal_store_round_trips_and_rejects_bad_files() {
     assert_eq!(code(store.load()), ErrorCode::LimitExceeded);
 }
 
+/// Index of a step that replaces an existing file (so it owns a backup path).
+fn replacing_step(world: &World) -> usize {
+    world
+        .plan
+        .steps
+        .iter()
+        .position(|s| s.old.is_some() && s.backup_rel.is_some())
+        .expect("plan has a replacing step")
+}
+
+#[test]
+fn journal_begin_pins_the_backup_path_to_the_step_namespace() {
+    let world = world();
+    let index = replacing_step(&world);
+    let step = &world.plan.steps[index];
+    assert_eq!(step.backup_rel.as_deref(), Some(format!("backup/{}", step.rel_path).as_str()));
+    // The canonical `backup/<rel_path>` is accepted.
+    UpdateJournal::begin(&world.plan, None).unwrap();
+
+    let other = format!("backup/{}-other", step.rel_path);
+    for bad in ["user.md", "backup/other.bin", other.as_str(), "backup", "backup/"] {
+        let mut plan = world.plan.clone();
+        plan.steps[index].backup_rel = Some(bad.to_string());
+        let result = UpdateJournal::begin(&plan, None);
+        let error = result.err().unwrap_or_else(|| panic!("backup {bad:?} was accepted"));
+        assert!(
+            matches!(error.code, ErrorCode::JournalInvalid | ErrorCode::ArchiveRejected),
+            "{bad:?}: {error}"
+        );
+    }
+    // Rejection is exact for a well-formed path outside the step's namespace.
+    let mut plan = world.plan.clone();
+    plan.steps[index].backup_rel = Some("user.md".to_string());
+    assert_eq!(code(UpdateJournal::begin(&plan, None)), ErrorCode::JournalInvalid);
+    plan.steps[index].backup_rel = Some("backup/other.bin".to_string());
+    assert_eq!(code(UpdateJournal::begin(&plan, None)), ErrorCode::JournalInvalid);
+
+    // A step without an old file must not carry a backup path.
+    let mut plan = world.plan.clone();
+    plan.steps[index].old = None;
+    assert_eq!(code(UpdateJournal::begin(&plan, None)), ErrorCode::JournalInvalid);
+}
+
+#[test]
+fn durable_journal_create_rejects_a_foreign_backup_path_and_stores_nothing() {
+    let world = world();
+    let index = replacing_step(&world);
+    let mut tampered = journal(&world);
+    tampered.steps[index].backup_rel = Some("user.md".to_string());
+
+    let store = FaultyJournalStore::default();
+    assert_eq!(
+        code(DurableJournal::create(store.clone(), tampered.clone())),
+        ErrorCode::JournalInvalid
+    );
+    assert!(store.stored().is_none());
+
+    let dir = TempDir::new("journal-backup-create");
+    let user_file = dir.path().join("user.md");
+    fs::write(&user_file, b"user data").unwrap();
+    let path = dir.path().join("journal.json");
+    assert_eq!(
+        code(DurableJournal::create(FileJournalStore::new(path.clone()), tampered)),
+        ErrorCode::JournalInvalid
+    );
+    assert!(!path.exists());
+    assert_eq!(fs::read(&user_file).unwrap(), b"user data");
+}
+
+#[test]
+fn reopening_a_journal_with_a_tampered_backup_path_is_rejected() {
+    let world = world();
+    let index = replacing_step(&world);
+    let dir = TempDir::new("journal-backup-open");
+    let user_file = dir.path().join("user.md");
+    fs::write(&user_file, b"user data").unwrap();
+    let path = dir.path().join("journal.json");
+
+    let good = journal(&world);
+    let mut store = FileJournalStore::new(path.clone());
+    store.store(&good).unwrap();
+    assert_eq!(
+        DurableJournal::open(FileJournalStore::new(path.clone())).unwrap().unwrap().journal(),
+        &good
+    );
+
+    let mut foreign = good.clone();
+    foreign.steps[index].backup_rel = Some("user.md".to_string());
+    let mut other_namespace = good.clone();
+    other_namespace.steps[index].backup_rel = Some("backup/other.bin".to_string());
+    let mut no_old = good.clone();
+    no_old.steps[index].old = None;
+    for (name, tampered) in [
+        ("foreign path", foreign),
+        ("other namespace", other_namespace),
+        ("backup without old", no_old),
+    ] {
+        // Write the bytes directly: `store` would refuse an invalid journal.
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let loaded = FileJournalStore::new(path.clone()).load();
+        assert_eq!(code(loaded), ErrorCode::JournalInvalid, "{name}");
+        let opened = DurableJournal::open(FileJournalStore::new(path.clone()));
+        assert_eq!(code(opened), ErrorCode::JournalInvalid, "{name}");
+        assert_eq!(fs::read(&user_file).unwrap(), b"user data", "{name}");
+    }
+}
+
 #[test]
 fn fs_disk_view_observes_identity_without_following_links() {
     let dir = TempDir::new("disk");
@@ -2207,6 +2414,57 @@ fn unknown_content_or_damaged_backups_stop_recovery_without_guessing() {
             matches!(decide(&world, &journal, &disk), RecoveryDecision::RecoveryRequired(_)),
             "{damage:?}"
         );
+    }
+}
+
+#[test]
+fn a_stop_between_move_aside_and_link_in_restores_the_backup() {
+    // Windows displaces the verified file before linking the new one in. A stop
+    // in between leaves the pathname absent; the verified backup restores it.
+    let world = world();
+    let last = world.plan.steps.len() - 1;
+    let step = &world.plan.steps[last];
+    assert_eq!(step.rel_path, "hane.exe");
+    let backup = step.backup_rel.clone().unwrap();
+    for phase in [Phase::Applying, Phase::AwaitingHealth, Phase::RollingBack] {
+        let mut journal = journal(&world);
+        journal.phase = phase;
+        journal.steps[last].state = StepState::Intent;
+        let mut disk = world.old_disk();
+        disk.remove("hane.exe");
+        let RecoveryDecision::RollBack { actions, .. } = decide(&world, &journal, &disk) else {
+            panic!("a missing file with an intact backup must roll back ({phase:?})");
+        };
+        assert_eq!(
+            actions,
+            vec![RollbackAction::RestoreFromBackup {
+                rel_path: "hane.exe".to_string(),
+                backup_rel: backup.clone(),
+                restore: step.old.clone().unwrap(),
+                expected_current: None,
+            }]
+        );
+
+        // A missing or damaged backup is never guessed at.
+        for damage in [None, Some(&b"damaged"[..])] {
+            let mut broken = disk.clone();
+            match damage {
+                None => broken.remove(&backup),
+                Some(bytes) => broken.set(&backup, bytes),
+            }
+            assert!(matches!(
+                decide(&world, &journal, &broken),
+                RecoveryDecision::RecoveryRequired(_)
+            ));
+        }
+
+        // Third-party content at the path is still protected.
+        let mut foreign = disk.clone();
+        foreign.set("hane.exe", b"neither old nor new");
+        assert!(matches!(
+            decide(&world, &journal, &foreign),
+            RecoveryDecision::RecoveryRequired(_)
+        ));
     }
 }
 

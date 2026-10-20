@@ -16,9 +16,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{durable_write, hash_regular_file_under, read_limited};
-use crate::identity::{ApplyPlan, FileIdentity, InstallId, ReleaseIdentity, TransactionId};
+use crate::identity::{
+    ApplyPlan, FileIdentity, InstallId, ReleaseIdentity, TransactionId, UnchangedFile,
+};
 use crate::limits::{MAX_ENTRIES, MAX_JOURNAL_BYTES};
-use crate::paths::validate_rel_path;
+use crate::paths::{collision_key, validate_rel_path};
 use crate::util::{is_sha256_hex, parse_strict};
 
 pub const JOURNAL_SCHEMA: u64 = 1;
@@ -100,6 +102,12 @@ pub struct UpdateJournal {
     pub ticket_sha256: Option<String>,
     pub phase: Phase,
     pub steps: Vec<JournalStep>,
+    /// Owned files the update leaves in place, with the identities fixed from
+    /// the signed inventory. They must hold these identities at every point
+    /// the install is accepted (before health, at commit, and in receipts).
+    /// The key is always written, even when empty, and a journal without it is
+    /// rejected: a missing list is never read as "nothing to verify".
+    pub unchanged: Vec<UnchangedFile>,
     /// Incremented on every durable update; detects a stale writer.
     pub generation: u64,
 }
@@ -126,6 +134,7 @@ impl UpdateJournal {
                     state: StepState::Planned,
                 })
                 .collect(),
+            unchanged: plan.unchanged.clone(),
             generation: 0,
         };
         journal.validate()?;
@@ -156,16 +165,49 @@ impl UpdateJournal {
             if step.old.is_none() && step.new.is_none() {
                 return invalid("step changes nothing");
             }
-            if let Some(backup) = &step.backup_rel {
-                validate_rel_path(backup)?;
-            }
-            if step.old.is_some() && step.backup_rel.is_none() {
-                return invalid("step replaces a file without a backup");
+            match (&step.old, &step.backup_rel) {
+                (Some(_), Some(backup)) => {
+                    validate_rel_path(backup)?;
+                    if backup != &format!("backup/{}", step.rel_path) {
+                        return invalid("step backup is not its own backup path");
+                    }
+                }
+                (Some(_), None) => {
+                    return invalid("step replaces a file without a backup");
+                }
+                (None, Some(_)) => {
+                    return invalid("step without an old file has a backup");
+                }
+                (None, None) => {}
             }
             for id in [&step.old, &step.new].into_iter().flatten() {
                 if !is_sha256_hex(&id.sha256) {
                     return invalid("step hash is not SHA-256 hex");
                 }
+            }
+        }
+        if self.unchanged.len() > MAX_ENTRIES {
+            return invalid("too many unchanged files");
+        }
+        // Every owned path appears once, whether changed or not.
+        let mut seen = std::collections::BTreeSet::new();
+        for path in self
+            .steps
+            .iter()
+            .map(|step| step.rel_path.as_str())
+            .chain(self.unchanged.iter().map(|file| file.rel_path.as_str()))
+        {
+            if !seen.insert(collision_key(path)) {
+                return invalid("a path is listed more than once");
+            }
+        }
+        for file in &self.unchanged {
+            validate_rel_path(&file.rel_path)?;
+            if file.rel_path.starts_with("backup/") {
+                return invalid("an unchanged file lives in the backup area");
+            }
+            if !is_sha256_hex(&file.identity.sha256) {
+                return invalid("unchanged file hash is not SHA-256 hex");
             }
         }
         Ok(())
@@ -374,12 +416,27 @@ impl DiskView for FsDiskView {
     }
 }
 
-fn identity_matches(observed: &Observed, expected: &Option<FileIdentity>) -> bool {
+pub(crate) fn identity_matches(observed: &Observed, expected: &Option<FileIdentity>) -> bool {
     match (observed, expected) {
         (Observed::Missing, None) => true,
         (Observed::File(actual), Some(wanted)) => actual == wanted,
         _ => false,
     }
+}
+
+/// The first journaled unchanged file whose live state is not its recorded
+/// identity. An observation failure is an error, never a match.
+pub(crate) fn first_unchanged_mismatch<'a>(
+    journal: &'a UpdateJournal,
+    disk: &dyn DiskView,
+) -> Result<Option<&'a str>> {
+    for file in &journal.unchanged {
+        let observed = disk.observe(&file.rel_path)?;
+        if !identity_matches(&observed, &Some(file.identity.clone())) {
+            return Ok(Some(file.rel_path.as_str()));
+        }
+    }
+    Ok(None)
 }
 
 /// Every step must still be at its pre-update identity (and an added file's
@@ -478,12 +535,17 @@ pub fn decide_recovery(
         Phase::RecoveryRequired => Ok(required("an earlier recovery did not complete")),
         Phase::Committed => {
             for step in &journal.steps {
-                if classify(step, disk)? != StepDisk::New {
+                if !identity_matches(&disk.observe(&step.rel_path)?, &step.new) {
                     return Ok(required(format!(
                         "committed update does not match the disk at {}",
                         step.rel_path
                     )));
                 }
+            }
+            if let Some(path) = first_unchanged_mismatch(journal, disk)? {
+                return Ok(required(format!(
+                    "committed update does not match the disk at unchanged {path}"
+                )));
             }
             Ok(RecoveryDecision::KeepNew)
         }
@@ -496,6 +558,11 @@ pub fn decide_recovery(
                     )));
                 }
             }
+            if let Some(path) = first_unchanged_mismatch(journal, disk)? {
+                return Ok(required(format!(
+                    "{path} changed although no update was applied"
+                )));
+            }
             Ok(RecoveryDecision::KeepOld)
         }
         Phase::Applying | Phase::AwaitingHealth | Phase::RollingBack => {
@@ -504,6 +571,24 @@ pub fn decide_recovery(
                 match classify(step, disk)? {
                     StepDisk::Old => {}
                     StepDisk::Unknown => {
+                        // Windows replaces a verified file in two steps (move the
+                        // verified file aside, then link the new one in). A stop
+                        // between them leaves the pathname absent while the
+                        // verified backup still holds the old content. Absence
+                        // is the only extra state accepted; any other content is
+                        // a third party's and stops recovery.
+                        if let (Some(old), Some(backup_rel)) = (&step.old, &step.backup_rel)
+                            && disk.observe(&step.rel_path)? == Observed::Missing
+                            && disk.observe(backup_rel)? == Observed::File(old.clone())
+                        {
+                            actions.push(RollbackAction::RestoreFromBackup {
+                                rel_path: step.rel_path.clone(),
+                                backup_rel: backup_rel.clone(),
+                                restore: old.clone(),
+                                expected_current: None,
+                            });
+                            continue;
+                        }
                         return Ok(required(format!(
                             "{} matches neither the old nor the new content",
                             step.rel_path
@@ -541,6 +626,13 @@ pub fn decide_recovery(
                 }
             }
             if actions.is_empty() {
+                // Only an install that is wholly at the old version, including
+                // the files the update never touches, is kept.
+                if let Some(path) = first_unchanged_mismatch(journal, disk)? {
+                    return Ok(required(format!(
+                        "{path} changed during the update and is not the signed file"
+                    )));
+                }
                 Ok(RecoveryDecision::KeepOld)
             } else {
                 Ok(RecoveryDecision::RollBack {
