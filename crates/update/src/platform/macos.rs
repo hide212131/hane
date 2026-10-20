@@ -630,7 +630,11 @@ mod tests {
         let mount = volume_mount_point(&inner).unwrap();
         let mount = Path::new(std::ffi::OsStr::from_bytes(mount.to_bytes()));
         assert!(mount.is_absolute());
-        assert!(inner.canonicalize().unwrap().starts_with(mount));
+        // firmlink等の別名pathは文字列prefixで比較できないため、volume identityで確かめる。
+        assert_eq!(
+            fs::metadata(mount).unwrap().dev(),
+            fs::metadata(&inner).unwrap().dev()
+        );
         // The query on the inner path succeeds only through the volume root.
         assert!(volume_uuid(&inner).is_ok());
     }
