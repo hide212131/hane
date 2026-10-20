@@ -1,0 +1,4 @@
+# Release / CI tooling for scripts/release_catalog.py. The Ed25519 implementation
+# is the maintained `cryptography` package; Hane adds no cryptography of its own.
+# CI and the release workflows install this one file so both use the same version.
+cryptography==50.0.2

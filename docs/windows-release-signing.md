@@ -28,6 +28,32 @@ GitHub の `hide212131/hane` → **Settings** → **Secrets and variables** → 
 
 ## リリース
 
-新しいリリースではCargoのパッケージバージョンを未使用のバージョンへ更新してmainに反映するか、そのバージョンのタグを作成する。`Release builds` ワークフローがWindows/macOSをビルドし、両方成功した場合だけGitHub ReleaseのZIPを公開する。公開後、Windows ZIPに上記4ファイルがあり、MSIX署名の拇印が新しい証明書と一致することを確認する。
+新しいリリースではCargoのパッケージバージョンを未使用のバージョンへ更新してmainに反映するか、そのバージョンのタグを作成する。`Release builds` ワークフローがWindows/macOSをビルドし、両方成功した場合だけGitHub ReleaseのZIPを公開する。
+
+Windows ZIPには `hane.exe`、`hane-updater.exe`、署名済み `Hane.ShellIntegration.msix`、公開証明書 `Hane.ShellIntegration.cer`、`Trust-HaneShellCertificate.ps1`、`shell-integration/<バージョン>/hane_shell_extension.dll`、署名付き `hane-install.json` を含める。`build-windows` はZIPを再展開し、MSIXのAuthenticode状態が `Valid` で署名者が同梱の公開証明書と一致すること、MSIXのmanifest版・COMクラスのDLLパス・DLLの版別ディレクトリが一致すること、`hane-install.json` がZIP内の所有ファイルをsize/hash付きで網羅することを確認する。検証のために公開証明書をrunnerの `LocalMachine\Root` へ一時的に登録し、検証後に削除する（配布先PCの信頼登録とは無関係）。
+
+## 更新用の署名資格情報（保守者が設定する値）
+
+次の値は保守者だけが設定する。値を推測・生成・commitしない。`prepare` は**存在の真偽値だけ**を評価し、値は署名を行うstepにだけ渡る。1つでも欠けるとリリースは失敗し、未署名のReleaseは作られない。Apple Developer ID・Team ID・notarization・stapleに関する設定は不要で、未設定でもmacOS ZIPの作成やWindows配布は止まらない。macOS ZIPの信頼根拠は、更新用Ed25519鍵で署名した `Hane.app/Contents/Resources/hane-install.json` と、catalogの `inventory_sha256` である。
+
+| 種別 | 名前 | 用途 |
+|---|---|---|
+| secret | `HANE_UPDATE_SIGNING_KEY_BASE64` | Hane更新専用Ed25519鍵の32バイト秘密鍵（Base64）。inventory・catalogの署名step専用。Codex runtime catalogの鍵とは共用しない |
+| variable | `HANE_UPDATE_KEY_ID` | 署名ファイルの `key_id`（英数字と `.` `_` `-`、64文字以内） |
+| variable | `HANE_UPDATE_PUBLIC_KEY_BASE64` | 上記秘密鍵に対応する公開鍵32バイト（Base64）。本体へ埋め込まれ、署名step・検証が秘密鍵との一致を確認する |
+| secret | `HANE_MSIX_PFX_BASE64`, `HANE_MSIX_PFX_PASSWORD` | 前節のMSIX署名用PFX |
+
+公開鍵はビルド時の環境変数として `crates/update` の `TrustPolicy::production()` に埋め込まれる。未設定・不正な値の場合は何も埋め込まれず、更新候補は `trust_unconfigured` で拒否される。
+
+## 更新catalogの発行と順序
+
+`release` ジョブは全入口（main push、tag push、手動dispatch、release-request）で共通のconcurrency group `hane-release-publish` に入り、次を直列に行う。
+
+1. 既存のtag/Releaseを読み、Releaseまたはtagが既にあれば停止する（tag pushで作られたtagだけ例外）。versionが既存の最新stableより新しくなければ停止し、古い版に最新ラベルを付けない。
+2. 公開済みReleaseのcatalogを全て取得して署名・schema・repository・channelを検証し、最大の `catalog_sequence` + 1 を採番する。取得・権限・解析・検証の失敗は「初回」と見なさず失敗する。公開済みcatalogが無い最初のリリースだけ、`workflow_dispatch` の `initial_catalog` を明示して sequence 1 を発行する（自動起動では初回扱いにならないため、最初の対応版はこの入力を付けて手動起動する）。重複・u64溢れも失敗する。
+3. 実ZIPのサイズ・SHA-256・unpacked size・inventory hash・bundle IDから `hane-update.json` を生成し、署名する。
+4. Draftを作り、4アセットをuploadし、再取得して同じ検証（署名、版、source SHA、target、ZIP hash、inventory、bundle metadata）を行う。成功した場合だけstableへ公開し、公開後にもう一度検証する。検証に失敗したDraftは削除され、既存のtag/Release/assetは上書きしない。
+
+期限更新だけの再署名や秘密鍵のローテーションはこの自動処理の対象外で、保守者が明示的に行う。この基盤だけでは実署名・二版更新の実機確認は完了しない（Issue #510のU5）。
 
 自己署名証明書なので、配布先のWindows 11ではREADMEに従って**新しい公開証明書**を `LocalMachine\TrustedPeople` に信頼登録する必要がある。配布先で秘密鍵を作成・配布する必要はない。旧証明書の信頼や旧パッケージはこの作業で自動削除しない。

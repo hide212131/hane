@@ -21,11 +21,11 @@ pub struct TrustedKey {
 /// Embedded trust material: the Ed25519 update public keys. Both targets use
 /// them; no Apple identity (Developer ID, Team ID, notarization) is part of it.
 ///
-/// [`TrustPolicy::production`] intentionally contains nothing. Until a
-/// maintainer embeds the real public key in a dedicated change, every
-/// verification fails with `trust_unconfigured`, so no candidate can be made
-/// applicable. The unknown key IDs in a fetched signature file are never
-/// auto-registered.
+/// [`TrustPolicy::production`] embeds only the key supplied to the release
+/// build through `HANE_UPDATE_KEY_ID` and `HANE_UPDATE_PUBLIC_KEY_BASE64`
+/// (raw 32-byte Ed25519 key). A build without both values, or with malformed
+/// values, embeds no key; verification then fails closed with `trust_unconfigured`.
+/// The unknown key IDs in a fetched signature file are never auto-registered.
 #[derive(Debug, Clone, Default)]
 pub struct TrustPolicy {
     keys: Vec<TrustedKey>,
@@ -33,7 +33,37 @@ pub struct TrustPolicy {
 
 impl TrustPolicy {
     pub fn production() -> Self {
-        Self::default()
+        Self::from_embedded(
+            option_env!("HANE_UPDATE_KEY_ID"),
+            option_env!("HANE_UPDATE_PUBLIC_KEY_BASE64"),
+        )
+    }
+
+    /// Fail-closed construction from build-time values: missing or malformed
+    /// values yield no key instead of a guessed default.
+    pub fn from_embedded(key_id: Option<&str>, public_key_base64: Option<&str>) -> Self {
+        let key = match (key_id, public_key_base64) {
+            (Some(id), Some(encoded))
+                if !id.is_empty()
+                    && id.len() <= 64
+                    && id.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+                    }) =>
+            {
+                STANDARD
+                    .decode(encoded.trim())
+                    .ok()
+                    .and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
+                    .map(|public_key| TrustedKey {
+                        key_id: id.to_string(),
+                        public_key,
+                    })
+            }
+            _ => None,
+        };
+        Self {
+            keys: key.into_iter().collect(),
+        }
     }
 
     pub fn new(keys: Vec<TrustedKey>) -> Self {
@@ -113,6 +143,30 @@ pub fn verify_signature(
         "signature key is not trusted"
     };
     Err(UpdateError::new(ErrorCode::SignatureInvalid, detail))
+}
+
+#[cfg(test)]
+mod embedded_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_values_must_be_complete_and_well_formed() {
+        let key = STANDARD.encode([7u8; 32]);
+        let ok = TrustPolicy::from_embedded(Some("hane-2026"), Some(&key));
+        assert!(ok.is_configured());
+
+        for (id, key_b64) in [
+            (None, Some(key.as_str())),
+            (Some("hane-2026"), None),
+            (Some(""), Some(key.as_str())),
+            (Some("bad id"), Some(key.as_str())),
+            (Some("hane-2026"), Some("not base64!")),
+        ] {
+            assert!(!TrustPolicy::from_embedded(id, key_b64).is_configured());
+        }
+        let short = STANDARD.encode([7u8; 31]);
+        assert!(!TrustPolicy::from_embedded(Some("k"), Some(&short)).is_configured());
+    }
 }
 
 /// Highest catalog sequence already verified for this installation.

@@ -16,6 +16,11 @@ on:
         description: "Expected commit SHA for an automated release dispatch"
         required: false
         type: string
+      initial_catalog:
+        description: "最初の更新catalog(sequence 1)を発行する。公開済みcatalogが無いときだけ明示的に指定する"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -76,26 +81,26 @@ jobs:
             exit 1
           fi
 
-          tag_exists=false
-          latest_tag=""
-          if [ "${{ github.ref_type }}" != "tag" ]; then
-            tag_names_file="$(mktemp)"
-            trap 'rm -f "$tag_names_file"' EXIT
-            if ! gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
-              --jq '.[].name' > "$tag_names_file"; then
-              echo "Failed to read repository tags; refusing to release." >&2
-              exit 1
-            fi
-
-            if grep -Fxq -- "$release_tag" "$tag_names_file"; then
-              tag_exists=true
-            fi
-            latest_tag="$(
-              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' "$tag_names_file" |
-                sort -V |
-                tail -n 1 || true
-            )"
+          # Every entry path (branch push, dispatch, tag push, a re-run of an
+          # existing tag) must prove the version is not older than the latest.
+          tag_names_file="$(mktemp)"
+          trap 'rm -f "$tag_names_file"' EXIT
+          if ! gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
+            --jq '.[].name' > "$tag_names_file"; then
+            echo "Failed to read repository tags; refusing to release." >&2
+            exit 1
           fi
+
+          tag_exists=false
+          if grep -Fxq -- "$release_tag" "$tag_names_file"; then
+            tag_exists=true
+          fi
+          latest_tag="$(
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' "$tag_names_file" |
+              grep -Fxv -- "$release_tag" |
+              sort -V |
+              tail -n 1 || true
+          )"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$tag_exists" = true ]; then
             echo "Tag already exists: $release_tag" >&2
@@ -110,7 +115,7 @@ jobs:
             should_release=false
           fi
 
-          if [ "$should_release" = true ] && [ "${{ github.ref_type }}" != "tag" ]; then
+          if [ "$should_release" = true ]; then
             if [ -n "$latest_tag" ] && [ "$(printf '%s\n%s\n' "$latest_tag" "$release_tag" | sort -V | tail -n 1)" != "$release_tag" ]; then
               echo "Release version $release_tag must be newer than latest tag $latest_tag." >&2
               exit 1
@@ -120,22 +125,76 @@ jobs:
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
 
+      # Only presence booleans are evaluated here; no secret value reaches this
+      # step. A missing credential fails the release instead of skipping it, and
+      # nothing in the pipeline invents a substitute key or certificate.
+      - name: Require release signing configuration
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        env:
+          HAS_HANE_UPDATE_SIGNING_KEY_BASE64: ${{ secrets.HANE_UPDATE_SIGNING_KEY_BASE64 != '' }}
+          HAS_HANE_UPDATE_KEY_ID: ${{ vars.HANE_UPDATE_KEY_ID != '' }}
+          HAS_HANE_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.HANE_UPDATE_PUBLIC_KEY_BASE64 != '' }}
+          HAS_HANE_MSIX_PFX_BASE64: ${{ secrets.HANE_MSIX_PFX_BASE64 != '' }}
+          HAS_HANE_MSIX_PFX_PASSWORD: ${{ secrets.HANE_MSIX_PFX_PASSWORD != '' }}
+        run: |
+          set -euo pipefail
+          missing=()
+          while IFS='=' read -r name value; do
+            case "$name" in
+              HAS_*) [ "$value" = true ] || missing+=("${name#HAS_}") ;;
+            esac
+          done < <(env | sort)
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Release signing configuration is incomplete; refusing to publish an unsigned or partially signed release." >&2
+            printf 'Missing: %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
   build-windows:
     name: Build hane-windows-x64
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      HANE_SOURCE_SHA: ${{ github.sha }}
+      HANE_UPDATE_KEY_ID: ${{ vars.HANE_UPDATE_KEY_ID }}
+      HANE_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.HANE_UPDATE_PUBLIC_KEY_BASE64 }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install release tooling
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install release tooling requirements
+        shell: bash
+        run: python -m pip install -r scripts/release-requirements.txt
 
       - name: Install Rust toolchain
         run: rustup show
 
+      # Unit tests assert that an unconfigured build embeds no trust, so they
+      # run without the production public key.
       - name: Run workspace tests
+        env:
+          HANE_UPDATE_KEY_ID: ""
+          HANE_UPDATE_PUBLIC_KEY_BASE64: ""
         run: cargo test --workspace --locked
 
-      - name: Build release binary
-        run: cargo build --release --locked -p hane
+      - name: Build release binaries
+        run: cargo build --release --locked -p hane -p hane-updater
+
+      - name: Verify helper identity in the built executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py binary-identity \
+            --binary target/release/hane-updater.exe \
+            --version "${RELEASE_TAG#v}" --target x86_64-pc-windows-msvc \
+            --source-sha "$HANE_SOURCE_SHA"
 
       - name: Prepare Windows Explorer package signing certificate
         shell: pwsh
@@ -184,24 +243,74 @@ jobs:
             -ExePath target/release/hane.exe -Architecture x64 `
             -CertificateThumbprint $env:HANE_MSIX_CERT_THUMBPRINT
 
-      - name: Package portable zip
+      - name: Stage Windows update layout
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $staging = "staging/hane-windows-x64"
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          foreach ($file in @('hane.exe', 'hane_shell_extension.dll', 'Hane.ShellIntegration.msix', 'Hane.ShellIntegration.cer')) {
+          foreach ($file in @('hane.exe', 'hane-updater.exe', 'Hane.ShellIntegration.msix', 'Hane.ShellIntegration.cer')) {
             Copy-Item -LiteralPath "target/release/$file" -Destination "$staging/$file" -ErrorAction Stop
           }
+          # The Explorer DLL is built into shell-integration/<version>/ and must keep that layout.
+          Copy-Item -LiteralPath 'target/release/shell-integration' -Destination "$staging/shell-integration" -Recurse -ErrorAction Stop
           Copy-Item -LiteralPath windows/shell-extension/Trust-HaneShellCertificate.ps1 -Destination "$staging/Trust-HaneShellCertificate.ps1"
           Copy-Item -LiteralPath README.md -Destination "$staging/README.md"
           Copy-Item LICENSE "$staging/LICENSE" -ErrorAction SilentlyContinue
-          $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new("$staging/Hane.ShellIntegration.cer")
-          $signature = Get-AuthenticodeSignature -LiteralPath "$staging/Hane.ShellIntegration.msix"
-          if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
-            throw 'The packaged MSIX signature does not match its bundled public certificate.'
+
+      # The only Windows step that receives the update signing key.
+      - name: Generate and sign Windows inventory
+        shell: bash
+        env:
+          HANE_UPDATE_SIGNING_KEY_BASE64: ${{ secrets.HANE_UPDATE_SIGNING_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          staging="staging/hane-windows-x64"
+          python scripts/release_catalog.py windows-inventory \
+            --root "$staging" --version "${RELEASE_TAG#v}" --source-sha "$HANE_SOURCE_SHA" \
+            --output "$RUNNER_TEMP/hane-install.json"
+          python scripts/release_catalog.py sign --domain inventory \
+            --input "$RUNNER_TEMP/hane-install.json" --output "$staging/hane-install.json.sig"
+          cp "$RUNNER_TEMP/hane-install.json" "$staging/hane-install.json"
+
+      - name: Package portable zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py make-zip \
+            --root staging/hane-windows-x64 --output hane-windows-x64.zip
+
+      - name: Verify packaged Windows zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          $verify = Join-Path $env:RUNNER_TEMP 'verify-windows'
+          if (Test-Path -LiteralPath $verify) { Remove-Item -LiteralPath $verify -Recurse -Force }
+          python scripts/release_catalog.py verify-windows-zip --zip hane-windows-x64.zip --version $version --source-sha $env:HANE_SOURCE_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'The Windows ZIP failed the release verifier.' }
+          python scripts/release_catalog.py extract-zip --zip hane-windows-x64.zip --dest $verify
+          if ($LASTEXITCODE -ne 0) { throw 'The Windows ZIP could not be extracted safely.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $verify "shell-integration/$version/hane_shell_extension.dll"))) {
+            throw 'The versioned Explorer DLL is missing from the ZIP.'
           }
-          Compress-Archive -Path "$staging/*" -DestinationPath "hane-windows-x64.zip" -Force
+          $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $verify 'Hane.ShellIntegration.cer'))
+          # The runner is a throwaway VM: trust the bundled public certificate
+          # only long enough to let Authenticode evaluate the package, then remove it.
+          Import-Certificate -FilePath (Join-Path $verify 'Hane.ShellIntegration.cer') -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+          try {
+            $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $verify 'Hane.ShellIntegration.msix')
+            if ($signature.Status -ne 'Valid') {
+              throw "The packaged MSIX Authenticode status is $($signature.Status), expected Valid."
+            }
+            if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
+              throw 'The packaged MSIX signature does not match its bundled public certificate.'
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath "Cert:\LocalMachine\Root\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $verify -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Upload portable build artifact
         uses: actions/upload-artifact@v6
@@ -215,13 +324,29 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      HANE_SOURCE_SHA: ${{ github.sha }}
+      HANE_UPDATE_KEY_ID: ${{ vars.HANE_UPDATE_KEY_ID }}
+      HANE_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.HANE_UPDATE_PUBLIC_KEY_BASE64 }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install release tooling
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install release tooling requirements
+        run: python -m pip install -r scripts/release-requirements.txt
 
       - name: Install Rust toolchain
         run: rustup show
 
       - name: Run workspace tests
+        env:
+          HANE_UPDATE_KEY_ID: ""
+          HANE_UPDATE_PUBLIC_KEY_BASE64: ""
         run: cargo test --workspace --locked
 
       - name: Build macOS app bundle
@@ -235,10 +360,37 @@ jobs:
           app="target/release/bundle/osx/Hane.app"
           test -d "$app"
           test -x "$app/Contents/MacOS/hane"
+          test -x "$app/Contents/Helpers/hane-updater"
           /usr/bin/plutil -lint "$app/Contents/Info.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$app/Contents/Info.plist")" = "APPL"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "hane"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "${RELEASE_TAG#v}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :HaneSourceCommit' "$app/Contents/Info.plist")" = "$HANE_SOURCE_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :HaneUpdaterProtocol' "$app/Contents/Info.plist")" = "1"
+          # Read-only inspection of the helper that was actually built for release.
+          python scripts/release_catalog.py binary-identity \
+            --binary "$app/Contents/Helpers/hane-updater" \
+            --version "${RELEASE_TAG#v}" --target aarch64-apple-darwin \
+            --source-sha "$HANE_SOURCE_SHA"
 
+      # The bundle's trust is the Ed25519-signed inventory inside it; no Apple
+      # credential is involved. This step is the only macOS step that receives
+      # the update signing key.
+      - name: Generate and sign macOS inventory
+        shell: bash
+        env:
+          HANE_UPDATE_SIGNING_KEY_BASE64: ${{ secrets.HANE_UPDATE_SIGNING_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          app="target/release/bundle/osx/Hane.app"
+          python scripts/release_catalog.py macos-inventory \
+            --app "$app" --version "${RELEASE_TAG#v}" --source-sha "$HANE_SOURCE_SHA" \
+            --output "$RUNNER_TEMP/hane-install.json"
+          python scripts/release_catalog.py sign --domain inventory \
+            --input "$RUNNER_TEMP/hane-install.json" --output "$app/Contents/Resources/hane-install.json.sig"
+          cp "$RUNNER_TEMP/hane-install.json" "$app/Contents/Resources/hane-install.json"
+
+      # The bundle is copied byte for byte; nothing edits it afterwards.
       - name: Package macOS app zip
         shell: bash
         run: |
@@ -246,12 +398,32 @@ jobs:
           staging="staging/hane-macos-arm64"
           rm -rf "$staging"
           mkdir -p "$staging"
-          ditto "target/release/bundle/osx/Hane.app" "$staging/Hane.app"
+          ditto --norsrc --noextattr --noqtn --noacl "target/release/bundle/osx/Hane.app" "$staging/Hane.app"
           cp README.md "$staging/README.md"
           if [ -f LICENSE ]; then
             cp LICENSE "$staging/LICENSE"
           fi
-          ditto -c -k --sequesterRsrc --keepParent "$staging" "hane-macos-arm64.zip"
+          ditto -c -k --norsrc --noextattr --noqtn --noacl --keepParent "$staging" "hane-macos-arm64.zip"
+
+      - name: Verify extracted macOS zip (signed inventory, identity)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          python scripts/release_catalog.py verify-macos-zip \
+            --zip hane-macos-arm64.zip --version "$version" --source-sha "$HANE_SOURCE_SHA"
+          verify="$RUNNER_TEMP/verify-macos"
+          rm -rf "$verify"
+          mkdir -p "$verify"
+          ditto -x -k hane-macos-arm64.zip "$verify"
+          app="$verify/hane-macos-arm64/Hane.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "io.github.hide212131.hane"
+          # The inventory regenerated from the extracted files must equal the signed one.
+          python scripts/release_catalog.py macos-inventory \
+            --app "$app" --version "$version" --source-sha "$HANE_SOURCE_SHA" \
+            --output "$RUNNER_TEMP/extracted-inventory.json"
+          cmp "$RUNNER_TEMP/extracted-inventory.json" "$app/Contents/Resources/hane-install.json"
+          rm -rf "$verify"
 
       - name: Upload portable build artifact
         uses: actions/upload-artifact@v6
@@ -260,6 +432,11 @@ jobs:
           path: hane-macos-arm64.zip
           if-no-files-found: error
 
+  # Reading the published catalogs, choosing catalog_sequence and publishing
+  # happen only in this job. Its concurrency group is shared by every entry
+  # point (branch push, tag push, dispatch, release-request), so two releases
+  # never compute the same sequence. A queued run replaced by a newer one is
+  # re-run by hand; it never publishes concurrently.
   release:
     name: Publish release assets
     needs:
@@ -268,10 +445,28 @@ jobs:
       - build-macos
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: hane-release-publish
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      HANE_SOURCE_SHA: ${{ github.sha }}
+      HANE_UPDATE_KEY_ID: ${{ vars.HANE_UPDATE_KEY_ID }}
+      HANE_UPDATE_PUBLIC_KEY_BASE64: ${{ vars.HANE_UPDATE_PUBLIC_KEY_BASE64 }}
     steps:
+      - uses: actions/checkout@v6
+
+      - name: Install release tooling
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install release tooling requirements
+        run: python -m pip install -r scripts/release-requirements.txt
+
       - name: Download Windows build artifact
         uses: actions/download-artifact@v7
         with:
@@ -284,27 +479,125 @@ jobs:
           name: hane-macos-arm64
           path: release-assets
 
-      - name: Publish GitHub Release assets
+      - name: Plan release (tag, latest and catalog sequence)
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          INITIAL_CATALOG: ${{ inputs.initial_catalog }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/*.zip \
-              --clobber \
-              --repo "$GITHUB_REPOSITORY"
-          else
-            create_args=(
-              "$RELEASE_TAG"
-              release-assets/*.zip
-              --generate-notes
-              --title "$RELEASE_TAG"
-              --repo "$GITHUB_REPOSITORY"
-            )
+          set -euo pipefail
+          args=(--repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT")
+          if [ "$REF_TYPE" = tag ]; then args+=(--tag-push); fi
+          if [ "$INITIAL_CATALOG" = true ]; then args+=(--initial); fi
+          python scripts/release_catalog.py plan "${args[@]}"
 
-            if [ "${{ github.ref_type }}" != "tag" ]; then
-              create_args+=(--target "$GITHUB_SHA")
-            fi
+      - name: Build catalog from the real ZIP files
+        env:
+          SEQUENCE: ${{ steps.plan.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py build-catalog \
+            --dir release-assets --tag "$RELEASE_TAG" --source-sha "$HANE_SOURCE_SHA" \
+            --sequence "$SEQUENCE" --output release-assets/hane-update.json
 
-            gh release create "${create_args[@]}"
+      # The only release-job step that receives the update signing key.
+      - name: Sign catalog
+        env:
+          HANE_UPDATE_SIGNING_KEY_BASE64: ${{ secrets.HANE_UPDATE_SIGNING_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py sign --domain catalog \
+            --input release-assets/hane-update.json --output release-assets/hane-update.json.sig
+
+      - name: Verify assets before creating the Draft
+        env:
+          SEQUENCE: ${{ steps.plan.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py verify-release \
+            --dir release-assets --tag "$RELEASE_TAG" --source-sha "$HANE_SOURCE_SHA" --sequence "$SEQUENCE"
+
+      - name: Create Draft release and upload assets
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          create_args=(
+            -f "tag_name=$RELEASE_TAG"
+            -f "name=$RELEASE_TAG"
+            -F draft=true
+            -F generate_release_notes=true
+            -f make_latest=false
+          )
+          if [ "$REF_TYPE" != tag ]; then
+            create_args+=(-f "target_commitish=$GITHUB_SHA")
+          fi
+          release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" "${create_args[@]}" --jq '.id')"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          for asset in release-assets/*; do
+            name="$(basename "$asset")"
+            curl --fail --silent --show-error --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@$asset" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$name" > /dev/null
+          done
+
+      - name: Re-download and verify the Draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          SEQUENCE: ${{ steps.plan.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py fetch-assets \
+            --repo "$GITHUB_REPOSITORY" --release-id "$RELEASE_ID" --dest verify-draft
+          python scripts/release_catalog.py verify-release \
+            --dir verify-draft --tag "$RELEASE_TAG" --source-sha "$HANE_SOURCE_SHA" --sequence "$SEQUENCE"
+          for asset in release-assets/*; do
+            cmp "$asset" "verify-draft/$(basename "$asset")"
+          done
+
+      - name: Publish the verified Draft as stable
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          MAKE_LATEST: ${{ steps.plan.outputs.make_latest }}
+        run: |
+          set -euo pipefail
+          # plan only returns make_latest=true after proving the version is newer
+          # than every existing stable tag; an older version is refused earlier
+          # and is never marked as the latest release.
+          test "$MAKE_LATEST" = true
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest=true --jq '.html_url'
+
+      - name: Verify the published Release again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEQUENCE: ${{ steps.plan.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          python scripts/release_catalog.py fetch-assets \
+            --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --dest verify-published
+          python scripts/release_catalog.py verify-release \
+            --dir verify-published --tag "$RELEASE_TAG" --source-sha "$HANE_SOURCE_SHA" --sequence "$SEQUENCE"
+
+      # A Draft that failed verification must not block the next attempt or be
+      # mistaken for a release. A published Release is never touched here.
+      - name: Discard an unpublished Draft after a failure
+        if: failure() && steps.draft.outputs.release_id != '' && steps.publish.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          is_draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.draft')"
+          if [ "$is_draft" = true ]; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
           fi
