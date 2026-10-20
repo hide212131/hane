@@ -208,18 +208,23 @@ class BuildJobTests(unittest.TestCase):
         self.assertEqual(indexes, sorted(indexes))
         sign = step_text(job, "Generate and sign macOS inventory")
         self.assertLess(sign.index("macos-inventory"), sign.index("sign --domain inventory"))
-        self.assertIn("Contents/Resources/hane-install.json.sig", sign)
+        self.assertIn("Hane.app.update", sign)
+        self.assertIn("hane-install.json.sig", sign)
+        self.assertNotIn("Contents/Resources/hane-install.json", sign)
         package = step_text(job, "Package macOS app zip")
+        self.assertIn('Hane.app.update" "$staging/Hane.app.update"', package)
         self.assertNotIn("codesign", package)
         self.assertNotIn("xattr -d", package)
         self.assertNotIn("sequesterRsrc", package)
+        app_verify = step_text(job, "Verify macOS app bundle")
+        self.assertIn("codesign --verify --deep --strict", app_verify)
         verify = step_text(job, "Verify extracted macOS zip")
-        for needle in ("ditto -x -k", "verify-macos-zip", "macos-inventory", "cmp ", "Contents/Resources/hane-install.json"):
+        for needle in ("ditto -x -k", "verify-macos-zip", "macos-inventory", "cmp ", "Hane.app.update"):
             self.assertIn(needle, verify)
 
     def test_no_workflow_asks_for_apple_credentials_or_bypasses_gatekeeper(self):
         for name, text in (("windows-release", RELEASE), ("release-request", REQUEST)):
-            for banned in ("APPLE_", "HANE_MACOS_TEAM_ID", "notarytool", "stapler", "codesign", "spctl",
+            for banned in ("APPLE_", "HANE_MACOS_TEAM_ID", "notarytool", "stapler", "spctl",
                            "Developer ID", "xattr"):
                 self.assertNotIn(banned, text, f"{name}: {banned}")
 
@@ -281,7 +286,9 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertIn("binary-identity", BUNDLE)
         self.assertIn("export HANE_SOURCE_SHA", BUNDLE)
         self.assertRegex(BUNDLE, r"\^\[0-9a-f\]\{40\}\$")
-        self.assertNotIn("codesign", BUNDLE.replace("# Signing, notarization", ""))
+        self.assertNotIn("codesign --remove-signature", BUNDLE)
+        self.assertIn("codesign --verify --deep --strict",
+                      step_text(jobs(RELEASE)["build-macos"], "Verify macOS app bundle"))
 
     def test_helper_embeds_identity_in_a_control_flow_that_uses_it(self):
         main = read("crates/updater/src/main.rs")
