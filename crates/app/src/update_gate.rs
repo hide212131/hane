@@ -531,7 +531,9 @@ pub fn enter() -> Entry {
     // A momentary lease observation cannot prove that no update happened (the
     // helper may release the lease before the probe), so on macOS the running
     // image is also compared with the signed executable now on disk.
-    let disk_differs = cfg!(target_os = "macos")
+    // Windows has the same blind spot: an old image loaded before the update can
+    // see an already-finished update and never observe a wait.
+    let disk_differs = cfg!(any(target_os = "macos", target_os = "windows"))
         && matches!(outcome, GateOutcome::Proceed(_) | GateOutcome::Unmanaged)
         && !disk_image_is_running_image(&exe);
     if needs_fresh_image(
@@ -559,7 +561,11 @@ pub fn enter() -> Entry {
         let err = reexec_current_image(&exe);
         return stop_after_failed_reexec(&err, present_notice);
     }
-    if needs_windows_restart(observed_update.get(), &outcome, cfg!(target_os = "windows")) {
+    if needs_windows_restart(
+        observed_update.get() || disk_differs,
+        &outcome,
+        cfg!(target_os = "windows"),
+    ) {
         // This image waited out an update, so it may be the pre-update version.
         // The executable on disk is not proven trustworthy here, so it is not
         // restarted: release the lease and ask the user to start Hane again.
@@ -740,6 +746,29 @@ mod tests {
         assert!(message.contains("もう一度Haneを起動"));
         assert!(message.contains("開く操作"));
         assert!(!message.contains("更新は完了しています"));
+    }
+
+    #[test]
+    fn a_windows_launch_with_a_different_disk_image_stops_without_an_observed_wait() {
+        let observed = std::cell::Cell::new(false);
+        let outcome = take_gate_observing_waits(
+            |_| GateOutcome::Unmanaged,
+            Duration::from_secs(1),
+            &observed,
+        );
+        assert!(!observed.get());
+        // The on-disk executable is another generation than the running image.
+        let disk_differs = !reader_contains(&b"other-generation"[..], image_marker()).unwrap();
+        assert!(disk_differs);
+        assert!(needs_windows_restart(observed.get() || disk_differs, &outcome, true));
+        // The same image on disk with no observed wait keeps the normal launch.
+        let mut same = b"x".to_vec();
+        same.extend_from_slice(image_marker());
+        let disk_differs = !reader_contains(&same[..], image_marker()).unwrap();
+        assert!(!needs_windows_restart(observed.get() || disk_differs, &outcome, true));
+        // Terminal stops are unchanged.
+        let recovery = GateOutcome::RecoveryRequired("x".into());
+        assert!(!needs_windows_restart(true, &recovery, true));
     }
 
     #[test]
