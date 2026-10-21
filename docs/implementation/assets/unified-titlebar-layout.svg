@@ -1,0 +1,196 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1000" viewBox="0 0 1440 1000" role="img" aria-labelledby="title desc">
+<title id="title">Hane 統合タイトルバーの配置設計 — Issue #542</title>
+<desc id="desc">設計図、未実装。macOSとWindowsのライト・ダークを4パネルで比較する。タイトルバーは論理40pxで一度だけ確保し、サイドバーと本文をその下に置く。macOSの左80pxは標準の3ボタンを予約する。Windowsは左12px、右34pxの3ボタン、合計102pxを予約する。ファイルメニューと既存タブを配置し、48px以上の移動用余白を残す。固定領域を押し出さず、タブ列だけが横スクロールする。設定画面ではタブ列に代えて設定と表示し、ウインドウ操作は保つ。</desc>
+<style>
+  text { font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans CJK JP", "Droid Sans Fallback", sans-serif; }
+  .heading { font-size: 26px; font-weight: 700; fill: #202020; }
+  .panel-label { font-size: 18px; font-weight: 700; fill: #202020; }
+  .body-note { font-size: 15px; fill: #454545; }
+  .measure { font-size: 12px; fill: #555555; }
+  .chrome-text { font-size: 13px; }
+  .content-label { font-size: 15px; font-weight: 700; }
+  .content-note { font-size: 12px; }
+</style>
+<rect width="1440" height="1000" fill="#ffffff"/>
+
+<text x="24" y="39" class="heading">Hane 統合タイトルバーの配置</text>
+<text x="1416" y="37" class="panel-label" text-anchor="end">Issue #542 · 設計図 / 未実装</text>
+<text x="24" y="69" class="body-note">数値は論理pxです。色と領域の関係を示す模式図で、実画面の画像ではありません。</text>
+<text x="36" y="119" class="panel-label">macOS / ライト</text>
+<text x="696" y="119" class="measure" text-anchor="end">上部 40px</text>
+<g id="macos-light" aria-label="macOS / ライト">
+<rect x="36" y="155" width="660" height="220" fill="#faf9f7" stroke="#d2cbc0"/>
+<rect x="36" y="155" width="660" height="40" fill="#f0ede7"/>
+<line x1="36" y1="195" x2="696" y2="195" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="36" y1="146" x2="116" y2="146" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="36" y1="143" x2="36" y2="149" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="116" y1="143" x2="116" y2="149" stroke="#6b6b6b" stroke-width="1"/>
+<text x="76.0" y="140" class="measure" text-anchor="middle">左 80px</text>
+<circle cx="56" cy="175" r="5.5" fill="#ff6057" stroke="#000000" stroke-opacity="0.15"/>
+<circle cx="76" cy="175" r="5.5" fill="#febc2e" stroke="#000000" stroke-opacity="0.15"/>
+<circle cx="96" cy="175" r="5.5" fill="#28c840" stroke="#000000" stroke-opacity="0.15"/>
+<line x1="116" y1="160" x2="116" y2="190" stroke="#d2cbc0" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="126" y="180" class="chrome-text" fill="#262626">ファイル</text>
+<rect x="180" y="160" width="135" height="30" fill="#356d94"/>
+<text x="192" y="180" class="chrome-text" fill="#f7fbff">メモ.md *</text>
+<rect x="315" y="160" width="135" height="30" fill="#f0ede7" stroke="#d2cbc0"/>
+<text x="327" y="180" class="chrome-text" fill="#262626">設計.md</text>
+<rect x="458" y="161" width="230" height="28" fill="none" stroke="#d2cbc0" stroke-dasharray="4 3"/>
+<text x="573.0" y="180" class="chrome-text" fill="#6b6259" text-anchor="middle">移動用余白 ≥ 48px</text>
+<rect x="36" y="196" width="220" height="179" fill="#f0ede7"/>
+<line x1="256" y1="196" x2="256" y2="375" stroke="#d2cbc0" stroke-width="1"/>
+<text x="52" y="227" class="content-label" fill="#262626">サイドバー</text>
+<text x="52" y="253" class="content-note" fill="#6b6259">上部の下から始まる</text>
+<line x1="52" y1="267" x2="240" y2="267" stroke="#d2cbc0" stroke-width="1"/>
+<text x="52" y="294" class="chrome-text" fill="#262626">メモ.md</text>
+<text x="52" y="321" class="chrome-text" fill="#262626">設計.md</text>
+<text x="52" y="354" class="content-note" fill="#6b6259">高さ = 画面高 − 40px</text>
+<text x="276" y="227" class="content-label" fill="#262626">本文</text>
+<text x="276" y="253" class="content-note" fill="#6b6259">本文の先頭 = 40px ＋ 検索欄の高さ</text>
+<text x="276" y="281" class="content-note" fill="#262626">検索欄を開くと、その分だけ下がる。</text>
+<line x1="276" y1="302" x2="668" y2="302" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="276" y1="324" x2="620" y2="324" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="276" y1="346" x2="646" y2="346" stroke="#d2cbc0" stroke-width="1"/>
+<text x="36" y="400" class="body-note">左の80pxにmacOS標準の3ボタン。余白からウインドウを移動。</text>
+</g>
+<text x="744" y="119" class="panel-label">macOS / ダーク</text>
+<text x="1404" y="119" class="measure" text-anchor="end">上部 40px</text>
+<g id="macos-dark" aria-label="macOS / ダーク">
+<rect x="744" y="155" width="660" height="220" fill="#1f2022" stroke="#55585f"/>
+<rect x="744" y="155" width="660" height="40" fill="#151618"/>
+<line x1="744" y1="195" x2="1404" y2="195" stroke="#55585f" stroke-width="1"/>
+<line x1="744" y1="146" x2="824" y2="146" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="744" y1="143" x2="744" y2="149" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="824" y1="143" x2="824" y2="149" stroke="#6b6b6b" stroke-width="1"/>
+<text x="784.0" y="140" class="measure" text-anchor="middle">左 80px</text>
+<circle cx="764" cy="175" r="5.5" fill="#ff6057" stroke="#000000" stroke-opacity="0.15"/>
+<circle cx="784" cy="175" r="5.5" fill="#febc2e" stroke="#000000" stroke-opacity="0.15"/>
+<circle cx="804" cy="175" r="5.5" fill="#28c840" stroke="#000000" stroke-opacity="0.15"/>
+<line x1="824" y1="160" x2="824" y2="190" stroke="#55585f" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="834" y="180" class="chrome-text" fill="#e8e5df">ファイル</text>
+<rect x="888" y="160" width="135" height="30" fill="#44779e"/>
+<text x="900" y="180" class="chrome-text" fill="#f7fbff">メモ.md *</text>
+<rect x="1023" y="160" width="135" height="30" fill="#151618" stroke="#55585f"/>
+<text x="1035" y="180" class="chrome-text" fill="#e8e5df">設計.md</text>
+<rect x="1166" y="161" width="230" height="28" fill="none" stroke="#55585f" stroke-dasharray="4 3"/>
+<text x="1281.0" y="180" class="chrome-text" fill="#aaa39a" text-anchor="middle">移動用余白 ≥ 48px</text>
+<rect x="744" y="196" width="220" height="179" fill="#18191b"/>
+<line x1="964" y1="196" x2="964" y2="375" stroke="#55585f" stroke-width="1"/>
+<text x="760" y="227" class="content-label" fill="#e8e5df">サイドバー</text>
+<text x="760" y="253" class="content-note" fill="#aaa39a">上部の下から始まる</text>
+<line x1="760" y1="267" x2="948" y2="267" stroke="#55585f" stroke-width="1"/>
+<text x="760" y="294" class="chrome-text" fill="#e8e5df">メモ.md</text>
+<text x="760" y="321" class="chrome-text" fill="#e8e5df">設計.md</text>
+<text x="760" y="354" class="content-note" fill="#aaa39a">高さ = 画面高 − 40px</text>
+<text x="984" y="227" class="content-label" fill="#e8e5df">本文</text>
+<text x="984" y="253" class="content-note" fill="#aaa39a">本文の先頭 = 40px ＋ 検索欄の高さ</text>
+<text x="984" y="281" class="content-note" fill="#e8e5df">検索欄を開くと、その分だけ下がる。</text>
+<line x1="984" y1="302" x2="1376" y2="302" stroke="#55585f" stroke-width="1"/>
+<line x1="984" y1="324" x2="1328" y2="324" stroke="#55585f" stroke-width="1"/>
+<line x1="984" y1="346" x2="1354" y2="346" stroke="#55585f" stroke-width="1"/>
+<text x="744" y="400" class="body-note">左の80pxにmacOS標準の3ボタン。余白からウインドウを移動。</text>
+</g>
+<text x="36" y="447" class="panel-label">Windows / ライト</text>
+<text x="696" y="447" class="measure" text-anchor="end">上部 40px</text>
+<g id="windows-light" aria-label="Windows / ライト">
+<rect x="36" y="483" width="660" height="220" fill="#faf9f7" stroke="#d2cbc0"/>
+<rect x="36" y="483" width="660" height="40" fill="#f0ede7"/>
+<line x1="36" y1="523" x2="696" y2="523" stroke="#d2cbc0" stroke-width="1"/>
+<text x="36" y="468" class="measure">左 12px</text>
+<line x1="36" y1="474" x2="48" y2="474" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="36" y1="471" x2="36" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="48" y1="471" x2="48" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="594" y1="474" x2="696" y2="474" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="594" y1="471" x2="594" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="696" y1="471" x2="696" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<text x="645.0" y="468" class="measure" text-anchor="middle">右 34px × 3 = 102px</text>
+<line x1="594" y1="488" x2="594" y2="518" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="628" y1="488" x2="628" y2="518" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="662" y1="488" x2="662" y2="518" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="606" y1="504" x2="616" y2="504" stroke="#262626" stroke-width="1.2"/>
+<rect x="640" y="498" width="10" height="10" fill="none" stroke="#262626"/>
+<line x1="674" y1="498" x2="684" y2="508" stroke="#262626" stroke-width="1.2"/>
+<line x1="684" y1="498" x2="674" y2="508" stroke="#262626" stroke-width="1.2"/>
+<text x="58" y="508" class="chrome-text" fill="#262626">ファイル</text>
+<rect x="112" y="488" width="135" height="30" fill="#356d94"/>
+<text x="124" y="508" class="chrome-text" fill="#f7fbff">メモ.md *</text>
+<rect x="247" y="488" width="135" height="30" fill="#f0ede7" stroke="#d2cbc0"/>
+<text x="259" y="508" class="chrome-text" fill="#262626">設計.md</text>
+<rect x="390" y="489" width="196" height="28" fill="none" stroke="#d2cbc0" stroke-dasharray="4 3"/>
+<text x="488.0" y="508" class="chrome-text" fill="#6b6259" text-anchor="middle">移動用余白 ≥ 48px</text>
+<rect x="36" y="524" width="220" height="179" fill="#f0ede7"/>
+<line x1="256" y1="524" x2="256" y2="703" stroke="#d2cbc0" stroke-width="1"/>
+<text x="52" y="555" class="content-label" fill="#262626">サイドバー</text>
+<text x="52" y="581" class="content-note" fill="#6b6259">上部の下から始まる</text>
+<line x1="52" y1="595" x2="240" y2="595" stroke="#d2cbc0" stroke-width="1"/>
+<text x="52" y="622" class="chrome-text" fill="#262626">メモ.md</text>
+<text x="52" y="649" class="chrome-text" fill="#262626">設計.md</text>
+<text x="52" y="682" class="content-note" fill="#6b6259">高さ = 画面高 − 40px</text>
+<text x="276" y="555" class="content-label" fill="#262626">本文</text>
+<text x="276" y="581" class="content-note" fill="#6b6259">本文の先頭 = 40px ＋ 検索欄の高さ</text>
+<text x="276" y="609" class="content-note" fill="#262626">検索欄を開くと、その分だけ下がる。</text>
+<line x1="276" y1="630" x2="668" y2="630" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="276" y1="652" x2="620" y2="652" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="276" y1="674" x2="646" y2="674" stroke="#d2cbc0" stroke-width="1"/>
+<text x="36" y="728" class="body-note">左12pxと右102pxを確保。操作ボタンはそれぞれ幅34px。</text>
+</g>
+<text x="744" y="447" class="panel-label">Windows / ダーク</text>
+<text x="1404" y="447" class="measure" text-anchor="end">上部 40px</text>
+<g id="windows-dark" aria-label="Windows / ダーク">
+<rect x="744" y="483" width="660" height="220" fill="#1f2022" stroke="#55585f"/>
+<rect x="744" y="483" width="660" height="40" fill="#151618"/>
+<line x1="744" y1="523" x2="1404" y2="523" stroke="#55585f" stroke-width="1"/>
+<text x="744" y="468" class="measure">左 12px</text>
+<line x1="744" y1="474" x2="756" y2="474" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="744" y1="471" x2="744" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="756" y1="471" x2="756" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="1302" y1="474" x2="1404" y2="474" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="1302" y1="471" x2="1302" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="1404" y1="471" x2="1404" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<text x="1353.0" y="468" class="measure" text-anchor="middle">右 34px × 3 = 102px</text>
+<line x1="1302" y1="488" x2="1302" y2="518" stroke="#55585f" stroke-width="1"/>
+<line x1="1336" y1="488" x2="1336" y2="518" stroke="#55585f" stroke-width="1"/>
+<line x1="1370" y1="488" x2="1370" y2="518" stroke="#55585f" stroke-width="1"/>
+<line x1="1314" y1="504" x2="1324" y2="504" stroke="#e8e5df" stroke-width="1.2"/>
+<rect x="1348" y="498" width="10" height="10" fill="none" stroke="#e8e5df"/>
+<line x1="1382" y1="498" x2="1392" y2="508" stroke="#e8e5df" stroke-width="1.2"/>
+<line x1="1392" y1="498" x2="1382" y2="508" stroke="#e8e5df" stroke-width="1.2"/>
+<text x="766" y="508" class="chrome-text" fill="#e8e5df">ファイル</text>
+<rect x="820" y="488" width="135" height="30" fill="#44779e"/>
+<text x="832" y="508" class="chrome-text" fill="#f7fbff">メモ.md *</text>
+<rect x="955" y="488" width="135" height="30" fill="#151618" stroke="#55585f"/>
+<text x="967" y="508" class="chrome-text" fill="#e8e5df">設計.md</text>
+<rect x="1098" y="489" width="196" height="28" fill="none" stroke="#55585f" stroke-dasharray="4 3"/>
+<text x="1196.0" y="508" class="chrome-text" fill="#aaa39a" text-anchor="middle">移動用余白 ≥ 48px</text>
+<rect x="744" y="524" width="220" height="179" fill="#18191b"/>
+<line x1="964" y1="524" x2="964" y2="703" stroke="#55585f" stroke-width="1"/>
+<text x="760" y="555" class="content-label" fill="#e8e5df">サイドバー</text>
+<text x="760" y="581" class="content-note" fill="#aaa39a">上部の下から始まる</text>
+<line x1="760" y1="595" x2="948" y2="595" stroke="#55585f" stroke-width="1"/>
+<text x="760" y="622" class="chrome-text" fill="#e8e5df">メモ.md</text>
+<text x="760" y="649" class="chrome-text" fill="#e8e5df">設計.md</text>
+<text x="760" y="682" class="content-note" fill="#aaa39a">高さ = 画面高 − 40px</text>
+<text x="984" y="555" class="content-label" fill="#e8e5df">本文</text>
+<text x="984" y="581" class="content-note" fill="#aaa39a">本文の先頭 = 40px ＋ 検索欄の高さ</text>
+<text x="984" y="609" class="content-note" fill="#e8e5df">検索欄を開くと、その分だけ下がる。</text>
+<line x1="984" y1="630" x2="1376" y2="630" stroke="#55585f" stroke-width="1"/>
+<line x1="984" y1="652" x2="1328" y2="652" stroke="#55585f" stroke-width="1"/>
+<line x1="984" y1="674" x2="1354" y2="674" stroke="#55585f" stroke-width="1"/>
+<text x="744" y="728" class="body-note">左12pxと右102pxを確保。操作ボタンはそれぞれ幅34px。</text>
+</g>
+<line x1="24" y1="751" x2="1416" y2="751" stroke="#d5d5d5" stroke-width="1"/>
+<text x="36" y="781" class="panel-label">設定画面の上部（macOSの例）</text>
+<rect x="36" y="798" width="660" height="40" fill="#f0ede7" stroke="#d2cbc0"/>
+<circle cx="56" cy="818" r="5.5" fill="#ff6057" stroke="#000000" stroke-opacity="0.15"/>
+<circle cx="76" cy="818" r="5.5" fill="#febc2e" stroke="#000000" stroke-opacity="0.15"/>
+<circle cx="96" cy="818" r="5.5" fill="#28c840" stroke="#000000" stroke-opacity="0.15"/>
+<line x1="116" y1="803" x2="116" y2="833" stroke="#d2cbc0" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="136" y="823" class="chrome-text" fill="#262626">設定</text>
+<text x="440" y="823" class="chrome-text" fill="#6b6259" text-anchor="middle">移動用余白</text>
+<text x="744" y="808" class="body-note">タブ列の代わりに「設定」を表示します。</text>
+<text x="744" y="833" class="body-note">Windowsも高さ40pxを保ち、右側の3ボタンを同じ位置に残します。</text>
+<text x="36" y="878" class="panel-label">配置の約束</text>
+<text x="36" y="909" class="body-note">1. OSボタン・ファイルメニュー・移動用余白を押し出さず、タブ列だけを横にスクロールします。</text>
+<text x="36" y="940" class="body-note">2. 上部40pxは一度だけ確保します。サイドバーと設定画面の内容高は「画面高 − 40px」です。</text>
+<text x="36" y="971" class="body-note">3. 移動用余白を48px以上残します。タブ・メニュー・OSボタンはウインドウ移動の領域にしません。</text>
+</svg>
