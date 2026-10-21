@@ -45,6 +45,21 @@ const AI_SELECTION_RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
 /// `ai_selection_overlay_element`'s `max_h` and the below/above fit check in
 /// `ai_selection_overlay_position` so the two stay in sync.
 const AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT: f32 = 320.0;
+/// The popup's width when the editor area is wide enough; a narrower area
+/// shrinks the popup to fit instead (`ai_selection_popup_width`).
+const AI_SELECTION_POPUP_WIDTH: f32 = 360.0;
+
+/// The popup's width inside an editor area `area_width` wide: the regular
+/// width, or the whole area when that is narrower.
+fn ai_selection_popup_width_for(area_width: f32) -> f32 {
+    AI_SELECTION_POPUP_WIDTH.min(area_width.max(0.0))
+}
+
+/// Shifts the popup's left edge `x` so a popup `width` wide stays inside the
+/// editor area spanning `area_left..area_left + area_width`.
+fn ai_selection_clamp_left(x: f32, area_left: f32, area_width: f32, width: f32) -> f32 {
+    x.min(area_left + area_width - width).max(area_left)
+}
 
 /// The built-in suggestion shown in the saved-prompt list only while nothing
 /// has ever been saved (`UserPromptsStore::load` returned `Ok(None)`),
@@ -1132,6 +1147,13 @@ impl EditorView {
     /// overflow the editor area.
     const AI_SELECTION_POPUP_MAX_HEIGHT: f32 = AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT + 2.0;
 
+    /// The horizontal extent of the editor area the popup must stay within:
+    /// the text column plus its side paddings, which is the window width minus
+    /// the sidebar.
+    fn ai_selection_editor_area_width(&self) -> f32 {
+        self.content_width + 2.0 * self.theme.line_horizontal_padding
+    }
+
     /// The popup's anchor point and the corner of the popup that should sit
     /// at that point: the active end of the captured selection's own screen
     /// position (`caret_geometry`, already content-area-relative), below the
@@ -1143,12 +1165,16 @@ impl EditorView {
     /// frame where no caret geometry has been resolved yet.
     fn ai_selection_overlay_position(&self) -> (gpui::Point<Pixels>, Anchor) {
         const GAP: f32 = 6.0;
-        let base_x = self.main_column_left + self.theme.line_horizontal_padding;
+        let area_width = self.ai_selection_editor_area_width();
+        let width = ai_selection_popup_width_for(area_width);
+        let clamp_x =
+            |x: f32| ai_selection_clamp_left(x, self.main_column_left, area_width, width);
+        let base_x = clamp_x(self.main_column_left + self.theme.line_horizontal_padding);
         let base_y = self.theme.header_height + self.document_find_reserved_height();
         let Some(geometry) = self.caret_geometry() else {
             return (point(px(base_x), px(base_y)), Anchor::TopLeft);
         };
-        let x = self.main_column_left + geometry.x;
+        let x = clamp_x(self.main_column_left + geometry.x);
         let caret_top = base_y + geometry.y;
         let caret_bottom = caret_top + geometry.height;
         let window_bottom = base_y + self.viewport_height;
@@ -1226,7 +1252,9 @@ impl EditorView {
             .id("ai-selection-popup")
             .debug_selector(|| "ai-selection-popup".to_owned())
             .occlude()
-            .w(px(360.0))
+            .w(px(ai_selection_popup_width_for(
+                self.ai_selection_editor_area_width(),
+            )))
             .max_h(px(AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT))
             .flex()
             .flex_col()
@@ -1824,6 +1852,63 @@ mod tests {
             let expected_y = caret_top - 6.0;
             assert!((f32::from(position.y) - expected_y).abs() < 0.01);
         });
+    }
+
+    #[test]
+    fn popup_width_keeps_regular_width_and_shrinks_to_narrow_areas() {
+        assert_eq!(ai_selection_popup_width_for(960.0), 360.0);
+        assert_eq!(ai_selection_popup_width_for(360.0), 360.0);
+        assert_eq!(ai_selection_popup_width_for(280.0), 280.0);
+        assert_eq!(ai_selection_popup_width_for(279.0), 279.0);
+        assert_eq!(ai_selection_popup_width_for(-5.0), 0.0);
+    }
+
+    #[test]
+    fn popup_left_edge_stays_inside_the_editor_area_at_every_width() {
+        for area_width in [279.0_f32, 280.0, 960.0] {
+            let width = ai_selection_popup_width_for(area_width);
+            for (area_left, x) in [(0.0_f32, 0.0_f32), (0.0, 100.0), (0.0, 900.0), (200.0, 250.0)] {
+                let left = ai_selection_clamp_left(x, area_left, area_width, width);
+                assert!(left >= area_left, "left {left} at width {area_width}");
+                assert!(
+                    left + width <= area_left + area_width + 0.01,
+                    "right edge {} at width {area_width}",
+                    left + width
+                );
+            }
+        }
+        // Regular width keeps the anchor position when it already fits.
+        assert_eq!(ai_selection_clamp_left(100.0, 0.0, 960.0, 360.0), 100.0);
+    }
+
+    #[gpui::test]
+    fn overlay_position_keeps_the_whole_popup_inside_a_narrow_editor_area(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one two\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        for window_width in [279.0_f32, 280.0, 960.0] {
+            view.update(cx, |view, _cx| {
+                view.main_column_left = 0.0;
+                view.content_width = window_width - 2.0 * view.theme.line_horizontal_padding;
+                view.viewport_height = 600.0;
+                view.caret_geometry = Some(CaretGeometry {
+                    x: 250.0,
+                    y: 50.0,
+                    height: 20.0,
+                });
+            });
+            view.read_with(cx, |view, _| {
+                let (position, _) = view.ai_selection_overlay_position();
+                let width = ai_selection_popup_width_for(view.ai_selection_editor_area_width());
+                let left = f32::from(position.x);
+                assert!(left >= 0.0);
+                assert!(left + width <= window_width + 0.01);
+            });
+        }
     }
 
     #[gpui::test]
