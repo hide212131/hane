@@ -27,7 +27,8 @@ use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{hash_regular_file, read_limited};
 use crate::identity::{FileIdentity, InstallFacts, InstallId};
 use crate::macos_apply::{
-    BundleHost, HELPER_REL, VolumeFacts, plist_string, verify_bundle_inventory,
+    BundleHost, HELPER_REL, InventoryOrigin, VolumeFacts, installed_sidecar_roots, plist_string,
+    verify_bundle_inventory,
 };
 use crate::model::{MACOS_BUNDLE_ID, Target};
 use crate::trust::TrustPolicy;
@@ -305,12 +306,18 @@ pub fn locate(exe: &Path) -> Result<Placement> {
 }
 
 /// The helper inside the bundle, accepted only if the whole bundle matches the
-/// inventory signed with the update key and that inventory lists the helper
-/// with exactly the bytes on disk. A build without an update key provides no
-/// helper recovery (intended fail-closed behavior).
+/// inventory signed with the update key (the install's sidecar generation, or
+/// for v0.27.0 the legacy inventory inside it) and that inventory lists the
+/// helper with exactly the bytes on disk. A build without an update key
+/// provides no helper recovery (intended fail-closed behavior).
 pub fn installed_helper(placement: &Placement, policy: &TrustPolicy) -> Result<HelperSource> {
-    let signed = verify_bundle_inventory(&placement.install_root, policy)?;
-    let listed = signed
+    let verified = verify_bundle_inventory(
+        &placement.install_root,
+        &installed_sidecar_roots(placement),
+        policy,
+    )?;
+    let listed = verified
+        .signed
         .inventory()
         .files
         .iter()
@@ -462,8 +469,13 @@ impl BundleHost for MacHost {
         Ok(())
     }
 
-    fn verify_bundle_inventory(&self, bundle: &Path, policy: &TrustPolicy) -> Result<()> {
-        verify_bundle_inventory(bundle, policy).map(|_| ())
+    fn verify_bundle_inventory(
+        &self,
+        bundle: &Path,
+        sidecar_roots: &[std::path::PathBuf],
+        policy: &TrustPolicy,
+    ) -> Result<InventoryOrigin> {
+        verify_bundle_inventory(bundle, sidecar_roots, policy).map(|verified| verified.origin)
     }
 
     fn bundle_mark(&self, bundle: &Path) -> Result<Option<Vec<u8>>> {
@@ -543,6 +555,20 @@ mod tests {
     #[test]
     fn a_bundle_without_a_signed_inventory_has_no_trusted_helper() {
         let dir = TempDir::new("macos-no-inventory");
+        // A bundle that names its release but has neither a sidecar generation
+        // nor a v0.27.0 inventory inside it.
+        let plist = format!(
+            "<plist><dict>\n\
+             <key>CFBundleIdentifier</key>\n<string>{MACOS_BUNDLE_ID}</string>\n\
+             <key>CFBundleShortVersionString</key>\n<string>0.27.1</string>\n\
+             <key>CFBundleVersion</key>\n<string>0.27.1</string>\n\
+             <key>HaneSourceCommit</key>\n<string>{}</string>\n\
+             <key>HaneUpdaterProtocol</key>\n<integer>1</integer>\n\
+             </dict></plist>\n",
+            "a".repeat(40)
+        );
+        fs::create_dir_all(dir.path().join("Contents")).unwrap();
+        fs::write(dir.path().join("Contents/Info.plist"), plist).unwrap();
         let placement = Placement {
             target: Target::MacosArm64,
             install_root: dir.path().to_path_buf(),

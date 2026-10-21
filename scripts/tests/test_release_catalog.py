@@ -45,8 +45,12 @@ def pe(version=VERSION, source=SHA, target=rc.WINDOWS_TARGET) -> bytes:
     return b"MZ\x90\x00" + b"\0" * 32 + identity(version, target, source) + b"\0" * 32
 
 
-def macho(version=VERSION, source=SHA) -> bytes:
-    return b"\xcf\xfa\xed\xfe" + b"\0" * 32 + identity(version, rc.MACOS_TARGET, source) + b"\0" * 32
+def macho(version=VERSION, source=SHA, signed=True) -> bytes:
+    """A 64-bit Mach-O header with (by default) an LC_CODE_SIGNATURE load command."""
+    command = (0x1D).to_bytes(4, "little") + (16).to_bytes(4, "little") + b"\0" * 8 if signed else b""
+    header = (b"\xcf\xfa\xed\xfe" + b"\0" * 12 + (1 if signed else 0).to_bytes(4, "little")
+              + len(command).to_bytes(4, "little") + b"\0" * 8)
+    return header + command + identity(version, rc.MACOS_TARGET, source) + b"\0" * 32
 
 
 def manifest(version=VERSION, dll_version=None, executable="hane.exe") -> str:
@@ -136,9 +140,12 @@ class Fixture:
         return path
 
     def macos_zip(self, path: Path, *, version=VERSION, source=SHA, plist_updates=None, drop=(), extra=(),
-                  helper=None, bundle_id=rc.MACOS_BUNDLE_ID, code_resources=False, tweak=None, tamper=None,
-                  inventory=True, signer=None) -> Path:
-        """No Apple signature: trust is the Ed25519-signed inventory inside the bundle."""
+                  helper=None, bundle_id=rc.MACOS_BUNDLE_ID, code_resources=True, tweak=None, tamper=None,
+                  inventory=True, signer=None, app_binary=None, legacy_inventory=False,
+                  sidecar_version=None, sidecar_source=None) -> Path:
+        """Layout 2 fixture. The app is sealed (CodeResources present, Mach-Os signed); this is
+        structural only and says nothing about a real Apple signature. The Ed25519 inventory is
+        the sidecar `Hane.app.update/<version>-<source>/`, never inside the app."""
         info = {
             "CFBundleIdentifier": bundle_id,
             "CFBundleExecutable": "hane",
@@ -154,7 +161,7 @@ class Fixture:
         app = rc.MACOS_APP
         entries = {
             f"{app}/Contents/Info.plist": (plistlib.dumps(info), 0o644),
-            f"{app}/Contents/MacOS/hane": (macho(version, source), 0o755),
+            f"{app}/Contents/MacOS/hane": (app_binary if app_binary is not None else macho(version, source), 0o755),
             f"{app}/Contents/Helpers/hane-updater": (helper if helper is not None else macho(version, source), 0o755),
             f"{app}/Contents/Resources/Hane.icns": (b"icns", 0o644),
             f"{rc.MACOS_ROOT}/README.md": (b"readme", 0o644),
@@ -178,8 +185,13 @@ class Fixture:
                 tweak(document)
                 raw = rc.canonical_json(document)
             sign = (signer or self).sign
-            entries[f"{app}/{rc.MACOS_INVENTORY_REL}"] = (raw, 0o644)
-            entries[f"{app}/{rc.MACOS_INVENTORY_SIGNATURE_REL}"] = (sign(rc.INVENTORY_DOMAIN, raw), 0o644)
+            inventory_path, signature_path = rc.macos_sidecar_paths(sidecar_version or version,
+                                                                    sidecar_source or source)
+            if legacy_inventory:  # the v0.27.0 place, which layout 2 refuses
+                inventory_path = f"{app}/{rc.MACOS_LEGACY_INVENTORY_REL}"
+                signature_path = f"{app}/{rc.MACOS_LEGACY_INVENTORY_SIGNATURE_REL}"
+            entries[inventory_path] = (raw, 0o644)
+            entries[signature_path] = (sign(rc.INVENTORY_DOMAIN, raw), 0o644)
         for name, data in (tamper or {}).items():  # changed after the inventory was made
             entries[f"{app}/{name}"] = (data, entries.get(f"{app}/{name}", (b"", 0o644))[1])
         write_zip(path, [(n, d, m) for n, (d, m) in entries.items()] + list(extra))
@@ -236,9 +248,9 @@ class CatalogAndSignatureTests(TempCase):
         mac = catalog["targets"][rc.MACOS_TARGET]
         self.assertEqual((mac["bundle_id"], mac["bundle_version"]), (rc.MACOS_BUNDLE_ID, VERSION))
         self.assertNotIn("team_id", mac)
-        self.assertEqual(mac["layout_revision"], 1)
+        self.assertEqual(mac["layout_revision"], 2)
         with zipfile.ZipFile(directory / rc.MACOS_ASSET) as archive:
-            inventory = archive.read(f"{rc.MACOS_APP}/{rc.MACOS_INVENTORY_REL}")
+            inventory = archive.read(rc.macos_sidecar_paths(VERSION, SHA)[0])
         self.assertEqual(mac["inventory_sha256"], rc.sha256_hex(inventory))
 
     def test_catalog_bytes_are_signed_raw_and_tampering_is_rejected(self):
@@ -493,18 +505,53 @@ class MacosZipTests(TempCase):
         args.update(kwargs)
         return rc.verify_macos_zip(path, **args)
 
-    def test_bundle_is_trusted_by_the_signed_inventory_without_any_apple_signature(self):
-        plain = self.fx.macos_zip(self.tmp / "plain.zip")
-        with zipfile.ZipFile(plain) as archive:
-            self.assertFalse([n for n in archive.namelist() if "_CodeSignature" in n])
-        self.verify(plain)
-        sealed = self.fx.macos_zip(self.tmp / "sealed.zip", code_resources=True)  # inspected when present
+    def test_sealed_bundle_and_external_sidecar_verify(self):
+        sealed = self.fx.macos_zip(self.tmp / "sealed.zip")
+        with zipfile.ZipFile(sealed) as archive:
+            names = archive.namelist()
+        self.assertIn(f"{rc.MACOS_APP}/{rc.MACOS_CODE_RESOURCES_REL}", names)
+        inventory_path, signature_path = rc.macos_sidecar_paths(VERSION, SHA)
+        self.assertEqual(inventory_path, f"{rc.MACOS_ROOT}/Hane.app.update/{VERSION}-{SHA}/hane-install.json")
+        self.assertIn(inventory_path, names)
+        self.assertIn(signature_path, names)
+        self.assertFalse([n for n in names if n.startswith(f"{rc.MACOS_APP}/") and n.endswith("hane-install.json")])
         self.verify(sealed)
+        with zipfile.ZipFile(sealed) as archive:
+            document = json.loads(archive.read(inventory_path))
+        # The seal is inventoried like every other file of the app.
+        self.assertIn(rc.MACOS_CODE_RESOURCES_REL, [f["path"] for f in document["files"]])
+        self.assertEqual(document["layout_revision"], 2)
+
+    def test_an_unsealed_bundle_is_rejected(self):
+        with self.assertRaisesRegex(ReleaseError, "CodeResources"):
+            self.verify(self.fx.macos_zip(self.tmp / "unsealed.zip", code_resources=False))
+
+    def test_the_v0_27_0_inventory_inside_the_app_is_not_a_layout_2_bundle(self):
+        with self.assertRaisesRegex(ReleaseError, "inside Hane.app"):
+            self.verify(self.fx.macos_zip(self.tmp / "legacy.zip", legacy_inventory=True))
+
+    def test_sidecar_must_name_this_release_and_nothing_else_may_sit_beside_the_app(self):
+        with self.assertRaisesRegex(ReleaseError, "unexpected entry"):
+            self.verify(self.fx.macos_zip(self.tmp / "other-version.zip", sidecar_version="0.26.0"))
+        with self.assertRaisesRegex(ReleaseError, "unexpected entry"):
+            self.verify(self.fx.macos_zip(self.tmp / "other-source.zip", sidecar_source=OTHER_SHA))
+        for name in ("extra.json", "run.sh"):
+            extra = [(f"{rc.MACOS_ROOT}/Hane.app.update/{VERSION}-{SHA}/{name}", b"x", 0o644)]
+            with self.assertRaisesRegex(ReleaseError, "unexpected entry", msg=name):
+                self.verify(self.fx.macos_zip(self.tmp / f"{name}.zip", extra=extra))
+        executable = [(f"{rc.MACOS_ROOT}/Hane.app.update/{VERSION}-{SHA}/hane-install.json", b"x", 0o755)]
+        with self.assertRaises(ReleaseError):
+            self.verify(self.fx.macos_zip(self.tmp / "exec.zip", extra=executable))
+        for escape in (f"{rc.MACOS_ROOT}/Hane.app.update/../evil", f"{rc.MACOS_ROOT}/Hane.app.update2/x"):
+            with self.assertRaises(ReleaseError, msg=escape):
+                self.verify(self.fx.macos_zip(self.tmp / "escape.zip", extra=[(escape, b"x", 0o644)]))
+            (self.tmp / "escape.zip").unlink(missing_ok=True)
 
     def test_real_generator_inventory_matches_the_verifier(self):
         staging = self.tmp / "Hane.app"
         for name, data in (("Contents/Info.plist", b"x"), ("Contents/MacOS/hane", macho()),
-                           ("Contents/Helpers/hane-updater", macho()), ("Contents/Resources/Hane.icns", b"i")):
+                           ("Contents/Helpers/hane-updater", macho()), ("Contents/Resources/Hane.icns", b"i"),
+                           (rc.MACOS_CODE_RESOURCES_REL, b"<plist/>")):
             (staging / name).parent.mkdir(parents=True, exist_ok=True)
             (staging / name).write_bytes(data)
         raw = rc.build_macos_inventory(staging, VERSION, SHA)
@@ -513,11 +560,42 @@ class MacosZipTests(TempCase):
                          (rc.MACOS_TARGET, rc.MACOS_LAYOUT, VERSION))
         self.assertEqual([f["path"] for f in document["files"]],
                          sorted(["Contents/Info.plist", "Contents/MacOS/hane", "Contents/Helpers/hane-updater",
-                                 "Contents/Resources/Hane.icns"]))
-        (staging / rc.MACOS_INVENTORY_REL).write_bytes(raw)
-        self.assertEqual(rc.build_macos_inventory(staging, VERSION, SHA), raw)  # its own files are skipped
+                                 "Contents/Resources/Hane.icns", rc.MACOS_CODE_RESOURCES_REL]))
         with self.assertRaises(ReleaseError):
             rc.build_macos_inventory(staging, VERSION, OTHER_SHA)
+        # An inventory inside the app would break the seal and is refused.
+        (staging / rc.MACOS_LEGACY_INVENTORY_REL).write_bytes(raw)
+        with self.assertRaisesRegex(ReleaseError, "sidecar"):
+            rc.build_macos_inventory(staging, VERSION, SHA)
+        (staging / rc.MACOS_LEGACY_INVENTORY_REL).unlink()
+        # So is an app that was never sealed.
+        (staging / rc.MACOS_CODE_RESOURCES_REL).unlink()
+        with self.assertRaisesRegex(ReleaseError, "not sealed"):
+            rc.build_macos_inventory(staging, VERSION, SHA)
+
+    def test_codesign_is_verified_with_apples_tool_and_must_be_ad_hoc_without_a_team(self):
+        calls = []
+
+        def runner(output):
+            def run(args):
+                calls.append(args)
+                code = 0 if "--verify" in args else output[0]
+                return mock.Mock(returncode=code, stdout=b"", stderr=output[1])
+            return run
+
+        good = (0, b"Signature=adhoc\nTeamIdentifier=not set\n")
+        rc.verify_macos_codesign(self.tmp / "Hane.app", runner(good))
+        self.assertEqual(calls[0][:5], ["/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2"])
+        with self.assertRaisesRegex(ReleaseError, "ad hoc"):
+            rc.verify_macos_codesign(self.tmp / "Hane.app", runner((0, b"Signature size=9000\nTeamIdentifier=ABCDE12345")))
+        with self.assertRaisesRegex(ReleaseError, "Team Identifier"):
+            rc.verify_macos_codesign(self.tmp / "Hane.app", runner((0, b"Signature=adhoc\nTeamIdentifier=ABCDE12345")))
+
+        def failing(args):
+            return mock.Mock(returncode=1, stdout=b"", stderr=b"invalid signature")
+
+        with self.assertRaisesRegex(ReleaseError, "invalid signature"):
+            rc.verify_macos_codesign(self.tmp / "Hane.app", failing)
 
     def test_inventory_is_required_signed_by_a_trusted_key_and_exact(self):
         with self.assertRaisesRegex(ReleaseError, "missing"):
@@ -544,7 +622,7 @@ class MacosZipTests(TempCase):
 
     def test_inventory_identity_fields_are_checked(self):
         for field, value in (("version", "0.27.1"), ("target", rc.WINDOWS_TARGET), ("source_sha", OTHER_SHA),
-                             ("updater_protocol", 2), ("layout_revision", 2)):
+                             ("updater_protocol", 2), ("layout_revision", 1)):
             path = self.fx.macos_zip(self.tmp / f"{field}.zip", tweak=lambda d, f=field, v=value: d.update({f: v}))
             with self.assertRaisesRegex(ReleaseError, field, msg=field):
                 self.verify(path)
@@ -585,6 +663,22 @@ class MacosZipTests(TempCase):
             path = self.fx.macos_zip(self.tmp / f"{name}.zip", helper=helper)
             with self.assertRaises(ReleaseError, msg=name):
                 self.verify(path)
+
+    def test_executables_without_a_code_signature_are_rejected(self):
+        # Header: magic, cputype, cpusubtype, filetype, ncmds=0, sizeofcmds=0, flags, reserved.
+        unsigned = macho(signed=False)
+        for name, kwargs in (("helper", {"helper": unsigned}), ("app", {"app_binary": unsigned})):
+            path = self.fx.macos_zip(self.tmp / f"{name}.zip", **kwargs)
+            with self.assertRaisesRegex(ReleaseError, "no code signature", msg=name):
+                self.verify(path)
+        with self.assertRaisesRegex(ReleaseError, "no code signature"):
+            rc.check_macho_signed(unsigned, "hane")
+        rc.check_macho_signed(macho(), "hane")
+        header = macho()[:32]
+        with self.assertRaises(ReleaseError):  # a load command that runs past the declared size
+            rc.check_macho_signed(header[:20] + (4096).to_bytes(4, "little") + header[24:] + b"\0" * 16, "hane")
+        with self.assertRaises(ReleaseError):
+            rc.check_macho_signed(b"MZ" + b"\0" * 64, "hane")
 
     def test_finder_metadata_and_stray_files_are_rejected(self):
         for extra in ([("__MACOSX/._x", b"x", 0o644)], [(f"{rc.MACOS_ROOT}/.DS_Store", b"x", 0o644)],

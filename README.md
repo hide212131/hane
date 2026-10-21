@@ -21,7 +21,11 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 - macOS Apple Silicon — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-macos-arm64.zip` をダウンロードし、展開して `Hane.app` を開きます。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-macos-arm64.zip)することもできます。
 - Windows 11 x64 — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` をダウンロードし、展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-windows-x64.zip)することもできます。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
 
-macOS 版は現在 Developer ID による署名と Apple の notarization には未対応です。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
+macOS 版の ZIP を初めて置くときは、展開後の `Hane.app` と、その隣にある `Hane.app.update` を必ず一緒に、書き込み可能なローカルの場所（例: `/Applications`）へ移してから起動してください。`Hane.app.update` にはアプリ内更新が本体を検証するための更新用データが入っているため、`Hane.app` だけを移さないでください。ダウンロード場所から直接起動して App Translocation される配置では、アプリ内更新の対象外になります。
+
+macOS 版は Apple Developer ID の署名も notarization も付けていません。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
+
+「開発元を検証できない」などの警告で止まった場合は、`Hane.app` を一度開いて警告を閉じたあと、「システム設定」→「プライバシーとセキュリティ」の「セキュリティ」欄に表示される「このまま開く」を選び、確認画面で本人が許可してください。この許可はアプリごとに初回だけ必要です。「壊れているため開けません」と表示される場合は、この手順では解決しません。許可操作で進めず、ダウンロードし直すか、[Issue #510](https://github.com/hide212131/hane/issues/510) で報告してください。
 
 Windows版は [最新のGitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。v0.19.1以降のZIPにはWindows 11のExplorer拡張も同梱します（v0.19.0のZIPには含まれません）。CLI の使い方とエクスプローラーへの統合については [Windows CLI / Explorer 統合](#windows-cli--explorer-統合) を参照してください。
 
@@ -74,7 +78,7 @@ Windows 11向けの新しい配布ZIPには `Hane.ShellIntegration.msix`、署�
 アプリ本体の更新（Issue #510、[ADR-0034](docs/adr/0034-zip-application-updates.md)）に使うため、各Releaseは次の4ファイルをそろえて公開します。`hane-update.json` と `hane-update.json.sig` は、両ZIPの実サイズ・SHA-256・Windowsの所有ファイル一覧・macOSのBundle ID/版/署名済みinventoryのhashから生成し、Hane更新専用のEd25519鍵で署名します。
 
 - `hane-windows-x64.zip` — 上記の構成に加え、署名済みの `hane-install.json` / `hane-install.json.sig`。
-- `hane-macos-arm64.zip` — 更新用Ed25519鍵で署名した `Contents/Resources/hane-install.json` / `.sig` を含む `Hane.app`（`Contents/Helpers/hane-updater` を含む）。Apple Developer ID・notarizationは使わず、署名後はbundleを変更せずZIP化します。
+- `hane-macos-arm64.zip` — ローカルのad-hoc署名で封印した `Hane.app`（`Contents/Helpers/hane-updater` を含む。Apple Siliconは署名のない実行コードを起動しないため、helper → 本体 → bundleの順に内側から署名し、`codesign --verify --deep --strict` で確認します）と、その隣の `Hane.app.update/<バージョン>-<source SHA>/hane-install.json` / `.sig`（更新用Ed25519鍵で署名したinventory。`_CodeSignature/CodeResources` を含む全ファイルを列挙し、アプリの外に置くので封印を壊しません）。Apple Developer ID・Team ID・notarizationは使いません。`Hane.app` と `Hane.app.update` は同じ場所に並べて置いてください。更新で入れ替えた後のinventoryはアプリごとの `.hane-update-*` 内に保存されます。v0.27.0のようにinventoryがアプリ内にある旧形式は、次の更新までの移行用に一度だけ読み取ります。
 - `hane-update.json`, `hane-update.json.sig` — 検証済みcatalogとその署名。
 
 更新対応版の最初の導入は、これまでどおり手動でZIPを展開します。更新用の署名鍵・公開鍵・MSIX署名証明書が未設定の間は、リリースは失敗し、更新対応のReleaseは公開されません。手順と必要な設定は [リリース手順](.github/RELEASE_AUTOMATION.md) と [Windows署名手順](docs/windows-release-signing.md) を参照してください。

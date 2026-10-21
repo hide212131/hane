@@ -6,16 +6,33 @@
 //! real one and it is compiled on macOS only.
 //!
 //! Trust comes from the Ed25519 update key alone: the catalog and the
-//! inventory inside the bundle are signed with it. No Apple Developer ID, Team
-//! ID or notarization is required, and none of Apple's protections is turned
-//! off (no quarantine removal, no re-signing, no Gatekeeper bypass).
+//! inventory are signed with it. The released `Hane.app` additionally carries a
+//! local ad-hoc code signature, which Apple Silicon needs before it runs any
+//! code; it is made at build time, is listed in the inventory like every other
+//! file (`Contents/_CodeSignature/CodeResources`), and is never made or changed
+//! here. No Apple Developer ID, Team ID or notarization is required, and none
+//! of Apple's protections is turned off (no quarantine removal, no re-signing,
+//! no Gatekeeper bypass).
+//!
+//! Because any file added to a sealed bundle breaks its seal, the inventory
+//! (layout 2) is kept outside the app, in a sidecar generation
+//! `<version>-<source_sha>/hane-install.json(.sig)`. The installed bundle uses
+//! the generation named by its own Info.plist, looked up in the install's
+//! app-specific `inventories/` directory and then next to the bundle
+//! (`Hane.app.update/`). A generation that exists is authoritative: if it is
+//! damaged, signed for another release or does not match the files, the bundle
+//! is refused and nothing falls back to older data. Only the one released
+//! bundle of layout 1 (v0.27.0, inventory inside the app) is still read, as a
+//! legacy, and only when no generation exists for it. The new generation of a
+//! candidate is copied into `inventories/` before the exchange, never over an
+//! existing one, and no old generation is removed.
 //!
 //! The helper accepts no path, command or environment. Like the Windows path it
 //! reads only `Coordination::transaction_dir(<its own transaction>)/candidate/`
 //! and derives everything else itself:
 //!
 //! 1. the current bundle: fixed Bundle ID, Info.plist version / source SHA /
-//!    updater protocol, and every file matching the signed inventory it carries,
+//!    updater protocol, and every file matching its signed inventory,
 //! 2. the candidate catalog and signature (verified again, bound to the
 //!    requested candidate id) and the archive hash, inspection (including the
 //!    signed inventory) and extraction into the transaction's own `stage/`,
@@ -45,8 +62,8 @@
 //! (U2 / U5 evidence).
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::apply::{self, FileOps, RecoveryOutcome};
@@ -54,10 +71,14 @@ use crate::archive::{ArchiveLimits, stage_archive};
 use crate::catalog::{VerifyContext, verify_catalog};
 use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::fsutil::{FileSeenStore, hash_regular_file, hash_regular_file_under, read_limited};
+use crate::fsutil::{
+    FileSeenStore, hash_regular_file, hash_regular_file_under, read_limited, rename_new_durable,
+    sync_directory,
+};
 use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, conclude_with_child};
 use crate::identity::{
-    ApplyPlan, FileIdentity, InstallId, PlanStep, ReleaseIdentity, SignedInventory, TransactionId,
+    ApplyPlan, FileIdentity, InstallId, Inventory, PlanStep, ReleaseIdentity, SignedInventory,
+    TransactionId,
 };
 use crate::journal::{
     DiskView, DurableJournal, FileJournalStore, JournalStore, Observed, Phase, StepState,
@@ -67,7 +88,10 @@ use crate::limits::{
     JOURNAL_RESERVE_BYTES, MAX_CATALOG_BYTES, MAX_INVENTORY_BYTES, MAX_SIGNATURE_BYTES,
 };
 use crate::model::{
-    MACOS_BUNDLE_ID, MACOS_INVENTORY_REL, MACOS_INVENTORY_SIGNATURE_REL, Target, UPDATER_PROTOCOL,
+    INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, MACOS_BUNDLE_ID,
+    MACOS_LEGACY_INVENTORY_REL, MACOS_LEGACY_INVENTORY_SIGNATURE_REL,
+    MACOS_LEGACY_LAYOUT_REVISION, MACOS_LEGACY_VERSION, MACOS_SIDECAR_DIR, Target,
+    UPDATER_PROTOCOL, macos_generation, parse_macos_generation,
 };
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
@@ -125,11 +149,16 @@ pub trait BundleHost {
     /// storage, so the exchanged directory entries survive a power loss. An
     /// error means the exchange is not known to be durable.
     fn sync_swap(&self, first: &Path, second: &Path) -> Result<()>;
-    /// Verification of the complete bundle against the Ed25519-signed
-    /// inventory it carries ([`verify_bundle_inventory`]). It is the only
-    /// content check: no Apple identity, notarization or Gatekeeper verdict is
-    /// asked for, and none is bypassed.
-    fn verify_bundle_inventory(&self, bundle: &Path, policy: &TrustPolicy) -> Result<()>;
+    /// Verification of the complete bundle against its Ed25519-signed
+    /// inventory, looked up in `sidecar_roots` ([`verify_bundle_inventory`]). It
+    /// is the only content check: no Apple identity, notarization or Gatekeeper
+    /// verdict is asked for, and none is bypassed.
+    fn verify_bundle_inventory(
+        &self,
+        bundle: &Path,
+        sidecar_roots: &[PathBuf],
+        policy: &TrustPolicy,
+    ) -> Result<InventoryOrigin>;
     /// The relocation mark stored on the bundle directory itself (an extended
     /// attribute, which follows the directory through a rename or a move), or
     /// `None` if there is none. Any other failure is an error.
@@ -367,20 +396,67 @@ fn collect_bundle_files(
     Ok(())
 }
 
-/// Verifies `bundle` against the inventory it carries, signed with the
-/// embedded Ed25519 update key: the signature, the target / protocol / layout,
-/// the version and source SHA against the Info.plist, and that the files on
-/// disk are exactly the listed ones (no missing, extra or changed file). An
-/// unconfigured or wrong key, a bad signature or any difference fails closed.
-pub fn verify_bundle_inventory(bundle: &Path, policy: &TrustPolicy) -> Result<SignedInventory> {
-    ensure_real_dir(bundle)?;
-    let missing = |what: &str| UpdateError::new(ErrorCode::NotFound, format!("{what} is missing"));
-    let raw = read_limited(&bundle.join(MACOS_INVENTORY_REL), MAX_INVENTORY_BYTES)?
-        .ok_or_else(|| missing("the bundle inventory"))?;
-    let signature = read_limited(&bundle.join(MACOS_INVENTORY_SIGNATURE_REL), MAX_SIGNATURE_BYTES)?
-        .ok_or_else(|| missing("the bundle inventory signature"))?;
-    let signed = SignedInventory::verify(&raw, &signature, policy)?;
-    let inventory = signed.inventory();
+/// Where the inventory that vouched for a bundle was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryOrigin {
+    /// Layout 2: the external `<version>-<source_sha>/` generation.
+    Sidecar,
+    /// Layout 1 (v0.27.0 only): the inventory inside the app, read as a legacy.
+    LegacyInBundle,
+}
+
+/// A bundle that matched a signed inventory, and which inventory it was.
+#[derive(Debug, Clone)]
+pub struct VerifiedBundle {
+    pub signed: SignedInventory,
+    pub origin: InventoryOrigin,
+}
+
+/// The sidecar directory paired with a bundle: `Hane.app` -> `Hane.app.update`
+/// next to it, as the ZIP lays them out.
+pub fn paired_sidecar_root(bundle: &Path) -> PathBuf {
+    let name = bundle
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Hane.app".to_owned());
+    bundle.with_file_name(format!("{name}.update"))
+}
+
+/// Where the staged candidate's sidecar sits: next to the staged bundle.
+fn staged_sidecar_root(slot: &Path) -> PathBuf {
+    slot.with_file_name(MACOS_SIDECAR_DIR)
+}
+
+/// Where an installed bundle's inventory is looked up, in order: the install's
+/// app-specific external data (`inventories/`, where updates put it) and the
+/// directory beside the bundle (where a fresh install from the ZIP has it).
+pub fn installed_sidecar_roots(placement: &Placement) -> Vec<PathBuf> {
+    vec![
+        Coordination::inventories_dir_for(&placement.coordination_parent, &placement.install_id),
+        paired_sidecar_root(&placement.install_root),
+    ]
+}
+
+fn missing_file(what: &str) -> UpdateError {
+    UpdateError::new(ErrorCode::NotFound, format!("{what} is missing"))
+}
+
+/// Reads a plain file below `dir`; a link or another kind of entry is refused.
+fn read_plain_limited(dir: &Path, name: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    let path = dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => read_limited(&path, limit),
+        Ok(_) => Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{} is not a plain file", path.display()),
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Checks the facts a signed inventory states against the bundle's Info.plist.
+fn check_inventory_describes(inventory: &Inventory, facts: &BundleFacts, layout: u64) -> Result<()> {
     let mismatch = |what: &str| {
         UpdateError::new(
             ErrorCode::IdentityMismatch,
@@ -396,21 +472,27 @@ pub fn verify_bundle_inventory(bundle: &Path, policy: &TrustPolicy) -> Result<Si
             "the bundle inventory updater protocol is not supported",
         ));
     }
-    if inventory.layout_revision != Target::MacosArm64.layout_revision() {
+    if inventory.layout_revision != layout {
         return Err(mismatch("layout revision"));
     }
-    let facts = read_bundle_facts(bundle)?;
     if inventory.version != facts.short_version {
         return Err(mismatch("version"));
     }
     if inventory.source_sha != facts.source_commit {
         return Err(mismatch("source SHA"));
     }
+    Ok(())
+}
 
+/// The files on disk must be exactly the listed ones: no missing, extra or
+/// changed file. `ignored` paths (the in-app inventory of layout 1) are the
+/// only files left out of the comparison.
+fn check_bundle_files(bundle: &Path, inventory: &Inventory, ignored: &[&str]) -> Result<()> {
     let mut on_disk = BTreeMap::new();
     collect_bundle_files(bundle, "", &mut on_disk)?;
-    on_disk.remove(MACOS_INVENTORY_REL);
-    on_disk.remove(MACOS_INVENTORY_SIGNATURE_REL);
+    for path in ignored {
+        on_disk.remove(*path);
+    }
     let changed = || {
         UpdateError::new(
             ErrorCode::InstallModified,
@@ -426,7 +508,227 @@ pub fn verify_bundle_inventory(bundle: &Path, policy: &TrustPolicy) -> Result<Si
             _ => return Err(changed()),
         }
     }
-    Ok(signed)
+    Ok(())
+}
+
+/// Verifies `bundle` against its inventory, signed with the embedded Ed25519
+/// update key: the signature, the target / protocol / layout, the version and
+/// source SHA against the Info.plist, and that the files on disk (the ad-hoc
+/// seal `Contents/_CodeSignature/CodeResources` included) are exactly the
+/// listed ones. An unconfigured or wrong key, a bad signature or any
+/// difference fails closed.
+///
+/// The inventory is the generation `<version>-<source_sha>` named by the
+/// Info.plist, searched in `sidecar_roots` in order. The first root that holds
+/// that name decides: its inventory must be complete and correct, and nothing
+/// falls back to another root or to older data. Only when no root holds the
+/// generation is the v0.27.0 inventory inside the bundle read, as a legacy.
+pub fn verify_bundle_inventory(
+    bundle: &Path,
+    sidecar_roots: &[PathBuf],
+    policy: &TrustPolicy,
+) -> Result<VerifiedBundle> {
+    ensure_real_dir(bundle)?;
+    let facts = read_bundle_facts(bundle)?;
+    let generation = macos_generation(&facts.short_version, &facts.source_commit);
+    // The name comes from an unverified Info.plist and becomes a path.
+    if parse_macos_generation(&generation).is_none() {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the bundle version facts cannot name an inventory",
+        ));
+    }
+    for root in sidecar_roots {
+        let dir = root.join(&generation);
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => return verify_sidecar_bundle(bundle, &dir, &facts, policy),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    verify_legacy_bundle(bundle, &facts, policy)
+}
+
+/// Layout 2: the inventory generation `dir` outside the sealed app.
+fn verify_sidecar_bundle(
+    bundle: &Path,
+    dir: &Path,
+    facts: &BundleFacts,
+    policy: &TrustPolicy,
+) -> Result<VerifiedBundle> {
+    let (raw, signature) = read_sidecar_pair(dir)?;
+    let signed = SignedInventory::verify(&raw, &signature, policy)?;
+    let inventory = signed.inventory();
+    check_inventory_describes(inventory, facts, Target::MacosArm64.layout_revision())?;
+    // A layout 2 bundle never carries the inventory inside the seal.
+    if inventory
+        .files
+        .iter()
+        .any(|file| file.path == MACOS_LEGACY_INVENTORY_REL || file.path == MACOS_LEGACY_INVENTORY_SIGNATURE_REL)
+    {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "a layout 2 inventory must not list an inventory inside the bundle",
+        ));
+    }
+    check_bundle_files(bundle, inventory, &[])?;
+    Ok(VerifiedBundle {
+        signed,
+        origin: InventoryOrigin::Sidecar,
+    })
+}
+
+/// Layout 1: the inventory inside the app. Accepted only for the one version
+/// that shipped it, and only as the layout 1 it states.
+fn verify_legacy_bundle(
+    bundle: &Path,
+    facts: &BundleFacts,
+    policy: &TrustPolicy,
+) -> Result<VerifiedBundle> {
+    let resources = bundle.join("Contents").join("Resources");
+    let name_of = |rel: &str| rel.rsplit('/').next().unwrap_or(rel).to_owned();
+    let raw = read_plain_limited(&resources, &name_of(MACOS_LEGACY_INVENTORY_REL), MAX_INVENTORY_BYTES)?
+        .ok_or_else(|| missing_file("the bundle inventory (no sidecar generation and no v0.27.0 inventory)"))?;
+    let signature = read_plain_limited(
+        &resources,
+        &name_of(MACOS_LEGACY_INVENTORY_SIGNATURE_REL),
+        MAX_SIGNATURE_BYTES,
+    )?
+    .ok_or_else(|| missing_file("the bundle inventory signature"))?;
+    if facts.short_version != MACOS_LEGACY_VERSION {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "only the v0.27.0 bundle may carry its inventory inside the app",
+        ));
+    }
+    let signed = SignedInventory::verify(&raw, &signature, policy)?;
+    let inventory = signed.inventory();
+    check_inventory_describes(inventory, facts, MACOS_LEGACY_LAYOUT_REVISION)?;
+    check_bundle_files(
+        bundle,
+        inventory,
+        &[MACOS_LEGACY_INVENTORY_REL, MACOS_LEGACY_INVENTORY_SIGNATURE_REL],
+    )?;
+    Ok(VerifiedBundle {
+        signed,
+        origin: InventoryOrigin::LegacyInBundle,
+    })
+}
+
+/// The inventory and its signature of one sidecar generation directory, which
+/// must hold exactly those two plain files.
+fn read_sidecar_pair(dir: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
+    ensure_real_dir(dir)?;
+    let mut count = 0usize;
+    for entry in fs::read_dir(dir)? {
+        entry?;
+        count += 1;
+    }
+    if count != 2 {
+        return Err(UpdateError::new(
+            ErrorCode::InstallModified,
+            format!("{} must hold exactly the inventory and its signature", dir.display()),
+        ));
+    }
+    let raw = read_plain_limited(dir, INVENTORY_FILE_NAME, MAX_INVENTORY_BYTES)?
+        .ok_or_else(|| missing_file("the bundle sidecar inventory"))?;
+    let signature = read_plain_limited(dir, INVENTORY_SIGNATURE_FILE_NAME, MAX_SIGNATURE_BYTES)?
+        .ok_or_else(|| missing_file("the bundle sidecar inventory signature"))?;
+    Ok((raw, signature))
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Copies the staged candidate's sidecar generation into the install's
+/// app-specific `inventories/` before the bundle is exchanged.
+///
+/// An existing generation of the same name is never overwritten: it is reused
+/// only when both files are byte for byte the staged ones, and anything else
+/// stops the update. A new generation is written complete into a private
+/// temporary directory and renamed into place, so it is either absent or whole.
+/// No other generation (the old bundle's included) is touched or removed.
+fn install_sidecar(coordination: &Coordination, staged_root: &Path, generation: &str) -> Result<()> {
+    if parse_macos_generation(generation).is_none() {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the candidate cannot name an inventory generation",
+        ));
+    }
+    let (raw, signature) = read_sidecar_pair(&staged_root.join(generation))?;
+    let inventories = coordination.ensure_inventories_dir()?;
+    place_generation(&inventories, generation, &raw, &signature)
+}
+
+/// Places the candidate's generation in the `Hane.app.update` beside the live
+/// bundle, so the new generation travels with the app when `Hane.app` and its
+/// neighbour are moved together. Same rules as [`install_sidecar`]; a failure
+/// refuses the update before the exchange.
+fn install_paired_sidecar(live: &Path, staged_root: &Path, generation: &str) -> Result<()> {
+    if parse_macos_generation(generation).is_none() {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the candidate cannot name an inventory generation",
+        ));
+    }
+    let (raw, signature) = read_sidecar_pair(&staged_root.join(generation))?;
+    let paired = paired_sidecar_root(live);
+    match fs::symlink_metadata(&paired) {
+        Ok(_) => ensure_real_dir(&paired)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&paired)?;
+            if let Some(parent) = paired.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Err(err) => return Err(err.into()),
+    }
+    place_generation(&paired, generation, &raw, &signature)
+}
+
+fn place_generation(inventories: &Path, generation: &str, raw: &[u8], signature: &[u8]) -> Result<()> {
+    let target = inventories.join(generation);
+    match fs::symlink_metadata(&target) {
+        Ok(_) => {
+            let (current_raw, current_signature) = read_sidecar_pair(&target)?;
+            return if current_raw == raw && current_signature == signature {
+                Ok(())
+            } else {
+                Err(UpdateError::new(
+                    ErrorCode::InstallModified,
+                    format!(
+                        "an inventory for {generation} already exists with different content"
+                    ),
+                ))
+            };
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let temp = inventories.join(format!(".{generation}.preparing"));
+    // A leftover of an earlier failed preparation bears this exact private name.
+    match fs::symlink_metadata(&temp) {
+        Ok(meta) if meta.file_type().is_dir() => fs::remove_dir_all(&temp)?,
+        Ok(_) => fs::remove_file(&temp)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    fs::create_dir(&temp)?;
+    let placed = write_new(&temp.join(INVENTORY_FILE_NAME), raw)
+        .and_then(|()| write_new(&temp.join(INVENTORY_SIGNATURE_FILE_NAME), signature))
+        .and_then(|()| sync_directory(&temp))
+        .and_then(|()| rename_new_durable(&temp, &target))
+        .and_then(|()| sync_directory(inventories));
+    if let Err(err) = placed {
+        // After a rename that succeeded the generation is whole and a retry
+        // reuses it; before, only the private temporary directory is removed.
+        let _ = fs::remove_dir_all(&temp);
+        return Err(err.into());
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------- the bundle
@@ -652,6 +954,8 @@ pub struct BundleOps<'a> {
 struct CommitCheck {
     version: String,
     policy: TrustPolicy,
+    /// Where the installed bundle's inventory is looked up.
+    sidecar_roots: Vec<PathBuf>,
 }
 
 /// Directory identity (device, inode) of the install parent and of the two
@@ -744,8 +1048,17 @@ impl<'a> BundleOps<'a> {
     /// Fixes what the live bundle must be (version from the signed candidate,
     /// the signed inventory under the update key) when the update is about to
     /// be committed.
-    pub fn with_commit_check(mut self, version: String, policy: TrustPolicy) -> Self {
-        self.commit_check = Some(CommitCheck { version, policy });
+    pub fn with_commit_check(
+        mut self,
+        version: String,
+        policy: TrustPolicy,
+        sidecar_roots: Vec<PathBuf>,
+    ) -> Self {
+        self.commit_check = Some(CommitCheck {
+            version,
+            policy,
+            sidecar_roots,
+        });
         self
     }
 
@@ -820,7 +1133,15 @@ impl FileOps for BundleOps<'_> {
                 "the live bundle is not the signed candidate version",
             ));
         }
-        require_verified(self.host, &self.live, &check.policy)
+        // The live bundle is the new one: it must now verify with the sidecar
+        // that was prepared before the exchange, and no legacy inventory.
+        match require_verified(self.host, &self.live, &check.sidecar_roots, &check.policy)? {
+            InventoryOrigin::Sidecar => Ok(()),
+            InventoryOrigin::LegacyInBundle => Err(UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "the live bundle is not described by its external inventory",
+            )),
+        }
     }
 
     /// Rolls back by exchanging again. The slot must still hold exactly the
@@ -866,6 +1187,8 @@ pub struct BundleApplyInputs<'a> {
 struct Verified {
     plan: ApplyPlan,
     slot: PathBuf,
+    /// Sidecar generation of the candidate (`<version>-<source_sha>`).
+    generation: String,
 }
 
 fn require_local_apfs(host: &dyn BundleHost, path: &Path, what: &str) -> Result<VolumeFacts> {
@@ -885,62 +1208,74 @@ fn require_local_apfs(host: &dyn BundleHost, path: &Path, what: &str) -> Result<
     Ok(volume)
 }
 
-fn require_verified(host: &dyn BundleHost, bundle: &Path, policy: &TrustPolicy) -> Result<()> {
-    host.verify_bundle_inventory(bundle, policy)
+fn require_verified(
+    host: &dyn BundleHost,
+    bundle: &Path,
+    sidecar_roots: &[PathBuf],
+    policy: &TrustPolicy,
+) -> Result<InventoryOrigin> {
+    host.verify_bundle_inventory(bundle, sidecar_roots, policy)
 }
 
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
-    use crate::identity::{Inventory, InventoryFile};
+    use crate::identity::InventoryFile;
     use crate::model::{INVENTORY_DOMAIN, INVENTORY_SCHEMA};
     use crate::testing::{TEST_KEY_ID, TEST_SOURCE_SHA, TempDir, sign, sign_with, test_policy};
     use crate::util::sha256_hex;
 
-    const VERSION: &str = "0.26.0";
+    const VERSION: &str = "0.27.1";
+    const LEGACY: &str = MACOS_LEGACY_VERSION;
+    const SEAL: &str = "Contents/_CodeSignature/CodeResources";
+    type Files = Vec<(&'static str, Vec<u8>)>;
 
-    fn plist() -> String {
+    fn plist(version: &str) -> String {
         format!(
             "<?xml version=\"1.0\"?>\n<plist version=\"1.0\"><dict>\n\
              <key>CFBundleIdentifier</key>\n<string>{MACOS_BUNDLE_ID}</string>\n\
-             <key>CFBundleShortVersionString</key>\n<string>{VERSION}</string>\n\
-             <key>CFBundleVersion</key>\n<string>{VERSION}</string>\n\
+             <key>CFBundleShortVersionString</key>\n<string>{version}</string>\n\
+             <key>CFBundleVersion</key>\n<string>{version}</string>\n\
              <key>HaneSourceCommit</key>\n<string>{TEST_SOURCE_SHA}</string>\n\
              <key>HaneUpdaterProtocol</key>\n<integer>1</integer>\n\
              </dict></plist>\n"
         )
     }
 
-    fn payload() -> Vec<(&'static str, Vec<u8>)> {
+    /// The files of a sealed bundle. The seal is just another inventoried file.
+    fn payload(version: &str) -> Files {
         vec![
-            ("Contents/Info.plist", plist().into_bytes()),
+            ("Contents/Info.plist", plist(version).into_bytes()),
             ("Contents/MacOS/hane", b"hane".to_vec()),
             (HELPER_REL, b"updater".to_vec()),
+            (SEAL, b"seal".to_vec()),
         ]
     }
 
-    /// Writes `files` plus a signed inventory over `listed` (by default the
-    /// same files). No Apple signature, Team ID or notarization data exists in
-    /// this bundle.
-    fn write_signed_bundle(
-        root: &Path,
-        files: &[(&'static str, Vec<u8>)],
-        listed: &[(&'static str, Vec<u8>)],
-        signer_seed: u8,
-        source_sha: &str,
-    ) {
+    fn write_files(root: &Path, files: &Files) {
         for (rel, data) in files {
             let path = root.join(rel);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, data).unwrap();
         }
+    }
+
+    /// A signed inventory (raw, signature) over `listed`; seed 1 is the test
+    /// update key, any other seed a key the policy does not trust.
+    fn inventory_for(
+        version: &str,
+        source_sha: &str,
+        layout: u64,
+        listed: &Files,
+        signer_seed: u8,
+    ) -> (Vec<u8>, Vec<u8>) {
         let inventory = Inventory {
             schema: INVENTORY_SCHEMA,
-            version: VERSION.to_owned(),
+            version: version.to_owned(),
             target: Target::MacosArm64.triple().to_owned(),
             source_sha: source_sha.to_owned(),
             updater_protocol: UPDATER_PROTOCOL,
-            layout_revision: Target::MacosArm64.layout_revision(),
+            layout_revision: layout,
             files: listed
                 .iter()
                 .map(|(path, data)| InventoryFile {
@@ -956,100 +1291,430 @@ mod inventory_tests {
         } else {
             sign_with(signer_seed, TEST_KEY_ID, INVENTORY_DOMAIN, &raw)
         };
-        for (rel, data) in [
-            (MACOS_INVENTORY_REL, raw),
-            (MACOS_INVENTORY_SIGNATURE_REL, signature),
-        ] {
-            let path = root.join(rel);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, data).unwrap();
-        }
+        (raw, signature)
+    }
+
+    fn write_generation(root: &Path, generation: &str, raw: &[u8], signature: &[u8]) {
+        let dir = root.join(generation);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(INVENTORY_FILE_NAME), raw).unwrap();
+        fs::write(dir.join(INVENTORY_SIGNATURE_FILE_NAME), signature).unwrap();
     }
 
     fn bundle(dir: &TempDir) -> PathBuf {
         dir.path().join("Hane.app")
     }
 
-    #[test]
-    fn a_bundle_without_any_apple_identity_verifies_under_the_update_key() {
-        let dir = TempDir::new("macos-inventory-ok");
-        let files = payload();
-        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
-        let signed = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap();
-        assert!(signed.inventory().files.iter().any(|file| file.path == HELPER_REL));
+    fn roots(dir: &TempDir) -> Vec<PathBuf> {
+        vec![dir.path().join("inventories")]
+    }
+
+    fn generation(version: &str) -> String {
+        macos_generation(version, TEST_SOURCE_SHA)
+    }
+
+    /// A layout 2 bundle with its sidecar generation, signed with `seed`.
+    fn sidecar_install(dir: &TempDir, version: &str, seed: u8) -> Files {
+        let files = payload(version);
+        write_files(&bundle(dir), &files);
+        let (raw, signature) = inventory_for(
+            version,
+            TEST_SOURCE_SHA,
+            Target::MacosArm64.layout_revision(),
+            &files,
+            seed,
+        );
+        write_generation(&roots(dir)[0], &generation(version), &raw, &signature);
+        files
+    }
+
+    fn verify(dir: &TempDir) -> Result<VerifiedBundle> {
+        verify_bundle_inventory(&bundle(dir), &roots(dir), &test_policy())
+    }
+
+    fn code(result: Result<VerifiedBundle>) -> ErrorCode {
+        result.unwrap_err().code
+    }
+
+    /// A v0.27.0 bundle: the layout 1 inventory sits inside the app.
+    fn legacy_install(dir: &TempDir, layout: u64, version: &str) -> Files {
+        let files = payload(version);
+        write_files(&bundle(dir), &files);
+        let (raw, signature) = inventory_for(version, TEST_SOURCE_SHA, layout, &files, 1);
+        write_files(
+            &bundle(dir),
+            &vec![
+                (MACOS_LEGACY_INVENTORY_REL, raw),
+                (MACOS_LEGACY_INVENTORY_SIGNATURE_REL, signature),
+            ],
+        );
+        files
     }
 
     #[test]
-    fn code_resources_is_inventoried_when_present_and_optional_otherwise() {
-        let dir = TempDir::new("macos-inventory-seal");
-        let mut files = payload();
-        files.push(("Contents/_CodeSignature/CodeResources", b"seal".to_vec()));
-        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
-        verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap();
-        // Present on disk but unlisted, or changed, is refused.
-        let seal = bundle(&dir).join("Contents/_CodeSignature/CodeResources");
-        fs::write(&seal, b"tampered").unwrap();
-        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::InstallModified);
-
-        let other = TempDir::new("macos-inventory-seal-unlisted");
-        write_signed_bundle(&bundle(&other), &payload(), &payload(), 1, TEST_SOURCE_SHA);
-        let seal = bundle(&other).join("Contents/_CodeSignature/CodeResources");
-        fs::create_dir_all(seal.parent().unwrap()).unwrap();
-        fs::write(&seal, b"seal").unwrap();
-        let err = verify_bundle_inventory(&bundle(&other), &test_policy()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::InstallModified);
-
-        // Without it, identity is still computed.
-        let bare = TempDir::new("macos-inventory-seal-absent");
-        write_signed_bundle(&bundle(&bare), &payload(), &payload(), 1, TEST_SOURCE_SHA);
-        assert!(matches!(bundle_identity(&bundle(&bare)).unwrap(), Observed::File(_)));
+    fn a_sealed_bundle_verifies_against_its_external_sidecar() {
+        let dir = TempDir::new("macos-sidecar-ok");
+        sidecar_install(&dir, VERSION, 1);
+        let verified = verify(&dir).unwrap();
+        assert_eq!(verified.origin, InventoryOrigin::Sidecar);
+        let listed = &verified.signed.inventory().files;
+        assert!(listed.iter().any(|file| file.path == HELPER_REL));
+        // The ad-hoc seal is inventoried like every other file of the app.
+        assert!(listed.iter().any(|file| file.path == SEAL));
+        assert_eq!(verified.signed.inventory().layout_revision, 2);
+        // And the app itself holds no inventory.
+        assert!(!bundle(&dir).join(MACOS_LEGACY_INVENTORY_REL).exists());
     }
 
     #[test]
-    fn an_unconfigured_or_foreign_update_key_is_refused() {
-        let dir = TempDir::new("macos-inventory-key");
-        let files = payload();
-        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
-        let err = verify_bundle_inventory(&bundle(&dir), &TrustPolicy::production()).unwrap_err();
+    fn a_changed_extra_or_missing_app_file_is_refused() {
+        for (name, damage) in [
+            ("helper", 0),
+            ("seal", 1),
+            ("extra", 2),
+            ("missing", 3),
+            ("unlisted-legacy-inventory", 4),
+        ] {
+            let dir = TempDir::new(&format!("macos-sidecar-damage-{name}"));
+            sidecar_install(&dir, VERSION, 1);
+            match damage {
+                0 => fs::write(bundle(&dir).join(HELPER_REL), b"tampered").unwrap(),
+                1 => fs::write(bundle(&dir).join(SEAL), b"tampered").unwrap(),
+                2 => {
+                    // The sidecar layout keeps no inventory in the app, so
+                    // the directory for the extra file may not exist yet.
+                    fs::create_dir_all(bundle(&dir).join("Contents/Resources")).unwrap();
+                    fs::write(bundle(&dir).join("Contents/Resources/extra.sh"), b"#!").unwrap();
+                }
+                3 => fs::remove_file(bundle(&dir).join(MAIN_EXE)).unwrap(),
+                _ => {
+                    fs::create_dir_all(bundle(&dir).join("Contents/Resources")).unwrap();
+                    fs::write(bundle(&dir).join(MACOS_LEGACY_INVENTORY_REL), b"{}").unwrap();
+                }
+            }
+            assert_eq!(code(verify(&dir)), ErrorCode::InstallModified, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_missing_forged_or_untrusted_sidecar_is_refused() {
+        // No generation anywhere and nothing legacy inside: nothing vouches.
+        let dir = TempDir::new("macos-sidecar-missing");
+        write_files(&bundle(&dir), &payload(VERSION));
+        assert_eq!(code(verify(&dir)), ErrorCode::NotFound);
+
+        let dir = TempDir::new("macos-sidecar-key");
+        sidecar_install(&dir, VERSION, 1);
+        let err = verify_bundle_inventory(&bundle(&dir), &roots(&dir), &TrustPolicy::production())
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::TrustUnconfigured);
 
-        let other = TempDir::new("macos-inventory-forged");
-        write_signed_bundle(&bundle(&other), &files, &files, 2, TEST_SOURCE_SHA);
-        let err = verify_bundle_inventory(&bundle(&other), &test_policy()).unwrap_err();
+        let dir = TempDir::new("macos-sidecar-forged");
+        sidecar_install(&dir, VERSION, 2);
+        assert_eq!(code(verify(&dir)), ErrorCode::SignatureInvalid);
+    }
+
+    #[test]
+    fn a_damaged_sidecar_generation_is_refused() {
+        // A signature file missing, an extra file, a link in place of a file.
+        let dir = TempDir::new("macos-sidecar-no-signature");
+        sidecar_install(&dir, VERSION, 1);
+        let sidecar = roots(&dir)[0].join(generation(VERSION));
+        fs::remove_file(sidecar.join(INVENTORY_SIGNATURE_FILE_NAME)).unwrap();
+        assert_eq!(code(verify(&dir)), ErrorCode::InstallModified);
+
+        let dir = TempDir::new("macos-sidecar-extra-file");
+        sidecar_install(&dir, VERSION, 1);
+        let sidecar = roots(&dir)[0].join(generation(VERSION));
+        fs::write(sidecar.join("notes.txt"), b"x").unwrap();
+        assert_eq!(code(verify(&dir)), ErrorCode::InstallModified);
+
+        #[cfg(unix)]
+        {
+            let dir = TempDir::new("macos-sidecar-link");
+            sidecar_install(&dir, VERSION, 1);
+            let sidecar = roots(&dir)[0].join(generation(VERSION));
+            let elsewhere = dir.path().join("elsewhere.json");
+            fs::rename(sidecar.join(INVENTORY_FILE_NAME), &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, sidecar.join(INVENTORY_FILE_NAME)).unwrap();
+            assert_eq!(code(verify(&dir)), ErrorCode::InstallModified);
+        }
+    }
+
+    #[test]
+    fn an_inventory_for_another_release_or_layout_is_refused() {
+        // Signed correctly, but stating another version, source or layout.
+        for (name, version, source, layout) in [
+            ("version", "0.26.0", TEST_SOURCE_SHA.to_owned(), 2),
+            ("source", VERSION, "a".repeat(40), 2),
+            ("layout", VERSION, TEST_SOURCE_SHA.to_owned(), MACOS_LEGACY_LAYOUT_REVISION),
+        ] {
+            let dir = TempDir::new(&format!("macos-sidecar-other-{name}"));
+            let files = payload(VERSION);
+            write_files(&bundle(&dir), &files);
+            let (raw, signature) = inventory_for(version, &source, layout, &files, 1);
+            write_generation(&roots(&dir)[0], &generation(VERSION), &raw, &signature);
+            assert_eq!(code(verify(&dir)), ErrorCode::IdentityMismatch, "{name}");
+        }
+
+        // The sidecar of another release is never used for this bundle: only
+        // the generation named by the Info.plist is looked at.
+        let dir = TempDir::new("macos-sidecar-wrong-generation");
+        let files = payload(VERSION);
+        write_files(&bundle(&dir), &files);
+        let (raw, signature) = inventory_for("0.27.0", TEST_SOURCE_SHA, 2, &files, 1);
+        write_generation(&roots(&dir)[0], &generation("0.27.0"), &raw, &signature);
+        assert_eq!(code(verify(&dir)), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn an_existing_generation_never_falls_back_to_older_data() {
+        // The bundle is v0.27.0 with its valid legacy inventory, but a
+        // generation exists for it and is forged: it decides, and fails.
+        let dir = TempDir::new("macos-sidecar-no-fallback");
+        legacy_install(&dir, MACOS_LEGACY_LAYOUT_REVISION, LEGACY);
+        let files = payload(LEGACY);
+        let (raw, signature) = inventory_for(LEGACY, TEST_SOURCE_SHA, 2, &files, 2);
+        write_generation(&roots(&dir)[0], &generation(LEGACY), &raw, &signature);
+        assert_eq!(code(verify(&dir)), ErrorCode::SignatureInvalid);
+
+        // The first root holding the generation decides, even if a later root
+        // holds a valid one.
+        let dir = TempDir::new("macos-sidecar-first-root");
+        let files = sidecar_install(&dir, VERSION, 2);
+        let paired = paired_sidecar_root(&bundle(&dir));
+        let (raw, signature) = inventory_for(VERSION, TEST_SOURCE_SHA, 2, &files, 1);
+        write_generation(&paired, &generation(VERSION), &raw, &signature);
+        let both = [roots(&dir)[0].clone(), paired];
+        let err = verify_bundle_inventory(&bundle(&dir), &both, &test_policy()).unwrap_err();
         assert_eq!(err.code, ErrorCode::SignatureInvalid);
     }
 
     #[test]
-    fn a_changed_extra_or_missing_file_is_refused() {
-        let files = payload();
+    fn a_fresh_install_uses_the_sidecar_beside_the_app() {
+        let dir = TempDir::new("macos-sidecar-paired");
+        let files = payload(VERSION);
+        write_files(&bundle(&dir), &files);
+        let paired = paired_sidecar_root(&bundle(&dir));
+        assert_eq!(paired.file_name().unwrap(), "Hane.app.update");
+        let (raw, signature) = inventory_for(VERSION, TEST_SOURCE_SHA, 2, &files, 1);
+        write_generation(&paired, &generation(VERSION), &raw, &signature);
+        let both = [roots(&dir)[0].clone(), paired];
+        let verified = verify_bundle_inventory(&bundle(&dir), &both, &test_policy()).unwrap();
+        assert_eq!(verified.origin, InventoryOrigin::Sidecar);
+    }
 
-        let dir = TempDir::new("macos-inventory-changed");
-        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+    #[test]
+    fn the_v0_27_0_inventory_inside_the_app_is_read_as_layout_1_only() {
+        let dir = TempDir::new("macos-legacy-ok");
+        legacy_install(&dir, MACOS_LEGACY_LAYOUT_REVISION, LEGACY);
+        let verified = verify(&dir).unwrap();
+        assert_eq!(verified.origin, InventoryOrigin::LegacyInBundle);
+        assert_eq!(verified.signed.inventory().layout_revision, 1);
+        // Its own two files are not part of the listing.
+        assert!(
+            !verified
+                .signed
+                .inventory()
+                .files
+                .iter()
+                .any(|file| file.path == MACOS_LEGACY_INVENTORY_REL)
+        );
+
+        // Changed, extra or removed app files are refused as for any bundle.
+        let dir = TempDir::new("macos-legacy-changed");
+        legacy_install(&dir, MACOS_LEGACY_LAYOUT_REVISION, LEGACY);
         fs::write(bundle(&dir).join(HELPER_REL), b"tampered").unwrap();
-        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(code(verify(&dir)), ErrorCode::InstallModified);
 
-        let dir = TempDir::new("macos-inventory-extra");
-        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
+        let dir = TempDir::new("macos-legacy-extra");
+        legacy_install(&dir, MACOS_LEGACY_LAYOUT_REVISION, LEGACY);
         fs::write(bundle(&dir).join("Contents/Resources/extra.sh"), b"#!").unwrap();
-        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
-        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(code(verify(&dir)), ErrorCode::InstallModified);
 
-        let dir = TempDir::new("macos-inventory-missing");
-        write_signed_bundle(&bundle(&dir), &files, &files, 1, TEST_SOURCE_SHA);
-        fs::remove_file(bundle(&dir).join(MAIN_EXE)).unwrap();
-        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+        // An in-app inventory that claims layout 2 is not the legacy.
+        let dir = TempDir::new("macos-legacy-layout-2");
+        legacy_install(&dir, 2, LEGACY);
+        assert_eq!(code(verify(&dir)), ErrorCode::IdentityMismatch);
+
+        // Nor is an in-app inventory of any other release.
+        let dir = TempDir::new("macos-legacy-other-version");
+        legacy_install(&dir, MACOS_LEGACY_LAYOUT_REVISION, VERSION);
+        assert_eq!(code(verify(&dir)), ErrorCode::IdentityMismatch);
+    }
+
+    #[test]
+    fn a_name_from_the_info_plist_cannot_become_a_path() {
+        let dir = TempDir::new("macos-sidecar-traversal");
+        let files: Files = vec![
+            ("Contents/Info.plist", plist("../evil").into_bytes()),
+            ("Contents/MacOS/hane", b"hane".to_vec()),
+            (HELPER_REL, b"updater".to_vec()),
+        ];
+        write_files(&bundle(&dir), &files);
+        assert_eq!(code(verify(&dir)), ErrorCode::IdentityMismatch);
+        assert!(parse_macos_generation(&generation(VERSION)).is_some());
+        for bad in ["", "-", "0.27.1", "0.27.1-abc", "a/b-0123456789012345678901234567890123456789"] {
+            assert!(parse_macos_generation(bad).is_none(), "{bad}");
+        }
+    }
+
+    // ------------------------------------------------ preparing the sidecar
+
+    struct Prepared {
+        dir: TempDir,
+        coordination: Coordination,
+        staged: PathBuf,
+    }
+
+    fn prepared(name: &str) -> Prepared {
+        use crate::identity::InstallFacts;
+        let dir = TempDir::new(name);
+        let install_id = InstallId::derive(&InstallFacts {
+            os: "test",
+            volume_id: "v",
+            install_path: "/x",
+            owner: "u",
+        })
+        .unwrap();
+        let coordination = Coordination::create(dir.path(), &install_id).unwrap();
+        let staged = dir.path().join("staged-sidecar");
+        let files = payload(VERSION);
+        let (raw, signature) = inventory_for(VERSION, TEST_SOURCE_SHA, 2, &files, 1);
+        write_generation(&staged, &generation(VERSION), &raw, &signature);
+        Prepared {
+            dir,
+            coordination,
+            staged,
+        }
+    }
+
+    fn installed_pair(prepared: &Prepared, version: &str) -> (Vec<u8>, Vec<u8>) {
+        let dir = prepared.coordination.inventories_dir().join(generation(version));
+        (
+            fs::read(dir.join(INVENTORY_FILE_NAME)).unwrap(),
+            fs::read(dir.join(INVENTORY_SIGNATURE_FILE_NAME)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_new_generation_is_copied_whole_beside_the_old_ones() {
+        let p = prepared("macos-sidecar-install");
+        // The old release already has its own generation.
+        let old = payload("0.27.0");
+        let (old_raw, old_sig) = inventory_for("0.27.0", TEST_SOURCE_SHA, 2, &old, 1);
+        let inventories = p.coordination.ensure_inventories_dir().unwrap();
+        write_generation(&inventories, &generation("0.27.0"), &old_raw, &old_sig);
+
+        install_sidecar(&p.coordination, &p.staged, &generation(VERSION)).unwrap();
+        let staged = (
+            fs::read(p.staged.join(generation(VERSION)).join(INVENTORY_FILE_NAME)).unwrap(),
+            fs::read(p.staged.join(generation(VERSION)).join(INVENTORY_SIGNATURE_FILE_NAME)).unwrap(),
+        );
+        assert_eq!(installed_pair(&p, VERSION), staged);
+        // The old generation is untouched, and no temporary directory is left.
+        assert_eq!(installed_pair(&p, "0.27.0"), (old_raw, old_sig));
+        let names: Vec<String> = fs::read_dir(&inventories)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().all(|name| !name.starts_with('.')), "{names:?}");
+
+        // The same release again is accepted when it is byte for byte the same.
+        install_sidecar(&p.coordination, &p.staged, &generation(VERSION)).unwrap();
+        assert_eq!(installed_pair(&p, VERSION), staged);
+    }
+
+    #[test]
+    fn the_new_generation_travels_with_the_app_and_its_neighbour() {
+        let p = prepared("macos-sidecar-moved-together");
+        let old_files = payload("0.27.0");
+        let live = p.dir.path().join("before").join("Hane.app");
+        write_files(&live, &payload(VERSION));
+        let paired = paired_sidecar_root(&live);
+        let (old_raw, old_sig) = inventory_for("0.27.0", TEST_SOURCE_SHA, 2, &old_files, 1);
+        write_generation(&paired, &generation("0.27.0"), &old_raw, &old_sig);
+
+        install_paired_sidecar(&live, &p.staged, &generation(VERSION)).unwrap();
+
+        // Both are moved together to a place with another InstallId store.
+        let moved = p.dir.path().join("after");
+        fs::rename(live.parent().unwrap(), &moved).unwrap();
+        let moved_paired = moved.join("Hane.app.update");
+        let new_dir = moved_paired.join(generation(VERSION));
+        let staged_dir = p.staged.join(generation(VERSION));
+        for name in [INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME] {
+            assert_eq!(fs::read(new_dir.join(name)).unwrap(), fs::read(staged_dir.join(name)).unwrap());
+        }
+        // The old generation is untouched, and the same release again is accepted.
+        assert!(moved_paired.join(generation("0.27.0")).join(INVENTORY_FILE_NAME).exists());
+        install_paired_sidecar(&moved.join("Hane.app"), &p.staged, &generation(VERSION)).unwrap();
+
+        // The moved app verifies from the updated generation beside it, with
+        // no InstallId store holding anything for it.
+        let verified = verify_bundle_inventory(
+            &moved.join("Hane.app"),
+            &[
+                p.dir.path().join("other-install-id-store").join("inventories"),
+                moved_paired,
+            ],
+            &test_policy(),
+        )
+        .unwrap();
+        assert_eq!(verified.origin, InventoryOrigin::Sidecar);
+        assert_eq!(verified.signed.inventory().version, VERSION);
+    }
+
+    #[test]
+    fn a_paired_sidecar_that_cannot_be_written_stops_the_update() {
+        let p = prepared("macos-sidecar-paired-unwritable");
+        let live = p.dir.path().join("Hane.app");
+        fs::create_dir_all(&live).unwrap();
+        // A plain file where the neighbouring directory belongs.
+        fs::write(paired_sidecar_root(&live), b"x").unwrap();
+        let err = install_paired_sidecar(&live, &p.staged, &generation(VERSION)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InstallModified);
     }
 
     #[test]
-    fn an_inventory_for_another_source_is_refused() {
-        let dir = TempDir::new("macos-inventory-source");
-        let files = payload();
-        write_signed_bundle(&bundle(&dir), &files, &files, 1, &"a".repeat(40));
-        let err = verify_bundle_inventory(&bundle(&dir), &test_policy()).unwrap_err();
+    fn an_existing_generation_with_other_content_stops_the_update_unchanged() {
+        let p = prepared("macos-sidecar-conflict");
+        let inventories = p.coordination.ensure_inventories_dir().unwrap();
+        write_generation(&inventories, &generation(VERSION), b"other", b"other-sig");
+        let err = install_sidecar(&p.coordination, &p.staged, &generation(VERSION)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert_eq!(installed_pair(&p, VERSION), (b"other".to_vec(), b"other-sig".to_vec()));
+
+        // A same-named generation that is not whole (an extra file) also stops.
+        fs::write(inventories.join(generation(VERSION)).join("notes.txt"), b"x").unwrap();
+        let err = install_sidecar(&p.coordination, &p.staged, &generation(VERSION)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    #[test]
+    fn an_incomplete_staged_sidecar_or_a_leftover_temporary_directory_is_handled() {
+        let p = prepared("macos-sidecar-staged");
+        let staged_dir = p.staged.join(generation(VERSION));
+        fs::remove_file(staged_dir.join(INVENTORY_SIGNATURE_FILE_NAME)).unwrap();
+        let err = install_sidecar(&p.coordination, &p.staged, &generation(VERSION)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert!(!p.coordination.inventories_dir().join(generation(VERSION)).exists());
+
+        // A name that is not a generation is refused before anything is read.
+        let err = install_sidecar(&p.coordination, &p.staged, "../x").unwrap_err();
         assert_eq!(err.code, ErrorCode::IdentityMismatch);
+
+        // A leftover of an earlier failed preparation is replaced.
+        fs::write(staged_dir.join(INVENTORY_SIGNATURE_FILE_NAME), b"sig").unwrap();
+        let inventories = p.coordination.ensure_inventories_dir().unwrap();
+        let leftover = inventories.join(format!(".{}.preparing", generation(VERSION)));
+        fs::create_dir_all(&leftover).unwrap();
+        fs::write(leftover.join("stale"), b"x").unwrap();
+        install_sidecar(&p.coordination, &p.staged, &generation(VERSION)).unwrap();
+        assert!(!leftover.exists());
+        assert_eq!(installed_pair(&p, VERSION).1, b"sig".to_vec());
+        assert!(p.dir.path().exists());
     }
 }
 
@@ -1079,7 +1744,10 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
     let install_volume = require_local_apfs(host, live, "the installed bundle")?;
     let current = read_bundle_facts(live)?;
     check_bundle_facts(&current, "the installed bundle")?;
-    require_verified(host, live, inputs.policy)?;
+    // The installed bundle is described by its own generation, or (v0.27.0
+    // only) by the legacy inventory inside it. Both are fine as the old side.
+    let installed_roots = installed_sidecar_roots(placement);
+    require_verified(host, live, &installed_roots, inputs.policy)?;
 
     let txn_dir = coordination.transaction_dir(inputs.transaction);
     let candidate_dir = txn_dir.join(CANDIDATE_DIR);
@@ -1164,7 +1832,15 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
             "the candidate bundle was not built from the cataloged source",
         ));
     }
-    require_verified(host, &slot, inputs.policy)?;
+    // The candidate is layout 2 only: its inventory is the sidecar extracted
+    // beside the staged bundle, never an inventory inside the bundle.
+    let staged_roots = vec![staged_sidecar_root(&slot)];
+    if require_verified(host, &slot, &staged_roots, inputs.policy)? != InventoryOrigin::Sidecar {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the candidate bundle is not described by its external inventory",
+        ));
+    }
 
     // Same volume, and a volume that really swaps. A candidate somewhere else
     // is refused before anything is changed.
@@ -1222,7 +1898,11 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
         }],
         unchanged: Vec::new(),
     };
-    Ok(Verified { plan, slot })
+    Ok(Verified {
+        plan,
+        slot,
+        generation: macos_generation(&version, &next.source_commit),
+    })
 }
 
 // ---------------------------------------------------------------- the swap
@@ -1335,6 +2015,17 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     // anything is mutated; otherwise it could not be retired safely.
     crate::startup::ensure_prior_receipts_current(inputs.coordination, &BundleView::new(live))?;
 
+    // The candidate's inventory is placed in the install's app-specific data
+    // before the exchange, so the new bundle can be verified the moment it is
+    // live. It is a new generation beside the old ones: the old bundle's
+    // inventory (or its in-app legacy inventory) is not touched, which keeps a
+    // rollback verifiable until the health commit.
+    install_sidecar(inputs.coordination, &staged_sidecar_root(&verified.slot), &verified.generation)?;
+    // And beside the live bundle, so the new generation stays verifiable after
+    // `Hane.app` and `Hane.app.update` are moved together. A failure here stops
+    // the update before the exchange; no unverified new app is left behind.
+    install_paired_sidecar(live, &staged_sidecar_root(&verified.slot), &verified.generation)?;
+
     // A mark left on the live bundle by the previous Committed update refers to
     // the receipt retired next. It is removed durably first, so a rollback that
     // restores this bundle cannot bring back a mark without its receipt.
@@ -1368,7 +2059,11 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     // The placement is fixed before the first mutation; a bundle that cannot be
     // pinned is refused here, with nothing written.
     let mut ops = BundleOps::pinned(inputs.host, live, &verified.slot)?
-        .with_commit_check(verified.plan.destination.version.clone(), inputs.policy.clone());
+        .with_commit_check(
+            verified.plan.destination.version.clone(),
+            inputs.policy.clone(),
+            installed_sidecar_roots(inputs.placement),
+        );
     match swap_bundle(&mut journal, &mut ops) {
         Ok(()) => Ok(AppliedBundle { journal, ops }),
         Err(err) => match apply::recover(&mut journal, &mut ops, &mut NoChild) {
@@ -1407,7 +2102,14 @@ fn verified_child(inputs: &BundleApplyInputs<'_>, applied: &AppliedBundle<'_>) -
             "the live bundle differs from the journaled new bundle",
         ));
     }
-    require_verified(inputs.host, live, inputs.policy)?;
+    if require_verified(inputs.host, live, &installed_sidecar_roots(inputs.placement), inputs.policy)?
+        != InventoryOrigin::Sidecar
+    {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the new bundle is not described by its external inventory",
+        ));
+    }
     let exe = live.join(MAIN_EXE);
     hash_regular_file(&exe)?
         .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the bundle executable is missing"))?;
@@ -1601,6 +2303,8 @@ mod tests {
         /// Runs right after a successful exchange, before anything observes it
         /// (the Finder moving the live bundle).
         after_swap: RefCell<Option<Box<dyn Fn()>>>,
+        /// Run the real [`verify_bundle_inventory`] instead of the stub.
+        real_inventory: Cell<bool>,
     }
 
     fn mark_key(path: &Path) -> Result<String> {
@@ -1639,6 +2343,7 @@ mod tests {
                 fail_swap_sync: Cell::new(false),
                 swap_syncs: RefCell::new(Vec::new()),
                 after_swap: RefCell::new(None),
+                real_inventory: Cell::new(false),
             }
         }
     }
@@ -1726,11 +2431,20 @@ mod tests {
             Ok(())
         }
 
-        fn verify_bundle_inventory(&self, bundle: &Path, _policy: &TrustPolicy) -> Result<()> {
+        fn verify_bundle_inventory(
+            &self,
+            bundle: &Path,
+            sidecar_roots: &[PathBuf],
+            policy: &TrustPolicy,
+        ) -> Result<InventoryOrigin> {
             if self.bad_signature.borrow().iter().any(|bad| bundle.starts_with(bad)) {
                 return Err(UpdateError::new(ErrorCode::SignatureInvalid, "bad signature"));
             }
-            Ok(())
+            if self.real_inventory.get() {
+                return verify_bundle_inventory(bundle, sidecar_roots, policy)
+                    .map(|verified| verified.origin);
+            }
+            Ok(InventoryOrigin::Sidecar)
         }
     }
 
@@ -1745,6 +2459,9 @@ mod tests {
         host: FakeHost,
         old_files: Vec<(&'static str, Vec<u8>)>,
         new_files: Vec<(&'static str, Vec<u8>)>,
+        /// The raw inventory and signature the archive carries beside the app.
+        new_inventory: (Vec<u8>, Vec<u8>),
+        new_version: String,
     }
 
     fn fixture() -> Fixture {
@@ -1753,9 +2470,15 @@ mod tests {
 
     /// `candidate_info` is the Info.plist inside the candidate archive.
     fn fixture_with(candidate_info: &str) -> Fixture {
+        fixture_for(OLD, NEW, candidate_info)
+    }
+
+    /// An install of `old` and a candidate archive of `new`. The archive is a
+    /// layout 2 release: the sealed app plus the inventory beside it.
+    fn fixture_for(old: &str, new: &str, candidate_info: &str) -> Fixture {
         let dir = TempDir::new("macos-apply");
         let live = dir.path().join("Hane.app");
-        let old_files = bundle_files(OLD, &good_plist(OLD));
+        let old_files = bundle_files(old, &good_plist(old));
         write_bundle(&live, &old_files);
 
         let install_id = InstallId::derive(&InstallFacts {
@@ -1769,14 +2492,18 @@ mod tests {
         let transaction = TransactionId::generate().unwrap();
         coordination.ensure_helper_dir(&transaction).unwrap();
 
-        let mut new_files = bundle_files(NEW, candidate_info);
+        let new_files = bundle_files(new, candidate_info);
         // The archive carries the inventory signed with the update key, as the
-        // release does; there is no Apple signature, Team ID or notarization.
+        // release does, beside the app and not inside it; the app itself holds
+        // the ad-hoc seal as an ordinary listed file. Nothing here is a real
+        // Apple signature.
         let listed: Vec<(String, Vec<u8>)> =
             new_files.iter().map(|(rel, data)| ((*rel).to_owned(), data.clone())).collect();
-        let (inventory_raw, inventory_sig) = macos_inventory(NEW, &listed);
-        new_files.push((MACOS_INVENTORY_REL, inventory_raw.clone()));
-        new_files.push((MACOS_INVENTORY_SIGNATURE_REL, inventory_sig));
+        let (inventory_raw, inventory_sig) = macos_inventory(new, &listed);
+        let sidecar_dir = format!(
+            "hane-macos-arm64/Hane.app.update/{}",
+            macos_generation(new, TEST_SOURCE_SHA)
+        );
         let mut entries = vec![
             ZipEntry::dir("hane-macos-arm64/"),
             ZipEntry::dir("hane-macos-arm64/Hane.app/"),
@@ -1790,10 +2517,15 @@ mod tests {
                 entry
             });
         }
+        entries.push(ZipEntry::file(&format!("{sidecar_dir}/{INVENTORY_FILE_NAME}"), &inventory_raw));
+        entries.push(ZipEntry::file(
+            &format!("{sidecar_dir}/{INVENTORY_SIGNATURE_FILE_NAME}"),
+            &inventory_sig,
+        ));
         entries.push(ZipEntry::file("hane-macos-arm64/README.md", b"readme"));
         let unpacked: u64 = entries.iter().map(ZipEntry::declared).sum();
         let zip = build_zip(&entries);
-        let doc = catalog_doc(NEW, 2, Target::MacosArm64, macos_entry(NEW, &zip, unpacked, &inventory_raw));
+        let doc = catalog_doc(new, 2, Target::MacosArm64, macos_entry(new, &zip, unpacked, &inventory_raw));
         let (catalog, catalog_sig) = sign_catalog(&doc);
 
         let ready = dir.path().join("ready");
@@ -1817,7 +2549,7 @@ mod tests {
             &VerifyContext {
                 policy: &test_policy(),
                 clock: &FixedClock::new(test_now()),
-                current_version: OLD,
+                current_version: old,
                 target: Target::MacosArm64,
                 seen: None,
                 expected_tag: None,
@@ -1847,10 +2579,26 @@ mod tests {
             host,
             old_files,
             new_files,
+            new_inventory: (inventory_raw, inventory_sig),
+            new_version: new.to_owned(),
         }
     }
 
     impl Fixture {
+        /// `inventories/<generation>` of the new release in this install.
+        fn new_generation_dir(&self) -> PathBuf {
+            self.coordination
+                .inventories_dir()
+                .join(macos_generation(&self.new_version, TEST_SOURCE_SHA))
+        }
+
+        /// Makes the fake host run the real inventory verification, so the
+        /// sidecar lookup, the legacy read and the file comparison are exercised.
+        fn with_real_inventory(self) -> Self {
+            self.host.real_inventory.set(true);
+            self
+        }
+
         fn inputs(&self) -> BundleApplyInputs<'_> {
             BundleApplyInputs {
                 coordination: &self.coordination,
@@ -2752,6 +3500,201 @@ mod tests {
         let applied = apply_bundle(&fx.inputs()).ok().unwrap();
         assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
         assert!(fx.live_is_new());
+    }
+
+    // ------------------------------------- the external inventory (layout 2)
+
+    /// A signed inventory over `files` for `version`, stating `layout`.
+    fn layout_inventory(
+        version: &str,
+        layout: u64,
+        files: &[(&'static str, Vec<u8>)],
+    ) -> (Vec<u8>, Vec<u8>) {
+        use crate::identity::{Inventory, InventoryFile};
+        use crate::model::{INVENTORY_DOMAIN, INVENTORY_SCHEMA};
+        use crate::testing::sign;
+        use crate::util::sha256_hex;
+        let inventory = Inventory {
+            schema: INVENTORY_SCHEMA,
+            version: version.to_owned(),
+            target: Target::MacosArm64.triple().to_owned(),
+            source_sha: TEST_SOURCE_SHA.to_owned(),
+            updater_protocol: UPDATER_PROTOCOL,
+            layout_revision: layout,
+            files: files
+                .iter()
+                .map(|(path, data)| InventoryFile {
+                    path: (*path).to_owned(),
+                    size: data.len() as u64,
+                    sha256: sha256_hex(data),
+                })
+                .collect(),
+        };
+        let raw = serde_json::to_vec(&inventory).unwrap();
+        let signature = sign(INVENTORY_DOMAIN, &raw);
+        (raw, signature)
+    }
+
+    impl Fixture {
+        /// Gives the installed old bundle its own sidecar generation, as an
+        /// earlier update would have left it.
+        fn old_gets_a_sidecar(&self, version: &str) -> (Vec<u8>, Vec<u8>) {
+            let (raw, signature) = layout_inventory(version, 2, &self.old_files);
+            let dir = self
+                .coordination
+                .ensure_inventories_dir()
+                .unwrap()
+                .join(macos_generation(version, TEST_SOURCE_SHA));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(INVENTORY_FILE_NAME), &raw).unwrap();
+            fs::write(dir.join(INVENTORY_SIGNATURE_FILE_NAME), &signature).unwrap();
+            (raw, signature)
+        }
+
+        fn old_generation_dir(&self, version: &str) -> PathBuf {
+            self.coordination.inventories_dir().join(macos_generation(version, TEST_SOURCE_SHA))
+        }
+
+        fn installed_roots(&self) -> Vec<PathBuf> {
+            installed_sidecar_roots(&self.placement)
+        }
+    }
+
+    #[test]
+    fn the_new_inventory_is_prepared_outside_the_app_before_the_exchange_and_the_old_one_stays() {
+        let fx = fixture().with_real_inventory();
+        let (old_raw, old_sig) = fx.old_gets_a_sidecar(OLD);
+        let new_dir = fx.new_generation_dir();
+        assert!(!new_dir.exists());
+        let present_at_exchange = Rc::new(Cell::new(false));
+        let (hook_dir, hook_seen) = (new_dir.clone(), Rc::clone(&present_at_exchange));
+        *fx.host.after_swap.borrow_mut() = Some(Box::new(move || hook_seen.set(hook_dir.is_dir())));
+
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+
+        assert!(present_at_exchange.get(), "the sidecar exists no later than the exchange");
+        assert!(fx.live_is_new());
+        assert_eq!(fx.stored().phase, Phase::Committed);
+        // The new generation is the archive's, byte for byte, and the old one
+        // was neither changed nor removed by the update.
+        assert_eq!(fs::read(new_dir.join(INVENTORY_FILE_NAME)).unwrap(), fx.new_inventory.0);
+        assert_eq!(fs::read(new_dir.join(INVENTORY_SIGNATURE_FILE_NAME)).unwrap(), fx.new_inventory.1);
+        let old_dir = fx.old_generation_dir(OLD);
+        assert_eq!(fs::read(old_dir.join(INVENTORY_FILE_NAME)).unwrap(), old_raw);
+        assert_eq!(fs::read(old_dir.join(INVENTORY_SIGNATURE_FILE_NAME)).unwrap(), old_sig);
+        // The app holds no inventory, and the live bundle verifies from the sidecar.
+        assert!(!fx.live().join(MACOS_LEGACY_INVENTORY_REL).exists());
+        let verified = verify_bundle_inventory(fx.live(), &fx.installed_roots(), &fx.policy).unwrap();
+        assert_eq!(verified.origin, InventoryOrigin::Sidecar);
+        assert_eq!(verified.signed.inventory().version, NEW);
+    }
+
+    #[test]
+    fn a_rollback_keeps_the_old_inventory_and_the_old_bundle_still_verifies() {
+        let fx = fixture().with_real_inventory();
+        let (old_raw, old_sig) = fx.old_gets_a_sidecar(OLD);
+        let mut launcher =
+            FakeLauncher::new(&fx, Err(UpdateError::new(ErrorCode::Timeout, "no health")));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+
+        assert!(fx.live_is_old());
+        assert_eq!(fx.stored().phase, Phase::RolledBack);
+        let old_dir = fx.old_generation_dir(OLD);
+        assert_eq!(fs::read(old_dir.join(INVENTORY_FILE_NAME)).unwrap(), old_raw);
+        assert_eq!(fs::read(old_dir.join(INVENTORY_SIGNATURE_FILE_NAME)).unwrap(), old_sig);
+        let verified = verify_bundle_inventory(fx.live(), &fx.installed_roots(), &fx.policy).unwrap();
+        assert_eq!(verified.origin, InventoryOrigin::Sidecar);
+        assert_eq!(verified.signed.inventory().version, OLD);
+        // A generation left by the failed attempt is whole, never partial.
+        let new_dir = fx.new_generation_dir();
+        assert_eq!(fs::read(new_dir.join(INVENTORY_FILE_NAME)).unwrap(), fx.new_inventory.0);
+    }
+
+    #[test]
+    fn v0_27_0_with_its_inventory_inside_the_app_moves_to_an_external_sidecar_once() {
+        let mut fx = fixture_for(MACOS_LEGACY_VERSION, "0.27.1", &good_plist("0.27.1")).with_real_inventory();
+        let (raw, signature) =
+            layout_inventory(MACOS_LEGACY_VERSION, MACOS_LEGACY_LAYOUT_REVISION, &fx.old_files);
+        let legacy = [
+            (MACOS_LEGACY_INVENTORY_REL, raw),
+            (MACOS_LEGACY_INVENTORY_SIGNATURE_REL, signature),
+        ];
+        write_bundle(fx.live(), &legacy);
+        fx.old_files.extend(legacy);
+        let roots = fx.installed_roots();
+        let before = verify_bundle_inventory(fx.live(), &roots, &fx.policy).unwrap();
+        assert_eq!(before.origin, InventoryOrigin::LegacyInBundle);
+
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        apply_and_settle(&fx.inputs(), &mut launcher).unwrap();
+
+        assert!(fx.live_is_new());
+        let after = verify_bundle_inventory(fx.live(), &roots, &fx.policy).unwrap();
+        assert_eq!(after.origin, InventoryOrigin::Sidecar);
+        assert_eq!(after.signed.inventory().version, "0.27.1");
+        assert!(!fx.live().join(MACOS_LEGACY_INVENTORY_REL).exists());
+        // The old bundle rests untouched in the slot and is still verifiable
+        // by its own legacy inventory.
+        assert_eq!(tree(&fx.slot()), files_tree(&fx.old_files));
+        let old = verify_bundle_inventory(&fx.slot(), &roots, &fx.policy).unwrap();
+        assert_eq!(old.origin, InventoryOrigin::LegacyInBundle);
+    }
+
+    #[test]
+    fn an_installed_bundle_without_any_inventory_is_not_replaced() {
+        let fx = fixture().with_real_inventory();
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(fx.untouched());
+        assert!(!fx.coordination.inventories_dir().exists());
+    }
+
+    #[test]
+    fn a_conflicting_generation_stops_the_update_before_anything_changes() {
+        let fx = fixture().with_real_inventory();
+        fx.old_gets_a_sidecar(OLD);
+        let dir = fx.new_generation_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(INVENTORY_FILE_NAME), b"other").unwrap();
+        fs::write(dir.join(INVENTORY_SIGNATURE_FILE_NAME), &fx.new_inventory.1).unwrap();
+
+        let err = apply_bundle(&fx.inputs()).err().unwrap();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+        assert!(fx.untouched());
+        assert_eq!(fs::read(dir.join(INVENTORY_FILE_NAME)).unwrap(), b"other");
+    }
+
+    #[test]
+    fn an_identical_existing_generation_is_reused() {
+        let fx = fixture().with_real_inventory();
+        fx.old_gets_a_sidecar(OLD);
+        let dir = fx.new_generation_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(INVENTORY_FILE_NAME), &fx.new_inventory.0).unwrap();
+        fs::write(dir.join(INVENTORY_SIGNATURE_FILE_NAME), &fx.new_inventory.1).unwrap();
+
+        let applied = apply_bundle(&fx.inputs()).ok().unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+        assert!(fx.live_is_new());
+    }
+
+    #[test]
+    fn the_commit_needs_the_new_bundle_to_verify_from_its_installed_sidecar() {
+        let fx = fixture().with_real_inventory();
+        fx.old_gets_a_sidecar(OLD);
+        let new_dir = fx.new_generation_dir();
+        // The updated generation also sits in the sidecar beside the app; the
+        // commit needs it gone from both places to refuse the new bundle.
+        let paired_dir = paired_sidecar_root(fx.live()).join(macos_generation(&fx.new_version, TEST_SOURCE_SHA));
+        let mut launcher = FakeLauncher::new(&fx, Ok(()));
+        launcher.before_verdict = Some(Rc::new(move || {
+            fs::remove_dir_all(&new_dir).unwrap();
+            fs::remove_dir_all(&paired_dir).unwrap();
+        }));
+        let _err = apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
+        assert_eq!(launcher.probe.commits.get(), 0);
+        assert_ne!(fx.stored().phase, Phase::Committed);
     }
 
     #[test]

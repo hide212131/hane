@@ -290,6 +290,32 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertIn("codesign --verify --deep --strict",
                       step_text(jobs(RELEASE)["build-macos"], "Verify macOS app bundle"))
 
+    def test_bundle_is_sealed_ad_hoc_from_the_inside_out_before_the_inventory_exists(self):
+        code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
+        # Helper first, then the main executable, then the bundle; local ad-hoc identity only.
+        signs = [line.strip() for line in code.splitlines() if "codesign --force" in line]
+        self.assertEqual(signs, [
+            '/usr/bin/codesign --force --sign - --timestamp=none "$bundle/Contents/Helpers/hane-updater"',
+            '/usr/bin/codesign --force --sign - --timestamp=none "$bundle/Contents/MacOS/hane"',
+            '/usr/bin/codesign --force --sign - --timestamp=none "$bundle"',
+        ])
+        self.assertNotIn("--remove-signature", code)
+        self.assertNotIn("macho-unsigned", code)
+        self.assertIn("macho-signed", code)
+        self.assertIn('codesign --verify --deep --strict --verbose=2 "$bundle"', code)
+        # The seal is verified, and the helper identity checked again, before the bundle is final.
+        seal = code.index('codesign --force --sign - --timestamp=none "$bundle"')
+        self.assertGreater(code.index("binary-identity", seal), seal)
+        self.assertGreater(code.index("--verify --deep --strict", seal), seal)
+        self.assertLess(code.index("--verify --deep --strict", seal), code.index('touch "$bundle"'))
+        # Nothing from Apple's trust chain beyond the local seal, and nothing is bypassed.
+        for banned in ("Developer ID", "notarytool", "stapler", "xattr", "spctl", "--options runtime", "TEAM_ID",
+                       "--entitlements"):
+            self.assertNotIn(banned, code)
+        # The inventory is never stored inside the sealed app.
+        self.assertIn("hane-install.json", code)  # only as a guard that it is absent
+        self.assertIn("must not be stored inside Hane.app", code)
+
     def test_helper_embeds_identity_in_a_control_flow_that_uses_it(self):
         main = read("crates/updater/src/main.rs")
         build = read("crates/updater/build.rs")

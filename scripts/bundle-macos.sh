@@ -218,8 +218,41 @@ if [[ ! -x "$bundle/Contents/Helpers/hane-updater" || ! -x "$bundle/Contents/Mac
   exit 1
 fi
 
-# The release workflow adds the Ed25519-signed inventory (hane-install.json) to
-# the finished bundle; this script never signs and must not run after it.
-# No Apple Developer ID, notarization or stapling is part of the release.
+# Apple Silicon only runs code that carries a valid signature, so the finished
+# bundle is sealed with a local ad-hoc signature (identity "-"): no Developer ID,
+# Team ID, notarization or stapling is involved, and quarantine and Gatekeeper
+# are left untouched (the user still has to allow the app once). The linker's
+# own ad-hoc signatures no longer match once the Info.plist and resources are
+# added, so the seal is made from the inside out after everything is in place:
+# the helper, the main executable, then the bundle itself (which writes
+# Contents/_CodeSignature/CodeResources).
+#
+# The release workflow afterwards generates the Ed25519-signed inventory over
+# every file of this sealed bundle, CodeResources included, and stores it
+# OUTSIDE Hane.app (Hane.app.update/<version>-<source_sha>/). Nothing may
+# modify the bundle after this point; adding a file inside would break the seal.
+chmod 755 "$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"
+/usr/bin/codesign --force --sign - --timestamp=none "$bundle/Contents/Helpers/hane-updater"
+/usr/bin/codesign --force --sign - --timestamp=none "$bundle/Contents/MacOS/hane"
+/usr/bin/codesign --force --sign - --timestamp=none "$bundle"
+for binary in "$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"; do
+  python3 "$workspace/scripts/release_catalog.py" macho-signed --binary "$binary"
+done
+
+# Signing must not change the helper identity the catalog binds.
+python3 "$workspace/scripts/release_catalog.py" binary-identity \
+  --binary "$bundle/Contents/Helpers/hane-updater" \
+  --version "$version" --target aarch64-apple-darwin --source-sha "$source_sha"
+
+if [[ ! -f "$bundle/Contents/_CodeSignature/CodeResources" ]]; then
+  echo "Bundle must be sealed (Contents/_CodeSignature/CodeResources is missing)" >&2
+  exit 1
+fi
+if [[ -e "$bundle/Contents/Resources/hane-install.json" || -e "$bundle/Contents/Resources/hane-install.json.sig" ]]; then
+  echo "The Ed25519 inventory must not be stored inside Hane.app" >&2
+  exit 1
+fi
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$bundle"
+
 touch "$bundle"
 echo "Built: $bundle"

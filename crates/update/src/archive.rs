@@ -28,8 +28,9 @@ use crate::limits::{
     RATIO_CHECK_MIN_BYTES,
 };
 use crate::model::{
-    INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, MACOS_APP_PREFIX, MACOS_INVENTORY_REL,
-    MACOS_INVENTORY_SIGNATURE_REL, Target,
+    INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, MACOS_APP_PREFIX, MACOS_ARCHIVE_ROOT,
+    MACOS_LEGACY_INVENTORY_REL, MACOS_LEGACY_INVENTORY_SIGNATURE_REL, MACOS_SIDECAR_DIR, Target,
+    macos_generation, parse_macos_generation,
 };
 use crate::paths::{ancestors, collision_key, validate_rel_path};
 use crate::trust::TrustPolicy;
@@ -484,15 +485,48 @@ const WINDOWS_REQUIRED: [&str; 4] = [
     "hane-install.json",
     "hane-install.json.sig",
 ];
-const MACOS_ROOT: &str = "hane-macos-arm64";
+const MACOS_ROOT: &str = MACOS_ARCHIVE_ROOT;
 const MACOS_APP: &str = "hane-macos-arm64/Hane.app";
-const MACOS_REQUIRED: [&str; 5] = [
+/// The sealed bundle's required files. `CodeResources` is the ad-hoc seal made
+/// before the inventory, so a bundle that was never signed is not a release.
+const MACOS_REQUIRED: [&str; 4] = [
     "hane-macos-arm64/Hane.app/Contents/Info.plist",
     "hane-macos-arm64/Hane.app/Contents/MacOS/hane",
     "hane-macos-arm64/Hane.app/Contents/Helpers/hane-updater",
-    "hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json",
-    "hane-macos-arm64/Hane.app/Contents/Resources/hane-install.json.sig",
+    "hane-macos-arm64/Hane.app/Contents/_CodeSignature/CodeResources",
 ];
+
+/// `hane-macos-arm64/Hane.app.update`: where the external inventories sit.
+fn macos_sidecar_root() -> String {
+    format!("{MACOS_ROOT}/{MACOS_SIDECAR_DIR}")
+}
+
+/// ZIP path of the inventory (`file` = `hane-install.json`) or its signature
+/// for one generation of the macOS release.
+fn macos_sidecar_path(generation: &str, file: &str) -> String {
+    format!("{}/{generation}/{file}", macos_sidecar_root())
+}
+
+/// Whether `path` is a directory of the sidecar tree: the root or one
+/// generation directory with a well-formed name.
+fn macos_sidecar_dir_allowed(path: &str) -> bool {
+    let root = macos_sidecar_root();
+    if path == root {
+        return true;
+    }
+    path.strip_prefix(&format!("{root}/"))
+        .is_some_and(|generation| parse_macos_generation(generation).is_some())
+}
+
+/// The generation named by a sidecar file `<root>/<generation>/<file>`, if
+/// `path` is exactly the inventory or the signature of a well-formed one.
+fn macos_sidecar_file_generation(path: &str) -> Option<&str> {
+    let root = macos_sidecar_root();
+    let rest = path.strip_prefix(&format!("{root}/"))?;
+    let (generation, file) = rest.split_once('/')?;
+    parse_macos_generation(generation)?;
+    (file == INVENTORY_FILE_NAME || file == INVENTORY_SIGNATURE_FILE_NAME).then_some(generation)
+}
 
 fn windows_file_allowed(path: &str) -> bool {
     if WINDOWS_ROOT_FILES.contains(&path) {
@@ -534,16 +568,35 @@ pub fn check_layout(target: Target, entries: &[EntryInfo]) -> Result<()> {
             }
         }
         Target::MacosArm64 => {
+            let mut generations: HashSet<&str> = HashSet::new();
             for entry in entries {
                 let path = entry.path.as_str();
                 let in_app = path == MACOS_APP || path.starts_with("hane-macos-arm64/Hane.app/");
                 let allowed = if entry.is_dir {
-                    path == MACOS_ROOT || in_app
+                    path == MACOS_ROOT || in_app || macos_sidecar_dir_allowed(path)
                 } else {
-                    in_app || path == "hane-macos-arm64/README.md" || path == "hane-macos-arm64/LICENSE"
+                    in_app
+                        || path == "hane-macos-arm64/README.md"
+                        || path == "hane-macos-arm64/LICENSE"
+                        || macos_sidecar_file_generation(path).is_some()
                 };
                 if !allowed {
                     return Err(reject(format!("unexpected entry {path:?}")));
+                }
+                if !entry.is_dir {
+                    if let Some(generation) = macos_sidecar_file_generation(path) {
+                        generations.insert(generation);
+                    }
+                    // Layout 1 kept the inventory inside the app, which would
+                    // break the bundle's seal; layout 2 never contains it.
+                    if [MACOS_LEGACY_INVENTORY_REL, MACOS_LEGACY_INVENTORY_SIGNATURE_REL]
+                        .iter()
+                        .any(|legacy| path == format!("{MACOS_APP_PREFIX}{legacy}"))
+                    {
+                        return Err(reject(format!(
+                            "{path:?}: the inventory must be outside Hane.app"
+                        )));
+                    }
                 }
                 if entry.executable
                     && !(path.starts_with("hane-macos-arm64/Hane.app/Contents/MacOS/")
@@ -554,6 +607,17 @@ pub fn check_layout(target: Target, entries: &[EntryInfo]) -> Result<()> {
             }
             for required in MACOS_REQUIRED {
                 if !files.contains(required) {
+                    return Err(reject(format!("missing required file {required:?}")));
+                }
+            }
+            // Exactly one generation, with both its inventory and signature.
+            let mut generations = generations.into_iter();
+            let (Some(generation), None) = (generations.next(), generations.next()) else {
+                return Err(reject("the archive must carry exactly one sidecar inventory"));
+            };
+            for file in [INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME] {
+                let required = macos_sidecar_path(generation, file);
+                if !files.contains(required.as_str()) {
                     return Err(reject(format!("missing required file {required:?}")));
                 }
             }
@@ -671,22 +735,27 @@ pub fn inspect_archive<R: Read + Seek>(
             candidate,
             policy,
             &InventoryLocation {
-                prefix: "",
-                inventory: INVENTORY_FILE_NAME,
-                signature: INVENTORY_SIGNATURE_FILE_NAME,
+                owned_prefix: "",
+                inventory: INVENTORY_FILE_NAME.to_owned(),
+                signature: INVENTORY_SIGNATURE_FILE_NAME.to_owned(),
             },
         )?),
-        Target::MacosArm64 => Some(verify_inventory(
-            reader,
-            &entries,
-            candidate,
-            policy,
-            &InventoryLocation {
-                prefix: MACOS_APP_PREFIX,
-                inventory: MACOS_INVENTORY_REL,
-                signature: MACOS_INVENTORY_SIGNATURE_REL,
-            },
-        )?),
+        Target::MacosArm64 => {
+            // The sidecar must be the generation of exactly this release.
+            let generation =
+                macos_generation(&candidate.version().to_string(), &candidate.catalog().source_sha);
+            Some(verify_inventory(
+                reader,
+                &entries,
+                candidate,
+                policy,
+                &InventoryLocation {
+                    owned_prefix: MACOS_APP_PREFIX,
+                    inventory: macos_sidecar_path(&generation, INVENTORY_FILE_NAME),
+                    signature: macos_sidecar_path(&generation, INVENTORY_SIGNATURE_FILE_NAME),
+                },
+            )?)
+        }
     };
     Ok(InspectedArchive {
         entries,
@@ -696,12 +765,13 @@ pub fn inspect_archive<R: Read + Seek>(
 }
 
 /// Where a target keeps its signed inventory inside the archive. Inventory
-/// paths are relative to `prefix`; files outside `prefix` (the macOS README and
-/// LICENSE) are not owned and not listed.
+/// paths are relative to `owned_prefix`; files outside it (the macOS README and
+/// LICENSE, and the sidecar itself) are not owned and not listed. `inventory`
+/// and `signature` are full archive paths.
 struct InventoryLocation {
-    prefix: &'static str,
-    inventory: &'static str,
-    signature: &'static str,
+    owned_prefix: &'static str,
+    inventory: String,
+    signature: String,
 }
 
 fn verify_inventory<R: Read + Seek>(
@@ -711,13 +781,13 @@ fn verify_inventory<R: Read + Seek>(
     policy: &TrustPolicy,
     location: &InventoryLocation,
 ) -> Result<SignedInventory> {
-    let inventory_path = format!("{}{}", location.prefix, location.inventory);
-    let signature_path = format!("{}{}", location.prefix, location.signature);
+    let inventory_path = location.inventory.as_str();
+    let signature_path = location.signature.as_str();
     let find = |name: &str| entries.iter().find(|e| !e.is_dir && e.path == name);
     let inventory_entry =
-        find(&inventory_path).ok_or_else(|| reject("archive has no signed inventory"))?;
+        find(inventory_path).ok_or_else(|| reject("archive has no signed inventory"))?;
     let signature_entry =
-        find(&signature_path).ok_or_else(|| reject("archive has no inventory signature"))?;
+        find(signature_path).ok_or_else(|| reject("archive has no inventory signature"))?;
     let raw = read_entry(reader, inventory_entry, MAX_INVENTORY_BYTES)?;
     let signature = read_entry(reader, signature_entry, MAX_SIGNATURE_BYTES)?;
     // The catalog binds the exact inventory bytes (check_candidate compares
@@ -734,7 +804,7 @@ fn verify_inventory<R: Read + Seek>(
     let present: BTreeMap<&str, &EntryInfo> = entries
         .iter()
         .filter(|e| !e.is_dir && e.path != inventory_path && e.path != signature_path)
-        .filter_map(|e| Some((e.path.strip_prefix(location.prefix)?, e)))
+        .filter_map(|e| Some((e.path.strip_prefix(location.owned_prefix)?, e)))
         .collect();
     if listed.len() != present.len() || !listed.keys().all(|p| present.contains_key(p)) {
         return Err(reject("archive files differ from the signed inventory"));
