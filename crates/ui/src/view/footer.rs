@@ -1051,4 +1051,36 @@ mod tests {
             assert_eq!(view.sessions.active().is_dirty(), dirty);
         });
     }
+
+    #[gpui::test]
+    fn choosing_the_painted_zoom_during_a_wheel_animation_settles_heights(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, "one two\n");
+        view.update(cx, |view, cx| {
+            // Painted at 125% while the wheel is still heading to 150%, with
+            // offscreen heights left over from an older zoom.
+            view.zoom = 1.25;
+            view.raw_zoom = 1.5;
+            view.heights = HeightIndex::new([123.0, 456.0]);
+            view.wheel_zoom_animation = Some(WheelZoomAnimation {
+                window_offset: 0.0,
+                last_frame: Instant::now(),
+            });
+            let text = view.editor().document().full_text();
+            let revision = view.editor().document().revision();
+            let dirty = view.sessions.active().is_dirty();
+
+            view.apply_footer_zoom(1.25, cx);
+
+            assert_eq!(view.zoom, 1.25);
+            assert_eq!(view.raw_zoom, 1.25);
+            assert!(view.wheel_zoom_animation.is_none());
+            assert_ne!(view.heights.height(0), Some(123.0));
+
+            assert_eq!(view.editor().document().full_text(), text);
+            assert_eq!(view.editor().document().revision(), revision);
+            assert_eq!(view.sessions.active().is_dirty(), dirty);
+        });
+    }
 }
