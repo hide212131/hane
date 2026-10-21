@@ -150,10 +150,22 @@ impl EditorView {
                         // invalidate presentations lazily through their
                         // disclosure check instead of throwing their caches
                         // away for a selection change.
-                        view.install_disclosure_heights_preserving_measurements(
-                            heights,
-                            previous_height_disclosure,
-                        );
+                        //
+                        // The D -> A difference is only valid on heights that
+                        // are still based on D. A mode round trip (or any
+                        // rebuild) while the job ran has already installed
+                        // heights for the current disclosure, and applying the
+                        // difference again would shift every fence/table
+                        // height off screen.
+                        let applied = view.last_applied_height_disclosure;
+                        let heights_already_current = disclosure
+                            .is_some_and(|disclosure| applied == Some((revision, disclosure)));
+                        // Without a matching basis only the snapshot's arithmetic
+                        // minimum is applied, which is safe on any heights.
+                        let basis = previous_height_disclosure.filter(|previous| {
+                            !heights_already_current && applied == Some((revision, *previous))
+                        });
+                        view.install_disclosure_heights_preserving_measurements(heights, basis);
                     } else if index_was_updated {
                         view.install_heights(granularity, heights);
                     }

@@ -2204,6 +2204,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn reading_find_on_a_closed_fence_info_string_scrolls_to_the_block_and_settles(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let mut text = String::new();
+        for n in 0..60 {
+            text.push_str(&format!("line {n:02}\n\n"));
+        }
+        text.push_str("```zzinfo\ncode body\n```\n\ntail\n");
+        let info_start = text.find("zzinfo").expect("info string present");
+        let info_range = SourceRange::new(info_start, info_start + "zzinfo".len());
+
+        let (view, cx) = {
+            let text = text.clone();
+            cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx))
+        };
+        cx.simulate_resize(gpui::size(px(960.0), px(400.0)));
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.toggle_editor_mode(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.document_find.query_text = "zzinfo".to_owned();
+            view.restart_document_find(cx, false, true);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches, vec![info_range]);
+            assert!(view.scroll_y > 0.0, "the match scrolls the viewport");
+            assert!(
+                !view.pending_find_visibility_after_layout,
+                "a match on a row that stays closed does not keep the request armed"
+            );
+            let (top, height) = view
+                .reading_visible_row(info_range.start)
+                .expect("a visible position for the closed row");
+            assert!(
+                top + height > view.scroll_y
+                    && top < view.scroll_y + view.viewport_height + CARET_VISIBILITY_TOLERANCE,
+                "the fence block is on screen: row {top}+{height}, scroll {}",
+                view.scroll_y
+            );
+            assert_eq!(view.editor().document().full_text(), text);
+        });
+    }
+
+    #[gpui::test]
     fn escape_closes_the_bar_and_selects_the_current_matchs_range_when_ready(
         cx: &mut gpui::TestAppContext,
     ) {

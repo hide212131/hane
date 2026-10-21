@@ -7280,14 +7280,26 @@ impl Render for EditorView {
         let caret = self.editor().selection().active;
         let fresh_caret = self.fresh_point_for_offset(&rendered, &shaper, caret);
         if self.pending_caret_visibility_after_layout {
-            if let Some((_, top, height)) = fresh_caret
-                && height > 0.0
-            {
+            // Reading keeps fences and table delimiters at zero height for
+            // good, so a caret on one never gets a positive-height row: it
+            // resolves to the nearest visible position instead of waiting.
+            // Nothing paints a caret badge there, so no clearance is asked.
+            let badge_height = if self.body_caret_visible() {
+                CARET_MODE_BADGE_HEIGHT
+            } else {
+                0.0
+            };
+            let caret_row = match fresh_caret {
+                Some((_, top, height)) if height > 0.0 => Some((top, height)),
+                _ if !self.body_editable() => self.reading_visible_row(caret),
+                _ => None,
+            };
+            if let Some((top, height)) = caret_row {
                 let before = self.scroll_y;
                 self.scroll_y = scroll_y_for_cursor(
                     self.scroll_y,
                     top,
-                    height + CARET_MODE_BADGE_HEIGHT,
+                    height + badge_height,
                     self.viewport_height,
                 );
                 self.scroll_y = clamp_scroll_y(
@@ -7295,7 +7307,7 @@ impl Render for EditorView {
                     self.scrollable_content_height(),
                     self.viewport_height,
                 );
-                let visible_bottom = top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
+                let visible_bottom = top + height + badge_height - self.scroll_y;
                 if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
                     && self.scroll_y == before
                 {
@@ -7360,9 +7372,19 @@ impl Render for EditorView {
         }
         let find_current_match = self.document_find_current_match();
         if self.pending_find_visibility_after_layout {
-            match find_current_match
-                .and_then(|range| self.fresh_point_for_offset(&rendered, &shaper, range.start))
-            {
+            let fresh_match = find_current_match
+                .and_then(|range| self.fresh_point_for_offset(&rendered, &shaper, range.start));
+            // While reading, a match on a closed fence or delimiter row has no
+            // height to wait for; show the nearest visible position.
+            let fresh_match = match (fresh_match, find_current_match) {
+                (Some((_, top, height)), _) if height > 0.0 => Some((0.0, top, height)),
+                (_, Some(range)) if !self.body_editable() => self
+                    .reading_visible_row(range.start)
+                    .map(|(top, height)| (0.0, top, height)),
+                (Some(_), _) => Some((0.0, 0.0, 0.0)),
+                (None, _) => None,
+            };
+            match fresh_match {
                 Some((_, top, height)) if height > 0.0 => {
                     let before = self.scroll_y;
                     self.scroll_y =
