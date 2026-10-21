@@ -236,9 +236,16 @@ impl EditorView {
     /// is `None` when there is no panel to open or the panel shows its own.
     pub(super) fn sidebar_toggle_in_header(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         (self.sidebar_panel_available() && self.sidebar_collapsed).then(|| {
+            // Fill the header and pad from its top edge, so the button sits at
+            // the same y as in the panel row whether or not the header's
+            // bottom border shrinks the centered area.
             div()
                 .flex_none()
+                .h_full()
                 .ml(px(SIDEBAR_TOGGLE_LEFT))
+                .pt(px(
+                    (SIDEBAR_TOGGLE_ROW_HEIGHT - SIDEBAR_TOGGLE_BUTTON_SIZE) / 2.0
+                ))
                 .child(self.sidebar_toggle_button(cx))
         })
     }
