@@ -717,8 +717,8 @@ fn place_generation(inventories: &Path, generation: &str, raw: &[u8], signature:
         Err(err) => return Err(err.into()),
     }
     fs::create_dir(&temp)?;
-    let placed = write_new(&temp.join(INVENTORY_FILE_NAME), &raw)
-        .and_then(|()| write_new(&temp.join(INVENTORY_SIGNATURE_FILE_NAME), &signature))
+    let placed = write_new(&temp.join(INVENTORY_FILE_NAME), raw)
+        .and_then(|()| write_new(&temp.join(INVENTORY_SIGNATURE_FILE_NAME), signature))
         .and_then(|()| sync_directory(&temp))
         .and_then(|()| rename_new_durable(&temp, &target))
         .and_then(|()| sync_directory(&inventories));
@@ -1631,7 +1631,7 @@ mod inventory_tests {
         let p = prepared("macos-sidecar-moved-together");
         let old_files = payload("0.27.0");
         let live = p.dir.path().join("before").join("Hane.app");
-        fs::create_dir_all(&live).unwrap();
+        write_files(&live, &payload(VERSION));
         let paired = paired_sidecar_root(&live);
         let (old_raw, old_sig) = inventory_for("0.27.0", TEST_SOURCE_SHA, 2, &old_files, 1);
         write_generation(&paired, &generation("0.27.0"), &old_raw, &old_sig);
@@ -1650,6 +1650,20 @@ mod inventory_tests {
         // The old generation is untouched, and the same release again is accepted.
         assert!(moved_paired.join(generation("0.27.0")).join(INVENTORY_FILE_NAME).exists());
         install_paired_sidecar(&moved.join("Hane.app"), &p.staged, &generation(VERSION)).unwrap();
+
+        // The moved app verifies from the updated generation beside it, with
+        // no InstallId store holding anything for it.
+        let verified = verify_bundle_inventory(
+            &moved.join("Hane.app"),
+            &[
+                p.dir.path().join("other-install-id-store").join("inventories"),
+                moved_paired,
+            ],
+            &test_policy(),
+        )
+        .unwrap();
+        assert_eq!(verified.origin, InventoryOrigin::Sidecar);
+        assert_eq!(verified.signed.inventory().version, VERSION);
     }
 
     #[test]
@@ -3670,8 +3684,14 @@ mod tests {
         let fx = fixture().with_real_inventory();
         fx.old_gets_a_sidecar(OLD);
         let new_dir = fx.new_generation_dir();
+        // The updated generation also sits in the sidecar beside the app; the
+        // commit needs it gone from both places to refuse the new bundle.
+        let paired_dir = paired_sidecar_root(fx.live()).join(macos_generation(&fx.new_version, TEST_SOURCE_SHA));
         let mut launcher = FakeLauncher::new(&fx, Ok(()));
-        launcher.before_verdict = Some(Rc::new(move || fs::remove_dir_all(&new_dir).unwrap()));
+        launcher.before_verdict = Some(Rc::new(move || {
+            fs::remove_dir_all(&new_dir).unwrap();
+            fs::remove_dir_all(&paired_dir).unwrap();
+        }));
         let _err = apply_and_settle(&fx.inputs(), &mut launcher).unwrap_err();
         assert_eq!(launcher.probe.commits.get(), 0);
         assert_ne!(fx.stored().phase, Phase::Committed);
