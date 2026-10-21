@@ -157,6 +157,17 @@ pub enum BufferSlice<'a> {
     Rope(RopeSlice<'a>),
 }
 
+impl BufferSlice<'_> {
+    /// Number of Unicode scalar values in the slice, read from the rope's
+    /// stored length rather than by walking or copying the text.
+    #[must_use]
+    pub fn len_chars(&self) -> CharLen {
+        match self {
+            Self::Rope(slice) => CharLen(slice.len_chars()),
+        }
+    }
+}
+
 impl fmt::Display for BufferSlice<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -677,6 +688,30 @@ mod tests {
             .unwrap();
         assert_eq!(buffer.full_text(), "a日本語🙂z");
         assert_eq!(buffer.revision(), Revision(2));
+    }
+
+    #[test]
+    fn slice_len_chars_counts_unicode_scalar_values_for_any_range() {
+        let text = "Aあ😀\r\ne\u{301}\n👨\u{200d}👩\u{200d}👧\u{200d}👦 # *";
+        let buffer = RopeBuffer::from_text(text);
+        let end = SourceOffset(buffer.len_bytes().0);
+        let whole = buffer.slice(SourceRange { start: SourceOffset(0), end }).unwrap();
+        assert_eq!(whole.len_chars().0, text.chars().count());
+        assert_eq!(whole.len_chars().0, buffer.len_chars().0);
+
+        // "Aあ😀" is three scalar values; the CRLF that follows is two.
+        let head = buffer.slice(SourceRange::new(0, 8)).unwrap();
+        assert_eq!(head.len_chars().0, 3);
+        let crlf = buffer.slice(SourceRange::new(8, 10)).unwrap();
+        assert_eq!(crlf.len_chars().0, 2);
+        // A combining sequence and a joined emoji count every scalar value.
+        let combining = buffer.slice(SourceRange::new(10, 13)).unwrap();
+        assert_eq!(combining.len_chars().0, 2);
+
+        let empty = buffer.slice(SourceRange::new(4, 4)).unwrap();
+        assert_eq!(empty.len_chars().0, 0);
+        // An invalid range is reported, never counted as zero.
+        assert!(buffer.slice(SourceRange::new(4, 1)).is_err());
     }
 
     #[test]

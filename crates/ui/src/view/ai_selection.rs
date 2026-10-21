@@ -868,6 +868,26 @@ impl EditorView {
         });
     }
 
+    /// Whether `open_ai_selection` can start at all right now: not while
+    /// settings or the popup are open, while another text field (rename,
+    /// sidebar filter, document find) holds the input, or while the body has
+    /// an active IME composition. The entry and the footer button share this
+    /// one check so the button is disabled for exactly the states in which
+    /// the entry would return without doing anything. It reads no selection
+    /// text, so it is cheap enough to evaluate on every render.
+    pub(crate) fn ai_selection_entry_available(&self) -> bool {
+        if self.settings_open() || self.ai_selection.open {
+            return false;
+        }
+        if self.inline_rename_active()
+            || self.sidebar_filter_is_focused()
+            || self.document_find_input_is_focused()
+        {
+            return false;
+        }
+        self.editor().ime().is_none()
+    }
+
     /// Opens the popup over the active document's current selection
     /// (section 3.1/4). A no-op while settings are open, while the popup is
     /// already open, while another text field holds focus, while the body
@@ -877,16 +897,7 @@ impl EditorView {
     /// status message rather than the popup itself, since there is nothing
     /// yet to compose an instruction against).
     pub(crate) fn open_ai_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_open() || self.ai_selection.open {
-            return;
-        }
-        if self.inline_rename_active()
-            || self.sidebar_filter_is_focused()
-            || self.document_find_input_is_focused()
-        {
-            return;
-        }
-        if self.editor().ime().is_some() {
+        if !self.ai_selection_entry_available() {
             return;
         }
         let session_id = self.sessions.active_id();

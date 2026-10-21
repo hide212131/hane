@@ -79,8 +79,8 @@ use hane_session::{
     FileEventOutcome, FileService, LoadedFile, OpenDecision, OpenPolicy, OsDraftStore,
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
-    Settings, StateStores, TitleSyncAction, UnsavedChanges, WorkFolder, WorkFolderNode,
-    WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
+    Settings, StateStores, ThemePreference, TitleSyncAction, UnsavedChanges, WorkFolder,
+    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
     format_relative_date_label, local_today, next_modified_sequence, run_save_job,
     split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
@@ -105,6 +105,8 @@ mod background_parse;
 mod basic_editing_keys;
 mod content_search;
 mod document_find;
+mod footer;
+use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod inline_rename;
 pub(crate) mod input_routing;
 mod session_save;
@@ -126,6 +128,13 @@ const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const MAIN_MIN_WIDTH: f32 = 280.0;
 const SIDEBAR_RESIZER_WIDTH: f32 = 5.0;
+/// Narrowest settings content column worth keeping beside the settings
+/// navigation; below it the navigation stacks above the content.
+const SETTINGS_CONTENT_MIN_WIDTH: f32 = 360.0;
+
+fn settings_layout_is_narrow(viewport_width: f32, sidebar_width: f32) -> bool {
+    viewport_width - sidebar_width < SETTINGS_CONTENT_MIN_WIDTH
+}
 const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
 const SIDEBAR_TOOLBAR_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_GAP: f32 = 4.0;
@@ -886,10 +895,15 @@ pub struct EditorView {
     /// in place, or by a work-folder switch — so the close is treated as
     /// canceled rather than applied to a different document.
     tab_close_after_save: HashMap<SessionId, DocumentInstance>,
-    /// Horizontal scroll state for the footer controls, so recent-file
-    /// buttons remain reachable without allowing the footer to cover the
-    /// editor viewport on a narrow main panel.
-    footer_scroll: ScrollHandle,
+    /// The latest save problem of each document, for the footer. Display-only
+    /// and never persisted: each record names the document instance it was
+    /// raised for, so a record that outlives its document is never shown, and
+    /// it is cleared only by a valid save success of that same document.
+    save_problems: HashMap<SessionId, ScopedSaveProblem>,
+    /// The last failure to write the settings file, shown in the general
+    /// settings page. Kept apart from `settings_error`, which belongs to the
+    /// Windows integration.
+    settings_store_error: Option<String>,
     /// Active drag of the sidebar's visible scrollbar thumb.
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
@@ -1012,6 +1026,13 @@ pub struct EditorView {
     theme: Theme,
     #[cfg(any(feature = "instrument", feature = "timing-probe"))]
     pub(crate) instrumentation: Instrumentation,
+    /// The revision whose formal background parse last changed the index. It
+    /// used to be shown in the footer's development line; the footer no longer
+    /// reads it, but the measurement paths still record it.
+    #[allow(
+        dead_code,
+        reason = "recorded for measurement; the ordinary footer no longer shows it"
+    )]
     background_presentation_generation: u64,
     /// Presented blocks, keyed by the index's stable block id so an entry
     /// survives typing elsewhere in the document.
@@ -1723,7 +1744,8 @@ impl EditorView {
             sidebar_context_menu: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
-            footer_scroll: ScrollHandle::new(),
+            save_problems: HashMap::new(),
+            settings_store_error: None,
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
             text_selection_drag: false,
@@ -2270,7 +2292,12 @@ impl EditorView {
                 if self.tab_close_after_save.get(&id) == Some(&instance) {
                     self.tab_close_after_save.remove(&id);
                 }
-                self.status = Some(format!("Save As failed: {error}"));
+                self.record_save_problem(
+                    id,
+                    instance,
+                    None,
+                    DocumentSaveProblem::SaveAsDialogFailed(error),
+                );
                 cx.notify();
             }
             SaveAsForCloseResponse::Canceled => {
@@ -2324,6 +2351,7 @@ impl EditorView {
             return;
         }
         self.tab_close_after_save.remove(&id);
+        self.save_problems.remove(&id);
         if self
             .tab_close_confirm
             .is_some_and(|confirm| confirm.id == id)
@@ -2593,8 +2621,12 @@ impl EditorView {
     }
 
     fn store_settings(&mut self) {
-        if let Err(error) = self.stores.settings().store(&self.settings) {
-            self.status = Some(format!("Settings failed: {error}"));
+        match self.stores.settings().store(&self.settings) {
+            Ok(()) => self.settings_store_error = None,
+            Err(error) => {
+                self.settings_store_error = Some(error.to_string());
+                self.status = Some(format!("Settings failed: {error}"));
+            }
         }
     }
 
@@ -3019,6 +3051,7 @@ impl EditorView {
         self.sidebar_context_menu = None;
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
+        self.save_problems.clear();
         // Any background read still in flight for the old folder (or for
         // single-file state) is now for a session that no longer exists;
         // bumping this makes `finish_open` discard it instead of merging a
@@ -3284,11 +3317,22 @@ impl EditorView {
     }
 
     pub(crate) fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
-        self.settings.autosave = !self.settings.autosave;
-        self.status = Some(format!(
-            "Autosave {}",
-            if self.settings.autosave { "on" } else { "off" }
-        ));
+        self.set_autosave(!self.settings.autosave, cx);
+    }
+
+    /// Applies and stores the autosave setting. Turning it on arms the
+    /// existing debounce for the active document; turning it off only stops
+    /// later autosave requests, a write that already started is not canceled.
+    pub(crate) fn set_autosave(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.settings.autosave == enabled {
+            return;
+        }
+        self.settings.autosave = enabled;
+        self.status = Some(if enabled {
+            "自動保存をオンにしました".to_owned()
+        } else {
+            "自動保存をオフにしました".to_owned()
+        });
         self.store_settings();
         self.schedule_autosave(cx);
         cx.notify();
@@ -3550,13 +3594,22 @@ impl EditorView {
             SettingsCategory::Connection => self.ai_settings_render(window, cx).into_any_element(),
             SettingsCategory::Prompts => self.ai_prompts_render(window, cx).into_any_element(),
         };
-        self.settings_screen_shell(body, cx)
+        let narrow = settings_layout_is_narrow(
+            f32::from(window.viewport_size().width),
+            self.sidebar_width,
+        );
+        self.settings_screen_shell(body, narrow, cx)
     }
 
     // Build the page before allocating the settings shell's style temporaries.
     // Both frames must not be live together on Windows' 1 MiB UI thread stack.
     #[inline(never)]
-    fn settings_screen_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_screen_shell(
+        &self,
+        body: gpui::AnyElement,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let view = cx.entity();
         let back = Button::new("settings-back")
             .icon(IconName::ArrowLeft)
@@ -3617,27 +3670,38 @@ impl EditorView {
         let root = div()
             .size_full()
             .flex()
-            .flex_row()
             .bg(rgb(self.theme.editor_background))
             .text_color(rgb(self.theme.foreground))
             .key_context("HaneEditor")
             .track_focus(&self.settings_focus_handle);
+        let root = if narrow { root.flex_col() } else { root.flex_row() };
         let sidebar = div()
             .id("settings-sidebar")
             .debug_selector(|| "settings-sidebar".to_owned())
-            .w(px(self.sidebar_width))
-            .h_full()
             .flex_none()
             .flex()
-            .flex_col()
             .gap_4()
             .px(px(16.0))
             .py(px(16.0))
-            .bg(rgb(self.theme.sidebar_background))
+            .bg(rgb(self.theme.sidebar_background));
+        // In a narrow window the navigation becomes a wrapping row above the
+        // content, so the content keeps the full width instead of being
+        // squeezed out of view beside a fixed-width column.
+        let sidebar = if narrow {
+            sidebar.w_full().flex_row().flex_wrap()
+        } else {
+            sidebar.w(px(self.sidebar_width)).h_full().flex_col()
+        };
+        let sidebar = sidebar
             .child(back)
             .child(general_tab)
             .child(ai_tab)
             .child(ai_prompts_tab);
+        let content = if narrow {
+            content.h_auto().min_h(px(0.0))
+        } else {
+            content
+        };
         install_action_listeners(root.child(sidebar).child(content), cx)
     }
 
@@ -3691,6 +3755,7 @@ impl EditorView {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("一般"),
             )
+            .child(self.display_and_save_settings(cx))
             .children(self.app_update_card(cx))
             .child(
                 div()
@@ -3783,8 +3848,114 @@ impl EditorView {
             )
     }
 
-    pub(crate) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings.theme = self.settings.theme.next();
+    /// The "表示" and "保存" sections of the general settings: the theme and
+    /// autosave controls that used to live in the footer. Both apply and are
+    /// stored the moment they change, through `set_theme` / `set_autosave`.
+    #[inline(never)]
+    fn display_and_save_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let current_theme = self.settings.theme;
+        let theme_view = cx.entity();
+        let theme_buttons = [
+            (ThemePreference::System, "システムに合わせる", "system"),
+            (ThemePreference::Light, "ライト", "light"),
+            (ThemePreference::Dark, "ダーク", "dark"),
+        ]
+        .map(|(preference, label, key)| {
+            let view = theme_view.clone();
+            Button::new(format!("settings-theme-{key}"))
+                .label(label)
+                .ghost()
+                .selected(current_theme == preference)
+                .on_click(move |_, window, app| {
+                    view.update(app, |view, cx| view.set_theme(preference, window, cx));
+                })
+        });
+        let autosave_view = cx.entity();
+        let autosave = Checkbox::new("settings-autosave")
+            .checked(self.settings.autosave)
+            .label("変更を自動保存する")
+            .on_click(move |checked, _window, app| {
+                autosave_view.update(app, |view, cx| view.set_autosave(*checked, cx));
+            });
+        let store_error = self.settings_store_error.as_ref().map(|error| {
+            div()
+                .id("settings-store-error")
+                .debug_selector(|| "settings-store-error".to_owned())
+                .text_color(rgb(0xb42318))
+                .child(format!(
+                    "設定を保存できませんでした: {error}。この起動中は反映されていますが、次回起動時に戻る可能性があります。"
+                ))
+        });
+        let section_title = |title: &'static str| {
+            div()
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(title)
+        };
+        let card = |id: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(|| id.to_owned())
+                .w_full()
+                .px(px(16.0))
+                .py(px(14.0))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(self.theme.sidebar_active_background))
+                .bg(rgb(self.theme.code_background))
+                .flex()
+                .flex_col()
+                .gap_2()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("表示"))
+                    .child(
+                        card("settings-theme-card")
+                            .child(
+                                div()
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("テーマ"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .children(theme_buttons),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("保存"))
+                    .child(card("settings-autosave-card").child(autosave).children(store_error)),
+            )
+    }
+
+    /// Applies and stores the chosen theme preference. Choosing the current
+    /// value again changes nothing, so no cache is rebuilt for it.
+    pub(crate) fn set_theme(
+        &mut self,
+        preference: ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.theme == preference {
+            return;
+        }
+        self.settings.theme = preference;
         self.theme = resolve_theme(self.settings.theme, window.appearance());
         sync_component_theme(self.settings.theme, window.appearance(), window, cx);
         self.block_cache.clear();
@@ -3797,7 +3968,7 @@ impl EditorView {
     /// Changes how the work-folder sidebar orders files and folders,
     /// re-sorting the already-scanned tree in place (no rescan) so the
     /// change is visible immediately, and persists the choice the same way
-    /// `cycle_theme`/`toggle_autosave` do. Selection, the active session,
+    /// `set_theme`/`set_autosave` do. Selection, the active session,
     /// expanded folders, and any unsaved content are all addressed by path
     /// rather than by position in the sidebar list, so re-sorting the tree
     /// here never disturbs any of them.
@@ -6355,24 +6526,6 @@ fn preserve_measured_height_after_fence_delta(
     }
 }
 
-/// The footer's status line, combining a persistent `draft_recovery_warning`
-/// with whatever transient `status` is current. Neither may swallow the
-/// other: the warning has to survive `open_path` cycling `status` through
-/// "Opening…"/"Opened" right after the scan that raised it, but a later
-/// status the user needs for data safety (a save failure, a conflict) must
-/// stay visible too, since this view only re-scans a work folder once at
-/// startup and an unconditional priority for the warning would otherwise
-/// hide every status for the rest of the session. `None` when neither is
-/// set, so the caller can fall back to its own default line.
-fn footer_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
-    match (warning, status) {
-        (Some(warning), Some(status)) => Some(format!("{warning} · {status}")),
-        (Some(warning), None) => Some(warning.to_owned()),
-        (None, Some(status)) => Some(status.to_owned()),
-        (None, None) => None,
-    }
-}
-
 #[cfg(not(any(feature = "instrument", feature = "timing-probe")))]
 impl EditorView {
     pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
@@ -7238,30 +7391,6 @@ impl Render for EditorView {
         let top_space = self.heights.prefix_sum(items.start);
         let bottom_space =
             (self.heights.total_height() - self.heights.prefix_sum(items.end)).max(0.0);
-        let revision = self.editor().document().revision().0;
-        let bytes = self.editor().document().len_bytes().0;
-        let p95 = self
-            .metrics
-            .painted_percentile(0.95)
-            .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
-        let background = if self.background_presentation_generation > 0 {
-            format!(" · bg {}", self.background_presentation_generation)
-        } else {
-            String::new()
-        };
-        let dirty = if self.sessions.active().is_dirty() {
-            " · modified"
-        } else {
-            ""
-        };
-        let status = footer_status_line(
-            self.draft_recovery_warning.as_deref(),
-            self.status.as_deref(),
-        )
-        .unwrap_or_else(|| {
-            format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
-        });
-
         let root = div()
             .size_full()
             .flex()
@@ -7392,7 +7521,9 @@ impl Render for EditorView {
                 )
                 .children(editor_scrollbar),
         );
-        let rendered = root.child(main_column.child(self.footer_element(status, cx)));
+        let editor_column_width =
+            (f32::from(window.viewport_size().width) - sidebar_width).max(0.0);
+        let rendered = root.child(main_column.child(self.footer_element(editor_column_width, cx)));
         let rendered = if let Some(menu) = self.file_tab_context_menu.as_ref() {
             rendered.child(
                 anchored()
@@ -7717,11 +7848,16 @@ impl EditorView {
             })
             .collect::<Vec<_>>();
 
-        div()
-            .id("file-tabs")
-            .debug_selector(|| "file-tabs".to_owned())
-            .h(px(self.theme.header_height))
-            .flex_none()
+        // The file menu sits beside the tab strip, not inside it: the strip's
+        // mouse-down handler (`on_editor_mouse_down`) must not run for a press
+        // on the menu button, or opening the menu would first change the
+        // body's focus and selection.
+        let tab_strip = div()
+            .id("file-tab-strip")
+            .debug_selector(|| "file-tab-strip".to_owned())
+            .h_full()
+            .flex_1()
+            .min_w(px(0.0))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
             .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _, cx| {
                 let delta = event.delta.pixel_delta(px(40.0));
@@ -7737,8 +7873,6 @@ impl EditorView {
             }))
             .bg(rgb(self.theme.tab_bar_background))
             .text_color(rgb(self.theme.tab_bar_foreground))
-            .border_b_1()
-            .border_color(rgb(self.theme.tab_bar_border))
             .child(
                 TabBar::new("file-tabs-tab-bar")
                     .h_full()
@@ -7755,153 +7889,133 @@ impl EditorView {
                         }
                     }))
                     .children(tabs),
-            )
+            );
+
+        div()
+            .id("file-tabs")
+            .debug_selector(|| "file-tabs".to_owned())
+            .h(px(self.theme.header_height))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(rgb(self.theme.tab_bar_background))
+            .text_color(rgb(self.theme.tab_bar_foreground))
+            .border_b_1()
+            .border_color(rgb(self.theme.tab_bar_border))
+            .child(self.file_menu_button(cx))
+            .child(tab_strip)
     }
 
-    fn footer_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let autosave = if self.settings.autosave {
-            "Autosave on"
-        } else {
-            "Autosave off"
-        };
-        let theme = format!("Theme {:?}", self.settings.theme);
+    /// The "ファイル" menu at the left of the header: open a file, open a
+    /// folder, and the recent files that used to sit in the footer. Every
+    /// entry calls the existing open path, which keeps the unsaved-content
+    /// guards, so choosing one never discards a document.
+    fn file_menu_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let active_path = self.sessions.active().path();
         let recent = self
             .recent
             .entries()
             .iter()
             .filter(|path| Some(path.as_path()) != active_path)
-            .take(3)
             .cloned()
-            .enumerate()
-            .map(|(index, path)| {
-                let label = path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                );
-                div()
-                    .id(("footer-recent", index))
-                    .max_w(px(140.0))
-                    .px_2()
-                    .rounded_sm()
-                    .bg(rgb(self.theme.editor_background))
-                    .text_color(rgb(self.theme.foreground))
-                    .cursor_pointer()
-                    .truncate()
-                    .child(label)
-                    .on_click(cx.listener(move |view, _, _, cx| view.open_path(&path, cx)))
-            })
             .collect::<Vec<_>>();
-        let settings_button = if self.work_folder.is_none() {
-            let view = cx.entity();
-            Some(
-                div()
-                    .id("footer-settings")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
-                    .child(
-                        gpui::svg()
-                            .path(icons::ICON_SETTINGS)
-                            .size_4()
-                            .flex_none()
-                            .text_color(rgb(self.theme.foreground)),
-                    )
-                    .child("設定")
-                    .on_click(move |_, window, app| {
-                        view.update(app, |view, cx| view.open_settings(window, cx));
+        let view = cx.entity();
+        let button = Button::new("file-menu")
+            .label("ファイル")
+            .xsmall()
+            .ghost()
+            .tooltip("ファイルを開く・最近開いたファイル")
+            .dropdown_menu(move |mut menu, _, _| {
+                let open_view = view.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .debug_selector(|| "file-menu-open-file".to_owned())
+                            .px(px(5.0))
+                            .py(px(3.0))
+                            .child("ファイルを開く…")
+                    })
+                    .on_click(move |_, _, app| {
+                        open_view.update(app, |view, cx| view.prompt_open(cx));
                     }),
-            )
-        } else {
-            None
-        };
-        // The macOS entry to the selection AI (Control+L now centers the caret
-        // line, Issue #494) and a second entry on Windows next to Alt+I. It
-        // calls the same `open_ai_selection` the key does, so the body
-        // selection is read, not changed, and an open popup disables it.
-        let ai_button = {
-            let view = cx.entity();
-            div()
-                .debug_selector(|| "footer-ai-selection".to_owned())
-                .flex_none()
-                .child(
-                    Button::new("footer-ai-selection-button")
-                        .label("AIに指示")
-                        .xsmall()
-                        .ghost()
-                        .tooltip("選択した文章に指示する")
-                        .disabled(self.ai_selection_blocks_editor_keys())
-                        .on_click(move |_, window, app| {
-                            view.update(app, |view, cx| view.open_ai_selection(window, cx));
+                );
+                let folder_view = view.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        div()
+                            .debug_selector(|| "file-menu-open-folder".to_owned())
+                            .px(px(5.0))
+                            .py(px(3.0))
+                            .child("フォルダを開く…")
+                    })
+                    .on_click(move |_, _, app| {
+                        folder_view.update(app, |view, cx| view.prompt_open_work_folder(cx));
+                    }),
+                );
+                menu = menu.item(PopupMenuItem::element(move |_, _| {
+                    div()
+                        .px(px(5.0))
+                        .py(px(3.0))
+                        .text_size(px(11.0))
+                        .opacity(0.7)
+                        .child("最近開いたファイル")
+                }));
+                if recent.is_empty() {
+                    return menu.item(PopupMenuItem::element(move |_, _| {
+                        div()
+                            .debug_selector(|| "file-menu-no-recent".to_owned())
+                            .px(px(5.0))
+                            .py(px(3.0))
+                            .child("最近開いたファイルはありません")
+                    }));
+                }
+                for (index, path) in recent.iter().enumerate() {
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    // The folder is shown in full, wrapped rather than cut,
+                    // so same-named files in different folders can be told
+                    // apart.
+                    let folder = path
+                        .parent()
+                        .map(|parent| parent.display().to_string())
+                        .unwrap_or_default();
+                    let open_path = path.clone();
+                    let recent_view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .debug_selector(move || format!("file-menu-recent-{index}"))
+                                .max_w(px(360.0))
+                                .px(px(5.0))
+                                .py(px(3.0))
+                                .flex()
+                                .flex_col()
+                                .child(div().child(name.clone()))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .opacity(0.7)
+                                        .whitespace_normal()
+                                        .child(folder.clone()),
+                                )
+                        })
+                        .on_click(move |_, _, app| {
+                            let path = open_path.clone();
+                            recent_view.update(app, |view, cx| view.open_path(&path, cx));
                         }),
-                )
-        };
-        let controls = div()
-            .h_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .text_size(px(11.0))
-            .children(settings_button)
-            .child(ai_button)
-            .child(
-                div()
-                    .id("footer-autosave")
-                    .flex_none()
-                    .cursor_pointer()
-                    .child(autosave)
-                    .on_click(cx.listener(|view, _, _, cx| view.toggle_autosave(cx))),
-            )
-            .child(
-                div()
-                    .id("footer-theme")
-                    .flex_none()
-                    .cursor_pointer()
-                    .child(theme)
-                    .on_click(cx.listener(|view, _, window, cx| view.cycle_theme(window, cx))),
-            )
-            .child("Recent:")
-            .children(recent);
-        let controls = div()
-            .id("footer-controls")
-            .debug_selector(|| "footer-controls".to_owned())
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_x_scroll()
-            .track_scroll(&self.footer_scroll)
-            .child(controls);
-
+                    );
+                }
+                menu
+            });
         div()
-            .id("editor-footer")
-            .debug_selector(|| "editor-footer".to_owned())
-            .h(px(self.theme.footer_height))
+            .id("file-menu-wrapper")
+            .debug_selector(|| "file-menu".to_owned())
             .flex_none()
-            .flex()
-            .flex_col()
-            .bg(rgb(self.theme.code_background))
-            .text_color(rgb(self.theme.foreground))
-            .child(
-                div()
-                    .id("footer-status")
-                    .debug_selector(|| "footer-status".to_owned())
-                    .h(px(24.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .min_w(px(0.0))
-                    .px_3()
-                    .text_size(px(11.0))
-                    .truncate()
-                    .child(status),
-            )
-            .child(controls)
+            .px_1()
+            .child(button)
     }
 }
 
@@ -8962,6 +9076,39 @@ mod tests {
         cx.run_until_parked();
         assert!(!view.read_with(cx, |view, _| view.settings_open));
         assert!(cx.debug_bounds("editor-footer").is_some());
+    }
+
+    #[gpui::test]
+    fn narrow_settings_keep_general_controls_inside_the_window(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(279.0), px(600.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+
+        for id in [
+            "settings-theme-card",
+            "settings-autosave-card",
+        ] {
+            let bounds = cx
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("{id} must be laid out"));
+            assert!(bounds.left() >= px(0.0), "{id} clipped on the left");
+            assert!(
+                bounds.right() <= px(279.0),
+                "{id} must not be clipped past the right edge: {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_layout_stacks_only_when_content_would_be_squeezed() {
+        assert!(settings_layout_is_narrow(279.0, 240.0));
+        assert!(!settings_layout_is_narrow(900.0, 240.0));
     }
 
     #[test]
@@ -13980,35 +14127,10 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    #[test]
-    fn footer_status_line_combines_warning_and_status_without_dropping_either() {
-        assert_eq!(footer_status_line(None, None), None);
-        assert_eq!(
-            footer_status_line(Some("2 drafts could not be recovered"), None),
-            Some("2 drafts could not be recovered".to_owned())
-        );
-        assert_eq!(
-            footer_status_line(None, Some("Opened")),
-            Some("Opened".to_owned())
-        );
-        // Regression for the P1 review finding: an unconditional priority for
-        // the warning would permanently hide a later, safety-relevant status
-        // (a save failure, a conflict) once a work folder has raised a
-        // recovery warning, since this view only re-scans a work folder once
-        // at startup. Both must show.
-        assert_eq!(
-            footer_status_line(
-                Some("2 drafts could not be recovered"),
-                Some("Save failed: disk full")
-            ),
-            Some("2 drafts could not be recovered · Save failed: disk full".to_owned())
-        );
-    }
-
     // Regression test for the P1 review finding on the footer status line: a
     // save failure that happens after a draft-recovery warning was raised
     // must still reach the user, not be hidden behind the warning for the
-    // rest of the session.
+    // rest of the session, and the warning must stay reachable next to it.
     #[gpui::test]
     fn a_save_failure_after_a_draft_recovery_warning_is_still_visible(
         cx: &mut gpui::TestAppContext,
@@ -14041,25 +14163,25 @@ mod tests {
             // raised (a later autosave, a manual save, a conflict) must not
             // be swallowed by the warning that is still sitting in
             // `draft_recovery_warning`.
-            view.status = Some("Save failed: disk full".to_owned());
+            let id = view.sessions.active_id();
+            let instance = view.document_instance(id).unwrap();
+            view.record_save_problem(
+                id,
+                instance,
+                None,
+                DocumentSaveProblem::Failed("disk full".to_owned()),
+            );
         });
 
         view.read_with(cx, |view, _| {
-            let combined = footer_status_line(
-                view.draft_recovery_warning.as_deref(),
-                view.status.as_deref(),
+            let warnings = view.footer_warnings();
+            assert!(
+                warnings.iter().any(|line| line.contains("disk full")),
+                "expected the save failure to still be visible, got {warnings:?}"
             );
             assert!(
-                combined
-                    .as_deref()
-                    .is_some_and(|line| line.contains("Save failed")),
-                "expected the save failure to still be visible, got {combined:?}"
-            );
-            assert!(
-                combined
-                    .as_deref()
-                    .is_some_and(|line| line.contains("recover")),
-                "expected the recovery warning to still be visible too, got {combined:?}"
+                warnings.iter().any(|line| line.contains("recover")),
+                "expected the recovery warning to still be visible too, got {warnings:?}"
             );
         });
 
@@ -15171,7 +15293,12 @@ mod tests {
                     .contains_key(&view.sessions.active_id()),
                 "a failed save must not leave a close request armed for a future, unrelated save"
             );
-            assert!(view.status.as_deref().unwrap_or_default().contains("Save failed"));
+            assert!(
+                view.footer_warnings()
+                    .iter()
+                    .any(|line| line.contains("保存できませんでした")),
+                "the failed save must stay visible as a per-document save problem"
+            );
         });
 
         std::fs::remove_dir_all(root).unwrap();
@@ -15234,10 +15361,11 @@ mod tests {
                     .contains_key(&view.sessions.active_id()),
                 "a stale write must drop the close request rather than retry it against a later, unrelated save"
             );
-            assert_eq!(
-                view.status.as_deref(),
-                Some("Saved snapshot; newer edits pending")
+            assert!(
+                view.footer_warnings().is_empty(),
+                "a snapshot that landed is not a save problem"
             );
+            assert_eq!(view.active_save_display(), footer::SaveDisplay::Unsaved);
         });
 
         std::fs::remove_dir_all(root).unwrap();
@@ -15294,12 +15422,12 @@ mod tests {
                     .contains_key(&view.sessions.active_id()),
                 "a refused save must drop the close request rather than retry it blindly"
             );
-            assert!(
-                view.status
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("changed on disk")
+            assert_eq!(
+                view.active_save_display(),
+                footer::SaveDisplay::Conflict,
+                "the conflict must stay in the document's footer warning"
             );
+            assert_eq!(view.footer_warnings().len(), 1);
         });
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -15389,12 +15517,12 @@ mod tests {
                 !view.tab_close_after_save.contains_key(&id),
                 "a refused save must drop the close request rather than let a coincidentally clean document close it"
             );
-            assert!(
-                view.status
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("changed on disk")
+            assert_eq!(
+                view.active_save_display(),
+                footer::SaveDisplay::Conflict,
+                "the conflict must stay in the document's footer warning"
             );
+            assert_eq!(view.footer_warnings().len(), 1);
         });
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
