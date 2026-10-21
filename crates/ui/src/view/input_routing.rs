@@ -687,7 +687,7 @@ mod tests {
 
     // ----- Reading mode (Issue #547, R04) -----
 
-    fn body_state(view: &TestView, cx: &mut TestCx) -> (String, Revision, bool) {
+    fn reading_body_state(view: &TestView, cx: &mut TestCx) -> (String, Revision, bool) {
         view.read_with(cx, |view, _| {
             (
                 view.editor().document().full_text(),
@@ -697,11 +697,10 @@ mod tests {
         })
     }
 
-    #[gpui::test]
-    fn reading_mode_keeps_filter_and_rename_input_selection_copy_and_paste(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let root = fixture_root("reading-r04");
+    /// Each surface gets its own fixture: a Filter left active would keep
+    /// winning the key routing over a Rename started in the same window.
+    fn reading_custom_input_contract(cx: &mut gpui::TestAppContext, surface: Surface, name: &str) {
+        let root = fixture_root(name);
         let (view, cx) = open_routing_view(cx, "body-text\n", &root);
         cx.update(|window, app| {
             view.update(app, |view, cx| {
@@ -709,36 +708,125 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        let body = body_state(&view, cx);
+        let body = reading_body_state(&view, cx);
 
-        for surface in [Surface::Filter, Surface::Rename] {
-            match surface {
-                Surface::Filter => click_filter(cx),
-                Surface::Rename => begin_rename(&view, cx, &rename_path(&root)),
-                Surface::Body => unreachable!(),
-            }
-            let label = format!("{surface:?}");
-            // Real input through the OS text callbacks, UTF-16 ranges.
-            replace(&view, cx, None, TEXT);
-            assert_eq!(surface_text(&view, cx, surface), TEXT, "{label}");
-            // A non-empty selection made with the keyboard.
-            select_emoji_forward(cx);
-            assert_eq!(surface_selection(&view, cx, surface), 1..5, "{label}");
-            assert_eq!(query_selection(&view, cx), Some((1..3, false)), "{label}");
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
-            cx.simulate_keystrokes("secondary-c");
-            cx.run_until_parked();
-            assert_eq!(
-                cx.read_from_clipboard().and_then(|item| item.text()),
-                Some("😀".to_owned()),
-                "{label}: Copy"
-            );
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string("羽".to_owned()));
-            cx.simulate_keystrokes("secondary-v");
-            cx.run_until_parked();
-            assert_eq!(surface_text(&view, cx, surface), REPLACED, "{label}: Paste");
-            assert_eq!(body_state(&view, cx), body, "{label}: the body is untouched");
+        match surface {
+            Surface::Filter => click_filter(cx),
+            Surface::Rename => begin_rename(&view, cx, &rename_path(&root)),
+            Surface::Body => unreachable!(),
         }
+        let label = format!("{surface:?}");
+        // Real input through the OS text callbacks, UTF-16 ranges.
+        replace(&view, cx, None, TEXT);
+        assert_eq!(surface_text(&view, cx, surface), TEXT, "{label}");
+        // A non-empty selection made with the keyboard.
+        select_emoji_forward(cx);
+        assert_eq!(surface_selection(&view, cx, surface), 1..5, "{label}");
+        assert_eq!(query_selection(&view, cx), Some((1..3, false)), "{label}");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
+        cx.simulate_keystrokes("secondary-c");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("😀".to_owned()),
+            "{label}: Copy"
+        );
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("羽".to_owned()));
+        cx.simulate_keystrokes("secondary-v");
+        cx.run_until_parked();
+        assert_eq!(surface_text(&view, cx, surface), REPLACED, "{label}: Paste");
+        assert_eq!(
+            reading_body_state(&view, cx),
+            body,
+            "{label}: the body is untouched"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn reading_mode_keeps_filter_input_selection_copy_and_paste(cx: &mut gpui::TestAppContext) {
+        reading_custom_input_contract(cx, Surface::Filter, "reading-r04-filter");
+    }
+
+    #[gpui::test]
+    fn reading_mode_keeps_rename_input_selection_copy_and_paste(cx: &mut gpui::TestAppContext) {
+        reading_custom_input_contract(cx, Surface::Rename, "reading-r04-rename");
+    }
+
+    /// Types, selects, copies and pastes through the search field's own
+    /// `InputState` while it really holds focus (UTF-16 selection 1..3), then
+    /// reads the whole line back through the clipboard.
+    fn reading_search_input_contract(
+        view: &TestView,
+        cx: &mut TestCx,
+        label: &str,
+        focused: fn(&EditorView) -> bool,
+    ) {
+        let body = reading_body_state(view, cx);
+        assert!(view.read_with(cx, |view, _| focused(view)), "{label}: focused");
+        cx.simulate_input(TEXT);
+        cx.run_until_parked();
+        select_emoji_forward(cx);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
+        cx.simulate_keystrokes("secondary-c");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("😀".to_owned()),
+            "{label}: Copy"
+        );
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("羽".to_owned()));
+        cx.simulate_keystrokes("secondary-v");
+        cx.run_until_parked();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
+        cx.simulate_keystrokes(&format!("{LINE_START_KEY} {SELECT_LINE_END_KEY}"));
+        cx.simulate_keystrokes("secondary-c");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(REPLACED.to_owned()),
+            "{label}: Paste"
+        );
+        assert!(view.read_with(cx, |view, _| focused(view)), "{label}: still focused");
+        assert_eq!(
+            reading_body_state(view, cx),
+            body,
+            "{label}: the body is untouched"
+        );
+    }
+
+    #[gpui::test]
+    fn reading_mode_keeps_search_input_selection_copy_and_paste(cx: &mut gpui::TestAppContext) {
+        let root = fixture_root("reading-r04-search");
+        let (view, cx) = open_routing_view(cx, "body-text\n", &root);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.set_editor_mode(EditorMode::Reading, window, cx));
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+        reading_search_input_contract(
+            &view,
+            cx,
+            "DocumentFind",
+            EditorView::document_find_input_is_focused,
+        );
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        reading_search_input_contract(
+            &view,
+            cx,
+            "ContentSearch",
+            EditorView::content_search_input_is_focused,
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -369,34 +369,41 @@ mod tests {
         view.read_with(cx, |view, _| view.layout_followup_frames_requested)
     }
 
-    /// Delivers the frames `render` asked for, at most `limit` of them, and
-    /// returns how many it took. The test platform never fires
-    /// `request_animation_frame` callbacks (the vendored gpui has no
-    /// `simulate_next_frame`), so a requested frame is delivered as the view
-    /// notification that callback makes. Frames are only delivered while the
-    /// request counter moved, so a view that stopped asking is not nudged.
-    /// `handled` is the counter value from before the action under test.
+    /// Delivers the frames `render` asked for, at most `limit` rounds of them,
+    /// and returns how many rounds it took. Each round runs the window's real
+    /// next-frame callbacks (`Window::simulate_next_frame`, the ones
+    /// `request_animation_frame` registered) and then lets the resulting
+    /// redraw settle. It ends on the first round with no callback left, so a
+    /// view that stopped asking is not nudged and a request without a real
+    /// callback is not hidden: the callers then assert the pending state is
+    /// gone. `mark` is the request counter from before the action under test;
+    /// if it moved, at least one real callback must have been delivered.
     fn deliver_requested_frames(
         view: &TestView,
         cx: &mut TestCx,
-        mut handled: u64,
+        mark: u64,
         limit: usize,
     ) -> usize {
         let mut delivered = 0;
         loop {
-            let now = requested_frames(view, cx);
-            if now == handled {
-                return delivered;
+            let callbacks = cx.update(|window, app| window.simulate_next_frame(app));
+            settle(cx);
+            if callbacks == 0 {
+                break;
             }
+            delivered += 1;
             assert!(
-                delivered < limit,
+                delivered <= limit,
                 "the layout correction asks for frames without converging ({delivered} delivered)"
             );
-            handled = now;
-            delivered += 1;
-            view.update(cx, |_, cx| cx.notify());
-            settle(cx);
         }
+        if requested_frames(view, cx) != mark {
+            assert!(
+                delivered > 0,
+                "frames were requested but no next-frame callback was registered"
+            );
+        }
+        delivered
     }
 
     /// Switches the mode, then settles it, including the frames the switch's
@@ -720,6 +727,128 @@ mod tests {
             view.read_with(cx, |view, _| view.editor_mode()),
             EditorMode::Reading
         );
+    }
+
+    /// Gives the body the real keyboard focus, as a click into it would.
+    fn focus_body_for_keys(view: &TestView, cx: &mut TestCx) {
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                window.focus(&view.focus_handle, cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    /// One real key press through the registered key bindings, then the frames
+    /// it asked for, and the pending/visibility/geometry checks that must hold
+    /// once the layout settled. The oracle is the rendered row geometry
+    /// (`source_offset_row_bounds`), not the height estimate.
+    fn press_and_check(view: &TestView, cx: &mut TestCx, keys: &str, label: &str) -> SourceOffset {
+        let mark = requested_frames(view, cx);
+        cx.simulate_keystrokes(keys);
+        settle(cx);
+        deliver_requested_frames(view, cx, mark, 8);
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.pending_caret_visibility_after_layout,
+                "{label}: the pending visibility request converged"
+            );
+            let active = view.editor().selection().active;
+            let (top, height) = view
+                .source_offset_row_bounds(active)
+                .unwrap_or_else(|| panic!("{label}: the reached row has measured geometry"));
+            assert!(
+                top.is_finite() && top >= 0.0 && height > 0.0,
+                "{label}: measured row {top}+{height}"
+            );
+        });
+        assert_caret_row_on_screen(view, cx, label);
+        view.read_with(cx, |view, _| view.editor().selection().active)
+    }
+
+    #[gpui::test]
+    fn reading_real_down_keys_cross_tables_and_code_in_a_narrow_viewport(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Narrow viewport so the long table cells wrap into several visual
+        // lines. Paragraphs surround the closed table and the closed fence.
+        let source = "before the table\n\n\
+            | a long header cell that wraps | another long header cell that wraps |\n\
+            | --- | --- |\n\
+            | one cell that also has to wrap around | 2 |\n\n\
+            between table and code\n\n\
+            ```rust\nlet x = 1;\n```\n\n\
+            after the code\n";
+        let (view, cx) = open_view(cx, source, 260.0, 300.0);
+        let before = snapshot(&view, cx);
+        assert!(toggle(&view, cx));
+        settle(cx);
+        let mark = requested_frames(&view, cx);
+        deliver_requested_frames(&view, cx, mark, 8);
+        focus_body_for_keys(&view, cx);
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
+        });
+        settle(cx);
+
+        // Plain Down: the offset never goes backwards and the document end is
+        // reachable by the real key alone.
+        let mut previous = view.read_with(cx, |view, _| view.editor().selection().active);
+        let mut visited = vec![previous];
+        for step in 0..60 {
+            let reached = press_and_check(&view, cx, "down", &format!("down #{step}"));
+            assert!(reached >= previous, "down #{step}: moved backwards");
+            visited.push(reached);
+            if reached == previous {
+                break;
+            }
+            previous = reached;
+        }
+        let last = *visited.last().unwrap();
+        assert!(
+            last.0 >= source.find("after the code").unwrap(),
+            "Down reaches the last paragraph (stopped at {})",
+            last.0
+        );
+        // Every structural part was passed through at least once.
+        for (label, marker) in [
+            ("table", "| one cell"),
+            ("code", "let x = 1;"),
+        ] {
+            let at = source.find(marker).unwrap();
+            assert!(
+                visited.iter().any(|offset| offset.0 >= at),
+                "{label}: Down went past it"
+            );
+        }
+
+        // Shift+Down from the start keeps the anchor and extends forward.
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
+        });
+        settle(cx);
+        let mut previous = SourceOffset(0);
+        for step in 0..60 {
+            let reached = press_and_check(&view, cx, "shift-down", &format!("shift-down #{step}"));
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().selection().anchor,
+                    SourceOffset(0),
+                    "shift-down #{step}: the anchor stays"
+                );
+            });
+            assert!(reached >= previous, "shift-down #{step}: moved backwards");
+            if reached == previous {
+                break;
+            }
+            previous = reached;
+        }
+        assert!(
+            previous.0 >= source.find("after the code").unwrap(),
+            "Shift+Down reaches the last paragraph (stopped at {})",
+            previous.0
+        );
+        assert_eq!(snapshot(&view, cx), before, "reading keys never edit the body");
     }
 
     #[gpui::test]
