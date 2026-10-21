@@ -36,6 +36,10 @@ impl EditorView {
         self.force_height_disclosure_snapshot = false;
         self.document_parse_job_running = true;
         let key = self.document_key();
+        // The heights below are prepared for this display mode only. A switch
+        // while the job runs must not let them (or the disclosure they were
+        // built for) come back afterwards.
+        let mode = self.editor_mode;
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
         let previous_height_disclosure = self
@@ -56,6 +60,7 @@ impl EditorView {
             let current = view
                 .update(cx, |view, _| {
                     view.document_key() == key
+                        && view.editor_mode == mode
                         && block_context_revision_is_current(
                             view.editor().document().revision(),
                             revision,
@@ -120,6 +125,15 @@ impl EditorView {
                     // re-derived once when the index actually changed.
                     view.block_cache.clear();
                     view.joined_parse_cache.clear();
+                }
+                if view.editor_mode != mode {
+                    // The source-only index above stays valid, but the heights
+                    // were prepared for the other display mode: rebuild them
+                    // for the current one instead of installing them.
+                    view.resync_heights_for_current_disclosure();
+                    view.schedule_document_parse(cx);
+                    cx.notify();
+                    return;
                 }
                 let (granularity, len) = view.desired_layout();
                 let snapshot_disclosure_is_current = view.editor().document().revision()

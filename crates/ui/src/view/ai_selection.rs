@@ -37,6 +37,7 @@ use std::sync::mpsc::RecvTimeoutError;
 pub(super) const AI_SELECTION_STALE_MESSAGE: &str =
     "文章が変更されたため、この結果は適用できません。選択し直して実行してください。";
 const AI_SELECTION_NO_SELECTION_MESSAGE: &str = "AIで処理する文章を選択してください";
+const AI_SELECTION_READING_MODE_MESSAGE: &str = "閲覧モードでは置換できません。";
 /// A generous upper bound on top of the service's own
 /// `text_transform::TEXT_TRANSFORM_TIMEOUT`, purely so this background thread
 /// cannot block forever if the service were ever to stop replying at all.
@@ -1040,6 +1041,13 @@ impl EditorView {
             anchor: target.range.start,
             active: SourceOffset(target.range.start.0 + result.len()),
         };
+        if !self.body_editable() {
+            // This write does not pass through `dispatch`, so the reading-mode
+            // check has to be made here, right before the document changes.
+            self.ai_selection.message = Some(AI_SELECTION_READING_MODE_MESSAGE.to_owned());
+            cx.notify();
+            return;
+        }
         let Some(session) = self.sessions.get_mut(target.session) else {
             return;
         };

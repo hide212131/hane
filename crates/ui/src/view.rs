@@ -28,8 +28,9 @@ use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
 use crate::line::DEFAULT_LINE_HEIGHT;
 use crate::line::{
-    BODY_FONT_SIZE, BlockPresentationRequest, CARET_MODE_BADGE_HEIGHT, block_element,
-    block_fits_sync_join_budget, expected_block_disclosures, presented_block, row_element,
+    BODY_FONT_SIZE, BlockPresentationRequest, CARET_MODE_BADGE_HEIGHT, DisclosurePolicy,
+    block_element, block_fits_sync_join_budget, expected_block_disclosures, presented_block,
+    row_element,
 };
 use crate::shape::WindowShaper;
 use crate::short_text_input::{ShortTextInput, utf16_offset_from_byte};
@@ -103,6 +104,8 @@ mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod inline_rename;
 pub(crate) mod input_routing;
+mod reading_mode;
+use reading_mode::{EditorMode, command_changes_text};
 mod session_save;
 mod sidebar;
 mod sidebar_filter;
@@ -951,6 +954,10 @@ pub struct EditorView {
     /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
     /// the life of the view; dropping it would cancel the hook.
     _quit_subscription: Subscription,
+    /// Whether the body is being edited or only read. One value per window:
+    /// it is not copied into sessions, editors or settings, and only an
+    /// explicit switch (see `reading_mode.rs`) changes it.
+    editor_mode: EditorMode,
     /// The active keyboard input mode, when the platform can determine it.
     /// Drives the caret's small input-mode badge; refreshed by
     /// `_input_mode_subscription` so it updates without polling.
@@ -1752,6 +1759,7 @@ impl EditorView {
             pending_new_folders: HashSet::new(),
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
+            editor_mode: EditorMode::default(),
             caret_input_mode: active_keyboard_input_mode(),
             _input_mode_subscription: input_mode_subscription,
             _input_mode_focus_subscription: None,
@@ -3990,6 +3998,11 @@ impl EditorView {
         intent: ListEditIntent,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.body_editable() {
+            // Handled as a no-op so the caller's plain-input fallback does not
+            // run either.
+            return true;
+        }
         if self.editor().ime().is_some() {
             return false;
         }
@@ -4045,6 +4058,9 @@ impl EditorView {
     }
 
     pub(crate) fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        if !self.body_editable() {
+            return;
+        }
         match self.editor_mut().dispatch(EditorCommand::Insert("\n")) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("editor command", error),
@@ -4053,6 +4069,9 @@ impl EditorView {
     }
 
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !self.body_editable() {
+            return;
+        }
         match self.editor_mut().insert_text(text) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("text input", error),
@@ -4061,6 +4080,9 @@ impl EditorView {
     }
 
     pub(crate) fn dispatch(&mut self, command: EditorCommand<'_>, cx: &mut Context<Self>) {
+        if !self.body_editable() && command_changes_text(&command) {
+            return;
+        }
         match self.editor_mut().dispatch(command) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("editor command", error),
@@ -4650,6 +4672,7 @@ impl EditorView {
             // the document-find bar's current match.
             forced_disclosure: None,
             line_height: self.line_height(),
+            disclosure_policy: self.disclosure_policy(),
         })?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
@@ -4672,8 +4695,9 @@ impl EditorView {
         x: f32,
         shaper: &dyn LineShaper,
     ) -> Option<(SourceOffset, f32)> {
+        let policy = self.disclosure_policy();
         let (indexed, window) =
-            neighbor_block_window(self.editor(), self.current_index(), block, down)?;
+            neighbor_block_window(self.editor(), self.current_index(), block, down, policy)?;
         let joined = self.current_joined_parse(&indexed);
         let list_projection = self
             .current_index()
@@ -4693,6 +4717,7 @@ impl EditorView {
             list_projection,
             table_projection,
             self.line_height(),
+            policy,
         )
     }
 
@@ -5375,6 +5400,12 @@ impl EditorView {
     }
 
     fn active_height_disclosure(&self) -> Option<SourceRange> {
+        if !self.body_editable() {
+            // Reading opens no Markdown markers, so no structural row stays
+            // expanded: `None` makes every fence and table delimiter row count
+            // as collapsed in height arithmetic and virtualization.
+            return None;
+        }
         self.editor()
             .ime()
             .map(|ime| ime.current_range)
@@ -5917,6 +5948,7 @@ impl EditorView {
             table_projection,
             forced_disclosure: self.document_find_current_match(),
             line_height: self.line_height(),
+            disclosure_policy: self.disclosure_policy(),
         })?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
@@ -5978,6 +6010,7 @@ impl EditorView {
             &render,
             self.current_joined_parse(indexed),
             self.document_find_current_match(),
+            self.disclosure_policy(),
         ) else {
             return false;
         };
@@ -6004,6 +6037,7 @@ fn neighbor_block_window(
     index: Option<&BlockIndex>,
     block: &VisualBlock,
     down: bool,
+    policy: DisclosurePolicy,
 ) -> Option<(IndexedBlock, Range<usize>)> {
     let document = editor.document();
     let probe = if down {
@@ -6018,10 +6052,13 @@ fn neighbor_block_window(
         span.start..span.start + 1
     } else {
         let last_line = span.end.saturating_sub(1);
-        let disclosure = editor
-            .ime()
-            .map(|ime| ime.current_range)
-            .or_else(|| Some(editor.selection().range()));
+        let disclosure = match policy {
+            DisclosurePolicy::Editing => editor
+                .ime()
+                .map(|ime| ime.current_range)
+                .or_else(|| Some(editor.selection().range())),
+            DisclosurePolicy::Reading => None,
+        };
         // Preserve tiled trailing blank lines as navigable rows. Only fall
         // back to the table's last formal row when the physical last line is
         // itself a collapsed delimiter (the header-only table edge case).
@@ -6071,6 +6108,7 @@ fn target_in_neighbor(
     list_projection: Option<&ListProjection>,
     table_projection: Option<&TableProjection>,
     line_height: f32,
+    disclosure_policy: DisclosurePolicy,
 ) -> Option<(SourceOffset, f32)> {
     let visual = presented_block(BlockPresentationRequest {
         editor,
@@ -6084,6 +6122,7 @@ fn target_in_neighbor(
         // document-find bar's current match.
         forced_disclosure: None,
         line_height,
+        disclosure_policy,
     })?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
@@ -6159,7 +6198,8 @@ fn neighbor_row_target(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
 ) -> Option<SourceOffset> {
-    let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
+    let (indexed, window) =
+        neighbor_block_window(editor, index, block, down, DisclosurePolicy::Editing)?;
     target_in_neighbor(
         editor,
         &indexed,
@@ -6172,6 +6212,7 @@ fn neighbor_row_target(
         None,
         None,
         DEFAULT_LINE_HEIGHT,
+        DisclosurePolicy::Editing,
     )
     .map(|(target, _)| target)
 }
@@ -7370,11 +7411,13 @@ impl Render for EditorView {
                 .unwrap_or(SourceOffset(0)),
         });
         // Where the caret was drawn, for the IME candidate window.
-        self.caret_geometry = fresh_caret.map(|(x, top, height)| CaretGeometry {
-            x: self.theme.line_horizontal_padding + x,
-            y: top - self.scroll_y,
-            height,
-        });
+        self.caret_geometry = fresh_caret
+            .filter(|_| self.body_caret_visible())
+            .map(|(x, top, height)| CaretGeometry {
+                x: self.theme.line_horizontal_padding + x,
+                y: top - self.scroll_y,
+                height,
+            });
         // Blocks are drawn whole, so the rendered span can start above the
         // viewport; the spacers have to match what was actually drawn.
         let items = if first_item < last_item {
@@ -7468,6 +7511,7 @@ impl Render for EditorView {
                                         self.zoom,
                                         &resolver,
                                         self.caret_input_mode,
+                                        self.body_caret_visible(),
                                         &find_matches,
                                         find_current_match,
                                     )
@@ -7899,6 +7943,10 @@ impl EditorView {
             .border_color(rgb(self.theme.tab_bar_border))
             .child(self.file_menu_button(cx))
             .child(tab_strip)
+            // Outside the scrolling strip, so it keeps its size with many tabs
+            // or a narrow window and its press never reaches the strip's
+            // body-click handler.
+            .child(self.reading_mode_button(cx))
     }
 
     /// The "ファイル" menu at the left of the header: open a file, open a
@@ -9134,6 +9182,7 @@ mod tests {
                     table_projection: None,
                     forced_disclosure: None,
                     line_height: DEFAULT_LINE_HEIGHT,
+                    disclosure_policy: DisclosurePolicy::Editing,
                 })
                 .expect("block presents")
                 .lines
@@ -9163,6 +9212,7 @@ mod tests {
             table_projection: Some(projection),
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("table presentation");
         let delimiter = visual
@@ -9769,6 +9819,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: view.line_height(),
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .expect("active fenced block presentation");
             let width = 80.0;
@@ -9860,6 +9911,7 @@ mod tests {
                 table_projection: Some(projection),
                 forced_disclosure: None,
                 line_height: view.line_height(),
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .expect("active table presentation");
             let layout = layout_block(&visual, width, &FixedAdvanceShaper::new(8.0));
@@ -10281,6 +10333,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .unwrap();
         assert_eq!(visual.lines.len(), 50, "only the visible lines are built");
@@ -10397,6 +10450,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("nested item presents");
         assert_eq!(nested.lines[0].visual_text, "1. nested");
@@ -10417,6 +10471,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late item presents");
         assert_eq!(late.lines[0].visual_text, "3000. item");
@@ -10448,6 +10503,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late continuation presents");
         let line = &late.lines[0];
@@ -10486,6 +10542,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late code row presents");
         let line = &code.lines[0];
@@ -10510,6 +10567,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late code opening presents");
         assert_eq!(opening.lines[0].visual_text, "");
@@ -10545,6 +10603,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late code row presents");
         let line = &presented.lines[0];
@@ -10582,6 +10641,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late nested code row presents");
         assert_eq!(presented.lines[0].visual_text, "```oops");
@@ -10606,6 +10666,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late nested closing fence presents");
         assert_eq!(closing.lines[0].visual_text, "");
@@ -10648,6 +10709,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late quote code row presents");
         let line = &code.lines[0];
@@ -10669,6 +10731,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late quote code opening presents");
         assert_eq!(opening.lines[0].visual_text, "> ````rust");
@@ -10711,6 +10774,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late list quote code row presents");
         assert_eq!(code.lines[0].visual_text, "    > > literal");
@@ -10751,6 +10815,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late list code row presents");
         let line = &code.lines[0];
@@ -10789,6 +10854,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("same-line nested fence presents");
         let line = &opening.lines[0];
@@ -10830,6 +10896,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("same-line multi-level fence presents");
         let line = &opening.lines[0];
@@ -10857,6 +10924,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("disclosed same-line multi-level fence presents");
         let outer_marker = SourceRange::new(opening_start + 4, opening_start + 6);
@@ -10902,6 +10970,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("formal continuation presents");
         assert_eq!(late.lines[0].visual_text, "continued");
@@ -10947,6 +11016,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: DEFAULT_LINE_HEIGHT,
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .unwrap();
         assert_eq!(code.lines.len(), 5, "four fence lines plus the blank below");
@@ -11776,6 +11846,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: DEFAULT_LINE_HEIGHT,
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .unwrap();
             assert_eq!(
@@ -12518,6 +12589,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("block presents");
         let layout = layout_block(&block, TEST_WIDTH, shaper);
@@ -12891,6 +12963,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("the wide window presents");
         let wide_layout = layout_block(&wide_visual, TEST_WIDTH, &shaper);

@@ -94,6 +94,13 @@ impl EditorView {
     /// platform input handler. Unchanged from the previous inline condition:
     /// no rename, no broad sidebar focus and no AI selection key block.
     pub(crate) fn body_input_capture_enabled(&self) -> bool {
+        self.body_editable() && self.other_input_capture_allows_body()
+    }
+
+    /// The rename / sidebar / AI-popup part of [`Self::body_input_capture_enabled`],
+    /// kept apart from the editability so a read-only body still takes part
+    /// in frame bookkeeping (see `InputCapture::paint`).
+    pub(crate) fn other_input_capture_allows_body(&self) -> bool {
         !self.inline_rename_active()
             && !self.sidebar_filter_is_focused()
             && !self.ai_selection_blocks_editor_keys()
