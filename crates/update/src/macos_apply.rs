@@ -660,6 +660,36 @@ fn install_sidecar(coordination: &Coordination, staged_root: &Path, generation: 
     }
     let (raw, signature) = read_sidecar_pair(&staged_root.join(generation))?;
     let inventories = coordination.ensure_inventories_dir()?;
+    place_generation(&inventories, generation, &raw, &signature)
+}
+
+/// Places the candidate's generation in the `Hane.app.update` beside the live
+/// bundle, so the new generation travels with the app when `Hane.app` and its
+/// neighbour are moved together. Same rules as [`install_sidecar`]; a failure
+/// refuses the update before the exchange.
+fn install_paired_sidecar(live: &Path, staged_root: &Path, generation: &str) -> Result<()> {
+    if parse_macos_generation(generation).is_none() {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the candidate cannot name an inventory generation",
+        ));
+    }
+    let (raw, signature) = read_sidecar_pair(&staged_root.join(generation))?;
+    let paired = paired_sidecar_root(live);
+    match fs::symlink_metadata(&paired) {
+        Ok(_) => ensure_real_dir(&paired)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&paired)?;
+            if let Some(parent) = paired.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Err(err) => return Err(err.into()),
+    }
+    place_generation(&paired, generation, &raw, &signature)
+}
+
+fn place_generation(inventories: &Path, generation: &str, raw: &[u8], signature: &[u8]) -> Result<()> {
     let target = inventories.join(generation);
     match fs::symlink_metadata(&target) {
         Ok(_) => {
@@ -1597,6 +1627,43 @@ mod inventory_tests {
     }
 
     #[test]
+    fn the_new_generation_travels_with_the_app_and_its_neighbour() {
+        let p = prepared("macos-sidecar-moved-together");
+        let old_files = payload("0.27.0");
+        let live = p.dir.path().join("before").join("Hane.app");
+        fs::create_dir_all(&live).unwrap();
+        let paired = paired_sidecar_root(&live);
+        let (old_raw, old_sig) = inventory_for("0.27.0", TEST_SOURCE_SHA, 2, &old_files, 1);
+        write_generation(&paired, &generation("0.27.0"), &old_raw, &old_sig);
+
+        install_paired_sidecar(&live, &p.staged, &generation(VERSION)).unwrap();
+
+        // Both are moved together to a place with another InstallId store.
+        let moved = p.dir.path().join("after");
+        fs::rename(live.parent().unwrap(), &moved).unwrap();
+        let moved_paired = moved.join("Hane.app.update");
+        let new_dir = moved_paired.join(generation(VERSION));
+        let staged_dir = p.staged.join(generation(VERSION));
+        for name in [INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME] {
+            assert_eq!(fs::read(new_dir.join(name)).unwrap(), fs::read(staged_dir.join(name)).unwrap());
+        }
+        // The old generation is untouched, and the same release again is accepted.
+        assert!(moved_paired.join(generation("0.27.0")).join(INVENTORY_FILE_NAME).exists());
+        install_paired_sidecar(&moved.join("Hane.app"), &p.staged, &generation(VERSION)).unwrap();
+    }
+
+    #[test]
+    fn a_paired_sidecar_that_cannot_be_written_stops_the_update() {
+        let p = prepared("macos-sidecar-paired-unwritable");
+        let live = p.dir.path().join("Hane.app");
+        fs::create_dir_all(&live).unwrap();
+        // A plain file where the neighbouring directory belongs.
+        fs::write(paired_sidecar_root(&live), b"x").unwrap();
+        let err = install_paired_sidecar(&live, &p.staged, &generation(VERSION)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InstallModified);
+    }
+
+    #[test]
     fn an_existing_generation_with_other_content_stops_the_update_unchanged() {
         let p = prepared("macos-sidecar-conflict");
         let inventories = p.coordination.ensure_inventories_dir().unwrap();
@@ -1940,6 +2007,10 @@ pub fn apply_bundle<'a>(inputs: &BundleApplyInputs<'a>) -> Result<AppliedBundle<
     // inventory (or its in-app legacy inventory) is not touched, which keeps a
     // rollback verifiable until the health commit.
     install_sidecar(inputs.coordination, &staged_sidecar_root(&verified.slot), &verified.generation)?;
+    // And beside the live bundle, so the new generation stays verifiable after
+    // `Hane.app` and `Hane.app.update` are moved together. A failure here stops
+    // the update before the exchange; no unverified new app is left behind.
+    install_paired_sidecar(live, &staged_sidecar_root(&verified.slot), &verified.generation)?;
 
     // A mark left on the live bundle by the previous Committed update refers to
     // the receipt retired next. It is removed durably first, so a rollback that
