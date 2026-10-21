@@ -4463,10 +4463,7 @@ impl EditorView {
         {
             return Some((block.clone(), entry.layout.clone()));
         }
-        let revision = self.editor().document().revision();
-        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
-            cached.revision == revision && cached.source_range == indexed.source_range
-        });
+        let joined = self.current_joined_parse(&indexed);
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
@@ -4480,7 +4477,7 @@ impl EditorView {
             self.editor(),
             &indexed,
             &window,
-            joined.map(|cached| &cached.parse),
+            joined,
             list_projection,
             fence_height_projection,
             table_projection,
@@ -4512,10 +4509,7 @@ impl EditorView {
     ) -> Option<(SourceOffset, f32)> {
         let (indexed, window) =
             neighbor_block_window(self.editor(), self.current_index(), block, down)?;
-        let revision = self.editor().document().revision();
-        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
-            cached.revision == revision && cached.source_range == indexed.source_range
-        });
+        let joined = self.current_joined_parse(&indexed);
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
@@ -4530,7 +4524,7 @@ impl EditorView {
             x,
             self.content_width,
             shaper,
-            joined.map(|cached| &cached.parse),
+            joined,
             list_projection,
             table_projection,
             self.line_height(),
@@ -5673,6 +5667,22 @@ impl EditorView {
             .max(1.0)
     }
 
+    /// The stored whole-span parse for `indexed`, only while it still describes
+    /// it: the lookup key is the block identity, the document revision must be
+    /// the current one (no rebasing, even for a non-intersecting edit), and the
+    /// whole-block range must match. The range compared is
+    /// `JoinedBlockCache.source_range`, not the inner parse's range, which may
+    /// exclude trailing blank lines.
+    fn current_joined_parse(&self, indexed: &IndexedBlock) -> Option<&JoinedParse> {
+        let revision = self.editor().document().revision();
+        self.joined_parse_cache
+            .get(&indexed.id)
+            .filter(|cached| {
+                cached.revision == revision && cached.source_range == indexed.source_range
+            })
+            .map(|cached| &cached.parse)
+    }
+
     /// Presents the part of a block that reaches `visible`, reusing the cached
     /// presentation when the document has not touched it, the index still
     /// describes it the same way, and it already covers the wanted lines.
@@ -5722,9 +5732,7 @@ impl EditorView {
                 return Some((cached, true));
             }
         }
-        let joined = self.joined_parse_cache.get(&block.id).filter(|cached| {
-            cached.revision == revision && cached.source_range == block.source_range
-        });
+        let joined = self.current_joined_parse(block);
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(block));
@@ -5738,7 +5746,7 @@ impl EditorView {
             self.sessions.active().editor(),
             block,
             visible,
-            joined.map(|cached| &cached.parse),
+            joined,
             list_projection,
             fence_height_projection,
             table_projection,
@@ -5797,17 +5805,13 @@ impl EditorView {
     /// selection or IME actually sits on, and invalidate the cache every frame
     /// the caret sits inside an active multi-line paragraph.
     fn disclosures_are_current(&self, indexed: &IndexedBlock, block: &VisualBlock) -> bool {
-        let revision = self.editor().document().revision();
         let render = block.span.start + block.lines_before
             ..block.span.start + block.lines_before + block.lines.len();
-        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
-            cached.revision == revision && cached.source_range == indexed.source_range
-        });
         let Some(expected) = expected_block_disclosures(
             self.editor(),
             indexed,
             &render,
-            joined.map(|cached| &cached.parse),
+            self.current_joined_parse(indexed),
             self.document_find_current_match(),
         ) else {
             return false;
@@ -11455,6 +11459,74 @@ mod tests {
                 assert!(view.joined_parse_cache.is_empty());
             });
         }
+    }
+
+    #[gpui::test]
+    fn current_joined_parse_requires_identity_revision_and_whole_block_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The first block owns a trailing blank line, so the inner parse range
+        // (content lines only) differs from the whole-block range the cache
+        // entry and the index compare.
+        let text = "This is **bold\nacross lines** ok\n\nsecond\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            let document = view.editor().document();
+            let indexed = BlockIndex::from_buffer(document).block(0).unwrap();
+            let span = block_line_span(document, &indexed).unwrap();
+            let blank = trailing_blank_lines(document, &span);
+            assert!(blank > 0, "the fixture block must own a trailing blank line");
+            let parse = parse_joined_span(
+                document,
+                span.start..span.end - blank,
+                indexed.source_range,
+                document.revision(),
+            )
+            .unwrap();
+            assert_ne!(
+                parse.source_range, indexed.source_range,
+                "inner parse range excludes the trailing blank line"
+            );
+            let revision = document.revision();
+
+            assert!(
+                view.current_joined_parse(&indexed).is_none(),
+                "an unregistered block has no parse"
+            );
+
+            view.joined_parse_cache.insert(
+                indexed.id,
+                JoinedBlockCache {
+                    revision,
+                    source_range: indexed.source_range,
+                    parse,
+                },
+            );
+            let found = view.current_joined_parse(&indexed).expect("matching entry");
+            assert!(std::ptr::eq(found, &view.joined_parse_cache[&indexed.id].parse));
+
+            let mut other_id = indexed;
+            other_id.id = BlockId(indexed.id.0 + 1000);
+            assert!(view.current_joined_parse(&other_id).is_none());
+
+            let mut other_start = indexed;
+            other_start.source_range.start.0 += 1;
+            assert!(view.current_joined_parse(&other_start).is_none());
+
+            let mut other_end = indexed;
+            other_end.source_range.end.0 -= 1;
+            assert!(view.current_joined_parse(&other_end).is_none());
+
+            // An edit in the later block advances the revision without
+            // touching this block's range; the old parse is still rejected.
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text("x").unwrap();
+            assert_ne!(view.editor().document().revision(), revision);
+            assert!(view.current_joined_parse(&indexed).is_none());
+        });
     }
 
     #[gpui::test]
