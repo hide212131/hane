@@ -721,7 +721,7 @@ fn place_generation(inventories: &Path, generation: &str, raw: &[u8], signature:
         .and_then(|()| write_new(&temp.join(INVENTORY_SIGNATURE_FILE_NAME), signature))
         .and_then(|()| sync_directory(&temp))
         .and_then(|()| rename_new_durable(&temp, &target))
-        .and_then(|()| sync_directory(&inventories));
+        .and_then(|()| sync_directory(inventories));
     if let Err(err) = placed {
         // After a rename that succeeded the generation is whole and a retry
         // reuses it; before, only the private temporary directory is removed.
