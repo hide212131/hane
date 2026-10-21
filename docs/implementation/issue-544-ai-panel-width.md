@@ -1,11 +1,13 @@
 # Issue #544: 狭幅のAI指示パネルを画面内に収める
 
-## 実装準備
+## 実装準備と状態
 
 - 対象Issue: [#544](https://github.com/hide212131/hane/issues/544)
 - ブロックされる親Issue: [#536](https://github.com/hide212131/hane/issues/536) のF02
 - 実装基準のmain SHA: `f56a70b4f3145d98de70af9cdcdfc44f20793351`
-- 状態: この準備文書だけを置いた段階。製品コード・テストは未変更、検証も未実施。
+- Claude Codeの実装workerはSonnet 5.5で起動し、パッチを作成。trusted finalizerが `dff2bfbc652251a2db15099ce32348a9d49e87bb` を作り、対象PR branchへpushしました。
+- AADW run `39622202229` は、検証時にPR APIが古いhead `ddcb3dec3ebaef92912efc218e61a2f485ce1597` を返したためexact-head確認で失敗し、テスト結果はありません。branch refは `dff2bfbc652251a2db15099ce32348a9d49e87bb` を指していました。
+- この追記はその検証失敗を記録する文書変更です。製品コードの検証済みを意味しません。
 
 ## 現状の証拠
 
@@ -35,4 +37,4 @@ AIサービス接続・送信処理、プロンプト形式や結果画面、本
 - 本文選択、未保存内容、入力値、IME制御が維持されることを確認する。
 - 必須CI、current-head review、対象head/baseに紐づくGUI証拠を揃える。
 
-準備PRの作成時点では上記を実装・検証済みとは扱いません。
+実装と検証をすべて完了したとは扱いません。
