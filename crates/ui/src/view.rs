@@ -27,15 +27,9 @@ use crate::input_mode::{
 use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
 use crate::line::DEFAULT_LINE_HEIGHT;
-#[cfg(test)]
-use crate::line::presented_block;
-#[cfg(test)]
-use crate::line::presented_block_with_list_projection;
-#[cfg(test)]
-use crate::line::presented_block_with_projections;
 use crate::line::{
-    BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
-    expected_block_disclosures, presented_block_with_table_projection, row_element,
+    BODY_FONT_SIZE, BlockPresentationRequest, CARET_MODE_BADGE_HEIGHT, block_element,
+    block_fits_sync_join_budget, expected_block_disclosures, presented_block, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::short_text_input::{ShortTextInput, utf16_offset_from_byte};
@@ -4644,19 +4638,19 @@ impl EditorView {
         let table_projection = self
             .current_index()
             .and_then(|index| index.table_projection(&indexed));
-        let visual = presented_block_with_table_projection(
-            self.editor(),
-            &indexed,
-            &window,
+        let visual = presented_block(BlockPresentationRequest {
+            editor: self.editor(),
+            block: &indexed,
+            visible: &window,
             joined,
             list_projection,
             fence_height_projection,
             table_projection,
             // Vertical caret navigation onto a neighbor block, unrelated to
             // the document-find bar's current match.
-            None,
-            self.line_height(),
-        )?;
+            forced_disclosure: None,
+            line_height: self.line_height(),
+        })?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
     }
@@ -5913,17 +5907,17 @@ impl EditorView {
         let table_projection = self
             .current_index()
             .and_then(|index| index.table_projection(block));
-        let presented = presented_block_with_table_projection(
-            self.sessions.active().editor(),
+        let presented = presented_block(BlockPresentationRequest {
+            editor: self.sessions.active().editor(),
             block,
             visible,
             joined,
             list_projection,
             fence_height_projection,
             table_projection,
-            self.document_find_current_match(),
-            self.line_height(),
-        )?;
+            forced_disclosure: self.document_find_current_match(),
+            line_height: self.line_height(),
+        })?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
     }
@@ -6078,19 +6072,19 @@ fn target_in_neighbor(
     table_projection: Option<&TableProjection>,
     line_height: f32,
 ) -> Option<(SourceOffset, f32)> {
-    let visual = presented_block_with_table_projection(
+    let visual = presented_block(BlockPresentationRequest {
         editor,
-        indexed,
-        &window,
+        block: indexed,
+        visible: &window,
         joined,
         list_projection,
-        None,
+        fence_height_projection: None,
         table_projection,
         // Vertical caret navigation onto a neighbor block, unrelated to the
         // document-find bar's current match.
-        None,
+        forced_disclosure: None,
         line_height,
-    )?;
+    })?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -9130,14 +9124,17 @@ mod tests {
         index
             .blocks()
             .flat_map(|block| {
-                presented_block_with_list_projection(
+                presented_block(BlockPresentationRequest {
                     editor,
-                    &block,
-                    &(0..usize::MAX),
-                    None,
-                    index.list_projection(&block),
-                    DEFAULT_LINE_HEIGHT,
-                )
+                    block: &block,
+                    visible: &(0..usize::MAX),
+                    joined: None,
+                    list_projection: index.list_projection(&block),
+                    fence_height_projection: None,
+                    table_projection: None,
+                    forced_disclosure: None,
+                    line_height: DEFAULT_LINE_HEIGHT,
+                })
                 .expect("block presents")
                 .lines
             })
@@ -9156,17 +9153,17 @@ mod tests {
         let block = index.blocks().next().expect("table block");
         let span = block_line_span(editor.document(), &block).expect("table span");
         let projection = index.table_projection(&block).expect("table projection");
-        let visual = presented_block_with_table_projection(
-            &editor,
-            &block,
-            &span,
-            None,
-            None,
-            None,
-            Some(projection),
-            None,
-            DEFAULT_LINE_HEIGHT,
-        )
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &span,
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: Some(projection),
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("table presentation");
         let delimiter = visual
             .lines
@@ -9762,15 +9759,17 @@ mod tests {
                 .current_index()
                 .and_then(|index| index.fence_height_projection(&block))
                 .expect("fence projection");
-            let visual = presented_block_with_projections(
-                view.editor(),
-                &block,
-                &span,
-                None,
-                None,
-                Some(projection),
-                view.line_height(),
-            )
+            let visual = presented_block(BlockPresentationRequest {
+                editor: view.editor(),
+                block: &block,
+                visible: &span,
+                joined: None,
+                list_projection: None,
+                fence_height_projection: Some(projection),
+                table_projection: None,
+                forced_disclosure: None,
+                line_height: view.line_height(),
+            })
             .expect("active fenced block presentation");
             let width = 80.0;
             let layout = layout_block(&visual, width, &FixedAdvanceShaper::new(8.0));
@@ -9851,17 +9850,17 @@ mod tests {
                 .and_then(|index| index.table_projection(&block))
                 .expect("table projection");
             let width = 80.0;
-            let visual = presented_block_with_table_projection(
-                view.editor(),
-                &block,
-                &span,
-                None,
-                None,
-                None,
-                Some(projection),
-                None,
-                view.line_height(),
-            )
+            let visual = presented_block(BlockPresentationRequest {
+                editor: view.editor(),
+                block: &block,
+                visible: &span,
+                joined: None,
+                list_projection: None,
+                fence_height_projection: None,
+                table_projection: Some(projection),
+                forced_disclosure: None,
+                line_height: view.line_height(),
+            })
             .expect("active table presentation");
             let layout = layout_block(&visual, width, &FixedAdvanceShaper::new(8.0));
             let delimiter_line = visual
@@ -10272,7 +10271,18 @@ mod tests {
         let lines = editor.document().line_count();
 
         let block = index.block(0).unwrap();
-        let visual = presented_block(&editor, &block, &(40_000..40_050), None).unwrap();
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(40_000..40_050),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .unwrap();
         assert_eq!(visual.lines.len(), 50, "only the visible lines are built");
         assert_eq!(visual.lines_before, 40_000);
         assert_eq!(visual.lines_after, lines - 40_050);
@@ -10377,14 +10387,17 @@ mod tests {
         // The nested item is rendered from a one-line viewport parse. Its
         // parent list is outside that parse, so the formal depth must come
         // from the projection retained by BlockIndex.
-        let nested = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(1..2),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let nested = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(1..2),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("nested item presents");
         assert_eq!(nested.lines[0].visual_text, "1. nested");
         assert_eq!(nested.lines[0].list.as_ref().unwrap().owner.depth, 2);
@@ -10394,14 +10407,17 @@ mod tests {
         // the direct-child ordinal from the whole list rather than restarting
         // at `1.` in the viewport.
         let late_line = 3_000;
-        let late = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(late_line..late_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let late = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(late_line..late_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late item presents");
         assert_eq!(late.lines[0].visual_text, "3000. item");
         assert_eq!(late.lines[0].list.as_ref().unwrap().owner.ordinal, 2_999);
@@ -10422,14 +10438,17 @@ mod tests {
         // formal projection must still identify this row as the first item and
         // hide its structural four-column continuation prefix.
         let late_line = 4_500;
-        let late = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(late_line..late_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let late = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(late_line..late_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late continuation presents");
         let line = &late.lines[0];
         assert_eq!(line.visual_text, "continued");
@@ -10457,14 +10476,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let code = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(code_line..code_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let code = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(code_line..code_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late code row presents");
         let line = &code.lines[0];
         assert_eq!(line.visual_text, "**literal**");
@@ -10478,14 +10500,17 @@ mod tests {
         assert_eq!(line.style_runs[0].kind, StyleKind::CodeBlock);
 
         let opening_line = code_line - 1;
-        let opening = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(opening_line..opening_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let opening = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(opening_line..opening_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late code opening presents");
         assert_eq!(opening.lines[0].visual_text, "");
         assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
@@ -10510,14 +10535,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let presented = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(lookalike_line..lookalike_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let presented = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(lookalike_line..lookalike_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late code row presents");
         let line = &presented.lines[0];
         assert_eq!(line.visual_text, "```oops");
@@ -10544,14 +10572,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let presented = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(lookalike_line..lookalike_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let presented = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(lookalike_line..lookalike_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late nested code row presents");
         assert_eq!(presented.lines[0].visual_text, "```oops");
         assert!(
@@ -10565,14 +10596,17 @@ mod tests {
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
-        let closing = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(closing_line..closing_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let closing = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(closing_line..closing_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late nested closing fence presents");
         assert_eq!(closing.lines[0].visual_text, "");
         assert_eq!(
@@ -10604,14 +10638,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let code = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(code_line..code_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let code = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(code_line..code_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late quote code row presents");
         let line = &code.lines[0];
         assert_eq!(line.visual_text, "> **literal**");
@@ -10622,14 +10659,17 @@ mod tests {
                 .any(|run| run.kind == StyleKind::CodeBlock)
         );
 
-        let opening = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(code_line - 1..code_line),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let opening = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(code_line - 1..code_line),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late quote code opening presents");
         assert_eq!(opening.lines[0].visual_text, "> ````rust");
         assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
@@ -10661,14 +10701,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let code = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(code_line..code_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let code = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(code_line..code_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late list quote code row presents");
         assert_eq!(code.lines[0].visual_text, "    > > literal");
         assert_eq!(code.lines[0].kind, BlockKind::CodeBlock);
@@ -10698,14 +10741,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let code = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(code_line..code_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let code = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(code_line..code_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("late list code row presents");
         let line = &code.lines[0];
         assert_eq!(line.visual_text, "- literal");
@@ -10733,14 +10779,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let opening = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(opening_line..opening_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let opening = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(opening_line..opening_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("same-line nested fence presents");
         let line = &opening.lines[0];
         assert_eq!(line.visual_text, "• ");
@@ -10771,14 +10820,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
 
-        let opening = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(opening_line..opening_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let opening = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(opening_line..opening_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("same-line multi-level fence presents");
         let line = &opening.lines[0];
         assert_eq!(line.visual_text, "• ");
@@ -10795,14 +10847,17 @@ mod tests {
                 opening_start + "    - - ````rust".find("rust").unwrap(),
             )))
             .unwrap();
-        let disclosed = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(opening_line..opening_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let disclosed = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(opening_line..opening_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("disclosed same-line multi-level fence presents");
         let outer_marker = SourceRange::new(opening_start + 4, opening_start + 6);
         let inner_marker = SourceRange::new(opening_start + 6, opening_start + 8);
@@ -10837,14 +10892,17 @@ mod tests {
         let projection = index.list_projection(&block).expect("list projection");
         let continuation_line = 5_000;
 
-        let late = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(continuation_line..continuation_line + 1),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let late = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(continuation_line..continuation_line + 1),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("formal continuation presents");
         assert_eq!(late.lines[0].visual_text, "continued");
     }
@@ -10879,7 +10937,18 @@ mod tests {
         let editor = Editor::new("```rust\nlet x = 1;\nlet y = 2;\n```\n\ntail\n");
         let index = BlockIndex::from_buffer(editor.document());
         let code =
-            presented_block(&editor, &index.block(0).unwrap(), &(0..usize::MAX), None).unwrap();
+            presented_block(BlockPresentationRequest {
+                editor: &editor,
+                block: &index.block(0).unwrap(),
+                visible: &(0..usize::MAX),
+                joined: None,
+                list_projection: None,
+                fence_height_projection: None,
+                table_projection: None,
+                forced_disclosure: None,
+                line_height: DEFAULT_LINE_HEIGHT,
+            })
+            .unwrap();
         assert_eq!(code.lines.len(), 5, "four fence lines plus the blank below");
         assert_eq!(code.source_range, index.block(0).unwrap().source_range);
         assert_eq!(
@@ -11697,7 +11766,18 @@ mod tests {
                 .unwrap();
             let indexed = view.block_at_offset(caret).unwrap();
             let span = block_line_span(view.editor().document(), &indexed).unwrap();
-            let visual = presented_block(view.editor(), &indexed, &span, None).unwrap();
+            let visual = presented_block(BlockPresentationRequest {
+                editor: view.editor(),
+                block: &indexed,
+                visible: &span,
+                joined: None,
+                list_projection: None,
+                fence_height_projection: None,
+                table_projection: None,
+                forced_disclosure: None,
+                line_height: DEFAULT_LINE_HEIGHT,
+            })
+            .unwrap();
             assert_eq!(
                 visual.lines.len(),
                 3,
@@ -12428,12 +12508,17 @@ mod tests {
         ordinal: usize,
         shaper: &FixedAdvanceShaper,
     ) -> (VisualBlock, BlockLayout) {
-        let block = presented_block(
+        let block = presented_block(BlockPresentationRequest {
             editor,
-            &index.block(ordinal).unwrap(),
-            &(0..usize::MAX),
-            None,
-        )
+            block: &index.block(ordinal).unwrap(),
+            visible: &(0..usize::MAX),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("block presents");
         let layout = layout_block(&block, TEST_WIDTH, shaper);
         (block, layout)
@@ -12796,8 +12881,18 @@ mod tests {
         // wider_window` establishes for `present_block` itself, carried
         // through navigation's own call path.
         let wide_window = span.start..(span.start + 5).min(content_end.max(span.start + 1));
-        let wide_visual = presented_block(&editor, &second, &wide_window, Some(&joined))
-            .expect("the wide window presents");
+        let wide_visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &second,
+            visible: &wide_window,
+            joined: Some(&joined),
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("the wide window presents");
         let wide_layout = layout_block(&wide_visual, TEST_WIDTH, &shaper);
         let wide_target = wide_layout
             .source_at_x(&wide_visual, 0, x, &shaper)
