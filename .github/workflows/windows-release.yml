@@ -372,10 +372,13 @@ jobs:
             --binary "$app/Contents/Helpers/hane-updater" \
             --version "${RELEASE_TAG#v}" --target aarch64-apple-darwin \
             --source-sha "$HANE_SOURCE_SHA"
+          # Apple Silicon requires signed executable code. Verify the completed
+          # app seal before adding the independent update inventory outside it.
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app"
 
-      # The bundle's trust is the Ed25519-signed inventory inside it; no Apple
-      # credential is involved. This step is the only macOS step that receives
-      # the update signing key.
+      # The bundle uses an ad-hoc code seal; update trust remains the independent
+      # Ed25519-signed inventory. This is the only macOS step that receives the
+      # update signing key.
       - name: Generate and sign macOS inventory
         shell: bash
         env:
@@ -383,12 +386,16 @@ jobs:
         run: |
           set -euo pipefail
           app="target/release/bundle/osx/Hane.app"
+          version="${RELEASE_TAG#v}"
+          sidecar="target/release/bundle/osx/Hane.app.update/${version}-${HANE_SOURCE_SHA}"
+          mkdir -p "$sidecar"
           python scripts/release_catalog.py macos-inventory \
-            --app "$app" --version "${RELEASE_TAG#v}" --source-sha "$HANE_SOURCE_SHA" \
+            --app "$app" --version "$version" --source-sha "$HANE_SOURCE_SHA" \
             --output "$RUNNER_TEMP/hane-install.json"
           python scripts/release_catalog.py sign --domain inventory \
-            --input "$RUNNER_TEMP/hane-install.json" --output "$app/Contents/Resources/hane-install.json.sig"
-          cp "$RUNNER_TEMP/hane-install.json" "$app/Contents/Resources/hane-install.json"
+            --input "$RUNNER_TEMP/hane-install.json" --output "$RUNNER_TEMP/hane-install.json.sig"
+          cp "$RUNNER_TEMP/hane-install.json" "$sidecar/hane-install.json"
+          cp "$RUNNER_TEMP/hane-install.json.sig" "$sidecar/hane-install.json.sig"
 
       # The bundle is copied byte for byte; nothing edits it afterwards.
       - name: Package macOS app zip
@@ -399,6 +406,7 @@ jobs:
           rm -rf "$staging"
           mkdir -p "$staging"
           ditto --norsrc --noextattr --noqtn --noacl "target/release/bundle/osx/Hane.app" "$staging/Hane.app"
+          ditto --norsrc --noextattr --noqtn --noacl "target/release/bundle/osx/Hane.app.update" "$staging/Hane.app.update"
           cp README.md "$staging/README.md"
           if [ -f LICENSE ]; then
             cp LICENSE "$staging/LICENSE"
@@ -417,12 +425,15 @@ jobs:
           mkdir -p "$verify"
           ditto -x -k hane-macos-arm64.zip "$verify"
           app="$verify/hane-macos-arm64/Hane.app"
+          sidecar="$verify/hane-macos-arm64/Hane.app.update/${version}-${HANE_SOURCE_SHA}"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "io.github.hide212131.hane"
-          # The inventory regenerated from the extracted files must equal the signed one.
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app"
+          # The inventory regenerated from the extracted app must equal the
+          # Ed25519-signed inventory in its external, version-bound sidecar.
           python scripts/release_catalog.py macos-inventory \
             --app "$app" --version "$version" --source-sha "$HANE_SOURCE_SHA" \
             --output "$RUNNER_TEMP/extracted-inventory.json"
-          cmp "$RUNNER_TEMP/extracted-inventory.json" "$app/Contents/Resources/hane-install.json"
+          cmp "$RUNNER_TEMP/extracted-inventory.json" "$sidecar/hane-install.json"
           rm -rf "$verify"
 
       - name: Upload portable build artifact
