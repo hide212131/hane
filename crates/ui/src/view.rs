@@ -128,6 +128,13 @@ const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const MAIN_MIN_WIDTH: f32 = 280.0;
 const SIDEBAR_RESIZER_WIDTH: f32 = 5.0;
+/// Narrowest settings content column worth keeping beside the settings
+/// navigation; below it the navigation stacks above the content.
+const SETTINGS_CONTENT_MIN_WIDTH: f32 = 360.0;
+
+fn settings_layout_is_narrow(viewport_width: f32, sidebar_width: f32) -> bool {
+    viewport_width - sidebar_width < SETTINGS_CONTENT_MIN_WIDTH
+}
 const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
 const SIDEBAR_TOOLBAR_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_GAP: f32 = 4.0;
@@ -3587,13 +3594,22 @@ impl EditorView {
             SettingsCategory::Connection => self.ai_settings_render(window, cx).into_any_element(),
             SettingsCategory::Prompts => self.ai_prompts_render(window, cx).into_any_element(),
         };
-        self.settings_screen_shell(body, cx)
+        let narrow = settings_layout_is_narrow(
+            f32::from(window.viewport_size().width),
+            self.sidebar_width,
+        );
+        self.settings_screen_shell(body, narrow, cx)
     }
 
     // Build the page before allocating the settings shell's style temporaries.
     // Both frames must not be live together on Windows' 1 MiB UI thread stack.
     #[inline(never)]
-    fn settings_screen_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_screen_shell(
+        &self,
+        body: gpui::AnyElement,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let view = cx.entity();
         let back = Button::new("settings-back")
             .icon(IconName::ArrowLeft)
@@ -3654,27 +3670,38 @@ impl EditorView {
         let root = div()
             .size_full()
             .flex()
-            .flex_row()
             .bg(rgb(self.theme.editor_background))
             .text_color(rgb(self.theme.foreground))
             .key_context("HaneEditor")
             .track_focus(&self.settings_focus_handle);
+        let root = if narrow { root.flex_col() } else { root.flex_row() };
         let sidebar = div()
             .id("settings-sidebar")
             .debug_selector(|| "settings-sidebar".to_owned())
-            .w(px(self.sidebar_width))
-            .h_full()
             .flex_none()
             .flex()
-            .flex_col()
             .gap_4()
             .px(px(16.0))
             .py(px(16.0))
-            .bg(rgb(self.theme.sidebar_background))
+            .bg(rgb(self.theme.sidebar_background));
+        // In a narrow window the navigation becomes a wrapping row above the
+        // content, so the content keeps the full width instead of being
+        // squeezed out of view beside a fixed-width column.
+        let sidebar = if narrow {
+            sidebar.w_full().flex_row().flex_wrap()
+        } else {
+            sidebar.w(px(self.sidebar_width)).h_full().flex_col()
+        };
+        let sidebar = sidebar
             .child(back)
             .child(general_tab)
             .child(ai_tab)
             .child(ai_prompts_tab);
+        let content = if narrow {
+            content.h_auto().min_h(px(0.0))
+        } else {
+            content
+        };
         install_action_listeners(root.child(sidebar).child(content), cx)
     }
 
@@ -3868,6 +3895,7 @@ impl EditorView {
         let card = |id: &'static str| {
             div()
                 .id(id)
+                .debug_selector(|| id.to_owned())
                 .w_full()
                 .px(px(16.0))
                 .py(px(14.0))
@@ -9044,6 +9072,39 @@ mod tests {
         cx.run_until_parked();
         assert!(!view.read_with(cx, |view, _| view.settings_open));
         assert!(cx.debug_bounds("editor-footer").is_some());
+    }
+
+    #[gpui::test]
+    fn narrow_settings_keep_general_controls_inside_the_window(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(279.0), px(600.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+
+        for id in [
+            "settings-theme-card",
+            "settings-autosave-card",
+        ] {
+            let bounds = cx
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("{id} must be laid out"));
+            assert!(bounds.left() >= px(0.0), "{id} clipped on the left");
+            assert!(
+                bounds.right() <= px(279.0),
+                "{id} must not be clipped past the right edge: {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_layout_stacks_only_when_content_would_be_squeezed() {
+        assert!(settings_layout_is_narrow(279.0, 240.0));
+        assert!(!settings_layout_is_narrow(900.0, 240.0));
     }
 
     #[test]
