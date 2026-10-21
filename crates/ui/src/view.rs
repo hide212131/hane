@@ -105,7 +105,7 @@ use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod inline_rename;
 pub(crate) mod input_routing;
 mod reading_mode;
-use reading_mode::{EditorMode, command_changes_text};
+use reading_mode::{EditorMode, ModeAnchor, command_changes_text};
 mod session_save;
 mod sidebar;
 mod sidebar_filter;
@@ -1078,6 +1078,14 @@ pub struct EditorView {
     /// Set by a zoom-changing gesture, consumed after the visible blocks have
     /// been remeasured for the new zoom. See `PendingZoomAnchor`.
     pending_zoom_anchor: Option<PendingZoomAnchor>,
+    /// Set by an editing/reading switch, consumed once the visible blocks are
+    /// measured under the new policy. Names a source row, so it can be refused
+    /// for any other document. See `ModeAnchor`.
+    pending_mode_anchor: Option<ModeAnchor>,
+    /// Bumped on every editing/reading switch. A background height snapshot
+    /// remembers the value it started under and is dropped (not its index) when
+    /// it differs, even if the mode itself is the same again.
+    mode_generation: u64,
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
@@ -1087,6 +1095,10 @@ pub struct EditorView {
     /// changes a row height (for example, an inactive zero-height code fence
     /// becoming editable).
     pending_caret_visibility_after_layout: bool,
+    /// How many times `render` asked for one more real frame to finish a
+    /// layout correction (anchor, caret or find visibility). Tests read it to
+    /// check that a correction ends and stops asking.
+    layout_followup_frames_requested: u64,
     /// Frames left to settle a "center the caret row" request on the caret's
     /// freshly measured row. The immediate scroll can only use the partial
     /// layout estimate; this corrects it once the row is drawn. Cleared by any
@@ -1796,8 +1808,11 @@ impl EditorView {
             wheel_zoom_animation: None,
             scroll_inertia: None,
             pending_zoom_anchor: None,
+            pending_mode_anchor: None,
+            mode_generation: 0,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
+            layout_followup_frames_requested: 0,
             pending_center_caret_frames: 0,
             center_window_line: None,
             retained_center_window: None,
@@ -2581,6 +2596,9 @@ impl EditorView {
         self.heights = HeightIndex::new(std::iter::repeat_n(self.line_height(), lines));
         self.height_blocks.clear();
         self.scroll_y = self.sessions.active().view_state().scroll_y;
+        // A switch's reading position belongs to the outgoing document; the
+        // incoming one keeps its saved scroll.
+        self.pending_mode_anchor = None;
         self.block_cache.clear();
         self.line_owners.clear();
         self.layout_cache.clear();
@@ -7243,20 +7261,24 @@ impl Render for EditorView {
         // for a soft-wrapped paragraph: the measured block height can differ by
         // several rows in the same frame. The next frame is notified below if
         // the corrected anchor changed which blocks should be visible.
+        // A mode switch is anchored on the source row instead (refused for any
+        // other document), against the layouts measured above.
+        let mode_anchor_applied = self.resolve_mode_anchor(&rendered, window, cx);
         let zoom_anchor_applied = self
             .pending_zoom_anchor
             .take()
-            .filter(|_| !self.heights.is_empty())
+            .filter(|_| !self.heights.is_empty() && !mode_anchor_applied)
             .map(|anchor| {
                 self.scroll_y = self.scroll_y_for_zoom_anchor(anchor);
                 true
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || mode_anchor_applied;
         if zoom_anchor_applied {
             // The visible block set was selected before measured heights were
             // installed. Ask GPUI for one more frame so virtualization and
             // spacers are recomputed from the corrected anchor position.
-            cx.notify();
+            self.request_layout_followup_frame(window, cx);
         }
         // Measuring wrapped rows can correct blocks above the viewport. Keep the
         // same block and the same position inside it at the top instead of
@@ -7308,22 +7330,29 @@ impl Render for EditorView {
                     self.viewport_height,
                 );
                 let visible_bottom = top + height + badge_height - self.scroll_y;
-                if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
-                    && self.scroll_y == before
-                {
+                let settled = visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE;
+                if settled && self.scroll_y == before {
                     self.pending_caret_visibility_after_layout = false;
-                } else {
+                } else if self.scroll_y == before && self.body_editable() {
+                    // Editing keeps the established behaviour (no new frame
+                    // is requested for an unmoved, unsettled request).
+                    cx.notify();
+                } else if self.scroll_y != before {
                     // Keep the request armed for one more frame whenever this
                     // correction moved the scroll. A following frame may apply
                     // the height anchor to newly measured rows; clearing here
                     // would let that anchor erase the badge clearance before
-                    // the caret has reached a stable layout.
-                    cx.notify();
-                }
-                if self.scroll_y != before {
-                    // The visible block set was selected before this corrected
-                    // position. One more frame lets virtualization follow it.
-                    cx.notify();
+                    // the caret has reached a stable layout. The visible block
+                    // set was also selected before the corrected position, so
+                    // the next frame lets virtualization follow it. `render`
+                    // cannot dirty the frame it is drawing, so an actual frame
+                    // is requested.
+                    self.request_layout_followup_frame(window, cx);
+                } else {
+                    // Reading, and the scroll can not move any further (the
+                    // end of the document): the request has nothing left to
+                    // improve, so it ends instead of asking for frames forever.
+                    self.pending_caret_visibility_after_layout = false;
                 }
             } else {
                 // The fresh disclosed row has not been laid out yet. Keep the
@@ -7395,15 +7424,16 @@ impl Render for EditorView {
                         self.viewport_height,
                     );
                     let visible_bottom = top + height - self.scroll_y;
-                    if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
-                        && self.scroll_y == before
-                    {
+                    let settled = visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE;
+                    if settled && self.scroll_y == before {
                         self.pending_find_visibility_after_layout = false;
+                    } else if self.scroll_y == before && self.body_editable() {
+                        cx.notify();
+                    } else if self.scroll_y != before {
+                        self.request_layout_followup_frame(window, cx);
                     } else {
-                        cx.notify();
-                    }
-                    if self.scroll_y != before {
-                        cx.notify();
+                        // Reading at a scroll limit: nothing more to correct.
+                        self.pending_find_visibility_after_layout = false;
                     }
                 }
                 Some(_) => {

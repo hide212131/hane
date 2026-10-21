@@ -172,6 +172,17 @@ impl EditorView {
         self.set_zoom(1.0, self.viewport_height / 2.0, cx);
     }
 
+    /// Asks for one more real frame from inside `render`. GPUI does not mark a
+    /// view dirty again for a `cx.notify()` made while that view is being drawn,
+    /// so a correction that needs another layout pass (a viewport the anchor,
+    /// caret or find fallback moved) has to schedule the frame itself.
+    pub(super) fn request_layout_followup_frame(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.layout_followup_frames_requested =
+            self.layout_followup_frames_requested.saturating_add(1);
+        cx.notify();
+        window.request_animation_frame();
+    }
+
     /// Resolves a `PendingZoomAnchor` captured before a zoom-driven height
     /// change back to the `scroll_y` that keeps the anchored item and
     /// fraction at the same `window_offset` now that `self.heights` reflects

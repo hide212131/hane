@@ -685,6 +685,63 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // ----- Reading mode (Issue #547, R04) -----
+
+    fn body_state(view: &TestView, cx: &mut TestCx) -> (String, Revision, bool) {
+        view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.sessions.active().is_dirty(),
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn reading_mode_keeps_filter_and_rename_input_selection_copy_and_paste(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = fixture_root("reading-r04");
+        let (view, cx) = open_routing_view(cx, "body-text\n", &root);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.set_editor_mode(EditorMode::Reading, window, cx));
+            });
+        });
+        cx.run_until_parked();
+        let body = body_state(&view, cx);
+
+        for surface in [Surface::Filter, Surface::Rename] {
+            match surface {
+                Surface::Filter => click_filter(cx),
+                Surface::Rename => begin_rename(&view, cx, &rename_path(&root)),
+                Surface::Body => unreachable!(),
+            }
+            let label = format!("{surface:?}");
+            // Real input through the OS text callbacks, UTF-16 ranges.
+            replace(&view, cx, None, TEXT);
+            assert_eq!(surface_text(&view, cx, surface), TEXT, "{label}");
+            // A non-empty selection made with the keyboard.
+            select_emoji_forward(cx);
+            assert_eq!(surface_selection(&view, cx, surface), 1..5, "{label}");
+            assert_eq!(query_selection(&view, cx), Some((1..3, false)), "{label}");
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
+            cx.simulate_keystrokes("secondary-c");
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("😀".to_owned()),
+                "{label}: Copy"
+            );
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("羽".to_owned()));
+            cx.simulate_keystrokes("secondary-v");
+            cx.run_until_parked();
+            assert_eq!(surface_text(&view, cx, surface), REPLACED, "{label}: Paste");
+            assert_eq!(body_state(&view, cx), body, "{label}: the body is untouched");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[gpui::test]
     fn body_utf16_range_replacement_maps_to_the_emoji_bytes(cx: &mut gpui::TestAppContext) {
         utf16_range_contract(cx, Surface::Body, "range-body");

@@ -2658,6 +2658,103 @@ mod tests {
     }
 
     #[gpui::test]
+    fn reading_mode_keeps_the_find_input_editable_and_searches_the_source(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let source = "[link](https://hidden.example/)\n\nA😀e\u{301}Z\n";
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(source, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.set_editor_mode(EditorMode::Reading, window, cx));
+                view.open_document_find(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let input = view
+            .read_with(cx, |view, _| view.document_find.input.clone())
+            .expect("find input is initialized by open_document_find");
+        assert!(view.read_with(cx, |view, _| view.document_find_input_is_focused()));
+        let body = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.sessions.active().is_dirty(),
+            )
+        });
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            cx.run_until_parked();
+        };
+
+        // Real text callbacks of the find input, with UTF-16 ranges.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    None,
+                    "A😀e\u{301}Z",
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.query_text, "A😀e\u{301}Z");
+            assert_eq!(view.document_find.matches.len(), 1);
+        });
+        // A non-empty (UTF-16 1..3) selection replaced by input.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    Some(1..3),
+                    "羽",
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.query_text, "A羽e\u{301}Z");
+            assert!(view.document_find.matches.is_empty());
+        });
+        // A hidden link target is matched in the source without opening it.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    Some(0..5),
+                    "hidden.example",
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.query_text, "hidden.example");
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert_eq!(view.editor_mode(), EditorMode::Reading);
+            assert_eq!(
+                (
+                    view.editor().document().full_text(),
+                    view.editor().document().revision(),
+                    view.sessions.active().is_dirty(),
+                ),
+                body,
+                "searching never changes the body"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn find_input_composition_blocks_reinvoking_the_shortcut_from_reselecting(
         cx: &mut gpui::TestAppContext,
     ) {

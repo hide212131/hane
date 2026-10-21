@@ -1941,6 +1941,144 @@ mod tests {
     }
 
     #[gpui::test]
+    fn reading_refuses_a_fresh_review_result_and_never_revives_an_old_reply(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("日本語の文章です\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        let open_popup = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    view.editor_mut()
+                        .set_selection(Selection {
+                            anchor: SourceOffset(0),
+                            active: SourceOffset("日本語".len()),
+                        })
+                        .unwrap();
+                    view.open_ai_selection(window, cx);
+                });
+            });
+            cx.run_until_parked();
+        };
+        let body = |view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                (
+                    view.editor().document().full_text(),
+                    view.editor().document().revision(),
+                    view.sessions.active().is_dirty(),
+                    view.editor().can_undo(),
+                )
+            })
+        };
+
+        // A review whose target is still fresh, reached while the body is
+        // read-only (the mode flag moves without the switch's popup close, as
+        // a result that was already in flight would find it): the write is
+        // refused on its own, not because a reset removed the popup.
+        open_popup(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                result: "改訂版".to_owned(),
+                unchanged: false,
+            };
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        let before = body(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.ai_selection.open);
+                assert!(view.ai_selection_target_is_fresh(view.ai_selection.target.unwrap()));
+                view.ai_selection_replace(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.ai_selection.message.as_deref(),
+                Some(AI_SELECTION_READING_MODE_MESSAGE)
+            );
+            assert!(view.ai_selection.open, "the refusal does not apply or discard");
+        });
+        assert_eq!(body(&view, cx), before, "nothing was written");
+        view.update(cx, |view, _| view.editor_mode = EditorMode::Editing);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.close_ai_selection(window, cx));
+        });
+        cx.run_until_parked();
+
+        // A request started in editing, the switch to reading closes it, and
+        // the editing mode comes back before the old reply arrives.
+        open_popup(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.request_generation = 3;
+            view.ai_selection.pending = Some(PendingRequest {
+                operation_id: OperationId(7),
+                generation: 3,
+            });
+            view.ai_selection.phase = AiSelectionPhase::Submitting;
+            cx.notify();
+        });
+        let before = body(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+            });
+        });
+        cx.run_until_parked();
+        // No explicit focus on the body here: the close itself returns it, so
+        // Copy reaches the body's selection.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
+        cx.simulate_keystrokes("secondary-c");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("日本語".to_owned()),
+            "Copy right after the switch copies the selection"
+        );
+        cx.update(|window, app| {
+            let view = view.read(app);
+            assert!(view.focus_handle.is_focused(window), "body focus is back");
+            assert!(!view.ai_selection_blocks_editor_keys());
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection().range()),
+            SourceRange::new(0, "日本語".len()),
+            "the selection survives"
+        );
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_selection.apply_outcome(
+                3,
+                OperationId(7),
+                Ok(TextTransformOutcome::Succeeded {
+                    text: "改訂版".to_owned(),
+                }),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.ai_selection.open, "the old reply does not reopen the popup");
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.ai_selection_replace(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(body(&view, cx), before, "the old reply cannot write or add history");
+    }
+
+    #[gpui::test]
     fn an_edit_after_opening_invalidates_the_pending_review_and_blocks_replace(
         cx: &mut gpui::TestAppContext,
     ) {

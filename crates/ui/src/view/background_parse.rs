@@ -40,6 +40,12 @@ impl EditorView {
         // while the job runs must not let them (or the disclosure they were
         // built for) come back afterwards.
         let mode = self.editor_mode;
+        // A switch also rebuilds every height for the then-current selection.
+        // An Editing -> Reading -> Editing round trip leaves the same mode but
+        // a different height basis than this job's `previous_height_disclosure`
+        // describes, so the heights of a job that started before it are
+        // dropped by generation (the source-only index is still kept).
+        let mode_generation = self.mode_generation;
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
         let previous_height_disclosure = self
@@ -61,6 +67,7 @@ impl EditorView {
                 .update(cx, |view, _| {
                     view.document_key() == key
                         && view.editor_mode == mode
+                        && view.mode_generation == mode_generation
                         && block_context_revision_is_current(
                             view.editor().document().revision(),
                             revision,
@@ -132,6 +139,20 @@ impl EditorView {
                     // for the current one instead of installing them.
                     view.resync_heights_for_current_disclosure();
                     view.schedule_document_parse(cx);
+                    cx.notify();
+                    return;
+                }
+                if view.mode_generation != mode_generation {
+                    // Back in the same mode after a round trip: the current
+                    // heights were rebuilt for the selection of that moment
+                    // (basis B), not the one this job's difference (D -> A)
+                    // starts from, and their offscreen fences and tables are
+                    // not touched by arithmetic `max`. Only the snapshot's
+                    // heights are dropped; the next job starts from the basis
+                    // that is applied now, so the difference stays valid.
+                    view.last_background_height_disclosure = None;
+                    view.schedule_document_parse(cx);
+                    view.ensure_active_disclosure_height();
                     cx.notify();
                     return;
                 }

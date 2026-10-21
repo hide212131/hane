@@ -28,6 +28,23 @@ impl EditorMode {
     }
 }
 
+/// The source row at the top of the viewport when the mode was switched, and
+/// the document it was read from. Unlike an ordinal and fraction it names the
+/// same text under either policy, and it is refused for any other document
+/// instance or revision.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ModeAnchor {
+    session: SessionId,
+    instance: DocumentInstance,
+    revision: Revision,
+    /// Start of the row that was at the top.
+    offset: SourceOffset,
+    /// How far the top edge was below that row's top.
+    inside_row: f32,
+    /// Frames spent waiting for the anchor's block to be drawn.
+    attempts: u8,
+}
+
 /// Whether `command` can change the document text (as opposed to moving or
 /// selecting). Undo and Redo count: they rewrite the body from history.
 pub(super) fn command_changes_text(command: &EditorCommand<'_>) -> bool {
@@ -136,12 +153,17 @@ impl EditorView {
     fn rebuild_presentation_for_mode_change(&mut self) {
         // The measured heights below are about to be replaced by estimates, and
         // a long wrapped line would be clamped to its estimated one-row height.
-        // Remember the position as a fraction of the block at the top of the
-        // viewport (kept if an earlier switch is still waiting for a frame);
-        // `render` resolves it once the visible blocks are measured again.
-        if self.pending_zoom_anchor.is_none() {
-            self.pending_zoom_anchor = self.zoom_anchor_at(0.0);
+        // Remember the position as the source row at the top of the viewport,
+        // read from the layouts that are still measured (kept if an earlier
+        // switch for this same document is still waiting for a frame);
+        // `render` resolves it against the new policy's layout.
+        if !self
+            .pending_mode_anchor
+            .is_some_and(|anchor| self.mode_anchor_is_current(&anchor))
+        {
+            self.pending_mode_anchor = self.capture_mode_anchor();
         }
+        self.mode_generation = self.mode_generation.wrapping_add(1);
         self.block_cache.clear();
         self.line_owners.clear();
         self.layout_cache.clear();
@@ -161,6 +183,111 @@ impl EditorView {
         let (granularity, _) = self.desired_layout();
         let heights = HeightIndex::new(self.item_heights());
         self.install_heights(granularity, heights);
+    }
+
+    /// Whether `anchor` still names the document it was read from: the same
+    /// session and instance (a tab, new document, reload or work-folder switch
+    /// changes one of them) at the same revision.
+    pub(super) fn mode_anchor_is_current(&self, anchor: &ModeAnchor) -> bool {
+        let id = self.sessions.active_id();
+        anchor.session == id
+            && self.document_instance(id) == Some(anchor.instance)
+            && anchor.revision == self.editor().document().revision()
+    }
+
+    /// The source row at the top of the viewport and how far into it the top
+    /// edge falls, from the layout that is measured right now. Reads one block
+    /// and its cached layout only; nothing is parsed or shaped.
+    fn capture_mode_anchor(&self) -> Option<ModeAnchor> {
+        if self.heights.is_empty() {
+            return None;
+        }
+        let document = self.editor().document();
+        let item = self.heights.block_at_y(self.scroll_y);
+        let local = (self.scroll_y - self.heights.prefix_sum(item)).max(0.0);
+        let (offset, inside_row) = match self.granularity {
+            Granularity::Lines => (document.line_range(LineId(item)).ok()?.start, local),
+            Granularity::Blocks => {
+                let block = self.current_index()?.block(item)?;
+                let measured = self
+                    .layout_cache
+                    .get(&block.id)
+                    .filter(|entry| {
+                        entry.is_valid(
+                            self.content_width,
+                            self.layout_font_revision,
+                            block.revision,
+                        )
+                    })
+                    .and_then(|entry| {
+                        let layout = &entry.layout;
+                        let row = layout.lines.get(layout.row_at_y(local)?)?;
+                        let row_top = layout.leading_space + row.y;
+                        Some((row.source_range.start, (local - row_top).clamp(0.0, row.height)))
+                    });
+                measured.unwrap_or((block.source_range.start, local))
+            }
+        };
+        let session = self.sessions.active_id();
+        Some(ModeAnchor {
+            session,
+            instance: self.document_instance(session)?,
+            revision: document.revision(),
+            offset,
+            inside_row,
+            attempts: 0,
+        })
+    }
+
+    /// Puts the remembered source row back at the top of the viewport, using
+    /// the rows `render` just measured under the new policy. Returns whether it
+    /// set `scroll_y` (the caller then skips the generic height anchor). An
+    /// anchor for another document or revision is dropped without touching the
+    /// scroll position. If the anchor's block was not drawn this frame, the
+    /// estimate is applied and the anchor is tried again for a few frames.
+    pub(super) fn resolve_mode_anchor(
+        &mut self,
+        rendered: &[(usize, VisualBlock, BlockLayout)],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        /// Frames an unmeasured anchor block is waited for.
+        const MAX_ATTEMPTS: u8 = 3;
+        let Some(mut anchor) = self.pending_mode_anchor.take() else {
+            return false;
+        };
+        if self.heights.is_empty() || !self.mode_anchor_is_current(&anchor) {
+            return false;
+        }
+        let measured = match self.granularity {
+            Granularity::Blocks => self
+                .current_index()
+                .and_then(|index| index.block_at(anchor.offset))
+                .and_then(|block| {
+                    let (_, _, layout) = rendered
+                        .iter()
+                        .find(|(ordinal, _, _)| *ordinal == block.ordinal)?;
+                    let (y, height) = layout.row_bounds_for_source(anchor.offset)?;
+                    Some(self.heights.prefix_sum(block.ordinal) + y + anchor.inside_row.min(height))
+                }),
+            Granularity::Lines => {
+                let top = self.scroll_for_offset(anchor.offset);
+                let item = self.heights.block_at_y(top);
+                let height = self.heights.height(item).unwrap_or(0.0);
+                Some(top + anchor.inside_row.min(height))
+            }
+        };
+        match measured {
+            Some(target) => self.scroll_y = target,
+            None if anchor.attempts < MAX_ATTEMPTS => {
+                self.scroll_y = self.scroll_for_offset(anchor.offset);
+                anchor.attempts += 1;
+                self.pending_mode_anchor = Some(anchor);
+            }
+            None => return false,
+        }
+        self.request_layout_followup_frame(window, cx);
+        true
     }
 
     /// The tab-row switch: an eye while editing, a pencil while reading. It sits
@@ -236,6 +363,67 @@ mod tests {
         cx.simulate_resize(gpui::size(px(width), px(height)));
         settle(cx);
         (view, cx)
+    }
+
+    fn requested_frames(view: &TestView, cx: &mut TestCx) -> u64 {
+        view.read_with(cx, |view, _| view.layout_followup_frames_requested)
+    }
+
+    /// Delivers the frames `render` asked for, at most `limit` of them, and
+    /// returns how many it took. The test platform never fires
+    /// `request_animation_frame` callbacks (the vendored gpui has no
+    /// `simulate_next_frame`), so a requested frame is delivered as the view
+    /// notification that callback makes. Frames are only delivered while the
+    /// request counter moved, so a view that stopped asking is not nudged.
+    /// `handled` is the counter value from before the action under test.
+    fn deliver_requested_frames(
+        view: &TestView,
+        cx: &mut TestCx,
+        mut handled: u64,
+        limit: usize,
+    ) -> usize {
+        let mut delivered = 0;
+        loop {
+            let now = requested_frames(view, cx);
+            if now == handled {
+                return delivered;
+            }
+            assert!(
+                delivered < limit,
+                "the layout correction asks for frames without converging ({delivered} delivered)"
+            );
+            handled = now;
+            delivered += 1;
+            view.update(cx, |_, cx| cx.notify());
+            settle(cx);
+        }
+    }
+
+    /// Switches the mode, then settles it, including the frames the switch's
+    /// own anchor resolution asks for.
+    fn toggle_and_settle(view: &TestView, cx: &mut TestCx) {
+        let mark = requested_frames(view, cx);
+        assert!(toggle(view, cx));
+        settle(cx);
+        deliver_requested_frames(view, cx, mark, 8);
+    }
+
+    /// The caret row is drawn on screen with its real coordinates.
+    fn assert_caret_row_on_screen(view: &TestView, cx: &mut TestCx, label: &str) {
+        view.read_with(cx, |view, _| {
+            let active = view.editor().selection().active;
+            let (top, height) = view
+                .source_offset_row_bounds(active)
+                .unwrap_or_else(|| panic!("{label}: the row is laid out"));
+            let tolerance = view.line_height();
+            assert!(
+                top + height >= view.scroll_y - tolerance
+                    && top <= view.scroll_y + view.viewport_height + tolerance,
+                "{label}: row {top}+{height} is outside the viewport at {} (+{})",
+                view.scroll_y,
+                view.viewport_height
+            );
+        });
     }
 
     fn toggle(view: &TestView, cx: &mut TestCx) -> bool {
@@ -462,15 +650,29 @@ mod tests {
             view.after_input(cx);
         });
         settle(cx);
+        let mark = requested_frames(&view, cx);
         assert!(toggle(&view, cx));
         settle(cx);
+        // The anchor resolution of the switch itself asks for frames.
+        deliver_requested_frames(&view, cx, mark, 8);
         assert!(view.read_with(cx, |view, _| view.scroll_y > 0.0));
 
         // DocumentStart lands on offset 0, the closed opening fence row.
+        let mark = requested_frames(&view, cx);
         view.update(cx, |view, cx| {
             view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
         });
         settle(cx);
+        // The helper returns only once a delivered frame asked for nothing more.
+        deliver_requested_frames(&view, cx, mark, 6);
+        let settled_requests = requested_frames(&view, cx);
+        settle(cx);
+        assert_eq!(
+            requested_frames(&view, cx),
+            settled_requests,
+            "no further frame is asked for once the request is consumed"
+        );
+        assert_caret_row_on_screen(&view, cx, "closed opening fence");
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection().active, SourceOffset(0));
             assert!(
@@ -496,13 +698,23 @@ mod tests {
         });
         settle(cx);
         for extend in [false, true, false, true] {
+            let mark = requested_frames(&view, cx);
             view.update(cx, |view, cx| {
                 view.dispatch(EditorCommand::MoveDown { extend }, cx);
             });
             settle(cx);
+            deliver_requested_frames(&view, cx, mark, 6);
             view.read_with(cx, |view, _| {
                 assert!(!view.pending_caret_visibility_after_layout, "extend={extend}");
             });
+            assert_caret_row_on_screen(&view, cx, "table or code row");
+            let settled_requests = requested_frames(&view, cx);
+            settle(cx);
+            assert_eq!(
+                requested_frames(&view, cx),
+                settled_requests,
+                "extend={extend}: no frame is requested after the request ended"
+            );
         }
         assert_eq!(
             view.read_with(cx, |view, _| view.editor_mode()),
@@ -588,10 +800,8 @@ mod tests {
         let before = view.read_with(cx, |view, _| view.scroll_y);
         assert!(before > viewport, "scrolled into the middle of the line");
         for _ in 0..2 {
-            assert!(toggle(&view, cx));
-            settle(cx);
-            assert!(toggle(&view, cx));
-            settle(cx);
+            toggle_and_settle(&view, cx);
+            toggle_and_settle(&view, cx);
             view.read_with(cx, |view, _| {
                 assert!(
                     (view.scroll_y - before).abs() <= view.line_height() * 1.5,
@@ -600,6 +810,240 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[gpui::test]
+    fn a_wrapped_fence_info_hidden_by_reading_keeps_the_same_source_at_the_top(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let info = "info ".repeat(120);
+        let mut source = String::new();
+        for n in 0..20 {
+            source.push_str(&format!("before {n:02}\n\n"));
+        }
+        let fence = source.len();
+        source.push_str(&format!("```{info}\nfirst code\nsecond code\nthird code\n```\n\n"));
+        for n in 0..20 {
+            source.push_str(&format!("after {n:02}\n\n"));
+        }
+        let info_last = SourceOffset(fence + 3 + info.len() - 2);
+        let first_code = SourceOffset(fence + 3 + info.len() + 1);
+        let (view, cx) = open_view(cx, &source, 400.0, 400.0);
+        // The caret inside the opening line keeps the fence, with its long
+        // wrapped info, open while editing.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(fence + 3)))
+                .unwrap();
+            view.after_input(cx);
+        });
+        settle(cx);
+        view.update(cx, |view, cx| {
+            let ordinal = view
+                .current_index()
+                .and_then(|index| index.block_at(SourceOffset(fence)))
+                .expect("fence block")
+                .ordinal;
+            view.scroll_y = view.heights.prefix_sum(ordinal);
+            cx.notify();
+        });
+        settle(cx);
+        // Put the top edge in the middle of the last wrapped info row.
+        let (block_top, row_top, row_height) = view.read_with(cx, |view, _| {
+            let ordinal = view
+                .current_index()
+                .and_then(|index| index.block_at(SourceOffset(fence)))
+                .expect("fence block")
+                .ordinal;
+            let (top, height) = view
+                .source_offset_row_bounds(info_last)
+                .expect("the info row is laid out");
+            (view.heights.prefix_sum(ordinal), top, height)
+        });
+        assert!(
+            row_top > block_top + row_height * 2.0,
+            "the info wraps over several rows ({row_top} in the block at {block_top})"
+        );
+        view.update(cx, |view, cx| {
+            view.scroll_y = row_top + row_height * 0.5;
+            cx.notify();
+        });
+        settle(cx);
+        let selection = view.read_with(cx, |view, _| view.editor().selection());
+
+        toggle_and_settle(&view, cx);
+        view.read_with(cx, |view, _| {
+            let (first_top, _) = view
+                .source_offset_row_bounds(first_code)
+                .expect("the first code row is laid out");
+            assert!(
+                (view.scroll_y - first_top).abs() <= view.line_height() * 0.5,
+                "the hidden info rows resolve to the next visible source row: {} vs {first_top}",
+                view.scroll_y
+            );
+            assert_eq!(view.editor().selection(), selection);
+        });
+    }
+
+    #[gpui::test]
+    fn a_switch_does_not_carry_its_position_into_another_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long: String = (0..200).map(|n| format!("line {n:03}\n")).collect();
+        let (view, cx) = open_view(cx, &long, 800.0, 400.0);
+        let (first, second) = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            let second = view.sessions.open_untitled(&long, "B.md");
+            // Whether or not opening activates it, start on the first one.
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            assert!(view.activate_session(second, cx));
+            (first, second)
+        });
+        settle(cx);
+        view.update(cx, |view, cx| {
+            view.scroll_y = 120.0;
+            view.activate_session(first, cx);
+        });
+        settle(cx);
+        // Scroll the first document into the middle, keep a selection there.
+        let middle = long.find("line 120").unwrap();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(middle)))
+                .unwrap();
+            view.scroll_y = 2_000.0;
+            cx.notify();
+        });
+        settle(cx);
+        let first_selection = view.read_with(cx, |view, _| view.editor().selection());
+
+        // Tab switch in the same event cycle as the mode switch.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+                assert!(view.pending_mode_anchor.is_some());
+                view.activate_session(second, cx);
+                assert!(view.pending_mode_anchor.is_none());
+            });
+        });
+        let mark = requested_frames(&view, cx);
+        settle(cx);
+        deliver_requested_frames(&view, cx, mark, 8);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), second);
+            assert!(
+                (view.scroll_y - 120.0).abs() <= view.line_height(),
+                "the incoming document keeps its saved scroll: {}",
+                view.scroll_y
+            );
+            assert_eq!(
+                view.sessions.get(second).map(|session| session.view_state().scroll_y),
+                Some(120.0)
+            );
+            assert_eq!(
+                view.sessions.get(first).map(|session| session.editor().selection()),
+                Some(first_selection)
+            );
+        });
+
+        // A replaced document (new document, reload) in the same cycle as the
+        // switch back to editing.
+        view.update(cx, |view, cx| {
+            view.scroll_y = 2_000.0;
+            cx.notify();
+        });
+        settle(cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+                assert!(view.pending_mode_anchor.is_some());
+                view.sessions
+                    .active_mut()
+                    .set_view_state(SessionViewState { scroll_y: 60.0 });
+                view.on_document_replaced();
+                assert!(view.pending_mode_anchor.is_none());
+                cx.notify();
+            });
+        });
+        let mark = requested_frames(&view, cx);
+        settle(cx);
+        deliver_requested_frames(&view, cx, mark, 8);
+        view.read_with(cx, |view, _| {
+            assert!(
+                (view.scroll_y - 60.0).abs() <= view.line_height(),
+                "the replacement keeps its saved scroll: {}",
+                view.scroll_y
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_background_snapshot_on_another_basis_does_not_leave_selection_only_heights(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source: String = (0..60).map(|n| format!("```\ncode{n:02}\n```\n\n")).collect();
+        let at = |n: usize| SourceOffset(source.find(&format!("code{n:02}")).unwrap());
+        let (view, cx) = open_view(cx, &source, 800.0, 400.0);
+        let select = |view: &TestView, cx: &mut TestCx, from: usize, to: usize| {
+            view.update(cx, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: at(from),
+                        active: at(to),
+                    })
+                    .unwrap();
+                view.after_input(cx);
+            });
+        };
+        // D (the caret) -> A starts a job that has not run yet.
+        select(&view, cx, 5, 25);
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.document_parse_job_running));
+        // Reading with selection B, then back: every height is based on B.
+        assert!(toggle(&view, cx));
+        select(&view, cx, 30, 50);
+        assert!(toggle(&view, cx));
+        cx.run_until_parked();
+        // The selection returns to A before the old job completes.
+        select(&view, cx, 5, 25);
+        for _ in 0..4 {
+            settle(cx);
+        }
+        view.read_with(cx, |view, _| {
+            let document = view.editor().document();
+            let index = view.current_index().expect("formal index");
+            let expected = block_heights_with_disclosure(
+                document,
+                index,
+                view.line_height(),
+                view.active_height_disclosure(),
+            );
+            let collapsed =
+                block_heights_with_disclosure(document, index, view.line_height(), None);
+            for n in 38..48 {
+                let ordinal = index.ordinal_at(at(n)).expect("fence block");
+                assert!(
+                    (expected[ordinal] - collapsed[ordinal]).abs() < 0.01,
+                    "fence {n} is outside the final selection"
+                );
+                let height = view.heights.height(ordinal).unwrap();
+                assert!(
+                    (height - expected[ordinal]).abs() < 0.01,
+                    "fence {n} only B opened is closed again: {height} vs {}",
+                    expected[ordinal]
+                );
+            }
+            for n in 10..20 {
+                let ordinal = index.ordinal_at(at(n)).expect("fence block");
+                let height = view.heights.height(ordinal).unwrap();
+                assert!(
+                    height >= expected[ordinal] - 0.01,
+                    "fence {n} inside A stays open: {height} vs {}",
+                    expected[ordinal]
+                );
+            }
+        });
     }
 
     #[gpui::test]
@@ -721,6 +1165,186 @@ mod tests {
         });
         assert_eq!(snapshot(&view, cx), before);
         assert!(view.read_with(cx, |view, _| view.editor().ime().is_none()));
+    }
+
+    /// The state a refused switch must leave alone.
+    fn composition_state(
+        view: &TestView,
+        cx: &mut TestCx,
+    ) -> (String, Option<std::ops::Range<usize>>, Selection, bool) {
+        let marked = cx.update(|window, app| {
+            view.update(app, |view, cx| view.marked_text_range(window, cx))
+        });
+        view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                marked,
+                view.editor().selection(),
+                view.editor().ime().is_some(),
+            )
+        })
+    }
+
+    fn press_switch_button(view: &TestView, cx: &mut TestCx) {
+        let point = cx
+            .debug_bounds("reading-mode-toggle")
+            .expect("the switch is painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let _ = view;
+    }
+
+    fn body_is_focused(view: &TestView, cx: &mut TestCx) -> bool {
+        cx.update(|window, app| view.read(app).focus_handle.is_focused(window))
+    }
+
+    #[gpui::test]
+    fn pressing_the_disabled_switch_during_a_real_body_composition_changes_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, "hello\n", 800.0, 400.0);
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("the first row is painted")
+            .center();
+        cx.simulate_click(row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(body_is_focused(&view, cx));
+
+        for (label, commit) in [("commit", true), ("cancel", false)] {
+            // A composition started through the real input handler.
+            let started = if commit { "に" } else { "き" };
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    view.replace_and_mark_text_in_range(None, started, Some(1..1), window, cx);
+                });
+            });
+            settle(cx);
+            assert!(view.read_with(cx, |view, _| view.editor_mode_switch_blocked()));
+            let before = composition_state(&view, cx);
+            assert!(before.3 && before.1.is_some(), "{label}: composing");
+
+            press_switch_button(&view, cx);
+            assert!(body_is_focused(&view, cx), "{label}: focus stays in the body");
+            assert_eq!(composition_state(&view, cx), before, "{label}: nothing changed");
+            assert_eq!(
+                view.read_with(cx, |view, _| view.editor_mode()),
+                EditorMode::Editing,
+                "{label}"
+            );
+
+            // The end of the composition through the real handler / key.
+            if commit {
+                cx.update(|window, app| {
+                    view.update(app, |view, cx| view.unmark_text(window, cx));
+                });
+            } else {
+                cx.simulate_keystrokes("escape");
+            }
+            settle(cx);
+            let after = composition_state(&view, cx);
+            assert!(!after.3 && after.1.is_none(), "{label}: composition ended");
+            assert_eq!(
+                after.0.contains(started),
+                commit,
+                "{label}: the text is kept on commit and removed on cancel"
+            );
+            assert!(body_is_focused(&view, cx), "{label}");
+
+            // Now the switch works, and returns to editing for the next round.
+            press_switch_button(&view, cx);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.editor_mode()),
+                EditorMode::Reading,
+                "{label}: the switch is available after the composition"
+            );
+            press_switch_button(&view, cx);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.editor_mode()),
+                EditorMode::Editing,
+                "{label}"
+            );
+            cx.simulate_click(row, gpui::Modifiers::none());
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    fn the_switch_is_reachable_and_big_enough_with_many_long_named_tabs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, "body\n", 320.0, 240.0);
+        view.update(cx, |view, cx| {
+            for index in 0..8 {
+                view.sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            cx.notify();
+        });
+        settle(cx);
+        let check_layout = |cx: &mut TestCx, label: &str| {
+            let button = cx
+                .debug_bounds("reading-mode-toggle")
+                .unwrap_or_else(|| panic!("{label}: the switch is painted"));
+            let tabs = cx
+                .debug_bounds("file-tabs")
+                .unwrap_or_else(|| panic!("{label}: the tab area is painted"));
+            let strip = cx
+                .debug_bounds("file-tab-strip")
+                .unwrap_or_else(|| panic!("{label}: the tab strip is painted"));
+            assert!(f32::from(button.size.width) >= 24.0, "{label}: hit width");
+            assert!(f32::from(button.size.height) >= 24.0, "{label}: hit height");
+            // `file-tabs` is the whole header row; the strip is the part that
+            // scrolls. The switch sits outside the strip and inside the row.
+            assert!(
+                button.left() >= strip.right() - px(0.5) || button.right() <= strip.left() + px(0.5),
+                "{label}: the switch does not overlap the tab strip ({button:?} vs {strip:?})"
+            );
+            assert!(
+                button.left() >= tabs.left()
+                    && button.right() <= tabs.right() + px(0.5)
+                    && button.top() >= tabs.top()
+                    && button.bottom() <= tabs.bottom() + px(0.5),
+                "{label}: the switch is inside the header ({button:?} vs {tabs:?})"
+            );
+            assert!(tabs.right() <= px(320.5), "{label}: the header fits the window");
+            (button, strip)
+        };
+        let (button_before, _) = check_layout(cx, "before scrolling");
+
+        // Scroll the tab strip sideways: the switch stays where it is.
+        let strip = cx.debug_bounds("file-tab-strip").expect("strip painted");
+        cx.simulate_event(ScrollWheelEvent {
+            position: strip.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x < px(0.0)));
+        let (button_after, _) = check_layout(cx, "after scrolling");
+        assert_eq!(button_before, button_after, "the switch is fixed");
+
+        // A real click on it works and neither moves the tab nor the focus
+        // away from the body.
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("the first row is painted")
+            .center();
+        cx.simulate_click(row, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(body_is_focused(&view, cx));
+        let active = view.read_with(cx, |view, _| view.sessions.active_id());
+        let selection = view.read_with(cx, |view, _| view.editor().selection());
+        press_switch_button(&view, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor_mode(), EditorMode::Reading);
+            assert_eq!(view.sessions.active_id(), active);
+            assert_eq!(view.editor().selection(), selection);
+        });
+        assert!(body_is_focused(&view, cx), "the body keeps focus");
     }
 
     #[gpui::test]
