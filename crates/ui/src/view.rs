@@ -21275,17 +21275,24 @@ mod tests {
             view.update(app, |view, cx| view.open_content_search(window, cx));
         });
         cx.run_until_parked();
-        view.update(cx, |view, _| view.content_search.query_text = "alpha".to_owned());
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.set_content_search_query_for_test("alpha", window, cx)
+            });
+        });
         cx.update(|window, app| {
             view.update(app, |view, cx| view.toggle_sidebar(window, cx));
         });
         cx.run_until_parked();
-        view.read_with(cx, |view, _| {
+        view.read_with(cx, |view, app| {
             assert!(view.sidebar_collapsed);
             assert!(!view.content_search_input_is_focused());
             assert!(!view.content_search_results_focused());
             assert!(view.content_search_sidebar_visible());
-            assert_eq!(view.content_search.query_text, "alpha");
+            assert_eq!(
+                view.content_search_query_for_test(app),
+                ("alpha".to_owned(), "alpha".to_owned())
+            );
         });
         cx.update(|window, app| {
             view.update(app, |view, cx| view.open_content_search(window, cx));
