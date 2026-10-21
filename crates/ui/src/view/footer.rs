@@ -452,7 +452,9 @@ impl EditorView {
         let notice = self.status.clone();
         let (total, selected) = self.footer_char_counts();
         let ai_enabled = self.ai_selection_entry_available();
-        let show_settings = self.work_folder.is_none();
+        // The panel's own settings entry is gone while the panel is hidden
+        // (Issue #549), so the footer offers it again.
+        let show_settings = self.work_folder.is_none() || !self.sidebar_shown();
         let zoom = self.zoom;
 
         let full_count = match selected {

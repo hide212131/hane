@@ -143,6 +143,14 @@ const SIDEBAR_FILTER_GAP: f32 = 4.0;
 const SIDEBAR_SETTINGS_HEIGHT: f32 = 36.0;
 const SIDEBAR_SETTINGS_GAP: f32 = 4.0;
 const SIDEBAR_PADDING: f32 = 8.0;
+/// The side panel's open/close button: a 32px square holding a 20px icon,
+/// 8px from the left of the window and (centered in the 40px row) 4px from
+/// the top, whether it sits in the panel or in the editor header.
+const SIDEBAR_TOGGLE_BUTTON_SIZE: f32 = 32.0;
+const SIDEBAR_TOGGLE_ICON_SIZE: f32 = 20.0;
+const SIDEBAR_TOGGLE_LEFT: f32 = 8.0;
+/// The fixed row above the panel that holds the toggle while it is shown.
+const SIDEBAR_TOGGLE_ROW_HEIGHT: f32 = 40.0;
 const SIDEBAR_ROW_HORIZONTAL_PADDING: f32 = 4.0;
 /// How often `_date_badge_refresh_task` re-observes the local calendar date
 /// for the sidebar's file-name badges. Short enough that a window left open
@@ -869,6 +877,10 @@ pub struct EditorView {
     inline_rename_swallowed_input: std::rc::Rc<std::cell::Cell<bool>>,
     /// User-adjustable width of the work-folder sidebar.
     sidebar_width: f32,
+    /// Whether the left side panel is hidden by the open/close button or
+    /// Command/Ctrl+B (Issue #549). Window-local and never persisted; every
+    /// other sidebar state is kept while it is hidden.
+    sidebar_collapsed: bool,
     /// Active drag of the vertical divider between sidebar and editor.
     sidebar_resize_drag: Option<SidebarResizeDrag>,
     /// Native scroll state for the work-folder list; a custom thumb mirrors it.
@@ -1737,6 +1749,7 @@ impl EditorView {
             inline_rename: None,
             inline_rename_swallowed_input,
             sidebar_width: theme.sidebar_width,
+            sidebar_collapsed: false,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
             file_tabs_scroll: ScrollHandle::new(),
@@ -1937,6 +1950,9 @@ impl EditorView {
                 let root = work_folder.root().to_path_buf();
                 let initial_session = self.sessions.active_id();
                 self.work_folder = Some(work_folder);
+                // A work folder that opened successfully is shown even if the
+                // side panel was hidden before (Issue #549).
+                self.sidebar_collapsed = false;
 
                 // A recovery failure must not look like the drafts were
                 // simply gone: `OsDraftStore::recover` already keeps
@@ -7103,7 +7119,7 @@ impl Render for EditorView {
         // its width out of the same window, so it must be subtracted here too,
         // not just in the element tree, or wrapping would be computed for a
         // column wider than what is actually drawn.
-        let sidebar_visible = self.work_folder.is_some() || self.content_search_sidebar_visible();
+        let sidebar_visible = self.sidebar_shown();
         let sidebar_width = if sidebar_visible {
             self.sidebar_width + SIDEBAR_RESIZER_WIDTH
         } else {
@@ -7903,6 +7919,10 @@ impl EditorView {
             .text_color(rgb(self.theme.tab_bar_foreground))
             .border_b_1()
             .border_color(rgb(self.theme.tab_bar_border))
+            // While the side panel is hidden its toggle sits here, at the same
+            // left 8px / top 4px as inside the panel. It is a sibling of the
+            // tab strip so a press on it never reaches the body handlers.
+            .children(self.sidebar_toggle_in_header(cx))
             .child(self.file_menu_button(cx))
             .child(tab_strip)
     }
@@ -21151,6 +21171,194 @@ mod tests {
         cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
         cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
+    }
+
+    fn sidebar_toggle_key() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-b"
+        } else {
+            "ctrl-b"
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_toggle_button_and_key_hide_and_restore_the_panel_keeping_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("sidebar-toggle-state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        std::fs::write(root.join("Beta.md"), "# Beta\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+        view.update(cx, |view, cx| {
+            view.sidebar_width = 200.0;
+            view.sidebar_filter = ShortTextInput::new("Al".to_owned());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        let shown = cx.debug_bounds("sidebar-toggle").expect("toggle in panel");
+        assert_eq!(shown.origin, point(px(8.0), px(4.0)));
+        assert_eq!(shown.size, gpui::size(px(32.0), px(32.0)));
+        let (generation, left) = view.read_with(cx, |view, _| {
+            assert_eq!(view.main_column_left, 200.0 + SIDEBAR_RESIZER_WIDTH);
+            (view.work_folder_generation, view.main_column_left)
+        });
+
+        // Click hides the panel and its resizer; the toggle moves to the
+        // header at the same left 8px / top 4px.
+        cx.simulate_mouse_down(shown.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(shown.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_collapsed);
+            assert_eq!(view.main_column_left, 0.0);
+            assert!(view.sidebar_resize_drag.is_none());
+        });
+        assert!(cx.debug_bounds("sidebar-list").is_none());
+        assert_eq!(cx.debug_bounds("sidebar-toggle"), Some(shown));
+        // The panel's settings entry is gone, so the footer offers it.
+        assert!(
+            cx.debug_bounds("footer-settings").is_some()
+                || cx.debug_bounds("footer-more").is_some()
+        );
+
+        // The key restores it without a rescan or reopen.
+        focus_body_for_key_dispatch(cx);
+        cx.simulate_keystrokes(sidebar_toggle_key());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_collapsed);
+            assert_eq!(view.main_column_left, left);
+            assert_eq!(view.sidebar_width, 200.0);
+            assert_eq!(view.sidebar_filter.text(), "Al");
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_some());
+        });
+        assert_eq!(cx.debug_bounds("sidebar-toggle"), Some(shown));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_toggle_from_the_filter_returns_input_to_the_body_and_keeps_content_search(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("sidebar-toggle-focus");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        // Filter focus is released when the filter is hidden.
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_collapsed);
+            assert!(!view.sidebar_filter_focused);
+            assert!(matches!(
+                view.input_target(),
+                crate::view::input_routing::InputTarget::Body
+            ));
+        });
+
+        // Content search keeps its mode and query while hidden, and the
+        // search key shows the panel again.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| view.content_search.query_text = "alpha".to_owned());
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_collapsed);
+            assert!(!view.content_search_input_is_focused());
+            assert!(!view.content_search_results_focused());
+            assert!(view.content_search_sidebar_visible());
+            assert_eq!(view.content_search.query_text, "alpha");
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_content_search(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_collapsed);
+            assert!(view.content_search_input_is_focused());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_toggle_is_a_no_op_during_rename_ime_and_without_a_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A lone file has no panel to open or close.
+        cx.update(crate::actions::register_key_bindings);
+        let (lone, lone_cx) =
+            cx.add_window_view(|_, cx| EditorView::new("lone\n", "Untitled", cx));
+        lone_cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        lone_cx.run_until_parked();
+        focus_body_for_key_dispatch(lone_cx);
+        lone_cx.simulate_keystrokes(sidebar_toggle_key());
+        lone_cx.run_until_parked();
+        lone.read_with(lone_cx, |view, _| assert!(!view.sidebar_collapsed));
+        assert!(lone_cx.debug_bounds("sidebar-toggle").is_none());
+
+        let root = draft_test_root("sidebar-toggle-noop");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+        focus_body_for_key_dispatch(cx);
+
+        // Renaming (including one waiting for its result) blocks the toggle
+        // before any blur or visibility change.
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                input: short_text_input_with("abcdef", 3..3, false),
+                fixed_extension: Some(".md".to_owned()),
+                pending: true,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_collapsed);
+            assert!(view.inline_rename_active());
+        });
+
+        // An unconfirmed filter composition is kept too.
+        view.update(cx, |view, cx| {
+            view.inline_rename = None;
+            view.sidebar_filter_focused = true;
+            view.sidebar_filter.replace_and_mark(None, "か", None);
+            cx.notify();
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_collapsed);
+            assert!(view.sidebar_filter_focused);
+            assert!(view.sidebar_filter_has_composition());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[gpui::test]

@@ -133,18 +133,173 @@ impl EditorView {
         label
     }
 
-    /// The folder/file tree for the sidebar, when this window was opened onto
-    /// a work folder. File and folder rows reserve the same disclosure slot,
-    /// so their file/folder icons line up and a folder does not shift when its
-    /// disclosure icon changes direction.
+    /// Whether there is a side panel to show at all: a work folder is open or
+    /// the content-search panel is active. A lone file has no panel, so the
+    /// toggle is a no-op there instead of creating an empty one.
+    pub(super) fn sidebar_panel_available(&self) -> bool {
+        self.work_folder.is_some() || self.content_search_sidebar_visible()
+    }
+
+    /// Whether the panel is drawn now. Render, width, `main_column_left`,
+    /// `content_width` and the footer width all read this one answer.
+    pub(super) fn sidebar_shown(&self) -> bool {
+        self.sidebar_panel_available() && !self.sidebar_collapsed
+    }
+
+    /// Whether the toggle must leave everything as it is: an IME composition
+    /// or a rename (running, or waiting for its result) would be lost or
+    /// confused by moving focus or hiding the field.
+    fn sidebar_toggle_blocked(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.settings_open
+            || self.ai_selection_blocks_editor_keys()
+            || self.tab_close_confirm.is_some()
+            || self.inline_rename_active()
+            || self.editor().ime().is_some()
+            || self.sidebar_filter_has_composition()
+            || self.content_search_input_is_composing(window, cx)
+            || self.document_find_input_is_composing(window, cx)
+    }
+
+    /// Opens or closes the left side panel from the button or Command/Ctrl+B.
+    /// Only visibility changes: the work folder, search state, widths,
+    /// scrolls and the document are untouched, and nothing is scanned,
+    /// searched, loaded or saved.
+    pub(crate) fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Checked before any blur, focus move or visibility change.
+        if self.sidebar_toggle_blocked(window, cx) || !self.sidebar_panel_available() {
+            return;
+        }
+        if self.sidebar_collapsed {
+            self.sidebar_collapsed = false;
+            cx.notify();
+            return;
+        }
+        let hidden_input_focused = self.sidebar_filter_focused
+            || self.content_search_input_is_focused()
+            || self.content_search_results_focused();
+        self.sidebar_collapsed = true;
+        self.sidebar_resize_drag = None;
+        self.sidebar_scrollbar_drag = None;
+        self.sidebar_context_menu = None;
+        self.blur_sidebar_filter(cx);
+        self.blur_content_search_focus(cx);
+        self.sidebar_keyboard_focus = false;
+        if hidden_input_focused {
+            // The hidden filter/search input may hold the real GPUI focus;
+            // hand it back to the body so typing reaches the document.
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// The shared open/close button: 32px square with a 20px icon. The
+    /// tooltip names the action the current state would perform and its key.
+    fn sidebar_toggle_button(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let label = if self.sidebar_shown() {
+            "サイドパネルを閉じる"
+        } else {
+            "サイドパネルを開く"
+        };
+        let key = if cfg!(target_os = "macos") {
+            "⌘B"
+        } else {
+            "Ctrl+B"
+        };
+        let view = cx.entity();
+        div()
+            .debug_selector(|| "sidebar-toggle".to_owned())
+            .w(px(SIDEBAR_TOGGLE_BUTTON_SIZE))
+            .h(px(SIDEBAR_TOGGLE_BUTTON_SIZE))
+            .flex_none()
+            .child(
+                Button::new("sidebar-toggle")
+                    .ghost()
+                    .w_full()
+                    .h_full()
+                    .tooltip(format!("{label} ({key})"))
+                    .accessibility_label(label)
+                    .child(
+                        gpui::svg()
+                            .path(icons::ICON_SIDEBAR)
+                            .flex_none()
+                            .w(px(SIDEBAR_TOGGLE_ICON_SIZE))
+                            .h(px(SIDEBAR_TOGGLE_ICON_SIZE))
+                            .text_color(rgb(self.theme.sidebar_foreground)),
+                    )
+                    .on_click(move |_, window, app| {
+                        view.update(app, |view, cx| view.toggle_sidebar(window, cx));
+                    }),
+            )
+    }
+
+    /// The toggle shown in the editor header while the panel is hidden. It
+    /// is `None` when there is no panel to open or the panel shows its own.
+    pub(super) fn sidebar_toggle_in_header(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        (self.sidebar_panel_available() && self.sidebar_collapsed).then(|| {
+            div()
+                .flex_none()
+                .ml(px(SIDEBAR_TOGGLE_LEFT))
+                .child(self.sidebar_toggle_button(cx))
+        })
+    }
+
+    /// The left side panel with its fixed 40px toggle row on top. The
+    /// existing panel gets the remaining height, so its internal list and
+    /// scrollbar coordinates stay local to it.
     pub(super) fn work_folder_sidebar(
         &self,
         sidebar_viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
-        if self.content_search_sidebar_visible() {
-            return Some(self.content_search_sidebar(sidebar_viewport_height, cx));
+        if !self.sidebar_shown() {
+            return None;
         }
+        let panel_height = (sidebar_viewport_height - SIDEBAR_TOGGLE_ROW_HEIGHT).max(0.0);
+        let panel = if self.content_search_sidebar_visible() {
+            self.content_search_sidebar(panel_height, cx)
+        } else {
+            self.work_folder_files_sidebar(panel_height, cx)?
+        };
+        let toggle_row = div()
+            .id("sidebar-toggle-row")
+            .h(px(SIDEBAR_TOGGLE_ROW_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl(px(SIDEBAR_TOGGLE_LEFT))
+            .child(self.sidebar_toggle_button(cx));
+        Some(
+            div()
+                .id("work-folder-column")
+                .flex_none()
+                .w(px(self.sidebar_width))
+                .h_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(rgb(self.theme.sidebar_background))
+                .child(toggle_row)
+                .child(
+                    div()
+                        .id("work-folder-panel-frame")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .child(panel),
+                ),
+        )
+    }
+
+    /// The folder/file tree for the sidebar, when this window was opened onto
+    /// a work folder. File and folder rows reserve the same disclosure slot,
+    /// so their file/folder icons line up and a folder does not shift when its
+    /// disclosure icon changes direction.
+    fn work_folder_files_sidebar(
+        &self,
+        sidebar_viewport_height: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         let work_folder = self.work_folder.as_ref()?;
         let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();

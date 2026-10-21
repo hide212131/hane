@@ -21,6 +21,9 @@ pub const ICON_CHEVRON_RIGHT: &str = "icons/work-folder/chevron-right.svg";
 /// Expanded folder disclosure chevron.
 pub const ICON_CHEVRON_DOWN: &str = "icons/work-folder/chevron-down.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
+/// The left side panel open/close button: a rounded wide frame with a thin
+/// vertical divider on its left.
+pub const ICON_SIDEBAR: &str = "icons/sidebar.svg";
 /// Overrides `gpui-component`'s `IconName::ArrowLeft` glyph.
 pub const ICON_ARROW_LEFT: &str = "icons/arrow-left.svg";
 /// Overrides `gpui-component`'s `IconName::Check` glyph.
@@ -54,6 +57,10 @@ const SETTINGS_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/settings.svg"
 ));
+const SIDEBAR_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/sidebar.svg"
+));
 const ARROW_LEFT_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/arrow-left.svg"
@@ -80,6 +87,7 @@ impl AssetSource for WorkFolderIcons {
             ICON_CHEVRON_RIGHT => Some(Cow::Borrowed(CHEVRON_RIGHT_SVG)),
             ICON_CHEVRON_DOWN => Some(Cow::Borrowed(CHEVRON_DOWN_SVG)),
             ICON_SETTINGS => Some(Cow::Borrowed(SETTINGS_SVG)),
+            ICON_SIDEBAR => Some(Cow::Borrowed(SIDEBAR_SVG)),
             ICON_ARROW_LEFT => Some(Cow::Borrowed(ARROW_LEFT_SVG)),
             ICON_CHECK => Some(Cow::Borrowed(CHECK_SVG)),
             _ => None,
@@ -130,6 +138,7 @@ mod tests {
             ICON_CHEVRON_RIGHT,
             ICON_CHEVRON_DOWN,
             ICON_SETTINGS,
+            ICON_SIDEBAR,
             ICON_ARROW_LEFT,
             ICON_CHECK,
         ] {
