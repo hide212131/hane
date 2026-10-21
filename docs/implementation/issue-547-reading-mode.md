@@ -51,6 +51,8 @@ Microsoftの[公式紹介](https://techcommunity.microsoft.com/blog/onedriveblog
 
 本文の文字入力、削除、単語削除、改行、リスト編集、貼り付け、切り取り、Undo/Redo、AI置換をすべて止める。既存の `body_key_ready` を一律にfalseにして移動・選択まで止める変更はしない。`Editor` や `DocumentSession` の汎用変更API全体を閲覧専用にする設計は不要。
 
+`capture.rs::InputCapture::paint` は現状、OS入力登録と `mark_frame_painted / record_frame_instrumentation` を同じ条件で実行している。入力登録の可否と描画計測の可否を分け、閲覧であることだけを理由に既存の描画計測を止めない。従来のrename・サイドバー・AI等に関する条件は維持し、本文の編集禁止から計測まで無効になる回帰を直接確認する。記録されなかったframeを処理量ゼロと解釈せず、新しい計測基盤は追加しない。
+
 AI処理中や結果表示中に閲覧へ切り替える場合は、既存の `EditorView::close_ai_selection(window, cx)` を使い、状態のresetと本文へのフォーカス復帰を行う。処理世代の検査で遅れた結果を現在の文書へ適用しない。`AiSelectionState::reset` だけを直接呼んで入力先を失わない。閲覧中のAIからの本文置換は無効にし、切替前に取得した結果にも同じ条件を適用する。外部AI送信をテスト目的で発生させない。
 
 調査基準では、タスクのチェック・表・日付バッジに独立したクリック編集入口はない。`context_menu.rs` はWindowsファイル関連付けであり、本文編集メニューではない。存在しない編集機能を追加せず、実装開始時に追加の直接書込みが増えていないか確認する。
@@ -105,7 +107,7 @@ AI処理中や結果表示中に閲覧へ切り替える場合は、既存の `E
 
 ## 実装担当へ渡す範囲
 
-主な対象は `crates/ui/src/view.rs`、`line.rs`、`input.rs`、`actions.rs`、`view/input_routing.rs`、`view/background_parse.rs`、`view/ai_selection.rs` と直接対応するテスト。必要なら小さな `view/reading_mode.rs` にモード・切替処理をまとめてよい。アイコンが必要なら `icons.rs` と `assets/icons/` に限定して追加する。
+主な対象は `crates/ui/src/view.rs`、`line.rs`、`input.rs`、`actions.rs`、`capture.rs`、`view/input_routing.rs`、`view/background_parse.rs`、`view/ai_selection.rs` と直接対応するテスト。必要なら小さな `view/reading_mode.rs` にモード・切替処理をまとめてよい。アイコンが必要なら `icons.rs` と `assets/icons/` に限定して追加する。
 
 PR #541がmainに入ったことを確認し、そのmainを取り込んだ実装用PRのcurrent headへ一度だけ初回依頼を投稿する。依頼にはこの文書のbranch内パスとIssueの受入条件を含める。Jevが利用できない環境ではCommander Policy §2.9に従い、取得できていない応答を作らない。
 
