@@ -1,6 +1,6 @@
 # Issue #510 U2: macOS ZIPの起動時署名検証
 
-状態: PR #535 はDraft・未merge。実装はこの文書の「現在の設計」に変更済みだが、この変更に対するCI・実Macでの署名検証・Finder起動・更新はまだ確認していない。CIの成功はIssue #510の完了ではない。実Finderでの起動、およびMac/Windowsの実更新と復旧は未確認。
+状態: PR #535 はopen・Ready・未merge。実装はこの文書の「現在の設計」に変更済みだが、この変更に対するCI・実Macでの署名検証・Finder起動・更新はまだ確認していない。CIの成功はIssue #510の完了ではない。実Finderでの起動、およびMac/Windowsの実更新と復旧は未確認。
 
 ## 設計の変遷
 
@@ -26,19 +26,27 @@
 - 現在のCargo version（0.27.1）を維持し、公開v0.27.0のassetは変更しない。
 - このPRと実装CIの成功だけでIssue #510全体を完了としない。
 
-## release workflowの接続変更（未反映）
+## release workflowの接続変更（PR #539でmain反映済み）
 
-`.github/**` は保護対象のためこのPRの作業者は変更していない。新layoutにするには `.github/workflows/windows-release.yml` の `build-macos` job で次を変える必要がある。これが反映されるまで、リリースのmacOS部分は新layoutで公開できない（`verify-macos-zip` は旧layoutのZIPを拒否する）。
+`.github/**` は保護対象のためPR #535の作業者は変更していない。release workflowの接続変更はPR #539として `d6ad3803bdd50100184619855220182f53365e4e` でmainへmerge済みで、現在のmainと、PR #535のbaseにも含まれている。
 
-1. 「Generate and sign macOS inventory」: 署名したinventoryを `$app/Contents/Resources/` ではなく、ZIPのstagingの `hane-macos-arm64/Hane.app.update/<version>-<source_sha>/hane-install.json(.sig)` へ置く（`python scripts/release_catalog.py macos-sidecar-dir --version … --source-sha …` が相対パスを出力する）。`macos-inventory` は封印済みのbundleから実行する。
-2. 「Package macOS app zip」: `Hane.app` と並べてその `Hane.app.update/…` を同じstagingに入れ、`ditto` でZIP化する。
-3. 「Verify extracted macOS zip」: 展開した `Hane.app` に `python scripts/release_catalog.py verify-macos-codesign --app "$app"` を実行し、`macos-inventory` を再生成して展開済みsidecarと `cmp` する。
-4. `scripts/tests/test_release_workflows.py` のうち旧layoutを前提にするworkflow検査（`Contents/Resources/hane-install.json.sig`、workflowに `codesign` を含めない検査）は、上記の変更と同時に更新する。
+PR #539により、Mac配布workflowは次を行う。
+
+1. 署名したinventoryをアプリ内ではなく、ZIPのstagingの `hane-macos-arm64/Hane.app.update/<version>-<source_sha>/hane-install.json(.sig)` へ置く。
+2. 署名済みの `Hane.app` の隣に `Hane.app.update` を含めてZIP化する。
+3. 展開後のアプリと外部inventoryを検査する。
+
+### PR #535・PR #539・Releaseの区別
+
+- PR #539はCargo versionを変更しておらず、単独ではversion更新もReleaseの開始も行っていない。
+- PR #535のversion更新は `0.27.1` である。Releaseを開始するには、PR #535のmergeが必要である。
+- v0.27.1の公開workflowの成功と、公開されたassetの確認は未実施で、結果は確認していない。それまで新layoutのZIPが公開済みとは扱わない。
 
 ## 実Macでの確認（未実施）
 
 次はすべて未確認で、完了として扱わない。
 
+- 公開ZIPからの起動、アプリ内更新・復旧、Windowsの実更新も未確認である。
 - 新しいrelease ZIPをFinderで展開し、`codesign --verify --deep --strict` が成功し、Apple Siliconで起動できること。
 - 展開後の `Hane.app` と `Hane.app.update` がEd25519検査に成功すること。
 - v0.27.0 → 新版の実更新、health失敗時のrollback、保存データの保持。
