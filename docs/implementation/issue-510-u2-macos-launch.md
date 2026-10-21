@@ -1,6 +1,6 @@
 # Issue #510 U2: macOS ZIPの起動時署名検証
 
-状態: PR #535 はopen・Ready・未merge。実装はこの文書の「現在の設計」に変更済みだが、この変更に対するCI・実Macでの署名検証・Finder起動・更新はまだ確認していない。CIの成功はIssue #510の完了ではない。実Finderでの起動、およびMac/Windowsの実更新と復旧は未確認。
+状態: PR #535 はopen・Ready・未merge。実装はこの文書の「現在の設計」に変更済みで、PR #539 のrelease workflow接続変更はmainへmerge済み。PR #535 の確認済みheadではPR CI（macOS・Windows）とexact-result verifierが成功している。ただしCIの成功だけではIssue #510全体の完了にならない。実配布物（v0.27.1本番ZIP）を使うFinder起動、実際のアプリ内更新、失敗時の復旧は未確認。
 
 ## 設計の変遷
 
