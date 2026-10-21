@@ -7,7 +7,9 @@
 - 実装基準のmain SHA: `f56a70b4f3145d98de70af9cdcdfc44f20793351`
 - Claude Codeの実装workerはSonnet 5.5で起動し、パッチを作成。trusted finalizerが `dff2bfbc652251a2db15099ce32348a9d49e87bb` を作り、対象PR branchへpushしました。
 - AADW run `39622202229` は、検証時にPR APIが古いhead `ddcb3dec3ebaef92912efc218e61a2f485ce1597` を返したためexact-head確認で失敗し、テスト結果はありません。branch refは `dff2bfbc652251a2db15099ce32348a9d49e87bb` を指していました。
-- この追記はその検証失敗を記録する文書変更です。製品コードの検証済みを意味しません。
+- CI run `39623132357` はPR head `dff2bfbc652251a2db15099ce32348a9d49e87bb` でメンテナー承認待ちになったため承認し、現在キューに入りました。
+- branch refは文書更新の `40049f1af635ab7f3b848cd41c7fdc9df949f790` まで進みましたが、PR APIは引き続き古いheadを示しています。このCI runは現行branch refを検証せず、同期後にcurrent-head CIが必要です。
+- 実装コードと回帰テストは追加済みですが、CI・current-head review・macOS/Windows GUI確認は未完了です。
 
 ## 現状の証拠
 
