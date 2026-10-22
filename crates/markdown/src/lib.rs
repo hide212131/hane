@@ -328,6 +328,114 @@ mod tests {
         }
     }
 
+    // A reference definition inside a list item is followed by a line of 0..=3
+    // SPACEs and then body text. This goes through the refdef loop that calls
+    // `scan_next_line_or_lazy_continuation`, so the blank-line check there is
+    // protected directly. Each indent is its own test.
+    #[test]
+    fn refdef_partial_indent_0_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(0);
+    }
+
+    #[test]
+    fn refdef_partial_indent_1_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(1);
+    }
+
+    #[test]
+    fn refdef_partial_indent_2_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(2);
+    }
+
+    #[test]
+    fn refdef_partial_indent_3_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(3);
+    }
+
+    fn check_refdef_partial_indent_blank_line_then_body(indent: usize) {
+        let source = format!("- [o]:u\n{}\ncontinued\n", " ".repeat(indent));
+        let base = 40;
+        let range = SourceRange::new(base, base + source.len());
+        let parsed = parse_document(Revision(3), range, &source);
+        assert_eq!(parsed.source_range, range, "{source:?}");
+
+        let count = |wanted: fn(&NodeKind) -> bool| {
+            parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| wanted(&node.kind))
+                .count()
+        };
+        assert_eq!(
+            count(|k| matches!(k, NodeKind::List { start: None })),
+            1,
+            "{source:?}"
+        );
+        assert_eq!(
+            count(|k| matches!(k, NodeKind::ListItem { task: None })),
+            1,
+            "{source:?}"
+        );
+        assert_eq!(count(|k| *k == NodeKind::Paragraph), 1, "{source:?}");
+        assert_eq!(count(|k| *k == NodeKind::Text), 1, "{source:?}");
+
+        assert!(
+            parsed.tree.iter().all(|(_, node)| {
+                node.source_range.start.0 >= range.start.0
+                    && node.source_range.end.0 <= range.end.0
+                    && node.source_range.start.0 < node.source_range.end.0
+            }),
+            "{source:?}"
+        );
+
+        // "- [o]:u\n" is 8 bytes, then the blank line is `indent` SPACEs + "\n".
+        let body_start = base + 8 + indent + 1;
+        let body_end = body_start + "continued".len();
+
+        let (_, text) = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| node.kind == NodeKind::Text)
+            .expect("body text node");
+        assert_eq!(
+            text.source_range,
+            SourceRange::new(body_start, body_end),
+            "the body text keeps its absolute byte range for {source:?}"
+        );
+
+        let paragraph = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| node.kind == NodeKind::Paragraph)
+            .map(|(_, node)| node.source_range)
+            .expect("body paragraph");
+        assert_eq!(paragraph.start.0, body_start, "{source:?}");
+        assert!(paragraph.end.0 >= body_end, "{source:?}");
+
+        // The body is not a descendant of the list item.
+        let mut ancestor = text.parent;
+        while let Some(id) = ancestor {
+            let node = parsed.tree.node(id).expect("ancestor node");
+            assert!(
+                !matches!(node.kind, NodeKind::ListItem { .. }),
+                "the body text must not be inside the list item for {source:?}"
+            );
+            ancestor = node.parent;
+        }
+
+        let item = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .map(|(_, node)| node.source_range)
+            .expect("list item");
+        assert_eq!(item.start.0, base, "{source:?}");
+        assert!(
+            item.end.0 <= body_start,
+            "the list item must end before the body for {source:?}"
+        );
+    }
+
     #[test]
     fn tree_nests_children_inside_their_parent_source_ranges() {
         let source = "- outer\n  - inner **bold**\n";
