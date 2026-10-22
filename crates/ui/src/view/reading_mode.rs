@@ -299,7 +299,11 @@ impl EditorView {
     /// press so neither the strip's body-click handling nor focus handling
     /// reaches it (a disabled button would otherwise still move focus and end
     /// a composition).
-    pub(super) fn reading_mode_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    ///
+    /// The tooltip is a `HoverCard` around the wrapper, like the tab path one:
+    /// `Button::tooltip` needs a `gpui_component::Root` as the window root,
+    /// which the app does not have, so it would never be shown.
+    pub(super) fn reading_mode_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let reading = self.editor_mode == EditorMode::Reading;
         let (icon, label) = if reading {
             (icons::ICON_EDITING_MODE, "編集モードに切り替え")
@@ -317,7 +321,6 @@ impl EditorView {
             .ghost()
             .with_size(px(24.0))
             .icon(Icon::empty().path(icon))
-            .tooltip(tooltip)
             .accessibility_label(label)
             .disabled(blocked)
             .on_click(move |_, window, app| {
@@ -325,7 +328,7 @@ impl EditorView {
                     view.toggle_editor_mode(window, cx);
                 });
             });
-        div()
+        let wrapper = div()
             .id("reading-mode-toggle-wrapper")
             .debug_selector(|| "reading-mode-toggle".to_owned())
             .flex_none()
@@ -334,7 +337,18 @@ impl EditorView {
                 window.prevent_default();
                 cx.stop_propagation();
             })
-            .child(button)
+            .child(button);
+        HoverCard::new("reading-mode-toggle-tooltip")
+            .anchor(Anchor::TopCenter)
+            .trigger(wrapper)
+            .content(move |_, _, _| {
+                div()
+                    .px_2()
+                    .py_1()
+                    .debug_selector(move || format!("reading-mode-toggle-tooltip:{tooltip}"))
+                    .child(tooltip)
+            })
+            .into_any_element()
     }
 }
 
@@ -2082,6 +2096,68 @@ mod tests {
         });
         assert_eq!(snapshot(&view, cx), before);
         assert!(view.read_with(cx, |view, _| view.editor().ime().is_none()));
+    }
+
+    /// Hovers the switch in a window without a `gpui_component::Root`, as the
+    /// app has none, and returns the tooltip texts that were painted.
+    fn hover_switch_tooltips(cx: &mut TestCx) -> Vec<&'static str> {
+        let point = cx
+            .debug_bounds("reading-mode-toggle")
+            .expect("the switch is painted")
+            .center();
+        cx.simulate_mouse_move(point, None, gpui::Modifiers::none());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1500));
+        cx.run_until_parked();
+        [
+            "閲覧モードに切り替え",
+            "編集モードに切り替え",
+            MODE_SWITCH_BLOCKED_BY_COMPOSITION,
+        ]
+        .into_iter()
+        .filter(|text| {
+            cx.debug_bounds(&format!("reading-mode-toggle-tooltip:{text}"))
+                .is_some()
+        })
+        .collect()
+    }
+
+    #[gpui::test]
+    fn hovering_the_switch_shows_its_tooltip_without_a_root(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "hello\n", 800.0, 400.0);
+        assert_eq!(hover_switch_tooltips(cx), ["閲覧モードに切り替え"]);
+        // The hover alone does not switch the mode.
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor_mode()),
+            EditorMode::Editing
+        );
+        cx.simulate_mouse_move(point(px(700.0), px(300.0)), None, gpui::Modifiers::none());
+        settle(cx);
+
+        assert!(toggle(&view, cx));
+        settle(cx);
+        assert_eq!(hover_switch_tooltips(cx), ["編集モードに切り替え"]);
+        cx.simulate_mouse_move(point(px(700.0), px(300.0)), None, gpui::Modifiers::none());
+        settle(cx);
+        assert!(toggle(&view, cx));
+        settle(cx);
+
+        // During a body composition the reason is shown and hovering neither
+        // switches nor ends the composition.
+        view.update(cx, |view, _| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "あ", Some(1..1))
+                .unwrap();
+        });
+        settle(cx);
+        assert_eq!(
+            hover_switch_tooltips(cx),
+            [MODE_SWITCH_BLOCKED_BY_COMPOSITION]
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor_mode(), EditorMode::Editing);
+            assert!(view.editor().ime().is_some(), "the marked text is kept");
+        });
     }
 
     /// The state a refused switch must leave alone.
