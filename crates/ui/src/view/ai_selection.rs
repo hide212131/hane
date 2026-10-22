@@ -55,6 +55,15 @@ fn ai_selection_popup_width_for(area_width: f32) -> f32 {
     AI_SELECTION_POPUP_WIDTH.min(area_width.max(0.0))
 }
 
+/// Whether a mouse press at `(x, y)` landed inside the window's client area
+/// (`0..width` x `0..height`). A press on the OS window frame (resize drag)
+/// can reach the popup's outside-click handler with a position on or beyond
+/// the client edge; that is not an intentional click on the document, so it
+/// must not close the popup or discard the unsent input.
+fn ai_selection_press_is_inside_client(x: f32, y: f32, width: f32, height: f32) -> bool {
+    x >= 0.0 && y >= 0.0 && x < width && y < height
+}
+
 /// Shifts the popup's left edge `x` so a popup `width` wide stays inside the
 /// editor area spanning `area_left..area_left + area_width`.
 fn ai_selection_clamp_left(x: f32, area_left: f32, area_width: f32, width: f32) -> f32 {
@@ -1290,7 +1299,16 @@ impl EditorView {
             .border_color(rgb(self.theme.header_foreground))
             .bg(rgb(self.theme.code_background))
             .text_color(rgb(self.theme.foreground))
-            .on_mouse_down_out(cx.listener(|view, _, window, cx| {
+            .on_mouse_down_out(cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
+                let size = window.viewport_size();
+                if !ai_selection_press_is_inside_client(
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                    f32::from(size.width),
+                    f32::from(size.height),
+                ) {
+                    return;
+                }
                 view.close_ai_selection(window, cx);
             }))
             .child(content)
@@ -1907,6 +1925,21 @@ mod tests {
         }
         // Regular width keeps the anchor position when it already fits.
         assert_eq!(ai_selection_clamp_left(100.0, 0.0, 960.0, 360.0), 100.0);
+    }
+
+    #[test]
+    fn frame_drag_presses_outside_the_client_area_do_not_count_as_outside_clicks() {
+        for (width, height) in [(279.0_f32, 600.0_f32), (280.0, 600.0), (962.0, 600.0)] {
+            // Intentional clicks inside the client area still close the popup.
+            assert!(ai_selection_press_is_inside_client(10.0, 10.0, width, height));
+            assert!(ai_selection_press_is_inside_client(width - 1.0, height - 1.0, width, height));
+            // Frame presses (right/bottom/left/top border) are ignored.
+            assert!(!ai_selection_press_is_inside_client(width, 100.0, width, height));
+            assert!(!ai_selection_press_is_inside_client(width + 4.0, 100.0, width, height));
+            assert!(!ai_selection_press_is_inside_client(100.0, height, width, height));
+            assert!(!ai_selection_press_is_inside_client(-1.0, 100.0, width, height));
+            assert!(!ai_selection_press_is_inside_client(100.0, -1.0, width, height));
+        }
     }
 
     #[gpui::test]
