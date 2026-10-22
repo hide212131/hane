@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1000" viewBox="0 0 1440 1000" role="img" aria-labelledby="title desc">
 <title id="title">Hane 統合タイトルバーの配置設計 — Issue #542</title>
-<desc id="desc">設計図、未実装。macOSとWindowsのライト・ダークを4パネルで比較する。タイトルバーは論理40pxで一度だけ確保し、サイドバーと本文をその下に置く。macOSの左80pxは標準の3ボタンを予約する。Windowsは左12px、右34pxの3ボタン、合計102pxを予約する。ファイルメニューと既存タブを配置し、48px以上の移動用余白を残す。固定領域を押し出さず、タブ列だけが横スクロールする。設定画面ではタブ列に代えて設定と表示し、ウインドウ操作は保つ。</desc>
+<desc id="desc">設計図、未実装。macOSとWindowsのライト・ダークを4パネルで比較する。タイトルバーは論理40pxで一度だけ確保し、サイドバーと本文をその下に置く。macOSの左80pxは標準の3ボタンを予約する。Windowsは左12px、右35pxの3ボタン、合計105pxを予約する。ファイルメニューと既存タブを配置し、48px以上の移動用余白を残す。固定領域を押し出さず、タブ列だけが横スクロールする。設定画面ではタブ列に代えて設定と表示し、ウインドウ操作は保つ。</desc>
 <style>
   text { font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans CJK JP", "Droid Sans Fallback", sans-serif; }
   .heading { font-size: 26px; font-weight: 700; fill: #202020; }
@@ -100,17 +100,17 @@
 <line x1="36" y1="474" x2="48" y2="474" stroke="#6b6b6b" stroke-width="1"/>
 <line x1="36" y1="471" x2="36" y2="477" stroke="#6b6b6b" stroke-width="1"/>
 <line x1="48" y1="471" x2="48" y2="477" stroke="#6b6b6b" stroke-width="1"/>
-<line x1="594" y1="474" x2="696" y2="474" stroke="#6b6b6b" stroke-width="1"/>
-<line x1="594" y1="471" x2="594" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="591" y1="474" x2="696" y2="474" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="591" y1="471" x2="591" y2="477" stroke="#6b6b6b" stroke-width="1"/>
 <line x1="696" y1="471" x2="696" y2="477" stroke="#6b6b6b" stroke-width="1"/>
-<text x="645.0" y="468" class="measure" text-anchor="middle">右 34px × 3 = 102px</text>
-<line x1="594" y1="488" x2="594" y2="518" stroke="#d2cbc0" stroke-width="1"/>
-<line x1="628" y1="488" x2="628" y2="518" stroke="#d2cbc0" stroke-width="1"/>
-<line x1="662" y1="488" x2="662" y2="518" stroke="#d2cbc0" stroke-width="1"/>
-<line x1="606" y1="504" x2="616" y2="504" stroke="#262626" stroke-width="1.2"/>
-<rect x="640" y="498" width="10" height="10" fill="none" stroke="#262626"/>
-<line x1="674" y1="498" x2="684" y2="508" stroke="#262626" stroke-width="1.2"/>
-<line x1="684" y1="498" x2="674" y2="508" stroke="#262626" stroke-width="1.2"/>
+<text x="643.5" y="468" class="measure" text-anchor="middle">右 35px × 3 = 105px</text>
+<line x1="591" y1="488" x2="591" y2="518" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="626" y1="488" x2="626" y2="518" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="661" y1="488" x2="661" y2="518" stroke="#d2cbc0" stroke-width="1"/>
+<line x1="603.5" y1="504" x2="613.5" y2="504" stroke="#262626" stroke-width="1.2"/>
+<rect x="638.5" y="498" width="10" height="10" fill="none" stroke="#262626"/>
+<line x1="673.5" y1="498" x2="683.5" y2="508" stroke="#262626" stroke-width="1.2"/>
+<line x1="683.5" y1="498" x2="673.5" y2="508" stroke="#262626" stroke-width="1.2"/>
 <text x="58" y="508" class="chrome-text" fill="#262626">ファイル</text>
 <rect x="112" y="488" width="135" height="30" fill="#356d94"/>
 <text x="124" y="508" class="chrome-text" fill="#f7fbff">メモ.md *</text>
@@ -132,7 +132,7 @@
 <line x1="276" y1="630" x2="668" y2="630" stroke="#d2cbc0" stroke-width="1"/>
 <line x1="276" y1="652" x2="620" y2="652" stroke="#d2cbc0" stroke-width="1"/>
 <line x1="276" y1="674" x2="646" y2="674" stroke="#d2cbc0" stroke-width="1"/>
-<text x="36" y="728" class="body-note">左12pxと右102pxを確保。操作ボタンはそれぞれ幅34px。</text>
+<text x="36" y="728" class="body-note">左12pxと右105pxを確保。操作ボタンはそれぞれ幅35px。</text>
 </g>
 <text x="744" y="447" class="panel-label">Windows / ダーク</text>
 <text x="1404" y="447" class="measure" text-anchor="end">上部 40px</text>
@@ -144,17 +144,17 @@
 <line x1="744" y1="474" x2="756" y2="474" stroke="#6b6b6b" stroke-width="1"/>
 <line x1="744" y1="471" x2="744" y2="477" stroke="#6b6b6b" stroke-width="1"/>
 <line x1="756" y1="471" x2="756" y2="477" stroke="#6b6b6b" stroke-width="1"/>
-<line x1="1302" y1="474" x2="1404" y2="474" stroke="#6b6b6b" stroke-width="1"/>
-<line x1="1302" y1="471" x2="1302" y2="477" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="1299" y1="474" x2="1404" y2="474" stroke="#6b6b6b" stroke-width="1"/>
+<line x1="1299" y1="471" x2="1299" y2="477" stroke="#6b6b6b" stroke-width="1"/>
 <line x1="1404" y1="471" x2="1404" y2="477" stroke="#6b6b6b" stroke-width="1"/>
-<text x="1353.0" y="468" class="measure" text-anchor="middle">右 34px × 3 = 102px</text>
-<line x1="1302" y1="488" x2="1302" y2="518" stroke="#55585f" stroke-width="1"/>
-<line x1="1336" y1="488" x2="1336" y2="518" stroke="#55585f" stroke-width="1"/>
-<line x1="1370" y1="488" x2="1370" y2="518" stroke="#55585f" stroke-width="1"/>
-<line x1="1314" y1="504" x2="1324" y2="504" stroke="#e8e5df" stroke-width="1.2"/>
-<rect x="1348" y="498" width="10" height="10" fill="none" stroke="#e8e5df"/>
-<line x1="1382" y1="498" x2="1392" y2="508" stroke="#e8e5df" stroke-width="1.2"/>
-<line x1="1392" y1="498" x2="1382" y2="508" stroke="#e8e5df" stroke-width="1.2"/>
+<text x="1351.5" y="468" class="measure" text-anchor="middle">右 35px × 3 = 105px</text>
+<line x1="1299" y1="488" x2="1299" y2="518" stroke="#55585f" stroke-width="1"/>
+<line x1="1334" y1="488" x2="1334" y2="518" stroke="#55585f" stroke-width="1"/>
+<line x1="1369" y1="488" x2="1369" y2="518" stroke="#55585f" stroke-width="1"/>
+<line x1="1311.5" y1="504" x2="1321.5" y2="504" stroke="#e8e5df" stroke-width="1.2"/>
+<rect x="1346.5" y="498" width="10" height="10" fill="none" stroke="#e8e5df"/>
+<line x1="1381.5" y1="498" x2="1391.5" y2="508" stroke="#e8e5df" stroke-width="1.2"/>
+<line x1="1391.5" y1="498" x2="1381.5" y2="508" stroke="#e8e5df" stroke-width="1.2"/>
 <text x="766" y="508" class="chrome-text" fill="#e8e5df">ファイル</text>
 <rect x="820" y="488" width="135" height="30" fill="#44779e"/>
 <text x="832" y="508" class="chrome-text" fill="#f7fbff">メモ.md *</text>
@@ -176,7 +176,7 @@
 <line x1="984" y1="630" x2="1376" y2="630" stroke="#55585f" stroke-width="1"/>
 <line x1="984" y1="652" x2="1328" y2="652" stroke="#55585f" stroke-width="1"/>
 <line x1="984" y1="674" x2="1354" y2="674" stroke="#55585f" stroke-width="1"/>
-<text x="744" y="728" class="body-note">左12pxと右102pxを確保。操作ボタンはそれぞれ幅34px。</text>
+<text x="744" y="728" class="body-note">左12pxと右105pxを確保。操作ボタンはそれぞれ幅35px。</text>
 </g>
 <line x1="24" y1="751" x2="1416" y2="751" stroke="#d5d5d5" stroke-width="1"/>
 <text x="36" y="781" class="panel-label">設定画面の上部（macOSの例）</text>

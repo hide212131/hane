@@ -13,7 +13,7 @@
 
 目的は、Windows / macOSでOSのタイトルバーとファイルタブを一段にし、アプリのLight / Dark / System設定と配色を揃えること。
 
-1. 既存の `gpui-component 0.6.6::TitleBar` を使う。高さ40px、macOS標準ボタン位置 `(9, 12)`・左予約80px、Windows右ボタン34px×3、移動用余白48px以上。最小サイズ330×240論理px。新規の＋／タブ閉じるボタンは作らない。
+1. 既存の `gpui-component 0.6.6::TitleBar` を使う。高さ40px、macOS標準ボタン位置 `(9, 12)`・左予約80px、Windows右ボタン35px×3（合計105px）、移動用余白48px以上。最小サイズ330×240論理px。新規の＋／タブ閉じるボタンは作らない。
 2. 共通外枠を上部＋残りの内容にし、編集画面では既存メニュー／タブ、設定画面では「設定」を置く。`settings_screen_shell` の `#[inline(never)]`、戻る処理、モーダルの遮蔽を保つ。非対象OSの既存配置を維持する。
 3. タブとメニューは `.occlude()` と左mousedown／二度押しの伝播停止でDragから分離する。右3ボタンへ独自click処理を追加しない。48px余白とOSボタンを操作領域の囲いに入れない。
 4. themeの初回同期を行う。native appearanceは既存の `gpui::App::set_window_appearance`（`gpui-pre 0.3.6`）で、Light／Dark→`Some(...)`、System→`None`。GPUI更新・vendor変更は行わない。macOSではoverrideの設定後とrender時の両方で `cx.window_appearance()` を読み、古い `window.appearance()` キャッシュへ戻らない。component themeも同期する。
