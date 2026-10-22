@@ -428,7 +428,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 current_container,
                 tree_position,
             ))
-            || (scanned_indent && scan_blank_line(&bytes[line_start.bytes_scanned()..]).is_some())
+            || scan_blank_line(&bytes[line_start.bytes_scanned()..]).is_some()
         {
             None
         } else {

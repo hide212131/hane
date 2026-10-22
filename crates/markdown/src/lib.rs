@@ -227,6 +227,84 @@ mod tests {
             );
         }
         assert_eq!("- [o]:u\n    \t".len(), 13);
+
+        let fixture = "- [o]:u\n    \t";
+        let range = SourceRange::new(40, 40 + fixture.len());
+        let parsed = parse_document(Revision(3), range, fixture);
+        assert!(
+            parsed
+                .tree
+                .iter()
+                .any(|(_, node)| node.kind == NodeKind::List { start: None }
+                    && node.source_range.start.0 == range.start.0),
+            "the 13-byte fixture keeps its bullet list at the absolute start"
+        );
+        assert!(
+            parsed
+                .tree
+                .iter()
+                .any(|(_, node)| matches!(node.kind, NodeKind::ListItem { task: None })
+                    && node.source_range.start.0 == range.start.0),
+            "the 13-byte fixture keeps its list item at the absolute start"
+        );
+        assert!(
+            parsed
+                .tree
+                .iter()
+                .all(|(_, node)| node.source_range.start.0 < node.source_range.end.0),
+            "every node of the 13-byte fixture has a nonzero range"
+        );
+    }
+
+    #[test]
+    fn partial_indent_before_blank_line_ends_the_list_item_paragraph() {
+        // Fewer than four SPACEs make `scan_space(4)` fail after partially
+        // consuming them; the remainder must still be checked as blank.
+        for indent in 0..=3usize {
+            let source = format!("- a\n{}\n", " ".repeat(indent));
+            let base = 40;
+            let range = SourceRange::new(base, base + source.len());
+            let parsed = parse_document(Revision(3), range, &source);
+            assert_eq!(parsed.source_range, range, "{source:?}");
+
+            let count = |wanted: fn(&NodeKind) -> bool| {
+                parsed
+                    .tree
+                    .iter()
+                    .filter(|(_, node)| wanted(&node.kind))
+                    .count()
+            };
+            assert_eq!(count(|k| matches!(k, NodeKind::List { start: None })), 1);
+            assert_eq!(count(|k| matches!(k, NodeKind::ListItem { task: None })), 1);
+            assert_eq!(count(|k| *k == NodeKind::Paragraph), 1, "{source:?}");
+
+            assert!(
+                parsed.tree.iter().all(|(_, node)| {
+                    node.source_range.start.0 >= range.start.0
+                        && node.source_range.end.0 <= range.end.0
+                        && node.source_range.start.0 < node.source_range.end.0
+                }),
+                "{source:?}"
+            );
+            let text = parsed
+                .tree
+                .iter()
+                .find(|(_, node)| node.kind == NodeKind::Text)
+                .map(|(_, node)| node.source_range)
+                .expect("paragraph text node");
+            assert_eq!(
+                text,
+                SourceRange::new(base + 2, base + 3),
+                "the paragraph text `a` keeps its absolute byte range for {source:?}"
+            );
+            let item = parsed
+                .tree
+                .iter()
+                .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                .map(|(_, node)| node.source_range)
+                .expect("list item");
+            assert_eq!(item.start.0, base, "{source:?}");
+        }
     }
 
     #[test]
