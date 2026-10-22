@@ -576,22 +576,6 @@ impl EditorView {
         self.content_search.input_subscription = Some(subscription);
     }
 
-    /// Types a query into the content-search input the way the input event
-    /// does, keeping the input value and the query in step.
-    #[cfg(test)]
-    pub(super) fn set_content_search_query_for_test(
-        &mut self,
-        text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.initialize_content_search_input(window, cx);
-        if let Some(input) = self.content_search.input.as_ref() {
-            input.update(cx, |state, cx| state.set_value(text, window, cx));
-        }
-        self.content_search_query_changed(text.to_owned(), cx);
-    }
-
     /// The current query and the content-search input value, for tests.
     #[cfg(test)]
     pub(super) fn content_search_query_for_test(&self, cx: &gpui::App) -> (String, String) {
