@@ -203,6 +203,240 @@ mod tests {
     }
 
     #[test]
+    fn blank_line_after_four_spaces_is_not_a_lazy_continuation_and_does_not_panic() {
+        // Issue #562: the first source is the 13-byte reproduction input.
+        for source in [
+            "- [o]:u\n    \t",
+            "- [o]:u\n    ",
+            "- a\n    \t\n",
+            "- a\n    \r\n",
+            "a\n    \t\nb",
+            "> a\n>     \t",
+            "1. [o]:u\n     \t",
+        ] {
+            let range = SourceRange::new(40, 40 + source.len());
+            let parsed = parse_document(Revision(3), range, source);
+            assert_eq!(parsed.source_range, range, "{source:?}");
+            assert!(
+                parsed.tree.iter().all(|(_, node)| {
+                    node.source_range.start.0 >= range.start.0
+                        && node.source_range.end.0 <= range.end.0
+                        && node.source_range.start.0 <= node.source_range.end.0
+                }),
+                "{source:?}"
+            );
+        }
+        assert_eq!("- [o]:u\n    \t".len(), 13);
+
+        let fixture = "- [o]:u\n    \t";
+        let range = SourceRange::new(40, 40 + fixture.len());
+        let parsed = parse_document(Revision(3), range, fixture);
+        assert!(
+            parsed
+                .tree
+                .iter()
+                .any(|(_, node)| node.kind == NodeKind::List { start: None }
+                    && node.source_range.start.0 == range.start.0),
+            "the 13-byte fixture keeps its bullet list at the absolute start"
+        );
+        assert!(
+            parsed
+                .tree
+                .iter()
+                .any(|(_, node)| matches!(node.kind, NodeKind::ListItem { task: None })
+                    && node.source_range.start.0 == range.start.0),
+            "the 13-byte fixture keeps its list item at the absolute start"
+        );
+        assert!(
+            parsed
+                .tree
+                .iter()
+                .all(|(_, node)| node.source_range.start.0 < node.source_range.end.0),
+            "every node of the 13-byte fixture has a nonzero range"
+        );
+    }
+
+    // Fewer than four SPACEs make `scan_space(4)` fail after partially
+    // consuming them; the remainder must still be checked as blank. Each
+    // indent is its own test so one failure cannot hide the others.
+    #[test]
+    fn partial_indent_0_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(0);
+    }
+
+    #[test]
+    fn partial_indent_1_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(1);
+    }
+
+    #[test]
+    fn partial_indent_2_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(2);
+    }
+
+    #[test]
+    fn partial_indent_3_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(3);
+    }
+
+    fn check_partial_indent_before_blank_line(indent: usize) {
+        {
+            let source = format!("- a\n{}\n", " ".repeat(indent));
+            let base = 40;
+            let range = SourceRange::new(base, base + source.len());
+            let parsed = parse_document(Revision(3), range, &source);
+            assert_eq!(parsed.source_range, range, "{source:?}");
+
+            let count = |wanted: fn(&NodeKind) -> bool| {
+                parsed
+                    .tree
+                    .iter()
+                    .filter(|(_, node)| wanted(&node.kind))
+                    .count()
+            };
+            assert_eq!(count(|k| matches!(k, NodeKind::List { start: None })), 1);
+            assert_eq!(count(|k| matches!(k, NodeKind::ListItem { task: None })), 1);
+            // The list is tight, so pulldown emits no Paragraph event.
+            assert_eq!(count(|k| *k == NodeKind::Paragraph), 0, "{source:?}");
+
+            assert!(
+                parsed.tree.iter().all(|(_, node)| {
+                    node.source_range.start.0 >= range.start.0
+                        && node.source_range.end.0 <= range.end.0
+                        && node.source_range.start.0 < node.source_range.end.0
+                }),
+                "{source:?}"
+            );
+            let text = parsed
+                .tree
+                .iter()
+                .find(|(_, node)| node.kind == NodeKind::Text)
+                .map(|(_, node)| node.source_range)
+                .expect("list item text node");
+            assert_eq!(
+                text,
+                SourceRange::new(base + 2, base + 3),
+                "the paragraph text `a` keeps its absolute byte range for {source:?}"
+            );
+            let item = parsed
+                .tree
+                .iter()
+                .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                .map(|(_, node)| node.source_range)
+                .expect("list item");
+            assert_eq!(item.start.0, base, "{source:?}");
+        }
+    }
+
+    // A reference definition inside a list item is followed by a line of 0..=3
+    // SPACEs and then body text. This goes through the refdef loop that calls
+    // `scan_next_line_or_lazy_continuation`, so the blank-line check there is
+    // protected directly. Each indent is its own test.
+    #[test]
+    fn refdef_partial_indent_0_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(0);
+    }
+
+    #[test]
+    fn refdef_partial_indent_1_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(1);
+    }
+
+    #[test]
+    fn refdef_partial_indent_2_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(2);
+    }
+
+    #[test]
+    fn refdef_partial_indent_3_blank_line_does_not_lazily_continue_into_body() {
+        check_refdef_partial_indent_blank_line_then_body(3);
+    }
+
+    fn check_refdef_partial_indent_blank_line_then_body(indent: usize) {
+        let source = format!("- [o]:u\n{}\ncontinued\n", " ".repeat(indent));
+        let base = 40;
+        let range = SourceRange::new(base, base + source.len());
+        let parsed = parse_document(Revision(3), range, &source);
+        assert_eq!(parsed.source_range, range, "{source:?}");
+
+        let count = |wanted: fn(&NodeKind) -> bool| {
+            parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| wanted(&node.kind))
+                .count()
+        };
+        assert_eq!(
+            count(|k| matches!(k, NodeKind::List { start: None })),
+            1,
+            "{source:?}"
+        );
+        assert_eq!(
+            count(|k| matches!(k, NodeKind::ListItem { task: None })),
+            1,
+            "{source:?}"
+        );
+        assert_eq!(count(|k| *k == NodeKind::Paragraph), 1, "{source:?}");
+        assert_eq!(count(|k| *k == NodeKind::Text), 1, "{source:?}");
+
+        assert!(
+            parsed.tree.iter().all(|(_, node)| {
+                node.source_range.start.0 >= range.start.0
+                    && node.source_range.end.0 <= range.end.0
+                    && node.source_range.start.0 < node.source_range.end.0
+            }),
+            "{source:?}"
+        );
+
+        // "- [o]:u\n" is 8 bytes, then the blank line is `indent` SPACEs + "\n".
+        let body_start = base + 8 + indent + 1;
+        let body_end = body_start + "continued".len();
+
+        let (_, text) = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| node.kind == NodeKind::Text)
+            .expect("body text node");
+        assert_eq!(
+            text.source_range,
+            SourceRange::new(body_start, body_end),
+            "the body text keeps its absolute byte range for {source:?}"
+        );
+
+        let paragraph = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| node.kind == NodeKind::Paragraph)
+            .map(|(_, node)| node.source_range)
+            .expect("body paragraph");
+        assert_eq!(paragraph.start.0, body_start, "{source:?}");
+        assert!(paragraph.end.0 >= body_end, "{source:?}");
+
+        // The body is not a descendant of the list item.
+        let mut ancestor = text.parent;
+        while let Some(id) = ancestor {
+            let node = parsed.tree.node(id).expect("ancestor node");
+            assert!(
+                !matches!(node.kind, NodeKind::ListItem { .. }),
+                "the body text must not be inside the list item for {source:?}"
+            );
+            ancestor = node.parent;
+        }
+
+        let item = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .map(|(_, node)| node.source_range)
+            .expect("list item");
+        assert_eq!(item.start.0, base, "{source:?}");
+        assert!(
+            item.end.0 <= body_start,
+            "the list item must end before the body for {source:?}"
+        );
+    }
+
+    #[test]
     fn tree_nests_children_inside_their_parent_source_ranges() {
         let source = "- outer\n  - inner **bold**\n";
         let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
