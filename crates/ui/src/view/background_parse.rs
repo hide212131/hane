@@ -223,12 +223,7 @@ impl EditorView {
                 continue;
             }
             if self.joined_parse_jobs.contains_key(&block.id)
-                || self
-                    .joined_parse_cache
-                    .get(&block.id)
-                    .is_some_and(|cached| {
-                        cached.revision == revision && cached.source_range == block.source_range
-                    })
+                || self.current_joined_parse(block).is_some()
             {
                 continue;
             }
