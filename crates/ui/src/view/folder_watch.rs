@@ -11,7 +11,9 @@
 //! undo history are never replaced by a listing update.
 
 use super::*;
-use hane_session::{FolderWatcher, WatchBatch, WatchTiming};
+#[cfg(not(test))]
+use hane_session::WatchTiming;
+use hane_session::{FolderWatcher, WatchBatch};
 
 /// The watch and re-list bookkeeping for the current work folder. Replaced
 /// wholesale (dropping the old watcher) whenever a folder is opened.
@@ -19,6 +21,10 @@ use hane_session::{FolderWatcher, WatchBatch, WatchTiming};
 pub(super) struct FolderWatchState {
     /// Held only for its lifetime: dropping it releases the OS watch.
     watcher: Option<FolderWatcher>,
+    /// Test-only stand-in for the watcher thread's sender; dropping it closes
+    /// the channel just as dropping the watcher does.
+    #[cfg(test)]
+    test_batches: Option<async_channel::Sender<WatchBatch>>,
     refresh_running: bool,
     /// A notification arrived while a re-list was running (or before the
     /// first scan finished); one more re-list follows once it is safe.
@@ -46,11 +52,27 @@ impl EditorView {
         // Released first so the previous watcher's task ends instead of two
         // watches reporting the same folder.
         self.folder_watch.watcher = None;
+        #[cfg(test)]
+        {
+            self.folder_watch.test_batches = None;
+        }
         let (sender, receiver) = async_channel::unbounded();
-        let watcher = FolderWatcher::start(root, WatchTiming::default(), move |batch| {
-            sender.send_blocking(batch).is_ok()
-        })?;
-        self.folder_watch.watcher = Some(watcher);
+        // GPUI's deterministic test scheduler must not be woken by a real OS
+        // thread, so unit tests do not start the OS watcher. They feed batches
+        // through `test_batches` from the test thread instead; the OS watcher
+        // itself is covered by the `hane_session` tests.
+        #[cfg(not(test))]
+        {
+            let watcher = FolderWatcher::start(root, WatchTiming::default(), move |batch| {
+                sender.send_blocking(batch).is_ok()
+            })?;
+            self.folder_watch.watcher = Some(watcher);
+        }
+        #[cfg(test)]
+        {
+            let _ = root;
+            self.folder_watch.test_batches = Some(sender);
+        }
         let generation = self.work_folder_generation;
         cx.spawn(async move |view, cx| {
             // Ends when the watcher is dropped (the channel closes), the view
@@ -374,6 +396,42 @@ mod tests {
             assert!(!keep, "the watch of a replaced folder is told to stop");
             assert!(!view.folder_watch.refresh_running);
         });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_delivered_batch_relists_the_folder_and_a_replaced_watch_is_released(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("delivery");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+        view.update(cx, |view, cx| {
+            view.connect_folder_watch(&root, cx).unwrap();
+        });
+
+        std::fs::write(root.join("Added.md"), "# Added\n").unwrap();
+        let sender = view.read_with(cx, |view, _| view.folder_watch.test_batches.clone().unwrap());
+        sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(file_names(view), ["Added.md"]);
+            assert!(!view.folder_watch.refresh_running);
+        });
+
+        // Replacing the folder generation ends the delivery task, and a batch
+        // sent by the old watch no longer starts a re-list.
+        view.update(cx, |view, _| {
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+        });
+        std::fs::write(root.join("Late.md"), "# Late\n").unwrap();
+        let _ = sender.send_blocking(WatchBatch::default());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(file_names(view), ["Added.md"]);
+            assert!(!view.folder_watch.refresh_running);
+        });
+        assert!(sender.is_closed(), "the old delivery task has ended");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
