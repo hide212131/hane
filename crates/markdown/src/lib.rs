@@ -256,11 +256,31 @@ mod tests {
         );
     }
 
+    // Fewer than four SPACEs make `scan_space(4)` fail after partially
+    // consuming them; the remainder must still be checked as blank. Each
+    // indent is its own test so one failure cannot hide the others.
     #[test]
-    fn partial_indent_before_blank_line_ends_the_list_item_paragraph() {
-        // Fewer than four SPACEs make `scan_space(4)` fail after partially
-        // consuming them; the remainder must still be checked as blank.
-        for indent in 0..=3usize {
+    fn partial_indent_0_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(0);
+    }
+
+    #[test]
+    fn partial_indent_1_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(1);
+    }
+
+    #[test]
+    fn partial_indent_2_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(2);
+    }
+
+    #[test]
+    fn partial_indent_3_before_blank_line_ends_the_list_item_paragraph() {
+        check_partial_indent_before_blank_line(3);
+    }
+
+    fn check_partial_indent_before_blank_line(indent: usize) {
+        {
             let source = format!("- a\n{}\n", " ".repeat(indent));
             let base = 40;
             let range = SourceRange::new(base, base + source.len());
@@ -276,7 +296,8 @@ mod tests {
             };
             assert_eq!(count(|k| matches!(k, NodeKind::List { start: None })), 1);
             assert_eq!(count(|k| matches!(k, NodeKind::ListItem { task: None })), 1);
-            assert_eq!(count(|k| *k == NodeKind::Paragraph), 1, "{source:?}");
+            // The list is tight, so pulldown emits no Paragraph event.
+            assert_eq!(count(|k| *k == NodeKind::Paragraph), 0, "{source:?}");
 
             assert!(
                 parsed.tree.iter().all(|(_, node)| {
@@ -291,7 +312,7 @@ mod tests {
                 .iter()
                 .find(|(_, node)| node.kind == NodeKind::Text)
                 .map(|(_, node)| node.source_range)
-                .expect("paragraph text node");
+                .expect("list item text node");
             assert_eq!(
                 text,
                 SourceRange::new(base + 2, base + 3),
