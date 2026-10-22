@@ -14919,17 +14919,109 @@ mod tests {
             );
             (first, second)
         });
+        view.update(cx, |view, cx| {
+            view.on_document_replaced();
+            cx.notify();
+        });
         cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
         cx.run_until_parked();
         (view, cx, first, second)
     }
 
+    /// Registers the real key bindings and focuses the editor body with a real
+    /// click, the way `ctrl_tab_cycles_file_tabs_in_order_and_wraps` does, so a
+    /// keystroke reaches the "HaneEditor" key context.
+    fn bind_keys_and_focus_body(cx: &mut gpui::VisualTestContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn close_tab_key() -> &'static str {
+        if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" }
+    }
+
+    #[gpui::test]
+    fn secondary_w_does_not_close_a_tab_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, _first, second) = two_clean_path_tabs(cx);
+        bind_keys_and_focus_body(cx);
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(close_tab_key());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 2);
+            assert!(view.sessions.get(second).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn secondary_w_does_not_close_a_tab_while_inline_rename_is_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, _first, second) = two_clean_path_tabs(cx);
+        bind_keys_and_focus_body(cx);
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                input: short_text_input_with("Alpha", 0..5, false),
+                fixed_extension: Some("md".to_owned()),
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(close_tab_key());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 2);
+            assert!(view.sessions.get(second).is_some());
+            assert!(view.inline_rename_active());
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_close_item_with_a_replaced_document_closes_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, first, second) = two_clean_path_tabs(cx);
+        let stale = view.read_with(cx, |view, _| {
+            view.document_instance(first).expect("first tab open")
+        });
+        // The same session id now holds a different document generation.
+        view.update(cx, |view, cx| {
+            view.work_folder_generation += 1;
+            view.close_file_tab_from_menu(first, stale, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 2);
+            assert!(view.sessions.get(first).is_some());
+            assert!(view.sessions.get(second).is_some());
+        });
+    }
+
     #[gpui::test]
     fn secondary_w_closes_only_the_selected_tab(cx: &mut gpui::TestAppContext) {
         let (view, cx, first, second) = two_clean_path_tabs(cx);
+        bind_keys_and_focus_body(cx);
         view.read_with(cx, |view, _| assert_eq!(view.sessions.active_id(), second));
 
-        let key = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" };
+        let key = close_tab_key();
         cx.simulate_keystrokes(key);
         cx.run_until_parked();
 
@@ -14952,12 +15044,12 @@ mod tests {
     #[gpui::test]
     fn secondary_w_on_an_unsaved_tab_asks_before_closing(cx: &mut gpui::TestAppContext) {
         let (view, cx, _first, second) = two_clean_path_tabs(cx);
+        bind_keys_and_focus_body(cx);
         view.update(cx, |view, cx| {
             view.editor_mut().insert_text("edit").unwrap();
             view.after_input(cx);
         });
-        let key = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" };
-        cx.simulate_keystrokes(key);
+        cx.simulate_keystrokes(close_tab_key());
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
