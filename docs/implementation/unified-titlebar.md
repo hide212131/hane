@@ -192,7 +192,13 @@ div()
 
 ### 7.1 設定とnative appearance
 
-`cx.set_window_appearance(...)` は、`Cargo.lock` が固定する `gpui-pre 0.3.6` の既存公開API `App::set_window_appearance(&self, Option<WindowAppearance>)` である。GPUIの更新やvendor変更は不要で、新しい公開APIも追加しない。Platform側のsetterはdefault no-opで、既存のmacOS backendがoverrideを持ち、Windowsはdefault no-opを使う。以下は、この既存setterに渡す値の契約である。
+`cx.set_window_appearance(...)` は、`Cargo.lock` が固定する
+`gpui-pre 0.3.6` の既存公開API
+`App::set_window_appearance(&self, Option<WindowAppearance>)` である。
+GPUIの更新やvendor変更は不要で、新しい公開APIも追加しない。
+Platform側のsetterはdefault no-opで、
+既存のmacOS backendがoverrideを持ち、Windowsはdefault no-opを使う。
+以下は、この既存setterに渡す値の契約である。
 
 | `ThemePreference` | 既存の `cx.set_window_appearance(...)` の引数 |
 |---|---|
