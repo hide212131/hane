@@ -33,7 +33,15 @@ Windows / macOSで、ウインドウ操作と既存のファイルタブを**高
 | 最小サイズ | 対象OSでは `window_min_size = 330 × 240`論理px。固定操作領域を保ちながらWindows Snapの小さい領域へ入れる範囲を広げる。初期サイズは現行960×760を維持 |
 | 設定画面 | 同じ40px上部とOSボタンを保ち、メニュー・タブの代わりに「設定」を表示。既存の「アプリに戻る」は設定画面の本文側に残す |
 
-Windows 11では最小幅がSnap領域より大きいと配置できない場合がある。Microsoftは幅330 effective pixels以下を、より広い端末でのSnap互換性の推奨値としている。Haneの下限は330論理pxを目標とするが、330 effective pxはより広い互換性の推奨であり、Issue #542にない固定の合否閾値にはしない。表示倍率による実効寸法は、T02/T04で最小幅の物理pixel幅と対象ウインドウのDPIを取得し、`effective px = physical px × 96 / DPI`（[Microsoft公式](https://learn.microsoft.com/en-us/windows/win32/learnwin32/dpi-and-device-independent-pixels)）で算出して記録する。物理pixel幅とDPIは同じウインドウ／モニターのものを対応させる。
+Windows 11では最小幅がSnap領域より大きいと配置できない場合がある。
+Microsoftは幅330 effective pixels以下を、より広い端末でのSnap互換性の推奨値としている。
+Haneの下限は330論理pxを目標とするが、330 effective pxはより広い互換性の推奨であり、
+Issue #542にない固定の合否閾値にはしない。
+表示倍率による実効寸法は、T02/T04で最小幅の物理pixel幅と対象ウインドウのDPIを取得し、
+`effective px = physical px × 96 / DPI`
+（[Microsoft公式](https://learn.microsoft.com/en-us/windows/win32/learnwin32/dpi-and-device-independent-pixels)）
+で算出して記録する。
+物理pixel幅とDPIは同じウインドウ／モニターのものを対応させる。
 
 タイトルを重ねて表示するための行や、タブの追加・閉じるボタン、新しい検索欄は作らない。ウインドウ名の管理、既存キーボード操作、フォーカスの復帰経路は維持する。サイドバーは全幅の上部の下から始める。
 
@@ -85,7 +93,10 @@ Windows 11では最小幅がSnap領域より大きいと配置できない場合
 
 対象OSでは `gpui_component::TitleBar::window_options()` を基に、既存bounds、最小サイズ、macOSボタン位置を設定する。通常起動・instrument・新規の対象テストは同じ生成関数を通す。
 
-共通定数 `WINDOW_TITLEBAR_HEIGHT` は、予定する `crates/ui/src/view/titlebar.rs` で描画する `TitleBar` 要素に `.h(WINDOW_TITLEBAR_HEIGHT)` として適用する。`TitleBar::window_options()` はウインドウ生成オプション（native titlebar / drag設定）のためのAPIであり、描画される要素の高さは変更しない。
+共通定数 `WINDOW_TITLEBAR_HEIGHT` は、予定する `crates/ui/src/view/titlebar.rs` で描画する
+`TitleBar` 要素に `.h(WINDOW_TITLEBAR_HEIGHT)` として適用する。
+`TitleBar::window_options()` はウインドウ生成オプション（native titlebar / drag設定）のためのAPIであり、
+描画される要素の高さは変更しない。
 
 ```rust
 // 設計上の形。実装はwindow_chrome側へ置く。
