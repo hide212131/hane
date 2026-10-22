@@ -76,12 +76,18 @@ impl Redactor {
                 }
                 _ => {}
             }
-            out.push(self.redact_token(token));
+            let (text, mask_following) = self.redact_token(token);
+            if mask_following && mask_next == 0 {
+                mask_next = 1;
+            }
+            out.push(text);
         }
         truncate_chars(&out.join(" "), max_chars)
     }
 
-    fn redact_token(&self, token: &str) -> String {
+    /// The masked token, and whether the value of a secret key continues in
+    /// the next whitespace-separated token (`token: abc`).
+    fn redact_token(&self, token: &str) -> (String, bool) {
         // A URL is handled as a whole: its query and userinfo are dropped.
         if !token.contains("://")
             && let Some(masked) = mask_secret_pair(token)
@@ -96,11 +102,33 @@ impl Redactor {
         if let Some(user) = &self.user {
             text = text.replace(user.as_str(), USER_MASK);
         }
-        text
+        (text, false)
     }
 }
 
-fn mask_secret_pair(token: &str) -> Option<String> {
+/// Masks every `key=value` / `key:value` / `"key":"value"` pair of a token
+/// whose key looks secret. Pairs are split on `,` `&` `;`.
+fn mask_secret_pair(token: &str) -> Option<(String, bool)> {
+    let mut out = String::new();
+    let mut changed = false;
+    let mut mask_following = false;
+    for segment in token.split_inclusive([',', '&', ';']) {
+        let body = segment.trim_end_matches([',', '&', ';']);
+        let delimiter = &segment[body.len()..];
+        match mask_secret_segment(body) {
+            Some((masked, continues)) => {
+                changed = true;
+                mask_following = continues && delimiter.is_empty();
+                out.push_str(&masked);
+            }
+            None => out.push_str(body),
+        }
+        out.push_str(delimiter);
+    }
+    changed.then_some((out, mask_following))
+}
+
+fn mask_secret_segment(body: &str) -> Option<(String, bool)> {
     const WORDS: [&str; 10] = [
         "token",
         "secret",
@@ -113,14 +141,42 @@ fn mask_secret_pair(token: &str) -> Option<String> {
         "credential",
         "key",
     ];
-    let (key, _) = token.split_once('=')?;
-    let lower = key.to_ascii_lowercase();
+    const WRAPPERS: [char; 8] = ['{', '[', '(', '"', '\'', '`', ' ', '\t'];
+    let at = body.find(['=', ':'])?;
+    let key_raw = &body[..at];
+    let separator = &body[at..=at];
+    let value = &body[at + 1..];
+    let lower = key_raw.trim_matches(WRAPPERS).to_ascii_lowercase();
     let signature = lower.contains("signature") || lower == "sig";
-    if signature || WORDS.iter().any(|word| lower.contains(word)) {
-        Some(format!("{key}={REDACTED}"))
-    } else {
-        None
+    if !(signature || WORDS.iter().any(|word| lower.contains(word))) {
+        return None;
     }
+    let bare = value.trim_matches(|c: char| WRAPPERS.contains(&c) || "}])".contains(c));
+    if bare.is_empty() {
+        // `token:` / `"token":` — the value is the next token.
+        return Some((body.to_owned(), true));
+    }
+    // Keep closing brackets so the surrounding structure stays readable.
+    let closers: String = value
+        .chars()
+        .rev()
+        .take_while(|c| "}])\"'`".contains(*c))
+        .filter(|c| "}])".contains(*c))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    // An opening quote without its closing one: the value has spaces.
+    let unterminated = value
+        .trim_start_matches(['{', '[', '('])
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\''))
+        .is_some_and(|quote| value.matches(quote).count() < 2);
+    Some((
+        format!("{key_raw}{separator}{REDACTED}{closers}"),
+        unterminated,
+    ))
 }
 
 /// Drops `user:password@` and everything after `?` or `#` of a URL.
@@ -458,6 +514,29 @@ mod tests {
         assert!(out.contains("https://example.com/a/b?<redacted>"), "{out}");
         assert!(out.contains("token=<redacted>"), "{out}");
         assert!(out.contains("~/Library/x"), "{out}");
+    }
+
+    #[test]
+    fn colon_and_json_style_secrets_are_masked() {
+        let cases: [(&str, &str); 7] = [
+            ("token:abc123", "token:<redacted>"),
+            ("token: abc123 next", "token: <redacted> next"),
+            ("\"token\":\"abc123\"", "\"token\":<redacted>"),
+            ("\"token\": \"abc123\" ok", "\"token\": <redacted> ok"),
+            ("{\"authToken\":\"abc123\"}", "{\"authToken\":<redacted>}"),
+            (
+                "{\"code\":\"E1\",\"password\":\"abc123\",\"stage\":\"check\"}",
+                "{\"code\":\"E1\",\"password\":<redacted>,\"stage\":\"check\"}",
+            ),
+            ("a=1&token=abc123&b=2", "a=1&token=<redacted>&b=2"),
+        ];
+        for (input, expected) in cases {
+            let out = redactor().redact(input, 1000);
+            assert_eq!(out, expected, "{input}");
+            assert!(!out.contains("abc123"), "leaked in {out}");
+        }
+        let plain = redactor().redact("stage=check code:E1 12:30:45", 1000);
+        assert_eq!(plain, "stage=check code:E1 12:30:45");
     }
 
     #[test]
