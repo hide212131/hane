@@ -223,6 +223,31 @@ fn failure_text(code: &str) -> &'static str {
     }
 }
 
+/// Why updates are unavailable, with what the user can actually do. Install
+/// placement failures are named here instead of surfacing later as a generic
+/// I/O error after the archive was fetched. Moving the app or reopening it
+/// from Finder is not promised to clear a quarantined launch.
+fn unavailable_text(code: &str) -> Option<&'static str> {
+    match code {
+        "app_translocated" => Some(
+            "macOSの隔離(App Translocation)された読み取り専用の場所から起動しているため、更新できません。Haneを終了し、配置済みの Hane.app を直接起動し直してください。それでも解消しない場合は、リリースページから手動で更新してください。",
+        ),
+        "unsupported_install" => Some(
+            "このインストール場所のHaneは自動更新に対応していません。リリースページから手動で更新してください。",
+        ),
+        "install_modified" => Some(
+            "インストール済みのアプリの内容を確認できませんでした。Haneを入れ直してください。",
+        ),
+        "identity_mismatch" => Some(
+            "このHaneの所有者が現在の実行ユーザーと異なるため、更新できません。現在のユーザーが所有し書き込める場所にHaneを入れ直してください。それまではリリースページから手動で更新できます。",
+        ),
+        "io" | "receipt_unwritable" => Some(
+            "インストール場所を確認できないため、更新できません。アプリの場所と書き込み権限を確認してください。",
+        ),
+        _ => None,
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     format!("{:.1} MiB", bytes as f64 / MIB)
@@ -300,7 +325,10 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             model.actions.push((CardAction::Check, "再試行"));
         }
         AppUpdatePhase::Unavailable => {
-            model.detail = Some(format!("更新情報を利用できません (診断コード: {code})"));
+            model.detail = Some(match unavailable_text(code) {
+                Some(text) => format!("{text} (診断コード: {code})"),
+                None => format!("更新情報を利用できません (診断コード: {code})"),
+            });
         }
     }
     model
@@ -1446,6 +1474,46 @@ mod tests {
         let detail = model.detail.unwrap();
         assert!(detail.contains("更新情報を利用できません"));
         assert!(detail.contains("trust_unconfigured"));
+    }
+
+    #[test]
+    fn an_unusable_placement_explains_itself_without_promising_a_fix() {
+        for code in ["app_translocated", "unsupported_install", "install_modified", "io"] {
+            let mut input = snapshot(AppUpdatePhase::Unavailable);
+            input.error_code = Some(code.to_owned());
+            let model = card_model(&input);
+            assert!(model.actions.is_empty(), "{code}");
+            let detail = model.detail.unwrap();
+            assert!(detail.contains(code), "{code}: {detail}");
+            assert!(!detail.contains("更新情報を利用できません"), "{code}: {detail}");
+            assert!(!detail.contains("必ず"), "{code}: {detail}");
+        }
+    }
+
+    #[test]
+    fn an_owner_mismatch_placement_explains_the_owner_and_a_safe_action() {
+        let mut input = snapshot(AppUpdatePhase::Unavailable);
+        input.error_code = Some("identity_mismatch".to_owned());
+        let model = card_model(&input);
+        assert!(model.actions.is_empty());
+        let detail = model.detail.unwrap();
+        assert!(detail.contains("所有者"), "{detail}");
+        assert!(detail.contains("入れ直"), "{detail}");
+        assert!(detail.contains("identity_mismatch"), "{detail}");
+        assert!(!detail.contains("更新情報を利用できません"), "{detail}");
+        assert!(!detail.contains("署名"), "{detail}");
+        assert!(!detail.contains("管理者"), "{detail}");
+    }
+
+    #[test]
+    fn a_failed_identity_mismatch_keeps_the_signature_wording() {
+        let mut input = snapshot(AppUpdatePhase::Failed);
+        input.error_code = Some("identity_mismatch".to_owned());
+        let model = card_model(&input);
+        let detail = model.detail.clone().unwrap();
+        assert!(detail.contains("署名または発行元"), "{detail}");
+        assert!(!detail.contains("所有者"), "{detail}");
+        assert_eq!(labels(&model), ["再試行"]);
     }
 
     #[test]
