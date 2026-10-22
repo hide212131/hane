@@ -1510,7 +1510,7 @@ mod tests {
         let mut input = snapshot(AppUpdatePhase::Failed);
         input.error_code = Some("identity_mismatch".to_owned());
         let model = card_model(&input);
-        let detail = model.detail.unwrap();
+        let detail = model.detail.clone().unwrap();
         assert!(detail.contains("署名または発行元"), "{detail}");
         assert!(!detail.contains("所有者"), "{detail}");
         assert_eq!(labels(&model), ["再試行"]);
