@@ -1328,6 +1328,34 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_mismatched_placement_stays_blocked_with_its_code() {
+        let dir = TempDir::new("app-update-owner-mismatch");
+        let transport = Arc::new(ScriptedTransport::new());
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            transport.clone(),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        let error = UpdateError::new(ErrorCode::IdentityMismatch, "owner differs");
+        service.block_placement(&error, Path::new("/Applications/Hane.app/Contents/MacOS/hane"));
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Unavailable);
+        assert_eq!(snapshot.error_code.as_deref(), Some("identity_mismatch"));
+        service.check();
+        service.restore_local();
+        service.download(&"a".repeat(64));
+        run_queued(&queue);
+        assert!(transport.requests().is_empty());
+        let after = service.snapshot();
+        assert_eq!(after.phase, AppUpdatePhase::Unavailable);
+        assert_eq!(after.error_code.as_deref(), Some("identity_mismatch"));
+        assert!(!after.restart_supported);
+        assert!(service.prepare_restart(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
     fn a_placement_failure_keeps_its_class_and_a_normal_service_still_downloads() {
         let error = UpdateError::new(ErrorCode::InstallModified, "damaged");
         assert_eq!(

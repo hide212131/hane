@@ -238,6 +238,9 @@ fn unavailable_text(code: &str) -> Option<&'static str> {
         "install_modified" => Some(
             "インストール済みのアプリの内容を確認できませんでした。Haneを入れ直してください。",
         ),
+        "identity_mismatch" => Some(
+            "このHaneの所有者が現在の実行ユーザーと異なるため、更新できません。現在のユーザーが所有し書き込める場所にHaneを入れ直してください。それまではリリースページから手動で更新できます。",
+        ),
         "io" | "receipt_unwritable" => Some(
             "インストール場所を確認できないため、更新できません。アプリの場所と書き込み権限を確認してください。",
         ),
@@ -1485,6 +1488,32 @@ mod tests {
             assert!(!detail.contains("更新情報を利用できません"), "{code}: {detail}");
             assert!(!detail.contains("必ず"), "{code}: {detail}");
         }
+    }
+
+    #[test]
+    fn an_owner_mismatch_placement_explains_the_owner_and_a_safe_action() {
+        let mut input = snapshot(AppUpdatePhase::Unavailable);
+        input.error_code = Some("identity_mismatch".to_owned());
+        let model = card_model(&input);
+        assert!(model.actions.is_empty());
+        let detail = model.detail.unwrap();
+        assert!(detail.contains("所有者"), "{detail}");
+        assert!(detail.contains("入れ直"), "{detail}");
+        assert!(detail.contains("identity_mismatch"), "{detail}");
+        assert!(!detail.contains("更新情報を利用できません"), "{detail}");
+        assert!(!detail.contains("署名"), "{detail}");
+        assert!(!detail.contains("管理者"), "{detail}");
+    }
+
+    #[test]
+    fn a_failed_identity_mismatch_keeps_the_signature_wording() {
+        let mut input = snapshot(AppUpdatePhase::Failed);
+        input.error_code = Some("identity_mismatch".to_owned());
+        let model = card_model(&input);
+        let detail = model.detail.unwrap();
+        assert!(detail.contains("署名または発行元"), "{detail}");
+        assert!(!detail.contains("所有者"), "{detail}");
+        assert_eq!(labels(&model), ["再試行"]);
     }
 
     #[test]
