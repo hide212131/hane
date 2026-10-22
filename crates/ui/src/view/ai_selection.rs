@@ -1291,6 +1291,10 @@ impl EditorView {
             .w(px(ai_selection_popup_width_for(
                 self.ai_selection_editor_area_width(),
             )))
+            .min_w(px(0.0))
+            .max_w(px(ai_selection_popup_width_for(
+                self.ai_selection_editor_area_width(),
+            )))
             .max_h(px(AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT))
             .flex()
             .flex_col()
@@ -1340,8 +1344,12 @@ impl EditorView {
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.close_ai_selection(window, cx));
             });
+        // The close control never shrinks and always keeps its slot at the
+        // header's right edge; the title gives way (truncates) instead.
         let close = div()
             .id("ai-selection-close-focus-ring")
+            .debug_selector(|| "ai-selection-close".to_owned())
+            .flex_none()
             .rounded_sm()
             .when(close_focused, |el| {
                 el.border_1().border_color(rgb(theme.link_foreground))
@@ -1351,11 +1359,22 @@ impl EditorView {
             .flex()
             .items_center()
             .justify_between()
+            .gap_2()
+            .w_full()
+            .min_w(px(0.0))
             .px_2()
             .py_1()
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::BOLD)
-            .child("選択した文章に指示する")
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child("選択した文章に指示する"),
+            )
             .child(close);
         let view = cx.entity();
         let send = Button::new("ai-selection-send")
@@ -1368,6 +1387,8 @@ impl EditorView {
             });
         let send = div()
             .id("ai-selection-send-focus-ring")
+            .debug_selector(|| "ai-selection-send".to_owned())
+            .flex_none()
             .rounded_sm()
             .when(send_focused, |el| {
                 el.border_1().border_color(rgb(theme.link_foreground))
@@ -1387,7 +1408,14 @@ impl EditorView {
                     .children(input.map(|input| Input::new(&input).aria_label("ai instruction"))),
             )
             .child(send);
-        let mut body = div().flex().flex_col().child(header).child(input_row);
+        let input_row = input_row.w_full().min_w(px(0.0));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w(px(0.0))
+            .child(header)
+            .child(input_row);
         if let Some(message) = &self.ai_selection.message {
             body = body.child(
                 div()
@@ -1969,6 +1997,46 @@ mod tests {
                 assert!(left >= 0.0);
                 assert!(left + width <= window_width + 0.01);
             });
+        }
+    }
+
+    #[gpui::test]
+    fn close_and_send_controls_are_painted_inside_the_window_at_narrow_widths(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("one two three\n", "Untitled", cx));
+        for window_width in [279.0_f32, 280.0, 960.0] {
+            cx.simulate_resize(gpui::size(px(window_width), px(760.0)));
+            cx.run_until_parked();
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    view.editor_mut()
+                        .set_selection(Selection {
+                            anchor: SourceOffset(0),
+                            active: SourceOffset(3),
+                        })
+                        .unwrap();
+                    view.open_ai_selection(window, cx);
+                });
+            });
+            cx.run_until_parked();
+            for selector in ["ai-selection-popup", "ai-selection-close", "ai-selection-send"] {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} painted at width {window_width}"));
+                assert!(
+                    f32::from(bounds.left()) >= -0.01
+                        && f32::from(bounds.right()) <= window_width + 0.01,
+                    "{selector} {bounds:?} must stay inside width {window_width}"
+                );
+            }
+            view.update(cx, |view, cx| {
+                view.ai_selection.open = false;
+                cx.notify();
+            });
+            cx.run_until_parked();
         }
     }
 
