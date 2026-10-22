@@ -9,7 +9,7 @@ Windows / macOSで、ウインドウ操作と既存のファイルタブを**高
 
 2026-10-21時点の実装前設計。製品コード、ビルド、実機での操作確認はこの文書の作成では変更・実施していない。現在の実装・受入状況はIssueと実装PRの証拠で確認する。設計PRの採用だけでは製品受入完了にならない。
 
-基準mainは `29f7943ce225016ebf3f76c1115857d887388103`。依存は `gpui-pre = 0.3.6`、`gpui-pre-platform = 0.3.6`、`gpui-component = 0.6.6`。Haneのcrate名は `gpui` / `gpui_platform` / `gpui_component`。有効なOSパッチは `vendor/gpui-pre-macos` と `vendor/gpui-pre-windows` であり、古い `vendor/gpui` だけを根拠にAPIや実行経路を判断しない。[S1][S4]
+基準mainは `29f7943ce225016ebf3f76c1115857d887388103`。依存は `gpui-pre = 0.3.6`、`gpui-pre-platform = 0.3.6`、`gpui-component = 0.6.6`。Haneのcrate名は `gpui` / `gpui_platform` / `gpui_component`。有効なOSパッチは `vendor/gpui-pre-macos` と `vendor/gpui-pre-windows` であり、古い `vendor/gpui` だけを根拠にAPIや実行経路を判断しない。`[S1][S4]`
 
 既存の[ADR-0030](../adr/0030-gpui-kit-incremental-local-adoption.md)に従う局所的な部品導入とし、新しいADR、汎用レイアウト基盤、依存更新は必要としない。
 
@@ -39,7 +39,7 @@ Windows 11では最小幅がSnap領域より大きいと配置できない場合
 
 ### 2.2 配色
 
-上部の背景には既存の `tab_bar_background`、文字には `tab_bar_foreground`、下端の1px境界には既存の `tab_bar_border` を使う。タブ選択・未選択・ホバーは現行の `TabBar` / `Tab` の配色を引き継ぐ。[S2]
+上部の背景には既存の `tab_bar_background`、文字には `tab_bar_foreground`、下端の1px境界には既存の `tab_bar_border` を使う。タブ選択・未選択・ホバーは現行の `TabBar` / `Tab` の配色を引き継ぐ。`[S2]`
 
 | 部位 | Light | Dark |
 |---|---|---|
@@ -48,7 +48,7 @@ Windows 11では最小幅がSnap領域より大きいと配置できない場合
 | 本文文字 | `#262626` | `#e8e5df` |
 | サイドバー背景 | `#f0ede7` | `#18191b` |
 
-`TitleBar` の既定グラデーションは `.bg(...)` で単色に置き換える。現行の可視タブ行はすでにテーマ対応している。Lightでも暗い値を持つ未使用の `header_background` を、新しい上部背景として転用しない。[S2][S4]
+`TitleBar` の既定グラデーションは `.bg(...)` で単色に置き換える。現行の可視タブ行はすでにテーマ対応している。Lightでも暗い値を持つ未使用の `header_background` を、新しい上部背景として転用しない。`[S2][S4]`
 
 ### 2.3 並行作業との接続
 
@@ -98,9 +98,9 @@ if let Some(titlebar) = options.titlebar.as_mut() {
 }
 ```
 
-`titlebar: Some(...)` と `app_owns_titlebar_drag: true` を保つ。`is_movable` / `is_resizable` / `is_minimizable` は既定のtrue。ウインドウ全体の透過設定は追加しない。[S4][S5]
+`titlebar: Some(...)` と `app_owns_titlebar_drag: true` を保つ。`is_movable` / `is_resizable` / `is_minimizable` は既定のtrue。ウインドウ全体の透過設定は追加しない。`[S4][S5]`
 
-macOSのy=12は、部品既定の高さ34・y=9に対して `(40 - 34) / 2` を加えた設計値。OS側は標準ボタンの実寸を読むため、全OSで厳密に同じ中心座標になるとは仮定しない。実画面で40px内への収まり・非重複・全画面復帰を確認する。修正が必要なら、まずこの一つの位置定数で調整できるか判断する。[S4][S6]
+macOSのy=12は、部品既定の高さ34・y=9に対して `(40 - 34) / 2` を加えた設計値。OS側は標準ボタンの実寸を読むため、全OSで厳密に同じ中心座標になるとは仮定しない。実画面で40px内への収まり・非重複・全画面復帰を確認する。修正が必要なら、まずこの一つの位置定数で調整できるか判断する。`[S4][S6]`
 
 ### 4.2 OS別の委譲
 
@@ -112,7 +112,7 @@ macOSのy=12は、部品既定の高さ34・y=9に対して `(40 - 34) / 2` を�
 | Windows最大化ボタン上のSnap | `Max` → `HTMAXBUTTON` の既存経路を維持。実機で候補表示と配置を確認 |
 | ウインドウ移動・上端／角のリサイズ | 部品と既存OS backendに任せ、同じ操作の追加ハンドラを重ねない |
 
-Windowsの3ボタンへ独自の `on_click` を追加しない。backendが押下・解放から標準操作や `WM_CLOSE` へつなぐ。`TitleBar::on_close_window()` はLinux専用なので、Windows / macOSの終了フックに使わない。[S4][S7]
+Windowsの3ボタンへ独自の `on_click` を追加しない。backendが押下・解放から標準操作や `WM_CLOSE` へつなぐ。`TitleBar::on_close_window()` はLinux専用なので、Windows / macOSの終了フックに使わない。`[S4][S7]`
 
 macOSの全画面往復は対象。全画面時の追加左余白と標準ボタンの復帰は既存部品・backendを利用する。基準HaneにWindows全画面の入口は確認できず、今回は新設しない。開始時のコードに入口が追加されていた場合だけ再評価する。現backendは全画面中に操作領域を返さず、部品は3ボタンを自動では隠さないため、動くと推測しない。
 
@@ -120,7 +120,7 @@ Linux等の非対象OSは既存の生成設定・標準タイトルバー・タ�
 
 ## 5. 操作領域と移動用余白
 
-`TitleBar 0.6.6` の内側全体には `WindowControlArea::Drag` が付く。タブやメニューを子に置くだけでは、OSのウインドウ移動と競合する。[S4]
+`TitleBar 0.6.6` の内側全体には `WindowControlArea::Drag` が付く。タブやメニューを子に置くだけでは、OSのウインドウ移動と競合する。`[S4]`
 
 メニューとタブのそれぞれを、次の条件を持つ操作領域で囲う。
 
@@ -128,7 +128,7 @@ Linux等の非対象OSは既存の生成設定・標準タイトルバー・タ�
 2. 左mousedownと二度押しの伝播をこの囲いで止め、親の `TitleBar` の移動開始・拡大処理へ流さない。子の既存クリック処理は先に実行される配置にする。
 3. 最低48pxの移動用余白と、部品が描くWindows操作ボタンは囲いの外に置く。余白に別の移動・拡大ハンドラは足さない。
 
-操作領域は `div().id("titlebar-tabs")` / `div().id("titlebar-menu")` のように安定したIDを付けて作る。0.6.6の `on_double_click` は `Stateful<E>` の拡張なので、IDなしの `Div` のまま呼ばない。形は以下のとおり。`gpui::InteractiveElement` と `gpui_component::InteractiveElementExt` を利用する。[S8]
+操作領域は `div().id("titlebar-tabs")` / `div().id("titlebar-menu")` のように安定したIDを付けて作る。0.6.6の `on_double_click` は `Stateful<E>` の拡張なので、IDなしの `Div` のまま呼ばない。形は以下のとおり。`gpui::InteractiveElement` と `gpui_component::InteractiveElementExt` を利用する。`[S8]`
 
 ```rust
 div()
@@ -139,7 +139,7 @@ div()
     .child(existing_tab_strip)
 ```
 
-このGPUI版の `WindowControlArea` に `Client` / `NoDrag` はない。`.block_mouse_except_scroll()` は親Dragの当たり判定IDを消す代用にはならない。上部全体の `.occlude()` は移動用余白まで無効にするため使わない。mouseupの伝播まで一律に止めず、部品内部の `should_move` が解除される既存処理を残す。[S8]
+このGPUI版の `WindowControlArea` に `Client` / `NoDrag` はない。`.block_mouse_except_scroll()` は親Dragの当たり判定IDを消す代用にはならない。上部全体の `.occlude()` は移動用余白まで無効にするため使わない。mouseupの伝播まで一律に止めず、部品内部の `should_move` が解除される既存処理を残す。`[S8]`
 
 タブ領域は `.flex_1().min_w_0().overflow_hidden()` とし、メニューと48px余白は `flex_none`。Windows右102pxは `TitleBar` 内部の固定領域に任せる。横スクロール対象にメニュー・余白・OSボタンを含めない。タブ表示領域内の空白も通常のタブ領域とし、移動は明示的に残した余白から行う。設定時は「設定」ラベルを除く空白を移動に使える。
 
@@ -151,7 +151,7 @@ div()
 
 対象OSの共通rootは縦並びで「40pxの上部」「残りの内容」の二つにする。編集内容の中を従来どおりサイドバー・仕切り・main columnの横並びにする。main columnに旧headerを残さない。
 
-設定画面は現在 `render` の途中で別rootを返すため、その分岐より前でテーマを同期し、両方を共通外枠へ渡す。設定画面の `request_leave_settings` と `settings_screen_shell` の `#[inline(never)]` は残す。後者はWindowsのUIスレッドのスタックを守るための分割であり、巨大な単一renderへ吸収しない。[S2]
+設定画面は現在 `render` の途中で別rootを返すため、その分岐より前でテーマを同期し、両方を共通外枠へ渡す。設定画面の `request_leave_settings` と `settings_screen_shell` の `#[inline(never)]` は残す。後者はWindowsのUIスレッドのスタックを守るための分割であり、巨大な単一renderへ吸収しない。`[S2]`
 
 内容側は `.flex_1().min_h(0).min_w(0)` などで残りの高さに収める。旧 `.size_full()` を40pxの下へそのまま積み、下端をはみ出させない。overlayがwindow座標を使う場合はouter rootに置くか座標系を明示し、移動した親の下で40pxを再加算しない。
 
@@ -178,11 +178,11 @@ div()
 | `view/viewport.rs::on_scroll_at` / `on_pinch` | 拡大の基準となるポインター位置 |
 | `view/ai_selection.rs::ai_selection_overlay_position` / `ai_selection_overlay` | 本文の選択位置とAI画面の上端制限 |
 
-サイドバーへ渡す `sidebar_viewport_height` は `H - T` にする。`work_folder_sidebar` と `content_search_sidebar` は同じ意味の高さを受け取る。一方、`list_top` とスクロールバーの `.top(list_top)` はサイドバー内の相対位置なのでTを足さない。スクロールバーのドラッグ差分は既存のwindow座標差分を維持する。[S2][S3]
+サイドバーへ渡す `sidebar_viewport_height` は `H - T` にする。`work_folder_sidebar` と `content_search_sidebar` は同じ意味の高さを受け取る。一方、`list_top` とスクロールバーの `.top(list_top)` はサイドバー内の相対位置なのでTを足さない。スクロールバーのドラッグ差分は既存のwindow座標差分を維持する。`[S2][S3]`
 
 ### 6.3 IMEの候補位置
 
-`InputCapture` は本文先頭に残す。`ElementInputHandler` に渡す実描画boundsと、`bounds_for_range` が返すcaretの相対位置の組合せを維持する。フィルター・名前変更の短い入力欄も実boundsを使う。候補位置に40pxを手動加算しない。[S3]
+`InputCapture` は本文先頭に残す。`ElementInputHandler` に渡す実描画boundsと、`bounds_for_range` が返すcaretの相対位置の組合せを維持する。フィルター・名前変更の短い入力欄も実boundsを使う。候補位置に40pxを手動加算しない。`[S3]`
 
 サイドバーは親が40px下へ動くので、実IMEの候補位置は必ず実画面で確認する。貼り付けやcaret表示だけを候補位置確認の代わりにしない。
 
@@ -200,7 +200,7 @@ div()
 | Dark | `Some(WindowAppearance::Dark)` |
 | System | `None` |
 
-Systemを、その瞬間のLight / Darkを入れた `Some(...)` に置き換えない。そうするとOS追従が固定される。Windowsではこのnative override APIはno-opであり、今回はHaneが描く上部と操作ボタンの配色を合わせる。OSが管理する外周1pxや影まで独自に変更するvendor拡張は追加しない。[S6][S7]
+Systemを、その瞬間のLight / Darkを入れた `Some(...)` に置き換えない。そうするとOS追従が固定される。Windowsではこのnative override APIはno-opであり、今回はHaneが描く上部と操作ボタンの配色を合わせる。OSが管理する外周1pxや影まで独自に変更するvendor拡張は追加しない。`[S6][S7]`
 
 ### 7.2 更新順と初期化
 
@@ -211,9 +211,9 @@ Systemを、その瞬間のLight / Darkを入れた `Some(...)` に置き換え�
 3. その値とpreferenceからHaneのthemeを解決する。初回／preference変更／解決色変更のいずれかで `sync_component_theme()` を一度実行し、上部を描画する前に揃える。判定用の状態は再通知前に更新する。
 4. 文字色等のcacheを消す条件は実際の配色変更に対応させる。毎フレーム `Theme::change` を無条件に呼んで描画通知を繰り返さない。通常のrenderも手順2と同じ取得関数を使う。
 
-`Window::appearance()` はキャッシュで、macOSの変更通知による更新は非同期に実行される。override解除直後にこのキャッシュを読むと、古い明暗で描画し直す可能性がある。`cx.window_appearance()` は `NSApplication.effectiveAppearance` を直接読むため、設定直後にもrenderにも同じ取得関数を使う。固定時間の待機や任意のdefer順には頼らない。[S6][S8]
+`Window::appearance()` はキャッシュで、macOSの変更通知による更新は非同期に実行される。override解除直後にこのキャッシュを読むと、古い明暗で描画し直す可能性がある。`cx.window_appearance()` は `NSApplication.effectiveAppearance` を直接読むため、設定直後にもrenderにも同じ取得関数を使う。固定時間の待機や任意のdefer順には頼らない。`[S6][S8]`
 
-`ComponentTheme::change()` だけではmacOS標準部品のappearanceは変わらない。初期Hane themeと保存設定がともにLightで見かけの色変化がなくても、初回同期を一度行う。設定画面の早期returnより前に処理し、設定中の上部にも即時反映する。[S2][S4]
+`ComponentTheme::change()` だけではmacOS標準部品のappearanceは変わらない。初期Hane themeと保存設定がともにLightで見かけの色変化がなくても、初回同期を一度行う。設定画面の早期returnより前に処理し、設定中の上部にも即時反映する。`[S2][S4]`
 
 ## 8. 既存操作を保つ境界
 
@@ -240,15 +240,15 @@ current mainには `file_menu_button` が実在し、ファイルを開く・フ
 | 末尾タブの表示 | `reveal_file_tab` / `scroll_to_item` を維持 |
 | パス表示・未保存表示 | `HoverCard` の識別子は `SessionId`。表示indexへ変えない。既存の `*` とパスコピーを維持 |
 
-`Ctrl+Tab`、IME中の切替制約、名前変更の完了／取消、focusの復帰は現行経路を使う。新しい上部専用の入力ルーティングは作らない。[S2]
+`Ctrl+Tab`、IME中の切替制約、名前変更の完了／取消、focusの復帰は現行経路を使う。新しい上部専用の入力ルーティングは作らない。`[S2]`
 
 ### 8.2 ウインドウを閉じる／タブを閉じる
 
-ウインドウの閉じるボタンは、既存のOS終了経路を一度だけ通す。通常ビルドの `main.rs::on_window_should_close` は `flush_pending_drafts(); true`。終了フックを通らない直接破棄や、`close_tab_now` への置換はしない。[S1]
+ウインドウの閉じるボタンは、既存のOS終了経路を一度だけ通す。通常ビルドの `main.rs::on_window_should_close` は `flush_pending_drafts(); true`。終了フックを通らない直接破棄や、`close_tab_now` への置換はしない。`[S1]`
 
 基準mainに全タブの未保存確認はなく、今回新設しない。`flush_pending_drafts` は作業フォルダーに属する無題の下書きを書き出すもので、全ファイルの未保存編集を保存する保証ではない。アプリ終了時の既存hookも保つ。
 
-タブの中クリックは既存の保存／破棄／キャンセル、文書世代、保存失敗時の保持をそのまま通す。ウインドウ終了とタブ終了を共通の新しい保存機構へまとめない。終了フックは基準mainで非instrument時の設定なので、下書き復元は通常ビルドでも確認する。[S1][S2]
+タブの中クリックは既存の保存／破棄／キャンセル、文書世代、保存失敗時の保持をそのまま通す。ウインドウ終了とタブ終了を共通の新しい保存機構へまとめない。終了フックは基準mainで非instrument時の設定なので、下書き復元は通常ビルドでも確認する。`[S1][S2]`
 
 ## 9. 実装順
 
@@ -319,11 +319,11 @@ Windowsは `papa-win` に接続したWindows側ChatGPTから直接操作する�
 
 固定版のソースを設計根拠とする。実装開始時はcurrent mainとの差分を確認する。
 
-- **[S1] Hane生成入口と依存**: [main.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/app/src/main.rs)、[Cargo.toml](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/Cargo.toml)。
-- **[S2] 画面・タブ・設定・配色**: [view.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view.rs)、[theme.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/theme.rs)。
-- **[S3] 座標と入力候補**: [sidebar.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/sidebar.rs)、[content_search.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/content_search.rs)、[viewport.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/viewport.rs)、[ai_selection.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/ai_selection.rs)、[capture.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/capture.rs)、[input.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/input.rs)。
-- **[S4] gpui-component 0.6.6**: [title_bar.rs](https://github.com/longbridge/gpui-kit/blob/v0.6.6/crates/component/src/title_bar.rs)、[theme/mod.rs](https://github.com/longbridge/gpui-kit/blob/v0.6.6/crates/component/src/theme/mod.rs)、[固定版TitleBar文書](https://gpui-kit.com/versions/v0.6.6/component/title-bar)。公開文書のcrate名表記をHaneの依存名へそのまま置き換えず、`gpui_component` を使う。
-- **[S5] GPUI 0.3.6の元commit**: [platform.rsのWindowOptions](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/platform.rs)。
-- **[S6] HaneのmacOS backend**: [window.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-macos/src/window.rs)、[platform.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-macos/src/platform.rs)。
-- **[S7] HaneのWindows backend**: [events.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-windows/src/events.rs)、[util.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-windows/src/util.rs)。SnapのOS契約: [Microsoft公式](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-snap-layout-menu)。
-- **[S8] 当たり判定・appearance・style**: 固定GPUIの [window.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/window.rs)、[app.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/app.rs)、[elements/div.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/elements/div.rs)、[styled.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/styled.rs)、部品側の [base/src/event.rs](https://github.com/longbridge/gpui-kit/blob/v0.6.6/crates/base/src/event.rs)。
+- **`[S1]` Hane生成入口と依存**: [main.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/app/src/main.rs)、[Cargo.toml](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/Cargo.toml)。
+- **`[S2]` 画面・タブ・設定・配色**: [view.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view.rs)、[theme.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/theme.rs)。
+- **`[S3]` 座標と入力候補**: [sidebar.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/sidebar.rs)、[content_search.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/content_search.rs)、[viewport.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/viewport.rs)、[ai_selection.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/view/ai_selection.rs)、[capture.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/capture.rs)、[input.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/crates/ui/src/input.rs)。
+- **`[S4]` gpui-component 0.6.6**: [title_bar.rs](https://github.com/longbridge/gpui-kit/blob/v0.6.6/crates/component/src/title_bar.rs)、[theme/mod.rs](https://github.com/longbridge/gpui-kit/blob/v0.6.6/crates/component/src/theme/mod.rs)、[固定版TitleBar文書](https://gpui-kit.com/versions/v0.6.6/component/title-bar)。公開文書のcrate名表記をHaneの依存名へそのまま置き換えず、`gpui_component` を使う。
+- **`[S5]` GPUI 0.3.6の元commit**: [platform.rsのWindowOptions](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/platform.rs)。
+- **`[S6]` HaneのmacOS backend**: [window.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-macos/src/window.rs)、[platform.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-macos/src/platform.rs)。
+- **`[S7]` HaneのWindows backend**: [events.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-windows/src/events.rs)、[util.rs](https://github.com/hide212131/hane/blob/29f7943ce225016ebf3f76c1115857d887388103/vendor/gpui-pre-windows/src/util.rs)。SnapのOS契約: [Microsoft公式](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-snap-layout-menu)。
+- **`[S8]` 当たり判定・appearance・style**: 固定GPUIの [window.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/window.rs)、[app.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/app.rs)、[elements/div.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/elements/div.rs)、[styled.rs](https://github.com/zed-industries/zed/blob/bcf6582ce3500df93a8a39366640173e6786cea6/crates/gpui/src/styled.rs)、部品側の [base/src/event.rs](https://github.com/longbridge/gpui-kit/blob/v0.6.6/crates/base/src/event.rs)。
