@@ -438,6 +438,79 @@ mod tests {
         block_height: f32,
     }
 
+    /// Proves `offset` lies on a physical source line that Reading collapses,
+    /// from the current formal projection and the document's own line
+    /// ownership (half-open per physical line; only the document end belongs
+    /// to the last line). A line the presentation still carries must be
+    /// closed (zero height, no disclosure); a line it omitted is accepted
+    /// only because the projection names it as collapsed.
+    fn closed_structural_row(
+        view: &EditorView,
+        index: &BlockIndex,
+        block: &IndexedBlock,
+        visual: &VisualBlock,
+        offset: SourceOffset,
+    ) -> Result<(), String> {
+        let document = view.editor().document();
+        let line = document
+            .line_for_offset(offset)
+            .map_err(|error| format!("no physical line owns {offset:?}: {error:?}"))?;
+        let line_range = document
+            .line_range(line)
+            .map_err(|error| format!("no range for {line:?}: {error:?}"))?;
+        let block_lines = block_line_span(document, block)
+            .ok_or("the owning block has no physical line span")?;
+        if !block_lines.contains(&line.0) {
+            return Err(format!(
+                "{offset:?} is on {line:?}, outside the owning block's lines {block_lines:?}"
+            ));
+        }
+        let relative_line = line.0 - block_lines.start;
+        let block_is_final = block.ordinal + 1 == index.len();
+        let disclosure = view.active_height_disclosure();
+        if disclosure.is_some() {
+            return Err("a reading view still has an open height disclosure".to_owned());
+        }
+        let collapsed_fence = index
+            .fence_height_projection(block)
+            .is_some_and(|projection| {
+                projection.is_fence_row_line(relative_line)
+                    && fence_row_is_inactive(
+                        projection,
+                        block.source_range,
+                        relative_line,
+                        disclosure,
+                        block_is_final,
+                    )
+            });
+        let table_delimiter = index.table_projection(block).is_some_and(|projection| {
+            projection.delimiter_range.is_some_and(|delimiter| {
+                document
+                    .line_for_offset(delimiter.start)
+                    .is_ok_and(|delimiter_line| delimiter_line == line)
+            })
+        });
+        if !collapsed_fence && !table_delimiter {
+            return Err(format!(
+                "no layout row owns {offset:?} and {line:?} is not a known collapsed \
+                 structural row of the owning block"
+            ));
+        }
+        if let Some(presented) = visual
+            .lines
+            .iter()
+            .find(|presented| presented.source_range.start == line_range.start)
+            && (presented.height() != 0.0 || presented.disclosure.is_some())
+        {
+            return Err(format!(
+                "the presented structural row is not closed (kind {:?}, height {})",
+                presented.kind,
+                presented.height()
+            ));
+        }
+        Ok(())
+    }
+
     /// Reads only data a render produced: the owning block's presentation and
     /// layout must both exist and agree with the index, the document revision,
     /// the width/font and the mode, and the latest frame must have drawn the
@@ -486,27 +559,12 @@ mod tests {
         let block_top = view.heights.prefix_sum(block.ordinal);
         let block_height = view.heights.height(block.ordinal).unwrap_or(0.0);
         let Some(row_index) = layout.row_for_source(offset) else {
-            // Only a source line the presentation itself closes (a table
-            // delimiter, or a code fence with no visible text) may have no
-            // layout row, and only while the layout drew no row for it. The
-            // owning block must then be drawn by the latest render.
-            let hidden = visual.lines.iter().find(|line| {
-                line.source_range.start <= offset && offset <= line.source_range.end
-            });
-            let Some(line) = hidden else {
-                return Err(format!("no presented line owns {offset:?}"));
-            };
-            let structural = line.kind == BlockKind::TableDelimiter
-                || (line.kind == BlockKind::CodeBlock && line.visual_text.is_empty());
-            if !structural || line.height() != 0.0 || line.disclosure.is_some() {
-                return Err(format!(
-                    "no layout row owns {offset:?} and the line is not a closed structural row \
-                     (kind {:?}, height {}, visual text {:?})",
-                    line.kind,
-                    line.height(),
-                    line.visual_text
-                ));
-            }
+            // Only a source line the formal projection proves Reading
+            // collapses (a table delimiter, or a fence row) may have no
+            // layout row; the presentation may then omit the line entirely
+            // (it is outside the render window) or keep it at zero height.
+            // The owning block must then be drawn by the latest render.
+            closed_structural_row(view, &index, &block, visual, offset)?;
             if !view
                 .line_owners
                 .values()
