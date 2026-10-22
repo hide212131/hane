@@ -795,10 +795,21 @@ impl EditorView {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("どのように直しますか?"));
-        let subscription = cx.subscribe(&input, |view, input, event: &InputEvent, cx| match event
+        let subscription = cx.subscribe_in(&input, window, |view, input, event: &InputEvent, window, cx| match event
         {
             InputEvent::Focus => {
                 view.ai_selection.input_focused = true;
+                // Pointer re-focus of the input must also bring the Tab
+                // order's logical focus back to `Input`; otherwise Tab keeps
+                // using a stale `focus_region` and skips Send. Ignore a late
+                // Focus event if real focus has already moved elsewhere.
+                if view.ai_selection.open
+                    && matches!(view.ai_selection.phase, AiSelectionPhase::Composing)
+                    && gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window)
+                {
+                    view.ai_selection.focus_region = AiSelectionFocusRegion::Input;
+                    view.ai_selection.list_focus_index = None;
+                }
                 cx.notify();
             }
             InputEvent::Blur => {
@@ -2904,6 +2915,52 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(!view.ai_selection.open);
+        });
+    }
+
+    #[gpui::test]
+    fn tab_after_pointer_refocusing_the_input_reaches_send(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Move logical focus away from the input, then focus the input
+        // directly (as a pointer click does, bypassing the Tab handler).
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+        let input = view
+            .read_with(cx, |view, _| view.ai_selection.input.clone())
+            .expect("input is initialized by open_ai_selection");
+        cx.update(|window, app| {
+            input.update(app, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Input);
+            assert!(view.ai_selection.input_focused);
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
         });
     }
 
