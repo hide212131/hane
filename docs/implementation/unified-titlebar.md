@@ -85,6 +85,8 @@ Windows 11では最小幅がSnap領域より大きいと配置できない場合
 
 対象OSでは `gpui_component::TitleBar::window_options()` を基に、既存bounds、最小サイズ、macOSボタン位置を設定する。通常起動・instrument・新規の対象テストは同じ生成関数を通す。
 
+共通定数 `WINDOW_TITLEBAR_HEIGHT` は、予定する `crates/ui/src/view/titlebar.rs` で描画する `TitleBar` 要素に `.h(WINDOW_TITLEBAR_HEIGHT)` として適用する。`TitleBar::window_options()` はウインドウ生成オプション（native titlebar / drag設定）のためのAPIであり、描画される要素の高さは変更しない。
+
 ```rust
 // 設計上の形。実装はwindow_chrome側へ置く。
 let mut options = WindowOptions {
