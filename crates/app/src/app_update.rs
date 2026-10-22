@@ -290,6 +290,7 @@ impl AppUpdateService {
 
     /// Like [`AppUpdateService::new`] with an explicit task runner, so tests
     /// can control when background work happens.
+    #[cfg(test)]
     pub fn with_runner(
         config: UpdateServiceConfig,
         transport: Arc<dyn Transport>,
