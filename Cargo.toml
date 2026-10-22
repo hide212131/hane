@@ -14,7 +14,7 @@ members = [
     "crates/updater",
 ]
 resolver = "2"
-exclude = ["vendor/gpui", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows"]
+exclude = ["vendor/accesskit_windows", "vendor/gpui", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows"]
 
 [workspace.package]
 # Source of truth for release version; Cargo.lock must stay in sync.
@@ -56,3 +56,5 @@ codegen-units = 1
 pulldown-cmark = { path = "vendor/pulldown-cmark" }
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+# Windows UIA invalid HWND result boundary (Issue #570); see vendor/accesskit_windows/HANE-PATCH.md.
+accesskit_windows = { path = "vendor/accesskit_windows" }

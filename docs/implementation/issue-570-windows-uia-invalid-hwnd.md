@@ -28,3 +28,7 @@ The reference manifest is [here](issue-570-windows-uia-invalid-hwnd-reference/ma
 Microsoft contracts: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-error-codes and https://learn.microsoft.com/en-us/windows/win32/api/uiautomationcoreapi/nf-uiautomationcoreapi-uiadisconnectprovider .
 
 No implementation/review/GUI/merge/Issueclose has been executed by this preparation.
+
+## Implementation record
+
+`vendor/accesskit_windows` に 0.34.0 を複製し、`src/context.rs` と `src/util.rs` の `client_top_left` と、`src/node.rs`・`src/text.rs` の4 caller だけを変更した（`HANE-PATCH.md` 参照）。未変更ファイルは manifest の bytes/SHA-256 と一致させる前提。
