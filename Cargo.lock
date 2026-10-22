@@ -3039,7 +3039,6 @@ dependencies = [
  "gpui-pre-platform",
  "hane-ai",
  "hane-document",
- "hane-editor",
  "hane-markdown",
  "hane-metrics",
  "hane-presentation",
@@ -3068,7 +3067,6 @@ name = "hane-benchmark"
 version = "0.28.0"
 dependencies = [
  "hane-document",
- "hane-editor",
  "hane-markdown",
  "hane-metrics",
  "hane-presentation",
