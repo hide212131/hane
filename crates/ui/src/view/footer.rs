@@ -385,6 +385,9 @@ impl EditorView {
         if let Some(warning) = self.draft_recovery_warning.as_ref() {
             warnings.push(warning.clone());
         }
+        if let Some(warning) = self.folder_watch_warning() {
+            warnings.push(warning);
+        }
         warnings
     }
 

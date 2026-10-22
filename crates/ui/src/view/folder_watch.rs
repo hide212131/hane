@@ -32,9 +32,31 @@ pub(super) struct FolderWatchState {
     /// The notification source's last reported trouble (overflow, watch
     /// error, root removed), consumed by the next re-list.
     failure: Option<String>,
+    /// Why the folder is not being watched right now. Unlike the transient
+    /// status text it lives as long as this state does (one work folder), so
+    /// later status updates cannot make an inactive watch look healthy. Set
+    /// when attaching fails and cleared when a reattach succeeds.
+    unwatched: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only error injection: the next attaches fail with this message.
+    static INJECTED_ATTACH_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl EditorView {
+    /// The warning shown for as long as the current work folder's changes are
+    /// not being watched.
+    pub(super) fn folder_watch_warning(&self) -> Option<String> {
+        self.folder_watch.unwatched.as_ref().map(|error| {
+            format!(
+                "作業フォルダの外部変更を監視できていません（サイドバーは自動更新されません）: {error}"
+            )
+        })
+    }
+
     /// Starts watching `root` for the folder about to be scanned, replacing
     /// (and thereby releasing) the previous folder's watch. Called *before*
     /// the initial scan so a change made while that scan runs still arrives
@@ -49,12 +71,21 @@ impl EditorView {
     }
 
     fn connect_folder_watch(&mut self, root: &Path, cx: &mut Context<Self>) -> std::io::Result<()> {
+        let result = self.attach_folder_watch(root, cx);
+        self.folder_watch.unwatched = result.as_ref().err().map(|error| error.to_string());
+        result
+    }
+
+    fn attach_folder_watch(&mut self, root: &Path, cx: &mut Context<Self>) -> std::io::Result<()> {
         // Released first so the previous watcher's task ends instead of two
         // watches reporting the same folder.
         self.folder_watch.watcher = None;
         #[cfg(test)]
         {
             self.folder_watch.test_batches = None;
+            if let Some(message) = INJECTED_ATTACH_ERROR.with(|slot| slot.borrow().clone()) {
+                return Err(std::io::Error::other(message));
+            }
         }
         let (sender, receiver) = async_channel::unbounded();
         // GPUI's deterministic test scheduler must not be woken by a real OS
@@ -432,6 +463,86 @@ mod tests {
             assert!(!view.folder_watch.refresh_running);
         });
         assert!(sender.is_closed(), "the old delivery task has ended");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn inject_attach_error(message: Option<&str>) {
+        INJECTED_ATTACH_ERROR.with(|slot| *slot.borrow_mut() = message.map(str::to_owned));
+    }
+
+    #[gpui::test]
+    fn a_failed_watch_start_stays_visible_after_later_status_updates(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("start-failed");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+
+        inject_attach_error(Some("no watch for you"));
+        view.update(cx, |view, cx| {
+            let text = view.editor().document().full_text();
+            view.start_folder_watch(&root, cx);
+            // The initial scan and the first note open overwrite the shared
+            // status line, and a later operation does too.
+            view.status = Some("Opening…".to_owned());
+            view.status = Some("Opened".to_owned());
+            view.status = Some("Saved".to_owned());
+
+            let warnings = view.footer_warnings();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("no watch for you"));
+            assert_eq!(view.editor().document().full_text(), text);
+            assert!(!view.active_session().is_dirty());
+        });
+
+        // Reattaching while the failure continues keeps the warning.
+        view.update(cx, |view, cx| {
+            assert!(view.connect_folder_watch(&root, cx).is_err());
+            assert_eq!(view.footer_warnings().len(), 1);
+        });
+
+        // A successful reattach removes it.
+        inject_attach_error(None);
+        view.update(cx, |view, cx| {
+            view.connect_folder_watch(&root, cx).unwrap();
+            assert!(view.footer_warnings().is_empty());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn switching_folders_drops_the_previous_folders_watch_warning(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("switch-warning");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+
+        inject_attach_error(Some("denied"));
+        view.update(cx, |view, cx| {
+            view.start_folder_watch(&root, cx);
+            assert_eq!(view.footer_warnings().len(), 1);
+        });
+
+        inject_attach_error(None);
+        view.update(cx, |view, cx| {
+            view.start_folder_watch(&root, cx);
+            assert!(view.footer_warnings().is_empty());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_healthy_watch_shows_no_warning(cx: &mut gpui::TestAppContext) {
+        let root = watch_test_root("healthy");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+        inject_attach_error(None);
+        view.update(cx, |view, cx| {
+            view.start_folder_watch(&root, cx);
+            assert!(view.folder_watch_warning().is_none());
+            assert!(view.footer_warnings().is_empty());
+        });
         std::fs::remove_dir_all(&root).unwrap();
     }
 
