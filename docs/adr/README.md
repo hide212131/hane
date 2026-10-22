@@ -17,7 +17,6 @@
 | [ADR-0030](0030-gpui-kit-incremental-local-adoption.md) | gpui-kit / gpui-base の段階的・局所的採用方針 |
 | [ADR-0032](0032-embedded-codex-app-server-ai-foundation.md) | ChatGPT/CodexのOAuthとCustom Providerを切り替えるAI連携基盤。§4.1の同梱決定は[ADR-0033](0033-managed-codex-runtime-and-extensions.md)で初回ダウンロードへ改訂 |
 | [ADR-0033](0033-managed-codex-runtime-and-extensions.md) | 固定版Codexの初回ダウンロード・専用管理・検証済み更新と、専用SKILL.md/スキルPackageの段階的対応。P0は[#480](https://github.com/hide212131/hane/issues/480) / [PR #485](https://github.com/hide212131/hane/pull/485)で完了。P1〜P3は[#479](https://github.com/hide212131/hane/issues/479)で追跡 |
-| [ADR-0034](0034-zip-application-updates.md) | ZIP配布を継続した設定画面からのアプリ本体更新。署名カタログ、保存と再起動、OS別適用と復旧の設計案。未実装 |
 
 ## Accepted design / implementation pending
 
@@ -26,6 +25,7 @@
 | ADR | 内容 |
 |---|---|
 | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | 一部適用済み。AADW v3の通常運用は有効で、残る実装・検証は [Issue #333](https://github.com/hide212131/hane/issues/333) で追跡中 |
+| [ADR-0034](0034-zip-application-updates.md) | 設計採用（PR #509）。#518・#526はmerge済み。実機での更新・復旧を含む残る受入条件は [Issue #510](https://github.com/hide212131/hane/issues/510) を参照 |
 
 ## Active
 
