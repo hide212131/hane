@@ -50,7 +50,11 @@ fn range_disclosure(
     range: SourceRange,
     is_final: bool,
     forced: Option<SourceRange>,
+    policy: DisclosurePolicy,
 ) -> Option<SourceRange> {
+    if policy == DisclosurePolicy::Reading {
+        return None;
+    }
     let selection = editor.selection().range();
     let disclosure = if selection.is_empty() {
         line_owns_cursor(range, selection.start, is_final).then_some(selection)
@@ -112,6 +116,17 @@ pub(crate) fn block_fits_sync_join_budget(block: &IndexedBlock, span: &Range<usi
     span.len() <= JOIN_SYNC_LINE_BUDGET && bytes <= JOIN_SYNC_BYTE_BUDGET
 }
 
+/// Whether caret, selection, composition and find matches open Markdown
+/// markers (`Editing`) or the rendered form is kept closed (`Reading`). It is
+/// derived from `EditorView`'s mode and handed to every presentation and
+/// disclosure computation, so drawing, cache checks and movement agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DisclosurePolicy {
+    #[default]
+    Editing,
+    Reading,
+}
+
 /// Borrowed inputs for one [`presented_block`] call.
 pub(crate) struct BlockPresentationRequest<'a> {
     pub(crate) editor: &'a Editor,
@@ -123,6 +138,7 @@ pub(crate) struct BlockPresentationRequest<'a> {
     pub(crate) table_projection: Option<&'a TableProjection>,
     pub(crate) forced_disclosure: Option<SourceRange>,
     pub(crate) line_height: f32,
+    pub(crate) disclosure_policy: DisclosurePolicy,
 }
 
 /// Presents the lines of one indexed Markdown block that reach `visible`.
@@ -163,6 +179,7 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
         table_projection,
         forced_disclosure,
         line_height,
+        disclosure_policy,
     } = request;
     let document = editor.document();
     let span = block_line_span(document, block)?;
@@ -175,6 +192,7 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
         joined,
         fence_height_projection,
         forced_disclosure,
+        disclosure_policy,
     )?;
     let lines = block_lines(editor, &ctx);
     let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
@@ -222,6 +240,7 @@ pub(crate) fn expected_block_disclosures(
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
     forced_disclosure: Option<SourceRange>,
+    disclosure_policy: DisclosurePolicy,
 ) -> Option<Vec<(usize, Option<SourceRange>)>> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
@@ -233,6 +252,7 @@ pub(crate) fn expected_block_disclosures(
         joined,
         None,
         forced_disclosure,
+        disclosure_policy,
     )?;
     let lines = block_lines(editor, &ctx);
     Some(expected_disclosures(
@@ -269,6 +289,7 @@ struct BlockContext {
     /// is also needed per-line, not just for the whole-block value fed to
     /// the fence-height projection below.
     forced_disclosure: Option<SourceRange>,
+    disclosure_policy: DisclosurePolicy,
     /// A fenced code block's own true opening physical line, its range and
     /// text — read even when `context`/`render` do not reach it — so a
     /// closing-fence candidate anywhere in a large block can be validated
@@ -285,6 +306,10 @@ struct BlockContext {
     zero_height_fence_rows_after: usize,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "block context threads the presentation request's borrowed inputs"
+)]
 fn block_context(
     editor: &Editor,
     block: &IndexedBlock,
@@ -293,6 +318,7 @@ fn block_context(
     joined: Option<&JoinedParse>,
     fence_height_projection: Option<&FenceHeightProjection>,
     forced_disclosure: Option<SourceRange>,
+    disclosure_policy: DisclosurePolicy,
 ) -> Option<BlockContext> {
     let document = editor.document();
     let joinable = block_is_joinable(block.kind);
@@ -331,6 +357,7 @@ fn block_context(
         block.source_range,
         span.end == document.line_count(),
         forced_disclosure,
+        disclosure_policy,
     );
     let trailing_blank_lines = trailing_blank_lines(document, span);
     let fenced = block_line_context(block.kind) == LineContext::FencedCode;
@@ -402,6 +429,7 @@ fn block_context(
         texts,
         block_disclosure,
         forced_disclosure,
+        disclosure_policy,
         opening_fence_line,
         clipped_fence_lines,
         zero_height_fence_rows_before,
@@ -417,7 +445,13 @@ fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>>
             line: *line,
             range: *range,
             text,
-            disclosure: disclosure_for_line(editor, *line, *range, ctx.forced_disclosure),
+            disclosure: disclosure_for_line(
+                editor,
+                *line,
+                *range,
+                ctx.forced_disclosure,
+                ctx.disclosure_policy,
+            ),
         });
     }
     lines.extend(ctx.context.clone().zip(&ctx.ranges).zip(&ctx.texts).map(
@@ -425,7 +459,13 @@ fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>>
             line,
             range: *range,
             text,
-            disclosure: disclosure_for_line(editor, line, *range, ctx.forced_disclosure),
+            disclosure: disclosure_for_line(
+                editor,
+                line,
+                *range,
+                ctx.forced_disclosure,
+                ctx.disclosure_policy,
+            ),
         },
     ));
     lines.sort_by_key(|line| line.line);
@@ -439,7 +479,13 @@ fn clipped_fence_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockL
             line: *line,
             range: *range,
             text,
-            disclosure: disclosure_for_line(editor, *line, *range, ctx.forced_disclosure),
+            disclosure: disclosure_for_line(
+                editor,
+                *line,
+                *range,
+                ctx.forced_disclosure,
+                ctx.disclosure_policy,
+            ),
         })
         .collect()
 }
@@ -453,12 +499,14 @@ pub(crate) fn disclosure_for_line(
     line: usize,
     range: SourceRange,
     forced: Option<SourceRange>,
+    policy: DisclosurePolicy,
 ) -> Option<SourceRange> {
     range_disclosure(
         editor,
         range,
         line + 1 == editor.document().line_count(),
         forced,
+        policy,
     )
 }
 
@@ -653,6 +701,7 @@ pub(crate) fn row_element(
     zoom: f32,
     resolver: &ResourceResolver,
     caret_input_mode: Option<KeyboardInputMode>,
+    show_caret: bool,
     find_matches: &[SourceRange],
     find_current_match: Option<SourceRange>,
 ) -> Div {
@@ -765,6 +814,7 @@ pub(crate) fn row_element(
             theme,
             zoom,
             caret_input_mode,
+            show_caret,
             find_matches,
             find_current_match,
         );
@@ -818,6 +868,7 @@ pub(crate) fn row_element(
             theme,
             zoom,
             caret_input_mode,
+            show_caret,
             find_matches,
             find_current_match,
         );
@@ -825,7 +876,8 @@ pub(crate) fn row_element(
 
     let cursor = editor.selection().active;
     let is_final_line = row.line_id as usize + 1 == editor.document().line_count();
-    let visual_cursor = if line_owns_cursor(line.source_range, cursor, is_final_line) {
+    let visual_cursor = if show_caret && line_owns_cursor(line.source_range, cursor, is_final_line)
+    {
         line.source_map
             .source_to_visual(cursor, Bias::After)
             .map(|candidate| candidate.visual_offset)
@@ -959,6 +1011,7 @@ fn table_row_element(
     theme: Theme,
     zoom: f32,
     caret_input_mode: Option<KeyboardInputMode>,
+    show_caret: bool,
     find_matches: &[SourceRange],
     find_current_match: Option<SourceRange>,
 ) -> Div {
@@ -969,8 +1022,9 @@ fn table_row_element(
         .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
     let (match_visuals, current_match_visual) =
         row_find_match_visuals(block, layout, row_index, find_matches, find_current_match);
-    let cursor_geometry = layout
-        .point_for_source(block, editor.selection().active, shaper)
+    let cursor_geometry = show_caret
+        .then(|| layout.point_for_source(block, editor.selection().active, shaper))
+        .flatten()
         .filter(|point| point.row == row_index)
         .map(|point| {
             (
@@ -1629,11 +1683,86 @@ mod tests {
                     table_projection: None,
                     forced_disclosure: None,
                     line_height: DEFAULT_LINE_HEIGHT,
+                    disclosure_policy: DisclosurePolicy::Editing,
                 })
                 .expect("block presents")
                     .lines
             })
             .collect()
+    }
+
+    fn present_with_policy(
+        editor: &Editor,
+        forced_disclosure: Option<SourceRange>,
+        disclosure_policy: DisclosurePolicy,
+    ) -> Vec<VisualLine> {
+        let index = BlockIndex::from_buffer(editor.document());
+        index
+            .blocks()
+            .flat_map(|block| {
+                presented_block(BlockPresentationRequest {
+                    editor,
+                    block: &block,
+                    visible: &(0..usize::MAX),
+                    joined: None,
+                    list_projection: None,
+                    fence_height_projection: None,
+                    table_projection: None,
+                    forced_disclosure,
+                    line_height: DEFAULT_LINE_HEIGHT,
+                    disclosure_policy,
+                })
+                .expect("block presents")
+                .lines
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reading_policy_keeps_markers_closed_under_caret_selection_and_find() {
+        // `Editor::new` puts the caret at offset 0, which opens the line's
+        // markers while editing.
+        let editor = Editor::new("**bold** text");
+        let editing = present_with_policy(&editor, None, DisclosurePolicy::Editing);
+        assert_eq!(editing[0].visual_text, "**bold** text");
+        let reading = present_with_policy(&editor, None, DisclosurePolicy::Reading);
+        assert_eq!(reading[0].visual_text, "bold text");
+        assert_eq!(reading[0].disclosure, None);
+
+        // A find match that lands on hidden markers must not open them either.
+        let forced = Some(SourceRange::new(0, 2));
+        let reading = present_with_policy(&editor, forced, DisclosurePolicy::Reading);
+        assert_eq!(reading[0].visual_text, "bold text");
+        assert_eq!(reading[0].disclosure, None);
+    }
+
+    #[test]
+    fn reading_policy_expected_disclosures_are_all_closed() {
+        let editor = Editor::new("**bold** text\n\n> quote\n");
+        let index = BlockIndex::from_buffer(editor.document());
+        for block in index.blocks() {
+            let span = block_line_span(editor.document(), &block).expect("block span");
+            let editing = expected_block_disclosures(
+                &editor,
+                &block,
+                &span,
+                None,
+                None,
+                DisclosurePolicy::Editing,
+            )
+            .expect("editing disclosures");
+            let reading = expected_block_disclosures(
+                &editor,
+                &block,
+                &span,
+                None,
+                Some(SourceRange::new(0, 2)),
+                DisclosurePolicy::Reading,
+            )
+            .expect("reading disclosures");
+            assert!(reading.iter().all(|(_, disclosure)| disclosure.is_none()));
+            assert_eq!(reading.len(), editing.len());
+        }
     }
 
     #[test]
@@ -1766,6 +1895,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("quote block presents");
         let layout = hane_presentation::layout_block(
@@ -1833,6 +1963,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("list block presents");
         let layout = hane_presentation::layout_block(
@@ -2269,6 +2400,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("full block presents");
         let clipped = presented_block(BlockPresentationRequest {
@@ -2281,6 +2413,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("middle code rows present");
 
@@ -2316,6 +2449,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("nested fenced code presents");
 
@@ -2358,6 +2492,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("full nested block presents");
         let clipped = presented_block(BlockPresentationRequest {
@@ -2370,6 +2505,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("nested code content presents");
 
@@ -2429,6 +2565,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("closing fence line presents");
         assert_eq!(visual.lines.len(), 1);
@@ -2503,6 +2640,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("block presents");
         let rendered = visual
@@ -2549,6 +2687,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("block presents");
         assert_eq!(visual.lines.len(), 1);
@@ -2598,6 +2737,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("block presents");
         assert!(
@@ -2655,6 +2795,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: DEFAULT_LINE_HEIGHT,
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .expect("block presents");
         assert!(

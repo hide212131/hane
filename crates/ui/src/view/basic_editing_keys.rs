@@ -675,6 +675,7 @@ mod tests {
                     table_projection: None,
                     forced_disclosure: None,
                     line_height: view.line_height(),
+                    disclosure_policy: view.disclosure_policy(),
                 })
                 .expect("the whole paragraph is presented");
                 let layout = layout_block(&visual, view.content_width, &shaper);

@@ -1,10 +1,38 @@
-# Hane の限定パッチ（Issue #101, #126）
+# Hane の GPUI 0.2.2 パッチ履歴
 
-crates.io の GPUI 0.2.2 を同梱。Apache-2.0 ライセンスは `LICENSE-APACHE` に保持。
+旧採用版の crates.io GPUI 0.2.2 を履歴資料として同梱する。
+Apache-2.0 ライセンスは `LICENSE-APACHE` に保持。
 配布 crate の SHA-256: `979b45cfa6ec723b6f42330915a1b3769b930d02b2d505f9697f8ca602bee707`。
-製品コードの変更は `src/platform/mac/text_system.rs`（Issue #101）と
-`src/platform/mac/platform.rs`（Issue #126）のみ。それぞれ独立した理由による
-パッチで、互いに依存しない。
+
+## 現行版との関係と差分の範囲
+
+2026-10-23、main `499c44639822e76518a93661e77578b23ff7b72a` で確認した。
+現在の workspace は `gpui-pre 0.3.6` を採用し、このディレクトリの
+`gpui 0.2.2` は `[patch.crates-io]` と `Cargo.lock` の採用先ではない。
+旧コード・ライセンス・検証経緯を参照できるよう保持している。
+
+配布 archive との比較では、既存 source の差分は次の **14ファイル**にある。
+当初の合成斜体と入力ソース再同期の2ファイルだけが変更範囲ではない。
+パスはこのディレクトリからの相対パスで、test用の変更も含む。
+
+| 差分の責務 | 旧版で変わったファイル | 現行の所有者・確認状況 |
+| --- | --- | --- |
+| 入力モードの照会・通知 | `src/app.rs`, `src/app/context.rs`, `src/platform.rs`, `src/platform/mac/keyboard.rs`, `src/platform/mac/platform.rs`, `src/platform/windows/events.rs`, `src/platform/windows/platform.rs` | 照会は `crates/ui/src/input_mode.rs`、購読は Hane と GPUI の既存 App subscription。macOS の context 再同期と Windows の IME mode 通知は現行 platform vendor に保持 |
+| trackpad の倍率変更と macOS test 接続 | `src/elements/div.rs`, `src/interactive.rs`, `src/platform/mac/events.rs`, `src/platform/mac/window.rs`, `src/window.rs` | 現行 GPUI 標準の `PinchEvent` / `on_pinch` と Hane の `view/viewport.rs` を使用。旧 mac/window の差分には context 再同期 test 用の input handler hook も含む |
+| 日本語の合成斜体 | `src/platform/mac/text_system.rs` | 現行 macOS vendor に保持 |
+| Wayland の空 commit | `src/platform/linux/wayland/client.rs` | 旧 helper と7件の test は現採用の `gpui-pre-linux 0.3.6` に存在せず、契約移行は未確認。旧 test を現経路の成功証拠にしない |
+
+配布との差分照合、現所有者への対応、未確認事項の根拠は
+[Issue #313 の監査記録](https://github.com/hide212131/hane/issues/313#issuecomment-6346215768)
+と、そこから参照する archive 照合・Wayland 診断にある。
+所有者が見つかったことだけで挙動同等性や旧 patch の解除を受け入れたとは扱わない。
+
+現行 platform patch の範囲・検証入口・解除条件は
+[macOS](../gpui-pre-macos/HANE-PATCH.md) と
+[Windows](../gpui-pre-windows/HANE-PATCH.md) を参照する。
+以下の Issue #101 / #126 の説明と `vendor/gpui` を指定するコマンドは
+旧採用時の履歴であり、現行製品 backend の検証コマンドではない。
+現在の CI は現行 platform vendor を指定して検証する。
 
 ## Issue #101: 合成斜体フォールバック
 
