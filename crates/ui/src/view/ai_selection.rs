@@ -1245,7 +1245,23 @@ impl EditorView {
         // `Regenerate`) stops rendering `Input` at all: with real focus left
         // on a now-unmounted widget, Tab/Enter stop reaching this popup's
         // own actions entirely (PR #450 review).
-        if self.ai_selection.focus_region != AiSelectionFocusRegion::Input {
+        //
+        // The exception is a pointer click that has just moved real focus
+        // onto the input while the logical region is still stale: the frame
+        // rendered right after that click would otherwise steal focus back
+        // before `InputEvent::Focus` is delivered. Adopt the input's real
+        // focus as the logical region instead.
+        let input_really_focused = matches!(self.ai_selection.phase, AiSelectionPhase::Composing)
+            && self
+                .ai_selection
+                .input
+                .as_ref()
+                .is_some_and(|input| gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window));
+        if input_really_focused {
+            self.ai_selection.focus_region = AiSelectionFocusRegion::Input;
+            self.ai_selection.list_focus_index = None;
+            self.ai_selection.input_focused = true;
+        } else if self.ai_selection.focus_region != AiSelectionFocusRegion::Input {
             window.focus(&self.focus_handle, cx);
             self.ai_selection.input_focused = false;
         }
@@ -1349,6 +1365,7 @@ impl EditorView {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
+                    .debug_selector(|| "ai-selection-input".to_owned())
                     .children(input.map(|input| Input::new(&input).aria_label("ai instruction"))),
             )
             .child(send);
@@ -2938,19 +2955,18 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Move logical focus away from the input, then focus the input
-        // directly (as a pointer click does, bypassing the Tab handler).
+        // Move logical focus away from the input, then click the input with
+        // a real pointer event (bypassing the Tab handler).
         cx.simulate_keystrokes("tab");
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
         });
-        let input = view
-            .read_with(cx, |view, _| view.ai_selection.input.clone())
-            .expect("input is initialized by open_ai_selection");
-        cx.update(|window, app| {
-            input.update(app, |state, cx| state.focus(window, cx));
-        });
+        let point = cx
+            .debug_bounds("ai-selection-input")
+            .expect("ai instruction input painted")
+            .center();
+        cx.simulate_click(point, gpui::Modifiers::none());
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Input);
