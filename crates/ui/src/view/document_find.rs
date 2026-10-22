@@ -2204,6 +2204,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn reading_find_on_a_closed_fence_info_string_scrolls_to_the_block_and_settles(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let mut text = String::new();
+        for n in 0..60 {
+            text.push_str(&format!("line {n:02}\n\n"));
+        }
+        text.push_str("```zzinfo\ncode body\n```\n\ntail\n");
+        let info_start = text.find("zzinfo").expect("info string present");
+        let info_range = SourceRange::new(info_start, info_start + "zzinfo".len());
+
+        let (view, cx) = {
+            let text = text.clone();
+            cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx))
+        };
+        cx.simulate_resize(gpui::size(px(960.0), px(400.0)));
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.toggle_editor_mode(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.document_find.query_text = "zzinfo".to_owned();
+            view.restart_document_find(cx, false, true);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches, vec![info_range]);
+            assert!(view.scroll_y > 0.0, "the match scrolls the viewport");
+            assert!(
+                !view.pending_find_visibility_after_layout,
+                "a match on a row that stays closed does not keep the request armed"
+            );
+            let (top, height) = view
+                .reading_visible_row(info_range.start)
+                .expect("a visible position for the closed row");
+            assert!(
+                top + height > view.scroll_y
+                    && top < view.scroll_y + view.viewport_height + CARET_VISIBILITY_TOLERANCE,
+                "the fence block is on screen: row {top}+{height}, scroll {}",
+                view.scroll_y
+            );
+            assert_eq!(view.editor().document().full_text(), text);
+        });
+    }
+
+    #[gpui::test]
     fn escape_closes_the_bar_and_selects_the_current_matchs_range_when_ready(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2595,6 +2654,110 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.document_find.current, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn reading_mode_keeps_the_find_input_editable_and_searches_the_source(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let source = "[link](https://hidden.example/)\n\nA😀e\u{301}Z\n";
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(source, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.set_editor_mode(EditorMode::Reading, window, cx));
+                view.open_document_find(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let input = view
+            .read_with(cx, |view, _| view.document_find.input.clone())
+            .expect("find input is initialized by open_document_find");
+        assert!(view.read_with(cx, |view, _| view.document_find_input_is_focused()));
+        let body = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.sessions.active().is_dirty(),
+            )
+        });
+        // The debounce re-checks `Instant::now()` after its timer wakes, and
+        // `advance_clock` only moves the virtual clock, so real time must pass
+        // too (see `rapid_query_changes_coalesce_into_a_single_scan_for_the_final_text`).
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+            cx.executor()
+                .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
+            cx.run_until_parked();
+        };
+
+        // Real text callbacks of the find input, with UTF-16 ranges.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    None,
+                    "A😀e\u{301}Z",
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.query_text, "A😀e\u{301}Z");
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 1);
+        });
+        // A non-empty (UTF-16 1..3) selection replaced by input.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    Some(1..3),
+                    "羽",
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.query_text, "A羽e\u{301}Z");
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert!(view.document_find.matches.is_empty());
+        });
+        // A hidden link target is matched in the source without opening it.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    Some(0..5),
+                    "hidden.example",
+                    window,
+                    cx,
+                );
+            });
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.query_text, "hidden.example");
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert_eq!(view.editor_mode(), EditorMode::Reading);
+            assert_eq!(
+                (
+                    view.editor().document().full_text(),
+                    view.editor().document().revision(),
+                    view.sessions.active().is_dirty(),
+                ),
+                body,
+                "searching never changes the body"
+            );
         });
     }
 

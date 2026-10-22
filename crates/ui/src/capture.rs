@@ -63,13 +63,26 @@ impl Element for InputCapture {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if self.input.read(cx).body_input_capture_enabled() {
+        // Registering the OS input target and recording the painted frame used
+        // to share one condition. A read-only body must stop taking OS text
+        // input, but its frames still have to be marked and measured, so the
+        // two decisions are made separately.
+        let (register_input, record_frame) = {
+            let view = self.input.read(cx);
+            (
+                view.body_input_capture_enabled(),
+                view.other_input_capture_allows_body(),
+            )
+        };
+        if register_input {
             let focus = self.input.read(cx).focus_handle.clone();
             window.handle_input(
                 &focus,
                 ElementInputHandler::new(bounds, self.input.clone()),
                 cx,
             );
+        }
+        if record_frame {
             self.input.update(cx, |view, _| {
                 let painted_at = Instant::now();
                 let measurements = view.editor_mut().mark_frame_painted();

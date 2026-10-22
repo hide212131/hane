@@ -25,6 +25,10 @@ pub const ICON_SETTINGS: &str = "icons/settings.svg";
 pub const ICON_ARROW_LEFT: &str = "icons/arrow-left.svg";
 /// Overrides `gpui-component`'s `IconName::Check` glyph.
 pub const ICON_CHECK: &str = "icons/check.svg";
+/// The tab-row button that switches to reading mode: an outlined eye.
+pub const ICON_READING_MODE: &str = "icons/reading-mode.svg";
+/// The tab-row button that switches back to editing: an outlined pencil.
+pub const ICON_EDITING_MODE: &str = "icons/editing-mode.svg";
 
 const FILE_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -62,6 +66,14 @@ const CHECK_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/check.svg"
 ));
+const READING_MODE_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/reading-mode.svg"
+));
+const EDITING_MODE_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/editing-mode.svg"
+));
 
 /// Serves the work-folder sidebar icons from memory. Every other asset
 /// path falls through to `None`, the same as gpui's default no-op
@@ -82,6 +94,8 @@ impl AssetSource for WorkFolderIcons {
             ICON_SETTINGS => Some(Cow::Borrowed(SETTINGS_SVG)),
             ICON_ARROW_LEFT => Some(Cow::Borrowed(ARROW_LEFT_SVG)),
             ICON_CHECK => Some(Cow::Borrowed(CHECK_SVG)),
+            ICON_READING_MODE => Some(Cow::Borrowed(READING_MODE_SVG)),
+            ICON_EDITING_MODE => Some(Cow::Borrowed(EDITING_MODE_SVG)),
             _ => None,
         })
     }
@@ -132,6 +146,8 @@ mod tests {
             ICON_SETTINGS,
             ICON_ARROW_LEFT,
             ICON_CHECK,
+            ICON_READING_MODE,
+            ICON_EDITING_MODE,
         ] {
             assert_eq!(
                 AppAssets.load(path).unwrap(),

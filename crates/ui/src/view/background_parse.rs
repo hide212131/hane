@@ -17,11 +17,23 @@ impl EditorView {
         let disclosure_collapse = disclosure
             .filter(|disclosure| disclosure.is_empty())
             .is_some_and(|_| {
-                self.last_background_height_disclosure.is_some_and(
+                let background_is_open = self.last_background_height_disclosure.is_some_and(
                     |(background_revision, background)| {
                         background_revision == revision && !background.is_empty()
                     },
-                )
+                );
+                // A mode rebuild forgets the background disclosure while the
+                // applied heights still describe a non-empty selection. The
+                // endpoint bridge only touches the selection's ends, so the
+                // interior must still collapse to this caret once.
+                let applied_is_open = self
+                    .last_applied_height_disclosure
+                    .is_some_and(|(applied_revision, applied)| {
+                        applied_revision == revision && !applied.is_empty()
+                    })
+                    && self.last_background_height_disclosure
+                        != disclosure.map(|disclosure| (revision, disclosure));
+                background_is_open || applied_is_open
             });
         if !self.block_index.needs_formal_parse(document)
             && !disclosure_refresh
@@ -36,6 +48,16 @@ impl EditorView {
         self.force_height_disclosure_snapshot = false;
         self.document_parse_job_running = true;
         let key = self.document_key();
+        // The heights below are prepared for this display mode only. A switch
+        // while the job runs must not let them (or the disclosure they were
+        // built for) come back afterwards.
+        let mode = self.editor_mode;
+        // A switch also rebuilds every height for the then-current selection.
+        // An Editing -> Reading -> Editing round trip leaves the same mode but
+        // a different height basis than this job's `previous_height_disclosure`
+        // describes, so the heights of a job that started before it are
+        // dropped by generation (the source-only index is still kept).
+        let mode_generation = self.mode_generation;
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
         let previous_height_disclosure = self
@@ -56,6 +78,8 @@ impl EditorView {
             let current = view
                 .update(cx, |view, _| {
                     view.document_key() == key
+                        && view.editor_mode == mode
+                        && view.mode_generation == mode_generation
                         && block_context_revision_is_current(
                             view.editor().document().revision(),
                             revision,
@@ -121,6 +145,29 @@ impl EditorView {
                     view.block_cache.clear();
                     view.joined_parse_cache.clear();
                 }
+                if view.editor_mode != mode {
+                    // The source-only index above stays valid, but the heights
+                    // were prepared for the other display mode: rebuild them
+                    // for the current one instead of installing them.
+                    view.resync_heights_for_current_disclosure();
+                    view.schedule_document_parse(cx);
+                    cx.notify();
+                    return;
+                }
+                if view.mode_generation != mode_generation {
+                    // Back in the same mode after a round trip: the current
+                    // heights were rebuilt for the selection of that moment
+                    // (basis B), not the one this job's difference (D -> A)
+                    // starts from, and their offscreen fences and tables are
+                    // not touched by arithmetic `max`. Only the snapshot's
+                    // heights are dropped; the next job starts from the basis
+                    // that is applied now, so the difference stays valid.
+                    view.last_background_height_disclosure = None;
+                    view.schedule_document_parse(cx);
+                    view.ensure_active_disclosure_height();
+                    cx.notify();
+                    return;
+                }
                 let (granularity, len) = view.desired_layout();
                 let snapshot_disclosure_is_current = view.editor().document().revision()
                     == revision
@@ -136,10 +183,22 @@ impl EditorView {
                         // invalidate presentations lazily through their
                         // disclosure check instead of throwing their caches
                         // away for a selection change.
-                        view.install_disclosure_heights_preserving_measurements(
-                            heights,
-                            previous_height_disclosure,
-                        );
+                        //
+                        // The D -> A difference is only valid on heights that
+                        // are still based on D. A mode round trip (or any
+                        // rebuild) while the job ran has already installed
+                        // heights for the current disclosure, and applying the
+                        // difference again would shift every fence/table
+                        // height off screen.
+                        let applied = view.last_applied_height_disclosure;
+                        let heights_already_current = disclosure
+                            .is_some_and(|disclosure| applied == Some((revision, disclosure)));
+                        // Without a matching basis only the snapshot's arithmetic
+                        // minimum is applied, which is safe on any heights.
+                        let basis = previous_height_disclosure.filter(|previous| {
+                            !heights_already_current && applied == Some((revision, *previous))
+                        });
+                        view.install_disclosure_heights_preserving_measurements(heights, basis);
                     } else if index_was_updated {
                         view.install_heights(granularity, heights);
                     }
