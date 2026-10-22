@@ -219,7 +219,17 @@ Systemを、その瞬間のLight / Darkを入れた `Some(...)` に置き換え�
 
 ### 8.1 ファイルメニューとタブ
 
-採用済みの `file_menu_button` は既存のopen／unsaved guardとIME中の制約をそのまま使う。メニューボタンを本文のmousedown処理へ巻き込み、本文選択を消さない。
+current mainには `file_menu_button` が実在し、ファイルを開く・フォルダを開く・最近開いたファイルを扱う。ただしこれは操作経路の一つであり、唯一の経路ではない。次の既存経路を、それぞれの担当のまま保つ。新しいメニュー、保存確認、操作経路は作らない。
+
+| 経路 | 担当 |
+|---|---|
+| `file_menu_button` | ファイルを開く、フォルダを開く、最近開いたファイル。Save / Save Asはこのメニュー内の操作ではない |
+| keyboard actions（`crates/ui/src/actions.rs`） | `Open` → `prompt_open`、`OpenFolder` → `prompt_open_work_folder`、`Save` → `save_or_prompt`、`SaveAs` → `prompt_save_as`。名前変更中は実行しない |
+| ファイルタブの右クリック | 描画時の `SessionId` → `open_file_tab_context_menu` |
+| 未保存のguard・確認 | ファイル／フォルダを開く経路は `prompt_open`（active sessionがdirtyなら中止）と `prompt_open_work_folder`（`has_unsaved_sessions` を選択前後に確認）の既存guard。dirtyなタブを閉じる経路は `request_tab_close` → `close_decision` → `tab_close_confirm` の既存確認 |
+| タブ切替のIME guard | `next_file_tab` / `prev_file_tab`（`NextFileTab` / `PrevFileTab`）はbodyでIME中（`editor().ime()` が存在する間）は切り替えない。検索入力・名前変更中なども切り替えない |
+
+タブメニュー操作は本文のmousedown処理（`on_editor_mouse_down`）へ巻き込まず、本文選択を消さない。
 
 | 操作・状態 | 保持する経路 |
 |---|---|
