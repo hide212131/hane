@@ -192,7 +192,9 @@ div()
 
 ### 7.1 設定とnative appearance
 
-| `ThemePreference` | `cx.set_window_appearance(...)` |
+`cx.set_window_appearance(...)` は、current main（`d9050c1f02e06c8748399757f5131d29a0aea41a`）の現行GPUI公開APIには存在しない。実装PRで追加する新しい公開setterであり、既存APIとしては呼べない。以下は、そのsetterに渡す値の契約である。
+
+| `ThemePreference` | 実装PRで追加する `cx.set_window_appearance(...)` の引数 |
 |---|---|
 | Light | `Some(WindowAppearance::Light)` |
 | Dark | `Some(WindowAppearance::Dark)` |
