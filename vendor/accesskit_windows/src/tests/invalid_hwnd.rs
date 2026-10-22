@@ -5,15 +5,18 @@
 // comes back through the COM boundary.
 
 use accesskit::{
-    ActionHandler, ActionRequest, Node, NodeId, Rect, Role, TextPosition, TextSelection, Tree,
-    TreeId, TreeUpdate,
+    ActionHandler, ActionRequest, Node, NodeId, Rect, Role, TextDirection, TextPosition,
+    TextSelection, Tree, TreeId, TreeUpdate,
 };
 use accesskit_consumer::Tree as ConsumerTree;
 use std::sync::Arc;
 use windows::{
     Win32::{
         Foundation::*,
-        System::Ole::SafeArrayDestroy,
+        System::{
+            Com::SAFEARRAY,
+            Ole::{SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound},
+        },
         UI::{Accessibility::*, WindowsAndMessaging::*},
     },
     core::*,
@@ -69,6 +72,9 @@ fn initial_state() -> TreeUpdate {
     text_run.set_character_positions(vec![0.0f32, 10.0, 20.0, 30.0, 40.0]);
     text_run.set_character_widths(vec![10.0f32; 5]);
     text_run.set_word_starts(vec![0u8]);
+    // Without a text direction the consumer produces no bounding boxes, and
+    // `GetBoundingRectangles` returns null before reaching `client_top_left`.
+    text_run.set_text_direction(TextDirection::LeftToRight);
 
     TreeUpdate {
         nodes: vec![
@@ -184,15 +190,73 @@ fn range_from_point_reports_element_not_available_for_invalid_hwnd() {
     }
 }
 
+/// Reads the `[left, top, width, height]` quadruples out of the SAFEARRAY
+/// returned by `GetBoundingRectangles` and destroys the array.
+fn take_rectangles(array: *mut SAFEARRAY) -> Vec<f64> {
+    assert!(!array.is_null());
+    let lower = unsafe { SafeArrayGetLBound(array, 1) }.unwrap();
+    let upper = unsafe { SafeArrayGetUBound(array, 1) }.unwrap();
+    let mut values = Vec::new();
+    for index in lower..=upper {
+        let mut value = 0.0f64;
+        unsafe { SafeArrayGetElement(array, &index, &mut value as *mut f64 as *mut _) }.unwrap();
+        values.push(value);
+    }
+    unsafe { SafeArrayDestroy(array) }.unwrap();
+    values
+}
+
 #[test]
 fn get_bounding_rectangles_reports_element_not_available_for_invalid_hwnd() {
     let _lock_guard = MUTEX.lock();
+
+    // Precondition: with a valid HWND the same fixture yields a non-empty
+    // rectangle list, so an empty range cannot hide the `client_top_left`
+    // error path below behind the early null return.
+    let valid_context = new_context(valid_hwnd());
+    let valid_range = unsafe { text_provider(&valid_context).DocumentRange() }.unwrap();
+    let valid_rectangles = take_rectangles(unsafe { valid_range.GetBoundingRectangles() }.unwrap());
+    assert!(!valid_rectangles.is_empty());
+
     for hwnd in invalid_hwnds() {
-        let provider = text_provider(&new_context(hwnd));
+        // Keep the Context alive; the provider and range only hold weak
+        // references, so a dropped Context would fail `DocumentRange()` itself.
+        let context = new_context(hwnd);
+        let provider = text_provider(&context);
         let range = unsafe { provider.DocumentRange() }.unwrap();
         let error = unsafe { range.GetBoundingRectangles() }.unwrap_err();
         assert_eq!(error.code(), element_not_available());
     }
+}
+
+#[test]
+fn get_bounding_rectangles_reports_element_not_available_after_window_destroyed() {
+    let _lock_guard = MUTEX.lock();
+    let hwnd = unsafe {
+        CreateWindowExW(
+            Default::default(),
+            w!("STATIC"),
+            w!("accesskit-windows-invalid-hwnd-live"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    .unwrap();
+    let context = new_context(hwnd);
+    let range = unsafe { text_provider(&context).DocumentRange() }.unwrap();
+    let rectangles = take_rectangles(unsafe { range.GetBoundingRectangles() }.unwrap());
+    assert!(!rectangles.is_empty());
+
+    unsafe { DestroyWindow(hwnd) }.unwrap();
+    let error = unsafe { range.GetBoundingRectangles() }.unwrap_err();
+    assert_eq!(error.code(), element_not_available());
 }
 
 #[test]
@@ -218,7 +282,11 @@ fn valid_hwnd_keeps_geometry_and_hit_testing() {
     unsafe { provider.RangeFromPoint(point) }.unwrap();
 
     let range = unsafe { provider.DocumentRange() }.unwrap();
-    let rectangles = unsafe { range.GetBoundingRectangles() }.unwrap();
-    assert!(!rectangles.is_null());
-    unsafe { SafeArrayDestroy(rectangles) }.unwrap();
+    // The text run is the only node in the range; it spans x 0..50, y 0..20.
+    let rectangles = take_rectangles(unsafe { range.GetBoundingRectangles() }.unwrap());
+    assert_eq!(
+        rectangles,
+        vec![top_left.x, top_left.y, 50.0, 20.0],
+        "unexpected rectangles: {rectangles:?}"
+    );
 }
