@@ -37,6 +37,14 @@ App Translocationで不適切な保存先へ進む問題そのものは#510。�
 必要なfocused tests、required CI、current-head最終レビュー、macOS GUI evidenceを揃えてCommanderが受入判断する。Windows更新成功の実機確認を追加せず、共有コードのWindows CIは維持する。GUI失敗時は`docs/gui-test-recovery.md`で復旧を続ける。
 
 
+## 実装メモ（#557採用後のmainに対する実装）
+
+- `crates/app/src/update_diagnostics.rs`: 更新state配下（`<state>/updates/<InstallId>/diagnostics.log`）へ、上限付き（20件・16KiB・詳細400文字）の1行レコードを保存する。保存と設定からのコピーは同じ秘匿規則（URLのquery/userinfo、認証情報風のkey=value、`/Users/`等のユーザー名、HOME/ユーザー名）を通る。各レコードにrun idを持たせ、現在の起動と以前の起動の記録を分けて表示する。保存できない場合は、その起動中の記録だけを表示し、保存不可の理由を明記する。
+- 失敗段階: `check` / `write_download` / `download` / `verify` / `save_history` / `publish` / `start` / `discard` / `restore` / `prepare` / `placement`。同じcodeだけから段階を推測しない。
+- OS情報: `UpdateError::from(io::Error)` と各記録地点で `io_detail`（`os_kind`、取得できた場合だけ `os_error`、無い場合は `none`）を使う。
+- 設定の更新カードに「診断情報をコピー」を追加（Unavailableでも表示。更新操作は再許可しない）。
+- 検証: この変更の自動テストは未実行（worker環境で実行不可）。CIの結果とmacOS GUIは別途確認する。
+
 ## 画面不要の実装準備（2026-10-23）
 
 利用者の「548を妨げないものは止めなくてよい」に基づき、全面保留を限定保留へ変更した。非GUIの準備・必要なCI/レビュー等は進められる。#557採用・main反映後に実装する依存は維持し、Mac GUI枠は#548最優先で取得しない。#548へ影響する統合・mergeは統合担当が調整し、#558を#548リリースの待ち条件にしない。

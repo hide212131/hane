@@ -51,6 +51,12 @@ pub struct AppUpdateSnapshot {
     pub total_bytes: u64,
     /// Stable machine-readable failure code (`Failed` / `Unavailable`).
     pub error_code: Option<String>,
+    /// Where the failure happened (`check`, `download`, `write_download`,
+    /// `verify`, `save_history`, `publish`, `start`, `placement`, `config`).
+    /// The same code can mean different things at different stages.
+    pub error_stage: Option<String>,
+    /// The service holds local diagnostics that can be copied from the card.
+    pub diagnostics_available: bool,
     /// A local re-validation of a previously prepared update is running.
     pub restoring: bool,
     /// The service can really apply a Ready update in this build: the trust
@@ -69,6 +75,8 @@ impl AppUpdateSnapshot {
             received_bytes: 0,
             total_bytes: 0,
             error_code: None,
+            error_stage: None,
+            diagnostics_available: false,
             restoring: false,
             restart_supported: false,
         }
@@ -104,6 +112,11 @@ pub trait AppUpdateController: Send + Sync {
     /// Re-validates a prepared update left by an earlier run, locally only.
     /// Idempotent; never communicates.
     fn restore_local(&self);
+    /// The local diagnostics text for the settings card (copy). It reads local
+    /// records only: no request, no change. `None` when there is none.
+    fn diagnostics_text(&self) -> Option<String> {
+        None
+    }
     /// Re-verifies the Ready candidate `candidate_id` and the install, starts
     /// the update helper and returns once it answered `Prepared`. It may take
     /// a while and is therefore called off the UI thread. Nothing is stopped,
@@ -223,6 +236,35 @@ fn failure_text(code: &str) -> &'static str {
     }
 }
 
+/// A failure text that fits the stage where the failure happened. The code
+/// alone (for example `io`) cannot tell a failed check from a failed write
+/// after the download, so the stage decides when it is known. `None` falls
+/// back to the code-based text.
+fn stage_failure_text(stage: &str, code: &str) -> Option<&'static str> {
+    match (stage, code) {
+        ("start", _) => Some(
+            "更新の処理を開始できませんでした。Haneを再起動してから、もう一度お試しください。",
+        ),
+        ("write_download", _) => Some(
+            "更新ファイルを保存する場所を準備できませんでした。空き容量と書き込み権限を確認してください。",
+        ),
+        ("download", "io" | "insufficient_space") => Some(
+            "ダウンロードした更新ファイルを保存できませんでした。空き容量と書き込み権限を確認してください。",
+        ),
+        ("verify", "signature_invalid" | "identity_mismatch") => None,
+        ("verify", _) => Some(
+            "ダウンロードした更新ファイルを検証または展開できませんでした。もう一度取得するか、手動でダウンロードしてください。",
+        ),
+        ("save_history", _) => Some(
+            "更新ファイルは検証できましたが、更新の履歴を保存できませんでした。更新は準備されていません。書き込み権限を確認してください。",
+        ),
+        ("publish", _) => Some(
+            "検証済みの更新を保存先へ移動できませんでした。更新は準備されていません。書き込み権限を確認してください。",
+        ),
+        _ => None,
+    }
+}
+
 /// Why updates are unavailable, with what the user can actually do. Install
 /// placement failures are named here instead of surfacing later as a generic
 /// I/O error after the archive was fetched. Moving the app or reopening it
@@ -321,7 +363,14 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             model.detail = Some("更新を削除しています…".to_owned());
         }
         AppUpdatePhase::Failed => {
-            model.detail = Some(format!("{} (診断コード: {code})", failure_text(code)));
+            let stage = snapshot.error_stage.as_deref();
+            let text = stage
+                .and_then(|stage| stage_failure_text(stage, code))
+                .unwrap_or_else(|| failure_text(code));
+            model.detail = Some(match stage {
+                Some(stage) => format!("{text} (診断コード: {code}, 段階: {stage})"),
+                None => format!("{text} (診断コード: {code})"),
+            });
             model.actions.push((CardAction::Check, "再試行"));
         }
         AppUpdatePhase::Unavailable => {
@@ -657,13 +706,34 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Copies the update diagnostics to the clipboard. The text is already
+    /// redacted by the service; this reads small local records only and makes
+    /// no request, so it is safe on the UI thread and while updates are
+    /// unavailable.
+    pub(super) fn copy_app_update_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let Some(controller) = self.app_update.clone() else {
+            return;
+        };
+        match controller.diagnostics_text() {
+            Some(text) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                self.restart_message = Some("更新の診断情報をコピーしました。".to_owned());
+            }
+            None => {
+                self.restart_message = Some("コピーできる診断情報がありません。".to_owned());
+            }
+        }
+        cx.notify();
+    }
+
     /// The "アプリの更新" card of the general settings page. `None` when no
     /// update service is attached (tests, unsupported builds).
     pub(super) fn app_update_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let controller = self.app_update.as_ref()?;
-        let model = card_model(&controller.snapshot());
+        let snapshot = controller.snapshot();
+        let model = card_model(&snapshot);
         let restarting = self.restart_in_progress;
-        let buttons: Vec<_> = model
+        let mut buttons: Vec<Button> = model
             .actions
             .into_iter()
             .filter(|(action, _)| !(restarting && *action == CardAction::Restart))
@@ -679,6 +749,19 @@ impl EditorView {
                     })
             })
             .collect();
+        // Available whenever records exist, also while updates are
+        // unavailable; it only copies local text and starts nothing.
+        if snapshot.diagnostics_available {
+            let view = cx.entity();
+            buttons.push(
+                Button::new("settings-app-update-diagnostics")
+                    .label("診断情報をコピー")
+                    .ghost()
+                    .on_click(move |_, _window, app| {
+                        view.update(app, |view, cx| view.copy_app_update_diagnostics(cx));
+                    }),
+            );
+        }
         let card = div()
             .id("settings-app-update-card")
             .debug_selector(|| "settings-app-update-card".to_owned())
