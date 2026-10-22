@@ -250,7 +250,7 @@ current mainには `file_menu_button` が実在し、ファイルを開く・フ
 
 ### 8.2 ウインドウを閉じる／タブを閉じる
 
-ウインドウの閉じるボタンは、既存のOS終了経路を一度だけ通す。通常ビルドの `main.rs::on_window_should_close` は `flush_pending_drafts(); true`。終了フックを通らない直接破棄や、`close_tab_now` への置換はしない。`[S1]`
+ウインドウの閉じるボタンは、既存のOS終了経路を一度だけ通す。通常ビルドでは `crates/app/src/main.rs` の `window.on_window_should_close(...)` に登録したコールバックが、`view.flush_pending_drafts()` を呼び出して `true` を返す。終了フックを通らない直接破棄や、`close_tab_now` への置換はしない。`[S1]`
 
 基準mainに全タブの未保存確認はなく、今回新設しない。`flush_pending_drafts` は作業フォルダーに属する無題の下書きを書き出すもので、全ファイルの未保存編集を保存する保証ではない。アプリ終了時の既存hookも保つ。
 
