@@ -34,7 +34,7 @@ Windows ZIPには `hane.exe`、`hane-updater.exe`、署名済み `Hane.ShellInte
 
 ## 更新用の署名資格情報（保守者が設定する値）
 
-次の値は保守者だけが設定する。値を推測・生成・commitしない。`prepare` は**存在の真偽値だけ**を評価し、値は署名を行うstepにだけ渡る。1つでも欠けるとリリースは失敗し、未署名のReleaseは作られない。Apple Developer ID・Team ID・notarization・stapleに関する設定は不要で、未設定でもmacOS ZIPの作成やWindows配布は止まらない。macOS ZIPの信頼根拠は、更新用Ed25519鍵で署名した `Hane.app/Contents/Resources/hane-install.json` と、catalogの `inventory_sha256` である。
+次の値は保守者だけが設定する。値を推測・生成・commitしない。`prepare` は**存在の真偽値だけ**を評価し、値は署名を行うstepにだけ渡る。1つでも欠けるとリリースは失敗し、未署名のReleaseは作られない。Apple Developer ID・Team ID・notarization・stapleに関する設定は不要で、未設定でもmacOS ZIPの作成やWindows配布は止まらない。macOS ZIPでは、ad-hoc署名で封印した `Hane.app` の外側に `Hane.app.update/<バージョン>-<source SHA>/hane-install.json` と `hane-install.json.sig` を配置する。更新時の信頼根拠は、このinventoryの更新用Ed25519署名とcatalogの `inventory_sha256` である。inventoryは `_CodeSignature/CodeResources` を含む封印後のアプリ全ファイルを列挙し、生成後にアプリ内へ追加して封印を壊さない。ZIPを展開した `Hane.app` と `Hane.app.update` は同じ場所に並べて置く。
 
 | 種別 | 名前 | 用途 |
 |---|---|---|
