@@ -48,6 +48,11 @@ impl EditorView {
         if next == self.zoom {
             return;
         }
+        // The explicit zoom owns the position under the pointer; a mode
+        // switch's remembered row from earlier in this cycle must not
+        // overwrite it on the next layout pass. Only an effective zoom change
+        // takes ownership.
+        self.pending_mode_anchor = None;
         self.pending_zoom_anchor = self.zoom_anchor_at(window_offset);
         self.zoom = next;
         cx.notify();
@@ -172,6 +177,17 @@ impl EditorView {
         self.set_zoom(1.0, self.viewport_height / 2.0, cx);
     }
 
+    /// Asks for one more real frame from inside `render`. GPUI does not mark a
+    /// view dirty again for a `cx.notify()` made while that view is being drawn,
+    /// so a correction that needs another layout pass (a viewport the anchor,
+    /// caret or find fallback moved) has to schedule the frame itself.
+    pub(super) fn request_layout_followup_frame(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.layout_followup_frames_requested =
+            self.layout_followup_frames_requested.saturating_add(1);
+        cx.notify();
+        window.request_animation_frame();
+    }
+
     /// Resolves a `PendingZoomAnchor` captured before a zoom-driven height
     /// change back to the `scroll_y` that keeps the anchored item and
     /// fraction at the same `window_offset` now that `self.heights` reflects
@@ -212,6 +228,20 @@ impl EditorView {
             .map(|line| (line, scroll_y))
             .or(self.retained_center_window);
         self.cancel_center_caret();
+        // A mode switch's remembered row is released only by an event that can
+        // actually move the viewport: a vertical scroll, or a wheel zoom that
+        // changes the effective zoom. Zero-delta / phase-only notifications
+        // (e.g. a Pixels(0, 0) end-of-gesture event) own nothing.
+        let vertical = f32::from(event.delta.pixel_delta(px(self.line_height())).y);
+        if event.modifiers.secondary() {
+            let factor = zoom_factor_for_wheel(event.delta, self.line_height());
+            let target = clamp_and_snap_zoom((self.raw_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM));
+            if target != self.zoom {
+                self.pending_mode_anchor = None;
+            }
+        } else if vertical != 0.0 {
+            self.pending_mode_anchor = None;
+        }
         if event.modifiers.secondary() {
             // A still-coasting scroll inertia must not keep advancing
             // `scroll_y` underneath a zoom gesture started from the same

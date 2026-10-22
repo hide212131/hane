@@ -185,7 +185,9 @@ impl LineShaper for WindowShaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::line::{BlockPresentationRequest, DEFAULT_LINE_HEIGHT, presented_block};
+    use crate::line::{
+        BlockPresentationRequest, DEFAULT_LINE_HEIGHT, DisclosurePolicy, presented_block,
+    };
     use crate::view::EditorView;
     use hane_document::SourceOffset;
     use hane_editor::{Editor, Selection};
@@ -221,6 +223,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: DEFAULT_LINE_HEIGHT,
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .expect("block presents");
             let line = &visual.lines[0];
@@ -299,6 +302,7 @@ mod tests {
                 table_projection: index.table_projection(&block),
                 forced_disclosure: None,
                 line_height: 26.0,
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .expect("table block presents");
             let line = &visual.lines[0];

@@ -37,6 +37,7 @@ use std::sync::mpsc::RecvTimeoutError;
 pub(super) const AI_SELECTION_STALE_MESSAGE: &str =
     "文章が変更されたため、この結果は適用できません。選択し直して実行してください。";
 const AI_SELECTION_NO_SELECTION_MESSAGE: &str = "AIで処理する文章を選択してください";
+const AI_SELECTION_READING_MODE_MESSAGE: &str = "閲覧モードでは置換できません。";
 /// A generous upper bound on top of the service's own
 /// `text_transform::TEXT_TRANSFORM_TIMEOUT`, purely so this background thread
 /// cannot block forever if the service were ever to stop replying at all.
@@ -45,6 +46,40 @@ const AI_SELECTION_RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
 /// `ai_selection_overlay_element`'s `max_h` and the below/above fit check in
 /// `ai_selection_overlay_position` so the two stay in sync.
 const AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT: f32 = 320.0;
+/// The popup's width when the editor area is wide enough; a narrower area
+/// shrinks the popup to fit instead (`ai_selection_popup_width`).
+const AI_SELECTION_POPUP_WIDTH: f32 = 360.0;
+
+/// Horizontal gap kept between the popup and each edge of the editor area.
+/// A popup flush with the window edge puts its close control on the window
+/// frame's resize/hit-test band (and past the visible client edge on
+/// Windows), where pointer presses never reach it.
+const AI_SELECTION_POPUP_EDGE_INSET: f32 = 8.0;
+
+/// The popup's width inside an editor area `area_width` wide: the regular
+/// width, or the area minus the edge insets on both sides when that is
+/// narrower.
+fn ai_selection_popup_width_for(area_width: f32) -> f32 {
+    AI_SELECTION_POPUP_WIDTH.min((area_width - 2.0 * AI_SELECTION_POPUP_EDGE_INSET).max(0.0))
+}
+
+/// Whether a mouse press at `(x, y)` landed inside the window's client area
+/// (`0..width` x `0..height`). A press on the OS window frame (resize drag)
+/// can reach the popup's outside-click handler with a position on or beyond
+/// the client edge; that is not an intentional click on the document, so it
+/// must not close the popup or discard the unsent input.
+fn ai_selection_press_is_inside_client(x: f32, y: f32, width: f32, height: f32) -> bool {
+    x >= 0.0 && y >= 0.0 && x < width && y < height
+}
+
+/// Shifts the popup's left edge `x` so a popup `width` wide stays inside the
+/// editor area spanning `area_left..area_left + area_width`, keeping
+/// `AI_SELECTION_POPUP_EDGE_INSET` clear of both edges.
+fn ai_selection_clamp_left(x: f32, area_left: f32, area_width: f32, width: f32) -> f32 {
+    let inset = AI_SELECTION_POPUP_EDGE_INSET;
+    x.min(area_left + area_width - inset - width)
+        .max(area_left + inset)
+}
 
 /// The built-in suggestion shown in the saved-prompt list only while nothing
 /// has ever been saved (`UserPromptsStore::load` returned `Ok(None)`),
@@ -780,10 +815,21 @@ impl EditorView {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("どのように直しますか?"));
-        let subscription = cx.subscribe(&input, |view, input, event: &InputEvent, cx| match event
+        let subscription = cx.subscribe_in(&input, window, |view, input, event: &InputEvent, window, cx| match event
         {
             InputEvent::Focus => {
                 view.ai_selection.input_focused = true;
+                // Pointer re-focus of the input must also bring the Tab
+                // order's logical focus back to `Input`; otherwise Tab keeps
+                // using a stale `focus_region` and skips Send. Ignore a late
+                // Focus event if real focus has already moved elsewhere.
+                if view.ai_selection.open
+                    && matches!(view.ai_selection.phase, AiSelectionPhase::Composing)
+                    && gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window)
+                {
+                    view.ai_selection.focus_region = AiSelectionFocusRegion::Input;
+                    view.ai_selection.list_focus_index = None;
+                }
                 cx.notify();
             }
             InputEvent::Blur => {
@@ -1040,6 +1086,13 @@ impl EditorView {
             anchor: target.range.start,
             active: SourceOffset(target.range.start.0 + result.len()),
         };
+        if !self.body_editable() {
+            // This write does not pass through `dispatch`, so the reading-mode
+            // check has to be made here, right before the document changes.
+            self.ai_selection.message = Some(AI_SELECTION_READING_MODE_MESSAGE.to_owned());
+            cx.notify();
+            return;
+        }
         let Some(session) = self.sessions.get_mut(target.session) else {
             return;
         };
@@ -1132,6 +1185,13 @@ impl EditorView {
     /// overflow the editor area.
     const AI_SELECTION_POPUP_MAX_HEIGHT: f32 = AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT + 2.0;
 
+    /// The horizontal extent of the editor area the popup must stay within:
+    /// the text column plus its side paddings, which is the window width minus
+    /// the sidebar.
+    fn ai_selection_editor_area_width(&self) -> f32 {
+        self.content_width + 2.0 * self.theme.line_horizontal_padding
+    }
+
     /// The popup's anchor point and the corner of the popup that should sit
     /// at that point: the active end of the captured selection's own screen
     /// position (`caret_geometry`, already content-area-relative), below the
@@ -1143,12 +1203,16 @@ impl EditorView {
     /// frame where no caret geometry has been resolved yet.
     fn ai_selection_overlay_position(&self) -> (gpui::Point<Pixels>, Anchor) {
         const GAP: f32 = 6.0;
-        let base_x = self.main_column_left + self.theme.line_horizontal_padding;
+        let area_width = self.ai_selection_editor_area_width();
+        let width = ai_selection_popup_width_for(area_width);
+        let clamp_x =
+            |x: f32| ai_selection_clamp_left(x, self.main_column_left, area_width, width);
+        let base_x = clamp_x(self.main_column_left + self.theme.line_horizontal_padding);
         let base_y = self.theme.header_height + self.document_find_reserved_height();
         let Some(geometry) = self.caret_geometry() else {
             return (point(px(base_x), px(base_y)), Anchor::TopLeft);
         };
-        let x = self.main_column_left + geometry.x;
+        let x = clamp_x(self.main_column_left + geometry.x);
         let caret_top = base_y + geometry.y;
         let caret_bottom = caret_top + geometry.height;
         let window_bottom = base_y + self.viewport_height;
@@ -1208,7 +1272,23 @@ impl EditorView {
         // `Regenerate`) stops rendering `Input` at all: with real focus left
         // on a now-unmounted widget, Tab/Enter stop reaching this popup's
         // own actions entirely (PR #450 review).
-        if self.ai_selection.focus_region != AiSelectionFocusRegion::Input {
+        //
+        // The exception is a pointer click that has just moved real focus
+        // onto the input while the logical region is still stale: the frame
+        // rendered right after that click would otherwise steal focus back
+        // before `InputEvent::Focus` is delivered. Adopt the input's real
+        // focus as the logical region instead.
+        let input_really_focused = matches!(self.ai_selection.phase, AiSelectionPhase::Composing)
+            && self
+                .ai_selection
+                .input
+                .as_ref()
+                .is_some_and(|input| gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window));
+        if input_really_focused {
+            self.ai_selection.focus_region = AiSelectionFocusRegion::Input;
+            self.ai_selection.list_focus_index = None;
+            self.ai_selection.input_focused = true;
+        } else if self.ai_selection.focus_region != AiSelectionFocusRegion::Input {
             window.focus(&self.focus_handle, cx);
             self.ai_selection.input_focused = false;
         }
@@ -1226,7 +1306,13 @@ impl EditorView {
             .id("ai-selection-popup")
             .debug_selector(|| "ai-selection-popup".to_owned())
             .occlude()
-            .w(px(360.0))
+            .w(px(ai_selection_popup_width_for(
+                self.ai_selection_editor_area_width(),
+            )))
+            .min_w(px(0.0))
+            .max_w(px(ai_selection_popup_width_for(
+                self.ai_selection_editor_area_width(),
+            )))
             .max_h(px(AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT))
             .flex()
             .flex_col()
@@ -1235,7 +1321,16 @@ impl EditorView {
             .border_color(rgb(self.theme.header_foreground))
             .bg(rgb(self.theme.code_background))
             .text_color(rgb(self.theme.foreground))
-            .on_mouse_down_out(cx.listener(|view, _, window, cx| {
+            .on_mouse_down_out(cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
+                let size = window.viewport_size();
+                if !ai_selection_press_is_inside_client(
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                    f32::from(size.width),
+                    f32::from(size.height),
+                ) {
+                    return;
+                }
                 view.close_ai_selection(window, cx);
             }))
             .child(content)
@@ -1267,8 +1362,12 @@ impl EditorView {
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.close_ai_selection(window, cx));
             });
+        // The close control never shrinks and always keeps its slot at the
+        // header's right edge; the title gives way (truncates) instead.
         let close = div()
             .id("ai-selection-close-focus-ring")
+            .debug_selector(|| "ai-selection-close".to_owned())
+            .flex_none()
             .rounded_sm()
             .when(close_focused, |el| {
                 el.border_1().border_color(rgb(theme.link_foreground))
@@ -1278,11 +1377,22 @@ impl EditorView {
             .flex()
             .items_center()
             .justify_between()
+            .gap_2()
+            .w_full()
+            .min_w(px(0.0))
             .px_2()
             .py_1()
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::BOLD)
-            .child("選択した文章に指示する")
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child("選択した文章に指示する"),
+            )
             .child(close);
         let view = cx.entity();
         let send = Button::new("ai-selection-send")
@@ -1295,6 +1405,8 @@ impl EditorView {
             });
         let send = div()
             .id("ai-selection-send-focus-ring")
+            .debug_selector(|| "ai-selection-send".to_owned())
+            .flex_none()
             .rounded_sm()
             .when(send_focused, |el| {
                 el.border_1().border_color(rgb(theme.link_foreground))
@@ -1310,10 +1422,18 @@ impl EditorView {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
+                    .debug_selector(|| "ai-selection-input".to_owned())
                     .children(input.map(|input| Input::new(&input).aria_label("ai instruction"))),
             )
             .child(send);
-        let mut body = div().flex().flex_col().child(header).child(input_row);
+        let input_row = input_row.w_full().min_w(px(0.0));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w(px(0.0))
+            .child(header)
+            .child(input_row);
         if let Some(message) = &self.ai_selection.message {
             body = body.child(
                 div()
@@ -1826,6 +1946,122 @@ mod tests {
         });
     }
 
+    #[test]
+    fn popup_width_keeps_regular_width_and_shrinks_to_narrow_areas() {
+        assert_eq!(ai_selection_popup_width_for(960.0), 360.0);
+        assert_eq!(ai_selection_popup_width_for(360.0), 344.0);
+        assert_eq!(ai_selection_popup_width_for(280.0), 264.0);
+        assert_eq!(ai_selection_popup_width_for(279.0), 263.0);
+        assert_eq!(ai_selection_popup_width_for(-5.0), 0.0);
+    }
+
+    #[test]
+    fn popup_left_edge_stays_inside_the_editor_area_at_every_width() {
+        for area_width in [279.0_f32, 280.0, 960.0] {
+            let width = ai_selection_popup_width_for(area_width);
+            for (area_left, x) in [(0.0_f32, 0.0_f32), (0.0, 100.0), (0.0, 900.0), (200.0, 250.0)] {
+                let left = ai_selection_clamp_left(x, area_left, area_width, width);
+                assert!(
+                    left >= area_left + AI_SELECTION_POPUP_EDGE_INSET - 0.01,
+                    "left {left} at width {area_width}"
+                );
+                assert!(
+                    left + width <= area_left + area_width - AI_SELECTION_POPUP_EDGE_INSET + 0.01,
+                    "right edge {} at width {area_width}",
+                    left + width
+                );
+            }
+        }
+        // Regular width keeps the anchor position when it already fits.
+        assert_eq!(ai_selection_clamp_left(100.0, 0.0, 960.0, 360.0), 100.0);
+    }
+
+    #[test]
+    fn frame_drag_presses_outside_the_client_area_do_not_count_as_outside_clicks() {
+        for (width, height) in [(279.0_f32, 600.0_f32), (280.0, 600.0), (962.0, 600.0)] {
+            // Intentional clicks inside the client area still close the popup.
+            assert!(ai_selection_press_is_inside_client(10.0, 10.0, width, height));
+            assert!(ai_selection_press_is_inside_client(width - 1.0, height - 1.0, width, height));
+            // Frame presses (right/bottom/left/top border) are ignored.
+            assert!(!ai_selection_press_is_inside_client(width, 100.0, width, height));
+            assert!(!ai_selection_press_is_inside_client(width + 4.0, 100.0, width, height));
+            assert!(!ai_selection_press_is_inside_client(100.0, height, width, height));
+            assert!(!ai_selection_press_is_inside_client(-1.0, 100.0, width, height));
+            assert!(!ai_selection_press_is_inside_client(100.0, -1.0, width, height));
+        }
+    }
+
+    #[gpui::test]
+    fn overlay_position_keeps_the_whole_popup_inside_a_narrow_editor_area(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one two\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        for window_width in [279.0_f32, 280.0, 960.0] {
+            view.update(cx, |view, _cx| {
+                view.main_column_left = 0.0;
+                view.content_width = window_width - 2.0 * view.theme.line_horizontal_padding;
+                view.viewport_height = 600.0;
+                view.caret_geometry = Some(CaretGeometry {
+                    x: 250.0,
+                    y: 50.0,
+                    height: 20.0,
+                });
+            });
+            view.read_with(cx, |view, _| {
+                let (position, _) = view.ai_selection_overlay_position();
+                let width = ai_selection_popup_width_for(view.ai_selection_editor_area_width());
+                let left = f32::from(position.x);
+                assert!(left >= AI_SELECTION_POPUP_EDGE_INSET - 0.01);
+                assert!(left + width <= window_width - AI_SELECTION_POPUP_EDGE_INSET + 0.01);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn close_and_send_controls_are_painted_inside_the_window_at_narrow_widths(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("one two three\n", "Untitled", cx));
+        for window_width in [279.0_f32, 280.0, 960.0] {
+            cx.simulate_resize(gpui::size(px(window_width), px(760.0)));
+            cx.run_until_parked();
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    view.editor_mut()
+                        .set_selection(Selection {
+                            anchor: SourceOffset(0),
+                            active: SourceOffset(3),
+                        })
+                        .unwrap();
+                    view.open_ai_selection(window, cx);
+                });
+            });
+            cx.run_until_parked();
+            for selector in ["ai-selection-popup", "ai-selection-close", "ai-selection-send"] {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} painted at width {window_width}"));
+                assert!(
+                    f32::from(bounds.left()) >= AI_SELECTION_POPUP_EDGE_INSET - 0.01
+                        && f32::from(bounds.right())
+                            <= window_width - AI_SELECTION_POPUP_EDGE_INSET + 0.01,
+                    "{selector} {bounds:?} must stay clear of the window edges at width {window_width}"
+                );
+            }
+            view.update(cx, |view, cx| {
+                view.ai_selection.open = false;
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+    }
+
     #[gpui::test]
     fn replace_applies_a_byte_accurate_multibyte_result_as_one_undoable_edit(
         cx: &mut gpui::TestAppContext,
@@ -1930,6 +2166,144 @@ mod tests {
             // open for the user to discard/regenerate explicitly.
             assert!(view.ai_selection.open);
         });
+    }
+
+    #[gpui::test]
+    fn reading_refuses_a_fresh_review_result_and_never_revives_an_old_reply(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("日本語の文章です\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        let open_popup = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    view.editor_mut()
+                        .set_selection(Selection {
+                            anchor: SourceOffset(0),
+                            active: SourceOffset("日本語".len()),
+                        })
+                        .unwrap();
+                    view.open_ai_selection(window, cx);
+                });
+            });
+            cx.run_until_parked();
+        };
+        let body = |view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                (
+                    view.editor().document().full_text(),
+                    view.editor().document().revision(),
+                    view.sessions.active().is_dirty(),
+                    view.editor().can_undo(),
+                )
+            })
+        };
+
+        // A review whose target is still fresh, reached while the body is
+        // read-only (the mode flag moves without the switch's popup close, as
+        // a result that was already in flight would find it): the write is
+        // refused on its own, not because a reset removed the popup.
+        open_popup(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.phase = AiSelectionPhase::Reviewing {
+                result: "改訂版".to_owned(),
+                unchanged: false,
+            };
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        let before = body(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.ai_selection.open);
+                assert!(view.ai_selection_target_is_fresh(view.ai_selection.target.unwrap()));
+                view.ai_selection_replace(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.ai_selection.message.as_deref(),
+                Some(AI_SELECTION_READING_MODE_MESSAGE)
+            );
+            assert!(view.ai_selection.open, "the refusal does not apply or discard");
+        });
+        assert_eq!(body(&view, cx), before, "nothing was written");
+        view.update(cx, |view, _| view.editor_mode = EditorMode::Editing);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.close_ai_selection(window, cx));
+        });
+        cx.run_until_parked();
+
+        // A request started in editing, the switch to reading closes it, and
+        // the editing mode comes back before the old reply arrives.
+        open_popup(cx);
+        view.update(cx, |view, cx| {
+            view.ai_selection.request_generation = 3;
+            view.ai_selection.pending = Some(PendingRequest {
+                operation_id: OperationId(7),
+                generation: 3,
+            });
+            view.ai_selection.phase = AiSelectionPhase::Submitting;
+            cx.notify();
+        });
+        let before = body(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+            });
+        });
+        cx.run_until_parked();
+        // No explicit focus on the body here: the close itself returns it, so
+        // Copy reaches the body's selection.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_owned()));
+        cx.simulate_keystrokes("secondary-c");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("日本語".to_owned()),
+            "Copy right after the switch copies the selection"
+        );
+        cx.update(|window, app| {
+            let view = view.read(app);
+            assert!(view.focus_handle.is_focused(window), "body focus is back");
+            assert!(!view.ai_selection_blocks_editor_keys());
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection().range()),
+            SourceRange::new(0, "日本語".len()),
+            "the selection survives"
+        );
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_selection.apply_outcome(
+                3,
+                OperationId(7),
+                Ok(TextTransformOutcome::Succeeded {
+                    text: "改訂版".to_owned(),
+                }),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.ai_selection.open, "the old reply does not reopen the popup");
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.ai_selection_replace(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(body(&view, cx), before, "the old reply cannot write or add history");
     }
 
     #[gpui::test]
@@ -2819,6 +3193,51 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(!view.ai_selection.open);
+        });
+    }
+
+    #[gpui::test]
+    fn tab_after_pointer_refocusing_the_input_reaches_send(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("abcdef\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(0),
+                        active: SourceOffset(3),
+                    })
+                    .unwrap();
+                view.open_ai_selection(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Move logical focus away from the input, then click the input with
+        // a real pointer event (bypassing the Tab handler).
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
+        });
+        let point = cx
+            .debug_bounds("ai-selection-input")
+            .expect("ai instruction input painted")
+            .center();
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Input);
+            assert!(view.ai_selection.input_focused);
+        });
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_selection.focus_region, AiSelectionFocusRegion::Send);
         });
     }
 
