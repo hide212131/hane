@@ -33,7 +33,7 @@ Windows / macOSで、ウインドウ操作と既存のファイルタブを**高
 | 最小サイズ | 対象OSでは `window_min_size = 330 × 240`論理px。固定操作領域を保ちながらWindows Snapの小さい領域へ入れる範囲を広げる。初期サイズは現行960×760を維持 |
 | 設定画面 | 同じ40px上部とOSボタンを保ち、メニュー・タブの代わりに「設定」を表示。既存の「アプリに戻る」は設定画面の本文側に残す |
 
-Windows 11では最小幅がSnap領域より大きいと配置できない場合がある。Microsoftは幅330 effective pixels以下を、より広い端末でのSnap互換性の推奨値としている。Haneの下限は330論理pxを目標とし、表示倍率による実効寸法とSnap配置をT02/T04の実画面確認で記録する。
+Windows 11では最小幅がSnap領域より大きいと配置できない場合がある。Microsoftは幅330 effective pixels以下を、より広い端末でのSnap互換性の推奨値としている。Haneの下限は330論理pxを目標とするが、330 effective pxはより広い互換性の推奨であり、Issue #542にない固定の合否閾値にはしない。表示倍率による実効寸法は、T02/T04で最小幅の物理pixel幅と対象ウインドウのDPIを取得し、`effective px = physical px × 96 / DPI`（[Microsoft公式](https://learn.microsoft.com/en-us/windows/win32/learnwin32/dpi-and-device-independent-pixels)）で算出して記録する。物理pixel幅とDPIは同じウインドウ／モニターのものを対応させる。
 
 タイトルを重ねて表示するための行や、タブの追加・閉じるボタン、新しい検索欄は作らない。ウインドウ名の管理、既存キーボード操作、フォーカスの復帰経路は維持する。サイドバーは全幅の上部の下から始める。
 
@@ -273,9 +273,9 @@ current mainには `file_menu_button` が実在し、ファイルを開く・フ
 | ID | 操作と合格条件 | 方法 |
 |---|---|---|
 | T01 配色 | 両OSでOS Light / Dark × アプリ Light / Dark / Systemの6通り。初回起動、再起動、同じ解決色の明示設定→System、System中のOS変更、明示設定中のOS変更、設定画面でも一貫 | theme／状態遷移の対象テスト＋両OS画面 |
-| T02 幅 | 330 / 360 / 480 / 960px、サイドバー有無、多数タブ、長い日本語名。メニュー・右102px・移動余白が押し出されず末尾タブへ到達。最小高さで内容が重ならず必要なscrollが可能 | 実rootのboundsテスト＋両OS画面 |
+| T02 幅 | 330 / 360 / 480 / 960px、サイドバー有無、多数タブ、長い日本語名。メニュー・右102px・移動余白が押し出されず末尾タブへ到達。最小高さで内容が重ならず必要なscrollが可能。Windowsでは330論理pxの最小幅で物理pixel幅と対象ウインドウのDPI／倍率を取得し、`effective px = physical px × 96 / DPI`で算出して100%と非100%の各倍率で記録する（記録のみで、330 effective pxの適合自体は合否にしない） | 実rootのboundsテスト＋両OS画面 |
 | T03 操作境界 | 余白だけで移動。タブ／メニューのクリック・二度押しで移動や拡大を起こさない。ポップアップの下へ操作が漏れない | 対象テスト＋両OS直接操作 |
-| T04 OS操作 | 最小化・復帰、最大化・復帰、上端・各角のresize。Windows Snap候補と配置、macOS標準3ボタン・二度押し設定・全画面往復 | 両OS直接操作。Windowsは100%と別の表示倍率、macOSは二度押しのOS設定も記録 |
+| T04 OS操作 | 最小化・復帰、最大化・復帰、上端・各角のresize。Windows Snap候補と配置、macOS標準3ボタン・二度押し設定・全画面往復。Windowsの合格条件は、各試験倍率でSnap候補が表示され、選択したSnap領域へ実際に配置できること。T02と同じ方法で算出したeffective px値と330 effective px推奨への適合は記録するが、それ自体はpass/fail条件にしない | 両OS直接操作。Windowsは100%と別の表示倍率、macOSは二度押しのOS設定も記録 |
 | T05 タブ | 左／右／中クリック、横scroll、Ctrl+Tab、dirtyタブの取消・保存・保存失敗。対象SessionIdと表示追従を維持 | 既存タブテスト＋代表操作 |
 | T06 座標 | 先頭・折返し行のクリックと選択、検索欄開閉、sidebar幅変更、wheel／pinch拡大、選択自動scroll、AI選択画面が実描画と一致 | 既存geometryテスト＋実rootの位置確認・短い実編集 |
 | T07 日本語 | 本文・filter・renameで実IMEの未確定／確定／取消とfocus切替。入力先が漏れず、候補位置を新たにずらさない | 両OS実IME。必要な状態を変更前と比較 |
