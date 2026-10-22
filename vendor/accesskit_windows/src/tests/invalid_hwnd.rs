@@ -68,7 +68,7 @@ fn initial_state() -> TreeUpdate {
     text_run.set_character_lengths(vec![1u8; 5]);
     text_run.set_character_positions(vec![0.0f32, 10.0, 20.0, 30.0, 40.0]);
     text_run.set_character_widths(vec![10.0f32; 5]);
-    text_run.set_word_lengths(vec![5u8]);
+    text_run.set_word_starts(vec![0u8]);
 
     TreeUpdate {
         nodes: vec![
