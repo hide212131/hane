@@ -2113,6 +2113,29 @@ impl EditorView {
         }
     }
 
+    /// Cmd/Ctrl+W: closes the selected tab through the same path as the
+    /// middle-click, so the unsaved-changes confirmation still applies.
+    pub(crate) fn close_active_file_tab(&mut self, cx: &mut Context<Self>) {
+        let id = self.sessions.active_id();
+        self.request_tab_close(id, cx);
+    }
+
+    /// The tab context menu's "タブを閉じる". The instance the menu captured
+    /// must still be current, so a tab that vanished or was replaced since the
+    /// menu opened never closes an unrelated document.
+    fn close_file_tab_from_menu(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tab_context_menu = None;
+        if self.document_instance(id) == Some(instance) {
+            self.request_tab_close(id, cx);
+        }
+        cx.notify();
+    }
+
     /// Unconditionally cancels whatever confirmation is current — the global
     /// Escape handler's contract, which dismisses whichever prompt the user
     /// is actually looking at right now rather than one tied to a specific
@@ -7645,6 +7668,15 @@ impl EditorView {
             move |view, _, _, cx| view.save_file_tab_as(save_as_id, save_as_instance, cx),
         );
 
+        let (close_id, close_instance) = (menu.id, menu.instance);
+        let close_item = self.file_tab_context_menu_item(
+            "file-tab-context-close",
+            "タブを閉じる",
+            true,
+            cx,
+            move |view, _, _, cx| view.close_file_tab_from_menu(close_id, close_instance, cx),
+        );
+
         let menu_element = div()
             .id("file-tab-context-menu")
             .debug_selector(|| "file-tab-context-menu".to_owned())
@@ -7669,7 +7701,10 @@ impl EditorView {
             .child(vscode_item);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let menu_element = menu_element.child(reveal_item);
-        menu_element.child(copy_item).child(save_as_item)
+        menu_element
+            .child(copy_item)
+            .child(save_as_item)
+            .child(close_item)
     }
 
     fn tab_close_confirm_element(
@@ -14849,6 +14884,176 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert_eq!(view.sessions.active_id(), other);
+        });
+    }
+
+    fn two_clean_path_tabs(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<EditorView>,
+        &mut gpui::VisualTestContext,
+        SessionId,
+        SessionId,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("first\n"),
+                    identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (first, second) = view.update(cx, |view, _| {
+            let first = view.sessions.active_id();
+            let second = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("second\n"),
+                    identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
+                    stamp: None,
+                },
+            );
+            (first, second)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+        (view, cx, first, second)
+    }
+
+    #[gpui::test]
+    fn secondary_w_closes_only_the_selected_tab(cx: &mut gpui::TestAppContext) {
+        let (view, cx, first, second) = two_clean_path_tabs(cx);
+        view.read_with(cx, |view, _| assert_eq!(view.sessions.active_id(), second));
+
+        let key = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" };
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1);
+            assert_eq!(view.sessions.active_id(), first);
+            assert!(view.sessions.get(second).is_none());
+        });
+
+        // The last tab keeps the existing contract: it is replaced by a blank
+        // untitled document rather than leaving the window without one.
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1);
+            assert!(view.sessions.active().path().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn secondary_w_on_an_unsaved_tab_asks_before_closing(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _first, second) = two_clean_path_tabs(cx);
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("edit").unwrap();
+            view.after_input(cx);
+        });
+        let key = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" };
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 2);
+            assert!(view.sessions.get(second).is_some());
+            assert!(view.tab_close_confirm.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_close_item_closes_an_unselected_tab_without_activating_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, first, second) = two_clean_path_tabs(cx);
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let item = cx
+            .debug_bounds("file-tab-context-close")
+            .expect("close item rendered");
+        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_none());
+            assert!(view.sessions.get(first).is_none());
+            assert_eq!(view.sessions.active_id(), second);
+            assert_eq!(view.sessions.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_close_item_for_a_vanished_tab_closes_nothing(cx: &mut gpui::TestAppContext) {
+        let (view, cx, first, second) = two_clean_path_tabs(cx);
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let item = cx
+            .debug_bounds("file-tab-context-close")
+            .expect("close item rendered");
+
+        // The menu's tab disappears through another route before the click.
+        view.update(cx, |view, cx| view.close_tab_now(first, cx));
+        view.update(cx, |view, cx| {
+            // A stale menu snapshot must not act on the remaining document.
+            view.close_file_tab_from_menu(
+                first,
+                DocumentInstance {
+                    generation: 0,
+                    workspace: view.work_folder_generation,
+                },
+                cx,
+            );
+        });
+        let _ = item;
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1);
+            assert!(view.sessions.get(second).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn context_menu_close_item_on_an_unsaved_tab_keeps_it_until_confirmed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, _first, second) = two_clean_path_tabs(cx);
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("edit").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        let tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let item = cx
+            .debug_bounds("file-tab-context-close")
+            .expect("close item rendered");
+        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(second).is_some());
+            assert!(view.sessions.active().is_dirty());
+            assert!(view.tab_close_confirm.is_some());
         });
     }
 

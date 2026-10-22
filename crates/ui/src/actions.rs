@@ -306,6 +306,19 @@ command_actions! {
             }
         }
     },
+    CloseFileTab ("secondary-w") => close_file_tab_action |view, _window, cx| {
+        if keys_claimed_elsewhere(view) {
+            return;
+        }
+        match view.input_target() {
+            InputTarget::SidebarFilter | InputTarget::InlineRename => {}
+            InputTarget::Body => {
+                if view.editor().ime().is_none() {
+                    view.close_active_file_tab(cx);
+                }
+            }
+        }
+    },
     ResetZoom ("secondary-0") => reset_zoom_action |view, _window, cx| { view.reset_zoom(cx); },
     Rename ("f2") => rename |view, window, cx| { view.begin_inline_rename_from_selection(window, cx); },
     Newline ("enter") => newline |view, window, cx| {
