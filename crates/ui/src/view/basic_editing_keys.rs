@@ -665,17 +665,17 @@ mod tests {
                 }
                 let span = block_line_span(view.editor().document(), &indexed)
                     .expect("the paragraph's lines");
-                let visual = presented_block_with_table_projection(
-                    view.editor(),
-                    &indexed,
-                    &span,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    view.line_height(),
-                )
+                let visual = presented_block(BlockPresentationRequest {
+                    editor: view.editor(),
+                    block: &indexed,
+                    visible: &span,
+                    joined: None,
+                    list_projection: None,
+                    fence_height_projection: None,
+                    table_projection: None,
+                    forced_disclosure: None,
+                    line_height: view.line_height(),
+                })
                 .expect("the whole paragraph is presented");
                 let layout = layout_block(&visual, view.content_width, &shaper);
                 offsets
