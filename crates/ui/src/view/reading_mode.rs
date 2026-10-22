@@ -564,7 +564,7 @@ mod tests {
             // layout row; the presentation may then omit the line entirely
             // (it is outside the render window) or keep it at zero height.
             // The owning block must then be drawn by the latest render.
-            closed_structural_row(view, &index, &block, visual, offset)?;
+            closed_structural_row(view, index, &block, visual, offset)?;
             if !view
                 .line_owners
                 .values()
