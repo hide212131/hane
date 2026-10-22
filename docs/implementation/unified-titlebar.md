@@ -192,15 +192,15 @@ div()
 
 ### 7.1 設定とnative appearance
 
-`cx.set_window_appearance(...)` は、current main（`d9050c1f02e06c8748399757f5131d29a0aea41a`）の現行GPUI公開APIには存在しない。実装PRで追加する新しい公開setterであり、既存APIとしては呼べない。以下は、そのsetterに渡す値の契約である。
+`cx.set_window_appearance(...)` は、`Cargo.lock` が固定する `gpui-pre 0.3.6` の既存公開API `App::set_window_appearance(&self, Option<WindowAppearance>)` である。GPUIの更新やvendor変更は不要で、新しい公開APIも追加しない。Platform側のsetterはdefault no-opで、既存のmacOS backendがoverrideを持ち、Windowsはdefault no-opを使う。以下は、この既存setterに渡す値の契約である。
 
-| `ThemePreference` | 実装PRで追加する `cx.set_window_appearance(...)` の引数 |
+| `ThemePreference` | 既存の `cx.set_window_appearance(...)` の引数 |
 |---|---|
 | Light | `Some(WindowAppearance::Light)` |
 | Dark | `Some(WindowAppearance::Dark)` |
 | System | `None` |
 
-Systemを、その瞬間のLight / Darkを入れた `Some(...)` に置き換えない。そうするとOS追従が固定される。Windowsではこのnative override APIはno-opであり、今回はHaneが描く上部と操作ボタンの配色を合わせる。OSが管理する外周1pxや影まで独自に変更するvendor拡張は追加しない。`[S6][S7]`
+macOSでは既存のnative appearance setterが反映され、`None` でOS追従に戻る。Systemを、その瞬間のLight / Darkを入れた `Some(...)` に置き換えない。そうするとOS追従が固定される。Windowsではこのnative override APIはno-opであり、今回はHaneが描く上部と操作ボタンの配色を合わせる。OSが管理する外周1pxや影まで独自に変更するvendor拡張は追加しない。`[S6][S7]`
 
 ### 7.2 更新順と初期化
 
