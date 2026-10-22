@@ -2109,17 +2109,27 @@ mod tests {
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(1500));
         cx.run_until_parked();
-        [
-            "閲覧モードに切り替え",
-            "編集モードに切り替え",
-            MODE_SWITCH_BLOCKED_BY_COMPOSITION,
-        ]
-        .into_iter()
-        .filter(|text| {
-            cx.debug_bounds(&format!("reading-mode-toggle-tooltip:{text}"))
-                .is_some()
-        })
-        .collect()
+        // `debug_bounds` takes a `&'static str`, so each selector is a literal
+        // that spells `reading-mode-toggle-tooltip:{text}`.
+        let candidates: [(&'static str, &'static str); 3] = [
+            (
+                "閲覧モードに切り替え",
+                "reading-mode-toggle-tooltip:閲覧モードに切り替え",
+            ),
+            (
+                "編集モードに切り替え",
+                "reading-mode-toggle-tooltip:編集モードに切り替え",
+            ),
+            (
+                MODE_SWITCH_BLOCKED_BY_COMPOSITION,
+                "reading-mode-toggle-tooltip:文字の変換を確定または取り消してから切り替えてください",
+            ),
+        ];
+        candidates
+            .into_iter()
+            .filter(|(_, selector)| cx.debug_bounds(selector).is_some())
+            .map(|(text, _)| text)
+            .collect()
     }
 
     #[gpui::test]
