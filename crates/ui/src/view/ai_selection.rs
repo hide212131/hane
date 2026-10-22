@@ -1941,7 +1941,7 @@ mod tests {
     #[test]
     fn popup_width_keeps_regular_width_and_shrinks_to_narrow_areas() {
         assert_eq!(ai_selection_popup_width_for(960.0), 360.0);
-        assert_eq!(ai_selection_popup_width_for(360.0), 360.0);
+        assert_eq!(ai_selection_popup_width_for(360.0), 344.0);
         assert_eq!(ai_selection_popup_width_for(280.0), 264.0);
         assert_eq!(ai_selection_popup_width_for(279.0), 263.0);
         assert_eq!(ai_selection_popup_width_for(-5.0), 0.0);
