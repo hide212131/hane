@@ -4546,6 +4546,8 @@ impl EditorView {
         self.pending_caret_visibility_after_layout = false;
         self.pending_find_visibility_after_layout = false;
         self.pending_zoom_anchor = None;
+        // Likewise a mode switch's remembered row from earlier in this cycle.
+        self.pending_mode_anchor = None;
         self.cancel_center_caret();
         self.retained_center_window = pinned;
         cx.notify();
@@ -6631,6 +6633,9 @@ impl EditorView {
         // from fighting the drag once it does resume (issue #389).
         self.scroll_inertia = None;
         self.cancel_center_caret();
+        // The drag owns the position; a mode switch's remembered row must not
+        // pull it back on the next render.
+        self.pending_mode_anchor = None;
         cx.stop_propagation();
         cx.notify();
     }

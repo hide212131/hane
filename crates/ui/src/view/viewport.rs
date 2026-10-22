@@ -223,6 +223,8 @@ impl EditorView {
             .map(|line| (line, scroll_y))
             .or(self.retained_center_window);
         self.cancel_center_caret();
+        // Same ownership for a mode switch's remembered row.
+        self.pending_mode_anchor = None;
         if event.modifiers.secondary() {
             // A still-coasting scroll inertia must not keep advancing
             // `scroll_y` underneath a zoom gesture started from the same

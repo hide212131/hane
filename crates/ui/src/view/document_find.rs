@@ -2684,10 +2684,14 @@ mod tests {
                 view.sessions.active().is_dirty(),
             )
         });
+        // The debounce re-checks `Instant::now()` after its timer wakes, and
+        // `advance_clock` only moves the virtual clock, so real time must pass
+        // too (see `rapid_query_changes_coalesce_into_a_single_scan_for_the_final_text`).
         let settle = |cx: &mut gpui::VisualTestContext| {
             cx.run_until_parked();
+            std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
             cx.executor()
-                .advance_clock(std::time::Duration::from_millis(300));
+                .advance_clock(DOCUMENT_FIND_DEBOUNCE + Duration::from_millis(50));
             cx.run_until_parked();
         };
 
@@ -2706,6 +2710,7 @@ mod tests {
         settle(cx);
         view.read_with(cx, |view, _| {
             assert_eq!(view.document_find.query_text, "A😀e\u{301}Z");
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
             assert_eq!(view.document_find.matches.len(), 1);
         });
         // A non-empty (UTF-16 1..3) selection replaced by input.
@@ -2723,6 +2728,7 @@ mod tests {
         settle(cx);
         view.read_with(cx, |view, _| {
             assert_eq!(view.document_find.query_text, "A羽e\u{301}Z");
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
             assert!(view.document_find.matches.is_empty());
         });
         // A hidden link target is matched in the source without opening it.
@@ -2740,6 +2746,7 @@ mod tests {
         settle(cx);
         view.read_with(cx, |view, _| {
             assert_eq!(view.document_find.query_text, "hidden.example");
+            assert_eq!(view.document_find.result, DocumentFindResult::Ready);
             assert_eq!(view.document_find.matches.len(), 1);
             assert_eq!(view.editor_mode(), EditorMode::Reading);
             assert_eq!(

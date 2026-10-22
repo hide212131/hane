@@ -17,11 +17,23 @@ impl EditorView {
         let disclosure_collapse = disclosure
             .filter(|disclosure| disclosure.is_empty())
             .is_some_and(|_| {
-                self.last_background_height_disclosure.is_some_and(
+                let background_is_open = self.last_background_height_disclosure.is_some_and(
                     |(background_revision, background)| {
                         background_revision == revision && !background.is_empty()
                     },
-                )
+                );
+                // A mode rebuild forgets the background disclosure while the
+                // applied heights still describe a non-empty selection. The
+                // endpoint bridge only touches the selection's ends, so the
+                // interior must still collapse to this caret once.
+                let applied_is_open = self
+                    .last_applied_height_disclosure
+                    .is_some_and(|(applied_revision, applied)| {
+                        applied_revision == revision && !applied.is_empty()
+                    })
+                    && self.last_background_height_disclosure
+                        != disclosure.map(|disclosure| (revision, disclosure));
+                background_is_open || applied_is_open
             });
         if !self.block_index.needs_formal_parse(document)
             && !disclosure_refresh

@@ -216,7 +216,11 @@ impl EditorView {
                         entry.is_valid(
                             self.content_width,
                             self.layout_font_revision,
-                            block.revision,
+                            // The layout is stamped with the document revision it
+                            // was drawn at; `block.revision` is only when this
+                            // block was last parsed and stays old after an edit
+                            // to another block.
+                            document.revision(),
                         )
                     })
                     .and_then(|entry| {
@@ -386,8 +390,12 @@ mod tests {
     ) -> usize {
         let mut delivered = 0;
         loop {
-            let callbacks = cx.update(|window, app| window.simulate_next_frame(app));
+            // Timers and executor work first, so a callback they register is
+            // already queued when the queue is inspected. The round that finds
+            // none ends the loop with no settle after it, so no callback made
+            // by that settle can be left behind unnoticed.
             settle(cx);
+            let callbacks = cx.update(|window, app| window.simulate_next_frame(app));
             if callbacks == 0 {
                 break;
             }
@@ -413,24 +421,137 @@ mod tests {
         assert!(toggle(view, cx));
         settle(cx);
         deliver_requested_frames(view, cx, mark, 8);
+        assert!(
+            view.read_with(cx, |view, _| view.pending_mode_anchor.is_none()),
+            "the mode anchor was resolved by the delivered frames"
+        );
+    }
+
+    /// Geometry the last render actually drew for one source offset.
+    #[derive(Debug)]
+    struct MeasuredRow {
+        /// Content-space top and height of the fragment holding the offset.
+        top: f32,
+        height: f32,
+        /// Content-space top and height of the owning block.
+        block_top: f32,
+        block_height: f32,
+    }
+
+    /// Reads only data a render produced: the owning block's presentation and
+    /// layout must both exist and agree with the index, the document revision,
+    /// the width/font and the mode, and the latest frame must have drawn the
+    /// row (`line_owners` is cleared and refilled by every render, so a layout
+    /// retained for an off-screen block is not mistaken for a drawn one). A
+    /// missing piece is an observation failure; nothing is estimated, laid out
+    /// or shaped to fill it in.
+    fn measured_row(
+        view: &EditorView,
+        window: &Window,
+        offset: SourceOffset,
+    ) -> Result<MeasuredRow, String> {
+        let shaper = crate::shape::WindowShaper::new(window, view.zoom);
+        let document = view.editor().document();
+        let index = view.current_index().ok_or("no current block index")?;
+        let block = index
+            .block_at(offset)
+            .ok_or_else(|| format!("no block owns {offset:?}"))?;
+        let visual = view
+            .block_cache
+            .get(&block.id)
+            .ok_or("the owning block has no presentation")?;
+        let entry = view
+            .layout_cache
+            .get(&block.id)
+            .ok_or("the owning block has no cached layout")?;
+        if !visual.matches(&block) {
+            return Err("the presentation no longer matches the index block".to_owned());
+        }
+        if !entry.is_valid(
+            view.content_width,
+            view.layout_font_revision,
+            document.revision(),
+        ) {
+            return Err("the layout is stale for the width, font or document revision".to_owned());
+        }
+        let layout = &entry.layout;
+        if layout.block != visual.id {
+            return Err("the layout belongs to another block".to_owned());
+        }
+        if view.editor_mode == EditorMode::Reading
+            && visual.lines.iter().any(|line| line.disclosure.is_some())
+        {
+            return Err("a reading presentation still discloses markers".to_owned());
+        }
+        let row_index = layout
+            .row_for_source(offset)
+            .ok_or_else(|| format!("no layout row owns {offset:?}"))?;
+        let row = layout
+            .lines
+            .get(row_index)
+            .ok_or("the layout row is missing")?;
+        let line = visual
+            .lines
+            .get(row.line)
+            .ok_or("the layout row has no visual line")?;
+        if view.line_owners.get(&(line.line_id as usize)) != Some(&(visual.id, row.line)) {
+            return Err("the latest render did not draw this row".to_owned());
+        }
+        let point = layout
+            .point_for_source(visual, offset, &shaper)
+            .ok_or("the layout has no fragment for the offset")?;
+        let block_top = view.heights.prefix_sum(block.ordinal);
+        Ok(MeasuredRow {
+            top: block_top + point.y,
+            height: point.height,
+            block_top,
+            block_height: view.heights.height(block.ordinal).unwrap_or(0.0),
+        })
+    }
+
+    /// The row holding `offset` is on screen with its real, drawn geometry.
+    /// A positive fragment must itself intersect the viewport (a wrapped cell
+    /// fragment off screen is not rescued by the rest of its row). A closed
+    /// structural row has no height of its own; there the owning block must be
+    /// visible instead.
+    fn assert_offset_row_on_screen(
+        view: &TestView,
+        cx: &mut TestCx,
+        offset: SourceOffset,
+        label: &str,
+    ) -> MeasuredRow {
+        let (row, scroll_y, viewport, tolerance) = cx.update(|window, app| {
+            let view = view.read(app);
+            (
+                measured_row(view, window, offset),
+                view.scroll_y,
+                view.viewport_height,
+                view.line_height(),
+            )
+        });
+        let row = row.unwrap_or_else(|error| {
+            panic!("{label}: no measured geometry for {offset:?}: {error}")
+        });
+        let (top, height) = if row.height > 0.0 {
+            (row.top, row.height)
+        } else {
+            (row.block_top, row.block_height)
+        };
+        assert!(
+            top.is_finite() && height.is_finite() && height > 0.0,
+            "{label}: measured {row:?}"
+        );
+        assert!(
+            top + height >= scroll_y - tolerance && top <= scroll_y + viewport + tolerance,
+            "{label}: {row:?} is outside the viewport at {scroll_y} (+{viewport})"
+        );
+        row
     }
 
     /// The caret row is drawn on screen with its real coordinates.
     fn assert_caret_row_on_screen(view: &TestView, cx: &mut TestCx, label: &str) {
-        view.read_with(cx, |view, _| {
-            let active = view.editor().selection().active;
-            let (top, height) = view
-                .source_offset_row_bounds(active)
-                .unwrap_or_else(|| panic!("{label}: the row is laid out"));
-            let tolerance = view.line_height();
-            assert!(
-                top + height >= view.scroll_y - tolerance
-                    && top <= view.scroll_y + view.viewport_height + tolerance,
-                "{label}: row {top}+{height} is outside the viewport at {} (+{})",
-                view.scroll_y,
-                view.viewport_height
-            );
-        });
+        let active = view.read_with(cx, |view, _| view.editor().selection().active);
+        assert_offset_row_on_screen(view, cx, active, label);
     }
 
     fn toggle(view: &TestView, cx: &mut TestCx) -> bool {
@@ -753,17 +874,15 @@ mod tests {
                 !view.pending_caret_visibility_after_layout,
                 "{label}: the pending visibility request converged"
             );
-            let active = view.editor().selection().active;
-            let (top, height) = view
-                .source_offset_row_bounds(active)
-                .unwrap_or_else(|| panic!("{label}: the reached row has measured geometry"));
             assert!(
-                top.is_finite() && top >= 0.0 && height > 0.0,
-                "{label}: measured row {top}+{height}"
+                view.pending_mode_anchor.is_none(),
+                "{label}: no mode anchor is left pending"
             );
         });
-        assert_caret_row_on_screen(view, cx, label);
-        view.read_with(cx, |view, _| view.editor().selection().active)
+        // The oracle is the drawn fragment, not a physical-line estimate.
+        let reached = view.read_with(cx, |view, _| view.editor().selection().active);
+        assert_offset_row_on_screen(view, cx, reached, label);
+        reached
     }
 
     #[gpui::test]
@@ -795,9 +914,23 @@ mod tests {
         // reachable by the real key alone.
         let mut previous = view.read_with(cx, |view, _| view.editor().selection().active);
         let mut visited = vec![previous];
+        let table_body = source.find("| one cell").unwrap()
+            ..=source.find("\n\nbetween table and code").unwrap();
+        let code_body = source.find("let x = 1;").unwrap()
+            ..=source.find("let x = 1;").unwrap() + "let x = 1;".len();
+        let mut table_fragments_seen = false;
         for step in 0..60 {
             let reached = press_and_check(&view, cx, "down", &format!("down #{step}"));
             assert!(reached >= previous, "down #{step}: moved backwards");
+            if table_body.contains(&reached.0) {
+                // The narrow cells really wrap into several drawn fragments.
+                table_fragments_seen |= view.read_with(cx, |view, _| {
+                    view.current_index()
+                        .and_then(|index| index.block_at(reached))
+                        .and_then(|block| view.layout_cache.get(&block.id))
+                        .is_some_and(|entry| entry.layout.lines.iter().any(|row| row.fragment > 0))
+                });
+            }
             visited.push(reached);
             if reached == previous {
                 break;
@@ -810,17 +943,17 @@ mod tests {
             "Down reaches the last paragraph (stopped at {})",
             last.0
         );
-        // Every structural part was passed through at least once.
-        for (label, marker) in [
-            ("table", "| one cell"),
-            ("code", "let x = 1;"),
-        ] {
-            let at = source.find(marker).unwrap();
-            assert!(
-                visited.iter().any(|offset| offset.0 >= at),
-                "{label}: Down went past it"
-            );
-        }
+        // Every structural part was actually stood on, not just passed: the
+        // reached offsets lie inside the table body and the code body.
+        assert!(
+            visited.iter().any(|offset| table_body.contains(&offset.0)),
+            "Down stood in the table body"
+        );
+        assert!(
+            visited.iter().any(|offset| code_body.contains(&offset.0)),
+            "Down stood in the code body"
+        );
+        assert!(table_fragments_seen, "a narrow table cell has several fragments");
 
         // Shift+Down from the start keeps the anchor and extends forward.
         view.update(cx, |view, cx| {
@@ -978,19 +1111,20 @@ mod tests {
         });
         settle(cx);
         // Put the top edge in the middle of the last wrapped info row.
-        let (block_top, row_top, row_height) = view.read_with(cx, |view, _| {
+        let block_top = view.read_with(cx, |view, _| {
             let ordinal = view
                 .current_index()
                 .and_then(|index| index.block_at(SourceOffset(fence)))
                 .expect("fence block")
                 .ordinal;
-            let (top, height) = view
-                .source_offset_row_bounds(info_last)
-                .expect("the info row is laid out");
-            (view.heights.prefix_sum(ordinal), top, height)
+            view.heights.prefix_sum(ordinal)
         });
+        // The row comes from the drawn fragment, not from a line estimate.
+        let info_row = cx.update(|window, app| measured_row(view.read(app), window, info_last));
+        let info_row = info_row.expect("the last info fragment is drawn");
+        let (row_top, row_height) = (info_row.top, info_row.height);
         assert!(
-            row_top > block_top + row_height * 2.0,
+            row_height > 0.0 && row_top > block_top + row_height * 2.0,
             "the info wraps over several rows ({row_top} in the block at {block_top})"
         );
         view.update(cx, |view, cx| {
@@ -1000,18 +1134,315 @@ mod tests {
         settle(cx);
         let selection = view.read_with(cx, |view, _| view.editor().selection());
 
-        toggle_and_settle(&view, cx);
+        // Precondition: after the last settle the viewport top is still inside
+        // the measured info fragment, and the anchor that would be captured
+        // names the right source offset inside it.
+        let info_start = fence + 3;
+        let info_end = info_start + info.len();
+        let mut trace = String::new();
+        let describe = |view: &EditorView, stage: &str| -> String {
+            let ordinal = view
+                .current_index()
+                .and_then(|index| index.block_at(first_code))
+                .map(|block| block.ordinal);
+            let code = ordinal.map(|ordinal| {
+                (
+                    view.heights.prefix_sum(ordinal),
+                    view.heights.height(ordinal).unwrap_or(0.0),
+                )
+            });
+            let opening = view.source_offset_row_bounds(SourceOffset(info_start));
+            let first = view.source_offset_row_bounds(first_code);
+            format!(
+                "[{stage}] scroll_y={} pending={:?} code(top,height)={code:?} opening={opening:?} first_code={first:?}\n",
+                view.scroll_y,
+                view.pending_mode_anchor
+                    .map(|anchor| (anchor.offset.0, anchor.inside_row, anchor.attempts)),
+            )
+        };
+        let before = view.read_with(cx, |view, _| {
+            let anchor = view.capture_mode_anchor();
+            (
+                view.scroll_y,
+                anchor.map(|anchor| (anchor.offset.0, anchor.inside_row)),
+            )
+        });
+        trace.push_str(&view.read_with(cx, |view, _| describe(view, "before toggle")));
+        assert!(
+            before.0 >= row_top - 0.01 && before.0 < row_top + row_height,
+            "the viewport top is inside the measured info fragment: {} vs {row_top}+{row_height}",
+            before.0
+        );
+        assert!(
+            before
+                .1
+                .is_some_and(|(offset, _)| (info_start..info_end).contains(&offset)),
+            "the captured anchor names an offset inside the info: {:?} (info {info_start}..{info_end})",
+            before.1
+        );
+
+        let mark = requested_frames(&view, cx);
+        assert!(toggle(&view, cx));
+        trace.push_str(&view.read_with(cx, |view, _| describe(view, "after toggle")));
+        let mut delivered = 0;
+        loop {
+            settle(cx);
+            let callbacks = cx.update(|window, app| window.simulate_next_frame(app));
+            trace.push_str(&view.read_with(cx, |view, _| {
+                describe(view, &format!("frame round {delivered} ({callbacks} callbacks)"))
+            }));
+            if callbacks == 0 {
+                break;
+            }
+            delivered += 1;
+            assert!(delivered <= 8, "the anchor does not converge\n{trace}");
+        }
+        if requested_frames(&view, cx) != mark {
+            assert!(delivered > 0, "frames were requested but none was registered\n{trace}");
+        }
         view.read_with(cx, |view, _| {
+            assert!(view.pending_mode_anchor.is_none(), "anchor resolved\n{trace}");
             let (first_top, _) = view
                 .source_offset_row_bounds(first_code)
                 .expect("the first code row is laid out");
             assert!(
                 (view.scroll_y - first_top).abs() <= view.line_height() * 0.5,
-                "the hidden info rows resolve to the next visible source row: {} vs {first_top}",
+                "the hidden info rows resolve to the next visible source row: {} vs {first_top}\n{trace}",
                 view.scroll_y
             );
             assert_eq!(view.editor().selection(), selection);
         });
+    }
+
+    #[gpui::test]
+    fn a_caret_after_a_mode_round_trip_collapses_the_interior_of_the_last_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source: String = (0..60).map(|n| format!("```\ncode{n:02}\n```\n\n")).collect();
+        let at = |n: u32| source.find(&format!("code{n:02}")).unwrap();
+        let (view, cx) = open_view(cx, &source, 800.0, 400.0);
+        let select = |view: &TestView, cx: &mut TestCx, anchor: usize, active: usize| {
+            view.update(cx, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(anchor),
+                        active: SourceOffset(active),
+                    })
+                    .unwrap();
+                view.after_input(cx);
+            });
+        };
+        // A: a non-empty selection whose background job is still running.
+        select(&view, cx, at(5), at(25));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.document_parse_job_running));
+        // Reading, then a different non-empty selection B, then editing: the
+        // rebuild installs the heights of B and forgets the background basis.
+        assert!(toggle(&view, cx));
+        cx.run_until_parked();
+        select(&view, cx, at(30), at(50));
+        cx.run_until_parked();
+        assert!(toggle(&view, cx));
+        cx.run_until_parked();
+        // Before the old job finishes the selection collapses to a caret C
+        // outside B.
+        select(&view, cx, at(5), at(5));
+        cx.run_until_parked();
+        settle(cx);
+        settle(cx);
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            let document = view.editor().document();
+            let index = view.current_index().expect("formal index");
+            let closed = block_heights_with_disclosure(
+                document,
+                index,
+                view.line_height(),
+                view.active_height_disclosure(),
+            );
+            let still_open = block_heights_with_disclosure(
+                document,
+                index,
+                view.line_height(),
+                Some(SourceRange::new(at(30), at(50))),
+            );
+            for n in 32..48 {
+                let ordinal = index.ordinal_at(SourceOffset(at(n))).expect("fence block");
+                assert!(
+                    still_open[ordinal] > closed[ordinal],
+                    "fence {n} is open under B and closed under the caret"
+                );
+                let height = view.heights.height(ordinal).unwrap();
+                assert!(
+                    (height - closed[ordinal]).abs() < 0.01,
+                    "off-screen fence {n} inside the old selection is closed: {height} vs {} (open {})",
+                    closed[ordinal],
+                    still_open[ordinal]
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn the_mode_anchor_accepts_a_layout_drawn_after_an_edit_to_another_block(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long = "word ".repeat(600);
+        let source = format!("short\n\n{long}\n\nend\n");
+        let (view, cx) = open_view(cx, &source, 400.0, 500.0);
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.insert_text("x", cx);
+        });
+        cx.run_until_parked();
+        let ordinal = view.update(cx, |view, cx| {
+            let ordinal = view
+                .current_index()
+                .and_then(|index| index.block_at(SourceOffset(source.find("word").unwrap() + 1)))
+                .expect("the long paragraph")
+                .ordinal;
+            view.scroll_y = view.heights.prefix_sum(ordinal) + view.viewport_height * 1.5;
+            cx.notify();
+            ordinal
+        });
+        // Drawn at the current revision, before the formal background parse
+        // can refresh the block's own parse revision.
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let document = view.editor().document();
+            let block = view
+                .current_index()
+                .and_then(|index| index.block(ordinal))
+                .expect("the long paragraph");
+            assert_ne!(
+                block.revision,
+                document.revision(),
+                "the block was parsed before the edit to the other block"
+            );
+            let entry = view
+                .layout_cache
+                .get(&block.id)
+                .expect("the long paragraph is drawn");
+            assert!(
+                entry.is_valid(
+                    view.content_width,
+                    view.layout_font_revision,
+                    document.revision()
+                ),
+                "its layout is valid for the current document revision"
+            );
+            let anchor = view
+                .capture_mode_anchor()
+                .expect("an anchor is captured");
+            assert!(
+                anchor.offset > block.source_range.start,
+                "the anchor names a drawn row inside the paragraph, not its block start \
+                 ({:?} vs {:?})",
+                anchor.offset,
+                block.source_range.start
+            );
+        });
+    }
+
+    fn plain_paragraphs() -> String {
+        (0..200).map(|n| format!("paragraph {n:03}\n\n")).collect()
+    }
+
+    /// Opens a long plain document, scrolls into the middle, and switches the
+    /// mode so an anchor is pending. `then` runs in the same event cycle,
+    /// before any render.
+    fn switch_then_scroll_in_the_same_cycle(
+        cx: &mut gpui::TestAppContext,
+        then: impl FnOnce(&mut EditorView, &mut Context<EditorView>),
+        check_scroll: impl FnOnce(f32, f32),
+    ) {
+        let source = plain_paragraphs();
+        let (view, cx) = open_view(cx, &source, 800.0, 400.0);
+        let middle = source.find("paragraph 120").unwrap();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(middle)))
+                .unwrap();
+            view.scroll_y = 2_000.0;
+            cx.notify();
+        });
+        settle(cx);
+        let selection = view.read_with(cx, |view, _| view.editor().selection());
+        let scroll_before = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(scroll_before > 1_000.0);
+
+        let mark = requested_frames(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+                assert!(view.pending_mode_anchor.is_some());
+                then(view, cx);
+                assert!(
+                    view.pending_mode_anchor.is_none(),
+                    "the later explicit scroll owns the position"
+                );
+            });
+        });
+        settle(cx);
+        deliver_requested_frames(&view, cx, mark, 8);
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_mode_anchor.is_none());
+            assert_eq!(view.editor().selection(), selection);
+            check_scroll(view.scroll_y, scroll_before);
+        });
+    }
+
+    #[gpui::test]
+    fn scroll_to_start_in_the_cycle_of_a_switch_is_not_undone_by_the_old_anchor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        switch_then_scroll_in_the_same_cycle(
+            cx,
+            |view, cx| view.scroll_to_document_edge(false, cx),
+            |scroll_y, _| assert!(scroll_y.abs() < 0.5, "scroll stays at the start: {scroll_y}"),
+        );
+    }
+
+    #[gpui::test]
+    fn a_wheel_event_in_the_cycle_of_a_switch_is_not_undone_by_the_old_anchor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        switch_then_scroll_in_the_same_cycle(
+            cx,
+            |view, cx| {
+                let event = gpui::ScrollWheelEvent {
+                    position: gpui::point(px(100.0), px(100.0)),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-600.0))),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                };
+                view.on_scroll_at(&event, std::time::Instant::now(), cx);
+            },
+            |scroll_y, before| {
+                assert!(
+                    scroll_y >= before + 500.0,
+                    "the wheel's position is kept: {scroll_y} vs {before}"
+                )
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn page_down_in_the_cycle_of_a_switch_is_not_undone_by_the_old_anchor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        switch_then_scroll_in_the_same_cycle(
+            cx,
+            |view, cx| view.scroll_page(true, cx),
+            |scroll_y, before| {
+                assert!(
+                    scroll_y > before + 100.0,
+                    "the page move's position is kept: {scroll_y} vs {before}"
+                )
+            },
+        );
     }
 
     #[gpui::test]

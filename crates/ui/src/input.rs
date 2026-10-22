@@ -282,6 +282,10 @@ impl EntityInputHandler for EditorView {
                 // input must not commit anything into the document.
                 if self.body_editable() {
                     self.editor_mut().commit_composition();
+                    // The core commit owns no UI notification, yet the mode
+                    // switch's disabled state is fixed at render time. Tell
+                    // the UI the composition ended so the first click works.
+                    cx.notify();
                 }
             }
         }
