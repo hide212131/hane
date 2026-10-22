@@ -48,6 +48,11 @@ impl EditorView {
         if next == self.zoom {
             return;
         }
+        // The explicit zoom owns the position under the pointer; a mode
+        // switch's remembered row from earlier in this cycle must not
+        // overwrite it on the next layout pass. Only an effective zoom change
+        // takes ownership.
+        self.pending_mode_anchor = None;
         self.pending_zoom_anchor = self.zoom_anchor_at(window_offset);
         self.zoom = next;
         cx.notify();
