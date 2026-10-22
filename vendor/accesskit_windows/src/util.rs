@@ -387,7 +387,10 @@ pub(crate) fn client_to_screen_error(error: Error) -> Error {
 // HANE-PATCH: returns a Result instead of unwrapping the ClientToScreen result.
 pub(crate) fn client_top_left(hwnd: WindowHandle) -> Result<Point> {
     let mut result = POINT::default();
-    unsafe { ClientToScreen(hwnd.0, &mut result) }.map_err(client_to_screen_error)?;
+    // ClientToScreen returns a BOOL; `ok()` captures the thread's last OS error on failure.
+    unsafe { ClientToScreen(hwnd.0, &mut result) }
+        .ok()
+        .map_err(client_to_screen_error)?;
     Ok(Point::new(result.x.into(), result.y.into()))
 }
 
