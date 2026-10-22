@@ -712,6 +712,11 @@ command_actions! {
     Cut ("secondary-x") => cut |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         let target = view.input_target();
+        // A read-only body must not even reach the clipboard: Cut would write
+        // the selection out before the delete is refused.
+        if matches!(target, InputTarget::Body) && !view.body_editable() {
+            return;
+        }
         let text = match target {
             InputTarget::SidebarFilter => view.selected_sidebar_filter_text(),
             InputTarget::InlineRename => view.selected_inline_rename_text(),

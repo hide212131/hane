@@ -18,7 +18,7 @@ exclude = ["vendor/gpui", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows"]
 
 [workspace.package]
 # Source of truth for release version; Cargo.lock must stay in sync.
-version = "0.28.0"
+version = "0.29.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.98.1"
@@ -31,7 +31,6 @@ hane-markdown = { path = "crates/markdown" }
 hane-metrics = { path = "crates/metrics" }
 hane-presentation = { path = "crates/presentation" }
 hane-session = { path = "crates/session" }
-hane-benchmark = { path = "crates/benchmark" }
 hane-ui = { path = "crates/ui" }
 hane-update = { path = "crates/update" }
 gpui = { package = "gpui-pre", version = "=0.3.6" }

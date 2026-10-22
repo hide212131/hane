@@ -1377,7 +1377,25 @@ fn badge_renders_before_remainder(position: DateBadgePosition) -> bool {
     matches!(position, DateBadgePosition::Left)
 }
 
-/// The sidebar's file-row label: the file name unchanged, unless it embeds
+/// The file name as shown in a sidebar row: a trailing `.md` extension
+/// (ASCII case-insensitive, matching what the work folder accepts) is
+/// omitted. Display only — the real file name and path are untouched. A name
+/// that is nothing but the extension is kept as is so the row is never blank.
+fn display_file_name(file_name: &str) -> &str {
+    let Some(stem_len) = file_name.len().checked_sub(3) else {
+        return file_name;
+    };
+    if stem_len == 0 || !file_name.is_char_boundary(stem_len) {
+        return file_name;
+    }
+    if file_name[stem_len..].eq_ignore_ascii_case(".md") {
+        &file_name[..stem_len]
+    } else {
+        file_name
+    }
+}
+
+/// The sidebar's file-row label: the file name (minus a trailing `.md`) unchanged, unless it embeds
 /// a recognized date (`YYYY-MM-DD` or `YYYYMMDD`), in which case that date
 /// renders as its own small badge (`本日`, `17日(木)`, `10/3(土)`,
 /// `2025/10/3(金)`, …) instead of raw digits, positioned per
@@ -1400,6 +1418,7 @@ fn file_name_label(
         .items_center()
         .gap_1()
         .min_w(px(0.0));
+    let file_name = display_file_name(file_name);
     let Some(badge) = split_file_name_for_badge(file_name) else {
         return row.child(file_name.to_owned());
     };
@@ -1463,6 +1482,33 @@ fn draft_preview(session: &DocumentSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_file_name_omits_only_a_trailing_md_extension() {
+        assert_eq!(display_file_name("note.md"), "note");
+        assert_eq!(display_file_name("NOTE.MD"), "NOTE");
+        assert_eq!(display_file_name("Note.Md"), "Note");
+        assert_eq!(display_file_name("日本語のメモ.md"), "日本語のメモ");
+        assert_eq!(display_file_name("a.md.md"), "a.md");
+        assert_eq!(display_file_name("a.md.txt"), "a.md.txt");
+        assert_eq!(display_file_name("a.mdx"), "a.mdx");
+        assert_eq!(display_file_name("my.md notes"), "my.md notes");
+        assert_eq!(display_file_name("md"), "md");
+        assert_eq!(display_file_name("日本"), "日本");
+        assert_eq!(display_file_name(".md"), ".md");
+        assert_eq!(display_file_name(""), "");
+    }
+
+    #[test]
+    fn display_file_name_keeps_date_badge_split_and_title() {
+        let badge = split_file_name_for_badge(display_file_name("2025-10-03_会議メモ.md")).unwrap();
+        assert_eq!(badge.remainder(), "会議メモ");
+        let badge = split_file_name_for_badge(display_file_name("会議_20251003.MD")).unwrap();
+        assert_eq!(badge.remainder(), "会議");
+        let badge = split_file_name_for_badge(display_file_name("2025-10-03.md")).unwrap();
+        assert_eq!(badge.remainder(), "");
+        assert_eq!(badge.date.day, 3);
+    }
 
     fn trash_test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hane-trash-{name}-{}", std::process::id()));

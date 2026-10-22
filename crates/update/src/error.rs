@@ -43,6 +43,10 @@ pub enum ErrorCode {
     JournalInvalid,
     TransitionInvalid,
     StaleJournal,
+    /// The running app executes from a read-only macOS App Translocation
+    /// copy. Only the app layer reports it; placement detection itself keeps
+    /// returning `UnsupportedInstall`.
+    AppTranslocated,
     Io,
 }
 
@@ -87,6 +91,7 @@ impl ErrorCode {
             ErrorCode::JournalInvalid => "journal_invalid",
             ErrorCode::TransitionInvalid => "transition_invalid",
             ErrorCode::StaleJournal => "stale_journal",
+            ErrorCode::AppTranslocated => "app_translocated",
             ErrorCode::Io => "io",
         }
     }

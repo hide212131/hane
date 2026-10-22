@@ -3613,6 +3613,93 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[gpui::test]
+    fn reading_mode_keeps_the_content_search_input_editable(cx: &mut gpui::TestAppContext) {
+        use hane_session::OsWorkFolderScanner;
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hane-547-reading-search-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Note.md"), "A😀e\u{301}Z in a file").unwrap();
+        let folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("body\n", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.work_folder = Some(folder);
+                assert!(view.set_editor_mode(EditorMode::Reading, window, cx));
+                view.open_content_search(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+        let input = view
+            .read_with(cx, |view, _| view.content_search.input.clone())
+            .expect("the search input exists");
+        let body = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.sessions.active().is_dirty(),
+            )
+        });
+
+        // Real text callbacks of the input, with UTF-16 ranges.
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    None,
+                    "A😀e\u{301}Z",
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.content_search.query_text, "A😀e\u{301}Z");
+        });
+        cx.update(|window, app| {
+            input.update(app, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    Some(1..3),
+                    "羽",
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.content_search.query_text, "A羽e\u{301}Z");
+            assert_eq!(view.editor_mode(), EditorMode::Reading);
+            assert_eq!(
+                (
+                    view.editor().document().full_text(),
+                    view.editor().document().revision(),
+                    view.sessions.active().is_dirty(),
+                ),
+                body,
+                "typing a search never changes the body"
+            );
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(feature = "instrument")]
     #[gpui::test]
     fn content_search_empty_work_folder_records_zero_queue_occupancy(
