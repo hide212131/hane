@@ -223,6 +223,28 @@ fn failure_text(code: &str) -> &'static str {
     }
 }
 
+/// Why updates are unavailable, with what the user can actually do. Install
+/// placement failures are named here instead of surfacing later as a generic
+/// I/O error after the archive was fetched. Moving the app or reopening it
+/// from Finder is not promised to clear a quarantined launch.
+fn unavailable_text(code: &str) -> Option<&'static str> {
+    match code {
+        "app_translocated" => Some(
+            "macOSの隔離(App Translocation)された読み取り専用の場所から起動しているため、更新できません。Haneを終了し、配置済みの Hane.app を直接起動し直してください。それでも解消しない場合は、リリースページから手動で更新してください。",
+        ),
+        "unsupported_install" => Some(
+            "このインストール場所のHaneは自動更新に対応していません。リリースページから手動で更新してください。",
+        ),
+        "install_modified" => Some(
+            "インストール済みのアプリの内容を確認できませんでした。Haneを入れ直してください。",
+        ),
+        "io" | "receipt_unwritable" => Some(
+            "インストール場所を確認できないため、更新できません。アプリの場所と書き込み権限を確認してください。",
+        ),
+        _ => None,
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     format!("{:.1} MiB", bytes as f64 / MIB)
@@ -300,7 +322,10 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             model.actions.push((CardAction::Check, "再試行"));
         }
         AppUpdatePhase::Unavailable => {
-            model.detail = Some(format!("更新情報を利用できません (診断コード: {code})"));
+            model.detail = Some(match unavailable_text(code) {
+                Some(text) => format!("{text} (診断コード: {code})"),
+                None => format!("更新情報を利用できません (診断コード: {code})"),
+            });
         }
     }
     model
@@ -1446,6 +1471,20 @@ mod tests {
         let detail = model.detail.unwrap();
         assert!(detail.contains("更新情報を利用できません"));
         assert!(detail.contains("trust_unconfigured"));
+    }
+
+    #[test]
+    fn an_unusable_placement_explains_itself_without_promising_a_fix() {
+        for code in ["app_translocated", "unsupported_install", "install_modified", "io"] {
+            let mut input = snapshot(AppUpdatePhase::Unavailable);
+            input.error_code = Some(code.to_owned());
+            let model = card_model(&input);
+            assert!(model.actions.is_empty(), "{code}");
+            let detail = model.detail.unwrap();
+            assert!(detail.contains(code), "{code}: {detail}");
+            assert!(!detail.contains("更新情報を利用できません"), "{code}: {detail}");
+            assert!(!detail.contains("必ず"), "{code}: {detail}");
+        }
     }
 
     #[test]

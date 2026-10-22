@@ -316,6 +316,30 @@ impl AppUpdateService {
     pub fn enable_restart(&self, wiring: RestartWiring) {
         let _ = self.inner.restart.set(wiring);
     }
+
+    /// Records that the running install location cannot be updated. The
+    /// service then never downloads, restores or prepares an update, so no
+    /// archive is fetched into a receipts directory that is not usable.
+    /// A build that is already unavailable keeps its own reason.
+    pub fn block_placement(&self, error: &UpdateError, exe: &Path) {
+        let mut state = self.inner.lock();
+        if matches!(state.stage, Stage::Idle) {
+            state.stage = Stage::Unavailable {
+                code: placement_block_code(error, exe),
+            };
+        }
+    }
+}
+
+/// The reason shown for a placement that failed to resolve. The failure class
+/// from `locate` is kept (damaged, I/O, unsupported); only a path inside an
+/// App Translocation copy gets its own code, since the user action differs.
+fn placement_block_code(error: &UpdateError, exe: &Path) -> ErrorCode {
+    if exe.components().any(|c| c.as_os_str() == "AppTranslocation") {
+        ErrorCode::AppTranslocated
+    } else {
+        error.code
+    }
 }
 
 impl Inner {
@@ -1275,6 +1299,44 @@ mod tests {
         assert_eq!(service.snapshot().phase, AppUpdatePhase::Unavailable);
         assert!(!snapshot.restart_supported);
         assert!(service.prepare_restart(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn a_failed_placement_blocks_check_download_and_restore_before_any_request() {
+        let dir = TempDir::new("app-update-placement");
+        let transport = Arc::new(ScriptedTransport::new());
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            transport.clone(),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        let error = UpdateError::new(ErrorCode::UnsupportedInstall, "translocated");
+        let exe = Path::new("/private/var/folders/x/AppTranslocation/ABC/d/Hane.app/Contents/MacOS/hane");
+        service.block_placement(&error, exe);
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Unavailable);
+        assert_eq!(snapshot.error_code.as_deref(), Some("app_translocated"));
+        service.check();
+        service.restore_local();
+        service.download(&"a".repeat(64));
+        run_queued(&queue);
+        assert!(transport.requests().is_empty());
+        assert_eq!(service.snapshot().phase, AppUpdatePhase::Unavailable);
+        assert!(service.prepare_restart(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn a_placement_failure_keeps_its_class_and_a_normal_service_still_downloads() {
+        let error = UpdateError::new(ErrorCode::InstallModified, "damaged");
+        assert_eq!(
+            placement_block_code(&error, Path::new("/Applications/Hane.app/Contents/MacOS/hane")),
+            ErrorCode::InstallModified
+        );
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
     }
 
     #[test]
