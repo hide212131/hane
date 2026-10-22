@@ -1,0 +1,397 @@
+//! Keeps the sidebar's work folder listing in step with changes made outside
+//! the app.
+//!
+//! `hane_session::FolderWatcher` reports coalesced OS notifications from a
+//! background thread; this module delivers them to the view and re-lists the
+//! folder on the background executor (`OsWorkFolderScanner`, which lists
+//! names and metadata and never opens a note). The result is accepted only if
+//! it still belongs to the folder it was requested for, the same
+//! `work_folder_generation` rule every other background result follows.
+//! Nothing here touches sessions, so an open note, its unsaved edits, and its
+//! undo history are never replaced by a listing update.
+
+use super::*;
+use hane_session::{FolderWatcher, WatchBatch, WatchTiming};
+
+/// The watch and re-list bookkeeping for the current work folder. Replaced
+/// wholesale (dropping the old watcher) whenever a folder is opened.
+#[derive(Default)]
+pub(super) struct FolderWatchState {
+    /// Held only for its lifetime: dropping it releases the OS watch.
+    watcher: Option<FolderWatcher>,
+    refresh_running: bool,
+    /// A notification arrived while a re-list was running (or before the
+    /// first scan finished); one more re-list follows once it is safe.
+    refresh_pending: bool,
+    /// The notification source's last reported trouble (overflow, watch
+    /// error, root removed), consumed by the next re-list.
+    failure: Option<String>,
+}
+
+impl EditorView {
+    /// Starts watching `root` for the folder about to be scanned, replacing
+    /// (and thereby releasing) the previous folder's watch. Called *before*
+    /// the initial scan so a change made while that scan runs still arrives
+    /// as a notification afterward.
+    pub(super) fn start_folder_watch(&mut self, root: &Path, cx: &mut Context<Self>) {
+        self.folder_watch = FolderWatchState::default();
+        if let Err(error) = self.connect_folder_watch(root, cx) {
+            self.status = Some(format!(
+                "Work folder changes are not being watched: {error}"
+            ));
+        }
+    }
+
+    fn connect_folder_watch(&mut self, root: &Path, cx: &mut Context<Self>) -> std::io::Result<()> {
+        // Released first so the previous watcher's task ends instead of two
+        // watches reporting the same folder.
+        self.folder_watch.watcher = None;
+        let (sender, receiver) = async_channel::unbounded();
+        let watcher = FolderWatcher::start(root, WatchTiming::default(), move |batch| {
+            sender.send_blocking(batch).is_ok()
+        })?;
+        self.folder_watch.watcher = Some(watcher);
+        let generation = self.work_folder_generation;
+        cx.spawn(async move |view, cx| {
+            // Ends when the watcher is dropped (the channel closes), the view
+            // is gone, or the folder this watch belonged to was replaced.
+            while let Ok(batch) = receiver.recv().await {
+                let keep_going = view
+                    .update(cx, |view, cx| {
+                        view.folder_watch_batch_arrived(generation, batch, cx)
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+        Ok(())
+    }
+
+    /// Returns whether the watch this batch came from is still current.
+    fn folder_watch_batch_arrived(
+        &mut self,
+        generation: u64,
+        batch: WatchBatch,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if generation != self.work_folder_generation {
+            return false;
+        }
+        if let Some(failure) = batch.failure {
+            self.folder_watch.failure = Some(failure);
+        }
+        self.refresh_work_folder_listing(cx);
+        true
+    }
+
+    /// Re-lists the current work folder on the background executor. Runs at
+    /// most one re-list at a time; notifications arriving meanwhile collapse
+    /// into one follow-up.
+    pub(super) fn refresh_work_folder_listing(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf())
+        else {
+            // The first scan has not installed a folder yet; it resumes this
+            // once it does.
+            self.folder_watch.refresh_pending = true;
+            return;
+        };
+        if self.folder_watch.refresh_running {
+            self.folder_watch.refresh_pending = true;
+            return;
+        }
+        self.folder_watch.refresh_running = true;
+        self.folder_watch.refresh_pending = false;
+        let mut failure = self.folder_watch.failure.take();
+        if let Some(reason) = failure.as_mut() {
+            // The notification source reported trouble, so what it will say
+            // next cannot be trusted to cover what it missed. Reattach
+            // before listing, so a change after the list is still noticed.
+            if let Err(error) = self.connect_folder_watch(&root, cx) {
+                *reason = format!("{reason}; could not reattach the watch: {error}");
+            }
+        }
+        let generation = self.work_folder_generation;
+        cx.spawn(async move |view, cx| {
+            let scan_root = root.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { OsWorkFolderScanner.scan(&scan_root) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_work_folder_refresh(generation, &root, failure, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_work_folder_refresh(
+        &mut self,
+        generation: u64,
+        root: &Path,
+        failure: Option<String>,
+        result: std::io::Result<WorkFolder>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.work_folder_generation
+            || self
+                .work_folder
+                .as_ref()
+                .is_none_or(|folder| folder.root() != root)
+        {
+            // Listed for a folder that has since been replaced: its
+            // bookkeeping was reset with the switch, so leave it alone.
+            return;
+        }
+        self.folder_watch.refresh_running = false;
+        match result {
+            Ok(mut fresh) => {
+                fresh.set_sort_order(self.settings.sidebar_sort);
+                // State keyed by a folder path survives for folders that are
+                // still there and is dropped for the ones that are not.
+                self.expanded_folders
+                    .retain(|path| fresh.children_at(path).is_some());
+                if self
+                    .selected_folder
+                    .as_ref()
+                    .is_some_and(|path| fresh.children_at(path).is_none())
+                {
+                    self.selected_folder = None;
+                    if self.sidebar_focus == SidebarFocus::Folder {
+                        self.sidebar_focus = SidebarFocus::ActiveSession;
+                    }
+                }
+                self.work_folder = Some(fresh);
+                if let Some(reason) = failure {
+                    self.status = Some(format!("Work folder was rescanned: {reason}"));
+                }
+            }
+            Err(error) => {
+                // The last good list stays; it is not replaced by an empty or
+                // partial one. The trouble is reported, and remembered so the
+                // next notification reattaches the watch.
+                self.status = Some(format!("Could not refresh the work folder: {error}"));
+                self.folder_watch.failure =
+                    Some(failure.unwrap_or_else(|| "the last refresh failed".to_owned()));
+            }
+        }
+        if self.folder_watch.refresh_pending {
+            self.refresh_work_folder_listing(cx);
+        }
+        cx.notify();
+    }
+
+    /// Resumes a re-list that was requested before the first scan finished.
+    pub(super) fn resume_pending_folder_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.folder_watch.refresh_pending {
+            self.refresh_work_folder_listing(cx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn watch_test_root(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "hane-folder-watch-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn view_with_folder(
+        cx: &mut gpui::TestAppContext,
+        root: &Path,
+    ) -> gpui::Entity<EditorView> {
+        let work_folder = OsWorkFolderScanner.scan(root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _| view.work_folder = Some(work_folder));
+        view
+    }
+
+    fn file_names(view: &EditorView) -> Vec<String> {
+        let mut names: Vec<String> = view
+            .work_folder
+            .as_ref()
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| entry.file_name().to_owned())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[gpui::test]
+    fn a_refresh_installs_the_new_listing_and_prunes_state_of_removed_folders(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("prune");
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::create_dir_all(root.join("gone")).unwrap();
+        std::fs::write(root.join("keep/A.md"), "# A\n").unwrap();
+        let view = view_with_folder(cx, &root);
+        view.update(cx, |view, _| {
+            view.expanded_folders.insert(root.join("keep"));
+            view.expanded_folders.insert(root.join("gone"));
+            view.selected_folder = Some(root.join("gone"));
+            view.sidebar_focus = SidebarFocus::Folder;
+        });
+
+        std::fs::remove_dir_all(root.join("gone")).unwrap();
+        std::fs::write(root.join("keep/B.md"), "# B\n").unwrap();
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            let fresh = OsWorkFolderScanner.scan(&root);
+            view.finish_work_folder_refresh(generation, &root, None, fresh, cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(file_names(view), ["A.md", "B.md"]);
+            assert!(view.expanded_folders.contains(&root.join("keep")));
+            assert!(!view.expanded_folders.contains(&root.join("gone")));
+            assert_eq!(view.selected_folder, None);
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_refresh_leaves_open_documents_and_unsaved_edits_alone(cx: &mut gpui::TestAppContext) {
+        let root = watch_test_root("document");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("unsaved text").unwrap();
+            view.after_input(cx);
+        });
+
+        std::fs::write(root.join("External.md"), "# External\n").unwrap();
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            let fresh = OsWorkFolderScanner.scan(&root);
+            view.finish_work_folder_refresh(generation, &root, None, fresh, cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(file_names(view), ["External.md"]);
+            assert_eq!(view.editor().document().full_text(), "unsaved text");
+            assert!(view.active_session().is_dirty());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_refresh_result_for_a_replaced_folder_is_rejected(cx: &mut gpui::TestAppContext) {
+        let root = watch_test_root("stale");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Current.md"), "# Current\n").unwrap();
+        let view = view_with_folder(cx, &root);
+
+        let other = watch_test_root("stale-other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("Other.md"), "# Other\n").unwrap();
+        view.update(cx, |view, cx| {
+            let stale_generation = view.work_folder_generation;
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            // A result listed for the older generation.
+            let fresh = OsWorkFolderScanner.scan(&other);
+            view.finish_work_folder_refresh(stale_generation, &other, None, fresh, cx);
+            // And one for a root that is not the current folder.
+            let generation = view.work_folder_generation;
+            let fresh = OsWorkFolderScanner.scan(&other);
+            view.finish_work_folder_refresh(generation, &other, None, fresh, cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(file_names(view), ["Current.md"]);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_failed_refresh_keeps_the_last_listing_and_reports_the_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("failed");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Kept.md"), "# Kept\n").unwrap();
+        let view = view_with_folder(cx, &root);
+
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            let error = Err(std::io::Error::other("boom"));
+            view.finish_work_folder_refresh(
+                generation,
+                &root,
+                Some("watch error".to_owned()),
+                error,
+                cx,
+            );
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(file_names(view), ["Kept.md"]);
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("boom"))
+            );
+            assert_eq!(view.folder_watch.failure.as_deref(), Some("watch error"));
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_notification_from_a_replaced_folder_does_not_start_a_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("old-notification");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+
+        view.update(cx, |view, cx| {
+            let stale_generation = view.work_folder_generation;
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            let keep = view.folder_watch_batch_arrived(stale_generation, WatchBatch::default(), cx);
+            assert!(!keep, "the watch of a replaced folder is told to stop");
+            assert!(!view.folder_watch.refresh_running);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn notifications_during_a_refresh_collapse_into_one_follow_up(cx: &mut gpui::TestAppContext) {
+        let root = watch_test_root("collapse");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+
+        view.update(cx, |view, cx| {
+            view.folder_watch.refresh_running = true;
+            for _ in 0..5 {
+                let generation = view.work_folder_generation;
+                assert!(view.folder_watch_batch_arrived(generation, WatchBatch::default(), cx));
+            }
+            assert!(view.folder_watch.refresh_pending);
+            assert!(view.folder_watch.refresh_running);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

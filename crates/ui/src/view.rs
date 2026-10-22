@@ -99,6 +99,7 @@ mod background_parse;
 mod basic_editing_keys;
 mod content_search;
 mod document_find;
+mod folder_watch;
 mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod inline_rename;
@@ -1011,6 +1012,10 @@ pub struct EditorView {
     /// is open now, since `into`/`latest_open_target` alone cannot tell a
     /// same-named stale request in the new folder apart from one in the old.
     work_folder_generation: u64,
+    /// The OS watch on the current work folder and its re-list bookkeeping;
+    /// dropped (releasing the watch) when the folder is replaced or the
+    /// window closes.
+    folder_watch: folder_watch::FolderWatchState,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -1767,6 +1772,7 @@ impl EditorView {
             pending_restore: VecDeque::new(),
             restoring_path: None,
             work_folder_generation: 0,
+            folder_watch: folder_watch::FolderWatchState::default(),
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -1863,6 +1869,10 @@ impl EditorView {
         // told apart from the current one once both land; see the
         // `generation` check at the top of `finish_work_folder_scan`.
         let generation = self.work_folder_generation;
+        // Watching starts before the scan, so a change made while the scan
+        // runs is still reported afterward; the previous folder's watch is
+        // released here.
+        self.start_folder_watch(&root, cx);
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
             let scanned = cx
@@ -1972,6 +1982,7 @@ impl EditorView {
                 };
 
                 self.content_search_workspace_changed(cx);
+                self.resume_pending_folder_refresh(cx);
 
                 if self.latest_open_target.is_some() {
                     // A document was requested (e.g. delivered by Finder at
