@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Trusted focused GUI validation for the file-tab hover path/copy affordance (Issue #354).
 
-One fixed fixture, one direct-open Hane launch, one real-OS theme cycle
-(System -> Light -> Dark) with a screenshot-pixel judgement of the selected
-tab's background per theme, one real-OS hover over the tab label to reveal
+One fixed fixture, one direct-open Hane launch, a real-OS theme selection in
+the general settings (open settings -> choose Light, then Dark -> return to
+the document) with a screenshot-pixel judgement of the selected tab's
+background per theme, one real-OS hover over the tab label to reveal
 its HoverCard, a pixel-contrast probe that locates the copy icon without
 trusting the target's own rendering as an authority, one real-OS click on
 that icon, and an exact clipboard comparison against the fixture's absolute
@@ -29,7 +30,7 @@ PROCEDURE_VERSION = "hosted-file-tabs/1"
 VERIFICATION_KIND = "file_tabs_focused"
 SCOPE_NOTE = (
     "Issue #354 の file tab hover path / copy icon に限定した focused GUI evidence。"
-    "固定 fixture の direct-open、System/Light/Dark の実 OS クリックによる選択タブ背景の"
+    "固定 fixture の direct-open、一般設定でのライト/ダークの実 OS クリック選択と本文への復帰による選択タブ背景の"
     "screenshot pixel 判定、タブラベルへの実 OS hover による HoverCard の絶対 path 表示、"
     "copy icon の pixel/ink 判定と実 OS クリック、clipboard の完全一致確認だけを行う。"
     "他の focused/comprehensive GUI 検証の合格を意味しない。"
@@ -45,10 +46,23 @@ FIXTURE_CONTENT = (
     "Hover the tab to reveal its absolute path.\n"
 )
 
-# The footer theme control renders exactly `Theme {:?}` of ThemePreference
-# (session::store::ThemePreference), so the visible label is always one of
-# these three literal words.
-THEME_PATTERN = r"Theme\s+(System|Light|Dark)"
+# The theme is chosen in the general settings (Issue #536): the theme buttons
+# are labelled with exactly these words, found by OCR in the settings screen.
+# The settings are opened from the footer's "設定" button, or, in a narrow
+# editor column, from the footer's "その他" menu; "アプリに戻る" returns to the
+# document.
+THEME_SYSTEM_PATTERN = r"システムに合わせる"
+THEME_LIGHT_PATTERN = r"ライト"
+THEME_DARK_PATTERN = r"ダーク"
+THEME_OPTION_KEYS = ("system", "light", "dark")
+THEME_OPTION_PATTERNS = {
+    "system": THEME_SYSTEM_PATTERN,
+    "light": THEME_LIGHT_PATTERN,
+    "dark": THEME_DARK_PATTERN,
+}
+SETTINGS_ENTRY_PATTERN = r"設定"
+FOOTER_MORE_PATTERN = r"その他"
+SETTINGS_BACK_PATTERN = r"アプリに戻る"
 
 # A selected-tab background at or above this level on every channel is
 # indistinguishable from white regardless of theme; dark theme must never
@@ -134,9 +148,35 @@ def colors_differ(a: str, b: str, min_delta: int = MIN_BACKGROUND_DELTA) -> bool
     return max(abs(ar - br), abs(ag - bg), abs(ab - bb)) >= min_delta
 
 
-def theme_label_from_text(text: str) -> str | None:
-    match = re.search(THEME_PATTERN, text)
-    return match.group(1).lower() if match else None
+def is_valid_background(value: object) -> bool:
+    try:
+        parse_hex_color(value)
+    except ValueError:
+        return False
+    return True
+
+
+def selected_theme_option(
+    backgrounds: dict[str, object], surrounds: dict[str, object]
+) -> str | None:
+    """The one theme option whose button background differs from its surround.
+
+    Takes the sampled button backgrounds and the independent surrounding
+    surface colors, both keyed by "system" / "light" / "dark". A button is
+    selected when its background differs from the surround; the result is the
+    key of the single selected button, or None when none, several, or
+    unreadable/missing samples are found.
+    """
+    for samples in (backgrounds, surrounds):
+        if set(samples) != set(THEME_OPTION_KEYS):
+            return None
+        if not all(is_valid_background(value) for value in samples.values()):
+            return None
+    selected = [
+        key for key in THEME_OPTION_KEYS
+        if colors_differ(backgrounds[key], surrounds[key])
+    ]
+    return selected[0] if len(selected) == 1 else None
 
 
 def strip_whitespace(text: str) -> str:
@@ -228,7 +268,7 @@ def run_focused_scenario(
     evidence: dict = {"fixture_path": expected_absolute_path}
     holder = {"process": None}
     pending = (
-        "initial_theme_is_system", "switch_theme_to_light", "switch_theme_to_dark",
+        "settings_theme_controls_visible", "switch_theme_to_light", "switch_theme_to_dark",
         "dark_selected_tab_background_rejects_near_white",
         "light_dark_selected_tab_background_differs",
         "hover_shows_hover_card_path", "copy_icon_visible_pixel_contrast",
@@ -255,61 +295,131 @@ def run_focused_scenario(
             icon_probe: dict | None = None
             clicked = False
 
-            try:
-                initial_text = helper_json(interaction, helper, ["find-text", str(initial_image), THEME_PATTERN], helper_timeout)
-                label = theme_label_from_text(initial_text.get("matched_text", ""))
-                steps.append(step(
-                    "initial_theme_is_system", "pass" if label == "system" else "fail",
-                    None if label == "system" else f"起動直後の Theme 表示が System ではない: {label!r}",
-                    matched_text=initial_text.get("matched_text"),
-                ))
-            except (RuntimeError, ValueError) as exc:
-                steps.append(step("initial_theme_is_system", "blocked", str(exc)))
+            def capture(name: str) -> Path:
+                steps.append(interaction.capture_named(gui_validate, env, config, window_id, scenario_dir, name))
+                return scenario_dir / f"{name}.png"
+
+            def click(image: Path, pattern: str) -> dict:
+                return helper_json(interaction, helper, ["click-text", str(pid), str(image), pattern], helper_timeout)
+
+            def open_general_settings(image: Path, label: str) -> dict:
+                # A wide editor column shows the footer's "設定" button; a
+                # narrower one folds it into the "その他" menu.
+                try:
+                    evidence = click(image, SETTINGS_ENTRY_PATTERN)
+                except RuntimeError:
+                    click(image, FOOTER_MORE_PATTERN)
+                    time.sleep(0.4)
+                    evidence = click(capture(f"footer-more-{label}"), SETTINGS_ENTRY_PATTERN)
+                time.sleep(0.5)
+                return evidence
+
+            def read_theme_selection(image: Path) -> tuple[str | None, dict]:
+                """The theme option shown as selected in a settings screenshot,
+                judged from the three theme buttons' sampled backgrounds."""
+                samples = {
+                    key: helper_json(
+                        interaction, helper, ["button-background", str(image), pattern], helper_timeout
+                    )
+                    for key, pattern in THEME_OPTION_PATTERNS.items()
+                }
+                backgrounds = {key: sample.get("background_color") for key, sample in samples.items()}
+                surrounds = {key: sample.get("surround_color") for key, sample in samples.items()}
+                return selected_theme_option(backgrounds, surrounds), {
+                    **backgrounds, "surround": surrounds,
+                }
+
+            def choose_theme_in_settings(
+                base_image: Path, option_key: str, label: str
+            ) -> tuple[Path, str | None, dict]:
+                """Settings -> theme option -> back to the document; returns the
+                document screenshot, its selected-tab background and evidence,
+                including the theme option shown as selected before and after."""
+                open_event = open_general_settings(base_image, label)
+                settings_image = capture(f"settings-{label}")
+                controls = helper_json(
+                    interaction, helper, ["find-text", str(settings_image), THEME_SYSTEM_PATTERN], helper_timeout
+                )
+                selected_before, backgrounds_before = read_theme_selection(settings_image)
+                click_event = click(settings_image, THEME_OPTION_PATTERNS[option_key])
+                time.sleep(0.4)
+                selected_image = capture(f"settings-{label}-selected")
+                selected_after, backgrounds_after = read_theme_selection(selected_image)
+                back_event = click(selected_image, SETTINGS_BACK_PATTERN)
+                time.sleep(0.5)
+                document_image = capture(f"theme-{label}")
+                tab = helper_json(
+                    interaction, helper, ["tab-background", str(document_image), re.escape(FIXTURE_TAB_LABEL)], helper_timeout
+                )
+                return document_image, tab.get("background_color"), {
+                    "open_settings_event": open_event, "theme_controls_text": controls.get("matched_text"),
+                    "selected_theme_before": selected_before, "button_backgrounds_before": backgrounds_before,
+                    "choose_theme_event": click_event,
+                    "selected_theme_after": selected_after, "button_backgrounds_after": backgrounds_after,
+                    "back_event": back_event,
+                }
 
             try:
-                click_evidence = helper_json(
-                    interaction, helper, ["click-text", str(pid), str(initial_image), THEME_PATTERN], helper_timeout
+                light_image, light_background, light_evidence = choose_theme_in_settings(
+                    initial_image, "light", "light"
                 )
-                light_image = scenario_dir / "theme-light.png"
-                steps.append(interaction.capture_named(gui_validate, env, config, window_id, scenario_dir, "theme-light"))
-                light_text = helper_json(interaction, helper, ["find-text", str(light_image), THEME_PATTERN], helper_timeout)
-                light_label = theme_label_from_text(light_text.get("matched_text", ""))
-                light_tab = helper_json(
-                    interaction, helper, ["tab-background", str(light_image), re.escape(FIXTURE_TAB_LABEL)], helper_timeout
-                )
-                light_background = light_tab.get("background_color")
+                controls_reason = None
+                if not light_evidence["theme_controls_text"]:
+                    controls_reason = "一般設定にテーマの選択肢を確認できない"
+                elif light_evidence["selected_theme_before"] != "system":
+                    controls_reason = (
+                        "一般設定を開いた時点の現在値が System ではない: "
+                        f"{light_evidence['selected_theme_before']!r}"
+                    )
                 steps.append(step(
-                    "switch_theme_to_light", "pass" if light_label == "light" else "fail",
-                    None if light_label == "light" else f"クリック後の Theme 表示が Light ではない: {light_label!r}",
-                    click_event=click_evidence, matched_text=light_text.get("matched_text"),
-                    selected_tab_background=light_background,
+                    "settings_theme_controls_visible", "fail" if controls_reason else "pass", controls_reason,
+                    matched_text=light_evidence["theme_controls_text"],
+                    selected_theme=light_evidence["selected_theme_before"],
+                    button_backgrounds=light_evidence["button_backgrounds_before"],
                 ))
+                valid_light = (
+                    is_valid_background(light_background)
+                    and light_evidence["selected_theme_after"] == "light"
+                )
+                steps.append(step(
+                    "switch_theme_to_light", "pass" if valid_light else "fail",
+                    None if valid_light else (
+                        "ライト選択後に設定画面でライトが選択状態になり、選択タブ背景を取得できることを確認できない: "
+                        f"selected={light_evidence['selected_theme_after']!r} background={light_background!r}"
+                    ),
+                    selected_tab_background=light_background, **light_evidence,
+                ))
+                if not valid_light:
+                    light_background = None
             except (RuntimeError, ValueError) as exc:
+                steps.append(step("settings_theme_controls_visible", "blocked", str(exc)))
                 steps.append(step("switch_theme_to_light", "blocked", str(exc)))
 
             if light_background is not None and light_image is not None:
                 try:
-                    click_evidence = helper_json(
-                        interaction, helper, ["click-text", str(pid), str(light_image), THEME_PATTERN], helper_timeout
+                    dark_image, dark_background, dark_evidence = choose_theme_in_settings(
+                        light_image, "dark", "dark"
                     )
-                    dark_image = scenario_dir / "theme-dark.png"
-                    steps.append(interaction.capture_named(gui_validate, env, config, window_id, scenario_dir, "theme-dark"))
-                    dark_text = helper_json(interaction, helper, ["find-text", str(dark_image), THEME_PATTERN], helper_timeout)
-                    dark_label = theme_label_from_text(dark_text.get("matched_text", ""))
-                    dark_tab = helper_json(
-                        interaction, helper, ["tab-background", str(dark_image), re.escape(FIXTURE_TAB_LABEL)], helper_timeout
+                    valid_dark = (
+                        is_valid_background(dark_background)
+                        and dark_evidence["selected_theme_before"] == "light"
+                        and dark_evidence["selected_theme_after"] == "dark"
                     )
-                    dark_background = dark_tab.get("background_color")
                     steps.append(step(
-                        "switch_theme_to_dark", "pass" if dark_label == "dark" else "fail",
-                        None if dark_label == "dark" else f"クリック後の Theme 表示が Dark ではない: {dark_label!r}",
-                        click_event=click_evidence, matched_text=dark_text.get("matched_text"),
-                        selected_tab_background=dark_background,
+                        "switch_theme_to_dark", "pass" if valid_dark else "fail",
+                        None if valid_dark else (
+                            "ダーク選択前がライト、選択後に設定画面でダークが選択状態になり、選択タブ背景を取得できることを確認できない: "
+                            f"before={dark_evidence['selected_theme_before']!r} "
+                            f"after={dark_evidence['selected_theme_after']!r} background={dark_background!r}"
+                        ),
+                        selected_tab_background=dark_background, **dark_evidence,
                     ))
+                    if not valid_dark:
+                        dark_background = None
                 except (RuntimeError, ValueError) as exc:
                     steps.append(step("switch_theme_to_dark", "blocked", str(exc)))
             else:
-                steps.append(skipped("switch_theme_to_dark", "Light への切替が確認できなかった"))
+                steps.append(skipped("switch_theme_to_dark", "ライトへの切替が確認できなかった"))
 
             if dark_background is not None:
                 try:

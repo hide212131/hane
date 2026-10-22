@@ -185,7 +185,7 @@ impl LineShaper for WindowShaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::line::{presented_block, presented_block_with_table_projection};
+    use crate::line::{BlockPresentationRequest, DEFAULT_LINE_HEIGHT, presented_block};
     use crate::view::EditorView;
     use hane_document::SourceOffset;
     use hane_editor::{Editor, Selection};
@@ -211,8 +211,18 @@ mod tests {
             let editor = Editor::new("*漢字ひらがな* *ascii* **太字** **bold**");
             let index = BlockIndex::from_buffer(editor.document());
             let block = index.blocks().next().expect("one paragraph block");
-            let visual =
-                presented_block(&editor, &block, &(0..usize::MAX), None).expect("block presents");
+            let visual = presented_block(BlockPresentationRequest {
+                editor: &editor,
+                block: &block,
+                visible: &(0..usize::MAX),
+                joined: None,
+                list_projection: None,
+                fence_height_projection: None,
+                table_projection: None,
+                forced_disclosure: None,
+                line_height: DEFAULT_LINE_HEIGHT,
+            })
+            .expect("block presents");
             let line = &visual.lines[0];
 
             let range_of = |needle: &str| {
@@ -279,17 +289,17 @@ mod tests {
                 .expect("selection is inside the document");
             let index = BlockIndex::from_buffer(editor.document());
             let block = index.blocks().next().expect("one table block");
-            let visual = presented_block_with_table_projection(
-                &editor,
-                &block,
-                &(0..usize::MAX),
-                None,
-                None,
-                None,
-                index.table_projection(&block),
-                None,
-                26.0,
-            )
+            let visual = presented_block(BlockPresentationRequest {
+                editor: &editor,
+                block: &block,
+                visible: &(0..usize::MAX),
+                joined: None,
+                list_projection: None,
+                fence_height_projection: None,
+                table_projection: index.table_projection(&block),
+                forced_disclosure: None,
+                line_height: 26.0,
+            })
             .expect("table block presents");
             let line = &visual.lines[0];
             assert!(line.table_header);

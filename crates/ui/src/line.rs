@@ -112,6 +112,19 @@ pub(crate) fn block_fits_sync_join_budget(block: &IndexedBlock, span: &Range<usi
     span.len() <= JOIN_SYNC_LINE_BUDGET && bytes <= JOIN_SYNC_BYTE_BUDGET
 }
 
+/// Borrowed inputs for one [`presented_block`] call.
+pub(crate) struct BlockPresentationRequest<'a> {
+    pub(crate) editor: &'a Editor,
+    pub(crate) block: &'a IndexedBlock,
+    pub(crate) visible: &'a Range<usize>,
+    pub(crate) joined: Option<&'a JoinedParse>,
+    pub(crate) list_projection: Option<&'a ListProjection>,
+    pub(crate) fence_height_projection: Option<&'a FenceHeightProjection>,
+    pub(crate) table_projection: Option<&'a TableProjection>,
+    pub(crate) forced_disclosure: Option<SourceRange>,
+    pub(crate) line_height: f32,
+}
+
 /// Presents the lines of one indexed Markdown block that reach `visible`.
 ///
 /// A block is not bounded — a document without a blank line in it is a single
@@ -130,78 +143,27 @@ pub(crate) fn block_fits_sync_join_budget(block: &IndexedBlock, span: &Range<usi
 /// (see [`JoinedParse`]); it is what lets a block that exceeds either sync
 /// budget still resolve a marker pair arbitrarily far apart without this
 /// function reading the whole span itself on every call.
-#[cfg(test)]
-pub(crate) fn presented_block(
-    editor: &Editor,
-    block: &IndexedBlock,
-    visible: &Range<usize>,
-    joined: Option<&JoinedParse>,
-) -> Option<VisualBlock> {
-    presented_block_with_list_projection(editor, block, visible, joined, None, DEFAULT_LINE_HEIGHT)
-}
-
+///
 /// `line_height` is the caller's zoomed row height (`EditorView::line_height`
 /// at runtime, or [`DEFAULT_LINE_HEIGHT`] for callers outside a view, such as
 /// tests). It seeds every presented line's `estimated_height`, so a block's
 /// height scales with zoom before `layout_block` ever measures it.
-#[cfg(test)]
-pub(crate) fn presented_block_with_list_projection(
-    editor: &Editor,
-    block: &IndexedBlock,
-    visible: &Range<usize>,
-    joined: Option<&JoinedParse>,
-    list_projection: Option<&ListProjection>,
-    line_height: f32,
-) -> Option<VisualBlock> {
-    presented_block_with_projections(
-        editor,
-        block,
-        visible,
-        joined,
-        list_projection,
-        None,
-        line_height,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn presented_block_with_projections(
-    editor: &Editor,
-    block: &IndexedBlock,
-    visible: &Range<usize>,
-    joined: Option<&JoinedParse>,
-    list_projection: Option<&ListProjection>,
-    fence_height_projection: Option<&FenceHeightProjection>,
-    line_height: f32,
-) -> Option<VisualBlock> {
-    presented_block_with_table_projection(
+///
+/// `forced_disclosure`, when given, is the document-find bar's current
+/// match: see [`range_disclosure`] for why this is threaded alongside the
+/// caret/selection/IME disclosures instead of as a second mechanism.
+pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<VisualBlock> {
+    let BlockPresentationRequest {
         editor,
         block,
         visible,
         joined,
         list_projection,
         fence_height_projection,
-        None,
-        None,
+        table_projection,
+        forced_disclosure,
         line_height,
-    )
-}
-
-/// `forced_disclosure`, when given, is the document-find bar's current
-/// match: see [`range_disclosure`] for why this is threaded alongside the
-/// caret/selection/IME disclosures instead of as a second mechanism.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn presented_block_with_table_projection(
-    editor: &Editor,
-    block: &IndexedBlock,
-    visible: &Range<usize>,
-    joined: Option<&JoinedParse>,
-    list_projection: Option<&ListProjection>,
-    fence_height_projection: Option<&FenceHeightProjection>,
-    table_projection: Option<&TableProjection>,
-    forced_disclosure: Option<SourceRange>,
-    line_height: f32,
-) -> Option<VisualBlock> {
+    } = request;
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
@@ -252,7 +214,7 @@ pub(crate) fn presented_block_with_table_projection(
 /// cache-currentness check compares like for like instead of drifting from
 /// what a fresh presentation would produce for a run joined across physical
 /// lines. `forced_disclosure` must be the exact same value the caller fed
-/// (or will feed) to `presented_block_with_table_projection` for this block,
+/// (or will feed) to `presented_block` for this block,
 /// or this comparison drifts from what was actually cached.
 pub(crate) fn expected_block_disclosures(
     editor: &Editor,
@@ -1657,8 +1619,18 @@ mod tests {
         index
             .blocks()
             .flat_map(|block| {
-                presented_block(editor, &block, &(0..usize::MAX), None)
-                    .expect("block presents")
+                presented_block(BlockPresentationRequest {
+                    editor,
+                    block: &block,
+                    visible: &(0..usize::MAX),
+                    joined: None,
+                    list_projection: None,
+                    fence_height_projection: None,
+                    table_projection: None,
+                    forced_disclosure: None,
+                    line_height: DEFAULT_LINE_HEIGHT,
+                })
+                .expect("block presents")
                     .lines
             })
             .collect()
@@ -1784,8 +1756,18 @@ mod tests {
             .blocks()
             .find(|block| block.kind == hane_markdown::NodeKind::Quote)
             .expect("quote block");
-        let visual =
-            presented_block(&editor, &block, &(0..usize::MAX), None).expect("quote block presents");
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(0..usize::MAX),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("quote block presents");
         let layout = hane_presentation::layout_block(
             &visual,
             80.0,
@@ -1841,8 +1823,18 @@ mod tests {
             .blocks()
             .find(|block| matches!(block.kind, hane_markdown::NodeKind::List { .. }))
             .expect("list block");
-        let visual =
-            presented_block(&editor, &block, &(0..usize::MAX), None).expect("list block presents");
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(0..usize::MAX),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("list block presents");
         let layout = hane_presentation::layout_block(
             &visual,
             160.0,
@@ -2267,9 +2259,30 @@ mod tests {
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one fenced block");
 
-        let full = presented_block(&editor, &block, &(0..4), None).expect("full block presents");
-        let clipped =
-            presented_block(&editor, &block, &(1..3), None).expect("middle code rows present");
+        let full = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(0..4),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("full block presents");
+        let clipped = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(1..3),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("middle code rows present");
 
         assert_eq!(clipped.lines_before, 1);
         assert_eq!(clipped.lines_after, 1);
@@ -2293,14 +2306,17 @@ mod tests {
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one list block");
         let projection = index.list_projection(&block).expect("formal projection");
-        let visual = presented_block_with_list_projection(
-            &editor,
-            &block,
-            &(0..4),
-            None,
-            Some(projection),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(0..4),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("nested fenced code presents");
 
         let opening = visual
@@ -2332,25 +2348,29 @@ mod tests {
             .fence_height_projection(&block)
             .expect("nested fence height projection");
 
-        let full = presented_block_with_projections(
-            &editor,
-            &block,
-            &(0..4),
-            None,
-            Some(projection),
-            Some(fence_heights),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let full = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(0..4),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: Some(fence_heights),
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("full nested block presents");
-        let clipped = presented_block_with_projections(
-            &editor,
-            &block,
-            &(2..3),
-            None,
-            Some(projection),
-            Some(fence_heights),
-            DEFAULT_LINE_HEIGHT,
-        )
+        let clipped = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(2..3),
+            joined: None,
+            list_projection: Some(projection),
+            fence_height_projection: Some(fence_heights),
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
         .expect("nested code content presents");
 
         assert_eq!(clipped.lines_before, 2);
@@ -2399,8 +2419,18 @@ mod tests {
         let index = BlockIndex::from_buffer(editor.document());
         assert_eq!(index.len(), 1, "one fenced code block");
         let block = index.block(0).unwrap();
-        let visual = presented_block(&editor, &block, &(closing_line..closing_line + 1), None)
-            .expect("closing fence line presents");
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(closing_line..closing_line + 1),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("closing fence line presents");
         assert_eq!(visual.lines.len(), 1);
         assert_eq!(
             visual.lines[0].visual_text, "",
@@ -2463,7 +2493,18 @@ mod tests {
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one paragraph block");
         let visible = 150..155;
-        let visual = presented_block(&editor, &block, &visible, None).expect("block presents");
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &visible,
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("block presents");
         let rendered = visual
             .lines
             .iter()
@@ -2498,7 +2539,18 @@ mod tests {
         assert!(!block_fits_sync_join_budget(&block, &span));
 
         let visible = 1..2;
-        let visual = presented_block(&editor, &block, &visible, None).expect("block presents");
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &visible,
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("block presents");
         assert_eq!(visual.lines.len(), 1);
         assert_eq!(visual.lines[0].line_id, 1);
         assert!(
@@ -2536,7 +2588,18 @@ mod tests {
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one paragraph block");
         let visible = 50_000..50_005;
-        let visual = presented_block(&editor, &block, &visible, None).expect("block presents");
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &visible,
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+        })
+        .expect("block presents");
         assert!(
             visual
                 .lines
@@ -2582,7 +2645,18 @@ mod tests {
         .expect("the whole span parses");
         let visible = 50_000..50_005;
         let visual =
-            presented_block(&editor, &block, &visible, Some(&joined)).expect("block presents");
+            presented_block(BlockPresentationRequest {
+                editor: &editor,
+                block: &block,
+                visible: &visible,
+                joined: Some(&joined),
+                list_projection: None,
+                fence_height_projection: None,
+                table_projection: None,
+                forced_disclosure: None,
+                line_height: DEFAULT_LINE_HEIGHT,
+            })
+            .expect("block presents");
         assert!(
             visual
                 .lines
