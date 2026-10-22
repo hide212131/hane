@@ -21336,69 +21336,117 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[gpui::test]
-    fn sidebar_toggle_from_the_filter_returns_input_to_the_body_and_keeps_content_search(
+    /// Closes the panel from a really focused filter / content-search input
+    /// (focus via a click on the painted filter or the search entry point),
+    /// through the painted toggle button or the registered key, then types
+    /// through the real input path and checks only the body received it.
+    fn close_sidebar_from_input_and_type(
         cx: &mut gpui::TestAppContext,
+        name: &str,
+        from_search: bool,
+        by_key: bool,
     ) {
-        let root = draft_test_root("sidebar-toggle-focus");
+        let root = draft_test_root(name);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
         let (view, cx) = open_inline_rename_test_view(cx, &root);
+        focus_body_for_key_dispatch(cx);
 
-        // Filter focus is released when the filter is hidden.
-        view.update(cx, |view, cx| {
-            view.sidebar_filter_focused = true;
-            cx.notify();
-        });
-        cx.update(|window, app| {
-            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
-        });
+        if from_search {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.open_content_search(window, cx));
+            });
+            cx.run_until_parked();
+            assert!(view.read_with(cx, |view, _| view.content_search_input_is_focused()));
+        } else {
+            let filter = cx.debug_bounds("sidebar-filter").expect("filter painted");
+            cx.simulate_click(filter.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert!(view.read_with(cx, |view, _| view.sidebar_filter_focused));
+        }
+        // The query typed here is what must survive the close untouched.
+        cx.simulate_input("alp");
+        cx.run_until_parked();
+        let body_before = view.read_with(cx, |view, _| view.editor().document().full_text());
+        let query_kept = |view: &EditorView, app: &gpui::App| {
+            if from_search {
+                view.content_search_query_for_test(app).1
+            } else {
+                view.sidebar_filter.text().to_owned()
+            }
+        };
+        assert_eq!(view.read_with(cx, |view, app| query_kept(view, app)), "alp");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().document().full_text()),
+            body_before
+        );
+
+        if by_key {
+            cx.simulate_keystrokes(sidebar_toggle_key());
+        } else {
+            let toggle = cx.debug_bounds("sidebar-toggle").expect("toggle painted");
+            cx.simulate_mouse_down(toggle.center(), MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_up(toggle.center(), MouseButton::Left, gpui::Modifiers::none());
+        }
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(view.sidebar_collapsed);
             assert!(!view.sidebar_filter_focused);
-            assert!(matches!(
-                view.input_target(),
-                crate::view::input_routing::InputTarget::Body
-            ));
-        });
-
-        // Content search keeps its mode and query while hidden, and the
-        // search key shows the panel again.
-        cx.update(|window, app| {
-            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
-            view.update(app, |view, cx| view.open_content_search(window, cx));
-        });
-        cx.run_until_parked();
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                view.set_content_search_query_for_test("alpha", window, cx)
-            });
-        });
-        cx.update(|window, app| {
-            view.update(app, |view, cx| view.toggle_sidebar(window, cx));
-        });
-        cx.run_until_parked();
-        view.read_with(cx, |view, app| {
-            assert!(view.sidebar_collapsed);
             assert!(!view.content_search_input_is_focused());
             assert!(!view.content_search_results_focused());
-            assert!(view.content_search_sidebar_visible());
-            assert_eq!(
-                view.content_search_query_for_test(app),
-                ("alpha".to_owned(), "alpha".to_owned())
-            );
-        });
-        cx.update(|window, app| {
-            view.update(app, |view, cx| view.open_content_search(window, cx));
-        });
-        cx.run_until_parked();
-        view.read_with(cx, |view, _| {
-            assert!(!view.sidebar_collapsed);
-            assert!(view.content_search_input_is_focused());
         });
 
+        cx.simulate_input("Z");
+        cx.run_until_parked();
+        view.read_with(cx, |view, app| {
+            let body = view.editor().document().full_text();
+            assert_eq!(body.len(), body_before.len() + 1);
+            assert!(body.contains('Z'));
+            assert_eq!(query_kept(view, app), "alp");
+            assert_eq!(view.content_search_sidebar_visible(), from_search);
+        });
+
+        if from_search {
+            // The search key shows the panel again with the kept query and
+            // focuses its input.
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.open_content_search(window, cx));
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, app| {
+                assert!(!view.sidebar_collapsed);
+                assert!(view.content_search_input_is_focused());
+                assert_eq!(view.content_search_query_for_test(app).1, "alp");
+            });
+        }
+
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_toggle_button_from_the_filter_sends_typing_to_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        close_sidebar_from_input_and_type(cx, "sidebar-toggle-filter-button", false, false);
+    }
+
+    #[gpui::test]
+    fn sidebar_toggle_key_from_the_filter_sends_typing_to_the_body(cx: &mut gpui::TestAppContext) {
+        close_sidebar_from_input_and_type(cx, "sidebar-toggle-filter-key", false, true);
+    }
+
+    #[gpui::test]
+    fn sidebar_toggle_button_from_content_search_sends_typing_to_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        close_sidebar_from_input_and_type(cx, "sidebar-toggle-search-button", true, false);
+    }
+
+    #[gpui::test]
+    fn sidebar_toggle_key_from_content_search_sends_typing_to_the_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        close_sidebar_from_input_and_type(cx, "sidebar-toggle-search-key", true, true);
     }
 
     #[gpui::test]
