@@ -2210,6 +2210,57 @@ mod tests {
         assert!(view.read_with(cx, |view, _| view.editor().ime().is_none()));
     }
 
+    /// The marked text sits in the document before it is confirmed, so an
+    /// autosave that fires mid-composition would write it to disk and clear
+    /// the dirty marker without the user having confirmed anything.
+    #[gpui::test]
+    fn autosave_waits_for_a_body_composition_to_end(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "hello\n", 800.0, 400.0);
+        let path = std::env::temp_dir().join(format!(
+            "hane-ime-autosave-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::write(&path, "hello\n").unwrap();
+        view.update(cx, |view, cx| view.open_path(&path, cx));
+        settle(cx);
+        view.update(cx, |view, _| view.settings.autosave = true);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "nihon", Some(5..5), window, cx);
+            });
+        });
+        // Past several autosave windows while composing.
+        for _ in 0..3 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(800));
+            cx.run_until_parked();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.active().is_dirty());
+            assert!(view.editor().ime().is_some());
+        });
+        press_switch_button(&view, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor_mode()),
+            EditorMode::Editing
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+
+        // Once the composition is confirmed the pending write goes through.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.unmark_text(window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("nihon"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Hovers the switch in a window without a `gpui_component::Root`, as the
     /// app has none, and returns the tooltip texts that were painted.
     fn hover_switch_tooltips(cx: &mut TestCx) -> Vec<&'static str> {
