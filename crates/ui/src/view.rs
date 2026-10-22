@@ -11746,6 +11746,100 @@ mod tests {
     }
 
     #[gpui::test]
+    fn joined_parse_scheduler_uses_the_current_cache_contract(cx: &mut gpui::TestAppContext) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Case {
+            NoCache,
+            Matching,
+            OtherId,
+            StaleRevision,
+            OtherStart,
+            OtherEnd,
+        }
+        // Byte budget only: a low-line joinable block with a trailing blank
+        // line, so the inner parse range differs from the outer block range.
+        let text = format!(
+            "{} **bold\nend**\n\nsecond\n",
+            "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET + 1)
+        );
+        for case in [
+            Case::NoCache,
+            Case::Matching,
+            Case::OtherId,
+            Case::StaleRevision,
+            Case::OtherStart,
+            Case::OtherEnd,
+        ] {
+            // A fresh View per case keeps in-flight jobs and the running cap
+            // from short-circuiting before the cache check.
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+            view.update(cx, |view, cx| {
+                let old_revision = view.editor().document().revision();
+                let document = view.editor().document();
+                let indexed = BlockIndex::from_buffer(document).block(0).unwrap();
+                let span = block_line_span(document, &indexed).unwrap();
+                assert!(!block_fits_sync_join_budget(&indexed, &span));
+                let blank = trailing_blank_lines(document, &span);
+                assert!(blank > 0, "the block must own a trailing blank line");
+                let parse = parse_joined_span(
+                    document,
+                    span.start..span.end - blank,
+                    indexed.source_range,
+                    old_revision,
+                )
+                .unwrap();
+                assert_ne!(parse.source_range, indexed.source_range);
+
+                let mut key = indexed.id;
+                let mut cached_range = indexed.source_range;
+                match case {
+                    Case::NoCache | Case::Matching | Case::StaleRevision => {}
+                    Case::OtherId => key = BlockId(indexed.id.0 + 1000),
+                    Case::OtherStart => cached_range.start.0 += 1,
+                    Case::OtherEnd => cached_range.end.0 -= 1,
+                }
+                if case != Case::NoCache {
+                    view.joined_parse_cache.insert(
+                        key,
+                        JoinedBlockCache {
+                            revision: old_revision,
+                            source_range: cached_range,
+                            parse,
+                        },
+                    );
+                }
+                if case == Case::StaleRevision {
+                    // Edit the later block: the revision advances while this
+                    // block's range stays unchanged.
+                    let end = SourceOffset(view.editor().document().len_bytes().0);
+                    view.editor_mut()
+                        .set_selection(Selection::caret(end))
+                        .unwrap();
+                    view.editor_mut().insert_text("x").unwrap();
+                    assert_ne!(view.editor().document().revision(), old_revision);
+                }
+                let document = view.editor().document();
+                let indexed = BlockIndex::from_buffer(document).block(0).unwrap();
+
+                assert!(view.joined_parse_jobs.is_empty());
+                assert_eq!(view.joined_parse_jobs_running, 0);
+                view.schedule_joined_parse(&[indexed], cx);
+
+                if case == Case::Matching {
+                    assert!(view.joined_parse_jobs.is_empty());
+                    assert_eq!(view.joined_parse_jobs_running, 0);
+                    let cached = &view.joined_parse_cache[&indexed.id];
+                    assert_eq!(cached.revision, old_revision);
+                    assert_eq!(cached.source_range, indexed.source_range);
+                } else {
+                    assert!(view.joined_parse_jobs.contains_key(&indexed.id));
+                    assert_eq!(view.joined_parse_jobs_running, 1);
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
     fn disclosures_are_current_reuses_a_joined_runs_shared_disclosure(
         cx: &mut gpui::TestAppContext,
     ) {
