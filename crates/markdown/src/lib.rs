@@ -203,6 +203,33 @@ mod tests {
     }
 
     #[test]
+    fn blank_line_after_four_spaces_is_not_a_lazy_continuation_and_does_not_panic() {
+        // Issue #562: the first source is the 13-byte reproduction input.
+        for source in [
+            "- [o]:u\n    \t",
+            "- [o]:u\n    ",
+            "- a\n    \t\n",
+            "- a\n    \r\n",
+            "a\n    \t\nb",
+            "> a\n>     \t",
+            "1. [o]:u\n     \t",
+        ] {
+            let range = SourceRange::new(40, 40 + source.len());
+            let parsed = parse_document(Revision(3), range, source);
+            assert_eq!(parsed.source_range, range, "{source:?}");
+            assert!(
+                parsed.tree.iter().all(|(_, node)| {
+                    node.source_range.start.0 >= range.start.0
+                        && node.source_range.end.0 <= range.end.0
+                        && node.source_range.start.0 <= node.source_range.end.0
+                }),
+                "{source:?}"
+            );
+        }
+        assert_eq!("- [o]:u\n    \t".len(), 13);
+    }
+
+    #[test]
     fn tree_nests_children_inside_their_parent_source_ranges() {
         let source = "- outer\n  - inner **bold**\n";
         let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
