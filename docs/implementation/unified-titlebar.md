@@ -89,7 +89,7 @@ Windows 11では最小幅がSnap領域より大きいと配置できない場合
 // 設計上の形。実装はwindow_chrome側へ置く。
 let mut options = WindowOptions {
     window_bounds: Some(WindowBounds::Windowed(bounds)),
-    window_min_size: Some(size(px(360.0), px(240.0))),
+    window_min_size: Some(size(px(330.0), px(240.0))),
     ..TitleBar::window_options()
 };
 #[cfg(target_os = "macos")]
