@@ -49,10 +49,17 @@ const AI_SELECTION_POPUP_MAX_CONTENT_HEIGHT: f32 = 320.0;
 /// shrinks the popup to fit instead (`ai_selection_popup_width`).
 const AI_SELECTION_POPUP_WIDTH: f32 = 360.0;
 
+/// Horizontal gap kept between the popup and each edge of the editor area.
+/// A popup flush with the window edge puts its close control on the window
+/// frame's resize/hit-test band (and past the visible client edge on
+/// Windows), where pointer presses never reach it.
+const AI_SELECTION_POPUP_EDGE_INSET: f32 = 8.0;
+
 /// The popup's width inside an editor area `area_width` wide: the regular
-/// width, or the whole area when that is narrower.
+/// width, or the area minus the edge insets on both sides when that is
+/// narrower.
 fn ai_selection_popup_width_for(area_width: f32) -> f32 {
-    AI_SELECTION_POPUP_WIDTH.min(area_width.max(0.0))
+    AI_SELECTION_POPUP_WIDTH.min((area_width - 2.0 * AI_SELECTION_POPUP_EDGE_INSET).max(0.0))
 }
 
 /// Whether a mouse press at `(x, y)` landed inside the window's client area
@@ -65,9 +72,12 @@ fn ai_selection_press_is_inside_client(x: f32, y: f32, width: f32, height: f32) 
 }
 
 /// Shifts the popup's left edge `x` so a popup `width` wide stays inside the
-/// editor area spanning `area_left..area_left + area_width`.
+/// editor area spanning `area_left..area_left + area_width`, keeping
+/// `AI_SELECTION_POPUP_EDGE_INSET` clear of both edges.
 fn ai_selection_clamp_left(x: f32, area_left: f32, area_width: f32, width: f32) -> f32 {
-    x.min(area_left + area_width - width).max(area_left)
+    let inset = AI_SELECTION_POPUP_EDGE_INSET;
+    x.min(area_left + area_width - inset - width)
+        .max(area_left + inset)
 }
 
 /// The built-in suggestion shown in the saved-prompt list only while nothing
@@ -1932,8 +1942,8 @@ mod tests {
     fn popup_width_keeps_regular_width_and_shrinks_to_narrow_areas() {
         assert_eq!(ai_selection_popup_width_for(960.0), 360.0);
         assert_eq!(ai_selection_popup_width_for(360.0), 360.0);
-        assert_eq!(ai_selection_popup_width_for(280.0), 280.0);
-        assert_eq!(ai_selection_popup_width_for(279.0), 279.0);
+        assert_eq!(ai_selection_popup_width_for(280.0), 264.0);
+        assert_eq!(ai_selection_popup_width_for(279.0), 263.0);
         assert_eq!(ai_selection_popup_width_for(-5.0), 0.0);
     }
 
@@ -1943,9 +1953,12 @@ mod tests {
             let width = ai_selection_popup_width_for(area_width);
             for (area_left, x) in [(0.0_f32, 0.0_f32), (0.0, 100.0), (0.0, 900.0), (200.0, 250.0)] {
                 let left = ai_selection_clamp_left(x, area_left, area_width, width);
-                assert!(left >= area_left, "left {left} at width {area_width}");
                 assert!(
-                    left + width <= area_left + area_width + 0.01,
+                    left >= area_left + AI_SELECTION_POPUP_EDGE_INSET - 0.01,
+                    "left {left} at width {area_width}"
+                );
+                assert!(
+                    left + width <= area_left + area_width - AI_SELECTION_POPUP_EDGE_INSET + 0.01,
                     "right edge {} at width {area_width}",
                     left + width
                 );
@@ -1994,8 +2007,8 @@ mod tests {
                 let (position, _) = view.ai_selection_overlay_position();
                 let width = ai_selection_popup_width_for(view.ai_selection_editor_area_width());
                 let left = f32::from(position.x);
-                assert!(left >= 0.0);
-                assert!(left + width <= window_width + 0.01);
+                assert!(left >= AI_SELECTION_POPUP_EDGE_INSET - 0.01);
+                assert!(left + width <= window_width - AI_SELECTION_POPUP_EDGE_INSET + 0.01);
             });
         }
     }
@@ -2027,9 +2040,10 @@ mod tests {
                     .debug_bounds(selector)
                     .unwrap_or_else(|| panic!("{selector} painted at width {window_width}"));
                 assert!(
-                    f32::from(bounds.left()) >= -0.01
-                        && f32::from(bounds.right()) <= window_width + 0.01,
-                    "{selector} {bounds:?} must stay inside width {window_width}"
+                    f32::from(bounds.left()) >= AI_SELECTION_POPUP_EDGE_INSET - 0.01
+                        && f32::from(bounds.right())
+                            <= window_width - AI_SELECTION_POPUP_EDGE_INSET + 0.01,
+                    "{selector} {bounds:?} must stay clear of the window edges at width {window_width}"
                 );
             }
             view.update(cx, |view, cx| {
