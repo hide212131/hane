@@ -2252,7 +2252,13 @@ mod tests {
             Arc::new(FixedClock::new(test_now())),
             manual_runner(&queue),
         );
-        assert!(!reopened.snapshot().diagnostics_available);
+        // The earlier record makes the report reachable, but the current
+        // service is healthy: nothing is turned into a current failure.
+        let reopened_snapshot = reopened.snapshot();
+        assert!(reopened_snapshot.diagnostics_available);
+        assert_eq!(reopened_snapshot.phase, AppUpdatePhase::Idle);
+        assert_eq!(reopened_snapshot.error_code, None);
+        assert_eq!(reopened_snapshot.error_stage, None);
         let report = reopened.diagnostics_text();
         assert!(!current_section(&report).contains("stage=check"), "{report}");
         let (_, past) = report.split_once("## 以前の起動の記録").unwrap();

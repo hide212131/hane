@@ -239,6 +239,9 @@ pub(crate) struct Diagnostics {
     path: PathBuf,
     identity: Identity,
     redactor: Redactor,
+    /// Whether the file held records from an earlier run when this run began.
+    /// It only makes the report reachable; it never describes a current failure.
+    has_past: bool,
     inner: Mutex<Inner>,
     /// Serialises file writes without holding `inner` during file I/O.
     io: Mutex<()>,
@@ -246,13 +249,17 @@ pub(crate) struct Diagnostics {
 
 impl Diagnostics {
     pub(crate) fn new(dir: &Path, identity: Identity, redactor: Redactor) -> Self {
-        Self {
+        let mut diag = Self {
             path: dir.join(FILE_NAME),
             identity,
             redactor,
+            has_past: false,
             inner: Mutex::new(Inner::default()),
             io: Mutex::new(()),
-        }
+        };
+        // Read once here (bounded by the file size cap), never per snapshot.
+        diag.has_past = !diag.read_persisted().is_empty();
+        diag
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -309,8 +316,10 @@ impl Diagnostics {
         self.flush();
     }
 
+    /// Whether there is anything to show: records of this run, or records an
+    /// earlier run saved (listed separately in the report).
     pub(crate) fn has_records(&self) -> bool {
-        !self.lock().session.is_empty()
+        self.has_past || !self.lock().session.is_empty()
     }
 
     fn persist(&self, batch: Vec<String>) -> io::Result<()> {
