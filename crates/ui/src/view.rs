@@ -14932,7 +14932,7 @@ mod tests {
     /// click, the way `ctrl_tab_cycles_file_tabs_in_order_and_wraps` does, so a
     /// keystroke reaches the "HaneEditor" key context.
     fn bind_keys_and_focus_body(cx: &mut gpui::VisualTestContext) {
-        cx.update(crate::actions::register_key_bindings);
+        cx.update(|_, app| crate::actions::register_key_bindings(app));
         let point = cx
             .debug_bounds("row-0-0")
             .expect("first row painted")
