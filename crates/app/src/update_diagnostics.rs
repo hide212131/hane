@@ -299,10 +299,21 @@ impl Diagnostics {
         if batch.is_empty() {
             return;
         }
-        let result = self.persist(batch);
-        self.lock().persist_error = result
-            .err()
-            .map(|error| self.redactor.redact(&io_detail(&error), MAX_DETAIL_CHARS));
+        let result = self.persist(batch.clone());
+        let mut inner = self.lock();
+        match result {
+            Ok(()) => inner.persist_error = None,
+            Err(error) => {
+                // Put the batch back ahead of records added meanwhile, so a
+                // later flush retries it in chronological order.
+                let mut restored = batch;
+                restored.append(&mut inner.unsaved);
+                trim_records(&mut restored);
+                inner.unsaved = restored;
+                inner.persist_error =
+                    Some(self.redactor.redact(&io_detail(&error), MAX_DETAIL_CHARS));
+            }
+        }
     }
 
     pub(crate) fn record(
@@ -500,5 +511,29 @@ mod tests {
         let report = diag.report();
         assert!(report.contains("保存: できませんでした"), "{report}");
         assert!(report.contains("rename failed"));
+    }
+
+    #[test]
+    fn a_failed_batch_is_retried_in_order_and_clears_the_error_on_success() {
+        let dir = TempDir::new("diag-retry");
+        fs::create_dir_all(dir.path().join(FILE_NAME)).unwrap();
+        let diag = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        diag.record("check", "io", "first failure", None);
+        assert!(diag.report().contains("保存: できませんでした"));
+        diag.record("check", "io", "second failure", None);
+        assert!(diag.report().contains("保存: できませんでした"));
+
+        fs::remove_dir_all(dir.path().join(FILE_NAME)).unwrap();
+        diag.record("check", "io", "third failure", None);
+        assert!(!diag.report().contains("保存: できませんでした"));
+
+        let restarted = Diagnostics::new(dir.path(), identity("run-2"), redactor());
+        let saved = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        let first = saved.find("first failure").expect("first saved");
+        let second = saved.find("second failure").expect("second saved");
+        let third = saved.find("third failure").expect("third saved");
+        assert!(first < second && second < third, "{saved}");
+        let report = restarted.report();
+        assert!(report.contains("first failure") && report.contains("third failure"));
     }
 }
