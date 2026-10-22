@@ -1692,6 +1692,118 @@ mod tests {
         );
     }
 
+    fn wrapped_paragraphs() -> String {
+        (0..60)
+            .map(|n| format!("paragraph {n:02} {}\n\n", "wrapped words ".repeat(40)))
+            .collect()
+    }
+
+    /// Switches the mode with a pending anchor, delivers `events` before any
+    /// render, and checks that the anchor survives them, is resolved by the
+    /// real renders, and the captured source row stays at the viewport top.
+    fn switch_then_deliver_non_owning_events(
+        cx: &mut gpui::TestAppContext,
+        start_in_reading: bool,
+        events: impl FnOnce(&mut EditorView, &mut Window, &mut Context<EditorView>),
+    ) {
+        let source = wrapped_paragraphs();
+        let (view, cx) = open_view(cx, &source, 600.0, 400.0);
+        if start_in_reading {
+            assert!(toggle(&view, cx));
+            settle(cx);
+        }
+        let middle = source.find("paragraph 30").unwrap();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(middle)))
+                .unwrap();
+            view.scroll_y = view.heights.prefix_sum(30) + view.line_height() * 3.0;
+            cx.notify();
+        });
+        settle(cx);
+        let selection = view.read_with(cx, |view, _| view.editor().selection());
+        let before = snapshot(&view, cx);
+        let (anchor, scroll_before) = view.read_with(cx, |view, _| {
+            (view.capture_mode_anchor().expect("an anchor is captured"), view.scroll_y)
+        });
+        assert!(scroll_before > 1_000.0);
+
+        let mark = requested_frames(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.toggle_editor_mode(window, cx));
+                assert!(view.pending_mode_anchor.is_some());
+                events(view, window, cx);
+                assert!(
+                    view.pending_mode_anchor.is_some(),
+                    "events that move nothing do not take the position"
+                );
+            });
+        });
+        settle(cx);
+        deliver_requested_frames(&view, cx, mark, 8);
+        let (row, scroll_y, line_height, pending, selection_after) = cx.update(|window, app| {
+            let view = view.read(app);
+            (
+                measured_row(view, window, anchor.offset),
+                view.scroll_y,
+                view.line_height(),
+                view.pending_mode_anchor.is_some(),
+                view.editor().selection(),
+            )
+        });
+        assert!(!pending, "the mode anchor was resolved");
+        let row = row.unwrap_or_else(|error| panic!("the source row is not measured: {error}"));
+        assert!(
+            scroll_y >= row.top - line_height * 0.5
+                && scroll_y <= row.top + row.height + line_height * 0.5,
+            "the source row stays at the viewport top: scroll_y={scroll_y} row=({}, {})",
+            row.top,
+            row.height
+        );
+        assert_eq!(selection_after, selection);
+        assert_eq!(snapshot(&view, cx), before, "the body is never edited");
+    }
+
+    fn no_op_scroll_events(view: &mut EditorView, cx: &mut Context<EditorView>) {
+        let at = gpui::point(px(100.0), px(100.0));
+        let scroll = |delta, modifiers, touch_phase| gpui::ScrollWheelEvent {
+            position: at,
+            delta,
+            modifiers,
+            touch_phase,
+        };
+        let secondary = gpui::Modifiers::secondary_key();
+        let zero_pixels = gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(0.0)));
+        let zero_lines = gpui::ScrollDelta::Lines(gpui::point(0.0, 0.0));
+        let horizontal_only = gpui::ScrollDelta::Pixels(gpui::point(px(40.0), px(0.0)));
+        for event in [
+            scroll(zero_pixels, gpui::Modifiers::none(), gpui::TouchPhase::Ended),
+            scroll(zero_pixels, gpui::Modifiers::none(), gpui::TouchPhase::Started),
+            scroll(zero_lines, gpui::Modifiers::none(), gpui::TouchPhase::Moved),
+            scroll(horizontal_only, gpui::Modifiers::none(), gpui::TouchPhase::Moved),
+            scroll(zero_pixels, secondary, gpui::TouchPhase::Ended),
+            scroll(zero_lines, secondary, gpui::TouchPhase::Moved),
+            scroll(horizontal_only, secondary, gpui::TouchPhase::Moved),
+        ] {
+            view.on_scroll_at(&event, std::time::Instant::now(), cx);
+        }
+    }
+
+    #[gpui::test]
+    fn zero_movement_wheel_events_keep_the_editing_to_reading_anchor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        switch_then_deliver_non_owning_events(cx, false, |view, _, cx| no_op_scroll_events(view, cx));
+    }
+
+    #[gpui::test]
+    fn zero_movement_wheel_events_keep_the_reading_to_editing_anchor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        switch_then_deliver_non_owning_events(cx, true, |view, _, cx| no_op_scroll_events(view, cx));
+    }
+
     /// Content-local pointer offset (below the viewport top) used by the pinch
     /// tests.
     const POINTER_OFFSET: f32 = 200.0;

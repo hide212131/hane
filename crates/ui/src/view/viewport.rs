@@ -228,8 +228,20 @@ impl EditorView {
             .map(|line| (line, scroll_y))
             .or(self.retained_center_window);
         self.cancel_center_caret();
-        // Same ownership for a mode switch's remembered row.
-        self.pending_mode_anchor = None;
+        // A mode switch's remembered row is released only by an event that can
+        // actually move the viewport: a vertical scroll, or a wheel zoom that
+        // changes the effective zoom. Zero-delta / phase-only notifications
+        // (e.g. a Pixels(0, 0) end-of-gesture event) own nothing.
+        let vertical = f32::from(event.delta.pixel_delta(px(self.line_height())).y);
+        if event.modifiers.secondary() {
+            let factor = zoom_factor_for_wheel(event.delta, self.line_height());
+            let target = clamp_and_snap_zoom((self.raw_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM));
+            if target != self.zoom {
+                self.pending_mode_anchor = None;
+            }
+        } else if vertical != 0.0 {
+            self.pending_mode_anchor = None;
+        }
         if event.modifiers.secondary() {
             // A still-coasting scroll inertia must not keep advancing
             // `scroll_y` underneath a zoom gesture started from the same
