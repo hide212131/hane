@@ -926,6 +926,17 @@ fn safe_token(value: &str) -> String {
     }
 }
 
+/// Returns the static `codexErrorInfo` name when it is one this code knows.
+fn known_error_info(name: &str) -> Option<&'static str> {
+    const KNOWN: [&str; 4] = [
+        "unauthorized",
+        "rateLimitExceeded",
+        "contextWindowExceeded",
+        "httpConnectionFailed",
+    ];
+    KNOWN.into_iter().find(|known| *known == name)
+}
+
 /// Describes a failed turn without its message: the notification method, the
 /// `codexErrorInfo` variant name and the numeric HTTP status, when present.
 fn provider_error_cause(method: &str, error: Option<&Value>) -> String {
@@ -948,9 +959,17 @@ fn provider_error_cause(method: &str, error: Option<&Value>) -> String {
 
     let mut cause = format!("provider_turn_failed method={}", safe_token(method));
     if let Some(error) = error {
+        // Only names with a known meaning are echoed; any other string or
+        // object key collapses to a fixed `unknown` so provider-supplied text
+        // can never reach the diagnostic cause.
         let info = match error.get("codexErrorInfo") {
-            Some(Value::String(name)) => Some(safe_token(name)),
-            Some(Value::Object(fields)) => fields.keys().next().map(|name| safe_token(name)),
+            Some(Value::String(name)) => Some(known_error_info(name).unwrap_or("unknown")),
+            Some(Value::Object(fields)) => Some(
+                fields
+                    .keys()
+                    .find_map(|name| known_error_info(name))
+                    .unwrap_or("unknown"),
+            ),
             _ => None,
         };
         if let Some(info) = info {
@@ -1085,6 +1104,36 @@ mod tests {
                 "threadId":"thread-1", "turn":{"id":"turn-1","status":"failed","error":{"message":"secret diagnostic","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":status}}}}
             }))), Some(ProbeTerminal::Failed(expected)));
         }
+    }
+
+    #[test]
+    fn provider_error_cause_never_echoes_unknown_error_info() {
+        let secret = "sk-proj-AbC123SecretKey";
+        let by_string = provider_error_cause(
+            "turn/completed",
+            Some(&json!({ "codexErrorInfo": secret })),
+        );
+        let by_key = provider_error_cause(
+            "turn/completed",
+            Some(&json!({ "codexErrorInfo": { secret: { "httpStatusCode": 500 } } })),
+        );
+        assert!(!by_string.contains(secret) && !by_string.contains("AbC123"));
+        assert!(by_string.contains("error_info=unknown"));
+        assert!(!by_key.contains(secret) && !by_key.contains("AbC123"));
+        assert!(by_key.contains("error_info=unknown"));
+        assert!(by_key.contains("http_status=500"));
+
+        let known = provider_error_cause(
+            "turn/completed",
+            Some(&json!({ "codexErrorInfo": { "httpConnectionFailed": { "httpStatusCode": 429 } } })),
+        );
+        assert!(known.contains("error_info=httpConnectionFailed"));
+        assert!(known.contains("http_status=429"));
+        let known_str = provider_error_cause(
+            "turn/completed",
+            Some(&json!({ "codexErrorInfo": "rateLimitExceeded" })),
+        );
+        assert!(known_str.contains("error_info=rateLimitExceeded"));
     }
 
     #[test]
