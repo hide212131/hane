@@ -63,6 +63,12 @@ impl Redactor {
     pub(crate) fn redact(&self, text: &str, max_chars: usize) -> String {
         let mut out: Vec<String> = Vec::new();
         let mut mask_next = 0_u8;
+        // HOME may contain whitespace (`/Users/Jane Doe`), so it is replaced
+        // in the whole text before the text is split into tokens.
+        let text = match &self.home {
+            Some(home) => text.replace(home.as_str(), "~"),
+            None => text.to_owned(),
+        };
         let tokens: Vec<&str> = text.split_whitespace().collect();
         for (index, token) in tokens.iter().copied().enumerate() {
             if mask_next > 0 {
@@ -548,6 +554,21 @@ mod tests {
         assert!(out.contains("https://example.com/a/b?<redacted>"), "{out}");
         assert!(out.contains("token=<redacted>"), "{out}");
         assert!(out.contains("~/Library/x"), "{out}");
+    }
+
+    #[test]
+    fn home_with_whitespace_is_masked_as_a_whole() {
+        let redactor = Redactor::new(Some("/Users/Jane Doe".to_owned()), None);
+        let out = redactor.redact(
+            "read /Users/Jane Doe/Library/x failed, cwd=/Users/Jane Doe token=sekret",
+            1000,
+        );
+        for leak in ["Jane", "Doe", "/Users"] {
+            assert!(!out.contains(leak), "{leak} leaked in {out}");
+        }
+        assert!(out.contains("~/Library/x failed"), "{out}");
+        assert!(out.contains("token=<redacted>"), "{out}");
+        assert!(!out.contains("sekret"), "{out}");
     }
 
     #[test]
