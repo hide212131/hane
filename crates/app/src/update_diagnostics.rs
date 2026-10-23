@@ -110,18 +110,13 @@ impl Redactor {
     /// The masked token, and whether the value of a secret key continues in
     /// the next whitespace-separated token (`token: abc`).
     fn redact_token(&self, token: &str) -> (String, bool) {
-        if !token.contains("://")
-            && let Some(masked) = mask_secret_pair(token)
-        {
-            return masked;
-        }
         // A URL's query and userinfo are dropped first; secret pairs that
         // share the token (`{"url":"https://h/x","token":"abc"}`) follow.
+        // Home / user path masking always runs afterwards, so a path sharing
+        // a token with a secret pair is masked too.
         let mut text = strip_url_secrets(token);
         let mut mask_following = false;
-        if token.contains("://")
-            && let Some((masked, continues)) = mask_secret_pair(&text)
-        {
+        if let Some((masked, continues)) = mask_secret_pair(&text) {
             text = masked;
             mask_following = continues;
         }
@@ -584,6 +579,13 @@ mod tests {
         assert!(out.contains("https://example.com/a/b?<redacted>"), "{out}");
         assert!(out.contains("token=<redacted>"), "{out}");
         assert!(out.contains("~/Library/x"), "{out}");
+    }
+
+    #[test]
+    fn user_paths_sharing_a_token_with_a_secret_pair_are_masked() {
+        let out = Redactor::new(None, None).redact(r#"{"path":"/Users/jane/Doc","token":"abc"}"#, 1000);
+        assert!(!out.contains("jane"), "{out}");
+        assert!(!out.contains("abc"), "{out}");
     }
 
     #[test]
