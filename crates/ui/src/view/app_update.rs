@@ -117,6 +117,13 @@ pub trait AppUpdateController: Send + Sync {
     fn diagnostics_text(&self) -> Option<String> {
         None
     }
+    /// Adds one failure of another operation (for example the AI response
+    /// check) to the same bounded local diagnostics. `stage`, `code` and
+    /// `detail` are already limited to safe values by the caller; the service
+    /// still redacts and caps them. A save failure never changes the caller.
+    fn record_diagnostic(&self, stage: &str, code: &str, detail: &str) {
+        let _ = (stage, code, detail);
+    }
     /// Re-verifies the Ready candidate `candidate_id` and the install, starts
     /// the update helper and returns once it answered `Prepared`. It may take
     /// a while and is therefore called off the UI thread. Nothing is stopped,
@@ -707,6 +714,20 @@ impl EditorView {
         }
         self.poll_app_update(cx);
         cx.notify();
+    }
+
+    /// Hands a newly failed AI response check to the local diagnostics, once.
+    pub(super) fn record_ai_probe_diagnostic(&mut self) {
+        let Some(diagnostic) = self.ai_settings.take_unrecorded_probe_diagnostic() else {
+            return;
+        };
+        if let Some(controller) = self.app_update.as_ref() {
+            controller.record_diagnostic(
+                &format!("ai_probe/{}", diagnostic.stage),
+                diagnostic.code,
+                &diagnostic.cause,
+            );
+        }
     }
 
     /// Copies the update diagnostics to the clipboard. The text is already

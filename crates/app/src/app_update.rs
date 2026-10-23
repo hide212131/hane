@@ -1323,6 +1323,10 @@ impl AppUpdateController for AppUpdateService {
         Some(AppUpdateService::diagnostics_text(self))
     }
 
+    fn record_diagnostic(&self, stage: &str, code: &str, detail: &str) {
+        self.inner.diag.record(stage, code, detail, None);
+    }
+
     fn prepare_restart(&self, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
         self.inner.prepare_restart(candidate_id)
     }
@@ -2170,6 +2174,32 @@ mod tests {
         assert!(report.contains("version=0.26.0"), "{report}");
         assert!(report.contains(&format!("PID {}", std::process::id())), "{report}");
         assert!(report.contains(install_id().as_str()), "{report}");
+    }
+
+    #[test]
+    fn an_ai_probe_failure_is_saved_beside_update_failures_without_secrets() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        fixture.check_now();
+        AppUpdateController::record_diagnostic(
+            &fixture.service,
+            "ai_probe/turn",
+            "unauthorized",
+            "provider_turn_failed method=turn/completed error_info=httpConnectionFailed \
+             http_status=401 api_key=zq9secret",
+        );
+        let report = fixture.service.diagnostics_text();
+        assert!(report.contains("stage=check"), "{report}");
+        assert!(report.contains("stage=ai_probe/turn"), "{report}");
+        assert!(report.contains("code=unauthorized"), "{report}");
+        assert!(report.contains("http_status=401"), "{report}");
+        assert!(!report.contains("zq9secret"), "{report}");
+        let saved =
+            fs::read_to_string(fixture.updates_root().join("diagnostics.log")).unwrap();
+        assert!(saved.contains("stage=ai_probe/turn"), "{saved}");
+        assert!(!saved.contains("zq9secret"), "{saved}");
     }
 
     #[test]

@@ -105,6 +105,67 @@ pub enum ProbeStatus {
     Isolated,
 }
 
+/// What a failed probe leaves for the local diagnostics (Issue #553): the
+/// operation, the processing stage that failed, the stable code and a short
+/// cause built only from fixed words, numeric codes and enum-like names. It
+/// never carries a provider message, a raw error string, request/response
+/// text or a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeDiagnostic {
+    pub operation_id: crate::service::OperationId,
+    pub stage: &'static str,
+    pub code: &'static str,
+    pub cause: String,
+}
+
+/// The stage that failed and its safe cause, as collected while probing.
+pub(crate) type ProbeFailure = (&'static str, String);
+
+pub(crate) fn failure_code(status: &ProbeStatus) -> Option<&'static str> {
+    match status {
+        ProbeStatus::Failed(code) => Some(code.stable_code()),
+        ProbeStatus::TimedOut => Some(ProbeErrorCode::TimedOut.stable_code()),
+        ProbeStatus::Isolated => Some(ProbeErrorCode::Isolated.stable_code()),
+        _ => None,
+    }
+}
+
+fn rpc_error_cause(error: &RpcError) -> String {
+    match error {
+        RpcError::Timeout => "rpc_timeout".to_owned(),
+        RpcError::Disconnected => "rpc_disconnected".to_owned(),
+        RpcError::Backpressure => "rpc_backpressure".to_owned(),
+        // Only the numeric JSON-RPC code; the message is provider text.
+        RpcError::Remote(remote) => format!("rpc_remote_error code={}", remote.code),
+    }
+}
+
+pub(crate) fn runtime_error_cause(error: &RuntimeError) -> String {
+    match error {
+        RuntimeError::NotReady => "runtime_not_ready".to_owned(),
+        RuntimeError::RestartBlocked => "runtime_restart_blocked".to_owned(),
+        RuntimeError::OwnerLockUnavailable => "owner_lock_unavailable".to_owned(),
+        RuntimeError::Spawn(error) => format!("spawn_failed io_kind={:?}", error.kind()),
+        RuntimeError::OwnerLock(error) => format!("owner_lock_failed io_kind={:?}", error.kind()),
+        RuntimeError::Handshake(error) => format!("handshake_{}", rpc_error_cause(error)),
+        RuntimeError::Rpc(error) => rpc_error_cause(error),
+        _ => "runtime_error".to_owned(),
+    }
+}
+
+fn connect_error_cause(error: &ConnectError) -> String {
+    match error {
+        ConnectError::SettingsBusy => "settings_lock_busy".to_owned(),
+        ConnectError::GenerationMismatch {
+            persisted,
+            configured,
+        } => format!("settings_generation_mismatch persisted={persisted} configured={configured}"),
+        ConnectError::Runtime(error) => runtime_error_cause(error),
+        ConnectError::Io(error) => format!("io_failed io_kind={:?}", error.kind()),
+        _ => "connect_failed".to_owned(),
+    }
+}
+
 pub fn thread_start_params(connection: ActiveConnection, model: &str, cwd: &Path) -> Value {
     let model_provider = match connection {
         ActiveConnection::ChatGpt => "openai",
@@ -165,6 +226,7 @@ pub(crate) struct ProbeExecution {
     pub result: Option<ProbeResult>,
     pub isolated: bool,
     pub deferred_events: Vec<RuntimeEvent>,
+    pub diagnostic: Option<ProbeDiagnostic>,
 }
 
 struct ProbeRuntimeContext {
@@ -174,12 +236,22 @@ struct ProbeRuntimeContext {
 }
 
 impl ProbeExecution {
-    fn failed(code: ProbeErrorCode) -> Self {
+    fn failed(
+        code: ProbeErrorCode,
+        operation_id: crate::service::OperationId,
+        cause: String,
+    ) -> Self {
         Self {
             status: ProbeStatus::Failed(code),
             result: None,
             isolated: false,
             deferred_events: Vec::new(),
+            diagnostic: Some(ProbeDiagnostic {
+                operation_id,
+                stage: "lock",
+                code: code.stable_code(),
+                cause,
+            }),
         }
     }
 }
@@ -207,6 +279,7 @@ pub(crate) fn execute_probe(
             result: None,
             isolated: false,
             deferred_events: Vec::new(),
+            diagnostic: None,
         };
     }
     let runtime_generation = runtime.snapshot().generation;
@@ -216,6 +289,7 @@ pub(crate) fn execute_probe(
         runtime_generation,
     };
     let mut deferred_events = Vec::new();
+    let mut failure: Option<ProbeFailure> = None;
     let result = with_generation_checked_lock(store, runtime, settings_generation, || {
         run_locked(
             runtime,
@@ -227,10 +301,24 @@ pub(crate) fn execute_probe(
             &context,
             cwd,
             &mut deferred_events,
+            &mut failure,
         )
     });
     match result {
         Ok((status, isolated, text)) => {
+            let diagnostic = failure_code(&status).map(|code| {
+                let (stage, mut cause) =
+                    failure.unwrap_or(("probe", "cause_not_recorded".to_owned()));
+                if isolated {
+                    cause.push_str("; child_stop_unconfirmed");
+                }
+                ProbeDiagnostic {
+                    operation_id,
+                    stage,
+                    code,
+                    cause,
+                }
+            });
             let result = text.map(|text| ProbeResult {
                 text,
                 connection,
@@ -245,16 +333,35 @@ pub(crate) fn execute_probe(
                 result,
                 isolated,
                 deferred_events,
+                diagnostic,
             }
         }
-        Err(ConnectError::SettingsBusy) => ProbeExecution::failed(ProbeErrorCode::Busy),
-        Err(ConnectError::GenerationMismatch { .. }) => {
-            ProbeExecution::failed(ProbeErrorCode::StaleGeneration)
+        Err(error) => {
+            let code = match &error {
+                ConnectError::SettingsBusy => ProbeErrorCode::Busy,
+                ConnectError::GenerationMismatch { .. } => ProbeErrorCode::StaleGeneration,
+                _ => ProbeErrorCode::RuntimeUnavailable,
+            };
+            ProbeExecution::failed(code, operation_id, connect_error_cause(&error))
         }
-        Err(ConnectError::Runtime(RuntimeError::NotReady)) => {
-            ProbeExecution::failed(ProbeErrorCode::RuntimeUnavailable)
-        }
-        Err(_) => ProbeExecution::failed(ProbeErrorCode::RuntimeUnavailable),
+    }
+}
+
+fn note_failure(failure: &mut Option<ProbeFailure>, stage: &'static str, cause: String) {
+    *failure = Some((stage, cause));
+}
+
+fn note_terminal_failure(
+    failure: &mut Option<ProbeFailure>,
+    collector: &ProbeCollector,
+    terminal: &ProbeTerminal,
+) {
+    if let ProbeTerminal::Failed(_) = terminal {
+        let cause = collector
+            .failure_cause()
+            .unwrap_or("turn_failed")
+            .to_owned();
+        note_failure(failure, "turn", cause);
     }
 }
 
@@ -269,6 +376,7 @@ fn run_locked(
     context: &ProbeRuntimeContext,
     cwd: &Path,
     deferred_events: &mut Vec<RuntimeEvent>,
+    failure: &mut Option<ProbeFailure>,
 ) -> (ProbeStatus, bool, Option<String>) {
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let thread_response = match runtime.call(
@@ -277,11 +385,17 @@ fn run_locked(
         bounded_rpc_timeout(deadline),
     ) {
         Ok(response) => response,
-        Err(error) => return settle_rpc_failure(runtime, error, deferred_events),
+        Err(error) => {
+            note_failure(failure, "thread/start", runtime_error_cause(&error));
+            return settle_rpc_failure(runtime, error, deferred_events);
+        }
     };
     let thread_id = match thread_id_from_response(&thread_response) {
         Ok(id) => id,
-        Err(code) => return stop_for_uncertain_turn(runtime, code, deferred_events),
+        Err(code) => {
+            note_failure(failure, "thread/start", "response_missing_thread_id".to_owned());
+            return stop_for_uncertain_turn(runtime, code, deferred_events);
+        }
     };
     if cancellation_requested(cancel_rx, operation_id, shutdown_rx, shutdown_seen) {
         return (ProbeStatus::Canceled, false, None);
@@ -293,11 +407,17 @@ fn run_locked(
         bounded_rpc_timeout(deadline),
     ) {
         Ok(response) => response,
-        Err(error) => return settle_rpc_failure(runtime, error, deferred_events),
+        Err(error) => {
+            note_failure(failure, "turn/start", runtime_error_cause(&error));
+            return settle_rpc_failure(runtime, error, deferred_events);
+        }
     };
     let turn_id = match turn_id_from_response(&turn_response) {
         Ok(id) => id,
-        Err(code) => return stop_for_uncertain_turn(runtime, code, deferred_events),
+        Err(code) => {
+            note_failure(failure, "turn/start", "response_missing_turn_id".to_owned());
+            return stop_for_uncertain_turn(runtime, code, deferred_events);
+        }
     };
     let mut collector = ProbeCollector::new(
         context.runtime_generation,
@@ -307,9 +427,11 @@ fn run_locked(
 
     loop {
         if let Some(terminal) = drain_probe_events(events_rx, &mut collector, deferred_events) {
+            note_terminal_failure(failure, &collector, &terminal);
             return settle_terminal(terminal);
         }
         if collector.has_unsafe_tool_activity() {
+            note_failure(failure, "turn", "tool_activity_detected".to_owned());
             return interrupt_or_stop(
                 runtime,
                 events_rx,
@@ -321,6 +443,7 @@ fn run_locked(
             );
         }
         if cancellation_requested(cancel_rx, operation_id, shutdown_rx, shutdown_seen) {
+            note_failure(failure, "turn", "cancel_requested".to_owned());
             return interrupt_or_stop(
                 runtime,
                 events_rx,
@@ -340,9 +463,18 @@ fn run_locked(
             } else {
                 ProbeErrorCode::RuntimeUnavailable
             };
+            let cause = if runtime_status.generation != context.runtime_generation {
+                "runtime_generation_changed"
+            } else if runtime_status.restart_blocked {
+                "runtime_restart_blocked"
+            } else {
+                "runtime_not_ready"
+            };
+            note_failure(failure, "turn", cause.to_owned());
             return stop_for_uncertain_turn(runtime, code, deferred_events);
         }
         if Instant::now() >= deadline {
+            note_failure(failure, "turn", "probe_deadline_exceeded".to_owned());
             return interrupt_or_stop(
                 runtime,
                 events_rx,
@@ -356,11 +488,13 @@ fn run_locked(
         match events_rx.recv_timeout(EVENT_POLL) {
             Ok(event) => {
                 if let Some(terminal) = observe_or_defer(event, &mut collector, deferred_events) {
+                    note_terminal_failure(failure, &collector, &terminal);
                     return settle_terminal(terminal);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                note_failure(failure, "turn", "event_channel_disconnected".to_owned());
                 return stop_for_uncertain_turn(
                     runtime,
                     ProbeErrorCode::NotificationOverflow,
@@ -549,6 +683,7 @@ pub struct ProbeCollector {
     unsafe_tool_activity: bool,
     fail_on_tool_activity: bool,
     overflowed: bool,
+    failure_cause: Option<String>,
 }
 
 impl ProbeCollector {
@@ -574,7 +709,15 @@ impl ProbeCollector {
             unsafe_tool_activity: false,
             fail_on_tool_activity: true,
             overflowed: false,
+            failure_cause: None,
         }
+    }
+
+    /// Why the observed turn terminal was a failure, built only from fixed
+    /// words, a numeric HTTP status and the enum-like `codexErrorInfo` name.
+    /// The provider's message text is never copied.
+    pub(crate) fn failure_cause(&self) -> Option<&str> {
+        self.failure_cause.as_deref()
     }
 
     /// Opts this collector out of the fixed Probe's own "any tool/command
@@ -618,6 +761,7 @@ impl ProbeCollector {
                         .and_then(Value::as_str)
                         .filter(|id| !id.is_empty())
                     else {
+                        self.failure_cause = Some("agent_message_missing_id".to_owned());
                         return Some(self.set_terminal(ProbeTerminal::Failed(
                             ProbeErrorCode::ProtocolMismatch,
                         )));
@@ -640,6 +784,7 @@ impl ProbeCollector {
                 let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
                 let error = turn.get("error").filter(|error| !error.is_null());
                 if self.unsafe_tool_activity && self.fail_on_tool_activity {
+                    self.failure_cause = Some("tool_activity_detected".to_owned());
                     Some(ProbeTerminal::Failed(
                         ProbeErrorCode::SafetyProfileUnsupported,
                     ))
@@ -647,16 +792,22 @@ impl ProbeCollector {
                     Some(ProbeTerminal::Interrupted)
                 } else if method == "turn/completed" && status == "completed" && error.is_none() {
                     if self.text.trim().is_empty() {
+                        self.failure_cause = Some("final_text_empty".to_owned());
                         Some(ProbeTerminal::Failed(ProbeErrorCode::ProtocolMismatch))
                     } else {
                         Some(ProbeTerminal::Completed(self.text.clone()))
                     }
                 } else if error.is_some() || status == "failed" || method == "turn/failed" {
+                    self.failure_cause = Some(provider_error_cause(method.as_str(), error));
                     Some(ProbeTerminal::Failed(error.map_or(
                         ProbeErrorCode::ProviderFailed,
                         classify_provider_error,
                     )))
                 } else {
+                    self.failure_cause = Some(format!(
+                        "unexpected_turn_status status={}",
+                        safe_token(status)
+                    ));
                     Some(ProbeTerminal::Failed(ProbeErrorCode::ProtocolMismatch))
                 }
             }
@@ -758,6 +909,58 @@ pub(crate) fn classify_provider_error(error: &Value) -> ProbeErrorCode {
         Some(_) => ProbeErrorCode::ProviderFailed,
         None => ProbeErrorCode::ProviderFailed,
     }
+}
+
+/// A short, fixed-alphabet token (ASCII letters, digits, `_`, `-`, `.`, at
+/// most 40 characters), so an unexpected value can never carry free text.
+fn safe_token(value: &str) -> String {
+    let token: String = value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(40)
+        .collect();
+    if token.is_empty() {
+        "none".to_owned()
+    } else {
+        token
+    }
+}
+
+/// Describes a failed turn without its message: the notification method, the
+/// `codexErrorInfo` variant name and the numeric HTTP status, when present.
+fn provider_error_cause(method: &str, error: Option<&Value>) -> String {
+    fn status_of(value: &Value) -> Option<u64> {
+        match value {
+            Value::Object(fields) => {
+                for key in ["httpStatusCode", "statusCode", "status"] {
+                    if let Some(status) = fields.get(key).and_then(Value::as_u64)
+                        && (100..=599).contains(&status)
+                    {
+                        return Some(status);
+                    }
+                }
+                fields.values().find_map(status_of)
+            }
+            Value::Array(values) => values.iter().find_map(status_of),
+            _ => None,
+        }
+    }
+
+    let mut cause = format!("provider_turn_failed method={}", safe_token(method));
+    if let Some(error) = error {
+        let info = match error.get("codexErrorInfo") {
+            Some(Value::String(name)) => Some(safe_token(name)),
+            Some(Value::Object(fields)) => fields.keys().next().map(|name| safe_token(name)),
+            _ => None,
+        };
+        if let Some(info) = info {
+            cause.push_str(&format!(" error_info={info}"));
+        }
+        if let Some(status) = status_of(error) {
+            cause.push_str(&format!(" http_status={status}"));
+        }
+    }
+    cause
 }
 
 #[cfg(test)]

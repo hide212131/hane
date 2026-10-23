@@ -13,7 +13,7 @@ use gpui_component::{Icon, Sizable};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiServiceHandle, AiSettings,
     AiSnapshot, ChatGptConnectionSettings, CustomConnectionSettings, LoginState, ModelListState,
-    OperationId, OwnershipState, PersistenceState, ProbeErrorCode, ProbeStatus,
+    OperationId, OwnershipState, PersistenceState, ProbeDiagnostic, ProbeErrorCode, ProbeStatus,
     RuntimeDistributionErrorCode, RuntimeInstallErrorCode, RuntimeInstallState,
     SafeOperationResult, ServiceBusyReason,
 };
@@ -265,6 +265,8 @@ pub(super) struct AiSettingsPage {
     pending_connection_switch: Option<ActiveConnection>,
     pending_confirmation: Option<PendingConfirmation>,
     diagnostics_open: bool,
+    /// The probe whose failure was already handed to the local diagnostics.
+    recorded_probe_operation: Option<OperationId>,
     save_then_leave: Option<(OperationId, LeaveTarget)>,
     route_ready: Option<LeaveTarget>,
     subscription_started: bool,
@@ -287,6 +289,7 @@ impl Default for AiSettingsPage {
             pending_connection_switch: None,
             pending_confirmation: None,
             diagnostics_open: false,
+            recorded_probe_operation: None,
             save_then_leave: None,
             route_ready: None,
             subscription_started: false,
@@ -336,6 +339,7 @@ impl AiSettingsPage {
                             .update(cx, move |view, cx| {
                                 let snapshot = snapshot_service.snapshot();
                                 view.ai_settings.apply_snapshot(snapshot, cx);
+                                view.record_ai_probe_diagnostic();
                                 cx.notify();
                             })
                             .is_err()
@@ -413,6 +417,17 @@ impl AiSettingsPage {
     /// permission to leave: the current inputs are compared with the newly
     /// saved settings, and leaving is only offered again (with the pending
     /// drop kept by the view) when something unsaved remains.
+    /// The latest failed probe's diagnostic, once. Returns `None` for a probe
+    /// that was already handed over, so a repeated snapshot adds no record.
+    pub(super) fn take_unrecorded_probe_diagnostic(&mut self) -> Option<ProbeDiagnostic> {
+        let diagnostic = self.snapshot.probe_diagnostic.clone()?;
+        if self.recorded_probe_operation == Some(diagnostic.operation_id) {
+            return None;
+        }
+        self.recorded_probe_operation = Some(diagnostic.operation_id);
+        Some(diagnostic)
+    }
+
     fn apply_snapshot(&mut self, snapshot: AiSnapshot, cx: &App) {
         self.snapshot = snapshot;
         if let Some((operation, target)) = self.save_then_leave
@@ -1848,6 +1863,12 @@ impl AiSettingsPage {
             ))
             .child(distribution)
             .children(install_failure)
+            .children(self.snapshot.probe_diagnostic.as_ref().map(|diagnostic| {
+                format!(
+                    "応答確認の失敗: 段階 {} / 分類 {} / 原因 {}（アプリ更新欄の「診断情報をコピー」にも記録されます）",
+                    diagnostic.stage, diagnostic.code, diagnostic.cause
+                )
+            }))
             .child("秘密のAPI key、token、auth URLは表示・記録しません")
     }
 

@@ -43,7 +43,7 @@ pub use credential_journal::{
 pub use models::{ChatGptModel, ModelListError, fetch_chatgpt_models, saved_model_is_available};
 pub use owner_lock::{OwnerLock, OwnerLockGuard};
 pub use paths::AiPaths;
-pub use probe::{ProbeErrorCode, ProbeResult, ProbeStatus};
+pub use probe::{ProbeDiagnostic, ProbeErrorCode, ProbeResult, ProbeStatus};
 pub use prompts::{
     MAX_PROMPT_BODY_BYTES, MAX_PROMPT_COUNT, MAX_PROMPT_TITLE_CHARS, USER_PROMPTS_SCHEMA_VERSION,
     UserPrompt, UserPromptDraft, UserPrompts, UserPromptsLoadError, UserPromptsSaveError,
