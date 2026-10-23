@@ -21,6 +21,9 @@ pub const ICON_CHEVRON_RIGHT: &str = "icons/work-folder/chevron-right.svg";
 /// Expanded folder disclosure chevron.
 pub const ICON_CHEVRON_DOWN: &str = "icons/work-folder/chevron-down.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
+/// The left side panel open/close button: a rounded wide frame with a thin
+/// vertical divider on its left.
+pub const ICON_SIDEBAR: &str = "icons/sidebar.svg";
 /// Overrides `gpui-component`'s `IconName::ArrowLeft` glyph.
 pub const ICON_ARROW_LEFT: &str = "icons/arrow-left.svg";
 /// Overrides `gpui-component`'s `IconName::Check` glyph.
@@ -58,6 +61,10 @@ const SETTINGS_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/settings.svg"
 ));
+const SIDEBAR_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/sidebar.svg"
+));
 const ARROW_LEFT_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/arrow-left.svg"
@@ -92,6 +99,7 @@ impl AssetSource for WorkFolderIcons {
             ICON_CHEVRON_RIGHT => Some(Cow::Borrowed(CHEVRON_RIGHT_SVG)),
             ICON_CHEVRON_DOWN => Some(Cow::Borrowed(CHEVRON_DOWN_SVG)),
             ICON_SETTINGS => Some(Cow::Borrowed(SETTINGS_SVG)),
+            ICON_SIDEBAR => Some(Cow::Borrowed(SIDEBAR_SVG)),
             ICON_ARROW_LEFT => Some(Cow::Borrowed(ARROW_LEFT_SVG)),
             ICON_CHECK => Some(Cow::Borrowed(CHECK_SVG)),
             ICON_READING_MODE => Some(Cow::Borrowed(READING_MODE_SVG)),
@@ -144,6 +152,7 @@ mod tests {
             ICON_CHEVRON_RIGHT,
             ICON_CHEVRON_DOWN,
             ICON_SETTINGS,
+            ICON_SIDEBAR,
             ICON_ARROW_LEFT,
             ICON_CHECK,
             ICON_READING_MODE,
@@ -155,6 +164,35 @@ mod tests {
                 "AppAssets must keep serving Hane's own icon at {path} unchanged"
             );
         }
+    }
+
+    // The sidebar toggle must stay a path-only outline on a 24px viewBox like
+    // Hane's other stroked icons that render correctly; a `<rect>` with
+    // fixed width/height rendered as an I-shaped glyph in the real app.
+    #[test]
+    fn sidebar_icon_is_path_only_rounded_frame_with_left_divider() {
+        let bytes = AppAssets
+            .load(ICON_SIDEBAR)
+            .unwrap()
+            .expect("the sidebar toggle icon must be served");
+        let svg = std::str::from_utf8(&bytes).expect("sidebar.svg must be UTF-8");
+        assert!(svg.contains("viewBox=\"0 0 24 24\""));
+        assert!(!svg.contains("<rect"), "frame must be a path, not a <rect>");
+        assert!(!svg.contains(" width=\"") && !svg.contains(" height=\""));
+        assert_eq!(svg.matches("<path").count(), 2, "frame and divider");
+        // Rounded frame: four arc corners; divider: a vertical line.
+        // Count both absolute `A` and relative `a` arc commands, only within
+        // path data (other attributes contain unrelated letters).
+        let frame_d = svg
+            .split("d=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("frame path must have a d attribute");
+        assert_eq!(
+            frame_d.chars().filter(|c| matches!(c, 'A' | 'a')).count(),
+            4
+        );
+        assert!(svg.contains("d=\"M9 5v14\""));
     }
 
     // gpui-component's own icon set, resolved through `gpui_kit_assets::Assets`
