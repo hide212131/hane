@@ -63,7 +63,8 @@ impl Redactor {
     pub(crate) fn redact(&self, text: &str, max_chars: usize) -> String {
         let mut out: Vec<String> = Vec::new();
         let mut mask_next = 0_u8;
-        for token in text.split_whitespace() {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        for (index, token) in tokens.iter().copied().enumerate() {
             if mask_next > 0 {
                 mask_next -= 1;
                 out.push(REDACTED.to_owned());
@@ -77,8 +78,18 @@ impl Redactor {
                 _ => {}
             }
             let (text, mask_following) = self.redact_token(token);
-            if mask_following && mask_next == 0 {
-                mask_next = 1;
+            if mask_next == 0 {
+                // `Proxy-Authorization: Bearer abc`: the scheme is its own
+                // token, so the credential is the one after it.
+                let scheme_next = tokens
+                    .get(index + 1)
+                    .is_some_and(|next| is_auth_scheme(next));
+                if mask_following {
+                    mask_next = if scheme_next { 2 } else { 1 };
+                } else if !token.contains("://") && secret_pair_value_is_scheme(token) {
+                    // `authorization:bearer abc`: the scheme sits inside the pair.
+                    mask_next = 1;
+                }
             }
             out.push(text);
         }
@@ -104,6 +115,29 @@ impl Redactor {
         }
         (text, false)
     }
+}
+
+fn is_auth_scheme(word: &str) -> bool {
+    const SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "ntlm"];
+    let lower = word.to_ascii_lowercase();
+    SCHEMES.contains(&lower.as_str())
+}
+
+/// Whether the last secret pair of a token has only an auth scheme as its
+/// value (`authorization:bearer`), so the credential is the next token.
+fn secret_pair_value_is_scheme(token: &str) -> bool {
+    let Some(segment) = token.rsplit([',', '&', ';']).next() else {
+        return false;
+    };
+    let Some(at) = segment.find(['=', ':']) else {
+        return false;
+    };
+    let Some((_, continues)) = mask_secret_segment(segment) else {
+        return false;
+    };
+    let value = segment[at + 1..]
+        .trim_matches(|c: char| "{[(\"'`}]) \t".contains(c));
+    !continues && is_auth_scheme(value)
 }
 
 /// Masks every `key=value` / `key:value` / `"key":"value"` pair of a token
@@ -514,6 +548,23 @@ mod tests {
         assert!(out.contains("https://example.com/a/b?<redacted>"), "{out}");
         assert!(out.contains("token=<redacted>"), "{out}");
         assert!(out.contains("~/Library/x"), "{out}");
+    }
+
+    #[test]
+    fn auth_scheme_credentials_are_masked_after_header_keys() {
+        let cases = [
+            "Proxy-Authorization: Bearer abc",
+            "authorization:bearer abc",
+            "Proxy-Authorization: basic abc",
+            "token: Bearer abc",
+            "Authorization: Bearer abc",
+        ];
+        for input in cases {
+            let out = redactor().redact(input, 1000);
+            assert!(!out.contains("abc"), "{input} leaked in {out}");
+        }
+        let kept = redactor().redact("Proxy-Authorization: Bearer abc stage=check", 1000);
+        assert!(kept.ends_with("stage=check"), "{kept}");
     }
 
     #[test]
