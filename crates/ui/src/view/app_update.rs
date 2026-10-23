@@ -766,7 +766,7 @@ impl EditorView {
         let snapshot = controller.snapshot();
         let model = card_model(&snapshot);
         let restarting = self.restart_in_progress;
-        let mut buttons: Vec<Button> = model
+        let buttons: Vec<Button> = model
             .actions
             .into_iter()
             .filter(|(action, _)| !(restarting && *action == CardAction::Restart))
@@ -784,17 +784,20 @@ impl EditorView {
             .collect();
         // Available whenever records exist, also while updates are
         // unavailable; it only copies local text and starts nothing.
-        if snapshot.diagnostics_available {
+        let diagnostics_button = snapshot.diagnostics_available.then(|| {
             let view = cx.entity();
-            buttons.push(
-                Button::new("settings-app-update-diagnostics")
-                    .label("診断情報をコピー")
-                    .ghost()
-                    .on_click(move |_, _window, app| {
-                        view.update(app, |view, cx| view.copy_app_update_diagnostics(cx));
-                    }),
-            );
-        }
+            div()
+                .id("settings-app-update-diagnostics-wrapper")
+                .debug_selector(|| "settings-app-update-diagnostics".to_owned())
+                .child(
+                    Button::new("settings-app-update-diagnostics")
+                        .label("診断情報をコピー")
+                        .ghost()
+                        .on_click(move |_, _window, app| {
+                            view.update(app, |view, cx| view.copy_app_update_diagnostics(cx));
+                        }),
+                )
+        });
         let card = div()
             .id("settings-app-update-card")
             .debug_selector(|| "settings-app-update-card".to_owned())
@@ -844,7 +847,8 @@ impl EditorView {
                     .flex_row()
                     .flex_wrap()
                     .gap_2()
-                    .children(buttons),
+                    .children(buttons)
+                    .children(diagnostics_button),
             );
         Some(
             div()
@@ -1915,6 +1919,7 @@ mod tests {
     struct FakeController {
         snapshot: Mutex<Option<AppUpdateSnapshot>>,
         calls: Mutex<Vec<String>>,
+        diagnostics: Option<String>,
     }
 
     impl FakeController {
@@ -1922,6 +1927,15 @@ mod tests {
             Arc::new(Self {
                 snapshot: Mutex::new(Some(snapshot)),
                 calls: Mutex::new(Vec::new()),
+                diagnostics: None,
+            })
+        }
+
+        fn with_diagnostics(snapshot: AppUpdateSnapshot, text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                snapshot: Mutex::new(Some(snapshot)),
+                calls: Mutex::new(Vec::new()),
+                diagnostics: Some(text.to_owned()),
             })
         }
 
@@ -1951,6 +1965,9 @@ mod tests {
         }
         fn restore_local(&self) {
             self.calls.lock().unwrap().push("restore".to_owned());
+        }
+        fn diagnostics_text(&self) -> Option<String> {
+            self.diagnostics.clone()
         }
     }
 
@@ -2020,6 +2037,44 @@ mod tests {
             view.read_with(cx, |view, _| view.restart_message.clone()),
             None,
             "a new non-restart action must drop the stale copy notice"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_diagnostics_button_copies_the_text_without_starting_work(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut idle = AppUpdateSnapshot::idle("0.26.0");
+        idle.diagnostics_available = true;
+        let controller = FakeController::with_diagnostics(idle, "diagnostics-fixture\nstage=check");
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, _| view.attach_app_update(Some(attached)));
+        open_general_settings(&view, cx);
+        let calls_before = controller.calls();
+
+        let button = cx
+            .debug_bounds("settings-app-update-diagnostics")
+            .expect("the diagnostics button is rendered when records exist");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("diagnostics-fixture\nstage=check"));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.restart_message.clone()),
+            Some("更新の診断情報をコピーしました。".to_owned())
+        );
+        assert_eq!(
+            controller.calls(),
+            calls_before,
+            "copying must not start a check or a download"
+        );
+        assert!(
+            controller
+                .calls()
+                .iter()
+                .all(|call| call != "check" && !call.starts_with("download")),
         );
     }
 
