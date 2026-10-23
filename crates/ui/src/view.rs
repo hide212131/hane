@@ -28,8 +28,9 @@ use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
 use crate::line::DEFAULT_LINE_HEIGHT;
 use crate::line::{
-    BODY_FONT_SIZE, BlockPresentationRequest, CARET_MODE_BADGE_HEIGHT, block_element,
-    block_fits_sync_join_budget, expected_block_disclosures, presented_block, row_element,
+    BODY_FONT_SIZE, BlockPresentationRequest, CARET_MODE_BADGE_HEIGHT, DisclosurePolicy,
+    block_element, block_fits_sync_join_budget, expected_block_disclosures, presented_block,
+    row_element,
 };
 use crate::shape::WindowShaper;
 use crate::short_text_input::{ShortTextInput, utf16_offset_from_byte};
@@ -104,6 +105,8 @@ mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod inline_rename;
 pub(crate) mod input_routing;
+mod reading_mode;
+use reading_mode::{EditorMode, ModeAnchor, command_changes_text};
 mod session_save;
 mod sidebar;
 mod sidebar_filter;
@@ -952,6 +955,10 @@ pub struct EditorView {
     /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
     /// the life of the view; dropping it would cancel the hook.
     _quit_subscription: Subscription,
+    /// Whether the body is being edited or only read. One value per window:
+    /// it is not copied into sessions, editors or settings, and only an
+    /// explicit switch (see `reading_mode.rs`) changes it.
+    editor_mode: EditorMode,
     /// The active keyboard input mode, when the platform can determine it.
     /// Drives the caret's small input-mode badge; refreshed by
     /// `_input_mode_subscription` so it updates without polling.
@@ -1076,6 +1083,14 @@ pub struct EditorView {
     /// Set by a zoom-changing gesture, consumed after the visible blocks have
     /// been remeasured for the new zoom. See `PendingZoomAnchor`.
     pending_zoom_anchor: Option<PendingZoomAnchor>,
+    /// Set by an editing/reading switch, consumed once the visible blocks are
+    /// measured under the new policy. Names a source row, so it can be refused
+    /// for any other document. See `ModeAnchor`.
+    pending_mode_anchor: Option<ModeAnchor>,
+    /// Bumped on every editing/reading switch. A background height snapshot
+    /// remembers the value it started under and is dropped (not its index) when
+    /// it differs, even if the mode itself is the same again.
+    mode_generation: u64,
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
@@ -1085,6 +1100,10 @@ pub struct EditorView {
     /// changes a row height (for example, an inactive zero-height code fence
     /// becoming editable).
     pending_caret_visibility_after_layout: bool,
+    /// How many times `render` asked for one more real frame to finish a
+    /// layout correction (anchor, caret or find visibility). Tests read it to
+    /// check that a correction ends and stops asking.
+    layout_followup_frames_requested: u64,
     /// Frames left to settle a "center the caret row" request on the caret's
     /// freshly measured row. The immediate scroll can only use the partial
     /// layout estimate; this corrects it once the row is drawn. Cleared by any
@@ -1757,6 +1776,7 @@ impl EditorView {
             pending_new_folders: HashSet::new(),
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
+            editor_mode: EditorMode::default(),
             caret_input_mode: active_keyboard_input_mode(),
             _input_mode_subscription: input_mode_subscription,
             _input_mode_focus_subscription: None,
@@ -1794,8 +1814,11 @@ impl EditorView {
             wheel_zoom_animation: None,
             scroll_inertia: None,
             pending_zoom_anchor: None,
+            pending_mode_anchor: None,
+            mode_generation: 0,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
+            layout_followup_frames_requested: 0,
             pending_center_caret_frames: 0,
             center_window_line: None,
             retained_center_window: None,
@@ -2584,6 +2607,9 @@ impl EditorView {
         self.heights = HeightIndex::new(std::iter::repeat_n(self.line_height(), lines));
         self.height_blocks.clear();
         self.scroll_y = self.sessions.active().view_state().scroll_y;
+        // A switch's reading position belongs to the outgoing document; the
+        // incoming one keeps its saved scroll.
+        self.pending_mode_anchor = None;
         self.block_cache.clear();
         self.line_owners.clear();
         self.layout_cache.clear();
@@ -4001,6 +4027,11 @@ impl EditorView {
         intent: ListEditIntent,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.body_editable() {
+            // Handled as a no-op so the caller's plain-input fallback does not
+            // run either.
+            return true;
+        }
         if self.editor().ime().is_some() {
             return false;
         }
@@ -4056,6 +4087,9 @@ impl EditorView {
     }
 
     pub(crate) fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        if !self.body_editable() {
+            return;
+        }
         match self.editor_mut().dispatch(EditorCommand::Insert("\n")) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("editor command", error),
@@ -4064,6 +4098,9 @@ impl EditorView {
     }
 
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !self.body_editable() {
+            return;
+        }
         match self.editor_mut().insert_text(text) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("text input", error),
@@ -4072,6 +4109,9 @@ impl EditorView {
     }
 
     pub(crate) fn dispatch(&mut self, command: EditorCommand<'_>, cx: &mut Context<Self>) {
+        if !self.body_editable() && command_changes_text(&command) {
+            return;
+        }
         match self.editor_mut().dispatch(command) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("editor command", error),
@@ -4517,6 +4557,8 @@ impl EditorView {
         self.pending_caret_visibility_after_layout = false;
         self.pending_find_visibility_after_layout = false;
         self.pending_zoom_anchor = None;
+        // Likewise a mode switch's remembered row from earlier in this cycle.
+        self.pending_mode_anchor = None;
         self.cancel_center_caret();
         self.retained_center_window = pinned;
         cx.notify();
@@ -4661,6 +4703,7 @@ impl EditorView {
             // the document-find bar's current match.
             forced_disclosure: None,
             line_height: self.line_height(),
+            disclosure_policy: self.disclosure_policy(),
         })?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
@@ -4683,8 +4726,9 @@ impl EditorView {
         x: f32,
         shaper: &dyn LineShaper,
     ) -> Option<(SourceOffset, f32)> {
+        let policy = self.disclosure_policy();
         let (indexed, window) =
-            neighbor_block_window(self.editor(), self.current_index(), block, down)?;
+            neighbor_block_window(self.editor(), self.current_index(), block, down, policy)?;
         let joined = self.current_joined_parse(&indexed);
         let list_projection = self
             .current_index()
@@ -4704,6 +4748,7 @@ impl EditorView {
             list_projection,
             table_projection,
             self.line_height(),
+            policy,
         )
     }
 
@@ -5386,6 +5431,12 @@ impl EditorView {
     }
 
     fn active_height_disclosure(&self) -> Option<SourceRange> {
+        if !self.body_editable() {
+            // Reading opens no Markdown markers, so no structural row stays
+            // expanded: `None` makes every fence and table delimiter row count
+            // as collapsed in height arithmetic and virtualization.
+            return None;
+        }
         self.editor()
             .ime()
             .map(|ime| ime.current_range)
@@ -5928,6 +5979,7 @@ impl EditorView {
             table_projection,
             forced_disclosure: self.document_find_current_match(),
             line_height: self.line_height(),
+            disclosure_policy: self.disclosure_policy(),
         })?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
@@ -5989,6 +6041,7 @@ impl EditorView {
             &render,
             self.current_joined_parse(indexed),
             self.document_find_current_match(),
+            self.disclosure_policy(),
         ) else {
             return false;
         };
@@ -6015,6 +6068,7 @@ fn neighbor_block_window(
     index: Option<&BlockIndex>,
     block: &VisualBlock,
     down: bool,
+    policy: DisclosurePolicy,
 ) -> Option<(IndexedBlock, Range<usize>)> {
     let document = editor.document();
     let probe = if down {
@@ -6029,10 +6083,13 @@ fn neighbor_block_window(
         span.start..span.start + 1
     } else {
         let last_line = span.end.saturating_sub(1);
-        let disclosure = editor
-            .ime()
-            .map(|ime| ime.current_range)
-            .or_else(|| Some(editor.selection().range()));
+        let disclosure = match policy {
+            DisclosurePolicy::Editing => editor
+                .ime()
+                .map(|ime| ime.current_range)
+                .or_else(|| Some(editor.selection().range())),
+            DisclosurePolicy::Reading => None,
+        };
         // Preserve tiled trailing blank lines as navigable rows. Only fall
         // back to the table's last formal row when the physical last line is
         // itself a collapsed delimiter (the header-only table edge case).
@@ -6082,6 +6139,7 @@ fn target_in_neighbor(
     list_projection: Option<&ListProjection>,
     table_projection: Option<&TableProjection>,
     line_height: f32,
+    disclosure_policy: DisclosurePolicy,
 ) -> Option<(SourceOffset, f32)> {
     let visual = presented_block(BlockPresentationRequest {
         editor,
@@ -6095,6 +6153,7 @@ fn target_in_neighbor(
         // document-find bar's current match.
         forced_disclosure: None,
         line_height,
+        disclosure_policy,
     })?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
@@ -6170,7 +6229,8 @@ fn neighbor_row_target(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
 ) -> Option<SourceOffset> {
-    let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
+    let (indexed, window) =
+        neighbor_block_window(editor, index, block, down, DisclosurePolicy::Editing)?;
     target_in_neighbor(
         editor,
         &indexed,
@@ -6183,6 +6243,7 @@ fn neighbor_row_target(
         None,
         None,
         DEFAULT_LINE_HEIGHT,
+        DisclosurePolicy::Editing,
     )
     .map(|(target, _)| target)
 }
@@ -6583,6 +6644,9 @@ impl EditorView {
         // from fighting the drag once it does resume (issue #389).
         self.scroll_inertia = None;
         self.cancel_center_caret();
+        // The drag owns the position; a mode switch's remembered row must not
+        // pull it back on the next render.
+        self.pending_mode_anchor = None;
         cx.stop_propagation();
         cx.notify();
     }
@@ -7213,20 +7277,24 @@ impl Render for EditorView {
         // for a soft-wrapped paragraph: the measured block height can differ by
         // several rows in the same frame. The next frame is notified below if
         // the corrected anchor changed which blocks should be visible.
+        // A mode switch is anchored on the source row instead (refused for any
+        // other document), against the layouts measured above.
+        let mode_anchor_applied = self.resolve_mode_anchor(&rendered, window, cx);
         let zoom_anchor_applied = self
             .pending_zoom_anchor
             .take()
-            .filter(|_| !self.heights.is_empty())
+            .filter(|_| !self.heights.is_empty() && !mode_anchor_applied)
             .map(|anchor| {
                 self.scroll_y = self.scroll_y_for_zoom_anchor(anchor);
                 true
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || mode_anchor_applied;
         if zoom_anchor_applied {
             // The visible block set was selected before measured heights were
             // installed. Ask GPUI for one more frame so virtualization and
             // spacers are recomputed from the corrected anchor position.
-            cx.notify();
+            self.request_layout_followup_frame(window, cx);
         }
         // Measuring wrapped rows can correct blocks above the viewport. Keep the
         // same block and the same position inside it at the top instead of
@@ -7250,14 +7318,26 @@ impl Render for EditorView {
         let caret = self.editor().selection().active;
         let fresh_caret = self.fresh_point_for_offset(&rendered, &shaper, caret);
         if self.pending_caret_visibility_after_layout {
-            if let Some((_, top, height)) = fresh_caret
-                && height > 0.0
-            {
+            // Reading keeps fences and table delimiters at zero height for
+            // good, so a caret on one never gets a positive-height row: it
+            // resolves to the nearest visible position instead of waiting.
+            // Nothing paints a caret badge there, so no clearance is asked.
+            let badge_height = if self.body_caret_visible() {
+                CARET_MODE_BADGE_HEIGHT
+            } else {
+                0.0
+            };
+            let caret_row = match fresh_caret {
+                Some((_, top, height)) if height > 0.0 => Some((top, height)),
+                _ if !self.body_editable() => self.reading_visible_row(caret),
+                _ => None,
+            };
+            if let Some((top, height)) = caret_row {
                 let before = self.scroll_y;
                 self.scroll_y = scroll_y_for_cursor(
                     self.scroll_y,
                     top,
-                    height + CARET_MODE_BADGE_HEIGHT,
+                    height + badge_height,
                     self.viewport_height,
                 );
                 self.scroll_y = clamp_scroll_y(
@@ -7265,23 +7345,30 @@ impl Render for EditorView {
                     self.scrollable_content_height(),
                     self.viewport_height,
                 );
-                let visible_bottom = top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
-                if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
-                    && self.scroll_y == before
-                {
+                let visible_bottom = top + height + badge_height - self.scroll_y;
+                let settled = visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE;
+                if settled && self.scroll_y == before {
                     self.pending_caret_visibility_after_layout = false;
-                } else {
+                } else if self.scroll_y == before && self.body_editable() {
+                    // Editing keeps the established behaviour (no new frame
+                    // is requested for an unmoved, unsettled request).
+                    cx.notify();
+                } else if self.scroll_y != before {
                     // Keep the request armed for one more frame whenever this
                     // correction moved the scroll. A following frame may apply
                     // the height anchor to newly measured rows; clearing here
                     // would let that anchor erase the badge clearance before
-                    // the caret has reached a stable layout.
-                    cx.notify();
-                }
-                if self.scroll_y != before {
-                    // The visible block set was selected before this corrected
-                    // position. One more frame lets virtualization follow it.
-                    cx.notify();
+                    // the caret has reached a stable layout. The visible block
+                    // set was also selected before the corrected position, so
+                    // the next frame lets virtualization follow it. `render`
+                    // cannot dirty the frame it is drawing, so an actual frame
+                    // is requested.
+                    self.request_layout_followup_frame(window, cx);
+                } else {
+                    // Reading, and the scroll can not move any further (the
+                    // end of the document): the request has nothing left to
+                    // improve, so it ends instead of asking for frames forever.
+                    self.pending_caret_visibility_after_layout = false;
                 }
             } else {
                 // The fresh disclosed row has not been laid out yet. Keep the
@@ -7330,9 +7417,19 @@ impl Render for EditorView {
         }
         let find_current_match = self.document_find_current_match();
         if self.pending_find_visibility_after_layout {
-            match find_current_match
-                .and_then(|range| self.fresh_point_for_offset(&rendered, &shaper, range.start))
-            {
+            let fresh_match = find_current_match
+                .and_then(|range| self.fresh_point_for_offset(&rendered, &shaper, range.start));
+            // While reading, a match on a closed fence or delimiter row has no
+            // height to wait for; show the nearest visible position.
+            let fresh_match = match (fresh_match, find_current_match) {
+                (Some((_, top, height)), _) if height > 0.0 => Some((0.0, top, height)),
+                (_, Some(range)) if !self.body_editable() => self
+                    .reading_visible_row(range.start)
+                    .map(|(top, height)| (0.0, top, height)),
+                (Some(_), _) => Some((0.0, 0.0, 0.0)),
+                (None, _) => None,
+            };
+            match fresh_match {
                 Some((_, top, height)) if height > 0.0 => {
                     let before = self.scroll_y;
                     self.scroll_y =
@@ -7343,15 +7440,16 @@ impl Render for EditorView {
                         self.viewport_height,
                     );
                     let visible_bottom = top + height - self.scroll_y;
-                    if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
-                        && self.scroll_y == before
-                    {
+                    let settled = visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE;
+                    if settled && self.scroll_y == before {
                         self.pending_find_visibility_after_layout = false;
+                    } else if self.scroll_y == before && self.body_editable() {
+                        cx.notify();
+                    } else if self.scroll_y != before {
+                        self.request_layout_followup_frame(window, cx);
                     } else {
-                        cx.notify();
-                    }
-                    if self.scroll_y != before {
-                        cx.notify();
+                        // Reading at a scroll limit: nothing more to correct.
+                        self.pending_find_visibility_after_layout = false;
                     }
                 }
                 Some(_) => {
@@ -7381,11 +7479,13 @@ impl Render for EditorView {
                 .unwrap_or(SourceOffset(0)),
         });
         // Where the caret was drawn, for the IME candidate window.
-        self.caret_geometry = fresh_caret.map(|(x, top, height)| CaretGeometry {
-            x: self.theme.line_horizontal_padding + x,
-            y: top - self.scroll_y,
-            height,
-        });
+        self.caret_geometry = fresh_caret
+            .filter(|_| self.body_caret_visible())
+            .map(|(x, top, height)| CaretGeometry {
+                x: self.theme.line_horizontal_padding + x,
+                y: top - self.scroll_y,
+                height,
+            });
         // Blocks are drawn whole, so the rendered span can start above the
         // viewport; the spacers have to match what was actually drawn.
         let items = if first_item < last_item {
@@ -7479,6 +7579,7 @@ impl Render for EditorView {
                                         self.zoom,
                                         &resolver,
                                         self.caret_input_mode,
+                                        self.body_caret_visible(),
                                         &find_matches,
                                         find_current_match,
                                     )
@@ -7910,6 +8011,10 @@ impl EditorView {
             .border_color(rgb(self.theme.tab_bar_border))
             .child(self.file_menu_button(cx))
             .child(tab_strip)
+            // Outside the scrolling strip, so it keeps its size with many tabs
+            // or a narrow window and its press never reaches the strip's
+            // body-click handler.
+            .child(self.reading_mode_button(cx))
     }
 
     /// The "ファイル" menu at the left of the header: open a file, open a
@@ -9145,6 +9250,7 @@ mod tests {
                     table_projection: None,
                     forced_disclosure: None,
                     line_height: DEFAULT_LINE_HEIGHT,
+                    disclosure_policy: DisclosurePolicy::Editing,
                 })
                 .expect("block presents")
                 .lines
@@ -9174,6 +9280,7 @@ mod tests {
             table_projection: Some(projection),
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("table presentation");
         let delimiter = visual
@@ -9780,6 +9887,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: view.line_height(),
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .expect("active fenced block presentation");
             let width = 80.0;
@@ -9871,6 +9979,7 @@ mod tests {
                 table_projection: Some(projection),
                 forced_disclosure: None,
                 line_height: view.line_height(),
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .expect("active table presentation");
             let layout = layout_block(&visual, width, &FixedAdvanceShaper::new(8.0));
@@ -10292,6 +10401,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .unwrap();
         assert_eq!(visual.lines.len(), 50, "only the visible lines are built");
@@ -10408,6 +10518,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("nested item presents");
         assert_eq!(nested.lines[0].visual_text, "1. nested");
@@ -10428,6 +10539,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late item presents");
         assert_eq!(late.lines[0].visual_text, "3000. item");
@@ -10459,6 +10571,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late continuation presents");
         let line = &late.lines[0];
@@ -10497,6 +10610,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late code row presents");
         let line = &code.lines[0];
@@ -10521,6 +10635,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late code opening presents");
         assert_eq!(opening.lines[0].visual_text, "");
@@ -10556,6 +10671,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late code row presents");
         let line = &presented.lines[0];
@@ -10593,6 +10709,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late nested code row presents");
         assert_eq!(presented.lines[0].visual_text, "```oops");
@@ -10617,6 +10734,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late nested closing fence presents");
         assert_eq!(closing.lines[0].visual_text, "");
@@ -10659,6 +10777,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late quote code row presents");
         let line = &code.lines[0];
@@ -10680,6 +10799,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late quote code opening presents");
         assert_eq!(opening.lines[0].visual_text, "> ````rust");
@@ -10722,6 +10842,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late list quote code row presents");
         assert_eq!(code.lines[0].visual_text, "    > > literal");
@@ -10762,6 +10883,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("late list code row presents");
         let line = &code.lines[0];
@@ -10800,6 +10922,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("same-line nested fence presents");
         let line = &opening.lines[0];
@@ -10841,6 +10964,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("same-line multi-level fence presents");
         let line = &opening.lines[0];
@@ -10868,6 +10992,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("disclosed same-line multi-level fence presents");
         let outer_marker = SourceRange::new(opening_start + 4, opening_start + 6);
@@ -10913,6 +11038,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("formal continuation presents");
         assert_eq!(late.lines[0].visual_text, "continued");
@@ -10958,6 +11084,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: DEFAULT_LINE_HEIGHT,
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .unwrap();
         assert_eq!(code.lines.len(), 5, "four fence lines plus the blank below");
@@ -11757,6 +11884,100 @@ mod tests {
     }
 
     #[gpui::test]
+    fn joined_parse_scheduler_uses_the_current_cache_contract(cx: &mut gpui::TestAppContext) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Case {
+            NoCache,
+            Matching,
+            OtherId,
+            StaleRevision,
+            OtherStart,
+            OtherEnd,
+        }
+        // Byte budget only: a low-line joinable block with a trailing blank
+        // line, so the inner parse range differs from the outer block range.
+        let text = format!(
+            "{} **bold\nend**\n\nsecond\n",
+            "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET + 1)
+        );
+        for case in [
+            Case::NoCache,
+            Case::Matching,
+            Case::OtherId,
+            Case::StaleRevision,
+            Case::OtherStart,
+            Case::OtherEnd,
+        ] {
+            // A fresh View per case keeps in-flight jobs and the running cap
+            // from short-circuiting before the cache check.
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+            view.update(cx, |view, cx| {
+                let old_revision = view.editor().document().revision();
+                let document = view.editor().document();
+                let indexed = BlockIndex::from_buffer(document).block(0).unwrap();
+                let span = block_line_span(document, &indexed).unwrap();
+                assert!(!block_fits_sync_join_budget(&indexed, &span));
+                let blank = trailing_blank_lines(document, &span);
+                assert!(blank > 0, "the block must own a trailing blank line");
+                let parse = parse_joined_span(
+                    document,
+                    span.start..span.end - blank,
+                    indexed.source_range,
+                    old_revision,
+                )
+                .unwrap();
+                assert_ne!(parse.source_range, indexed.source_range);
+
+                let mut key = indexed.id;
+                let mut cached_range = indexed.source_range;
+                match case {
+                    Case::NoCache | Case::Matching | Case::StaleRevision => {}
+                    Case::OtherId => key = BlockId(indexed.id.0 + 1000),
+                    Case::OtherStart => cached_range.start.0 += 1,
+                    Case::OtherEnd => cached_range.end.0 -= 1,
+                }
+                if case != Case::NoCache {
+                    view.joined_parse_cache.insert(
+                        key,
+                        JoinedBlockCache {
+                            revision: old_revision,
+                            source_range: cached_range,
+                            parse,
+                        },
+                    );
+                }
+                if case == Case::StaleRevision {
+                    // Edit the later block: the revision advances while this
+                    // block's range stays unchanged.
+                    let end = SourceOffset(view.editor().document().len_bytes().0);
+                    view.editor_mut()
+                        .set_selection(Selection::caret(end))
+                        .unwrap();
+                    view.editor_mut().insert_text("x").unwrap();
+                    assert_ne!(view.editor().document().revision(), old_revision);
+                }
+                let document = view.editor().document();
+                let indexed = BlockIndex::from_buffer(document).block(0).unwrap();
+
+                assert!(view.joined_parse_jobs.is_empty());
+                assert_eq!(view.joined_parse_jobs_running, 0);
+                view.schedule_joined_parse(&[indexed], cx);
+
+                if case == Case::Matching {
+                    assert!(view.joined_parse_jobs.is_empty());
+                    assert_eq!(view.joined_parse_jobs_running, 0);
+                    let cached = &view.joined_parse_cache[&indexed.id];
+                    assert_eq!(cached.revision, old_revision);
+                    assert_eq!(cached.source_range, indexed.source_range);
+                } else {
+                    assert!(view.joined_parse_jobs.contains_key(&indexed.id));
+                    assert_eq!(view.joined_parse_jobs_running, 1);
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
     fn disclosures_are_current_reuses_a_joined_runs_shared_disclosure(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -11787,6 +12008,7 @@ mod tests {
                 table_projection: None,
                 forced_disclosure: None,
                 line_height: DEFAULT_LINE_HEIGHT,
+                disclosure_policy: DisclosurePolicy::Editing,
             })
             .unwrap();
             assert_eq!(
@@ -12529,6 +12751,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("block presents");
         let layout = layout_block(&block, TEST_WIDTH, shaper);
@@ -12902,6 +13125,7 @@ mod tests {
             table_projection: None,
             forced_disclosure: None,
             line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: DisclosurePolicy::Editing,
         })
         .expect("the wide window presents");
         let wide_layout = layout_block(&wide_visual, TEST_WIDTH, &shaper);

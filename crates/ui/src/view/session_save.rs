@@ -25,18 +25,26 @@ impl EditorView {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
-            let should_save = view
+            let (should_save, composing) = view
                 .read_with(cx, |view, _| {
-                    view.document_instance(id) == instance
+                    let current = view.document_instance(id) == instance
                         && view.sessions.active_id() == id
                         && view
                             .sessions
                             .active()
-                            .autosave_is_current(ticket, view.settings.autosave)
+                            .autosave_is_current(ticket, view.settings.autosave);
+                    // The marked text is not committed yet, so writing it
+                    // would put an unconfirmed composition on disk.
+                    let composing = view.sessions.active().editor().ime().is_some();
+                    (current && !composing, current && composing)
                 })
-                .unwrap_or(false);
+                .unwrap_or((false, false));
             if should_save {
                 let _ = view.update(cx, |view, cx| view.save_current(cx));
+            } else if composing {
+                // Try again once the composition may have ended; the edit
+                // that armed this timer is still unsaved.
+                let _ = view.update(cx, |view, cx| view.schedule_autosave(cx));
             }
         })
         .detach();

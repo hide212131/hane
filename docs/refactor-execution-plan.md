@@ -602,3 +602,59 @@ P5の元移動ではP4 baseのunit test 54件のうち12件を `projection/block
 RF2-B全体のP1〜P4受入記録は§9.14〜§9.17、P5の検証記録は本節を参照する。Issue #302はP1〜P5とIssue全体の受入条件を最終確認した後に完了する。
 
 （P1受入時点の履歴）P1のみ受入済みで、P2以降は未着手だった。Issue #302の他の受入条件が未完了のため、当時はIssueをopenのまま維持した。後続段階の進捗は§9.15〜§9.18に記録する。
+
+### 9.19 RF0: ADR・保護契約の限定照合（#298、2026-10-23）
+
+照合対象はmain `499c44639822e76518a93661e77578b23ff7b72a`。[Issue #298の照合記録](https://github.com/hide212131/hane/issues/298#issuecomment-6347233628)と、同SHAのADR本文・索引、第4節、第9.3節を確認した。製品変更、build/test、GUI、性能測定は今回実施していない。第9.1〜9.5節は初回調査時点の履歴として保持し、本節を当時の結果へ上書きしない。
+
+第4節には12要件群の担当Issue・主な証拠、第9.3節には保護契約8群の既存assert・不足検証の担当がある。次の表はADRと既存の担当範囲を対応付けるものであり、各Issueの受入完了を示さない。
+
+| ADRの契約 | 変更前の照合・検証先 | 維持する境界・不足 |
+|---|---|---|
+| 0003 / 0007 / 0013: source位置、IME、編集transaction | #305、保存境界は#309。`crates/editor/tests/ime_contract.rs`、`crates/session/tests/conflict_rules.rs`等 | 自動テストの存在だけでnative IMEや保存の実OS成功を推測しない。 |
+| 0005 / 0018 / 0025: revision、BlockIndex、shared parse | #306、job寿命は#309/#368。`crates/markdown/tests/block_index_contract.rs`、UI background parse | strict-matchとrebaseを区別する。#306の部分受入だけで、提案中のADR-0025全体を採用・検証済みにしない。 |
+| 0020 / 0021 / 0022: 仮想化、geometry、cache/height | #307/#368、実測#314。`crates/presentation/tests/`のlayout/source map/height index契約 | 実字形・paint/入力整合、巨大文書・保持量の未測定をunit passへ読み替えない。 |
+| 0019: sessionとFile I/O | #308/#309。状態所有、要求と結果受理、失敗注入 | 未保存内容、遅い結果、draft/保存の実OS残条件を維持する。 |
+| 0011 / 0014 / 0030: 依存、GPUI、性能の採用条件 | #313/#314、既存#23原本 | GPUI世代の移行とgpui-kit部品の採用を区別し、ADR-0030の部品採用は提案のまま維持する。 |
+| 0024 / 0031: GUI trust boundary、AADW | #310/#311、現行Commander Policy。v3残件は既存#333 | 0031は一部運用済み・残件あり。通常運用の有効化だけで#333全体を完了にしない。 |
+| 0029: source-first list editing | 第1段階実装済みという本文の履歴、#305/#306の変更範囲 | 本文作成時点のGUI未実施は、その後のcurrent evidenceと区別する。 |
+
+ADR-0034本文は設計採用（PR #509）、#518/#526 merge済み、実機更新・復旧未完了と明記している。索引の「Proposed / 未実装」を本文に合わせて「設計採用・残受入条件あり」へ訂正し、受入条件の正本である#510へ誘導する。製品全体の検証完了への変更ではない。ADR-0032の同梱sidecar案は0033で初回ダウンロードへ改訂され、0033にはP0受入済み・P1〜P3未完了が明記されている。
+
+**旧サイクルとの対応。** [旧実施計画](history/refactor-cycle-1/refactor-execution-plan.md)冒頭は13段階を当時の「完了」として記録する。一方、同文書の残メモにはGUI計測や全文解析のCPU/RSS影響などの未実施がある。旧[詳細計画](history/refactor-cycle-1/refactor-plan.md)と合わせ、現在の変更前検証を追う担当範囲を次のように対応付ける。旧文書の原文・checkboxは変更しない。
+
+| 旧段階 | 第2サイクルで関係する担当 | 追跡する契約・証拠 |
+|---|---|---|
+| R0 基準線 | #298/#23/#314/#315 | 対象SHA・fixture・測定条件を伴う原本、公開API差分、適用範囲 |
+| R0.5 契約テスト | #298/#305/#306/#307/#309 | source往復、Unicode/IME、fallback、stale結果、保存 |
+| R1 不要物削除 | #299/#300/#313 | 到達性、構成別参照、削除または維持の根拠 |
+| R2前半 計測分離 | #311/#313/#314 | 通常・timing-probe・instrumentの構成差と、計測負荷の比較条件 |
+| R3 解析単一化 | #303/#306 | parser設定と解析入口、API・同一fixtureの結果 |
+| R3.25 解析・表示契約 | #303/#306/#307 | 構文/表示/UIの責務、Unsupported、marker・SourceMap・disclosure |
+| R3.5 BlockIndex | #306/#368 | 局所/正式解析、revision、全文copyのCPU/RSS、同期処理上限 |
+| R3.75 session/FileService | #308/#309/#368 | 文書identity、保存/draft、非同期結果、session保持量 |
+| R4A 仮想化 | #307/#368/#314 | 可視範囲の処理量、scroll anchoring、実GUI・入力/scroll比較 |
+| R4B LayoutLine | #307/#368/#314 | geometry正本、実字形、paint/入力整合、shapeの処理量 |
+| R4C cache/差分更新 | #307/#309/#368/#314 | cache key、局所splice、job/文書寿命、RSS・遅延 |
+| R2後半 script/文書 | #310/#311/#312/#313 | 既存入口・権限・計測手順、共有部と履歴文書の区別 |
+| R5 型/API/文書 | #300/#301/#302/#303/#306/#307/#313/#315 | 型の責務、公開面、旧→新対応、設計状態と最終証拠 |
+
+この表は段階・契約の追跡先であり、旧計画の個々のassertや残メモをcurrent headで検証済みにするものではない。旧計測の数値・相対gateを現在の基準へそのまま流用せず、今回の詳細計画と#23原本の条件を使う。旧R3.75に記されたwatcherの将来追加などの機能要求は、対応する機能Issue/PRの範囲として扱い、RF0全体へ自動的に取り込まない。
+
+初回の並列SIGABRTは[修正受入記録](https://github.com/hide212131/hane/issues/298#issuecomment-5846679709)があり、現在の未解決事項へ戻さない。#23原本は[受入記録](https://github.com/hide212131/hane/issues/298#issuecomment-5856129531)の適用範囲で維持し、2026-09-27の測定対象SHAを今回のmainの実測とは扱わない。
+
+**構成別証拠の適用範囲。** main `499c446…` とPR #561の受入head `70e5b8d82e6b326ff4a5659e10f7e03356515063` を二つのtreeの直接diffで比較すると、差は `docs/windows-release-signing.md` だけだった。`crates/` subtreeは両方 `42ec54cd1db8ddb175b9b0c0d7b10c5a208fee23`、`vendor/` subtreeは両方 `1eaf8e0b1efe9d2be8fe04f0c4bb5acd614b45fa` で、manifest・lock・CI workflowも同一。GitHubのthree-dot compareはmerge-baseからの差分を返すため、この二つのtreeの同一性確認には用いない。
+
+| 構成・入口 | 観測済みの証拠 | 適用範囲と未実施 |
+|---|---|---|
+| macOS / Windows、workspace all-features・Clippy | PR #561 head `70e5b8d…` の[CI run 39803892766 attempt 2](https://github.com/hide212131/hane/actions/runs/39803892766)で両OSのworkspace testsとClippy stepがsuccess | 受入時のPR contextの結果。製品source同一は上記で確認したが、main `499c446…` を対象に今回再実行したものではない。 |
+| macOS / Windows、workspace外vendor | 同runのmacOS fallback glyph rasterization・input source reactivation、Windows IME notification dispatchがsuccess | 各focused vendor testの範囲。native操作全体の保証ではない。 |
+| macOS、trusted exact-head検証 | [run 39803607068](https://github.com/hide212131/hane/actions/runs/39803607068)はfinal SHA `70e5b8d…` のall-features 1981 passed / 0 failed / 0 ignored、Clippy成功 | 通常feature・Release成果物・GUIの代替ではない。 |
+| macOS arm64、通常feature | 同headの通常workspace testsは1975 passed / 0 failed / 0 ignored。[最終受入記録](https://github.com/hide212131/hane/pull/561#issuecomment-6346699887)を参照 | all-featuresと区別する。Windows通常featureやcurrent mainの新規実行は今回未実施。 |
+| macOS、通常Release | PR #563 head `333af645e810f1fee0794ed6629fbc38850e84e9` で通常tests 1974件とRelease build成功。[証拠](https://github.com/hide212131/hane/pull/563#issuecomment-6345613406) | その後のP3でUI source二つが変わっており、main `499c446…` のRelease buildそのものとは扱わない。timing-probe版も通常Releaseの代替にしない。 |
+| Python / workflow | PR #561同CIの共通Python検査はsuccess。#311の変更範囲・入口照合と併読 | 選択されていないテストの成功は含まない。Release専用jobはskipであり、発行・配布・実機更新の成功を意味しない。 |
+| 実GUI・実IME・filesystem | 各変更領域の既存受入証拠を#305/#307/#309/#313で照合 | 今回は追加実行なし。必要な実OS保証をunit成功で免除しない。 |
+
+既知問題#562のoffset parser panicは専任のPR #564で対応中である。上表の既存suite成功を、その再現入力の安全性の証明にしない。PR #564の新規回帰テスト失敗も同PRのheadに属する結果として扱い、未mergeの修正・テストをmainの結果へ混ぜない。
+
+#298には、必要な構成別・実OSの証拠の補完と、旧サイクルを含む全要件の最終照合が残る。本節はその一部の文書照合であり、RF0全体や親#297を完了にしない。#479/#510/#333等の機能・運用Issue全体を一律にRF0の完了条件へ追加せず、変更する責務と共有する契約・検証だけを照合する。

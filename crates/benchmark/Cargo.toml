@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 hane-document.workspace = true
-hane-editor.workspace = true
 hane-markdown.workspace = true
 hane-metrics.workspace = true
 hane-presentation.workspace = true

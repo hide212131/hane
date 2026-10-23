@@ -277,7 +277,17 @@ impl EntityInputHandler for EditorView {
         match self.input_target_for_text_callback() {
             InputTarget::InlineRename => self.commit_inline_rename_composition(cx),
             InputTarget::SidebarFilter => self.commit_sidebar_filter_composition(cx),
-            InputTarget::Body => self.editor_mut().commit_composition(),
+            InputTarget::Body => {
+                // A callback that arrives after the body stopped accepting
+                // input must not commit anything into the document.
+                if self.body_editable() {
+                    self.editor_mut().commit_composition();
+                    // The core commit owns no UI notification, yet the mode
+                    // switch's disabled state is fixed at render time. Tell
+                    // the UI the composition ended so the first click works.
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -323,7 +333,13 @@ impl EntityInputHandler for EditorView {
                 }
                 return;
             }
-            InputTarget::Body => {}
+            InputTarget::Body => {
+                // Late platform text can still reach the view after the body
+                // stopped being editable; it must not change the document.
+                if !self.body_editable() {
+                    return;
+                }
+            }
         }
         if platform_cancel && self.editor().ime().is_some() {
             self.perform_cancel_composition(cx);
@@ -374,7 +390,7 @@ impl EntityInputHandler for EditorView {
                     self.cancel_sidebar_filter_composition(cx);
                     return;
                 }
-                InputTarget::Body if self.editor().ime().is_some() => {
+                InputTarget::Body if self.body_editable() && self.editor().ime().is_some() => {
                     self.perform_cancel_composition(cx);
                     return;
                 }
@@ -400,7 +416,11 @@ impl EntityInputHandler for EditorView {
                 );
                 return;
             }
-            InputTarget::Body => {}
+            InputTarget::Body => {
+                if !self.body_editable() {
+                    return;
+                }
+            }
         }
         if let Err(error) =
             self.editor_mut()

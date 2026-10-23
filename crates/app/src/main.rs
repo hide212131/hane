@@ -211,16 +211,18 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     // the startup gate leases on, and keeps its receipts in the coordination
     // directory beside the install. Anything else keeps the interim identity;
     // such a placement never becomes applicable.
-    let located = hane_update::platform::locate(&exe).ok();
+    // The failure is kept: a placement that cannot be resolved must not be
+    // read as a normal unmanaged install (see `block_placement` below).
+    let located = hane_update::platform::locate(&exe);
     let (install_id, receipts_dir) = match &located {
-        Some(placement) => {
+        Ok(placement) => {
             let receipts = hane_update::platform::lease::Coordination::receipts_dir_for(
                 &placement.coordination_parent,
                 &placement.install_id,
             );
             (placement.install_id.clone(), receipts)
         }
-        None => {
+        Err(_) => {
             let volume = install_dir
                 .components()
                 .next()?
@@ -264,12 +266,15 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     // Only a supported placement can hand a Ready update to the helper, and
     // even then "restart and update" is offered only once the trust policy is
     // configured; the production policy is not, so it stays fail-closed.
-    if let Some(placement) = located {
-        service.enable_restart(app_update::RestartWiring {
+    match located {
+        Ok(placement) => service.enable_restart(app_update::RestartWiring {
             placement,
             exe,
             state_root: state.root().to_path_buf(),
-        });
+        }),
+        // The interim receipts location is not a usable update location, so
+        // the card reports the reason instead of fetching an archive first.
+        Err(error) => service.block_placement(&error, &exe),
     }
     Some(service)
 }
