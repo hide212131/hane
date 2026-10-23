@@ -31,6 +31,7 @@ mod https_transport;
 mod limited_start;
 #[cfg(target_os = "windows")]
 mod open_request;
+mod update_diagnostics;
 mod update_gate;
 mod update_restart;
 

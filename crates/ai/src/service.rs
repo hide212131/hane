@@ -25,7 +25,7 @@ use crate::connect::{
 use crate::credential_journal::CredentialJournal;
 use crate::owner_lock::{OwnerLock, OwnerLockGuard};
 use crate::paths::AiPaths;
-use crate::probe::{ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
+use crate::probe::{ProbeDiagnostic, ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
 use crate::runtime::{AiRuntime, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState};
@@ -136,6 +136,9 @@ pub struct AiSnapshot {
     pub persistence: PersistenceState,
     pub probe_status: ProbeStatus,
     pub probe_result: Option<ProbeResult>,
+    /// Stage, stable code and safe cause of the latest failed Probe, for the
+    /// local diagnostics (Issue #553). Cleared when a new Probe starts.
+    pub probe_diagnostic: Option<ProbeDiagnostic>,
     /// Runtime-wide isolation after a child process's exit could not be
     /// confirmed, regardless of which AI operation (Probe or text
     /// transform) observed it. Decoupled from `probe_status` so a
@@ -178,6 +181,7 @@ impl Default for AiSnapshot {
             persistence: PersistenceState::Clean,
             probe_status: ProbeStatus::NotRun,
             probe_result: None,
+            probe_diagnostic: None,
             runtime_isolated: false,
             runtime_distribution_error: None,
             runtime_install: RuntimeInstallState::NotInstalled,
@@ -1116,12 +1120,14 @@ fn run_probe_command(
     shutdown: &mut bool,
 ) {
     let snapshot = shared.snapshot.lock().unwrap().clone();
-    let model = match probe_model(settings, &snapshot, config.credential_store.as_ref()) {
+    let model = match probe_model_checked(settings, &snapshot, config.credential_store.as_ref()) {
         Ok(model) => model,
-        Err(code) => {
+        Err((code, cause)) => {
             mutate(shared, |snapshot| {
                 snapshot.probe_status = ProbeStatus::Failed(code);
                 snapshot.probe_result = None;
+                snapshot.probe_diagnostic =
+                    Some(probe_diagnostic(id, "validate_settings", code, cause.to_owned()));
             });
             finish(
                 shared,
@@ -1136,11 +1142,13 @@ fn run_probe_command(
     mutate(shared, |snapshot| {
         snapshot.probe_status = ProbeStatus::Running;
         snapshot.probe_result = None;
+        snapshot.probe_diagnostic = None;
     });
 
     if ensure_runtime(config, paths, settings, shared, state).is_err() {
         let owner_elsewhere =
             shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere;
+        let distribution_error = shared.snapshot.lock().unwrap().runtime_distribution_error;
         let (status, code) = if owner_elsewhere {
             (
                 ProbeStatus::Failed(ProbeErrorCode::OwnedElsewhere),
@@ -1152,9 +1160,17 @@ fn run_probe_command(
                 ProbeErrorCode::RuntimeUnavailable,
             )
         };
+        let cause = if owner_elsewhere {
+            "runtime_owned_by_another_process".to_owned()
+        } else if let Some(error) = distribution_error {
+            format!("runtime_distribution_error={error:?}")
+        } else {
+            "runtime_start_failed".to_owned()
+        };
         mutate(shared, |snapshot| {
             snapshot.probe_status = status;
             snapshot.probe_result = None;
+            snapshot.probe_diagnostic = Some(probe_diagnostic(id, "runtime_start", code, cause));
             if owner_elsewhere {
                 snapshot.ownership = OwnershipState::OwnedElsewhere;
             }
@@ -1175,6 +1191,12 @@ fn run_probe_command(
         mutate(shared, |snapshot| {
             snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::RuntimeUnavailable);
             snapshot.probe_result = None;
+            snapshot.probe_diagnostic = Some(probe_diagnostic(
+                id,
+                "runtime_start",
+                ProbeErrorCode::RuntimeUnavailable,
+                "runtime_event_channel_missing".to_owned(),
+            ));
         });
         finish(
             shared,
@@ -1186,10 +1208,17 @@ fn run_probe_command(
     };
     let workspace = match paths.create_probe_workspace() {
         Ok(workspace) => workspace,
-        Err(_) => {
+        Err(error) => {
+            let cause = format!("workspace_create_failed io_kind={:?}", error.kind());
             mutate(shared, |snapshot| {
                 snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::RuntimeUnavailable);
                 snapshot.probe_result = None;
+                snapshot.probe_diagnostic = Some(probe_diagnostic(
+                    id,
+                    "workspace",
+                    ProbeErrorCode::RuntimeUnavailable,
+                    cause,
+                ));
             });
             finish(
                 shared,
@@ -1229,6 +1258,7 @@ fn run_probe_command(
         mutate(shared, |snapshot| {
             snapshot.probe_status = ProbeStatus::Isolated;
             snapshot.probe_result = None;
+            snapshot.probe_diagnostic = execution.diagnostic;
             snapshot.ownership = OwnershipState::Unavailable;
             snapshot.runtime_isolated = true;
         });
@@ -1263,6 +1293,7 @@ fn run_probe_command(
     mutate(shared, |snapshot| {
         snapshot.probe_status = execution.status;
         snapshot.probe_result = execution.result;
+        snapshot.probe_diagnostic = execution.diagnostic;
         snapshot.ownership = if owns_runtime_lock {
             OwnershipState::Owned
         } else {
@@ -1458,11 +1489,35 @@ fn probe_model(
     snapshot: &AiSnapshot,
     credential_store: &dyn CredentialStore,
 ) -> Result<String, ProbeErrorCode> {
+    probe_model_checked(settings, snapshot, credential_store).map_err(|(code, _)| code)
+}
+
+fn probe_diagnostic(
+    id: OperationId,
+    stage: &'static str,
+    code: ProbeErrorCode,
+    cause: String,
+) -> ProbeDiagnostic {
+    ProbeDiagnostic {
+        operation_id: id,
+        stage,
+        code: code.stable_code(),
+        cause,
+    }
+}
+
+/// [`probe_model`] that also names which check rejected the settings. The
+/// cause is a fixed word; it never carries a model id, URL or credential.
+fn probe_model_checked(
+    settings: &AiSettings,
+    snapshot: &AiSnapshot,
+    credential_store: &dyn CredentialStore,
+) -> Result<String, (ProbeErrorCode, &'static str)> {
     if snapshot.ownership != OwnershipState::Owned {
         return Err(if snapshot.ownership == OwnershipState::OwnedElsewhere {
-            ProbeErrorCode::OwnedElsewhere
+            (ProbeErrorCode::OwnedElsewhere, "runtime_owned_by_another_process")
         } else {
-            ProbeErrorCode::RuntimeUnavailable
+            (ProbeErrorCode::RuntimeUnavailable, "settings_not_owned")
         });
     }
     if snapshot.recovery_required
@@ -1473,27 +1528,27 @@ fn probe_model(
                 | PersistenceState::RecoveryRequired
         )
     {
-        return Err(ProbeErrorCode::InvalidConfiguration);
+        return Err((ProbeErrorCode::InvalidConfiguration, "settings_recovery_required"));
     }
     match settings.active_connection {
         ActiveConnection::ChatGpt => {
             if !matches!(snapshot.account, AccountState::SignedIn { .. })
                 || snapshot.account_refresh_failed
             {
-                return Err(ProbeErrorCode::AccountUnavailable);
+                return Err((ProbeErrorCode::AccountUnavailable, "chatgpt_not_signed_in"));
             }
             let model = settings
                 .chatgpt
                 .model_id
                 .as_deref()
                 .filter(|model| !model.trim().is_empty())
-                .ok_or(ProbeErrorCode::ModelUnavailable)?;
+                .ok_or((ProbeErrorCode::ModelUnavailable, "chatgpt_model_not_selected"))?;
             if !matches!(
                 &snapshot.model_list,
                 ModelListState::Loaded(models)
                     if crate::models::saved_model_is_available(Some(model), models) == Some(true)
             ) {
-                return Err(ProbeErrorCode::ModelUnavailable);
+                return Err((ProbeErrorCode::ModelUnavailable, "chatgpt_model_not_in_list"));
             }
             Ok(model.to_owned())
         }
@@ -1501,14 +1556,21 @@ fn probe_model(
             let custom = settings
                 .custom
                 .as_ref()
-                .ok_or(ProbeErrorCode::InvalidConfiguration)?;
-            let credential_ref = custom
-                .credential_ref
-                .as_ref()
-                .ok_or(ProbeErrorCode::CredentialUnavailable)?;
+                .ok_or((ProbeErrorCode::InvalidConfiguration, "custom_connection_missing"))?;
+            let credential_ref = custom.credential_ref.as_ref().ok_or((
+                ProbeErrorCode::CredentialUnavailable,
+                "custom_credential_not_configured",
+            ))?;
             match credential_store.get(credential_ref) {
                 Ok(Some(_secret)) => Ok(custom.model_id.clone()),
-                Ok(None) | Err(_) => Err(ProbeErrorCode::CredentialUnavailable),
+                Ok(None) => Err((
+                    ProbeErrorCode::CredentialUnavailable,
+                    "custom_credential_not_found",
+                )),
+                Err(_) => Err((
+                    ProbeErrorCode::CredentialUnavailable,
+                    "custom_credential_store_error",
+                )),
             }
         }
     }

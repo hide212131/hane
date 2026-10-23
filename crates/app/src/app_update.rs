@@ -32,8 +32,10 @@ use hane_update::limits::{MAX_CATALOG_BYTES, MAX_SIGNATURE_BYTES};
 use hane_update::model::Target;
 use hane_update::trust::{SeenStore, TrustPolicy};
 use hane_update::version::{VersionRelation, parse_current_version};
+use hane_update::error::io_detail;
 use hane_update::{ErrorCode, UpdateError};
 
+use crate::update_diagnostics::{Diagnostics, Identity, Redactor, short_id};
 use crate::update_restart::{self, HelperHandoff};
 
 pub(crate) const CATALOG_FILE: &str = "hane-update.json";
@@ -108,11 +110,15 @@ enum Stage {
         offer: Arc<Offer>,
         dir: PathBuf,
     },
+    /// `stage` names where it failed (`check`, `download`, `verify`, ...); the
+    /// same code can mean different things at different stages.
     Failed {
         code: ErrorCode,
+        stage: &'static str,
     },
     Unavailable {
         code: ErrorCode,
+        stage: &'static str,
     },
 }
 
@@ -174,6 +180,10 @@ struct Inner {
     /// `candidates/<id>` directory. It serialises publication, discard and
     /// the helper handoff across processes.
     candidate_lease: Mutex<Option<File>>,
+    /// Local, bounded failure records (Issue #553).
+    diag: Diagnostics,
+    /// Why the default runner could not start its thread, when it could not.
+    spawn_error: Arc<Mutex<Option<String>>>,
 }
 
 fn new_owner_id() -> String {
@@ -195,16 +205,23 @@ pub struct AppUpdateService {
     inner: Arc<Inner>,
 }
 
-fn thread_runner() -> Runner {
-    Box::new(|task| {
-        std::thread::Builder::new()
+fn thread_runner(spawn_error: Arc<Mutex<Option<String>>>) -> Runner {
+    Box::new(move |task| {
+        match std::thread::Builder::new()
             .name("hane-app-update".to_owned())
             .spawn(task)
-            .is_ok()
+        {
+            Ok(_) => true,
+            Err(error) => {
+                *spawn_error.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(io_detail(&error));
+                false
+            }
+        }
     })
 }
 
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -266,30 +283,62 @@ impl AppUpdateService {
         transport: Arc<dyn Transport>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self::with_runner(config, transport, clock, thread_runner())
+        let spawn_error = Arc::new(Mutex::new(None));
+        let runner = thread_runner(Arc::clone(&spawn_error));
+        Self::build(config, transport, clock, runner, spawn_error)
     }
 
     /// Like [`AppUpdateService::new`] with an explicit task runner, so tests
     /// can control when background work happens.
+    #[cfg(test)]
     pub fn with_runner(
         config: UpdateServiceConfig,
         transport: Arc<dyn Transport>,
         clock: Arc<dyn Clock>,
         runner: Runner,
     ) -> Self {
+        Self::build(config, transport, clock, runner, Arc::new(Mutex::new(None)))
+    }
+
+    fn build(
+        config: UpdateServiceConfig,
+        transport: Arc<dyn Transport>,
+        clock: Arc<dyn Clock>,
+        runner: Runner,
+        spawn_error: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         // Without embedded trust material no catalog can ever be verified, so
         // the service says so up front instead of contacting the network.
         let stage = if !config.policy.is_configured() {
             Stage::Unavailable {
                 code: ErrorCode::TrustUnconfigured,
+                stage: "config",
             }
         } else if config.target.is_none() {
             Stage::Unavailable {
                 code: ErrorCode::TargetUnsupported,
+                stage: "config",
             }
         } else {
             Stage::Idle
         };
+        let owner = new_owner_id();
+        let exe = std::env::current_exe().map_or_else(
+            |error| format!("unknown ({})", io_detail(&error)),
+            |exe| exe.display().to_string(),
+        );
+        let diag = Diagnostics::new(
+            &config.updates_root,
+            Identity {
+                run: owner.clone(),
+                pid: std::process::id(),
+                exe,
+                install: config.install_id.as_str().to_owned(),
+                state: short_id(&config.updates_root.display().to_string()),
+                version: config.current_version.clone(),
+            },
+            Redactor::from_environment(),
+        );
         Self {
             inner: Arc::new(Inner {
                 config,
@@ -303,9 +352,11 @@ impl AppUpdateService {
                     restore_started: false,
                 }),
                 restart: OnceLock::new(),
-                owner: new_owner_id(),
+                owner,
                 lease: Mutex::new(None),
                 candidate_lease: Mutex::new(None),
+                diag,
+                spawn_error,
             }),
         }
     }
@@ -322,12 +373,39 @@ impl AppUpdateService {
     /// archive is fetched into a receipts directory that is not usable.
     /// A build that is already unavailable keeps its own reason.
     pub fn block_placement(&self, error: &UpdateError, exe: &Path) {
-        let mut state = self.inner.lock();
-        if matches!(state.stage, Stage::Idle) {
-            state.stage = Stage::Unavailable {
-                code: placement_block_code(error, exe),
-            };
+        let blocked = {
+            let mut state = self.inner.lock();
+            let idle = matches!(state.stage, Stage::Idle);
+            if idle {
+                state.stage = Stage::Unavailable {
+                    code: placement_block_code(error, exe),
+                    stage: "placement",
+                };
+            }
+            idle
+        };
+        if blocked {
+            // The original error is kept: the shown code alone cannot say
+            // whether the location, the owner or the I/O failed.
+            let shown = placement_block_code(error, exe);
+            self.inner.diag.record(
+                "placement",
+                shown.as_str(),
+                &format!(
+                    "locate failed with {}: {}; exe={}",
+                    error.code.as_str(),
+                    error.detail,
+                    exe.display()
+                ),
+                None,
+            );
         }
+    }
+
+    /// The text the user can open or copy from the settings card. Local
+    /// records only; no request is made and nothing is changed.
+    pub fn diagnostics_text(&self) -> String {
+        self.inner.diag.report()
     }
 }
 
@@ -455,17 +533,45 @@ impl Inner {
     /// operation identified by `op` fails instead of waiting forever.
     fn dispatch(self: &Arc<Self>, op: u64, task: Task) {
         if !(self.runner)(task) {
-            let mut state = self.lock();
-            let running = match &state.stage {
-                Stage::Checking { op: live, .. } | Stage::Downloading { op: live, .. } => {
-                    *live == op
+            let detail = self.spawn_failure_detail();
+            {
+                let mut state = self.lock();
+                let version = match &state.stage {
+                    Stage::Downloading { offer, .. } => {
+                        Some(offer.candidate.version().to_string())
+                    }
+                    _ => None,
+                };
+                let running = match &state.stage {
+                    Stage::Checking { op: live, .. } | Stage::Downloading { op: live, .. } => {
+                        *live == op
+                    }
+                    _ => false,
+                };
+                if running {
+                    state.stage = Stage::Failed {
+                        code: ErrorCode::Io,
+                        stage: "start",
+                    };
+                    self.diag.note(
+                        "start",
+                        ErrorCode::Io.as_str(),
+                        &detail,
+                        version.as_deref(),
+                    );
                 }
-                _ => false,
-            };
-            if running {
-                state.stage = Stage::Failed { code: ErrorCode::Io };
             }
+            self.diag.flush();
         }
+    }
+
+    /// The recorded reason a background task could not be started.
+    fn spawn_failure_detail(&self) -> String {
+        self.spawn_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| "the task runner refused to start the task".to_owned())
     }
 
     // ------------------------------------------------------------ check
@@ -516,8 +622,19 @@ impl Inner {
             Ok(CheckOutcome::UpToDate) => Stage::UpToDate,
             Ok(CheckOutcome::Available(offer)) => Stage::Available(Arc::from(offer)),
             Err(error) if error.code == ErrorCode::Cancelled => Stage::Idle,
-            Err(error) => Stage::Failed { code: error.code },
+            Err(error) => {
+                // Only a live operation records, so a late result of a
+                // cancelled or superseded check never reaches the diagnostics.
+                self.diag
+                    .note("check", error.code.as_str(), &error.detail, None);
+                Stage::Failed {
+                    code: error.code,
+                    stage: "check",
+                }
+            }
         };
+        drop(state);
+        self.diag.flush();
     }
 
     fn verify_context<'a>(
@@ -608,7 +725,9 @@ impl Inner {
         let work = self
             .work_dir()
             .join(format!("{op}-{}", offer.id().as_str()));
-        let outcome = self.download_into(op, offer, cancel, received, &work);
+        let mut step = "write_download";
+        let outcome = self.download_into(op, offer, cancel, received, &work, &mut step);
+        let version = offer.candidate.version().to_string();
 
         let mut state = self.lock();
         let expected = Ticket {
@@ -632,9 +751,18 @@ impl Inner {
                         offer: Arc::clone(offer),
                         dir: target,
                     },
-                    Err(_) => {
+                    Err(error) => {
                         remove_dir_if_present(&work);
-                        Stage::Failed { code: ErrorCode::Io }
+                        self.diag.note(
+                            "publish",
+                            ErrorCode::Io.as_str(),
+                            &io_detail(&error),
+                            Some(version.as_str()),
+                        );
+                        Stage::Failed {
+                            code: ErrorCode::Io,
+                            stage: "publish",
+                        }
                     }
                 };
             }
@@ -643,10 +771,21 @@ impl Inner {
                 state.stage = if error.code == ErrorCode::Cancelled {
                     Stage::Available(Arc::clone(offer))
                 } else {
-                    Stage::Failed { code: error.code }
+                    self.diag.note(
+                        step,
+                        error.code.as_str(),
+                        &error.detail,
+                        Some(version.as_str()),
+                    );
+                    Stage::Failed {
+                        code: error.code,
+                        stage: step,
+                    }
                 };
             }
         }
+        drop(state);
+        self.diag.flush();
     }
 
     /// Moves the verified work directory to the shared candidate directory.
@@ -686,7 +825,10 @@ impl Inner {
     }
 
     /// Fetches, verifies and stages the archive inside `work`. Nothing outside
-    /// `work` and the sequence receipt is touched.
+    /// `work` and the sequence receipt is touched. `step` always names the part
+    /// that is running (`write_download`, `download`, `verify`, `save_history`),
+    /// so a failure is attributed to where it happened and a local write
+    /// failure after the download is not reported as a failed check.
     fn download_into(
         &self,
         op: u64,
@@ -694,9 +836,11 @@ impl Inner {
         cancel: &CancelToken,
         received: &Arc<AtomicU64>,
         work: &Path,
+        step: &mut &'static str,
     ) -> Result<(), UpdateError> {
         let entry = offer.candidate.target_entry();
         let tag = &offer.candidate.catalog().tag;
+        *step = "write_download";
         self.ensure_lease()?;
         create_private_dir(work)?;
         durable_write(&work.join(CATALOG_FILE), &offer.catalog)?;
@@ -710,6 +854,7 @@ impl Inner {
             transport: &*self.transport,
             clock: &*self.clock,
         };
+        *step = "download";
         fetcher.download_archive(
             &ArchiveDownload {
                 tag,
@@ -725,6 +870,7 @@ impl Inner {
         }
 
         self.mark_verifying(op, offer);
+        *step = "verify";
         let stage_dir = work.join(STAGE_DIR);
         create_private_dir(&stage_dir)?;
         let mut archive = File::open(work.join(ARCHIVE_FILE))?;
@@ -741,6 +887,7 @@ impl Inner {
         }
 
         // A candidate is Ready only once its sequence floor is stored.
+        *step = "save_history";
         create_private_dir(&self.config.receipts_dir)?;
         let mut seen = self.seen_store();
         record_seen(&mut seen, &offer.candidate)?;
@@ -794,10 +941,14 @@ impl Inner {
         if !started {
             // Nothing ran, so the prepared update is untouched: make it
             // Ready again so the user can retry.
+            let detail = self.spawn_failure_detail();
             let mut state = self.lock();
             if matches!(&state.stage, Stage::Discarding { op: live, .. } if *live == op) {
+                self.diag.note("start", ErrorCode::Io.as_str(), &detail, None);
                 state.stage = Stage::Ready { offer, dir };
             }
+            drop(state);
+            self.diag.flush();
         }
     }
 
@@ -830,10 +981,16 @@ impl Inner {
                 };
             }
         }
-        if moved.is_ok() {
-            // The slow deletion runs after the candidate directory is out of
-            // the way and the lock is released.
-            remove_dir_if_present(&trash);
+        match &moved {
+            Ok(()) => {
+                // The slow deletion runs after the candidate directory is out
+                // of the way and the lock is released.
+                remove_dir_if_present(&trash);
+            }
+            Err(error) => {
+                self.diag
+                    .record("discard", ErrorCode::Io.as_str(), &io_detail(error), None);
+            }
         }
     }
 
@@ -850,7 +1007,13 @@ impl Inner {
         }
         let inner = Arc::clone(self);
         if !(self.runner)(Box::new(move || inner.run_restore())) {
-            self.lock().restoring = false;
+            let detail = self.spawn_failure_detail();
+            {
+                let mut state = self.lock();
+                state.restoring = false;
+                self.diag.note("start", ErrorCode::Io.as_str(), &detail, None);
+            }
+            self.diag.flush();
         }
     }
 
@@ -872,10 +1035,22 @@ impl Inner {
                 };
                 match (found.is_none(), self.restore_candidate(&dir)) {
                     (true, Ok(offer)) => found = Some((offer, dir, lease)),
-                    _ => remove_dir_if_present(&dir),
+                    (_, Err(error)) => {
+                        // The rejected candidate is removed as before; why it
+                        // was rejected is kept for the diagnostics. A candidate
+                        // that is merely no longer newer is the normal cleanup
+                        // after an applied update, not a failure.
+                        if error.code != ErrorCode::NotApplicable {
+                            self.diag
+                                .note("restore", error.code.as_str(), &error.detail, None);
+                        }
+                        remove_dir_if_present(&dir);
+                    }
+                    (false, Ok(_)) => remove_dir_if_present(&dir),
                 }
             }
         }
+        self.diag.flush();
         let mut state = self.lock();
         state.restoring = false;
         let idle = matches!(state.stage, Stage::Idle);
@@ -969,19 +1144,44 @@ impl Inner {
 
     /// Re-confirms the Ready candidate and the install location. The ticket is
     /// written only if this still holds.
-    fn confirm_restart(&self, candidate_id: &str) -> Result<(), String> {
+    ///
+    /// The error is returned as is; the handoff's failure sink records it once.
+    fn confirm_restart(&self, candidate_id: &str) -> Result<(), UpdateError> {
+        self.confirm_restart_with(candidate_id, hane_update::platform::locate)
+    }
+
+    /// `confirm_restart` with the install lookup given, so a test can reach the
+    /// `InstallId` comparison on any OS.
+    fn confirm_restart_with(
+        &self,
+        candidate_id: &str,
+        locate: impl FnOnce(&Path) -> Result<hane_update::platform::Placement, UpdateError>,
+    ) -> Result<(), UpdateError> {
         if !self.is_ready(candidate_id) {
-            return Err("the prepared update changed".to_owned());
+            return Err(UpdateError::new(
+                ErrorCode::TransitionInvalid,
+                "the prepared update changed",
+            ));
         }
-        let wiring = self
-            .restart
-            .get()
-            .ok_or_else(|| "restart is not enabled".to_owned())?;
-        let placement = hane_update::platform::locate(&wiring.exe).map_err(|err| err.to_string())?;
+        let wiring = self.restart.get().ok_or_else(|| {
+            UpdateError::new(ErrorCode::UnsupportedInstall, "restart is not enabled")
+        })?;
+        let placement = locate(&wiring.exe)?;
         if placement.install_id != wiring.placement.install_id {
-            return Err("the install location changed".to_owned());
+            return Err(UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "the install location changed",
+            ));
         }
         Ok(())
+    }
+
+    /// Records a failure of the restart preparation before the error is turned
+    /// into text, so the code and detail are not lost.
+    fn prepare_failure(&self, error: &UpdateError, version: Option<&str>) -> String {
+        self.diag
+            .record("prepare", error.code.as_str(), &error.detail, version);
+        error.to_string()
     }
 
     /// Starts the helper for the Ready candidate. The lock is not held while
@@ -992,13 +1192,13 @@ impl Inner {
             return Err(unsupported());
         }
         let wiring = self.restart.get().ok_or_else(unsupported)?;
-        let dir = {
+        let (dir, version) = {
             let state = self.lock();
             match &state.stage {
                 Stage::Ready { offer, dir }
                     if !state.restoring && offer.id().as_str() == candidate_id =>
                 {
-                    dir.clone()
+                    (dir.clone(), offer.candidate.version().to_string())
                 }
                 _ => return Err("準備した更新が変わりました。もう一度お試しください".to_owned()),
             }
@@ -1010,12 +1210,12 @@ impl Inner {
             &dir,
             &wiring.state_root,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| self.prepare_failure(&err, Some(&version)))?;
         // A failure from here on drops `prepared`, which aborts the helper.
         let coordination = wiring
             .placement
             .coordination()
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| self.prepare_failure(&err, Some(&version)))?;
         let inner = Arc::clone(self);
         let candidate = candidate_id.to_owned();
         Ok(Box::new(HelperHandoff::new(
@@ -1023,7 +1223,17 @@ impl Inner {
             coordination,
             wiring.state_root.clone(),
             Box::new(move || inner.confirm_restart(&candidate)),
+            self.handoff_failure_sink(version),
         )))
+    }
+
+    /// Records a failure of the ticket write or the helper authorization, which
+    /// happen after `prepare_restart` returned.
+    fn handoff_failure_sink(self: &Arc<Self>, version: String) -> Box<dyn Fn(&UpdateError) + Send> {
+        let inner = Arc::clone(self);
+        Box::new(move |error| {
+            inner.prepare_failure(error, Some(&version));
+        })
     }
 
     fn snapshot(&self) -> AppUpdateSnapshot {
@@ -1031,6 +1241,7 @@ impl Inner {
         let mut snapshot = AppUpdateSnapshot::idle(self.config.current_version.clone());
         snapshot.restoring = state.restoring;
         snapshot.restart_supported = self.restart_supported();
+        snapshot.diagnostics_available = self.diag.has_records();
         let describe = |snapshot: &mut AppUpdateSnapshot, offer: &Offer| {
             snapshot.candidate_id = Some(offer.id().as_str().to_owned());
             snapshot.candidate_version = Some(offer.candidate.version().to_string());
@@ -1068,13 +1279,15 @@ impl Inner {
                 snapshot.phase = AppUpdatePhase::Discarding;
                 describe(&mut snapshot, offer);
             }
-            Stage::Failed { code } => {
+            Stage::Failed { code, stage } => {
                 snapshot.phase = AppUpdatePhase::Failed;
                 snapshot.error_code = Some(code.as_str().to_owned());
+                snapshot.error_stage = Some((*stage).to_owned());
             }
-            Stage::Unavailable { code } => {
+            Stage::Unavailable { code, stage } => {
                 snapshot.phase = AppUpdatePhase::Unavailable;
                 snapshot.error_code = Some(code.as_str().to_owned());
+                snapshot.error_stage = Some((*stage).to_owned());
             }
         }
         snapshot
@@ -1106,6 +1319,14 @@ impl AppUpdateController for AppUpdateService {
         self.inner.start_restore();
     }
 
+    fn diagnostics_text(&self) -> Option<String> {
+        Some(AppUpdateService::diagnostics_text(self))
+    }
+
+    fn record_diagnostic(&self, stage: &str, code: &str, detail: &str) {
+        self.inner.diag.record(stage, code, detail, None);
+    }
+
     fn prepare_restart(&self, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
         self.inner.prepare_restart(candidate_id)
     }
@@ -1120,6 +1341,7 @@ mod tests {
     use hane_update::testing::{
         FixedClock, Scripted, ScriptedTransport, TEST_KEY_ID, TempDir, WindowsRelease,
         default_payload, release_json_sized, sign_with, test_now, test_policy, windows_release,
+        windows_release_with,
     };
 
     const ARCHIVE_NAME: &str = "hane-windows-x64.zip";
@@ -1520,6 +1742,50 @@ mod tests {
     }
 
     #[test]
+    fn a_package_verification_failure_is_recorded_at_the_verify_stage() {
+        let mut fixture = fixture("0.26.0", "0.27.0", 5);
+        // The signed inventory lists a file the (correctly hashed) archive does
+        // not contain: the download and catalog checks pass, package
+        // verification rejects it.
+        let mut listed: Vec<(String, Vec<u8>)> = default_payload("0.27.0")
+            .iter()
+            .filter(|e| !e.is_dir())
+            .map(|e| (String::from_utf8_lossy(&e.name).into_owned(), e.data.clone()))
+            .collect();
+        listed.push(("LICENSE".to_owned(), b"license".to_vec()));
+        fixture.release =
+            windows_release_with("0.27.0", 5, default_payload("0.27.0"), Some(listed));
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.check_now();
+        assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+        fixture.service.download(&fixture.candidate_id());
+        run_queued(&fixture.queue);
+
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("verify"));
+        assert_eq!(snapshot.error_code.as_deref(), Some("archive_rejected"));
+        assert!(!fixture.updates_root().join("candidates").exists());
+        assert!(
+            !fixture.dir.path().join("receipts").join("seen-catalog.json").exists(),
+            "a rejected package must not advance the sequence floor"
+        );
+
+        let saved = fs::read_to_string(fixture.updates_root().join("diagnostics.log")).unwrap();
+        for text in [fixture.service.diagnostics_text(), saved] {
+            assert!(text.contains("stage=verify"), "{text}");
+            assert!(text.contains("code=archive_rejected"), "{text}");
+            assert!(
+                text.contains("archive files differ from the signed inventory"),
+                "{text}"
+            );
+            assert!(text.contains("candidate=0.27.0"), "{text}");
+            assert!(!text.contains("stage=download"), "{text}");
+        }
+    }
+
+    #[test]
     fn download_clicks_for_another_candidate_or_repeats_do_not_start_extra_work() {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.script_check();
@@ -1604,6 +1870,36 @@ mod tests {
         run_queued(&queue);
         assert_eq!(reopened.snapshot().phase, AppUpdatePhase::Idle);
         assert!(!archive.exists());
+        let report = reopened.diagnostics_text();
+        assert!(report.contains("stage=restore"), "{report}");
+    }
+
+    #[test]
+    fn an_already_applied_candidate_is_removed_on_restore_without_a_failure_record() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate_dir = fixture
+            .updates_root()
+            .join("candidates")
+            .join(fixture.candidate_id());
+        assert!(candidate_dir.is_dir());
+        *fixture.service.inner.candidate_lease.lock().unwrap() = None;
+
+        // The update was applied: the running build is now the candidate's version.
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reopened = AppUpdateService::with_runner(
+            config(&fixture.dir, "0.27.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        reopened.restore_local();
+        run_queued(&queue);
+        assert_ne!(reopened.snapshot().phase, AppUpdatePhase::Ready);
+        assert!(!candidate_dir.exists());
+        let report = reopened.diagnostics_text();
+        assert!(!report.contains("stage=restore"), "{report}");
+        assert!(!report.contains("not_applicable"), "{report}");
     }
 
     #[test]
@@ -1886,6 +2182,446 @@ mod tests {
             Box::new(|_| false),
         );
         service.check();
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("start"));
+        assert!(!snapshot.is_busy(), "a refused start must not stay busy");
+        let report = service.diagnostics_text();
+        assert!(report.contains("stage=start"), "{report}");
+        assert!(report.contains("refused to start"), "{report}");
+        // The failed start is not a success and can be tried again.
+        service.check();
         assert_eq!(service.snapshot().phase, AppUpdatePhase::Failed);
+    }
+
+    // ------------------------------------------------ diagnostics (#553)
+
+    fn current_section(report: &str) -> &str {
+        report
+            .split_once("## 以前の起動の記録")
+            .map_or(report, |(current, _)| current)
+    }
+
+    #[test]
+    fn a_failed_check_is_recorded_with_its_stage_and_code() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        fixture.check_now();
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("check"));
+        assert!(snapshot.diagnostics_available);
+        let report = fixture.service.diagnostics_text();
+        assert!(report.contains("stage=check"), "{report}");
+        assert!(report.contains("code=not_found"), "{report}");
+        assert!(report.contains("version=0.26.0"), "{report}");
+        assert!(report.contains(&format!("PID {}", std::process::id())), "{report}");
+        assert!(report.contains(install_id().as_str()), "{report}");
+    }
+
+    #[test]
+    fn an_ai_probe_failure_is_saved_beside_update_failures_without_secrets() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        fixture.check_now();
+        AppUpdateController::record_diagnostic(
+            &fixture.service,
+            "ai_probe/turn",
+            "unauthorized",
+            "provider_turn_failed method=turn/completed error_info=httpConnectionFailed \
+             http_status=401 api_key=zq9secret",
+        );
+        let report = fixture.service.diagnostics_text();
+        assert!(report.contains("stage=check"), "{report}");
+        assert!(report.contains("stage=ai_probe/turn"), "{report}");
+        assert!(report.contains("code=unauthorized"), "{report}");
+        assert!(report.contains("http_status=401"), "{report}");
+        assert!(!report.contains("zq9secret"), "{report}");
+        let saved =
+            fs::read_to_string(fixture.updates_root().join("diagnostics.log")).unwrap();
+        assert!(saved.contains("stage=ai_probe/turn"), "{saved}");
+        assert!(!saved.contains("zq9secret"), "{saved}");
+    }
+
+    #[test]
+    fn a_real_ai_probe_failure_reaches_the_saved_diagnostic_text_without_secrets() {
+        use hane_ai::{
+            AiCommand, AiService, AiServiceConfig, FakeCredentialStore, ProbeStatus,
+            ShellEnvironmentPolicyFormat, SystemBrowserOpener,
+        };
+
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        let ai_root = TempDir::new("app-update-ai-probe");
+        let ai = AiService::spawn(AiServiceConfig {
+            app_data_root: ai_root.path().to_path_buf(),
+            binary_path: PathBuf::new(),
+            binary_resolution_error: None,
+            credential_store: Arc::new(FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        })
+        .unwrap();
+        let handle = ai.handle();
+        let wait = |id| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let snapshot = handle.snapshot();
+                if snapshot.busy.is_none()
+                    && snapshot
+                        .last_result
+                        .as_ref()
+                        .is_some_and(|(finished, _)| *finished == id)
+                {
+                    return snapshot;
+                }
+                assert!(std::time::Instant::now() < deadline, "{snapshot:?}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let open_id = handle.try_submit(AiCommand::OpenSettings).unwrap();
+        wait(open_id);
+        let mut settings = handle.snapshot().settings;
+        settings.chatgpt.model_id = Some("gpt-fake-text".to_owned());
+        let save_id = handle
+            .try_save_settings(settings.revision, settings)
+            .unwrap();
+        wait(save_id);
+
+        // Signed out: the probe is rejected by the settings validation before
+        // any request is made, with no network and no runtime.
+        let probe_id = handle.try_submit(AiCommand::Probe).unwrap();
+        let snapshot = wait(probe_id);
+        assert!(matches!(snapshot.probe_status, ProbeStatus::Failed(_)));
+        let diagnostic = snapshot.probe_diagnostic.expect("the failure is recorded");
+        assert_eq!(diagnostic.operation_id, probe_id);
+
+        // The same hand-over the settings view performs for a new failure.
+        AppUpdateController::record_diagnostic(
+            &fixture.service,
+            &format!("ai_probe/{}", diagnostic.stage),
+            diagnostic.code,
+            &diagnostic.cause,
+        );
+        let saved = fs::read_to_string(fixture.updates_root().join("diagnostics.log")).unwrap();
+        for text in [fixture.service.diagnostics_text(), saved] {
+            assert!(text.contains("stage=ai_probe/validate_settings"), "{text}");
+            assert!(text.contains("code=probe_account_unavailable"), "{text}");
+            assert!(text.contains("chatgpt_not_signed_in"), "{text}");
+            assert!(!text.contains("HANE_AI_OK"), "{text}");
+            assert!(!text.contains("gpt-fake-text"), "{text}");
+            assert!(!text.contains("sk-"), "{text}");
+        }
+        drop(ai);
+    }
+
+    #[test]
+    fn a_write_failure_after_the_download_is_not_reported_as_a_failed_check() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.check_now();
+        // The receipts location can no longer be created once the archive is
+        // verified; the update itself and the log stay writable.
+        fs::write(fixture.dir.path().join("receipts"), b"not a directory").unwrap();
+        fixture.service.download(&fixture.candidate_id());
+        run_queued(&fixture.queue);
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("save_history"));
+        assert_ne!(snapshot.error_code.as_deref(), Some("not_found"));
+        assert!(!fixture.updates_root().join("candidates").exists());
+        let report = fixture.service.diagnostics_text();
+        assert!(report.contains("stage=save_history"), "{report}");
+        assert!(!report.contains("stage=check"), "{report}");
+        assert!(report.contains("os_kind="), "the OS error kind must be kept: {report}");
+        assert!(report.contains("candidate=0.27.0"), "{report}");
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_be_moved_keeps_its_cause() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.check_now();
+        fs::create_dir_all(fixture.updates_root()).unwrap();
+        fs::write(fixture.updates_root().join("candidates"), b"in the way").unwrap();
+        fixture.service.download(&fixture.candidate_id());
+        run_queued(&fixture.queue);
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("publish"));
+        let report = fixture.service.diagnostics_text();
+        assert!(report.contains("stage=publish"), "{report}");
+        assert!(report.contains("os_kind="), "{report}");
+        assert!(
+            fixture
+                .service
+                .inner
+                .work_dir()
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_none()),
+            "the private work directory must be cleaned"
+        );
+    }
+
+    #[test]
+    fn a_handoff_failure_after_prepare_is_saved_and_shown_with_its_os_facts() {
+        let dir = TempDir::new("app-update-diag-handoff");
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&Arc::new(Mutex::new(Vec::new()))),
+        );
+        assert!(!service.snapshot().diagnostics_available);
+        let sink = service.inner.handoff_failure_sink("0.27.0".to_owned());
+        sink(&UpdateError::new(
+            ErrorCode::Io,
+            "access denied (os_kind=PermissionDenied, os_error=5)",
+        ));
+        assert!(service.snapshot().diagnostics_available);
+        let saved =
+            fs::read_to_string(service.inner.config.updates_root.join("diagnostics.log")).unwrap();
+        let shared = service.diagnostics_text();
+        for text in [&saved, &shared] {
+            assert!(text.contains("stage=prepare"), "{text}");
+            assert!(text.contains("code=io"), "{text}");
+            assert!(text.contains("os_kind=PermissionDenied, os_error=5"), "{text}");
+            assert!(text.contains("candidate=0.27.0"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_restart_reconfirmation_returns_its_own_error_code_without_recording_it() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate = fixture.candidate_id();
+        let inner = &fixture.service.inner;
+        let before = inner.diag.has_records();
+
+        // Restart is not wired up.
+        let err = inner.confirm_restart(&candidate).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+
+        let exe = fixture.dir.path().join("missing").join("hane");
+        fixture.service.enable_restart(RestartWiring {
+            placement: hane_update::platform::Placement {
+                target: Target::WindowsX64,
+                install_root: fixture.dir.path().join("missing"),
+                coordination_parent: fixture.dir.path().to_path_buf(),
+                install_id: install_id(),
+            },
+            exe: exe.clone(),
+            state_root: fixture.dir.path().join("state"),
+        });
+
+        // Another candidate than the Ready one.
+        let err = inner.confirm_restart("another-candidate").unwrap_err();
+        assert_eq!(err.code, ErrorCode::TransitionInvalid);
+
+        // The install cannot be located again: the cause is returned as is.
+        let located = hane_update::platform::locate(&exe).unwrap_err();
+        let err = inner.confirm_restart(&candidate).unwrap_err();
+        assert_eq!(err.code, located.code);
+        assert_eq!(err.detail, located.detail);
+
+        // Returning an error is not recording it: the failure sink does that once.
+        assert_eq!(inner.diag.has_records(), before);
+    }
+
+    #[test]
+    fn a_moved_install_is_reported_as_identity_mismatch_and_recorded_once() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate = fixture.candidate_id();
+        let inner = &fixture.service.inner;
+        let exe = fixture.dir.path().join("install").join("hane");
+        let wired = hane_update::platform::Placement {
+            target: Target::WindowsX64,
+            install_root: fixture.dir.path().join("install"),
+            coordination_parent: fixture.dir.path().to_path_buf(),
+            install_id: install_id(),
+        };
+        fixture.service.enable_restart(RestartWiring {
+            placement: wired.clone(),
+            exe,
+            state_root: fixture.dir.path().join("state"),
+        });
+        let located = |install_id: InstallId| {
+            let placement = hane_update::platform::Placement { install_id, ..wired.clone() };
+            move |_: &Path| Ok(placement)
+        };
+
+        // The same InstallId confirms and records nothing.
+        let before = inner.diag.has_records();
+        inner.confirm_restart_with(&candidate, located(install_id())).unwrap();
+        assert_eq!(inner.diag.has_records(), before);
+
+        // Another InstallId is the mismatch code, not an I/O error.
+        let other = InstallId::derive(&InstallFacts {
+            os: "test",
+            volume_id: "volume",
+            install_path: "/opt/elsewhere",
+            owner: "user",
+        })
+        .unwrap();
+        assert_ne!(other.as_str(), install_id().as_str());
+        let err = inner.confirm_restart_with(&candidate, located(other)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert_eq!(inner.diag.has_records(), before);
+
+        // The handoff's failure sink records the returned error exactly once.
+        let sink = inner.handoff_failure_sink("0.27.0".to_owned());
+        sink(&err);
+        let report = fixture.service.diagnostics_text();
+        assert_eq!(report.matches("stage=prepare").count(), 1, "{report}");
+        assert_eq!(report.matches("code=identity_mismatch").count(), 1, "{report}");
+        assert!(!report.contains("code=io"), "{report}");
+        assert!(report.contains("candidate=0.27.0"), "{report}");
+    }
+
+    #[test]
+    fn the_unavailable_context_is_recorded_without_allowing_updates() {
+        let dir = TempDir::new("app-update-diag-placement");
+        let transport = Arc::new(ScriptedTransport::new());
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            transport.clone(),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        let error = UpdateError::new(ErrorCode::IdentityMismatch, "owner differs");
+        service.block_placement(
+            &error,
+            Path::new("/Applications/Hane.app/Contents/MacOS/hane"),
+        );
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Unavailable);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("placement"));
+        assert!(snapshot.diagnostics_available);
+        let report = service.diagnostics_text();
+        assert!(report.contains("stage=placement"), "{report}");
+        assert!(report.contains("owner differs"), "{report}");
+        // Reading the diagnostics re-enables nothing.
+        service.check();
+        service.download(&"a".repeat(64));
+        service.restore_local();
+        run_queued(&queue);
+        assert!(transport.requests().is_empty());
+        assert_eq!(service.snapshot().phase, AppUpdatePhase::Unavailable);
+        assert!(service.prepare_restart(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn secrets_and_user_names_do_not_reach_the_saved_or_shared_text() {
+        let dir = TempDir::new("app-update-diag-secrets");
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&Arc::new(Mutex::new(Vec::new()))),
+        );
+        let error = UpdateError::new(
+            ErrorCode::Io,
+            "open https://qzxw:hunter2@host.example/asset?X-Amz-Signature=deadbeef failed \
+             token=abc123 at /Users/qzxwuser/Library/Hane",
+        );
+        service.block_placement(&error, Path::new("/Applications/Hane.app/Contents/MacOS/hane"));
+        let shared = service.diagnostics_text();
+        let saved =
+            fs::read_to_string(service.inner.config.updates_root.join("diagnostics.log")).unwrap();
+        for text in [&shared, &saved] {
+            for leak in ["hunter2", "deadbeef", "abc123", "qzxwuser", "X-Amz"] {
+                assert!(!text.contains(leak), "{leak} leaked: {text}");
+            }
+        }
+        assert!(saved.contains("host.example"), "{saved}");
+    }
+
+    #[test]
+    fn a_cancelled_operations_late_result_does_not_touch_the_diagnostics() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        fixture.service.check();
+        fixture.service.cancel();
+        run_queued(&fixture.queue);
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Idle);
+        assert!(!snapshot.diagnostics_available);
+        assert!(!fixture.service.diagnostics_text().contains("stage=check"));
+    }
+
+    #[test]
+    fn records_of_an_earlier_run_are_kept_apart_from_the_current_failure() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        fixture.check_now();
+        let first = fixture.service.diagnostics_text();
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reopened = AppUpdateService::with_runner(
+            config(&fixture.dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        // The earlier record makes the report reachable, but the current
+        // service is healthy: nothing is turned into a current failure.
+        let reopened_snapshot = reopened.snapshot();
+        assert!(reopened_snapshot.diagnostics_available);
+        assert_eq!(reopened_snapshot.phase, AppUpdatePhase::Idle);
+        assert_eq!(reopened_snapshot.error_code, None);
+        assert_eq!(reopened_snapshot.error_stage, None);
+        let report = reopened.diagnostics_text();
+        assert!(!current_section(&report).contains("stage=check"), "{report}");
+        let (_, past) = report.split_once("## 以前の起動の記録").unwrap();
+        assert!(past.contains("stage=check") && past.contains("code=not_found"), "{report}");
+        assert_ne!(first, report);
+
+        // A different state directory is told apart by its state id.
+        let other = TempDir::new("app-update-diag-other-state");
+        let other_service = AppUpdateService::with_runner(
+            config(&other, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        let state_line = |report: &str| {
+            report
+                .lines()
+                .find(|line| line.starts_with("state: "))
+                .map(str::to_owned)
+        };
+        assert_ne!(state_line(&report), state_line(&other_service.diagnostics_text()));
+    }
+
+    #[test]
+    fn an_unwritable_log_does_not_block_the_update_or_hide_the_failure() {
+        // Only the log location is unusable: the update still becomes Ready.
+        let ready = fixture("0.26.0", "0.27.0", 5);
+        fs::create_dir_all(ready.updates_root().join("diagnostics.log")).unwrap();
+        ready.prepare_ready();
+        assert_eq!(ready.phase(), AppUpdatePhase::Ready);
+
+        // A failure is still a failure, and the report says it was not saved.
+        let failed = fixture("0.26.0", "0.27.0", 5);
+        fs::create_dir_all(failed.updates_root().join("diagnostics.log")).unwrap();
+        failed
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        failed.check_now();
+        assert_eq!(failed.phase(), AppUpdatePhase::Failed);
+        let report = failed.service.diagnostics_text();
+        assert!(report.contains("保存: できませんでした"), "{report}");
+        assert!(report.contains("code=not_found"), "{report}");
     }
 }

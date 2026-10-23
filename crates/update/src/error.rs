@@ -127,7 +127,17 @@ impl From<io::Error> for UpdateError {
             io::ErrorKind::TimedOut => ErrorCode::Timeout,
             _ => ErrorCode::Io,
         };
-        UpdateError::new(code, err.to_string())
+        UpdateError::new(code, io_detail(&err))
+    }
+}
+
+/// The message of an OS error together with the facts the OS actually gave:
+/// the error kind and, only when there is one, the raw OS error number. A
+/// missing number is stated as absent instead of being invented.
+pub fn io_detail(err: &io::Error) -> String {
+    match err.raw_os_error() {
+        Some(raw) => format!("{err} (os_kind={:?}, os_error={raw})", err.kind()),
+        None => format!("{err} (os_kind={:?}, os_error=none)", err.kind()),
     }
 }
 

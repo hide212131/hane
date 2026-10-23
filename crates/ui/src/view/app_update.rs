@@ -51,6 +51,12 @@ pub struct AppUpdateSnapshot {
     pub total_bytes: u64,
     /// Stable machine-readable failure code (`Failed` / `Unavailable`).
     pub error_code: Option<String>,
+    /// Where the failure happened (`check`, `download`, `write_download`,
+    /// `verify`, `save_history`, `publish`, `start`, `placement`, `config`).
+    /// The same code can mean different things at different stages.
+    pub error_stage: Option<String>,
+    /// The service holds local diagnostics that can be copied from the card.
+    pub diagnostics_available: bool,
     /// A local re-validation of a previously prepared update is running.
     pub restoring: bool,
     /// The service can really apply a Ready update in this build: the trust
@@ -69,6 +75,8 @@ impl AppUpdateSnapshot {
             received_bytes: 0,
             total_bytes: 0,
             error_code: None,
+            error_stage: None,
+            diagnostics_available: false,
             restoring: false,
             restart_supported: false,
         }
@@ -104,6 +112,18 @@ pub trait AppUpdateController: Send + Sync {
     /// Re-validates a prepared update left by an earlier run, locally only.
     /// Idempotent; never communicates.
     fn restore_local(&self);
+    /// The local diagnostics text for the settings card (copy). It reads local
+    /// records only: no request, no change. `None` when there is none.
+    fn diagnostics_text(&self) -> Option<String> {
+        None
+    }
+    /// Adds one failure of another operation (for example the AI response
+    /// check) to the same bounded local diagnostics. `stage`, `code` and
+    /// `detail` are already limited to safe values by the caller; the service
+    /// still redacts and caps them. A save failure never changes the caller.
+    fn record_diagnostic(&self, stage: &str, code: &str, detail: &str) {
+        let _ = (stage, code, detail);
+    }
     /// Re-verifies the Ready candidate `candidate_id` and the install, starts
     /// the update helper and returns once it answered `Prepared`. It may take
     /// a while and is therefore called off the UI thread. Nothing is stopped,
@@ -223,6 +243,44 @@ fn failure_text(code: &str) -> &'static str {
     }
 }
 
+/// A failure text that fits the stage where the failure happened. The code
+/// alone (for example `io`) cannot tell a failed check from a failed write
+/// after the download, so the stage decides when it is known. `None` falls
+/// back to the code-based text.
+fn stage_failure_text(stage: &str, code: &str) -> Option<&'static str> {
+    match (stage, code) {
+        ("start", _) => Some(
+            "更新の処理を開始できませんでした。Haneを再起動してから、もう一度お試しください。",
+        ),
+        ("write_download", _) => Some(
+            "更新ファイルを保存する場所を準備できませんでした。空き容量と書き込み権限を確認してください。",
+        ),
+        ("download", "io" | "insufficient_space") => Some(
+            "ダウンロードした更新ファイルを保存できませんでした。空き容量と書き込み権限を確認してください。",
+        ),
+        ("download", "hash_mismatch" | "size_mismatch") => Some(
+            "ダウンロードした更新ファイルの内容が更新情報と一致しませんでした。もう一度取得するか、手動でダウンロードしてください。",
+        ),
+        ("download", "limit_exceeded") => Some(
+            "更新ファイルが想定されたサイズの上限を超えたため、ダウンロードを中止しました。手動でダウンロードしてください。",
+        ),
+        ("download", "redirect_rejected") => Some(
+            "更新ファイルの取得先が許可されていない場所へ転送されたため、ダウンロードを中止しました。手動でダウンロードしてください。",
+        ),
+        ("verify", "signature_invalid" | "identity_mismatch") => None,
+        ("verify", _) => Some(
+            "ダウンロードした更新ファイルを検証または展開できませんでした。もう一度取得するか、手動でダウンロードしてください。",
+        ),
+        ("save_history", _) => Some(
+            "更新ファイルは検証できましたが、更新の履歴を保存できませんでした。更新は準備されていません。書き込み権限を確認してください。",
+        ),
+        ("publish", _) => Some(
+            "検証済みの更新を保存先へ移動できませんでした。更新は準備されていません。書き込み権限を確認してください。",
+        ),
+        _ => None,
+    }
+}
+
 /// Why updates are unavailable, with what the user can actually do. Install
 /// placement failures are named here instead of surfacing later as a generic
 /// I/O error after the archive was fetched. Moving the app or reopening it
@@ -321,7 +379,14 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             model.detail = Some("更新を削除しています…".to_owned());
         }
         AppUpdatePhase::Failed => {
-            model.detail = Some(format!("{} (診断コード: {code})", failure_text(code)));
+            let stage = snapshot.error_stage.as_deref();
+            let text = stage
+                .and_then(|stage| stage_failure_text(stage, code))
+                .unwrap_or_else(|| failure_text(code));
+            model.detail = Some(match stage {
+                Some(stage) => format!("{text} (診断コード: {code}, 段階: {stage})"),
+                None => format!("{text} (診断コード: {code})"),
+            });
             model.actions.push((CardAction::Check, "再試行"));
         }
         AppUpdatePhase::Unavailable => {
@@ -643,6 +708,9 @@ impl EditorView {
         // A new action ends the one-time "updated" notice.
         self.update_completed = None;
         self.explorer_migration_failed = None;
+        // A stale notice (e.g. the diagnostics copy result) must not outlive
+        // the state it was shown under.
+        self.restart_message = None;
         match action {
             CardAction::Check => controller.check(),
             CardAction::Download(candidate) => controller.download(&candidate),
@@ -657,13 +725,48 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Hands a newly failed AI response check to the local diagnostics, once.
+    pub(super) fn record_ai_probe_diagnostic(&mut self) {
+        let Some(diagnostic) = self.ai_settings.take_unrecorded_probe_diagnostic() else {
+            return;
+        };
+        if let Some(controller) = self.app_update.as_ref() {
+            controller.record_diagnostic(
+                &format!("ai_probe/{}", diagnostic.stage),
+                diagnostic.code,
+                &diagnostic.cause,
+            );
+        }
+    }
+
+    /// Copies the update diagnostics to the clipboard. The text is already
+    /// redacted by the service; this reads small local records only and makes
+    /// no request, so it is safe on the UI thread and while updates are
+    /// unavailable.
+    pub(super) fn copy_app_update_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let Some(controller) = self.app_update.clone() else {
+            return;
+        };
+        match controller.diagnostics_text() {
+            Some(text) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                self.restart_message = Some("更新の診断情報をコピーしました。".to_owned());
+            }
+            None => {
+                self.restart_message = Some("コピーできる診断情報がありません。".to_owned());
+            }
+        }
+        cx.notify();
+    }
+
     /// The "アプリの更新" card of the general settings page. `None` when no
     /// update service is attached (tests, unsupported builds).
     pub(super) fn app_update_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let controller = self.app_update.as_ref()?;
-        let model = card_model(&controller.snapshot());
+        let snapshot = controller.snapshot();
+        let model = card_model(&snapshot);
         let restarting = self.restart_in_progress;
-        let buttons: Vec<_> = model
+        let buttons: Vec<Button> = model
             .actions
             .into_iter()
             .filter(|(action, _)| !(restarting && *action == CardAction::Restart))
@@ -679,6 +782,22 @@ impl EditorView {
                     })
             })
             .collect();
+        // Available whenever records exist, also while updates are
+        // unavailable; it only copies local text and starts nothing.
+        let diagnostics_button = snapshot.diagnostics_available.then(|| {
+            let view = cx.entity();
+            div()
+                .id("settings-app-update-diagnostics-wrapper")
+                .debug_selector(|| "settings-app-update-diagnostics".to_owned())
+                .child(
+                    Button::new("settings-app-update-diagnostics")
+                        .label("診断情報をコピー")
+                        .ghost()
+                        .on_click(move |_, _window, app| {
+                            view.update(app, |view, cx| view.copy_app_update_diagnostics(cx));
+                        }),
+                )
+        });
         let card = div()
             .id("settings-app-update-card")
             .debug_selector(|| "settings-app-update-card".to_owned())
@@ -728,7 +847,8 @@ impl EditorView {
                     .flex_row()
                     .flex_wrap()
                     .gap_2()
-                    .children(buttons),
+                    .children(buttons)
+                    .children(diagnostics_button),
             );
         Some(
             div()
@@ -1526,6 +1646,24 @@ mod tests {
     }
 
     #[test]
+    fn download_stage_integrity_and_limit_failures_explain_the_download() {
+        for code in [
+            "hash_mismatch",
+            "size_mismatch",
+            "limit_exceeded",
+            "redirect_rejected",
+        ] {
+            let mut input = snapshot(AppUpdatePhase::Failed);
+            input.error_code = Some(code.to_owned());
+            input.error_stage = Some("download".to_owned());
+            let detail = card_model(&input).detail.unwrap();
+            assert!(detail.contains("ダウンロード"), "{code}: {detail}");
+            assert!(!detail.contains("更新を確認できませんでした"), "{code}: {detail}");
+            assert!(detail.contains(code), "{code}: {detail}");
+        }
+    }
+
+    #[test]
     fn download_is_bound_to_the_candidate_shown() {
         let model = card_model(&snapshot(AppUpdatePhase::Available));
         assert_eq!(
@@ -1781,6 +1919,7 @@ mod tests {
     struct FakeController {
         snapshot: Mutex<Option<AppUpdateSnapshot>>,
         calls: Mutex<Vec<String>>,
+        diagnostics: Option<String>,
     }
 
     impl FakeController {
@@ -1788,6 +1927,15 @@ mod tests {
             Arc::new(Self {
                 snapshot: Mutex::new(Some(snapshot)),
                 calls: Mutex::new(Vec::new()),
+                diagnostics: None,
+            })
+        }
+
+        fn with_diagnostics(snapshot: AppUpdateSnapshot, text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                snapshot: Mutex::new(Some(snapshot)),
+                calls: Mutex::new(Vec::new()),
+                diagnostics: Some(text.to_owned()),
             })
         }
 
@@ -1817,6 +1965,9 @@ mod tests {
         }
         fn restore_local(&self) {
             self.calls.lock().unwrap().push("restore".to_owned());
+        }
+        fn diagnostics_text(&self) -> Option<String> {
+            self.diagnostics.clone()
         }
     }
 
@@ -1864,6 +2015,66 @@ mod tests {
         assert_eq!(
             controller.calls(),
             vec!["check".to_owned(), "download:cand".to_owned()]
+        );
+    }
+
+    #[gpui::test]
+    fn a_new_card_action_clears_the_diagnostics_copy_notice(cx: &mut gpui::TestAppContext) {
+        let controller = FakeController::new(AppUpdateSnapshot::idle("0.26.0"));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, _| view.attach_app_update(Some(attached)));
+        open_general_settings(&view, cx);
+        view.update(cx, |view, cx| view.copy_app_update_diagnostics(cx));
+        assert!(
+            view.read_with(cx, |view, _| view.restart_message.is_some()),
+            "the copy action itself must still report its result"
+        );
+        view.update(cx, |view, cx| {
+            view.run_app_update_action(CardAction::Check, cx);
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.restart_message.clone()),
+            None,
+            "a new non-restart action must drop the stale copy notice"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_diagnostics_button_copies_the_text_without_starting_work(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut idle = AppUpdateSnapshot::idle("0.26.0");
+        idle.diagnostics_available = true;
+        let controller = FakeController::with_diagnostics(idle, "diagnostics-fixture\nstage=check");
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, _| view.attach_app_update(Some(attached)));
+        open_general_settings(&view, cx);
+        let calls_before = controller.calls();
+
+        let button = cx
+            .debug_bounds("settings-app-update-diagnostics")
+            .expect("the diagnostics button is rendered when records exist");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("diagnostics-fixture\nstage=check"));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.restart_message.clone()),
+            Some("更新の診断情報をコピーしました。".to_owned())
+        );
+        assert_eq!(
+            controller.calls(),
+            calls_before,
+            "copying must not start a check or a download"
+        );
+        assert!(
+            controller
+                .calls()
+                .iter()
+                .all(|call| call != "check" && !call.starts_with("download")),
         );
     }
 
