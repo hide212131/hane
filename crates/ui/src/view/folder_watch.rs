@@ -37,7 +37,16 @@ pub(super) struct FolderWatchState {
     /// later status updates cannot make an inactive watch look healthy. Set
     /// when attaching fails and cleared when a reattach succeeds.
     unwatched: Option<String>,
+    /// The folder the (failed) attach was for; a delayed retry connects only
+    /// while this is still the root it was scheduled for.
+    watch_root: Option<PathBuf>,
+    /// A delayed reattach is already waiting, so failures do not stack timers.
+    retry_scheduled: bool,
 }
+
+/// How long to wait before trying to attach a watch that failed. Retrying is
+/// timer-driven and never depends on a new OS notification arriving.
+const FOLDER_WATCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
 thread_local! {
@@ -73,7 +82,52 @@ impl EditorView {
     fn connect_folder_watch(&mut self, root: &Path, cx: &mut Context<Self>) -> std::io::Result<()> {
         let result = self.attach_folder_watch(root, cx);
         self.folder_watch.unwatched = result.as_ref().err().map(|error| error.to_string());
+        self.folder_watch.watch_root = Some(root.to_path_buf());
+        if result.is_err() {
+            self.schedule_folder_watch_retry(root, cx);
+        }
         result
+    }
+
+    /// Waits, then reattaches without any notification. The retry is dropped
+    /// if the work folder was replaced or the window is gone meanwhile; a
+    /// failed retry schedules the next one, so there is at most one timer.
+    fn schedule_folder_watch_retry(&mut self, root: &Path, cx: &mut Context<Self>) {
+        if self.folder_watch.retry_scheduled {
+            return;
+        }
+        self.folder_watch.retry_scheduled = true;
+        let generation = self.work_folder_generation;
+        let root = root.to_path_buf();
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(FOLDER_WATCH_RETRY_DELAY)
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.retry_folder_watch(generation, &root, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn retry_folder_watch(&mut self, generation: u64, root: &Path, cx: &mut Context<Self>) {
+        if generation != self.work_folder_generation
+            || self.folder_watch.watch_root.as_deref() != Some(root)
+        {
+            // Belongs to a replaced folder; its bookkeeping was reset.
+            return;
+        }
+        self.folder_watch.retry_scheduled = false;
+        if self.folder_watch.unwatched.is_none() {
+            return;
+        }
+        if self.connect_folder_watch(root, cx).is_ok() {
+            // Changes made while unwatched were never reported; list again.
+            self.refresh_work_folder_listing(cx);
+            cx.notify();
+        } else {
+            cx.notify();
+        }
     }
 
     fn attach_folder_watch(&mut self, root: &Path, cx: &mut Context<Self>) -> std::io::Result<()> {
@@ -506,6 +560,72 @@ mod tests {
         view.update(cx, |view, cx| {
             view.connect_folder_watch(&root, cx).unwrap();
             assert!(view.footer_warnings().is_empty());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_failed_attach_is_retried_after_a_delay_without_a_notification(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("retry");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+
+        inject_attach_error(Some("busy"));
+        view.update(cx, |view, cx| view.start_folder_watch(&root, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.footer_warnings().len(), 1));
+
+        // The scan succeeds, and the warning stays while nothing is watched.
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            let fresh = OsWorkFolderScanner.scan(&root);
+            view.finish_work_folder_refresh(generation, &root, None, fresh, cx);
+            assert_eq!(view.footer_warnings().len(), 1);
+        });
+
+        // A retry that fails again keeps the warning and waits for the next.
+        cx.executor().advance_clock(FOLDER_WATCH_RETRY_DELAY);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.footer_warnings().len(), 1);
+            assert!(view.folder_watch.test_batches.is_none());
+            assert!(view.folder_watch.retry_scheduled);
+        });
+
+        // Once the cause is gone, the next delayed retry reconnects and
+        // lists the folder again, with no new OS notification.
+        inject_attach_error(None);
+        std::fs::write(root.join("Missed.md"), "# Missed\n").unwrap();
+        cx.executor().advance_clock(FOLDER_WATCH_RETRY_DELAY);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.footer_warnings().is_empty());
+            assert!(view.folder_watch.test_batches.is_some());
+            assert!(!view.folder_watch.retry_scheduled);
+            assert_eq!(file_names(view), ["Missed.md"]);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_retry_scheduled_for_a_replaced_folder_does_not_attach(cx: &mut gpui::TestAppContext) {
+        let root = watch_test_root("retry-stale");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+
+        inject_attach_error(Some("busy"));
+        view.update(cx, |view, cx| view.start_folder_watch(&root, cx));
+        inject_attach_error(None);
+        view.update(cx, |view, _| {
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+        });
+        cx.executor().advance_clock(FOLDER_WATCH_RETRY_DELAY);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.folder_watch.test_batches.is_none());
+            assert_eq!(view.footer_warnings().len(), 1);
         });
         std::fs::remove_dir_all(&root).unwrap();
     }
