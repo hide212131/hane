@@ -1341,6 +1341,7 @@ mod tests {
     use hane_update::testing::{
         FixedClock, Scripted, ScriptedTransport, TEST_KEY_ID, TempDir, WindowsRelease,
         default_payload, release_json_sized, sign_with, test_now, test_policy, windows_release,
+        windows_release_with,
     };
 
     const ARCHIVE_NAME: &str = "hane-windows-x64.zip";
@@ -1738,6 +1739,46 @@ mod tests {
             !fixture.dir.path().join("receipts").join("seen-catalog.json").exists(),
             "an unverified archive must not advance the sequence floor"
         );
+    }
+
+    #[test]
+    fn a_package_verification_failure_is_recorded_at_the_verify_stage() {
+        let mut fixture = fixture("0.26.0", "0.27.0", 5);
+        // The signed inventory lists a file the (correctly hashed) archive does
+        // not contain: the download and catalog checks pass, package
+        // verification rejects it.
+        let mut listed: Vec<(String, Vec<u8>)> = default_payload("0.27.0")
+            .iter()
+            .filter(|e| !e.is_dir())
+            .map(|e| (String::from_utf8_lossy(&e.name).into_owned(), e.data.clone()))
+            .collect();
+        listed.push(("LICENSE".to_owned(), b"license".to_vec()));
+        fixture.release =
+            windows_release_with("0.27.0", 5, default_payload("0.27.0"), Some(listed));
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.check_now();
+        assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+        fixture.service.download(&fixture.candidate_id());
+        run_queued(&fixture.queue);
+
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("verify"));
+        assert_eq!(snapshot.error_code.as_deref(), Some("archive_rejected"));
+        assert!(!fixture.updates_root().join("candidates").exists());
+        assert!(
+            !fixture.dir.path().join("receipts").join("seen-catalog.json").exists(),
+            "a rejected package must not advance the sequence floor"
+        );
+
+        let saved = fs::read_to_string(fixture.updates_root().join("diagnostics.log")).unwrap();
+        for text in [fixture.service.diagnostics_text(), saved] {
+            assert!(text.contains("stage=verify"), "{text}");
+            assert!(text.contains("code=archive_rejected"), "{text}");
+            assert!(text.contains("candidate=0.27.0"), "{text}");
+            assert!(!text.contains("stage=download"), "{text}");
+        }
     }
 
     #[test]
