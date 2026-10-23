@@ -163,7 +163,11 @@ fn text_provider(context: &Arc<Context>) -> ITextProvider {
 fn bounding_rectangle_reports_element_not_available_for_invalid_hwnd() {
     let _lock_guard = MUTEX.lock();
     for hwnd in invalid_hwnds() {
-        let fragment = fragment(&new_context(hwnd));
+        // Keep the Context alive; the provider only holds a weak reference, so a
+        // dropped Context would fail with the same HRESULT without reaching
+        // the `ClientToScreen` error mapping.
+        let context = new_context(hwnd);
+        let fragment = fragment(&context);
         let error = unsafe { fragment.BoundingRectangle() }.unwrap_err();
         assert_eq!(error.code(), element_not_available());
     }
@@ -173,7 +177,9 @@ fn bounding_rectangle_reports_element_not_available_for_invalid_hwnd() {
 fn element_provider_from_point_reports_element_not_available_for_invalid_hwnd() {
     let _lock_guard = MUTEX.lock();
     for hwnd in invalid_hwnds() {
-        let root = fragment_root(&new_context(hwnd));
+        // Keep the Context alive for the COM call (see the test above).
+        let context = new_context(hwnd);
+        let root = fragment_root(&context);
         let error = unsafe { root.ElementProviderFromPoint(10.0, 10.0) }.unwrap_err();
         assert_eq!(error.code(), element_not_available());
     }
@@ -183,7 +189,9 @@ fn element_provider_from_point_reports_element_not_available_for_invalid_hwnd() 
 fn range_from_point_reports_element_not_available_for_invalid_hwnd() {
     let _lock_guard = MUTEX.lock();
     for hwnd in invalid_hwnds() {
-        let provider = text_provider(&new_context(hwnd));
+        // Keep the Context alive for the COM call (see the tests above).
+        let context = new_context(hwnd);
+        let provider = text_provider(&context);
         let point = UiaPoint { x: 10.0, y: 10.0 };
         let error = unsafe { provider.RangeFromPoint(point) }.unwrap_err();
         assert_eq!(error.code(), element_not_available());
