@@ -69,6 +69,11 @@ impl Redactor {
             Some(home) => text.replace(home.as_str(), "~"),
             None => text.to_owned(),
         };
+        // The user name may contain whitespace too (`Jane Doe`).
+        let text = match &self.user {
+            Some(user) => text.replace(user.as_str(), USER_MASK),
+            None => text,
+        };
         let tokens: Vec<&str> = text.split_whitespace().collect();
         for (index, token) in tokens.iter().copied().enumerate() {
             if mask_next > 0 {
@@ -569,6 +574,20 @@ mod tests {
         assert!(out.contains("~/Library/x failed"), "{out}");
         assert!(out.contains("token=<redacted>"), "{out}");
         assert!(!out.contains("sekret"), "{out}");
+    }
+
+    #[test]
+    fn user_with_whitespace_is_masked_as_a_whole() {
+        let redactor = Redactor::new(None, Some("Jane Doe".to_owned()));
+        let out = redactor.redact(
+            "read /Users/Jane Doe/Library/x failed, owner=Jane Doe token=sekret",
+            1000,
+        );
+        for leak in ["Jane", "Doe", "sekret"] {
+            assert!(!out.contains(leak), "{leak} leaked in {out}");
+        }
+        assert!(out.contains("failed,"), "{out}");
+        assert!(out.contains("token=<redacted>"), "{out}");
     }
 
     #[test]
