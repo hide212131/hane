@@ -75,8 +75,8 @@ use hane_session::{
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, ThemePreference, TitleSyncAction, UnsavedChanges, WorkFolder,
-    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
-    format_relative_date_label, local_today, next_modified_sequence, run_save_job,
+    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync,
+    extract_h1_title, format_relative_date_label, local_today, run_save_job,
     split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2862,8 +2862,7 @@ impl EditorView {
                     // can retain the new folder's modified time the same
                     // no-rescan way a save does, instead of leaving it
                     // unknown (and sorting as oldest) until the next scan.
-                    let modified = files.stamp(&probe_path).and_then(|stamp| stamp.modified);
-                    let modified_seq = next_modified_sequence();
+                    let (modified, modified_seq) = stamp_with_sequence(files.as_ref(), &probe_path);
                     // The parent directory's own entry just gained this new
                     // folder, so its real modified time changed too; failing
                     // this new folder's own creation leaves the tree
