@@ -112,6 +112,14 @@ impl Redactor {
                 } else if !token.contains("://") && secret_pair_value_is_scheme(token) {
                     // `authorization:bearer abc`: the scheme sits inside the pair.
                     mask_next = 1;
+                } else if tokens
+                    .get(index + 1)
+                    .is_some_and(|next| next.starts_with(['=', ':']))
+                    && is_bare_secret_key(token)
+                {
+                    // `token = abc` / `api_key : abc` / `token =abc`: the key,
+                    // the separator and the value are separate tokens.
+                    mask_next = 1;
                 }
             }
             out.push(text);
@@ -191,7 +199,19 @@ fn mask_secret_pair(token: &str) -> Option<(String, bool)> {
     changed.then_some((out, mask_following))
 }
 
-fn mask_secret_segment(body: &str) -> Option<(String, bool)> {
+/// Whether a token without its own separator is a secret key name
+/// (`token`, `"api_key"`), so a separate `=` / `:` token may follow it.
+fn is_bare_secret_key(token: &str) -> bool {
+    if token.contains(['=', ':']) {
+        return false;
+    }
+    let key = token
+        .trim_matches(|c: char| "{[(\"'`}]) \t".contains(c))
+        .to_ascii_lowercase();
+    !key.is_empty() && is_secret_key(&key)
+}
+
+fn is_secret_key(lower: &str) -> bool {
     const WORDS: [&str; 10] = [
         "token",
         "secret",
@@ -204,14 +224,18 @@ fn mask_secret_segment(body: &str) -> Option<(String, bool)> {
         "credential",
         "key",
     ];
+    let signature = lower.contains("signature") || lower == "sig";
+    signature || WORDS.iter().any(|word| lower.contains(word))
+}
+
+fn mask_secret_segment(body: &str) -> Option<(String, bool)> {
     const WRAPPERS: [char; 8] = ['{', '[', '(', '"', '\'', '`', ' ', '\t'];
     let at = body.find(['=', ':'])?;
     let key_raw = &body[..at];
     let separator = &body[at..=at];
     let value = &body[at + 1..];
     let lower = key_raw.trim_matches(WRAPPERS).to_ascii_lowercase();
-    let signature = lower.contains("signature") || lower == "sig";
-    if !(signature || WORDS.iter().any(|word| lower.contains(word))) {
+    if !is_secret_key(&lower) {
         // `headers={"Authorization":`: a non-secret key wraps the real pair.
         if value.starts_with(['{', '[', '(']) {
             let (inner, continues) = mask_secret_segment(value)?;
@@ -649,6 +673,29 @@ mod tests {
         "{\n  \"code\": \"E1\",\n  \"Authorization\" : \"Bearer abc\",\n  \"stage\": \"check\"\n}",
         "{\n  \"Authorization\"\n    :\n    \"Bearer abc\"\n}",
     ];
+
+    #[test]
+    fn whitespace_separated_secret_keys_do_not_leak_the_value() {
+        for input in [
+            "token = zq9secret",
+            "api_key = zq9secret",
+            "password : zq9secret",
+            "passwd : zq9secret",
+            "secret =zq9secret",
+            "token :zq9secret",
+            r#""api-key" : "zq9secret""#,
+            "credential = zq9secret",
+            "X-Amz-Signature = zq9secret",
+        ] {
+            let out = redactor().redact(input, 1000);
+            assert!(!out.contains("zq9secret"), "{input:?} leaked in {out}");
+            assert!(out.contains("<redacted>"), "{input:?} -> {out}");
+        }
+        let kept = redactor().redact("token = zq9secret stage=check", 1000);
+        assert!(kept.ends_with("stage=check"), "{kept}");
+        let kept = redactor().redact("stage = check", 1000);
+        assert_eq!(kept, "stage = check");
+    }
 
     #[test]
     fn spaced_authorization_separators_do_not_leak_the_credential() {
