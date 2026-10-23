@@ -101,6 +101,9 @@ pub(crate) struct HelperHandoff<S: HelperSession> {
     /// Reads the enabled Explorer integration before the update. A failure
     /// keeps the ticket from being written.
     explorer: Box<dyn Fn() -> Result<Option<ExplorerTicket>, String> + Send>,
+    /// Receives the error of a failed ticket write or helper authorization
+    /// before it is turned into text, so its code and detail are recorded.
+    on_failure: Box<dyn Fn(&UpdateError) + Send>,
 }
 
 impl<S: HelperSession> HelperHandoff<S> {
@@ -109,6 +112,7 @@ impl<S: HelperSession> HelperHandoff<S> {
         coordination: Coordination,
         state_root: PathBuf,
         still_valid: Box<dyn Fn() -> Result<(), String> + Send>,
+        on_failure: Box<dyn Fn(&UpdateError) + Send>,
     ) -> Self {
         Self {
             session: Some(session),
@@ -116,6 +120,7 @@ impl<S: HelperSession> HelperHandoff<S> {
             state_root,
             still_valid,
             explorer: Box::new(capture_explorer),
+            on_failure,
         }
     }
 
@@ -187,12 +192,18 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
                 }
             },
         )
-        .map_err(|err| err.to_string())
+        .map_err(|err| {
+            (self.on_failure)(&err);
+            err.to_string()
+        })
     }
 
     fn authorize_exit(mut self: Box<Self>) -> Result<(), String> {
         match self.session.take() {
-            Some(session) => session.authorize_exit().map_err(|err| err.to_string()),
+            Some(session) => session.authorize_exit().map_err(|err| {
+                (self.on_failure)(&err);
+                err.to_string()
+            }),
             None => Err("the update helper is gone".to_owned()),
         }
     }
@@ -527,7 +538,10 @@ mod tests {
         fn authorize_exit(self) -> Result<(), UpdateError> {
             self.log.lock().unwrap().push("authorize");
             if self.fail_exit {
-                Err(UpdateError::new(ErrorCode::Io, "pipe closed"))
+                Err(UpdateError::new(
+                    ErrorCode::Io,
+                    "pipe closed (os_kind=BrokenPipe, os_error=32)",
+                ))
             } else {
                 Ok(())
             }
@@ -562,8 +576,73 @@ mod tests {
             coordination,
             dir.path().join("state"),
             Box::new(move || valid.clone()),
+            Box::new(|_| {}),
         );
         (handoff, log)
+    }
+
+    /// Makes the handoff hand every failure it reports to the returned list.
+    fn recording(
+        mut handoff: HelperHandoff<FakeSession>,
+    ) -> (HelperHandoff<FakeSession>, Arc<Mutex<Vec<UpdateError>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        handoff.on_failure = Box::new(move |err| sink.lock().unwrap().push(err.clone()));
+        (handoff, seen)
+    }
+
+    #[test]
+    fn a_failed_ticket_write_reports_its_error_and_a_success_reports_nothing() {
+        let dir = TempDir::new("handoff-ticket-failure");
+        let snapshot = RestartTicketSnapshot {
+            work_folder: None,
+            files: vec![file("a.md")],
+            active: Some(0),
+        };
+        // The state root is not bound for this transaction: the write fails.
+        let (first, _log) = handoff(&dir, false, Ok(()));
+        let (mut unbound, seen) = recording(first);
+        let text = unbound.issue_ticket(&snapshot, &|| true).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        // The permit went stale: the error that is recorded is the one returned.
+        let (second, _log) = handoff(&dir, false, Ok(()));
+        let (mut stale, seen) = recording(second);
+        let text = stale.issue_ticket(&snapshot, &|| false).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(text, seen[0].to_string());
+    }
+
+    #[test]
+    fn a_failed_authorization_reports_its_code_and_os_facts_once() {
+        let dir = TempDir::new("handoff-exit-failure");
+        let (failing, _log) = handoff(&dir, true, Ok(()));
+        let (failing, seen) = recording(failing);
+        let text = Box::new(failing).authorize_exit().unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::Io);
+        assert!(seen[0].detail.contains("os_kind=BrokenPipe, os_error=32"));
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        let (ok, _log) = handoff(&dir, false, Ok(()));
+        let (ok, seen) = recording(ok);
+        Box::new(ok).authorize_exit().unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_missing_helper_and_an_abort_report_nothing_to_the_diagnostics() {
+        let dir = TempDir::new("handoff-no-report");
+        let (idle, _log) = handoff(&dir, false, Ok(()));
+        let (idle, seen) = recording(idle);
+        Box::new(idle).abort();
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]

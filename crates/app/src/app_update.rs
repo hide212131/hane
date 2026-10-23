@@ -1207,7 +1207,17 @@ impl Inner {
             coordination,
             wiring.state_root.clone(),
             Box::new(move || inner.confirm_restart(&candidate)),
+            self.handoff_failure_sink(version),
         )))
+    }
+
+    /// Records a failure of the ticket write or the helper authorization, which
+    /// happen after `prepare_restart` returned.
+    fn handoff_failure_sink(self: &Arc<Self>, version: String) -> Box<dyn Fn(&UpdateError) + Send> {
+        let inner = Arc::clone(self);
+        Box::new(move |error| {
+            inner.prepare_failure(error, Some(&version));
+        })
     }
 
     fn snapshot(&self) -> AppUpdateSnapshot {
@@ -2194,6 +2204,33 @@ mod tests {
                 .is_ok_and(|mut entries| entries.next().is_none()),
             "the private work directory must be cleaned"
         );
+    }
+
+    #[test]
+    fn a_handoff_failure_after_prepare_is_saved_and_shown_with_its_os_facts() {
+        let dir = TempDir::new("app-update-diag-handoff");
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&Arc::new(Mutex::new(Vec::new()))),
+        );
+        assert!(!service.snapshot().diagnostics_available);
+        let sink = service.inner.handoff_failure_sink("0.27.0".to_owned());
+        sink(&UpdateError::new(
+            ErrorCode::Io,
+            "access denied (os_kind=PermissionDenied, os_error=5)",
+        ));
+        assert!(service.snapshot().diagnostics_available);
+        let saved =
+            fs::read_to_string(service.inner.config.updates_root.join("diagnostics.log")).unwrap();
+        let shared = service.diagnostics_text();
+        for text in [&saved, &shared] {
+            assert!(text.contains("stage=prepare"), "{text}");
+            assert!(text.contains("code=io"), "{text}");
+            assert!(text.contains("os_kind=PermissionDenied, os_error=5"), "{text}");
+            assert!(text.contains("candidate=0.27.0"), "{text}");
+        }
     }
 
     #[test]
