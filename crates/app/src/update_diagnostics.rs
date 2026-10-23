@@ -110,13 +110,21 @@ impl Redactor {
     /// The masked token, and whether the value of a secret key continues in
     /// the next whitespace-separated token (`token: abc`).
     fn redact_token(&self, token: &str) -> (String, bool) {
-        // A URL is handled as a whole: its query and userinfo are dropped.
         if !token.contains("://")
             && let Some(masked) = mask_secret_pair(token)
         {
             return masked;
         }
+        // A URL's query and userinfo are dropped first; secret pairs that
+        // share the token (`{"url":"https://h/x","token":"abc"}`) follow.
         let mut text = strip_url_secrets(token);
+        let mut mask_following = false;
+        if token.contains("://")
+            && let Some((masked, continues)) = mask_secret_pair(&text)
+        {
+            text = masked;
+            mask_following = continues;
+        }
         if let Some(home) = &self.home {
             text = text.replace(home.as_str(), "~");
         }
@@ -124,7 +132,7 @@ impl Redactor {
         if let Some(user) = &self.user {
             text = text.replace(user.as_str(), USER_MASK);
         }
-        (text, false)
+        (text, mask_following)
     }
 }
 
@@ -559,6 +567,30 @@ mod tests {
         assert!(out.contains("https://example.com/a/b?<redacted>"), "{out}");
         assert!(out.contains("token=<redacted>"), "{out}");
         assert!(out.contains("~/Library/x"), "{out}");
+    }
+
+    #[test]
+    fn secret_pairs_sharing_a_token_with_a_url_are_masked() {
+        let out = redactor().redact(r#"{"url":"https://h/x","token":"abc123"}"#, 1000);
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(out.contains("https://h/x"), "{out}");
+        assert!(out.contains("<redacted>"), "{out}");
+
+        let out = redactor().redact(r#"{"url":"https://u:pw@h/x","token": abc123 ok}"#, 1000);
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(!out.contains("u:pw"), "{out}");
+
+        let out = redactor().redact(r#"{"url":"https://h/x","token": abc123}"#, 1000);
+        assert!(!out.contains("abc123"), "{out}");
+    }
+
+    #[test]
+    fn url_secret_pair_value_continuing_in_next_token_is_masked() {
+        let out = redactor().redact(r#"{"url":"https://h/x","token": topsecret more}"#, 1000);
+        assert!(!out.contains("topsecret"), "{out}");
+        let out = redactor().redact(r#"https://h/x,token: topsecret ok"#, 1000);
+        assert!(!out.contains("topsecret"), "{out}");
+        assert!(out.ends_with("ok"), "{out}");
     }
 
     #[test]
