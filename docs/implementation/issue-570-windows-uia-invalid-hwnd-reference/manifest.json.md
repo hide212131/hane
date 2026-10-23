@@ -50,6 +50,13 @@
       "source_final_newline": true
     },
     {
+      "upstream_path": "LICENSE.chromium",
+      "reference_path": "docs/implementation/issue-570-windows-uia-invalid-hwnd-reference/LICENSE.chromium.md",
+      "bytes": 1559,
+      "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+      "source_final_newline": true
+    },
+    {
       "upstream_path": "LICENSE-MIT",
       "reference_path": "docs/implementation/issue-570-windows-uia-invalid-hwnd-reference/LICENSE-MIT.md",
       "bytes": 1023,

@@ -6,6 +6,7 @@
 - crate SHA-256: `106c2b961215864d1c2e703ee63269c25c4e80a577ffb2c1017b9c17dcdf83a1`
 - upstream commit: `c88605b96d04431f9c3c792464a0f2f253480e94`（`platforms/windows`）
 - ライセンス: MIT OR Apache-2.0（`LICENSE-MIT` / `LICENSE-APACHE` を保持）
+- Chromium 由来のライセンス: `src/node.rs` の Chromium 由来部分には、crate 全体の MIT OR Apache-2.0 に加えて BSD-style license（Copyright 2015 The Chromium Authors）が適用される。upstream commit `c88605b96d04431f9c3c792464a0f2f253480e94` の root `LICENSE.chromium` を `vendor/accesskit_windows/LICENSE.chromium` として同梱する。
 - 入力の正本: `docs/implementation/issue-570-windows-uia-invalid-hwnd-reference/manifest.json.md`
 
 ## 変更理由（Issue #570）
