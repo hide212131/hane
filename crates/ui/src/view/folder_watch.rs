@@ -265,7 +265,7 @@ impl EditorView {
         .detach();
     }
 
-    fn finish_work_folder_refresh(
+    pub(super) fn finish_work_folder_refresh(
         &mut self,
         generation: u64,
         request: u64,
