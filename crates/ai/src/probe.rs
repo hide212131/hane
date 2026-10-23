@@ -804,10 +804,15 @@ impl ProbeCollector {
                         classify_provider_error,
                     )))
                 } else {
-                    self.failure_cause = Some(format!(
-                        "unexpected_turn_status status={}",
-                        safe_token(status)
-                    ));
+                    // Only protocol-defined states are echoed; any other value
+                    // is untrusted and must not reach diagnostics.
+                    let status = match status {
+                        "completed" | "failed" | "interrupted" | "canceled" | "inProgress" => {
+                            status
+                        }
+                        _ => "unknown",
+                    };
+                    self.failure_cause = Some(format!("unexpected_turn_status status={status}"));
                     Some(ProbeTerminal::Failed(ProbeErrorCode::ProtocolMismatch))
                 }
             }
@@ -1104,6 +1109,23 @@ mod tests {
                 "threadId":"thread-1", "turn":{"id":"turn-1","status":"failed","error":{"message":"secret diagnostic","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":status}}}}
             }))), Some(ProbeTerminal::Failed(expected)));
         }
+    }
+
+    #[test]
+    fn unknown_turn_status_is_never_copied_into_failure_cause() {
+        let secret = "sk-proj-AbC123SecretKey";
+        let mut collector = new_collector();
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"partial"}
+        })));
+        assert_eq!(collector.observe(event(7, "turn/completed", json!({
+            "threadId":"thread-1", "turn":{"id":"turn-1","status":secret,"error":null}
+        }))), Some(ProbeTerminal::Failed(ProbeErrorCode::ProtocolMismatch)));
+        let cause = collector.failure_cause().expect("failure cause").to_owned();
+        assert!(cause.contains("unexpected_turn_status status=unknown"));
+        assert!(!cause.contains(secret));
+        assert!(!cause.contains("AbC123"));
+        assert!(!cause.contains("sk-proj"));
     }
 
     #[test]
