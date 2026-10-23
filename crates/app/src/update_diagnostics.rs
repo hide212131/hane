@@ -443,15 +443,32 @@ impl Diagnostics {
     }
 
     fn persist(&self, batch: Vec<String>) -> io::Result<()> {
-        let mut lines = self.read_persisted();
-        lines.extend(batch);
-        trim_records(&mut lines);
         if let Some(parent) = self.path.parent() {
             crate::app_update::create_private_dir(parent)?;
         }
+        // The read-modify-write below must not interleave with another Hane
+        // process sharing this file. The lock lives on a sibling file that is
+        // never replaced, so it stays valid across the atomic rename.
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())?;
+        lock.lock()?;
+        let mut lines = self.read_persisted();
+        lines.extend(batch);
+        trim_records(&mut lines);
         let mut text = lines.join("\n");
         text.push('\n');
-        durable_write(&self.path, text.as_bytes())
+        let result = durable_write(&self.path, text.as_bytes());
+        drop(lock);
+        result
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self.path.clone().into_os_string();
+        name.push(".lock");
+        PathBuf::from(name)
     }
 
     /// The saved records. An absent, oversized or unreadable file counts as
@@ -700,6 +717,66 @@ mod tests {
         assert!(past.contains("run=run-1") && !past.contains("run=run-2"));
         assert!(!report.contains("alice"));
         assert!(report.contains("[") && report.contains("install-abc"));
+    }
+
+    #[test]
+    fn persist_waits_for_the_cross_process_lock_and_keeps_foreign_records() {
+        // Real child processes are not practical in this test setup, so the
+        // lock is held through a separate file handle (the same OS lock a
+        // second process would contend on) while a writer is started.
+        let dir = TempDir::new("diag-lock");
+        let diag = std::sync::Arc::new(Diagnostics::new(dir.path(), identity("run-1"), redactor()));
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(diag.lock_path())
+            .unwrap();
+        held.lock().unwrap();
+
+        let writer = {
+            let diag = std::sync::Arc::clone(&diag);
+            std::thread::spawn(move || diag.record("check", "io", "record of run-1", None))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // The other "process" saves its record while the lock is held. A
+        // writer that ignored the lock would overwrite it with a stale read.
+        let other = dir.path().join(FILE_NAME);
+        fs::write(&other, "2000-01-01T00:00:00Z run=run-2 stage=check code=io detail=foreign\n")
+            .unwrap();
+        drop(held);
+        writer.join().unwrap();
+
+        let saved = fs::read_to_string(&other).unwrap();
+        let foreign = saved.find("run=run-2").expect("foreign record kept");
+        let own = saved.find("record of run-1").expect("own record saved");
+        assert!(foreign < own, "{saved}");
+    }
+
+    #[test]
+    fn concurrent_instances_on_one_log_keep_every_record() {
+        let dir = TempDir::new("diag-concurrent");
+        let path = dir.path().to_path_buf();
+        let handles: Vec<_> = (0..4)
+            .map(|worker| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let diag = Diagnostics::new(&path, identity(&format!("run-{worker}")), redactor());
+                    for index in 0..3 {
+                        diag.record("check", "io", &format!("w{worker} n{index}"), None);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let saved = fs::read_to_string(path.join(FILE_NAME)).unwrap();
+        for worker in 0..4 {
+            for index in 0..3 {
+                assert!(saved.contains(&format!("w{worker} n{index}")), "{saved}");
+            }
+        }
     }
 
     #[test]
