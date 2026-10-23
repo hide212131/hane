@@ -204,6 +204,11 @@ fn mask_secret_segment(body: &str) -> Option<(String, bool)> {
     let lower = key_raw.trim_matches(WRAPPERS).to_ascii_lowercase();
     let signature = lower.contains("signature") || lower == "sig";
     if !(signature || WORDS.iter().any(|word| lower.contains(word))) {
+        // `headers={"Authorization":`: a non-secret key wraps the real pair.
+        if value.starts_with(['{', '[', '(']) {
+            let (inner, continues) = mask_secret_segment(value)?;
+            return Some((format!("{key_raw}{separator}{inner}"), continues));
+        }
         return None;
     }
     let bare = value.trim_matches(|c: char| WRAPPERS.contains(&c) || "}])".contains(c));
@@ -614,6 +619,20 @@ mod tests {
         assert!(!out.contains("dXNlcjpwdw"), "{out}");
         let out = redactor().redact(r#"{"Proxy-Authorization": "Bearer abc"}"#, 1000);
         assert!(!out.contains("abc"), "{out}");
+    }
+
+    #[test]
+    fn prefixed_quoted_authorization_scheme_credentials_are_masked() {
+        let out = redactor().redact(r#"headers={"Authorization": "Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
+        let out = redactor().redact(r#"headers={"Authorization": "Basic dXNlcjpwdw=="}"#, 1000);
+        assert!(!out.contains("dXNlcjpwdw"), "{out}");
+        let out = redactor().redact(r#"headers={"Proxy-Authorization": "Basic dXNlcjpwdw=="}"#, 1000);
+        assert!(!out.contains("dXNlcjpwdw"), "{out}");
+        let out = redactor().redact(r#"headers={"Authorization":"Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
+        let out = redactor().redact(r#"data={"count": 3} ok"#, 1000);
+        assert!(out.contains(r#"data={"count": 3} ok"#), "{out}");
     }
 
     #[test]
