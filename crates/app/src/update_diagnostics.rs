@@ -721,9 +721,9 @@ mod tests {
 
     #[test]
     fn persist_waits_for_the_cross_process_lock_and_keeps_foreign_records() {
-        // Real child processes are not practical in this test setup, so the
-        // lock is held through a separate file handle (the same OS lock a
-        // second process would contend on) while a writer is started.
+        // In-process variant: the lock is held through a separate file handle
+        // while a writer thread is started. Real separate processes are
+        // covered by `independent_processes_on_one_log_keep_every_record`.
         let dir = TempDir::new("diag-lock");
         let diag = std::sync::Arc::new(Diagnostics::new(dir.path(), identity("run-1"), redactor()));
         let held = fs::OpenOptions::new()
@@ -751,6 +751,106 @@ mod tests {
         let foreign = saved.find("run=run-2").expect("foreign record kept");
         let own = saved.find("record of run-1").expect("own record saved");
         assert!(foreign < own, "{saved}");
+    }
+
+    const CHILD_DIR_ENV: &str = "HANE_DIAG_TEST_CHILD_DIR";
+    const CHILD_NAME_ENV: &str = "HANE_DIAG_TEST_CHILD_NAME";
+    const CHILD_ENTRY: &str = "diagnostics_child_process_entry";
+
+    /// Entry point of the child processes started by
+    /// `independent_processes_on_one_log_keep_every_record`. Without the
+    /// environment variables (a normal test run) it does nothing.
+    #[test]
+    fn diagnostics_child_process_entry() {
+        let (Some(dir), Some(name)) = (
+            std::env::var_os(CHILD_DIR_ENV),
+            std::env::var(CHILD_NAME_ENV).ok(),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let diag = Diagnostics::new(&dir, identity(&name), redactor());
+        // Tell the parent that this process is about to save its record.
+        fs::write(dir.join(format!("{name}.ready")), b"ready").unwrap();
+        diag.record("check", "io", &format!("record of {name}"), None);
+    }
+
+    #[test]
+    fn independent_processes_on_one_log_keep_every_record() {
+        let dir = TempDir::new("diag-processes");
+        let parent = Diagnostics::new(dir.path(), identity("parent"), redactor());
+        let log = dir.path().join(FILE_NAME);
+
+        // The parent holds the cross-process lock, so every child that tries
+        // to save has to wait for it.
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(parent.lock_path())
+            .unwrap();
+        held.lock().unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let names = ["child-a", "child-b"];
+        let mut children: Vec<_> = names
+            .iter()
+            .map(|name| {
+                std::process::Command::new(&exe)
+                    .args([CHILD_ENTRY, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_DIR_ENV, dir.path())
+                    .env(CHILD_NAME_ENV, name)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+
+        // Wait (no fixed delay) until every child reports it is saving.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        for (name, child) in names.iter().zip(children.iter_mut()) {
+            let marker = dir.path().join(format!("{name}.ready"));
+            while !marker.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "{name} exited before it was ready"
+                );
+                assert!(std::time::Instant::now() < deadline, "{name} never became ready");
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        // While the lock is held the children cannot have saved anything.
+        // Another process saves its record now; a child that ignored the lock
+        // would overwrite it from a stale read or have saved already.
+        assert!(!log.exists(), "a child saved while the lock was held");
+        fs::write(&log, "2000-01-01T00:00:00Z run=foreign stage=check code=io detail=foreign\n")
+            .unwrap();
+        drop(held);
+
+        for (name, child) in names.iter().zip(children) {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{name} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Guards against a test filter that matched nothing.
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{name} did not run the entry test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let saved = fs::read_to_string(&log).unwrap();
+        assert!(saved.contains("run=foreign"), "{saved}");
+        for name in names {
+            assert!(saved.contains(&format!("record of {name}")), "{saved}");
+        }
     }
 
     #[test]
