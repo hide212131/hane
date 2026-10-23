@@ -258,6 +258,15 @@ fn stage_failure_text(stage: &str, code: &str) -> Option<&'static str> {
         ("download", "io" | "insufficient_space") => Some(
             "ダウンロードした更新ファイルを保存できませんでした。空き容量と書き込み権限を確認してください。",
         ),
+        ("download", "hash_mismatch" | "size_mismatch") => Some(
+            "ダウンロードした更新ファイルの内容が更新情報と一致しませんでした。もう一度取得するか、手動でダウンロードしてください。",
+        ),
+        ("download", "limit_exceeded") => Some(
+            "更新ファイルが想定されたサイズの上限を超えたため、ダウンロードを中止しました。手動でダウンロードしてください。",
+        ),
+        ("download", "redirect_rejected") => Some(
+            "更新ファイルの取得先が許可されていない場所へ転送されたため、ダウンロードを中止しました。手動でダウンロードしてください。",
+        ),
         ("verify", "signature_invalid" | "identity_mismatch") => None,
         ("verify", _) => Some(
             "ダウンロードした更新ファイルを検証または展開できませんでした。もう一度取得するか、手動でダウンロードしてください。",
@@ -1630,6 +1639,24 @@ mod tests {
         let model = card_model(&input);
         assert!(model.detail.as_deref().unwrap().contains("signature_invalid"));
         assert_eq!(labels(&model), ["再試行"]);
+    }
+
+    #[test]
+    fn download_stage_integrity_and_limit_failures_explain_the_download() {
+        for code in [
+            "hash_mismatch",
+            "size_mismatch",
+            "limit_exceeded",
+            "redirect_rejected",
+        ] {
+            let mut input = snapshot(AppUpdatePhase::Failed);
+            input.error_code = Some(code.to_owned());
+            input.error_stage = Some("download".to_owned());
+            let detail = card_model(&input).detail.unwrap();
+            assert!(detail.contains("ダウンロード"), "{code}: {detail}");
+            assert!(!detail.contains("更新を確認できませんでした"), "{code}: {detail}");
+            assert!(detail.contains(code), "{code}: {detail}");
+        }
     }
 
     #[test]
