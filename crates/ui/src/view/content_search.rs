@@ -1641,6 +1641,7 @@ impl EditorView {
         self.content_search.status = ContentSearchStatus::Waiting;
         self.content_search.status_detail = Some("Work folder一覧を更新しています…".to_owned());
         let generation = self.work_folder_generation;
+        let request = self.begin_listing_request();
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
@@ -1650,6 +1651,16 @@ impl EditorView {
                 if generation != view.work_folder_generation {
                     return;
                 }
+                // A listing started after this one may already be installed.
+                // Keep it, and search it instead of leaving the UI waiting.
+                let result = if view.accept_listing_result(request) {
+                    result
+                } else {
+                    match view.work_folder.clone() {
+                        Some(current) => Ok(current),
+                        None => result,
+                    }
+                };
                 match result {
                     Ok(folder) => {
                         view.work_folder = Some(folder);

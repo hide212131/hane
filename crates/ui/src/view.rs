@@ -1027,6 +1027,9 @@ pub struct EditorView {
     /// dropped (releasing the watch) when the folder is replaced or the
     /// window closes.
     folder_watch: folder_watch::FolderWatchState,
+    /// Start order of every work folder listing scan; see
+    /// `folder_watch::ListingRequests`.
+    listing_requests: folder_watch::ListingRequests,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -1797,6 +1800,7 @@ impl EditorView {
             restoring_path: None,
             work_folder_generation: 0,
             folder_watch: folder_watch::FolderWatchState::default(),
+            listing_requests: folder_watch::ListingRequests::default(),
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -1900,6 +1904,7 @@ impl EditorView {
         // runs is still reported afterward; the previous folder's watch is
         // released here.
         self.start_folder_watch(&root, cx);
+        let request = self.begin_listing_request();
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
             let scanned = cx
@@ -1915,6 +1920,13 @@ impl EditorView {
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
+                // A listing started after this scan may already be applied
+                // for the same folder; do not overwrite it.
+                if generation == view.work_folder_generation
+                    && !view.accept_listing_result(request)
+                {
+                    return;
+                }
                 view.finish_work_folder_scan(generation, scanned, cx);
             });
         })

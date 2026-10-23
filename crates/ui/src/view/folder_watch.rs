@@ -44,6 +44,17 @@ pub(super) struct FolderWatchState {
     retry_scheduled: bool,
 }
 
+/// Orders every work folder listing request (first scan, watcher re-list, and
+/// the explicit re-list of the content search) by the moment it was started.
+/// The generation and root cannot tell two scans of the same folder apart, so
+/// a result is applied only if no request started later has already been
+/// applied; a slow older scan never overwrites a newer listing.
+#[derive(Default)]
+pub(super) struct ListingRequests {
+    started: u64,
+    applied: u64,
+}
+
 /// How long to wait before trying to attach a watch that failed. Retrying is
 /// timer-driven and never depends on a new OS notification arriving.
 const FOLDER_WATCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -64,6 +75,22 @@ impl EditorView {
                 "作業フォルダの外部変更を監視できていません（サイドバーは自動更新されません）: {error}"
             )
         })
+    }
+
+    /// Takes the next listing request number; call when a scan is started.
+    pub(super) fn begin_listing_request(&mut self) -> u64 {
+        self.listing_requests.started = self.listing_requests.started.wrapping_add(1);
+        self.listing_requests.started
+    }
+
+    /// Whether the result of listing request `request` may be applied. A
+    /// `true` answer records it, so every older request is rejected from now on.
+    pub(super) fn accept_listing_result(&mut self, request: u64) -> bool {
+        if request <= self.listing_requests.applied {
+            return false;
+        }
+        self.listing_requests.applied = request;
+        true
     }
 
     /// Starts watching `root` for the folder about to be scanned, replacing
@@ -224,6 +251,7 @@ impl EditorView {
             }
         }
         let generation = self.work_folder_generation;
+        let request = self.begin_listing_request();
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
             let result = cx
@@ -231,7 +259,7 @@ impl EditorView {
                 .spawn(async move { OsWorkFolderScanner.scan(&scan_root) })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.finish_work_folder_refresh(generation, &root, failure, result, cx);
+                view.finish_work_folder_refresh(generation, request, &root, failure, result, cx);
             });
         })
         .detach();
@@ -240,6 +268,7 @@ impl EditorView {
     fn finish_work_folder_refresh(
         &mut self,
         generation: u64,
+        request: u64,
         root: &Path,
         failure: Option<String>,
         result: std::io::Result<WorkFolder>,
@@ -256,6 +285,19 @@ impl EditorView {
             return;
         }
         self.folder_watch.refresh_running = false;
+        if !self.accept_listing_result(request) {
+            // A scan started later (or the explicit re-list of the content
+            // search) has already installed a newer listing; this older
+            // result must not overwrite it. Keep the unreported trouble for
+            // the next re-list.
+            if self.folder_watch.failure.is_none() {
+                self.folder_watch.failure = failure;
+            }
+            if self.folder_watch.refresh_pending {
+                self.refresh_work_folder_listing(cx);
+            }
+            return;
+        }
         match result {
             Ok(mut fresh) => {
                 fresh.set_sort_order(self.settings.sidebar_sort);
@@ -365,8 +407,9 @@ mod tests {
         std::fs::write(root.join("keep/B.md"), "# B\n").unwrap();
         view.update(cx, |view, cx| {
             let generation = view.work_folder_generation;
+            let request = view.begin_listing_request();
             let fresh = OsWorkFolderScanner.scan(&root);
-            view.finish_work_folder_refresh(generation, &root, None, fresh, cx);
+            view.finish_work_folder_refresh(generation, request, &root, None, fresh, cx);
         });
 
         view.read_with(cx, |view, _| {
@@ -392,8 +435,9 @@ mod tests {
         std::fs::write(root.join("External.md"), "# External\n").unwrap();
         view.update(cx, |view, cx| {
             let generation = view.work_folder_generation;
+            let request = view.begin_listing_request();
             let fresh = OsWorkFolderScanner.scan(&root);
-            view.finish_work_folder_refresh(generation, &root, None, fresh, cx);
+            view.finish_work_folder_refresh(generation, request, &root, None, fresh, cx);
         });
 
         view.read_with(cx, |view, _| {
@@ -418,12 +462,14 @@ mod tests {
             let stale_generation = view.work_folder_generation;
             view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
             // A result listed for the older generation.
+            let request = view.begin_listing_request();
             let fresh = OsWorkFolderScanner.scan(&other);
-            view.finish_work_folder_refresh(stale_generation, &other, None, fresh, cx);
+            view.finish_work_folder_refresh(stale_generation, request, &other, None, fresh, cx);
             // And one for a root that is not the current folder.
             let generation = view.work_folder_generation;
+            let request = view.begin_listing_request();
             let fresh = OsWorkFolderScanner.scan(&other);
-            view.finish_work_folder_refresh(generation, &other, None, fresh, cx);
+            view.finish_work_folder_refresh(generation, request, &other, None, fresh, cx);
         });
 
         view.read_with(cx, |view, _| {
@@ -431,6 +477,35 @@ mod tests {
         });
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_older_scan_of_the_same_folder_finishing_last_is_rejected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = watch_test_root("reordered");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            // The older scan started first but saw the folder before the
+            // external file appeared.
+            let older_request = view.begin_listing_request();
+            let older = OsWorkFolderScanner.scan(&root);
+            std::fs::write(root.join("External.md"), "# External\n").unwrap();
+            let newer_request = view.begin_listing_request();
+            let newer = OsWorkFolderScanner.scan(&root);
+
+            // The newer scan completes first, then the older one.
+            view.finish_work_folder_refresh(generation, newer_request, &root, None, newer, cx);
+            view.finish_work_folder_refresh(generation, older_request, &root, None, older, cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(file_names(view), ["External.md"]);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
@@ -444,9 +519,11 @@ mod tests {
 
         view.update(cx, |view, cx| {
             let generation = view.work_folder_generation;
+            let request = view.begin_listing_request();
             let error = Err(std::io::Error::other("boom"));
             view.finish_work_folder_refresh(
                 generation,
+                request,
                 &root,
                 Some("watch error".to_owned()),
                 error,
@@ -580,8 +657,9 @@ mod tests {
         // The scan succeeds, and the warning stays while nothing is watched.
         view.update(cx, |view, cx| {
             let generation = view.work_folder_generation;
+            let request = view.begin_listing_request();
             let fresh = OsWorkFolderScanner.scan(&root);
-            view.finish_work_folder_refresh(generation, &root, None, fresh, cx);
+            view.finish_work_folder_refresh(generation, request, &root, None, fresh, cx);
             assert_eq!(view.footer_warnings().len(), 1);
         });
 
