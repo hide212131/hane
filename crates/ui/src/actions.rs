@@ -236,6 +236,10 @@ command_actions! {
     ContentSearch ("secondary-shift-f") => content_search_action |view, window, cx| {
         view.open_content_search(window, cx);
     },
+    // Command+B / Ctrl+B. The SaveAs key (`secondary-shift-s`) is unchanged.
+    ToggleSidebar ("secondary-b") => toggle_sidebar_action |view, window, cx| {
+        view.toggle_sidebar(window, cx);
+    },
     DocumentFind ("secondary-f") => document_find_action |view, window, cx| {
         view.open_document_find(window, cx);
     },

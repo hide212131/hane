@@ -129,6 +129,7 @@ cargo run --release -p hane
 | 開く | Command + O | Ctrl + O |
 | フォルダを開く（work folder mode） | Command + Shift + O | Ctrl + Shift + O |
 | Work folder の本文を検索 | Command + Shift + F | Ctrl + Shift + F |
+| 左サイドパネルを開く / 閉じる | Command + B | Ctrl + B |
 | 保存 / 名前を付けて保存 | Command + S / Command + Shift + S | Ctrl + S / Ctrl + Shift + S |
 | 自動保存の切り替え | Command + Option + A | Ctrl + Alt + A |
 | 選択中のタブを閉じる（未保存なら確認。タブの中クリック・右クリックの「タブを閉じる」も同じ） | Command + W | Ctrl + W |
@@ -150,6 +151,8 @@ Emacs 風の Control + 英字（Control + A / E / B / F / K / Y など）は割�
 ### Work folder mode
 
 起動時にディレクトリを引数として渡すか、起動後に Command + Shift + O（Windows / Linux は Ctrl + Shift + O）でフォルダを選ぶと、その配下の Markdown 一覧が左サイドバーに表示されます。一覧からメモを選ぶと保存ダイアログを挟まずすぐ編集でき、`+` を押すとファイル名を聞かれない空のメモがその場で開きます。
+
+左サイドパネルは、パネル左上（閉じている間は本文ヘッダー左端）のボタン、または Command + B（Windows / Linux は Ctrl + B）で開閉できます。開閉は表示を切り替えるだけで、幅・選択・フィルター・本文検索の結果や本文の編集状態は保たれます。名前変更中や日本語入力の変換中は開閉されません。本文検索（Command / Ctrl + Shift + F）やフォルダを開く操作ではパネルが再表示されます。閉じている間も、設定はフッターから開けます。
 
 新規メモは最初の H1（`# ...`）がファイル名になり、自動命名対象のメモは以後 H1 を変更するとファイル名も追従します。ファイル名と H1 が最初から異なる既存の Markdown は、自動命名対象と判断されないため勝手にリネームされません。
 
