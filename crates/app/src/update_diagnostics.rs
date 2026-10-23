@@ -1,0 +1,1094 @@
+//! Local diagnostics for application update failures (Issue #553).
+//!
+//! A failed update used to leave only a short code such as `io`. This module
+//! keeps, on this machine only, a small bounded text of what failed: the
+//! stage, the code, the internal detail and the OS error facts that were
+//! available where the error was created. Nothing is sent anywhere.
+//!
+//! * Every value passes [`Redactor`] before it is stored, so the saved file and
+//!   the text shown to the user follow the same rule: URL query/userinfo,
+//!   credential-looking pairs, and user names inside paths are masked.
+//! * The record count and total size are capped, and text is cut on character
+//!   boundaries.
+//! * Each record carries the id of the run (process instance) that wrote it,
+//!   so a failure of the current run is never mixed up with records that were
+//!   left by an earlier run.
+//! * If the file cannot be written the records of this run stay in memory, and
+//!   the report says that they were not saved. Updates are never reported as
+//!   successful because of it, and nothing else is written for the log's sake.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Longest a save waits for the cross-process log lock before it fails.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+const LOCK_POLL: Duration = Duration::from_millis(10);
+
+use hane_update::error::io_detail;
+use hane_update::fsutil::durable_write;
+
+pub(crate) const FILE_NAME: &str = "diagnostics.log";
+pub(crate) const MAX_DETAIL_CHARS: usize = 400;
+pub(crate) const MAX_RECORDS: usize = 20;
+pub(crate) const MAX_FILE_BYTES: usize = 16 * 1024;
+
+const REDACTED: &str = "<redacted>";
+const USER_MASK: &str = "<user>";
+
+/// Masks what must not be stored or shared. It never decides success or
+/// failure of anything; it only rewrites text.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Redactor {
+    home: Option<String>,
+    user: Option<String>,
+}
+
+impl Redactor {
+    pub(crate) fn new(home: Option<String>, user: Option<String>) -> Self {
+        Self {
+            home: home.filter(|home| home.len() > 1),
+            user: user.filter(|user| user.chars().count() >= 3 && user != "root"),
+        }
+    }
+
+    pub(crate) fn from_environment() -> Self {
+        let var = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        };
+        Self::new(var(&["HOME", "USERPROFILE"]), var(&["USER", "USERNAME"]))
+    }
+
+    /// One line of at most `max_chars` characters (plus an ellipsis).
+    pub(crate) fn redact(&self, text: &str, max_chars: usize) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let mut mask_next = 0_u8;
+        // HOME may contain whitespace (`/Users/Jane Doe`), so it is replaced
+        // in the whole text before the text is split into tokens.
+        let text = match &self.home {
+            Some(home) => text.replace(home.as_str(), "~"),
+            None => text.to_owned(),
+        };
+        // The user name may contain whitespace too (`Jane Doe`).
+        let text = match &self.user {
+            Some(user) => text.replace(user.as_str(), USER_MASK),
+            None => text,
+        };
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        for (index, token) in tokens.iter().copied().enumerate() {
+            if mask_next > 0 {
+                // A stand-alone separator (`Authorization = Bearer abc`,
+                // `"Authorization" : "Bearer abc"`) is not the credential.
+                if token.chars().all(|c| c == '=' || c == ':') {
+                    out.push(token.to_owned());
+                    continue;
+                }
+                mask_next -= 1;
+                out.push(REDACTED.to_owned());
+                continue;
+            }
+            // JSON quotes / brackets and the separator may wrap the key.
+            let key = token
+                .trim_matches(|c: char| "{[(\"'`}]):=".contains(c))
+                .to_ascii_lowercase();
+            if key.ends_with("authorization") {
+                mask_next = 2;
+            } else if matches!(key.as_str(), "bearer" | "basic") {
+                mask_next = 1;
+            }
+            let (text, mask_following) = self.redact_token(token);
+            if mask_next == 0 {
+                // `Proxy-Authorization: Bearer abc`: the scheme is its own
+                // token, so the credential is the one after it.
+                let scheme_next = tokens
+                    .get(index + 1)
+                    .is_some_and(|next| is_auth_scheme(next));
+                if mask_following {
+                    mask_next = if scheme_next { 2 } else { 1 };
+                } else if !token.contains("://") && secret_pair_value_is_scheme(token) {
+                    // `authorization:bearer abc`: the scheme sits inside the pair.
+                    mask_next = 1;
+                } else if tokens
+                    .get(index + 1)
+                    .is_some_and(|next| next.starts_with(['=', ':']))
+                    && is_bare_secret_key(token)
+                {
+                    // `token = abc` / `api_key : abc` / `token =abc`: the key,
+                    // the separator and the value are separate tokens.
+                    mask_next = 1;
+                }
+            }
+            out.push(text);
+        }
+        truncate_chars(&out.join(" "), max_chars)
+    }
+
+    /// The masked token, and whether the value of a secret key continues in
+    /// the next whitespace-separated token (`token: abc`).
+    fn redact_token(&self, token: &str) -> (String, bool) {
+        // A URL's query and userinfo are dropped first; secret pairs that
+        // share the token (`{"url":"https://h/x","token":"abc"}`) follow.
+        // Home / user path masking always runs afterwards, so a path sharing
+        // a token with a secret pair is masked too.
+        let mut text = strip_url_secrets(token);
+        let mut mask_following = false;
+        if let Some((masked, continues)) = mask_secret_pair(&text) {
+            text = masked;
+            mask_following = continues;
+        }
+        if let Some(home) = &self.home {
+            text = text.replace(home.as_str(), "~");
+        }
+        let mut text = mask_user_segments(&text);
+        if let Some(user) = &self.user {
+            text = text.replace(user.as_str(), USER_MASK);
+        }
+        (text, mask_following)
+    }
+}
+
+fn is_auth_scheme(word: &str) -> bool {
+    const SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "ntlm"];
+    // JSON / bracket wrappers (`"Bearer`) must not hide the scheme.
+    let lower = word
+        .trim_matches(|c: char| "{[(\"'`}]) \t".contains(c))
+        .to_ascii_lowercase();
+    SCHEMES.contains(&lower.as_str())
+}
+
+/// Whether the last secret pair of a token has only an auth scheme as its
+/// value (`authorization:bearer`), so the credential is the next token.
+fn secret_pair_value_is_scheme(token: &str) -> bool {
+    let Some(segment) = token.rsplit([',', '&', ';']).next() else {
+        return false;
+    };
+    let Some(at) = segment.find(['=', ':']) else {
+        return false;
+    };
+    let Some((_, continues)) = mask_secret_segment(segment) else {
+        return false;
+    };
+    let value = segment[at + 1..]
+        .trim_matches(|c: char| "{[(\"'`}]) \t".contains(c));
+    !continues && is_auth_scheme(value)
+}
+
+/// Masks every `key=value` / `key:value` / `"key":"value"` pair of a token
+/// whose key looks secret. Pairs are split on `,` `&` `;`.
+fn mask_secret_pair(token: &str) -> Option<(String, bool)> {
+    let mut out = String::new();
+    let mut changed = false;
+    let mut mask_following = false;
+    for segment in token.split_inclusive([',', '&', ';']) {
+        let body = segment.trim_end_matches([',', '&', ';']);
+        let delimiter = &segment[body.len()..];
+        match mask_secret_segment(body) {
+            Some((masked, continues)) => {
+                changed = true;
+                mask_following = continues && delimiter.is_empty();
+                out.push_str(&masked);
+            }
+            None => out.push_str(body),
+        }
+        out.push_str(delimiter);
+    }
+    changed.then_some((out, mask_following))
+}
+
+/// Whether a token without its own separator is a secret key name
+/// (`token`, `"api_key"`), so a separate `=` / `:` token may follow it.
+fn is_bare_secret_key(token: &str) -> bool {
+    if token.contains(['=', ':']) {
+        return false;
+    }
+    let key = token
+        .trim_matches(|c: char| "{[(\"'`}]) \t".contains(c))
+        .to_ascii_lowercase();
+    !key.is_empty() && is_secret_key(&key)
+}
+
+fn is_secret_key(lower: &str) -> bool {
+    const WORDS: [&str; 10] = [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "apikey",
+        "api_key",
+        "api-key",
+        "auth",
+        "credential",
+        "key",
+    ];
+    let signature = lower.contains("signature") || lower == "sig";
+    signature || WORDS.iter().any(|word| lower.contains(word))
+}
+
+fn mask_secret_segment(body: &str) -> Option<(String, bool)> {
+    const WRAPPERS: [char; 8] = ['{', '[', '(', '"', '\'', '`', ' ', '\t'];
+    let at = body.find(['=', ':'])?;
+    let key_raw = &body[..at];
+    let separator = &body[at..=at];
+    let value = &body[at + 1..];
+    let lower = key_raw.trim_matches(WRAPPERS).to_ascii_lowercase();
+    if !is_secret_key(&lower) {
+        // `headers={"Authorization":`: a non-secret key wraps the real pair.
+        if value.starts_with(['{', '[', '(']) {
+            let (inner, continues) = mask_secret_segment(value)?;
+            return Some((format!("{key_raw}{separator}{inner}"), continues));
+        }
+        return None;
+    }
+    let bare = value.trim_matches(|c: char| WRAPPERS.contains(&c) || "}])".contains(c));
+    if bare.is_empty() {
+        // `token:` / `"token":` — the value is the next token.
+        return Some((body.to_owned(), true));
+    }
+    // Keep closing brackets so the surrounding structure stays readable.
+    let closers: String = value
+        .chars()
+        .rev()
+        .take_while(|c| "}])\"'`".contains(*c))
+        .filter(|c| "}])".contains(*c))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    // An opening quote without its closing one: the value has spaces.
+    let unterminated = value
+        .trim_start_matches(['{', '[', '('])
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\''))
+        .is_some_and(|quote| value.matches(quote).count() < 2);
+    Some((
+        format!("{key_raw}{separator}{REDACTED}{closers}"),
+        unterminated,
+    ))
+}
+
+/// Drops `user:password@` and everything after `?` or `#` of a URL.
+fn strip_url_secrets(token: &str) -> String {
+    let Some(sep) = token.find("://") else {
+        return token.to_owned();
+    };
+    let (head, rest) = token.split_at(sep + 3);
+    let cut = rest.find(['?', '#']);
+    let (rest, had_query) = match cut {
+        Some(index) => (&rest[..index], true),
+        None => (rest, false),
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let suffix = if had_query { "?<redacted>" } else { "" };
+    format!("{head}{host}{path}{suffix}")
+}
+
+/// Replaces the segment after `/Users/`, `/home/` and the Windows forms.
+fn mask_user_segments(text: &str) -> String {
+    let mut out = text.to_owned();
+    for marker in ["/Users/", "/home/", "\\Users\\", "\\users\\"] {
+        let mut from = 0;
+        while let Some(found) = out[from..].find(marker) {
+            let start = from + found + marker.len();
+            let end = out[start..]
+                .find(['/', '\\'])
+                .map_or(out.len(), |index| start + index);
+            out.replace_range(start..end, USER_MASK);
+            from = start + USER_MASK.len();
+        }
+    }
+    out
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// A stable, non-reversible short id, so redacted paths still tell two
+/// installs or state directories apart.
+pub(crate) fn short_id(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")[..12].to_owned()
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix time.
+pub(crate) fn iso_utc(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// Keeps the newest records within the count and byte caps.
+fn trim_records(lines: &mut Vec<String>) {
+    while lines.len() > 1
+        && (lines.len() > MAX_RECORDS
+            || lines.iter().map(|line| line.len() + 1).sum::<usize>() > MAX_FILE_BYTES)
+    {
+        lines.remove(0);
+    }
+}
+
+/// Who is writing: enough to tell several Hane processes and state
+/// directories apart without the (redacted) paths.
+pub(crate) struct Identity {
+    /// Unique per service instance; marks which run wrote a record.
+    pub run: String,
+    pub pid: u32,
+    pub exe: String,
+    pub install: String,
+    pub state: String,
+    pub version: String,
+}
+
+#[derive(Default)]
+struct Inner {
+    /// Records of this run, kept even when they cannot be saved.
+    session: Vec<String>,
+    /// Records not yet written to the file.
+    unsaved: Vec<String>,
+    persist_error: Option<String>,
+}
+
+pub(crate) struct Diagnostics {
+    path: PathBuf,
+    identity: Identity,
+    redactor: Redactor,
+    /// Whether the file held records from an earlier run when this run began.
+    /// It only makes the report reachable; it never describes a current failure.
+    has_past: bool,
+    inner: Mutex<Inner>,
+    /// Serialises file writes without holding `inner` during file I/O.
+    io: Mutex<()>,
+}
+
+impl Diagnostics {
+    pub(crate) fn new(dir: &Path, identity: Identity, redactor: Redactor) -> Self {
+        let mut diag = Self {
+            path: dir.join(FILE_NAME),
+            identity,
+            redactor,
+            has_past: false,
+            inner: Mutex::new(Inner::default()),
+            io: Mutex::new(()),
+        };
+        // Read once here (bounded by the file size cap), never per snapshot.
+        diag.has_past = !diag.read_persisted().is_empty();
+        diag
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds a record in memory only (cheap; safe under another lock). Call
+    /// [`Self::flush`] afterwards, outside any lock, to save it.
+    pub(crate) fn note(
+        &self,
+        stage: &str,
+        code: &str,
+        detail: &str,
+        candidate_version: Option<&str>,
+    ) {
+        let line = format!(
+            "{} run={} stage={} code={} version={} candidate={} detail={}",
+            iso_utc(now_unix()),
+            self.identity.run,
+            self.redactor.redact(stage, 40),
+            self.redactor.redact(code, 40),
+            self.redactor.redact(&self.identity.version, 40),
+            candidate_version.map_or_else(|| "-".to_owned(), |v| self.redactor.redact(v, 40)),
+            self.redactor.redact(detail, MAX_DETAIL_CHARS),
+        );
+        let mut inner = self.lock();
+        inner.session.push(line.clone());
+        trim_records(&mut inner.session);
+        inner.unsaved.push(line);
+    }
+
+    /// Writes the records added since the last flush. A failure is remembered
+    /// for the report; it never affects the update itself.
+    pub(crate) fn flush(&self) {
+        let _io = self.io.lock().unwrap_or_else(PoisonError::into_inner);
+        let batch = std::mem::take(&mut self.lock().unsaved);
+        if batch.is_empty() {
+            return;
+        }
+        let result = self.persist(batch.clone());
+        let mut inner = self.lock();
+        match result {
+            Ok(()) => inner.persist_error = None,
+            Err(error) => {
+                // Put the batch back ahead of records added meanwhile, so a
+                // later flush retries it in chronological order.
+                let mut restored = batch;
+                restored.append(&mut inner.unsaved);
+                trim_records(&mut restored);
+                inner.unsaved = restored;
+                inner.persist_error =
+                    Some(self.redactor.redact(&io_detail(&error), MAX_DETAIL_CHARS));
+            }
+        }
+    }
+
+    pub(crate) fn record(
+        &self,
+        stage: &str,
+        code: &str,
+        detail: &str,
+        candidate_version: Option<&str>,
+    ) {
+        self.note(stage, code, detail, candidate_version);
+        self.flush();
+    }
+
+    /// Whether there is anything to show: records of this run, or records an
+    /// earlier run saved (listed separately in the report).
+    pub(crate) fn has_records(&self) -> bool {
+        self.has_past || !self.lock().session.is_empty()
+    }
+
+    fn persist(&self, batch: Vec<String>) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            crate::app_update::create_private_dir(parent)?;
+        }
+        // The read-modify-write below must not interleave with another Hane
+        // process sharing this file. The lock lives on a sibling file that is
+        // never replaced, so it stays valid across the atomic rename.
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())?;
+        // Never wait forever: this runs on the UI thread, and another Hane
+        // holding the lock must not freeze editing. A timeout is a save
+        // failure, so the batch returns to `unsaved` and a later flush retries.
+        let started = std::time::Instant::now();
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= LOCK_WAIT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "diagnostics log is locked by another process",
+                        ));
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+        let mut lines = self.read_persisted();
+        lines.extend(batch);
+        trim_records(&mut lines);
+        let mut text = lines.join("\n");
+        text.push('\n');
+        let result = durable_write(&self.path, text.as_bytes());
+        drop(lock);
+        result
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self.path.clone().into_os_string();
+        name.push(".lock");
+        PathBuf::from(name)
+    }
+
+    /// The saved records. An absent, oversized or unreadable file counts as
+    /// empty; it is replaced by the next successful save.
+    fn read_persisted(&self) -> Vec<String> {
+        match fs::metadata(&self.path) {
+            Ok(meta) if meta.is_file() && meta.len() <= 2 * MAX_FILE_BYTES as u64 => {}
+            _ => return Vec::new(),
+        }
+        fs::read(&self.path)
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The text the user can open or copy. Records of this run and records
+    /// left by earlier runs are listed separately.
+    pub(crate) fn report(&self) -> String {
+        let (session, persist_error) = {
+            let inner = self.lock();
+            (inner.session.clone(), inner.persist_error.clone())
+        };
+        let past: Vec<String> = self
+            .read_persisted()
+            .into_iter()
+            .filter(|line| line_run(line) != Some(self.identity.run.as_str()))
+            .collect();
+        let identity = &self.identity;
+        let mut out = String::new();
+        out.push_str("Hane 更新の診断情報\n");
+        out.push_str(&format!("作成: {}\n", iso_utc(now_unix())));
+        out.push_str(&format!("Hane: {}\n", identity.version));
+        out.push_str(&format!("run: {} (PID {})\n", identity.run, identity.pid));
+        out.push_str(&format!(
+            "実行パス: {} [{}]\n",
+            self.redactor.redact(&identity.exe, 300),
+            short_id(&identity.exe)
+        ));
+        out.push_str(&format!("install: {}\n", identity.install));
+        out.push_str(&format!("state: {}\n", identity.state));
+        let saved_path = self.redactor.redact(&self.path.display().to_string(), 300);
+        match (&persist_error, session.is_empty()) {
+            (Some(reason), _) => out.push_str(&format!(
+                "診断の保存: できませんでした ({reason})。下はこの起動中の記録のみで、再起動すると失われます。\n"
+            )),
+            (None, true) => out.push_str("診断の保存: この起動で記録された失敗はありません\n"),
+            (None, false) => out.push_str(&format!("診断の保存: 保存済み ({saved_path})\n")),
+        }
+        out.push_str("\n## この起動の記録\n");
+        if session.is_empty() {
+            out.push_str("(なし)\n");
+        }
+        for line in &session {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("\n## 以前の起動の記録 (現在の失敗ではありません)\n");
+        if past.is_empty() {
+            out.push_str("(なし)\n");
+        }
+        for line in &past {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+fn line_run(line: &str) -> Option<&str> {
+    line.split_whitespace().nth(1)?.strip_prefix("run=")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hane_update::testing::TempDir;
+
+    fn identity(run: &str) -> Identity {
+        Identity {
+            run: run.to_owned(),
+            pid: 4242,
+            exe: "/Users/alice/Apps/Hane.app/Contents/MacOS/hane".to_owned(),
+            install: "install-abc".to_owned(),
+            state: "state-def".to_owned(),
+            version: "0.26.0".to_owned(),
+        }
+    }
+
+    fn redactor() -> Redactor {
+        Redactor::new(Some("/Users/alice".to_owned()), Some("alice".to_owned()))
+    }
+
+    #[test]
+    fn iso_utc_formats_known_instants() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn urls_credentials_and_user_paths_are_masked() {
+        let text = "GET https://user:pw@example.com/a/b?X-Amz-Signature=abc&t=1#frag failed \
+                    token=sekret Authorization: Bearer abc.def \
+                    /Users/alice/Library/x C:\\Users\\bob\\AppData";
+        let out = redactor().redact(text, 1000);
+        for leak in ["user:pw", "X-Amz", "abc&t", "sekret", "abc.def", "alice", "bob"] {
+            assert!(!out.contains(leak), "{leak} leaked in {out}");
+        }
+        assert!(out.contains("https://example.com/a/b?<redacted>"), "{out}");
+        assert!(out.contains("token=<redacted>"), "{out}");
+        assert!(out.contains("~/Library/x"), "{out}");
+    }
+
+    #[test]
+    fn quoted_authorization_scheme_credentials_are_masked() {
+        let out = redactor().redact(r#"{"Authorization": "Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
+        let out = redactor().redact(r#"{"Authorization": "Basic dXNlcjpwdw=="}"#, 1000);
+        assert!(!out.contains("dXNlcjpwdw"), "{out}");
+        let out = redactor().redact(r#"{"Proxy-Authorization": "Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
+    }
+
+    #[test]
+    fn prefixed_quoted_authorization_scheme_credentials_are_masked() {
+        let out = redactor().redact(r#"headers={"Authorization": "Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
+        let out = redactor().redact(r#"headers={"Authorization": "Basic dXNlcjpwdw=="}"#, 1000);
+        assert!(!out.contains("dXNlcjpwdw"), "{out}");
+        let out = redactor().redact(r#"headers={"Proxy-Authorization": "Basic dXNlcjpwdw=="}"#, 1000);
+        assert!(!out.contains("dXNlcjpwdw"), "{out}");
+        let out = redactor().redact(r#"headers={"Authorization":"Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
+        let out = redactor().redact(r#"data={"count": 3} ok"#, 1000);
+        assert!(out.contains(r#"data={"count": 3} ok"#), "{out}");
+    }
+
+    const SPACED_AUTHORIZATION_CASES: [&str; 4] = [
+        "Authorization = Bearer abc",
+        r#""Authorization" : "Bearer abc""#,
+        "{\n  \"code\": \"E1\",\n  \"Authorization\" : \"Bearer abc\",\n  \"stage\": \"check\"\n}",
+        "{\n  \"Authorization\"\n    :\n    \"Bearer abc\"\n}",
+    ];
+
+    #[test]
+    fn whitespace_separated_secret_keys_do_not_leak_the_value() {
+        for input in [
+            "token = zq9secret",
+            "api_key = zq9secret",
+            "password : zq9secret",
+            "passwd : zq9secret",
+            "secret =zq9secret",
+            "token :zq9secret",
+            r#""api-key" : "zq9secret""#,
+            "credential = zq9secret",
+            "X-Amz-Signature = zq9secret",
+        ] {
+            let out = redactor().redact(input, 1000);
+            assert!(!out.contains("zq9secret"), "{input:?} leaked in {out}");
+            assert!(out.contains("<redacted>"), "{input:?} -> {out}");
+        }
+        let kept = redactor().redact("token = zq9secret stage=check", 1000);
+        assert!(kept.ends_with("stage=check"), "{kept}");
+        let kept = redactor().redact("stage = check", 1000);
+        assert_eq!(kept, "stage = check");
+    }
+
+    #[test]
+    fn spaced_authorization_separators_do_not_leak_the_credential() {
+        for input in SPACED_AUTHORIZATION_CASES {
+            let out = redactor().redact(input, 1000);
+            assert!(!out.contains("abc"), "{input:?} leaked in {out}");
+        }
+        let kept = redactor().redact("Authorization = Bearer abc stage=check", 1000);
+        assert!(kept.ends_with("stage=check"), "{kept}");
+    }
+
+    #[test]
+    fn spaced_authorization_is_masked_in_the_log_and_the_report() {
+        let dir = TempDir::new("diag-spaced-auth");
+        let diag = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        for input in SPACED_AUTHORIZATION_CASES {
+            // The test identity's install id contains "abc", so the
+            // credential uses a distinct marker here.
+            diag.record("check", "http", &input.replace("abc", "zq9cred"), None);
+        }
+        let saved = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(saved.contains("<redacted>"), "{saved}");
+        assert!(!saved.contains("zq9cred"), "{saved}");
+        let report = diag.report();
+        assert!(!report.contains("zq9cred"), "{report}");
+        let restarted = Diagnostics::new(dir.path(), identity("run-2"), redactor());
+        assert!(!restarted.report().contains("zq9cred"));
+    }
+
+    #[test]
+    fn user_paths_sharing_a_token_with_a_secret_pair_are_masked() {
+        let out = Redactor::new(None, None).redact(r#"{"path":"/Users/jane/Doc","token":"abc"}"#, 1000);
+        assert!(!out.contains("jane"), "{out}");
+        assert!(!out.contains("abc"), "{out}");
+    }
+
+    #[test]
+    fn secret_pairs_sharing_a_token_with_a_url_are_masked() {
+        let out = redactor().redact(r#"{"url":"https://h/x","token":"abc123"}"#, 1000);
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(out.contains("https://h/x"), "{out}");
+        assert!(out.contains("<redacted>"), "{out}");
+
+        let out = redactor().redact(r#"{"url":"https://u:pw@h/x","token": abc123 ok}"#, 1000);
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(!out.contains("u:pw"), "{out}");
+
+        let out = redactor().redact(r#"{"url":"https://h/x","token": abc123}"#, 1000);
+        assert!(!out.contains("abc123"), "{out}");
+    }
+
+    #[test]
+    fn url_secret_pair_value_continuing_in_next_token_is_masked() {
+        let out = redactor().redact(r#"{"url":"https://h/x","token": topsecret more}"#, 1000);
+        assert!(!out.contains("topsecret"), "{out}");
+        let out = redactor().redact(r#"https://h/x,token: topsecret ok"#, 1000);
+        assert!(!out.contains("topsecret"), "{out}");
+        assert!(out.ends_with("ok"), "{out}");
+    }
+
+    #[test]
+    fn home_with_whitespace_is_masked_as_a_whole() {
+        let redactor = Redactor::new(Some("/Users/Jane Doe".to_owned()), None);
+        let out = redactor.redact(
+            "read /Users/Jane Doe/Library/x failed, cwd=/Users/Jane Doe token=sekret",
+            1000,
+        );
+        for leak in ["Jane", "Doe", "/Users"] {
+            assert!(!out.contains(leak), "{leak} leaked in {out}");
+        }
+        assert!(out.contains("~/Library/x failed"), "{out}");
+        assert!(out.contains("token=<redacted>"), "{out}");
+        assert!(!out.contains("sekret"), "{out}");
+    }
+
+    #[test]
+    fn user_with_whitespace_is_masked_as_a_whole() {
+        let redactor = Redactor::new(None, Some("Jane Doe".to_owned()));
+        let out = redactor.redact(
+            "read /Users/Jane Doe/Library/x failed, owner=Jane Doe token=sekret",
+            1000,
+        );
+        for leak in ["Jane", "Doe", "sekret"] {
+            assert!(!out.contains(leak), "{leak} leaked in {out}");
+        }
+        assert!(out.contains("failed,"), "{out}");
+        assert!(out.contains("token=<redacted>"), "{out}");
+    }
+
+    #[test]
+    fn auth_scheme_credentials_are_masked_after_header_keys() {
+        let cases = [
+            "Proxy-Authorization: Bearer abc",
+            "authorization:bearer abc",
+            "Proxy-Authorization: basic abc",
+            "token: Bearer abc",
+            "Authorization: Bearer abc",
+        ];
+        for input in cases {
+            let out = redactor().redact(input, 1000);
+            assert!(!out.contains("abc"), "{input} leaked in {out}");
+        }
+        let kept = redactor().redact("Proxy-Authorization: Bearer abc stage=check", 1000);
+        assert!(kept.ends_with("stage=check"), "{kept}");
+    }
+
+    #[test]
+    fn colon_and_json_style_secrets_are_masked() {
+        let cases: [(&str, &str); 7] = [
+            ("token:abc123", "token:<redacted>"),
+            ("token: abc123 next", "token: <redacted> next"),
+            ("\"token\":\"abc123\"", "\"token\":<redacted>"),
+            ("\"token\": \"abc123\" ok", "\"token\": <redacted> ok"),
+            ("{\"authToken\":\"abc123\"}", "{\"authToken\":<redacted>}"),
+            (
+                "{\"code\":\"E1\",\"password\":\"abc123\",\"stage\":\"check\"}",
+                "{\"code\":\"E1\",\"password\":<redacted>,\"stage\":\"check\"}",
+            ),
+            ("a=1&token=abc123&b=2", "a=1&token=<redacted>&b=2"),
+        ];
+        for (input, expected) in cases {
+            let out = redactor().redact(input, 1000);
+            assert_eq!(out, expected, "{input}");
+            assert!(!out.contains("abc123"), "leaked in {out}");
+        }
+        let plain = redactor().redact("stage=check code:E1 12:30:45", 1000);
+        assert_eq!(plain, "stage=check code:E1 12:30:45");
+    }
+
+    #[test]
+    fn long_japanese_text_is_cut_on_character_boundaries() {
+        let text = "あ".repeat(1000);
+        let out = redactor().redact(&text, MAX_DETAIL_CHARS);
+        assert_eq!(out.chars().count(), MAX_DETAIL_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn os_facts_are_kept_and_absent_numbers_are_not_invented() {
+        let with_raw = io_detail(&io::Error::from_raw_os_error(2));
+        assert!(with_raw.contains("os_error=2"), "{with_raw}");
+        let without = io_detail(&io::Error::other("custom"));
+        assert!(without.contains("os_error=none"), "{without}");
+    }
+
+    #[test]
+    fn records_are_saved_bounded_and_separated_by_run() {
+        let dir = TempDir::new("diag-bounded");
+        let first = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        for index in 0..(MAX_RECORDS * 3) {
+            first.record("check", "io", &format!("failure {index} {}", "あ".repeat(380)), None);
+        }
+        let saved = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(saved.len() <= MAX_FILE_BYTES, "{}", saved.len());
+        assert!(saved.lines().count() <= MAX_RECORDS);
+        assert!(saved.contains("failure 59"));
+        assert!(!saved.contains("failure 0 "));
+
+        // A later run sees the earlier records only as past records.
+        let second = Diagnostics::new(dir.path(), identity("run-2"), redactor());
+        second.record("download", "hash_mismatch", "mismatch", Some("0.27.0"));
+        let report = second.report();
+        let (current, past) = report.split_once("## 以前の起動の記録").unwrap();
+        assert!(current.contains("run=run-2") && !current.contains("run=run-1"));
+        assert!(past.contains("run=run-1") && !past.contains("run=run-2"));
+        assert!(!report.contains("alice"));
+        assert!(report.contains("[") && report.contains("install-abc"));
+    }
+
+    #[test]
+    fn persist_waits_for_the_cross_process_lock_and_keeps_foreign_records() {
+        // In-process variant: the lock is held through a separate file handle
+        // while a writer thread is started. Real separate processes are
+        // covered by `independent_processes_on_one_log_keep_every_record`.
+        let dir = TempDir::new("diag-lock");
+        let diag = std::sync::Arc::new(Diagnostics::new(dir.path(), identity("run-1"), redactor()));
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(diag.lock_path())
+            .unwrap();
+        held.lock().unwrap();
+
+        let writer = {
+            let diag = std::sync::Arc::clone(&diag);
+            std::thread::spawn(move || diag.record("check", "io", "record of run-1", None))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // The other "process" saves its record while the lock is held. A
+        // writer that ignored the lock would overwrite it with a stale read.
+        let other = dir.path().join(FILE_NAME);
+        fs::write(&other, "2000-01-01T00:00:00Z run=run-2 stage=check code=io detail=foreign\n")
+            .unwrap();
+        drop(held);
+        writer.join().unwrap();
+
+        let saved = fs::read_to_string(&other).unwrap();
+        let foreign = saved.find("run=run-2").expect("foreign record kept");
+        let own = saved.find("record of run-1").expect("own record saved");
+        assert!(foreign < own, "{saved}");
+    }
+
+    #[test]
+    fn flush_gives_up_on_a_held_lock_and_retries_unsaved_records_later() {
+        let dir = TempDir::new("diag-lock-timeout");
+        let diag = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(diag.lock_path())
+            .unwrap();
+        held.lock().unwrap();
+
+        let started = std::time::Instant::now();
+        diag.record("check", "io", "record while locked", None);
+        assert!(
+            started.elapsed() < LOCK_WAIT + std::time::Duration::from_secs(10),
+            "flush waited too long for the lock"
+        );
+        assert!(!dir.path().join(FILE_NAME).exists());
+        assert_eq!(diag.lock().unsaved.len(), 1);
+        assert!(diag.lock().persist_error.is_some());
+
+        drop(held);
+        diag.flush();
+        let saved = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(saved.contains("record while locked"), "{saved}");
+        assert!(diag.lock().unsaved.is_empty());
+        assert!(diag.lock().persist_error.is_none());
+    }
+
+    const CHILD_DIR_ENV: &str = "HANE_DIAG_TEST_CHILD_DIR";
+    const CHILD_NAME_ENV: &str = "HANE_DIAG_TEST_CHILD_NAME";
+    const CHILD_ENTRY: &str = "diagnostics_child_process_entry";
+
+    /// Entry point of the child processes started by
+    /// `independent_processes_on_one_log_keep_every_record`. Without the
+    /// environment variables (a normal test run) it does nothing.
+    #[test]
+    fn diagnostics_child_process_entry() {
+        let (Some(dir), Some(name)) = (
+            std::env::var_os(CHILD_DIR_ENV),
+            std::env::var(CHILD_NAME_ENV).ok(),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let diag = Diagnostics::new(&dir, identity(&name), redactor());
+        // Tell the parent that this process is about to save its record.
+        fs::write(dir.join(format!("{name}.ready")), b"ready").unwrap();
+        diag.record("check", "io", &format!("record of {name}"), None);
+    }
+
+    #[test]
+    fn independent_processes_on_one_log_keep_every_record() {
+        let dir = TempDir::new("diag-processes");
+        let parent = Diagnostics::new(dir.path(), identity("parent"), redactor());
+        let log = dir.path().join(FILE_NAME);
+
+        // The parent holds the cross-process lock, so every child that tries
+        // to save has to wait for it.
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(parent.lock_path())
+            .unwrap();
+        held.lock().unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let names = ["child-a", "child-b"];
+        let mut children: Vec<_> = names
+            .iter()
+            .map(|name| {
+                std::process::Command::new(&exe)
+                    .args([CHILD_ENTRY, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_DIR_ENV, dir.path())
+                    .env(CHILD_NAME_ENV, name)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+
+        // Wait (no fixed delay) until every child reports it is saving.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        for (name, child) in names.iter().zip(children.iter_mut()) {
+            let marker = dir.path().join(format!("{name}.ready"));
+            while !marker.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "{name} exited before it was ready"
+                );
+                assert!(std::time::Instant::now() < deadline, "{name} never became ready");
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        // While the lock is held the children cannot have saved anything.
+        // Another process saves its record now; a child that ignored the lock
+        // would overwrite it from a stale read or have saved already.
+        assert!(!log.exists(), "a child saved while the lock was held");
+        fs::write(&log, "2000-01-01T00:00:00Z run=foreign stage=check code=io detail=foreign\n")
+            .unwrap();
+        drop(held);
+
+        for (name, child) in names.iter().zip(children) {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{name} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Guards against a test filter that matched nothing.
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{name} did not run the entry test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let saved = fs::read_to_string(&log).unwrap();
+        assert!(saved.contains("run=foreign"), "{saved}");
+        for name in names {
+            assert!(saved.contains(&format!("record of {name}")), "{saved}");
+        }
+    }
+
+    #[test]
+    fn concurrent_instances_on_one_log_keep_every_record() {
+        let dir = TempDir::new("diag-concurrent");
+        let path = dir.path().to_path_buf();
+        let handles: Vec<_> = (0..4)
+            .map(|worker| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let diag = Diagnostics::new(&path, identity(&format!("run-{worker}")), redactor());
+                    for index in 0..3 {
+                        diag.record("check", "io", &format!("w{worker} n{index}"), None);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let saved = fs::read_to_string(path.join(FILE_NAME)).unwrap();
+        for worker in 0..4 {
+            for index in 0..3 {
+                assert!(saved.contains(&format!("w{worker} n{index}")), "{saved}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_unwritable_log_keeps_this_runs_records_and_says_so() {
+        let dir = TempDir::new("diag-unwritable");
+        // A directory where the file belongs makes only the log unwritable.
+        fs::create_dir_all(dir.path().join(FILE_NAME)).unwrap();
+        let diag = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        diag.record("publish", "io", "rename failed", None);
+        assert!(diag.has_records());
+        let report = diag.report();
+        assert!(report.contains("保存: できませんでした"), "{report}");
+        assert!(report.contains("rename failed"));
+    }
+
+    #[test]
+    fn a_failed_batch_is_retried_in_order_and_clears_the_error_on_success() {
+        let dir = TempDir::new("diag-retry");
+        fs::create_dir_all(dir.path().join(FILE_NAME)).unwrap();
+        let diag = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        diag.record("check", "io", "first failure", None);
+        assert!(diag.report().contains("保存: できませんでした"));
+        diag.record("check", "io", "second failure", None);
+        assert!(diag.report().contains("保存: できませんでした"));
+
+        fs::remove_dir_all(dir.path().join(FILE_NAME)).unwrap();
+        diag.record("check", "io", "third failure", None);
+        assert!(!diag.report().contains("保存: できませんでした"));
+
+        let restarted = Diagnostics::new(dir.path(), identity("run-2"), redactor());
+        let saved = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        let first = saved.find("first failure").expect("first saved");
+        let second = saved.find("second failure").expect("second saved");
+        let third = saved.find("third failure").expect("third saved");
+        assert!(first < second && second < third, "{saved}");
+        let report = restarted.report();
+        assert!(report.contains("first failure") && report.contains("third failure"));
+    }
+}

@@ -97,10 +97,13 @@ pub(crate) struct HelperHandoff<S: HelperSession> {
     state_root: PathBuf,
     /// Re-confirms the Ready candidate and the install placement. Asked after
     /// the ticket was validated and before it is written.
-    still_valid: Box<dyn Fn() -> Result<(), String> + Send>,
+    still_valid: Box<dyn Fn() -> Result<(), UpdateError> + Send>,
     /// Reads the enabled Explorer integration before the update. A failure
     /// keeps the ticket from being written.
     explorer: Box<dyn Fn() -> Result<Option<ExplorerTicket>, String> + Send>,
+    /// Receives the error of a failed ticket write or helper authorization
+    /// before it is turned into text, so its code and detail are recorded.
+    on_failure: Box<dyn Fn(&UpdateError) + Send>,
 }
 
 impl<S: HelperSession> HelperHandoff<S> {
@@ -108,7 +111,8 @@ impl<S: HelperSession> HelperHandoff<S> {
         session: S,
         coordination: Coordination,
         state_root: PathBuf,
-        still_valid: Box<dyn Fn() -> Result<(), String> + Send>,
+        still_valid: Box<dyn Fn() -> Result<(), UpdateError> + Send>,
+        on_failure: Box<dyn Fn(&UpdateError) + Send>,
     ) -> Self {
         Self {
             session: Some(session),
@@ -116,6 +120,7 @@ impl<S: HelperSession> HelperHandoff<S> {
             state_root,
             still_valid,
             explorer: Box::new(capture_explorer),
+            on_failure,
         }
     }
 
@@ -169,14 +174,21 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
         let transaction = session.transaction();
         let still_valid = &self.still_valid;
         let mut content = ticket_content(ticket);
-        content.explorer = (self.explorer)()?;
+        content.explorer = match (self.explorer)() {
+            Ok(explorer) => explorer,
+            Err(why) => {
+                let err = UpdateError::new(ErrorCode::Io, why);
+                (self.on_failure)(&err);
+                return Err(err.to_string());
+            }
+        };
         state_root::issue_ticket(
             &self.coordination,
             &transaction,
             &self.state_root,
             content,
             || {
-                still_valid().map_err(|why| UpdateError::new(ErrorCode::IdentityMismatch, why))?;
+                still_valid()?;
                 if permit_is_fresh() {
                     Ok(())
                 } else {
@@ -187,12 +199,18 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
                 }
             },
         )
-        .map_err(|err| err.to_string())
+        .map_err(|err| {
+            (self.on_failure)(&err);
+            err.to_string()
+        })
     }
 
     fn authorize_exit(mut self: Box<Self>) -> Result<(), String> {
         match self.session.take() {
-            Some(session) => session.authorize_exit().map_err(|err| err.to_string()),
+            Some(session) => session.authorize_exit().map_err(|err| {
+                (self.on_failure)(&err);
+                err.to_string()
+            }),
             None => Err("the update helper is gone".to_owned()),
         }
     }
@@ -527,7 +545,10 @@ mod tests {
         fn authorize_exit(self) -> Result<(), UpdateError> {
             self.log.lock().unwrap().push("authorize");
             if self.fail_exit {
-                Err(UpdateError::new(ErrorCode::Io, "pipe closed"))
+                Err(UpdateError::new(
+                    ErrorCode::Io,
+                    "pipe closed (os_kind=BrokenPipe, os_error=32)",
+                ))
             } else {
                 Ok(())
             }
@@ -541,7 +562,7 @@ mod tests {
     fn handoff(
         dir: &TempDir,
         fail_exit: bool,
-        valid: Result<(), String>,
+        valid: Result<(), UpdateError>,
     ) -> (HelperHandoff<FakeSession>, Arc<Mutex<Vec<&'static str>>>) {
         let install = InstallId::derive(&InstallFacts {
             os: "test",
@@ -562,8 +583,73 @@ mod tests {
             coordination,
             dir.path().join("state"),
             Box::new(move || valid.clone()),
+            Box::new(|_| {}),
         );
         (handoff, log)
+    }
+
+    /// Makes the handoff hand every failure it reports to the returned list.
+    fn recording(
+        mut handoff: HelperHandoff<FakeSession>,
+    ) -> (HelperHandoff<FakeSession>, Arc<Mutex<Vec<UpdateError>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        handoff.on_failure = Box::new(move |err| sink.lock().unwrap().push(err.clone()));
+        (handoff, seen)
+    }
+
+    #[test]
+    fn a_failed_ticket_write_reports_its_error_and_a_success_reports_nothing() {
+        let dir = TempDir::new("handoff-ticket-failure");
+        let snapshot = RestartTicketSnapshot {
+            work_folder: None,
+            files: vec![file("a.md")],
+            active: Some(0),
+        };
+        // The state root is not bound for this transaction: the write fails.
+        let (first, _log) = handoff(&dir, false, Ok(()));
+        let (mut unbound, seen) = recording(first);
+        let text = unbound.issue_ticket(&snapshot, &|| true).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        // The permit went stale: the error that is recorded is the one returned.
+        let (second, _log) = handoff(&dir, false, Ok(()));
+        let (mut stale, seen) = recording(second);
+        let text = stale.issue_ticket(&snapshot, &|| false).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(text, seen[0].to_string());
+    }
+
+    #[test]
+    fn a_failed_authorization_reports_its_code_and_os_facts_once() {
+        let dir = TempDir::new("handoff-exit-failure");
+        let (failing, _log) = handoff(&dir, true, Ok(()));
+        let (failing, seen) = recording(failing);
+        let text = Box::new(failing).authorize_exit().unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::Io);
+        assert!(seen[0].detail.contains("os_kind=BrokenPipe, os_error=32"));
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        let (ok, _log) = handoff(&dir, false, Ok(()));
+        let (ok, seen) = recording(ok);
+        Box::new(ok).authorize_exit().unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_missing_helper_and_an_abort_report_nothing_to_the_diagnostics() {
+        let dir = TempDir::new("handoff-no-report");
+        let (idle, _log) = handoff(&dir, false, Ok(()));
+        let (idle, seen) = recording(idle);
+        Box::new(idle).abort();
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -600,12 +686,79 @@ mod tests {
         assert!(unbound.issue_ticket(&snapshot, &|| true).is_err());
 
         // The candidate or the placement changed: no ticket.
-        let (mut changed, _log) = handoff(&dir, false, Err("candidate changed".to_owned()));
+        let (mut changed, _log) = handoff(&dir, false, Err(UpdateError::new(ErrorCode::TransitionInvalid, "candidate changed")));
         assert!(changed.issue_ticket(&snapshot, &|| true).is_err());
 
         // The permit went stale: no ticket.
         let (mut stale, _log) = handoff(&dir, false, Ok(()));
         assert!(stale.issue_ticket(&snapshot, &|| false).is_err());
+    }
+
+    /// Binds the handoff's state root to its transaction so that the ticket
+    /// write reaches the placement re-confirmation.
+    fn bind_state_root(handoff: &HelperHandoff<FakeSession>) {
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        handoff.coordination.ensure_helper_dir(&transaction).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&handoff.state_root).unwrap();
+        hane_update::state_root::publish_binding(
+            &handoff.coordination,
+            &transaction,
+            &handoff.state_root,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_reconfirmation_keeps_its_code_and_is_recorded_once() {
+        let snapshot = RestartTicketSnapshot {
+            work_folder: None,
+            files: vec![file("a.md")],
+            active: Some(0),
+        };
+
+        // The install could not be located again: the I/O cause is kept.
+        let dir = TempDir::new("handoff-reconfirm-io");
+        let io = UpdateError::new(
+            ErrorCode::Io,
+            "locate failed (os_kind=PermissionDenied, os_error=5)",
+        );
+        let (base, _log) = handoff(&dir, false, Err(io.clone()));
+        bind_state_root(&base);
+        let (mut failing, seen) = recording(base);
+        let text = failing.issue_ticket(&snapshot, &|| true).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::Io);
+        assert_eq!(seen[0].detail, io.detail);
+        assert!(seen[0].detail.contains("os_kind=PermissionDenied, os_error=5"));
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        // The install is somewhere else: the mismatch is its own code.
+        let dir = TempDir::new("handoff-reconfirm-mismatch");
+        let moved = UpdateError::new(ErrorCode::IdentityMismatch, "the install location changed");
+        let (base, _log) = handoff(&dir, false, Err(moved.clone()));
+        bind_state_root(&base);
+        let (mut mismatched, seen) = recording(base);
+        let text = mismatched.issue_ticket(&snapshot, &|| true).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::IdentityMismatch);
+        assert_eq!(seen[0].detail, moved.detail);
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        // A confirmed placement records nothing.
+        let dir = TempDir::new("handoff-reconfirm-ok");
+        let (base, _log) = handoff(&dir, false, Ok(()));
+        bind_state_root(&base);
+        let (mut ok, seen) = recording(base);
+        ok.issue_ticket(&snapshot, &|| true).unwrap();
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -617,10 +770,16 @@ mod tests {
             active: Some(0),
         };
         let (handoff, _log) = handoff(&dir, false, Ok(()));
-        let mut handoff =
+        let handoff =
             handoff.with_explorer(Box::new(|| Err("Explorer 連携の状態を確認できません".to_owned())));
+        let (mut handoff, seen) = recording(handoff);
         let err = handoff.issue_ticket(&snapshot, &|| true).unwrap_err();
         assert!(err.contains("Explorer"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::Io);
+        assert!(seen[0].detail.contains("Explorer 連携の状態を確認できません"));
+        assert_eq!(err, seen[0].to_string());
     }
 
     #[test]

@@ -598,6 +598,88 @@ fn probe_provider_errors_are_classified_without_switching_or_exposing_error_text
 }
 
 #[test]
+fn probe_failures_leave_stage_code_and_safe_cause_for_the_local_diagnostics() {
+    for (scenario, stage, code, cause_parts) in [
+        (
+            "probe_401",
+            "turn",
+            ProbeErrorCode::Unauthorized,
+            vec!["error_info=httpConnectionFailed", "http_status=401"],
+        ),
+        (
+            "probe_429",
+            "turn",
+            ProbeErrorCode::RateLimited,
+            vec!["http_status=429"],
+        ),
+        (
+            "probe_invalid_turn_ack",
+            "turn/start",
+            ProbeErrorCode::ProtocolMismatch,
+            vec!["response_missing_turn_id"],
+        ),
+    ] {
+        let (service, data_root) = prepare_probe_service(scenario);
+        let handle = service.handle();
+        let probe_id = handle.try_submit(AiCommand::Probe).unwrap();
+        wait_for_result(&service, probe_id);
+        let snapshot = handle.snapshot();
+        let diagnostic = snapshot
+            .probe_diagnostic
+            .as_ref()
+            .unwrap_or_else(|| panic!("scenario {scenario} records a diagnostic"));
+        assert_eq!(diagnostic.operation_id, probe_id, "scenario {scenario}");
+        assert_eq!(diagnostic.stage, stage, "scenario {scenario}");
+        assert_eq!(diagnostic.code, code.stable_code(), "scenario {scenario}");
+        for part in cause_parts {
+            assert!(
+                diagnostic.cause.contains(part),
+                "scenario {scenario}: {}",
+                diagnostic.cause
+            );
+        }
+        // The provider's message (which carries a secret in the fake) and
+        // the fixed probe input are never part of the record.
+        let text = format!("{diagnostic:?}");
+        assert!(!text.contains("sk-fake-secret"), "{text}");
+        assert!(!text.contains("provider rejected"), "{text}");
+        assert!(!text.contains("HANE_AI_OK"), "{text}");
+        drop(service);
+        let _ = std::fs::remove_dir_all(data_root);
+    }
+}
+
+#[test]
+fn probe_settings_validation_failure_names_the_rejecting_check() {
+    let data_root = unique_data_root();
+    let service = spawn_service(data_root.clone(), Arc::new(RecordingBrowser::default()));
+    open_settings(&service);
+    let handle = service.handle();
+    let mut settings = handle.snapshot().settings;
+    settings.chatgpt.model_id = Some("gpt-fake-text".to_owned());
+    let save_id = handle
+        .try_save_settings(settings.revision, settings)
+        .unwrap();
+    wait_for_result(&service, save_id);
+
+    // Signed out: the probe is rejected before any request is made.
+    let probe_id = handle.try_submit(AiCommand::Probe).unwrap();
+    wait_for_result(&service, probe_id);
+    let snapshot = handle.snapshot();
+    assert_eq!(
+        snapshot.probe_status,
+        ProbeStatus::Failed(ProbeErrorCode::AccountUnavailable)
+    );
+    let diagnostic = snapshot.probe_diagnostic.expect("diagnostic recorded");
+    assert_eq!(diagnostic.operation_id, probe_id);
+    assert_eq!(diagnostic.stage, "validate_settings");
+    assert_eq!(diagnostic.code, "probe_account_unavailable");
+    assert_eq!(diagnostic.cause, "chatgpt_not_signed_in");
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[test]
 fn probe_timeout_and_invalid_turn_ack_fail_safely_after_confirmed_stop() {
     for (scenario, expected_result, expected_status) in [
         (

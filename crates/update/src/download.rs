@@ -174,18 +174,33 @@ pub fn status_error(status: u16) -> UpdateError {
     }
 }
 
+/// Structured diagnostic suffix: the `ErrorKind` and, when present, the raw OS
+/// error number. Kept separate from the human text so it survives rewording.
+fn io_diagnostics(err: &io::Error) -> String {
+    match err.raw_os_error() {
+        Some(code) => format!("io_kind={:?} os_error={code}", err.kind()),
+        None => format!("io_kind={:?}", err.kind()),
+    }
+}
+
 fn read_error(err: &io::Error) -> UpdateError {
+    let diagnostics = io_diagnostics(err);
     match err.kind() {
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
-            UpdateError::new(ErrorCode::Timeout, format!("read stalled: {err}"))
-        }
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => UpdateError::new(
+            ErrorCode::Timeout,
+            format!("read stalled: {err} [{diagnostics}]"),
+        ),
         io::ErrorKind::UnexpectedEof
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::BrokenPipe => {
-            UpdateError::new(ErrorCode::Truncated, format!("connection cut: {err}"))
-        }
-        _ => UpdateError::new(ErrorCode::NetworkUnavailable, err.to_string()),
+        | io::ErrorKind::BrokenPipe => UpdateError::new(
+            ErrorCode::Truncated,
+            format!("connection cut: {err} [{diagnostics}]"),
+        ),
+        _ => UpdateError::new(
+            ErrorCode::NetworkUnavailable,
+            format!("{err} [{diagnostics}]"),
+        ),
     }
 }
 
@@ -558,4 +573,40 @@ pub trait PartStore {
     fn commit_part(&mut self) -> io::Result<()>;
     /// Removes any partial file; must not fail the caller.
     fn discard_part(&mut self);
+}
+
+#[cfg(test)]
+mod io_error_tests {
+    use super::*;
+
+    #[test]
+    fn read_error_keeps_class_kind_and_os_error() {
+        let cases = [
+            (io::ErrorKind::TimedOut, ErrorCode::Timeout),
+            (io::ErrorKind::ConnectionReset, ErrorCode::Truncated),
+            (
+                io::ErrorKind::PermissionDenied,
+                ErrorCode::NetworkUnavailable,
+            ),
+        ];
+        for (kind, code) in cases {
+            let error = read_error(&io::Error::new(kind, "synthetic"));
+            assert_eq!(error.code, code);
+            assert!(error.detail.contains("synthetic"), "{}", error.detail);
+            assert!(
+                error.detail.contains(&format!("io_kind={kind:?}")),
+                "{}",
+                error.detail
+            );
+            assert!(!error.detail.contains("os_error"), "{}", error.detail);
+        }
+    }
+
+    #[test]
+    fn read_error_reports_raw_os_error_number() {
+        let error = read_error(&io::Error::from_raw_os_error(4242));
+        assert_eq!(error.code, ErrorCode::NetworkUnavailable);
+        assert!(error.detail.contains("os_error=4242"), "{}", error.detail);
+        assert!(error.detail.contains("io_kind="), "{}", error.detail);
+    }
 }
