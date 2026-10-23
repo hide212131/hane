@@ -18,6 +18,9 @@ use hane_ai::{AiPaths, UserPromptDraft, UserPrompts, UserPromptsLoadError, UserP
 use hane_session::FileStateStore;
 use std::path::PathBuf;
 
+/// プロンプト本文Textareaを初期表示から複数行見せるための高さ（px）。
+const PROMPT_BODY_HEIGHT: f32 = 220.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeaveTarget {
     Category(super::SettingsCategory),
@@ -683,7 +686,17 @@ impl AiPromptsPage {
                 .child("タイトル")
                 .children(title_input.map(|input| Input::new(&input).aria_label("prompt title")))
                 .child("プロンプト")
-                .children(body_input.map(|input| Textarea::new(&input).aria_label("prompt body")))
+                .child(
+                    div()
+                        .id("ai-prompt-body")
+                        .w_full()
+                        .h(px(PROMPT_BODY_HEIGHT))
+                        .flex_none()
+                        .overflow_y_scroll()
+                        .children(
+                            body_input.map(|input| Textarea::new(&input).aria_label("prompt body")),
+                        ),
+                )
                 .into_any_element()
         };
         div().w_full().flex().gap_4().child(list_column).child(detail)
@@ -854,6 +867,12 @@ mod tests {
     use super::*;
     use crate::view::{ExternalDropTarget, SettingsCategory};
     use gpui::px;
+
+    // Issue #580: 本文Textareaが初期表示から複数行を見せる高さを保つ。
+    #[test]
+    fn prompt_body_height_shows_multiple_lines() {
+        assert!(PROMPT_BODY_HEIGHT >= 180.0);
+    }
 
     // Regression for a saved draft resetting `selected` to the first prompt
     // and losing track of the one actually being edited.
