@@ -576,8 +576,38 @@ impl EditorView {
         self.content_search.input_subscription = Some(subscription);
     }
 
+    /// The current query and the content-search input value, for tests.
+    #[cfg(test)]
+    pub(super) fn content_search_query_for_test(&self, cx: &gpui::App) -> (String, String) {
+        let input_value = self
+            .content_search
+            .input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        (self.content_search.query_text.clone(), input_value)
+    }
+
     pub(super) fn content_search_sidebar_visible(&self) -> bool {
         self.content_search.mode == SidebarMode::Content
+    }
+
+    /// Whether the content-search input has an unconfirmed IME composition,
+    /// read the same way as `document_find_input_is_composing`.
+    pub(crate) fn content_search_input_is_composing(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.content_search.input_focused {
+            return false;
+        }
+        let Some(input) = self.content_search.input.clone() else {
+            return false;
+        };
+        input.update(cx, |state, cx| {
+            <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
+        })
     }
 
     pub(crate) fn content_search_results_focused(&self) -> bool {
@@ -615,6 +645,8 @@ impl EditorView {
         // of the search input or the document after Escape (Issue #417).
         self.blur_sidebar_filter(cx);
         self.initialize_content_search_input(window, cx);
+        // An explicit search shows the side panel again (Issue #549).
+        self.sidebar_collapsed = false;
         self.content_search.mode = SidebarMode::Content;
         self.content_search.results_focused = false;
         self.content_search.input_focused = true;
