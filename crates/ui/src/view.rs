@@ -15354,9 +15354,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn secondary_w_while_a_tab_close_confirm_is_open_closes_nothing(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn secondary_w_while_a_tab_close_confirm_is_open_closes_nothing(cx: &mut gpui::TestAppContext) {
         let (view, cx, first, second) = two_clean_path_tabs(cx);
         bind_keys_and_focus_body(cx);
         // Dirty the unselected first tab, then go back to the second.
@@ -15382,7 +15380,8 @@ mod tests {
 
         let confirm = view.read_with(cx, |view, _| {
             assert_eq!(view.sessions.active_id(), second);
-            view.tab_close_confirm.expect("confirm armed for the dirty tab")
+            view.tab_close_confirm
+                .expect("confirm armed for the dirty tab")
         });
         assert_eq!(confirm.id, first);
 
