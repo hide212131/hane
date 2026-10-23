@@ -21,7 +21,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Longest a save waits for the cross-process log lock before it fails.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+const LOCK_POLL: Duration = Duration::from_millis(10);
 
 use hane_update::error::io_detail;
 use hane_update::fsutil::durable_write;
@@ -449,7 +453,25 @@ impl Diagnostics {
             .truncate(false)
             .write(true)
             .open(self.lock_path())?;
-        lock.lock()?;
+        // Never wait forever: this runs on the UI thread, and another Hane
+        // holding the lock must not freeze editing. A timeout is a save
+        // failure, so the batch returns to `unsaved` and a later flush retries.
+        let started = std::time::Instant::now();
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= LOCK_WAIT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "diagnostics log is locked by another process",
+                        ));
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
         let mut lines = self.read_persisted();
         lines.extend(batch);
         trim_records(&mut lines);
@@ -753,6 +775,36 @@ mod tests {
         let foreign = saved.find("run=run-2").expect("foreign record kept");
         let own = saved.find("record of run-1").expect("own record saved");
         assert!(foreign < own, "{saved}");
+    }
+
+    #[test]
+    fn flush_gives_up_on_a_held_lock_and_retries_unsaved_records_later() {
+        let dir = TempDir::new("diag-lock-timeout");
+        let diag = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(diag.lock_path())
+            .unwrap();
+        held.lock().unwrap();
+
+        let started = std::time::Instant::now();
+        diag.record("check", "io", "record while locked", None);
+        assert!(
+            started.elapsed() < LOCK_WAIT + std::time::Duration::from_secs(10),
+            "flush waited too long for the lock"
+        );
+        assert!(!dir.path().join(FILE_NAME).exists());
+        assert_eq!(diag.lock().unsaved.len(), 1);
+        assert!(diag.lock().persist_error.is_some());
+
+        drop(held);
+        diag.flush();
+        let saved = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(saved.contains("record while locked"), "{saved}");
+        assert!(diag.lock().unsaved.is_empty());
+        assert!(diag.lock().persist_error.is_none());
     }
 
     const CHILD_DIR_ENV: &str = "HANE_DIAG_TEST_CHILD_DIR";
