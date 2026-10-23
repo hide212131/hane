@@ -1776,6 +1776,10 @@ mod tests {
         for text in [fixture.service.diagnostics_text(), saved] {
             assert!(text.contains("stage=verify"), "{text}");
             assert!(text.contains("code=archive_rejected"), "{text}");
+            assert!(
+                text.contains("archive files differ from the signed inventory"),
+                "{text}"
+            );
             assert!(text.contains("candidate=0.27.0"), "{text}");
             assert!(!text.contains("stage=download"), "{text}");
         }
