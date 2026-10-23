@@ -174,7 +174,14 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
         let transaction = session.transaction();
         let still_valid = &self.still_valid;
         let mut content = ticket_content(ticket);
-        content.explorer = (self.explorer)()?;
+        content.explorer = match (self.explorer)() {
+            Ok(explorer) => explorer,
+            Err(why) => {
+                let err = UpdateError::new(ErrorCode::Io, why);
+                (self.on_failure)(&err);
+                return Err(err.to_string());
+            }
+        };
         state_root::issue_ticket(
             &self.coordination,
             &transaction,
@@ -696,10 +703,16 @@ mod tests {
             active: Some(0),
         };
         let (handoff, _log) = handoff(&dir, false, Ok(()));
-        let mut handoff =
+        let handoff =
             handoff.with_explorer(Box::new(|| Err("Explorer 連携の状態を確認できません".to_owned())));
+        let (mut handoff, seen) = recording(handoff);
         let err = handoff.issue_ticket(&snapshot, &|| true).unwrap_err();
         assert!(err.contains("Explorer"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::Io);
+        assert!(seen[0].detail.contains("Explorer 連携の状態を確認できません"));
+        assert_eq!(err, seen[0].to_string());
     }
 
     #[test]
