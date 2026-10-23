@@ -15167,7 +15167,11 @@ mod tests {
     }
 
     fn close_tab_key() -> &'static str {
-        if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" }
+        if cfg!(target_os = "macos") {
+            "cmd-w"
+        } else {
+            "ctrl-w"
+        }
     }
 
     #[gpui::test]
