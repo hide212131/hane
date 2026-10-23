@@ -218,12 +218,14 @@ impl EditorView {
                     .h_full()
                     .tooltip(format!("{label} ({key})"))
                     .accessibility_label(label)
-                    .child(
-                        gpui::svg()
+                    // A bare `svg()` child is laid out by the Button's own
+                    // content flex and rendered as an I-shaped glyph; the
+                    // `Icon` path (as in the reading-mode toggle) sizes the
+                    // 24px viewBox glyph correctly.
+                    .icon(
+                        Icon::empty()
                             .path(icons::ICON_SIDEBAR)
-                            .flex_none()
-                            .w(px(SIDEBAR_TOGGLE_ICON_SIZE))
-                            .h(px(SIDEBAR_TOGGLE_ICON_SIZE))
+                            .size(px(SIDEBAR_TOGGLE_ICON_SIZE))
                             .text_color(rgb(self.theme.sidebar_foreground)),
                     )
                     .on_click(move |_, window, app| {
