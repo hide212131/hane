@@ -2139,6 +2139,11 @@ impl EditorView {
     /// Cmd/Ctrl+W: closes the selected tab through the same path as the
     /// middle-click, so the unsaved-changes confirmation still applies.
     pub(crate) fn close_active_file_tab(&mut self, cx: &mut Context<Self>) {
+        // While a confirmation is open the shortcut must neither close the
+        // active tab behind it nor replace the dialog's target.
+        if self.tab_close_confirm.is_some() {
+            return;
+        }
         let id = self.sessions.active_id();
         self.request_tab_close(id, cx);
     }
@@ -15345,6 +15350,52 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.sessions.len(), 1);
             assert!(view.sessions.get(second).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn secondary_w_while_a_tab_close_confirm_is_open_closes_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, first, second) = two_clean_path_tabs(cx);
+        bind_keys_and_focus_body(cx);
+        // Dirty the unselected first tab, then go back to the second.
+        view.update(cx, |view, cx| {
+            view.activate_file_tab(first, cx);
+            view.editor_mut().insert_text("edit").unwrap();
+            view.after_input(cx);
+            view.activate_file_tab(second, cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let item = cx
+            .debug_bounds("file-tab-context-close")
+            .expect("close item rendered");
+        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let confirm = view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), second);
+            view.tab_close_confirm.expect("confirm armed for the dirty tab")
+        });
+        assert_eq!(confirm.id, first);
+
+        cx.simulate_keystrokes(close_tab_key());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 2);
+            assert!(view.sessions.get(second).is_some());
+            assert_eq!(view.sessions.active_id(), second);
+            let dirty = view.sessions.get(first).expect("dirty tab kept");
+            assert!(dirty.is_dirty());
+            assert_eq!(view.tab_close_confirm, Some(confirm));
         });
     }
 
