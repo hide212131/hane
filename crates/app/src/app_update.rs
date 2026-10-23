@@ -1144,18 +1144,24 @@ impl Inner {
 
     /// Re-confirms the Ready candidate and the install location. The ticket is
     /// written only if this still holds.
-    fn confirm_restart(&self, candidate_id: &str) -> Result<(), String> {
+    ///
+    /// The error is returned as is; the handoff's failure sink records it once.
+    fn confirm_restart(&self, candidate_id: &str) -> Result<(), UpdateError> {
         if !self.is_ready(candidate_id) {
-            return Err("the prepared update changed".to_owned());
+            return Err(UpdateError::new(
+                ErrorCode::TransitionInvalid,
+                "the prepared update changed",
+            ));
         }
-        let wiring = self
-            .restart
-            .get()
-            .ok_or_else(|| "restart is not enabled".to_owned())?;
-        let placement = hane_update::platform::locate(&wiring.exe)
-            .map_err(|err| self.prepare_failure(&err, None))?;
+        let wiring = self.restart.get().ok_or_else(|| {
+            UpdateError::new(ErrorCode::UnsupportedInstall, "restart is not enabled")
+        })?;
+        let placement = hane_update::platform::locate(&wiring.exe)?;
         if placement.install_id != wiring.placement.install_id {
-            return Err("the install location changed".to_owned());
+            return Err(UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "the install location changed",
+            ));
         }
         Ok(())
     }
@@ -2231,6 +2237,44 @@ mod tests {
             assert!(text.contains("os_kind=PermissionDenied, os_error=5"), "{text}");
             assert!(text.contains("candidate=0.27.0"), "{text}");
         }
+    }
+
+    #[test]
+    fn the_restart_reconfirmation_returns_its_own_error_code_without_recording_it() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate = fixture.candidate_id();
+        let inner = &fixture.service.inner;
+        let before = inner.diag.has_records();
+
+        // Restart is not wired up.
+        let err = inner.confirm_restart(&candidate).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedInstall);
+
+        let exe = fixture.dir.path().join("missing").join("hane");
+        fixture.service.enable_restart(RestartWiring {
+            placement: hane_update::platform::Placement {
+                target: Target::WindowsX64,
+                install_root: fixture.dir.path().join("missing"),
+                coordination_parent: fixture.dir.path().to_path_buf(),
+                install_id: install_id(),
+            },
+            exe: exe.clone(),
+            state_root: fixture.dir.path().join("state"),
+        });
+
+        // Another candidate than the Ready one.
+        let err = inner.confirm_restart("another-candidate").unwrap_err();
+        assert_eq!(err.code, ErrorCode::TransitionInvalid);
+
+        // The install cannot be located again: the cause is returned as is.
+        let located = hane_update::platform::locate(&exe).unwrap_err();
+        let err = inner.confirm_restart(&candidate).unwrap_err();
+        assert_eq!(err.code, located.code);
+        assert_eq!(err.detail, located.detail);
+
+        // Returning an error is not recording it: the failure sink does that once.
+        assert_eq!(inner.diag.has_records(), before);
     }
 
     #[test]

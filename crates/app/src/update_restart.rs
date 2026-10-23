@@ -97,7 +97,7 @@ pub(crate) struct HelperHandoff<S: HelperSession> {
     state_root: PathBuf,
     /// Re-confirms the Ready candidate and the install placement. Asked after
     /// the ticket was validated and before it is written.
-    still_valid: Box<dyn Fn() -> Result<(), String> + Send>,
+    still_valid: Box<dyn Fn() -> Result<(), UpdateError> + Send>,
     /// Reads the enabled Explorer integration before the update. A failure
     /// keeps the ticket from being written.
     explorer: Box<dyn Fn() -> Result<Option<ExplorerTicket>, String> + Send>,
@@ -111,7 +111,7 @@ impl<S: HelperSession> HelperHandoff<S> {
         session: S,
         coordination: Coordination,
         state_root: PathBuf,
-        still_valid: Box<dyn Fn() -> Result<(), String> + Send>,
+        still_valid: Box<dyn Fn() -> Result<(), UpdateError> + Send>,
         on_failure: Box<dyn Fn(&UpdateError) + Send>,
     ) -> Self {
         Self {
@@ -188,7 +188,7 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
             &self.state_root,
             content,
             || {
-                still_valid().map_err(|why| UpdateError::new(ErrorCode::IdentityMismatch, why))?;
+                still_valid()?;
                 if permit_is_fresh() {
                     Ok(())
                 } else {
@@ -562,7 +562,7 @@ mod tests {
     fn handoff(
         dir: &TempDir,
         fail_exit: bool,
-        valid: Result<(), String>,
+        valid: Result<(), UpdateError>,
     ) -> (HelperHandoff<FakeSession>, Arc<Mutex<Vec<&'static str>>>) {
         let install = InstallId::derive(&InstallFacts {
             os: "test",
@@ -686,12 +686,79 @@ mod tests {
         assert!(unbound.issue_ticket(&snapshot, &|| true).is_err());
 
         // The candidate or the placement changed: no ticket.
-        let (mut changed, _log) = handoff(&dir, false, Err("candidate changed".to_owned()));
+        let (mut changed, _log) = handoff(&dir, false, Err(UpdateError::new(ErrorCode::TransitionInvalid, "candidate changed")));
         assert!(changed.issue_ticket(&snapshot, &|| true).is_err());
 
         // The permit went stale: no ticket.
         let (mut stale, _log) = handoff(&dir, false, Ok(()));
         assert!(stale.issue_ticket(&snapshot, &|| false).is_err());
+    }
+
+    /// Binds the handoff's state root to its transaction so that the ticket
+    /// write reaches the placement re-confirmation.
+    fn bind_state_root(handoff: &HelperHandoff<FakeSession>) {
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        handoff.coordination.ensure_helper_dir(&transaction).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&handoff.state_root).unwrap();
+        hane_update::state_root::publish_binding(
+            &handoff.coordination,
+            &transaction,
+            &handoff.state_root,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_reconfirmation_keeps_its_code_and_is_recorded_once() {
+        let snapshot = RestartTicketSnapshot {
+            work_folder: None,
+            files: vec![file("a.md")],
+            active: Some(0),
+        };
+
+        // The install could not be located again: the I/O cause is kept.
+        let dir = TempDir::new("handoff-reconfirm-io");
+        let io = UpdateError::new(
+            ErrorCode::Io,
+            "locate failed (os_kind=PermissionDenied, os_error=5)",
+        );
+        let (base, _log) = handoff(&dir, false, Err(io.clone()));
+        bind_state_root(&base);
+        let (mut failing, seen) = recording(base);
+        let text = failing.issue_ticket(&snapshot, &|| true).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::Io);
+        assert_eq!(seen[0].detail, io.detail);
+        assert!(seen[0].detail.contains("os_kind=PermissionDenied, os_error=5"));
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        // The install is somewhere else: the mismatch is its own code.
+        let dir = TempDir::new("handoff-reconfirm-mismatch");
+        let moved = UpdateError::new(ErrorCode::IdentityMismatch, "the install location changed");
+        let (base, _log) = handoff(&dir, false, Err(moved.clone()));
+        bind_state_root(&base);
+        let (mut mismatched, seen) = recording(base);
+        let text = mismatched.issue_ticket(&snapshot, &|| true).unwrap_err();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].code, ErrorCode::IdentityMismatch);
+        assert_eq!(seen[0].detail, moved.detail);
+        assert_eq!(text, seen[0].to_string());
+        drop(seen);
+
+        // A confirmed placement records nothing.
+        let dir = TempDir::new("handoff-reconfirm-ok");
+        let (base, _log) = handoff(&dir, false, Ok(()));
+        bind_state_root(&base);
+        let (mut ok, seen) = recording(base);
+        ok.issue_ticket(&snapshot, &|| true).unwrap();
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]
