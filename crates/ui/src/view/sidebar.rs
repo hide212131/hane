@@ -1,4 +1,5 @@
 use super::*;
+use gpui_component::Icon;
 
 /// One row of the flattened sidebar tree: a node together with how deeply it
 /// is nested, so indentation can be applied without recursive rendering.
