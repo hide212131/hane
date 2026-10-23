@@ -1037,9 +1037,13 @@ impl Inner {
                     (true, Ok(offer)) => found = Some((offer, dir, lease)),
                     (_, Err(error)) => {
                         // The rejected candidate is removed as before; why it
-                        // was rejected is kept for the diagnostics.
-                        self.diag
-                            .note("restore", error.code.as_str(), &error.detail, None);
+                        // was rejected is kept for the diagnostics. A candidate
+                        // that is merely no longer newer is the normal cleanup
+                        // after an applied update, not a failure.
+                        if error.code != ErrorCode::NotApplicable {
+                            self.diag
+                                .note("restore", error.code.as_str(), &error.detail, None);
+                        }
                         remove_dir_if_present(&dir);
                     }
                     (false, Ok(_)) => remove_dir_if_present(&dir),
@@ -1791,6 +1795,36 @@ mod tests {
         run_queued(&queue);
         assert_eq!(reopened.snapshot().phase, AppUpdatePhase::Idle);
         assert!(!archive.exists());
+        let report = reopened.diagnostics_text();
+        assert!(report.contains("stage=restore"), "{report}");
+    }
+
+    #[test]
+    fn an_already_applied_candidate_is_removed_on_restore_without_a_failure_record() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate_dir = fixture
+            .updates_root()
+            .join("candidates")
+            .join(fixture.candidate_id());
+        assert!(candidate_dir.is_dir());
+        *fixture.service.inner.candidate_lease.lock().unwrap() = None;
+
+        // The update was applied: the running build is now the candidate's version.
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reopened = AppUpdateService::with_runner(
+            config(&fixture.dir, "0.27.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        reopened.restore_local();
+        run_queued(&queue);
+        assert_ne!(reopened.snapshot().phase, AppUpdatePhase::Ready);
+        assert!(!candidate_dir.exists());
+        let report = reopened.diagnostics_text();
+        assert!(!report.contains("stage=restore"), "{report}");
+        assert!(!report.contains("not_applicable"), "{report}");
     }
 
     #[test]
