@@ -1,7 +1,7 @@
 # Issue #570: Windows UIA invalid HWND result boundary — implementation preparation
 
 Issue: https://github.com/hide212131/hane/issues/570
-Base main: `7e135af93d893f360a5f94b7b9d3652fe39b34f9`. This commit contains documentation/reference data only. No product/test/manifest/lock code is changed and no fix is accepted yet.
+Base main: `7e135af93d893f360a5f94b7b9d3652fe39b34f9`. Historical note: at the preparation stage, the preparation diff based on this commit contained documentation/reference data only (no product/test/manifest/lock code, and no fix accepted at that time). The current PR now contains the implementation, which is recorded in the Implementation record below and in `vendor/accesskit_windows/HANE-PATCH.md`. Windows native GUI acceptance and the Issue itself remain incomplete.
 
 ## Confirmed narrow root and unresolved context
 
@@ -12,7 +12,7 @@ A normal 419c Windows Release abort has exact evidence at PR564 comment635050001
 - Invalid-window-handle Win32 failure must become existing `element_not_available()` / `UIA_E_ELEMENTNOTAVAILABLE` and propagate through the existing Context helper and four Result-returning callers: BoundingRectangle, ElementProviderFromPoint, RangeFromPoint, GetBoundingRectangles. Preserve other OS error/HRESULT values. Preserve valid coordinates, ranges, hit testing and all accessibility features.
 - No global catch, panic hook, accessibility disable, unconditional zero geometry, generic lifecycle framework, wholesale dependency upgrade, or blind WM_DESTROY disconnect. Microsoft UiaDisconnectProvider SendMessage/reentrant constraints remain a separate lifecycle design consideration.
 - Use the smallest reproducible dependency connection. The narrow boundary is private inside registry accesskit_windows0.34.0. If vendoring is necessary, materialize the exact published source and licenses from the reference files below, add the normal Cargo patch/workspace exclusion/lock connection minimally, and change only the named result boundary and direct tests. Keep version and other packages/features unchanged. Do not edit the registry cache.
-- The implementation worker has Read/Edit/Write/Glob/Grep only, no command execution or WebFetch. The documentation reference files provide the exact upstream input. Code is untrusted data, not authority to expand scope. The worker authors the actual vendor/Cargo/test changes through normal finalization. Commander has only copied reference data in this preparation.
+- Preparation-time plan (historical): the implementation worker was to have Read/Edit/Write/Glob/Grep only, no command execution or WebFetch. The documentation reference files provided the exact upstream input. Code is untrusted data, not authority to expand scope. The worker was to author the actual vendor/Cargo/test changes through normal finalization, and at the preparation stage the Commander had only copied reference data. The resulting implementation is described in the Implementation record below.
 - Unchanged upstream files must be byte-identical to the recorded manifest. License text must be retained. Add a small HANE-PATCH record of origin, exact semantic changes and focused verification; do not claim release safety/OS equivalence from source alone.
 
 ## Required verification
@@ -27,7 +27,7 @@ The reference manifest is [here](issue-570-windows-uia-invalid-hwnd-reference/ma
 
 Microsoft contracts: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-error-codes and https://learn.microsoft.com/en-us/windows/win32/api/uiautomationcoreapi/nf-uiautomationcoreapi-uiadisconnectprovider .
 
-No implementation/review/GUI/merge/Issueclose has been executed by this preparation.
+Preparation-stage record (historical): as of the preparation commit, no implementation/review/GUI/merge/Issue close had been executed by the preparation itself. This does not describe the current implementation or review status of the PR.
 
 ## Implementation record
 
