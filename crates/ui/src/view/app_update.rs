@@ -692,6 +692,9 @@ impl EditorView {
         // A new action ends the one-time "updated" notice.
         self.update_completed = None;
         self.explorer_migration_failed = None;
+        // A stale notice (e.g. the diagnostics copy result) must not outlive
+        // the state it was shown under.
+        self.restart_message = None;
         match action {
             CardAction::Check => controller.check(),
             CardAction::Download(candidate) => controller.download(&candidate),
@@ -1947,6 +1950,28 @@ mod tests {
         assert_eq!(
             controller.calls(),
             vec!["check".to_owned(), "download:cand".to_owned()]
+        );
+    }
+
+    #[gpui::test]
+    fn a_new_card_action_clears_the_diagnostics_copy_notice(cx: &mut gpui::TestAppContext) {
+        let controller = FakeController::new(AppUpdateSnapshot::idle("0.26.0"));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, _| view.attach_app_update(Some(attached)));
+        open_general_settings(&view, cx);
+        view.update(cx, |view, cx| view.copy_app_update_diagnostics(cx));
+        assert!(
+            view.read_with(cx, |view, _| view.restart_message.is_some()),
+            "the copy action itself must still report its result"
+        );
+        view.update(cx, |view, cx| {
+            view.run_app_update_action(CardAction::Check, cx);
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.restart_message.clone()),
+            None,
+            "a new non-restart action must drop the stale copy notice"
         );
     }
 
