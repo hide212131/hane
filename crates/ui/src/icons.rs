@@ -181,7 +181,17 @@ mod tests {
         assert!(!svg.contains(" width=\"") && !svg.contains(" height=\""));
         assert_eq!(svg.matches("<path").count(), 2, "frame and divider");
         // Rounded frame: four arc corners; divider: a vertical line.
-        assert_eq!(svg.matches('A').count(), 4);
+        // Count both absolute `A` and relative `a` arc commands, only within
+        // path data (other attributes contain unrelated letters).
+        let frame_d = svg
+            .split("d=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("frame path must have a d attribute");
+        assert_eq!(
+            frame_d.chars().filter(|c| matches!(c, 'A' | 'a')).count(),
+            4
+        );
         assert!(svg.contains("d=\"M9 5v14\""));
     }
 
