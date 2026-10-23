@@ -1,76 +1,47 @@
-# Issue #553: 更新失敗の診断テキスト — 実装準備
+# Issue #553: 更新・AI接続・検証失敗の診断テキスト — 実装メモ
 
 対象: https://github.com/hide212131/hane/issues/553
-基準main: `7de394127383b50641b7345aee4866b6c3b16be0`
 
-このcommitはClaude実装先の準備のみ。製品コード・テストは未変更、受入検証は未実施。要求と受入条件の正本はIssue本文とする。
+要求と受入条件の正本はIssue本文とする。このメモは実装の所在と検証方法を記録する。
 
-## 範囲
+## 発端（履歴）
 
-macOSの通常起動で更新に失敗した本人が、設定画面から失敗段階と具体的原因を診断テキストとして取得・共有できるようにする。既存のアプリ所有更新サービスへ最小限で追加する。
+macOSのApp Translocation下で更新に失敗した利用者が、失敗段階と具体的原因を共有できなかったことが発端である。配置エラーそのものの修正は#510で扱う。この事例の実障害再現や新リリース待ちは、現行の受入条件ではない。
 
-- 確認・取得・検証・適用準備の失敗段階、診断コード、内部詳細、取得可能なOSエラー種別/番号を保持する。背景スレッド開始やファイル移動の失敗も詳細を捨てない。
-- 時刻、現在版・候補版、PID、実行パス、更新stateの識別を含め、複数のHane/stateを区別する。
-- ユーザー名を含むパス等は共有時に伏せる。認証情報、トークン、署名付きURLのquery、文書本文、AI入出力を記録しない。未加工のエラー文字列を無条件に保存しない。
-- 既存state配下等に記録量を制限して保存し、アプリbundle内の書込を前提にしない。
-- 設定の更新カードから開くかコピーする最小導線と、段階に合った日本語の失敗説明を追加する。
-- 保存不可でも編集を妨げず、更新失敗を成功扱いにしない。署名・ZIP検証、未保存文書の保護、明示操作のみの通信を維持する。
+## 現行の範囲
 
-## 先行する最小範囲
+更新・AI接続（AI probe）・代表的な設定検証の失敗について、本人が設定画面から診断テキストを取得して共有できるようにする。
 
-#510の配置エラー修正PR #557が、同じ`start_update_service`、更新サービスの利用可能性・Ready復元・取得、設定カードを変更する。#557の受入・main反映後にその経路を確認して実装依頼する。廃止する旧fallbackと新経路への二重実装を避ける。#297/RF0全体や独立したタブ・sidebar・閲覧モード・依存整理の完了待ちは不要。
+- 更新: 確認・取得・検証・適用準備などの失敗段階、診断コード、内部詳細、取得可能なOSエラー種別/番号を保持する。
+- AI接続: probeの失敗を `ai_probe/<stage>`（例: `ai_probe/turn`、`ai_probe/validate_settings`）、安定code、安全な原因として同じ診断に記録する。設定検証の拒否は `validate_settings` として区別する。
+- 同じoperationのsnapshotが重複しても、記録は一度だけ（UI側 `take_unrecorded_probe_diagnostic` が `operation_id` で判定する）。
 
-App Translocationで不適切な保存先へ進む問題そのものは#510。巨大な汎用ログ基盤、テレメトリ、quarantine削除、OS保護の緩和、未公開API、文書/AIデータ変更、保護された運用基盤の変更は対象外。
+## 実装
 
-## 読む場所
+- `crates/app/src/update_diagnostics.rs`: 更新state配下（`<state>/updates/<InstallId>/diagnostics.log`）へ、上限付き（20件・16KiB・詳細400文字）の1行レコードを保存する。保存と設定からのコピーは同じ秘匿規則を通る。各レコードにrun idを持たせ、現在の起動と以前の起動を分けて表示する。保存できない場合はその起動中の記録だけを表示し、理由を明記する。編集は妨げない。
+- 更新の失敗段階: `check` / `write_download` / `download` / `verify` / `save_history` / `publish` / `start` / `discard` / `restore` / `prepare` / `placement`。
+- OS情報: `io_detail`（`os_kind`、取得できた場合だけ `os_error`）を使い、取得できないものを捏造しない。
+- AI probe: `crates/ai/src/service.rs` が `ProbeDiagnostic`（`operation_id` / `stage` / `code` / `cause`）をsnapshotに載せる。`cause` は固定語または安全に整形した分類で、providerの生メッセージ、probe入力、モデルID、URL、資格情報を含めない。`crates/ui/src/view/app_update.rs` の `record_ai_probe_diagnostic` が `ai_probe/<stage>` として更新診断のcontrollerへ渡す。
+- 設定の更新カードの「診断情報をコピー」で取得する。Unavailableでも表示し、更新操作は再許可しない。設定を開くだけでは通信しない。
 
-`AGENTS.md`、`docs/aadw-command-policy.md`、`docs/aadw-claude-execution.md`、`docs/adr/0034-zip-application-updates.md`、`docs/application-update-implementation-spec.md`、`crates/app/src/main.rs`、`crates/app/src/app_update.rs`、`crates/app/src/https_transport.rs`、`crates/update/src/error.rs`、`crates/ui/src/view/app_update.rs`と関連controller/presentation契約。具体的な型や変更ファイルは実装時のcurrent codeで再確認する。
+## 秘密の除外
 
-## 受入条件と検証
+認証情報、API key、token、署名付きURLのquery/userinfo、ユーザー名を含むパス、AI入力・応答本文、文書本文、providerの生レスポンスを記録しない。保存と共有は同じ秘匿規則を通す。
 
-1. 通常起動のmacOS検証アプリで代表的な失敗を再現し、設定から診断テキストを取得する。実PID・実行パス・隔離state・対象headを記録し、特別なターミナル起動を利用者の取得条件にしない。
-2. 確認失敗とダウンロード後の失敗を区別し、ファイル書込失敗が`io`だけに潰れず、具体的原因と取得可能なOS情報を含むことを自動テストとfocused GUIで確認する。
-3. 複数のアプリ/stateの識別、再起動後の参照、過去記録と現在状態の区別を確認する。
-4. 秘密を含むURL・パス、長い詳細、反復失敗に対し、秘匿・保存量上限・文字境界を確認する。
-5. 書込不可でも編集継続・誤成功防止を確認し、署名検証・文書保護の既存テストを維持する。
+## 決定的テスト（ネットワーク・実リリース・手動GUI不要）
 
-必要なfocused tests、required CI、current-head最終レビュー、macOS GUI evidenceを揃えてCommanderが受入判断する。Windows更新成功の実機確認を追加せず、共有コードのWindows CIは維持する。GUI失敗時は`docs/gui-test-recovery.md`で復旧を続ける。
+- `crates/ai/tests/account_service.rs`
+  - `probe_failures_leave_stage_code_and_safe_cause_for_the_local_diagnostics`: fakeのapp-serverで401/429/不正なturn ackを発生させ、stage・code・安全な原因が残り、provider生メッセージ・probe入力・secretが含まれないことを確認する。
+  - `probe_settings_validation_failure_names_the_rejecting_check`: 未サインインの設定検証失敗が `validate_settings` として残ることを確認する。
+- `crates/app/src/app_update.rs`
+  - `a_real_ai_probe_failure_reaches_the_saved_diagnostic_text_without_secrets`: 実際の `AiService` の設定検証失敗から得た `ProbeDiagnostic` を診断controllerへ渡し、共有テキストと保存ファイルの両方に `ai_probe/validate_settings`・code・安全な原因が含まれ、probe入力とモデルIDが含まれないことを確認する。
+  - `an_ai_probe_failure_is_saved_beside_update_failures_without_secrets`: 更新失敗と並べて保存され、secretがredactされることを確認する。
+  - 更新側の `a_failed_check_is_recorded_with_its_stage_and_code`、`a_write_failure_after_the_download_is_not_reported_as_a_failed_check`、`a_candidate_that_cannot_be_moved_keeps_its_cause`、`a_runner_that_cannot_start_fails_the_operation_instead_of_hanging` など。
 
+## ログの取得
 
-## 実装メモ（#557採用後のmainに対する実装）
+設定画面の更新カードで「診断情報をコピー」を押すと、現在の起動と以前の起動の記録を含む診断テキストがクリップボードに入る。保存先は上記の `diagnostics.log` で、アプリbundle内には書かない。
 
-- `crates/app/src/update_diagnostics.rs`: 更新state配下（`<state>/updates/<InstallId>/diagnostics.log`）へ、上限付き（20件・16KiB・詳細400文字）の1行レコードを保存する。保存と設定からのコピーは同じ秘匿規則（URLのquery/userinfo、認証情報風のkey=value、`/Users/`等のユーザー名、HOME/ユーザー名）を通る。各レコードにrun idを持たせ、現在の起動と以前の起動の記録を分けて表示する。保存できない場合は、その起動中の記録だけを表示し、保存不可の理由を明記する。
-- 失敗段階: `check` / `write_download` / `download` / `verify` / `save_history` / `publish` / `start` / `discard` / `restore` / `prepare` / `placement`。同じcodeだけから段階を推測しない。
-- OS情報: `UpdateError::from(io::Error)` と各記録地点で `io_detail`（`os_kind`、取得できた場合だけ `os_error`、無い場合は `none`）を使う。
-- 設定の更新カードに「診断情報をコピー」を追加（Unavailableでも表示。更新操作は再許可しない）。
-- 検証: この変更の自動テストは未実行（worker環境で実行不可）。CIの結果とmacOS GUIは別途確認する。
+## 検証状況
 
-## 画面不要の実装準備（2026-10-23）
-
-利用者の「548を妨げないものは止めなくてよい」に基づき、全面保留を限定保留へ変更した。非GUIの準備・必要なCI/レビュー等は進められる。#557採用・main反映後に実装する依存は維持し、Mac GUI枠は#548最優先で取得しない。#548へ影響する統合・mergeは統合担当が調整し、#558を#548リリースの待ち条件にしない。
-
-### 失敗段階と検証の対応
-
-以下は採用待ちの#557 head `8281db1fb47435cb373762087b8f4f62ec4e268f`で読み取った観測であり、#557の採用・受入を意味しない。実装前に取り込んだcurrent codeで再確認する。新しいworkflow状態や全域ログ基盤を定義するものではない。
-
-| 対象段階 | 現在失われる情報・注意する箇所 | 関連する検証 |
-| --- | --- | --- |
-| 配置確認 | #557の`AppUpdateService::block_placement`は拒否理由のcodeを保持するが、元`UpdateError.detail`は保持しない。 | 隔離/非対応の拒否理由を取得でき、更新不能な配置へ取得・適用を再許可しない。 |
-| 背景処理開始 | `thread_runner`の`spawn(...).is_ok()`が実際の開始エラーを破棄し、`dispatch`は`Io`だけにする。 | 制御できるrunner失敗で元の具体的原因と取得可能なOS情報が残り、busyが残り続けず、成功にもならない。 |
-| 更新確認 | `run_check`の`Stage::Failed { code }`でdetailを捨てる。 | HTTP/ネットワーク・署名等の代表失敗について、段階・code・安全なdetailを取得でき、最新と誤表示しない。 |
-| 取得・検証・履歴保存 | `download_into`は同じ関数でアーカイブ取得、ZIP検証、receipts/seen保存、Ready marker書込を行う。後半の書込失敗を取得・署名失敗と取り違えない。 | 取得失敗とZIP検証後の書込失敗を別に再現し、操作と具体的原因を区別する。Readyは全検証・必須履歴保存の成功後だけ。 |
-| 候補の移動・公開 | `publish_candidate`の`Err(_)`が元の移動/leaseエラーを`Io`へ潰す。 | ファイルをディレクトリの位置に置く等、OS権限昇格に依存しない注入で元の原因を確認し、候補や別processのleaseを壊さない。 |
-| 適用準備 | `prepare_restart`等でhelper/coordinationの`UpdateError`を`String`へ変換する。 | 型を失う前に取得可能なcode/OS情報を確認し、helper起動・適用準備の失敗として記録する。未保存保護や停止・復旧の順序は変更しない。 |
-| ローカル復元・削除 | `run_restore`やdiscardにはエラーを無視/縮退する箇所がある。 | 本Issueの対象となる失敗が診断不能にならないか確認する。通常のstale候補掃除を理由に汎用ログ化や更新契約の変更へ範囲を広げない。 |
-
-`UpdateError::from(io::Error)`は現状codeと文字列だけを保持する。OSのkind/raw番号を文字列から推測したり、取得できなかったものを捏造したりせず、取得可能な地点で保持する。具体的な型・保存上限・保存方式は、受入条件とcurrent codeを満たす最小限を実装担当が具体化する。
-
-### 段階をまたぐ検証
-
-- 診断の保存と設定からの取得に同じ秘匿規則を使う。認証情報・URLのquery/userinfo・ユーザー名等のパス情報・文書本文・AI内容を含む入力を使い、保存前/共有時の漏れがないことを確認する。生のresponse本文や環境変数一覧を記録しない。
-- 長い日本語の詳細と繰り返す失敗でも、レコード/履歴全体の上限と文字境界を守る。ログ保存不可のケースは、更新先の失敗とは独立に注入し、必要ならその起動中に取得できる内容と保存不可の説明を区別する。
-- PID・実行パス・install/state識別・現在版/候補版・時刻で別のHaneを区別できることを確認する。伏せ字で識別力を失わないよう、不透明な識別子等と組み合わせる。再起動後の過去ログは現行失敗と取り違えない。
-- キャンセル/旧operationの遅延結果に対する既存ticket guardを維持する。診断追加によって旧失敗を現在の失敗として表示しない。
-- 設定を開くだけで通信しないこと、保存できない診断だけを理由に編集を止めないこと、署名/ZIP検証と文書保護の既存テストが維持されることを確認する。
-
-Jev（provider `typesafe`、要求`jev-latest`、応答`jev-1.14.0`）は、ファイル単位より失敗段階ごとの対応表を準備文書に残すactionを選択した。この追記も文書準備のみで、製品実装・テスト成功・GUI受入の証拠ではない。
+この実装メモの変更時点では、worker環境でテストを実行していない。テストとlintは信頼済みの後段job（CI）で確認し、レビュー・GUI・mergeは別のCommander判断とする。

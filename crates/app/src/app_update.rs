@@ -2203,6 +2203,77 @@ mod tests {
     }
 
     #[test]
+    fn a_real_ai_probe_failure_reaches_the_saved_diagnostic_text_without_secrets() {
+        use hane_ai::{
+            AiCommand, AiService, AiServiceConfig, FakeCredentialStore, ProbeStatus,
+            ShellEnvironmentPolicyFormat, SystemBrowserOpener,
+        };
+
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        let ai_root = TempDir::new("app-update-ai-probe");
+        let ai = AiService::spawn(AiServiceConfig {
+            app_data_root: ai_root.path().to_path_buf(),
+            binary_path: PathBuf::new(),
+            binary_resolution_error: None,
+            credential_store: Arc::new(FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        })
+        .unwrap();
+        let handle = ai.handle();
+        let wait = |id| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let snapshot = handle.snapshot();
+                if snapshot.busy.is_none()
+                    && snapshot
+                        .last_result
+                        .as_ref()
+                        .is_some_and(|(finished, _)| *finished == id)
+                {
+                    return snapshot;
+                }
+                assert!(std::time::Instant::now() < deadline, "{snapshot:?}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let open_id = handle.try_submit(AiCommand::OpenSettings).unwrap();
+        wait(open_id);
+        let mut settings = handle.snapshot().settings;
+        settings.chatgpt.model_id = Some("gpt-fake-text".to_owned());
+        let save_id = handle
+            .try_save_settings(settings.revision, settings)
+            .unwrap();
+        wait(save_id);
+
+        // Signed out: the probe is rejected by the settings validation before
+        // any request is made, with no network and no runtime.
+        let probe_id = handle.try_submit(AiCommand::Probe).unwrap();
+        let snapshot = wait(probe_id);
+        assert!(matches!(snapshot.probe_status, ProbeStatus::Failed(_)));
+        let diagnostic = snapshot.probe_diagnostic.expect("the failure is recorded");
+        assert_eq!(diagnostic.operation_id, probe_id);
+
+        // The same hand-over the settings view performs for a new failure.
+        AppUpdateController::record_diagnostic(
+            &fixture.service,
+            &format!("ai_probe/{}", diagnostic.stage),
+            diagnostic.code,
+            &diagnostic.cause,
+        );
+        let saved = fs::read_to_string(fixture.updates_root().join("diagnostics.log")).unwrap();
+        for text in [fixture.service.diagnostics_text(), saved] {
+            assert!(text.contains("stage=ai_probe/validate_settings"), "{text}");
+            assert!(text.contains("code=probe_account_unavailable"), "{text}");
+            assert!(text.contains("chatgpt_not_signed_in"), "{text}");
+            assert!(!text.contains("HANE_AI_OK"), "{text}");
+            assert!(!text.contains("gpt-fake-text"), "{text}");
+            assert!(!text.contains("sk-"), "{text}");
+        }
+        drop(ai);
+    }
+
+    #[test]
     fn a_write_failure_after_the_download_is_not_reported_as_a_failed_check() {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.script_check();
