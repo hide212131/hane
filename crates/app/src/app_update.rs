@@ -1147,6 +1147,16 @@ impl Inner {
     ///
     /// The error is returned as is; the handoff's failure sink records it once.
     fn confirm_restart(&self, candidate_id: &str) -> Result<(), UpdateError> {
+        self.confirm_restart_with(candidate_id, hane_update::platform::locate)
+    }
+
+    /// `confirm_restart` with the install lookup given, so a test can reach the
+    /// `InstallId` comparison on any OS.
+    fn confirm_restart_with(
+        &self,
+        candidate_id: &str,
+        locate: impl FnOnce(&Path) -> Result<hane_update::platform::Placement, UpdateError>,
+    ) -> Result<(), UpdateError> {
         if !self.is_ready(candidate_id) {
             return Err(UpdateError::new(
                 ErrorCode::TransitionInvalid,
@@ -1156,7 +1166,7 @@ impl Inner {
         let wiring = self.restart.get().ok_or_else(|| {
             UpdateError::new(ErrorCode::UnsupportedInstall, "restart is not enabled")
         })?;
-        let placement = hane_update::platform::locate(&wiring.exe)?;
+        let placement = locate(&wiring.exe)?;
         if placement.install_id != wiring.placement.install_id {
             return Err(UpdateError::new(
                 ErrorCode::IdentityMismatch,
@@ -2275,6 +2285,57 @@ mod tests {
 
         // Returning an error is not recording it: the failure sink does that once.
         assert_eq!(inner.diag.has_records(), before);
+    }
+
+    #[test]
+    fn a_moved_install_is_reported_as_identity_mismatch_and_recorded_once() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate = fixture.candidate_id();
+        let inner = &fixture.service.inner;
+        let exe = fixture.dir.path().join("install").join("hane");
+        let wired = hane_update::platform::Placement {
+            target: Target::WindowsX64,
+            install_root: fixture.dir.path().join("install"),
+            coordination_parent: fixture.dir.path().to_path_buf(),
+            install_id: install_id(),
+        };
+        fixture.service.enable_restart(RestartWiring {
+            placement: wired.clone(),
+            exe,
+            state_root: fixture.dir.path().join("state"),
+        });
+        let located = |install_id: InstallId| {
+            let placement = hane_update::platform::Placement { install_id, ..wired.clone() };
+            move |_: &Path| Ok(placement)
+        };
+
+        // The same InstallId confirms and records nothing.
+        let before = inner.diag.has_records();
+        inner.confirm_restart_with(&candidate, located(install_id())).unwrap();
+        assert_eq!(inner.diag.has_records(), before);
+
+        // Another InstallId is the mismatch code, not an I/O error.
+        let other = InstallId::derive(&InstallFacts {
+            os: "test",
+            volume_id: "volume",
+            install_path: "/opt/elsewhere",
+            owner: "user",
+        })
+        .unwrap();
+        assert_ne!(other.as_str(), install_id().as_str());
+        let err = inner.confirm_restart_with(&candidate, located(other)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert_eq!(inner.diag.has_records(), before);
+
+        // The handoff's failure sink records the returned error exactly once.
+        let sink = inner.handoff_failure_sink("0.27.0".to_owned());
+        sink(&err);
+        let report = fixture.service.diagnostics_text();
+        assert_eq!(report.matches("stage=prepare").count(), 1, "{report}");
+        assert_eq!(report.matches("code=identity_mismatch").count(), 1, "{report}");
+        assert!(!report.contains("code=io"), "{report}");
+        assert!(report.contains("candidate=0.27.0"), "{report}");
     }
 
     #[test]
