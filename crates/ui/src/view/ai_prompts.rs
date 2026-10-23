@@ -686,17 +686,11 @@ impl AiPromptsPage {
                 .child("タイトル")
                 .children(title_input.map(|input| Input::new(&input).aria_label("prompt title")))
                 .child("プロンプト")
-                .child(
-                    div()
-                        .id("ai-prompt-body")
-                        .w_full()
+                .children(body_input.map(|input| {
+                    Textarea::new(&input)
+                        .aria_label("prompt body")
                         .h(px(PROMPT_BODY_HEIGHT))
-                        .flex_none()
-                        .overflow_y_scroll()
-                        .children(
-                            body_input.map(|input| Textarea::new(&input).aria_label("prompt body")),
-                        ),
-                )
+                }))
                 .into_any_element()
         };
         div().w_full().flex().gap_4().child(list_column).child(detail)
