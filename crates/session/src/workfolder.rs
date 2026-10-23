@@ -29,18 +29,17 @@ use std::time::SystemTime;
 static NEXT_MODIFIED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Allocates the next value from `NEXT_MODIFIED_SEQUENCE`. Callers acquire
-/// this at the same point they read a node's real modified time through
-/// `FileService::stamp`, off the UI thread, pairing the two before either
-/// crosses back onto the UI thread through `WorkFolder::touch`.
+/// this at the same point they read a node's real modified time, pairing the
+/// two before either crosses back onto the UI thread through `WorkFolder::touch`.
 pub fn next_modified_sequence() -> u64 {
     NEXT_MODIFIED_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
-/// One lock per path ever stamped through `stamp_with_sequence`, kept for the
-/// life of the process. Entries are never removed: the set of distinct paths
-/// a running process stamps is bounded by the folders and files the user's
-/// work folder actually has, the same bound `WorkFolder`'s own tree already
-/// keeps.
+/// One lock per path ever stamped through `modified_with_sequence`, kept for
+/// the life of the process. Entries are never removed: the set of distinct
+/// paths a running process stamps is bounded by the folders and files the
+/// user's work folder actually has, the same bound `WorkFolder`'s own tree
+/// already keeps.
 static PATH_STAMP_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -52,10 +51,11 @@ fn path_stamp_lock(path: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// Reads `path`'s current modified time through `FileService::stamp` and
-/// allocates its paired `next_modified_sequence` value as one step, held
-/// behind a lock specific to `path`, rather than as two separate steps a
-/// thread switch can land in between.
+/// Reads a path's current modified time and allocates its paired sequence
+/// under the same path-specific lock used by saves and renames. `read_modified`
+/// preserves the caller's metadata source (for example, `DirEntry::metadata`
+/// in the scanner) while keeping the read and sequence allocation indivisible
+/// with respect to other observations of the same path.
 ///
 /// Pairing the read and the sequence this way — not merely reading, then
 /// allocating a sequence afterward — is what keeps two calls for the *same*
@@ -67,12 +67,22 @@ fn path_stamp_lock(path: &Path) -> Arc<Mutex<()>> {
 /// and `rename` only have the sequence to tell the two apart (see
 /// `set_modified`), so once that numbering itself is wrong, no comparison on
 /// the receiving side can recover the real order.
-pub fn stamp_with_sequence(files: &dyn FileService, path: &Path) -> (Option<SystemTime>, u64) {
+fn modified_with_sequence(
+    path: &Path,
+    read_modified: impl FnOnce() -> Option<SystemTime>,
+) -> (Option<SystemTime>, u64) {
     let lock = path_stamp_lock(path);
     let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
-    let modified = files.stamp(path).and_then(|stamp| stamp.modified);
+    let modified = read_modified();
     let sequence = next_modified_sequence();
     (modified, sequence)
+}
+
+/// Reads `path`'s current modified time through `FileService::stamp` and
+/// allocates its paired sequence as one step, held behind the path-specific
+/// lock shared with scanner reads.
+pub fn stamp_with_sequence(files: &dyn FileService, path: &Path) -> (Option<SystemTime>, u64) {
+    modified_with_sequence(path, || files.stamp(path).and_then(|stamp| stamp.modified))
 }
 
 /// One Markdown file discovered under a work folder, not yet loaded.
@@ -937,10 +947,11 @@ fn walk(root: &Path, dir: &Path) -> io::Result<Vec<WorkFolderNode>> {
         // failure (permission, or an entry removed mid-walk) degrades to
         // `None` instead of failing the whole scan, since this is purely an
         // enrichment of the listing `file_type` above already succeeded at.
-        let modified = item
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
+        let (modified, sequence) = modified_with_sequence(&path, || {
+            item.metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+        });
         if file_type.is_dir() {
             // `.hane` directly under the work folder root is where Hane
             // keeps its own state for this work folder (the unnamed-note
@@ -953,12 +964,13 @@ fn walk(root: &Path, dir: &Path) -> io::Result<Vec<WorkFolderNode>> {
                 continue;
             }
             let children = walk(root, &path)?;
-            nodes.push(WorkFolderNode::Folder(WorkFolderFolder::new(
-                path, children, modified,
-            )));
+            let mut folder = WorkFolderFolder::new(path, children, modified);
+            folder.modified_seq = Some(sequence);
+            nodes.push(WorkFolderNode::Folder(folder));
         } else if file_type.is_file() && is_markdown(&path) {
             let mut entry = WorkFolderEntry::new(path);
             entry.modified = modified;
+            entry.modified_seq = Some(sequence);
             nodes.push(WorkFolderNode::File(entry));
         }
     }
@@ -1895,6 +1907,147 @@ mod tests {
             entry.modified().is_some(),
             "a real scan must acquire a modified time for later UpdatedNewest/UpdatedOldest sorting"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_scan_read_and_sequence_stay_ordered_with_a_newer_save() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let path = PathBuf::from("/notes/External.md");
+        let (scan_read_tx, scan_read_rx) = mpsc::channel();
+        let (release_scan_tx, release_scan_rx) = mpsc::channel();
+        let scan_path = path.clone();
+        let scan = thread::spawn(move || {
+            modified_with_sequence(&scan_path, || {
+                let stale = Some(system_time_at(100));
+                scan_read_tx
+                    .send(())
+                    .expect("the test observes the stale scan read");
+                release_scan_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the test releases the scan before sequence allocation");
+                stale
+            })
+        });
+        scan_read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the scan has read its stale mtime and is paused before sequence allocation");
+
+        let scan_holds_path_lock = matches!(
+            path_stamp_lock(&path).try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+
+        let (save_lock_result_tx, save_lock_result_rx) = mpsc::channel();
+        let save_path = path.clone();
+        let save = thread::spawn(move || {
+            let lock = path_stamp_lock(&save_path);
+            let blocked_by_scan =
+                matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+            save_lock_result_tx
+                .send(blocked_by_scan)
+                .expect("the test observes the save thread's path-lock probe");
+            modified_with_sequence(&save_path, || Some(system_time_at(300)))
+        });
+        let save_was_blocked_by_scan = save_lock_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the save probes the same path lock while the scan is paused");
+
+        release_scan_tx
+            .send(())
+            .expect("the scan is paused until the test releases it");
+        let (scan_modified, scan_sequence) = scan.join().expect("the scan completes");
+        let (save_modified, save_sequence) = save.join().expect("the save completes");
+
+        assert!(
+            scan_holds_path_lock,
+            "the scan must keep the path lock from its mtime read through sequence allocation"
+        );
+        assert!(
+            save_was_blocked_by_scan,
+            "the save's try_lock must observe the scan holding the path lock after its mtime read"
+        );
+        assert_eq!(scan_modified, Some(system_time_at(100)));
+        assert_eq!(save_modified, Some(system_time_at(300)));
+        assert!(scan_sequence < save_sequence);
+
+        let other_path = PathBuf::from("/notes/Other.md");
+        let mut folder = WorkFolder::from_tree(
+            PathBuf::from("/notes"),
+            vec![
+                file_node(path.to_str().unwrap(), Some(system_time_at(50))),
+                file_node(other_path.to_str().unwrap(), Some(system_time_at(200))),
+            ],
+        );
+        folder.set_sort_order(WorkFolderSortOrder::UpdatedNewest);
+        // Deliver the newer save first, then the scan that read the old mtime.
+        folder.touch(&path, save_modified, save_sequence);
+        folder.touch(&path, scan_modified, scan_sequence);
+
+        let sorted_paths: Vec<&Path> = folder.children().iter().map(WorkFolderNode::path).collect();
+        assert_eq!(
+            sorted_paths,
+            [path.as_path(), other_path.as_path()],
+            "the newer saved mtime remains first under the actual UpdatedNewest ordering"
+        );
+        assert_eq!(
+            folder
+                .entry_for_path(&path)
+                .and_then(WorkFolderEntry::modified),
+            Some(system_time_at(300))
+        );
+    }
+
+    #[test]
+    fn a_save_read_taken_before_a_scan_does_not_overwrite_the_scanned_time_when_it_lands_later() {
+        // Save side: its mtime read (and sequence) happens first, off the UI
+        // thread. An external edit follows, the rescan observes it and is
+        // applied; only then does the save completion arrive.
+        let save_modified = Some(system_time_at(100));
+        let save_seq = next_modified_sequence();
+
+        let root = temporary_directory("workfolder-save-rescan-race");
+        fs::create_dir_all(&root).unwrap();
+        let external = root.join("External.md");
+        let other = root.join("Other.md");
+        fs::write(&external, "# External\n").unwrap();
+        fs::write(&other, "# Other\n").unwrap();
+
+        let mut folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let scanned = folder
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path() == external)
+            .and_then(|entry| entry.modified())
+            .expect("the scan observed the external file's modified time");
+        assert!(scanned > system_time_at(100));
+
+        // The stale save completion arrives after the scan result.
+        folder.touch(&external, save_modified, save_seq);
+
+        let after = folder
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path() == external)
+            .and_then(|entry| entry.modified());
+        assert_eq!(
+            after,
+            Some(scanned),
+            "an older save read must not replace the scan's observation"
+        );
+
+        // A save whose read happens after the scan still applies.
+        let later_seq = next_modified_sequence();
+        folder.touch(&external, Some(system_time_at(9_999_999_999)), later_seq);
+        let updated = folder
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path() == external)
+            .and_then(|entry| entry.modified());
+        assert_eq!(updated, Some(system_time_at(9_999_999_999)));
         fs::remove_dir_all(root).unwrap();
     }
 }

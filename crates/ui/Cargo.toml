@@ -10,6 +10,7 @@ timing-probe = []
 instrument = ["timing-probe"]
 
 [dependencies]
+async-channel.workspace = true
 hane-document.workspace = true
 hane-ai.workspace = true
 hane-editor.workspace = true
