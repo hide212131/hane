@@ -941,6 +941,11 @@ fn walk(root: &Path, dir: &Path) -> io::Result<Vec<WorkFolderNode>> {
             .metadata()
             .ok()
             .and_then(|metadata| metadata.modified().ok());
+        // Paired with the read above so a save or rename result whose own
+        // read happened *before* this scan cannot overwrite what the scan
+        // observed when its completion reaches the UI thread afterwards;
+        // see `set_modified`.
+        let sequence = next_modified_sequence();
         if file_type.is_dir() {
             // `.hane` directly under the work folder root is where Hane
             // keeps its own state for this work folder (the unnamed-note
@@ -953,12 +958,13 @@ fn walk(root: &Path, dir: &Path) -> io::Result<Vec<WorkFolderNode>> {
                 continue;
             }
             let children = walk(root, &path)?;
-            nodes.push(WorkFolderNode::Folder(WorkFolderFolder::new(
-                path, children, modified,
-            )));
+            let mut folder = WorkFolderFolder::new(path, children, modified);
+            folder.modified_seq = Some(sequence);
+            nodes.push(WorkFolderNode::Folder(folder));
         } else if file_type.is_file() && is_markdown(&path) {
             let mut entry = WorkFolderEntry::new(path);
             entry.modified = modified;
+            entry.modified_seq = Some(sequence);
             nodes.push(WorkFolderNode::File(entry));
         }
     }
@@ -1895,6 +1901,56 @@ mod tests {
             entry.modified().is_some(),
             "a real scan must acquire a modified time for later UpdatedNewest/UpdatedOldest sorting"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_read_taken_before_a_scan_does_not_overwrite_the_scanned_time_when_it_lands_later() {
+        // Save side: its mtime read (and sequence) happens first, off the UI
+        // thread. An external edit follows, the rescan observes it and is
+        // applied; only then does the save completion arrive.
+        let save_modified = Some(system_time_at(100));
+        let save_seq = next_modified_sequence();
+
+        let root = temporary_directory("workfolder-save-rescan-race");
+        fs::create_dir_all(&root).unwrap();
+        let external = root.join("External.md");
+        let other = root.join("Other.md");
+        fs::write(&external, "# External\n").unwrap();
+        fs::write(&other, "# Other\n").unwrap();
+
+        let mut folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let scanned = folder
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path() == external)
+            .and_then(|entry| entry.modified())
+            .expect("the scan observed the external file's modified time");
+        assert!(scanned > system_time_at(100));
+
+        // The stale save completion arrives after the scan result.
+        folder.touch(&external, save_modified, save_seq);
+
+        let after = folder
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path() == external)
+            .and_then(|entry| entry.modified());
+        assert_eq!(
+            after,
+            Some(scanned),
+            "an older save read must not replace the scan's observation"
+        );
+
+        // A save whose read happens after the scan still applies.
+        let later_seq = next_modified_sequence();
+        folder.touch(&external, Some(system_time_at(9_999_999_999)), later_seq);
+        let updated = folder
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path() == external)
+            .and_then(|entry| entry.modified());
+        assert_eq!(updated, Some(system_time_at(9_999_999_999)));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -538,6 +538,10 @@ struct SaveAttempt {
     ticket: SaveTicket,
     instance: Option<DocumentInstance>,
     path: PathBuf,
+    /// The saved file's own modified time and `next_modified_sequence`,
+    /// acquired together off the UI thread at the point of the write.
+    /// `None` when the write failed.
+    leaf: Option<(Option<SystemTime>, u64)>,
     ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
