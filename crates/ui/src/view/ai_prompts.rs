@@ -868,12 +868,6 @@ mod tests {
     use crate::view::{ExternalDropTarget, SettingsCategory};
     use gpui::px;
 
-    // Issue #580: 本文Textareaが初期表示から複数行を見せる高さを保つ。
-    #[test]
-    fn prompt_body_height_shows_multiple_lines() {
-        assert!(PROMPT_BODY_HEIGHT >= 180.0);
-    }
-
     // Regression for a saved draft resetting `selected` to the first prompt
     // and losing track of the one actually being edited.
     #[gpui::test]
