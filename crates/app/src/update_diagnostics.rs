@@ -137,7 +137,10 @@ impl Redactor {
 
 fn is_auth_scheme(word: &str) -> bool {
     const SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "ntlm"];
-    let lower = word.to_ascii_lowercase();
+    // JSON / bracket wrappers (`"Bearer`) must not hide the scheme.
+    let lower = word
+        .trim_matches(|c: char| "{[(\"'`}]) \t".contains(c))
+        .to_ascii_lowercase();
     SCHEMES.contains(&lower.as_str())
 }
 
@@ -601,6 +604,16 @@ mod tests {
         assert!(out.contains("https://example.com/a/b?<redacted>"), "{out}");
         assert!(out.contains("token=<redacted>"), "{out}");
         assert!(out.contains("~/Library/x"), "{out}");
+    }
+
+    #[test]
+    fn quoted_authorization_scheme_credentials_are_masked() {
+        let out = redactor().redact(r#"{"Authorization": "Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
+        let out = redactor().redact(r#"{"Authorization": "Basic dXNlcjpwdw=="}"#, 1000);
+        assert!(!out.contains("dXNlcjpwdw"), "{out}");
+        let out = redactor().redact(r#"{"Proxy-Authorization": "Bearer abc"}"#, 1000);
+        assert!(!out.contains("abc"), "{out}");
     }
 
     #[test]
