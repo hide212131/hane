@@ -166,6 +166,25 @@ mod tests {
         }
     }
 
+    // The sidebar toggle must stay a path-only outline on a 24px viewBox like
+    // Hane's other stroked icons that render correctly; a `<rect>` with
+    // fixed width/height rendered as an I-shaped glyph in the real app.
+    #[test]
+    fn sidebar_icon_is_path_only_rounded_frame_with_left_divider() {
+        let bytes = AppAssets
+            .load(ICON_SIDEBAR)
+            .unwrap()
+            .expect("the sidebar toggle icon must be served");
+        let svg = std::str::from_utf8(&bytes).expect("sidebar.svg must be UTF-8");
+        assert!(svg.contains("viewBox=\"0 0 24 24\""));
+        assert!(!svg.contains("<rect"), "frame must be a path, not a <rect>");
+        assert!(!svg.contains(" width=\"") && !svg.contains(" height=\""));
+        assert_eq!(svg.matches("<path").count(), 2, "frame and divider");
+        // Rounded frame: four arc corners; divider: a vertical line.
+        assert_eq!(svg.matches('A').count(), 4);
+        assert!(svg.contains("d=\"M9 5v14\""));
+    }
+
     // gpui-component's own icon set, resolved through `gpui_kit_assets::Assets`
     // rather than one of Hane's `ICON_*` constants. This is what
     // `IconName::Copy` (the file tab HoverCard's copy button) needs to
