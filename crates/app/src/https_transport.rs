@@ -79,25 +79,35 @@ fn failure(kind: TransportFailure, detail: impl Into<String>) -> TransportError 
     }
 }
 
+/// Human text plus the structured `ErrorKind` and, when present, the raw OS
+/// error number.
+fn io_detail(error: &io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{error} [io_kind={:?} os_error={code}]", error.kind()),
+        None => format!("{error} [io_kind={:?}]", error.kind()),
+    }
+}
+
 fn map_io(error: &io::Error) -> TransportError {
+    let detail = io_detail(error);
     if matches!(
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ) {
-        return failure(TransportFailure::Timeout, error.to_string());
+        return failure(TransportFailure::Timeout, detail);
     }
     if error
         .get_ref()
         .is_some_and(|inner| inner.is::<rustls::Error>())
     {
-        return failure(TransportFailure::Tls, error.to_string());
+        return failure(TransportFailure::Tls, detail);
     }
     match error.kind() {
         io::ErrorKind::UnexpectedEof
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::BrokenPipe => failure(TransportFailure::Disconnected, error.to_string()),
-        _ => failure(TransportFailure::Other, error.to_string()),
+        | io::ErrorKind::BrokenPipe => failure(TransportFailure::Disconnected, detail),
+        _ => failure(TransportFailure::Other, detail),
     }
 }
 
@@ -575,6 +585,40 @@ impl Transport for HttpsTransport {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn map_io_keeps_class_kind_and_os_error() {
+        let cases = [
+            (io::ErrorKind::TimedOut, TransportFailure::Timeout),
+            (io::ErrorKind::ConnectionReset, TransportFailure::Disconnected),
+            (io::ErrorKind::PermissionDenied, TransportFailure::Other),
+        ];
+        for (kind, expected) in cases {
+            let mapped = map_io(&io::Error::new(kind, "synthetic"));
+            assert_eq!(mapped.kind, expected);
+            assert!(mapped.detail.contains("synthetic"), "{}", mapped.detail);
+            assert!(
+                mapped.detail.contains(&format!("io_kind={kind:?}")),
+                "{}",
+                mapped.detail
+            );
+            assert!(!mapped.detail.contains("os_error"), "{}", mapped.detail);
+        }
+        let tls = map_io(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::HandshakeNotComplete,
+        ));
+        assert_eq!(tls.kind, TransportFailure::Tls);
+        assert!(tls.detail.contains("io_kind=InvalidData"), "{}", tls.detail);
+    }
+
+    #[test]
+    fn map_io_reports_raw_os_error_number() {
+        let mapped = map_io(&io::Error::from_raw_os_error(4242));
+        assert_eq!(mapped.kind, TransportFailure::Other);
+        assert!(mapped.detail.contains("os_error=4242"), "{}", mapped.detail);
+        assert!(mapped.detail.contains("io_kind="), "{}", mapped.detail);
+    }
 
     struct Fake(Cursor<Vec<u8>>);
 
