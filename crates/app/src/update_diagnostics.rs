@@ -81,16 +81,24 @@ impl Redactor {
         let tokens: Vec<&str> = text.split_whitespace().collect();
         for (index, token) in tokens.iter().copied().enumerate() {
             if mask_next > 0 {
+                // A stand-alone separator (`Authorization = Bearer abc`,
+                // `"Authorization" : "Bearer abc"`) is not the credential.
+                if token.chars().all(|c| c == '=' || c == ':') {
+                    out.push(token.to_owned());
+                    continue;
+                }
                 mask_next -= 1;
                 out.push(REDACTED.to_owned());
                 continue;
             }
-            match token.to_ascii_lowercase().trim_end_matches(':') {
-                "authorization" => mask_next = 2,
-                "bearer" | "basic" => {
-                    mask_next = 1;
-                }
-                _ => {}
+            // JSON quotes / brackets and the separator may wrap the key.
+            let key = token
+                .trim_matches(|c: char| "{[(\"'`}]):=".contains(c))
+                .to_ascii_lowercase();
+            if key.ends_with("authorization") {
+                mask_next = 2;
+            } else if matches!(key.as_str(), "bearer" | "basic") {
+                mask_next = 1;
             }
             let (text, mask_following) = self.redact_token(token);
             if mask_next == 0 {
@@ -633,6 +641,41 @@ mod tests {
         assert!(!out.contains("abc"), "{out}");
         let out = redactor().redact(r#"data={"count": 3} ok"#, 1000);
         assert!(out.contains(r#"data={"count": 3} ok"#), "{out}");
+    }
+
+    const SPACED_AUTHORIZATION_CASES: [&str; 4] = [
+        "Authorization = Bearer abc",
+        r#""Authorization" : "Bearer abc""#,
+        "{\n  \"code\": \"E1\",\n  \"Authorization\" : \"Bearer abc\",\n  \"stage\": \"check\"\n}",
+        "{\n  \"Authorization\"\n    :\n    \"Bearer abc\"\n}",
+    ];
+
+    #[test]
+    fn spaced_authorization_separators_do_not_leak_the_credential() {
+        for input in SPACED_AUTHORIZATION_CASES {
+            let out = redactor().redact(input, 1000);
+            assert!(!out.contains("abc"), "{input:?} leaked in {out}");
+        }
+        let kept = redactor().redact("Authorization = Bearer abc stage=check", 1000);
+        assert!(kept.ends_with("stage=check"), "{kept}");
+    }
+
+    #[test]
+    fn spaced_authorization_is_masked_in_the_log_and_the_report() {
+        let dir = TempDir::new("diag-spaced-auth");
+        let diag = Diagnostics::new(dir.path(), identity("run-1"), redactor());
+        for input in SPACED_AUTHORIZATION_CASES {
+            // The test identity's install id contains "abc", so the
+            // credential uses a distinct marker here.
+            diag.record("check", "http", &input.replace("abc", "zq9cred"), None);
+        }
+        let saved = fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        assert!(saved.contains("<redacted>"), "{saved}");
+        assert!(!saved.contains("zq9cred"), "{saved}");
+        let report = diag.report();
+        assert!(!report.contains("zq9cred"), "{report}");
+        let restarted = Diagnostics::new(dir.path(), identity("run-2"), redactor());
+        assert!(!restarted.report().contains("zq9cred"));
     }
 
     #[test]
