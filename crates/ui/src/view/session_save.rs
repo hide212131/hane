@@ -553,17 +553,12 @@ impl EditorView {
     /// directory entry changed too — see `WorkFolder::ancestor_folder_paths`.
     fn touch_saved_work_folder_entry(
         &mut self,
-        id: SessionId,
         path: &Path,
+        leaf: Option<(Option<SystemTime>, u64)>,
         ancestors: &[(PathBuf, Option<SystemTime>, u64)],
     ) {
-        let modified = self
-            .sessions
-            .get(id)
-            .and_then(|session| session.file().stamp())
-            .and_then(|stamp| stamp.modified);
-        if let Some(folder) = self.work_folder.as_mut() {
-            folder.touch(path, modified, next_modified_sequence());
+        if let (Some(folder), Some((modified, sequence))) = (self.work_folder.as_mut(), leaf) {
+            folder.touch(path, modified, sequence);
         }
         self.touch_work_folder_ancestors(ancestors);
     }
@@ -680,11 +675,22 @@ impl EditorView {
                     .map(|folder| folder.ancestor_folder_paths(&path))
                     .unwrap_or_default();
                 cx.spawn(async move |view, cx| {
-                    let (result, ancestors) = cx
+                    let (result, leaf, ancestors) = cx
                         .background_executor()
                         .spawn(async move {
                             let result =
                                 run_save_job(files.as_ref(), &job.path, &job.document, job.guard);
+                            // The saved file's own modified time is read and
+                            // sequenced here, at the point of the write,
+                            // rather than when this completion reaches the
+                            // UI thread: a rescan that observed a later
+                            // external change and was applied first holds a
+                            // newer sequence, so this older read is dropped.
+                            let leaf = if result.is_ok() {
+                                Some(stamp_with_sequence(files.as_ref(), &job.path))
+                            } else {
+                                None
+                            };
                             // The containing directory's own entry changed
                             // alongside the leaf's write (an atomic save
                             // replaces the target via a temp-file rename),
@@ -697,7 +703,7 @@ impl EditorView {
                             } else {
                                 Vec::new()
                             };
-                            (result, ancestors)
+                            (result, leaf, ancestors)
                         })
                         .await;
                     let _ = view.update(cx, |view, cx| {
@@ -706,6 +712,7 @@ impl EditorView {
                             ticket,
                             instance,
                             path,
+                            leaf,
                             ancestors,
                         };
                         view.finish_save(attempt, result, cx);
@@ -728,6 +735,7 @@ impl EditorView {
             ticket,
             instance,
             path,
+            leaf,
             ancestors,
         } = attempt;
         let path = path.as_path();
@@ -769,7 +777,7 @@ impl EditorView {
                 cx.add_recent_document(path);
                 self.retire_work_folder_draft(id, cx);
                 self.apply_pending_title_sync(id, path);
-                self.touch_saved_work_folder_entry(id, path, &ancestors);
+                self.touch_saved_work_folder_entry(path, leaf, &ancestors);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::SavedStale => {
@@ -782,7 +790,7 @@ impl EditorView {
                 self.schedule_autosave(cx);
                 self.retire_work_folder_draft(id, cx);
                 self.apply_pending_title_sync(id, path);
-                self.touch_saved_work_folder_entry(id, path, &ancestors);
+                self.touch_saved_work_folder_entry(path, leaf, &ancestors);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::Conflict => {

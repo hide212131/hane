@@ -75,8 +75,8 @@ use hane_session::{
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, ThemePreference, TitleSyncAction, UnsavedChanges, WorkFolder,
-    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync, extract_h1_title,
-    format_relative_date_label, local_today, next_modified_sequence, run_save_job,
+    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync,
+    extract_h1_title, format_relative_date_label, local_today, run_save_job,
     split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -100,6 +100,7 @@ mod background_parse;
 mod basic_editing_keys;
 mod content_search;
 mod document_find;
+mod folder_watch;
 mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod inline_rename;
@@ -545,6 +546,10 @@ struct SaveAttempt {
     ticket: SaveTicket,
     instance: Option<DocumentInstance>,
     path: PathBuf,
+    /// The saved file's own modified time and `next_modified_sequence`,
+    /// acquired together off the UI thread at the point of the write.
+    /// `None` when the write failed.
+    leaf: Option<(Option<SystemTime>, u64)>,
     ancestors: Vec<(PathBuf, Option<SystemTime>, u64)>,
 }
 
@@ -1030,6 +1035,13 @@ pub struct EditorView {
     /// is open now, since `into`/`latest_open_target` alone cannot tell a
     /// same-named stale request in the new folder apart from one in the old.
     work_folder_generation: u64,
+    /// The OS watch on the current work folder and its re-list bookkeeping;
+    /// dropped (releasing the watch) when the folder is replaced or the
+    /// window closes.
+    folder_watch: folder_watch::FolderWatchState,
+    /// Start order of every work folder listing scan; see
+    /// `folder_watch::ListingRequests`.
+    listing_requests: folder_watch::ListingRequests,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -1800,6 +1812,8 @@ impl EditorView {
             pending_restore: VecDeque::new(),
             restoring_path: None,
             work_folder_generation: 0,
+            folder_watch: folder_watch::FolderWatchState::default(),
+            listing_requests: folder_watch::ListingRequests::default(),
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -1899,6 +1913,11 @@ impl EditorView {
         // told apart from the current one once both land; see the
         // `generation` check at the top of `finish_work_folder_scan`.
         let generation = self.work_folder_generation;
+        // Watching starts before the scan, so a change made while the scan
+        // runs is still reported afterward; the previous folder's watch is
+        // released here.
+        self.start_folder_watch(&root, cx);
+        let request = self.begin_listing_request();
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
             let scanned = cx
@@ -1914,6 +1933,13 @@ impl EditorView {
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
+                // A listing started after this scan may already be applied
+                // for the same folder; do not overwrite it.
+                if generation == view.work_folder_generation
+                    && !view.accept_listing_result(request)
+                {
+                    return;
+                }
                 view.finish_work_folder_scan(generation, scanned, cx);
             });
         })
@@ -2011,6 +2037,7 @@ impl EditorView {
                 };
 
                 self.content_search_workspace_changed(cx);
+                self.resume_pending_folder_refresh(cx);
 
                 if self.latest_open_target.is_some() {
                     // A document was requested (e.g. delivered by Finder at
@@ -2863,8 +2890,7 @@ impl EditorView {
                     // can retain the new folder's modified time the same
                     // no-rescan way a save does, instead of leaving it
                     // unknown (and sorting as oldest) until the next scan.
-                    let modified = files.stamp(&probe_path).and_then(|stamp| stamp.modified);
-                    let modified_seq = next_modified_sequence();
+                    let (modified, modified_seq) = stamp_with_sequence(files.as_ref(), &probe_path);
                     // The parent directory's own entry just gained this new
                     // folder, so its real modified time changed too; failing
                     // this new folder's own creation leaves the tree

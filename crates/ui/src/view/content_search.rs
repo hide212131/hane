@@ -1656,6 +1656,28 @@ impl EditorView {
     }
 
     fn rescan_content_search(&mut self, cx: &mut Context<Self>) {
+        let Some((root, generation, request)) = self.begin_content_search_rescan(cx) else {
+            return;
+        };
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { OsWorkFolderScanner.scan(&root) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_content_search_rescan(generation, request, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Marks the explicit re-search as waiting for a fresh listing and returns
+    /// what the scan needs, or `None` when there is nothing to scan.
+    fn begin_content_search_rescan(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(PathBuf, u64, u64)> {
         let Some(root) = self
             .work_folder
             .as_ref()
@@ -1664,43 +1686,54 @@ impl EditorView {
             self.content_search.status = ContentSearchStatus::NeedsWorkFolder;
             self.content_search.status_detail = None;
             cx.notify();
-            return;
+            return None;
         };
         if self.content_search.status == ContentSearchStatus::Waiting {
-            return;
+            return None;
         }
         self.invalidate_content_search(true);
         self.content_search.status = ContentSearchStatus::Waiting;
         self.content_search.status_detail = Some("Work folder一覧を更新しています…".to_owned());
         let generation = self.work_folder_generation;
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { OsWorkFolderScanner.scan(&root) })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                if generation != view.work_folder_generation {
-                    return;
-                }
-                match result {
-                    Ok(folder) => {
-                        view.work_folder = Some(folder);
-                        view.content_search.workspace_epoch =
-                            view.content_search.workspace_epoch.wrapping_add(1);
-                        view.content_search.status_detail = None;
-                        view.content_search.status = ContentSearchStatus::Waiting;
-                        view.request_current_query(cx, false);
-                    }
-                    Err(error) => {
-                        view.content_search.status = ContentSearchStatus::Failed;
-                        view.content_search.status_detail =
-                            Some(format!("Work folder一覧の更新に失敗しました: {error}"));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        let request = self.begin_listing_request();
+        Some((root, generation, request))
+    }
+
+    fn finish_content_search_rescan(
+        &mut self,
+        generation: u64,
+        request: u64,
+        result: std::io::Result<WorkFolder>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.work_folder_generation {
+            return;
+        }
+        // A listing started after this one may already be installed.
+        // Keep it, and search it instead of leaving the UI waiting.
+        let result = if self.accept_listing_result(request) {
+            result
+        } else {
+            match self.work_folder.clone() {
+                Some(current) => Ok(current),
+                None => result,
+            }
+        };
+        match result {
+            Ok(folder) => {
+                self.work_folder = Some(folder);
+                self.content_search.workspace_epoch =
+                    self.content_search.workspace_epoch.wrapping_add(1);
+                self.content_search.status_detail = None;
+                self.content_search.status = ContentSearchStatus::Waiting;
+                self.request_current_query(cx, false);
+            }
+            Err(error) => {
+                self.content_search.status = ContentSearchStatus::Failed;
+                self.content_search.status_detail =
+                    Some(format!("Work folder一覧の更新に失敗しました: {error}"));
+            }
+        }
         cx.notify();
     }
 
@@ -3608,6 +3641,95 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.content_search.files_finished, FILE_COUNT);
             assert_eq!(view.content_search.status, ContentSearchStatus::Complete);
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_stale_explicit_rescan_result_resumes_the_query_on_the_current_listing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::OsWorkFolderScanner;
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hane-554-stale-rescan-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Before.md"), "no match here").unwrap();
+        let folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.initialize_content_search_input(window, cx);
+                view.editor_mut().insert_text("unsaved text").unwrap();
+                view.work_folder = Some(folder);
+                view.content_search.mode = SidebarMode::Content;
+                view.content_search.query_text = "needle".to_owned();
+            });
+        });
+
+        // The explicit re-search starts its scan first and sees the folder
+        // before the external file appears. Its completion is held back and
+        // delivered by hand instead of through a real background task.
+        let (older_request, older_scan, generation) = view.update(cx, |view, cx| {
+            let (scan_root, generation, request) = view
+                .begin_content_search_rescan(cx)
+                .expect("the explicit re-search starts a scan");
+            (request, OsWorkFolderScanner.scan(&scan_root), generation)
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.content_search.status, ContentSearchStatus::Waiting);
+        });
+
+        // A watcher scan started later installs the newer listing first.
+        std::fs::write(root.join("External.md"), "# External\n").unwrap();
+        view.update(cx, |view, cx| {
+            let request = view.begin_listing_request();
+            let newer = OsWorkFolderScanner.scan(&root);
+            view.finish_work_folder_refresh(generation, request, &root, None, newer, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            // A background listing update alone never re-runs the search.
+            assert_eq!(view.content_search.status, ContentSearchStatus::Waiting);
+            assert!(view.content_search.current_work.is_none());
+            assert_eq!(view.work_folder.as_ref().unwrap().entries().len(), 2);
+        });
+
+        // Now the older explicit re-search scan completes.
+        view.update(cx, |view, cx| {
+            view.finish_content_search_rescan(generation, older_request, older_scan, cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().unwrap().entries().len(),
+                2,
+                "the older listing must not replace the newer one"
+            );
+            assert_ne!(view.content_search.status, ContentSearchStatus::Waiting);
+        });
+
+        // The held query runs on the current listing and completes.
+        cx.run_until_parked();
+        cx.executor().advance_clock(SEARCH_DELIVERY_POLL);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.content_search.total_files, 2);
+            assert_eq!(view.content_search.status, ContentSearchStatus::Complete);
+            assert_eq!(view.editor().document().full_text(), "unsaved text");
+            assert!(view.active_session().is_dirty());
         });
 
         std::fs::remove_dir_all(root).unwrap();

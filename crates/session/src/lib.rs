@@ -38,6 +38,7 @@ mod service;
 mod session;
 mod store;
 pub mod testing;
+mod watch;
 mod workfolder;
 
 pub use date_badge::{
@@ -64,6 +65,7 @@ pub use store::{
     FileStateStore, MemoryStateStore, RecentFiles, RecentFilesRepository, Settings,
     SettingsRepository, StateStores, ThemePreference, pin_state_root,
 };
+pub use watch::{DEFAULT_MAX_WAIT, DEFAULT_QUIET_PERIOD, FolderWatcher, WatchBatch, WatchTiming};
 pub use workfolder::{
     OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderFolder, WorkFolderNode,
     WorkFolderScanner, WorkFolderSortOrder, next_modified_sequence, stamp_with_sequence,
