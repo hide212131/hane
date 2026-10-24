@@ -35,6 +35,7 @@ mod list_editing;
 mod list_projection;
 mod local_block_index;
 mod markers;
+mod mermaid;
 mod parser;
 mod syntax;
 
@@ -58,6 +59,7 @@ pub use markers::{
     FenceDelimiter, FenceMarkerEdge, fence_closes, fence_closing_delimiter, fence_delimiter,
     has_delimiter_markers, is_table_delimiter,
 };
+pub use mermaid::{MermaidFence, mermaid_fence};
 pub use parser::parse_document;
 pub use syntax::{
     LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,

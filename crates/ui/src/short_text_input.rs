@@ -608,6 +608,63 @@ mod tests {
         assert_eq!(next_boundary(text, emoji_end), text.len());
     }
 
+    /// Pinned byte boundaries, written out by hand rather than asked of the
+    /// segmentation library, so a library update that moves a boundary fails
+    /// here (Issue #587 updates `unicode-segmentation` to 1.13.3).
+    const PINNED_BOUNDARIES: &[(&str, &[usize])] = &[
+        ("日本語", &[0, 3, 6, 9]),
+        ("e\u{301}x", &[0, 3, 4]),
+        ("👨\u{200d}👩\u{200d}👧\u{200d}👦", &[0, 25]),
+        ("🇯🇵🇺🇸", &[0, 8, 16]),
+        ("👍🏽", &[0, 8]),
+        ("か\u{3099}き", &[0, 6, 9]),
+        ("☺\u{fe0f}!", &[0, 6, 7]),
+        ("1\u{fe0f}\u{20e3}", &[0, 7]),
+        ("\u{1112}\u{1161}\u{11ab}", &[0, 9]),
+        ("a\r\nb", &[0, 1, 3, 4]),
+    ];
+
+    #[test]
+    fn grapheme_boundaries_match_the_pinned_unicode_expectations() {
+        for (text, boundaries) in PINNED_BOUNDARIES {
+            let mut forward = vec![0];
+            while *forward.last().unwrap() < text.len() {
+                forward.push(next_boundary(text, *forward.last().unwrap()));
+            }
+            assert_eq!(&forward, boundaries, "forward over {text:?}");
+
+            let mut backward = vec![text.len()];
+            while *backward.last().unwrap() > 0 {
+                backward.push(previous_boundary(text, *backward.last().unwrap()));
+            }
+            backward.reverse();
+            assert_eq!(&backward, boundaries, "backward over {text:?}");
+        }
+    }
+
+    #[test]
+    fn deleting_and_moving_remove_whole_pinned_clusters() {
+        for (text, boundaries) in PINNED_BOUNDARIES {
+            let mut backspace = ShortTextInput::new((*text).to_owned());
+            backspace.move_end(false);
+            backspace.delete(true);
+            assert_eq!(
+                backspace.text(),
+                &text[..boundaries[boundaries.len() - 2]],
+                "backspace at the end of {text:?}"
+            );
+
+            let mut delete = ShortTextInput::new((*text).to_owned());
+            delete.move_home(false);
+            delete.delete(false);
+            assert_eq!(
+                delete.text(),
+                &text[boundaries[1]..],
+                "delete at the start of {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn shift_home_and_end_extend_from_the_active_caret() {
         let mut forward = with_selection("abcdef", 2..4, false);

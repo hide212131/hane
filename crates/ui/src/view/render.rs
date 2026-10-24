@@ -62,6 +62,7 @@ impl Render for EditorView {
         {
             self.tab_close_confirm = None;
         }
+        self.begin_mermaid_frame(window, cx);
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height
@@ -110,6 +111,7 @@ impl Render for EditorView {
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
         let blocks = self.visible_blocks(visible.clone());
         self.schedule_joined_parse(&blocks, cx);
+        self.schedule_mermaid(&blocks, cx);
         // Keep a margin of presentations around the viewport so scrolling back
         // does not re-present, and drop the rest.
         let retained = self
@@ -122,6 +124,9 @@ impl Render for EditorView {
             })
             .unwrap_or_else(|| blocks.iter().map(|block| block.id).collect());
         self.block_cache.retain(|id, _| retained.contains(id));
+        // Diagrams follow the same window: a render for a block that left it is
+        // stopped and its picture handed back to the window.
+        self.mermaid.retain_blocks(&retained);
 
         self.layout_cache.retain(|id, _| retained.contains(id));
         self.joined_parse_cache
@@ -463,6 +468,8 @@ impl Render for EditorView {
                         // row: what is generated scales with visible blocks, and
                         // within a block with the rows that reach the viewport.
                         .children(rendered.into_iter().map(|(_, visual, layout)| {
+                            let diagram_paint = self.diagram_paint(&visual);
+                            let note = self.mermaid_note_element(&visual);
                             block_element(
                                 &layout,
                                 (0..layout.lines.len()).map(|row_index| {
@@ -484,6 +491,7 @@ impl Render for EditorView {
                                         self.body_caret_visible(),
                                         &find_matches,
                                         find_current_match,
+                                        diagram_paint.as_ref(),
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`
@@ -524,6 +532,7 @@ impl Render for EditorView {
                                     )
                                 }),
                             )
+                            .when_some(note, |element, note| element.relative().child(note))
                         }))
                         .child(div().h(px(bottom_space))),
                 )

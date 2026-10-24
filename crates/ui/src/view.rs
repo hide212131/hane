@@ -29,9 +29,12 @@ use crate::instrument::{Instrumentation, log_summary};
 use crate::line::DEFAULT_LINE_HEIGHT;
 use crate::line::{
     BODY_FONT_SIZE, BlockPresentationRequest, CARET_MODE_BADGE_HEIGHT, DisclosurePolicy,
-    block_element, block_fits_sync_join_budget, expected_block_disclosures, presented_block,
-    row_element,
+    block_element, block_fits_sync_join_budget, expected_block_disclosures,
+    presented_block_with_diagram, row_element,
 };
+#[cfg(test)]
+use crate::line::presented_block;
+use crate::mermaid::MermaidStore;
 use crate::shape::WindowShaper;
 use crate::short_text_input::{ShortTextInput, utf16_offset_from_byte};
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme, sync_component_theme};
@@ -105,6 +108,8 @@ mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod inline_rename;
 pub(crate) mod input_routing;
+mod mermaid_diagrams;
+use mermaid_diagrams::diagram_plan_matches;
 mod reading_mode;
 use reading_mode::{EditorMode, ModeAnchor, command_changes_text};
 mod render;
@@ -1197,6 +1202,13 @@ pub struct EditorView {
     /// Includes detached jobs from previous documents until their completion.
     /// Unlike the per-document deduplication map, replacement must not reset it.
     joined_parse_jobs_running: usize,
+    /// Mermaid fences read from the blocks near the viewport and the pictures
+    /// drawn for them (Issue #587). Keyed like `block_cache`, and emptied
+    /// whenever another document replaces this one.
+    mermaid: MermaidStore,
+    /// Hands the pictures back to the window when the view is released; dropping
+    /// it would cancel the hook.
+    _mermaid_release_subscription: Subscription,
 }
 
 /// Identity of a background request. A late completion must not clear the
@@ -1638,6 +1650,14 @@ impl EditorView {
             view.flush_pending_drafts();
             std::future::ready(())
         });
+        // The diagrams' pictures are also held by the window's atlas; a view
+        // that goes away returns them so that memory is freed with it.
+        let mermaid_release_subscription = cx.on_release(|view: &mut Self, app| {
+            for retired in view.mermaid.release_all() {
+                let (image, _reservation) = retired.into_parts();
+                app.drop_image(image, None);
+            }
+        });
         // The caret's mode badge (see `caret_input_mode`) has to
         // update the moment the user switches IME mode, even if nothing else
         // about the document changes, so this reuses the same platform event
@@ -1856,6 +1876,8 @@ impl EditorView {
             joined_parse_cache: HashMap::new(),
             joined_parse_jobs: HashMap::new(),
             joined_parse_jobs_running: 0,
+            mermaid: MermaidStore::new(),
+            _mermaid_release_subscription: mermaid_release_subscription,
         }
     }
 
@@ -2687,6 +2709,9 @@ impl EditorView {
         // for an unrelated block in whatever document replaced it.
         self.joined_parse_cache.clear();
         self.joined_parse_jobs.clear();
+        // Same for the diagrams: stop their jobs, and let the window forget the
+        // pictures on the next frame. A job that finishes later finds no entry.
+        self.mermaid.reset();
     }
 
     /// Carries each ancestor folder's just-fetched real modified time into
@@ -4355,6 +4380,12 @@ impl EditorView {
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
+        // The picture of a diagram stands for the whole fenced block. A press on
+        // it moves the edit position to the start of the diagram's text instead
+        // of being measured against the (hidden) source line under it.
+        if self.click_diagram_row(line, cx) {
+            return;
+        }
         let shaper = WindowShaper::new(window, self.zoom);
         let Some(hit) = self.row_hit_at_window_point(
             line,
@@ -4725,11 +4756,13 @@ impl EditorView {
             }
         }
         let window = window_start..window_end;
+        let diagram = self.diagram_plan_for(&indexed);
         let drawn = self
             .block_cache
             .get(&indexed.id)
             .filter(|block| block.matches(&indexed) && block.covers(&window))
-            .filter(|block| self.disclosures_are_current(&indexed, block));
+            .filter(|block| self.disclosures_are_current(&indexed, block))
+            .filter(|block| diagram_plan_matches(block, diagram.as_ref()));
         if let Some(block) = drawn
             && let Some(entry) = self.layout_cache.get(&indexed.id).filter(|entry| {
                 entry.is_valid(
@@ -4751,20 +4784,23 @@ impl EditorView {
         let table_projection = self
             .current_index()
             .and_then(|index| index.table_projection(&indexed));
-        let visual = presented_block(BlockPresentationRequest {
-            editor: self.editor(),
-            block: &indexed,
-            visible: &window,
-            joined,
-            list_projection,
-            fence_height_projection,
-            table_projection,
-            // Vertical caret navigation onto a neighbor block, unrelated to
-            // the document-find bar's current match.
-            forced_disclosure: None,
-            line_height: self.line_height(),
-            disclosure_policy: self.disclosure_policy(),
-        })?;
+        let visual = presented_block_with_diagram(
+            BlockPresentationRequest {
+                editor: self.editor(),
+                block: &indexed,
+                visible: &window,
+                joined,
+                list_projection,
+                fence_height_projection,
+                table_projection,
+                // Vertical caret navigation onto a neighbor block, unrelated to
+                // the document-find bar's current match.
+                forced_disclosure: None,
+                line_height: self.line_height(),
+                disclosure_policy: self.disclosure_policy(),
+            },
+            diagram.as_ref(),
+        )?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
     }
@@ -4796,6 +4832,9 @@ impl EditorView {
         let table_projection = self
             .current_index()
             .and_then(|index| index.table_projection(&indexed));
+        // A neighbor that is a rendered diagram is stepped onto through the same
+        // rows it is drawn with, not through its source lines.
+        let diagram = self.diagram_plan_for(&indexed);
         target_in_neighbor(
             self.editor(),
             &indexed,
@@ -4807,6 +4846,7 @@ impl EditorView {
             joined,
             list_projection,
             table_projection,
+            diagram.as_ref(),
             self.line_height(),
             policy,
         )
@@ -5982,6 +6022,9 @@ impl EditorView {
         visible: &Range<usize>,
     ) -> Option<(VisualBlock, bool)> {
         let revision = self.editor().document().revision();
+        // Whether this block is a rendered diagram right now is part of what a
+        // cached presentation has to agree with, like its disclosures.
+        let diagram = self.diagram_plan_for(block);
         if let Some(mut cached) = self.block_cache.remove(&block.id) {
             let editor = self.sessions.active().editor();
             let reusable = if cached.revision == revision {
@@ -6014,6 +6057,7 @@ impl EditorView {
                 && cached.matches(block)
                 && cached.covers(visible)
                 && self.disclosures_are_current(block, &cached)
+                && diagram_plan_matches(&cached, diagram.as_ref())
             {
                 self.block_cache.insert(block.id, cached.clone());
                 return Some((cached, true));
@@ -6029,18 +6073,21 @@ impl EditorView {
         let table_projection = self
             .current_index()
             .and_then(|index| index.table_projection(block));
-        let presented = presented_block(BlockPresentationRequest {
-            editor: self.sessions.active().editor(),
-            block,
-            visible,
-            joined,
-            list_projection,
-            fence_height_projection,
-            table_projection,
-            forced_disclosure: self.document_find_current_match(),
-            line_height: self.line_height(),
-            disclosure_policy: self.disclosure_policy(),
-        })?;
+        let presented = presented_block_with_diagram(
+            BlockPresentationRequest {
+                editor: self.sessions.active().editor(),
+                block,
+                visible,
+                joined,
+                list_projection,
+                fence_height_projection,
+                table_projection,
+                forced_disclosure: self.document_find_current_match(),
+                line_height: self.line_height(),
+                disclosure_policy: self.disclosure_policy(),
+            },
+            diagram.as_ref(),
+        )?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
     }
@@ -6198,23 +6245,27 @@ fn target_in_neighbor(
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
     table_projection: Option<&TableProjection>,
+    diagram: Option<&hane_presentation::DiagramPlan>,
     line_height: f32,
     disclosure_policy: DisclosurePolicy,
 ) -> Option<(SourceOffset, f32)> {
-    let visual = presented_block(BlockPresentationRequest {
-        editor,
-        block: indexed,
-        visible: &window,
-        joined,
-        list_projection,
-        fence_height_projection: None,
-        table_projection,
-        // Vertical caret navigation onto a neighbor block, unrelated to the
-        // document-find bar's current match.
-        forced_disclosure: None,
-        line_height,
-        disclosure_policy,
-    })?;
+    let visual = presented_block_with_diagram(
+        BlockPresentationRequest {
+            editor,
+            block: indexed,
+            visible: &window,
+            joined,
+            list_projection,
+            fence_height_projection: None,
+            table_projection,
+            // Vertical caret navigation onto a neighbor block, unrelated to the
+            // document-find bar's current match.
+            forced_disclosure: None,
+            line_height,
+            disclosure_policy,
+        },
+        diagram,
+    )?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -6300,6 +6351,7 @@ fn neighbor_row_target(
         width,
         shaper,
         joined,
+        None,
         None,
         None,
         DEFAULT_LINE_HEIGHT,

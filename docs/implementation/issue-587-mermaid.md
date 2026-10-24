@@ -174,3 +174,49 @@ rendererの初期化と処理は必要時に遅らせ、起動と通常の入力
 - [フォント例](https://github.com/Latias94/merman/blob/v0.9.2/crates/merman/examples/render_svg_monospace.rs)
 
 この環境では既定のJev CLIが存在しなかった。Commander Policy §2.9の返答取得不能時の扱いに従い、current factsから文書準備のactionを選んだ。Jevの判断を取得したとは記録しない。
+
+## 実装の構成と判断（実装worker記録）
+
+実装worker（shell・Cargo・テストを実行できない環境）が記録する。ここに書いた内容はコードを読んで確認した範囲で、ビルド・テスト・実画面の結果ではない。
+
+### 構成
+
+| 責務 | 場所 | 内容 |
+| --- | --- | --- |
+| 正式な認識 | `crates/markdown/src/mermaid.rs` | ブロック原文をpulldown-cmarkで解析し、トップレベルの単一のfenced code blockで最初の言語語が `mermaid`（ASCII大文字小文字を無視）のときだけ `MermaidFence` を返す。囲みの範囲・本文範囲・本文・閉鎖の有無を絶対offsetで持つ。引用・リスト内、インデント型、別言語は認識しない。開閉行の判定は既存の `fence_delimiter` 系を使う。 |
+| 表示方針 | `crates/presentation/src/diagram.rs`、`BlockKind::Diagram` | `apply_diagram` が囲みの各物理行を残したまま、先頭行（開き囲み）に図の高さ、他の囲み行に高さ0を与える。前後の空行は変えない。範囲を保証できない提示（クリップ済み等）は原文のまま。`diagram_display_size` / `diagram_row_height` を配置と描画の両方が使う。 |
+| 高さ・位置 | 既存の `layout_block` / `BlockLayout` / `HeightIndex` | 既存の「高さ0の折り畳み行」と同じ行構造なので、source↔point、クリック、上下移動、被覆は通常の行から得る。描画後の測定高さが既存経路で `HeightIndex` に入り、読み位置補正も既存のものを使う。 |
+| 生成・保持 | `crates/ui/src/mermaid.rs` | Merman（`=0.9.2`）→ `resvg_safe` SVG → XML検査（ルート寸法、`image`/`feImage` 不在）→ GPUI `SvgRenderer` → `RenderImage`。保持・同時実行・画素の上限と古い結果の破棄。 |
+| 接続 | `crates/ui/src/view/mermaid_diagrams.rs`、`line.rs`、`view.rs`、`view/render.rs` | 可視範囲付近の認識と背景ジョブ、図にしてよいかの判定、提示キャッシュとの照合、クリック、描画。 |
+
+### 動作の決め方
+
+- 図にするかは毎フレーム、`line.rs` の既存の行ごとのdisclosure判定（カーソル・選択・日本語変換範囲・現在の検索結果）を囲みの全行に適用して決める。どれか一行でも触れていれば全原文を表示し、途中の行だけが混在することはない。閲覧モードは既存どおりdisclosureが無いため常に図。
+- 図は、ブロックの正式な索引（`Confidence::Formal`）があり、現在の本文・テーマ（明暗）に完全一致する描画済み結果があるときだけ出す。それ以外（生成中・失敗・未閉鎖・未対応・上限超過・古い結果）は原文を表示し、失敗は短い理由を右上に添える。
+- 編集位置が囲みに入っている間は描画を始めない。外れたときに本文が変わっていれば背景で作り直し、完了まで原文を残す。変わっていなければ結果を再利用する。同じ失敗は本文とテーマが同じ限り再実行しない。
+- 古い仕事は `OperationControl::cancel()` とフラグで止め、完了時にトークン・文書実体で照合して古い結果を捨てる。タブ切替・再読込（文書の置換）・可視範囲から外れたブロックは仕事と画像を破棄する。
+- クリックは、図の行の原文範囲の末尾（＝本文の先頭行の先頭）に編集位置を置く。図内の高さ割合から行を推測しない。閲覧モードでは何もしない。
+- SVGはMermanが返した文字列をそのままGPUIへ渡し、置換しない。色・背景・フォントは描画前に `%%{init: …}%%`（serde_jsonで生成）として原文の前に置く。先頭にfront matterがあるときはその直後に置く。
+- 画像は最長辺2048px・最大4,194,304画素。保持画素メモリ（幅×高さ×4）の合計32 MiBを、表示待ち・表示中・再利用分・描画中の結果すべてに適用する。追い出しや文書/ビューの破棄では `cx.drop_image` を呼ぶ（描画フレーム先頭、またはビューのrelease時）。SVGは画像化した時点で捨てるため保持しない（1件最大8 MiB、同時2件なので同時に持つSVGは最大16 MiB）。入力は本文64 KiB・512行、同時描画2件、保持64件。
+- 画像は自然寸法の最大2倍で作り、本文幅・表示倍率からの表示寸法（縦横比を保ち、拡大はしない）は配置のたびに計算する。幅や倍率の変更ではSVGを作り直さない。倍率が2倍を超えると画像は拡大表示されるため鮮明さが落ちる。
+
+### 依存
+
+| crate | 目的 | 使用箇所 |
+| --- | --- | --- |
+| `merman =0.9.2`（svgと5図種のfeatureのみ） | Mermaid→SVG | `hane-ui` |
+| `roxmltree =0.21.1` | SVGのルート寸法と `image`/`feImage` の検査 | `hane-ui` |
+| `serde_json =1.0.154` | 描画前のテーマ設定JSONの生成 | `hane-ui` |
+| `unicode-segmentation =1.13.3` | Merman要件による更新（Unicode 17） | 既存利用箇所 |
+
+### 未検証・既知の制限
+
+実装workerは次を実行・確認していない。current headのCI、レビュー、実画面で別途確認する。
+
+- ビルド、既存・追加テスト、Clippy、`--locked` の通過。特にMerman 0.9.2のAPIは本書の抜粋と事前検証の記述だけを根拠にしており、コンパイルしていない。推測した箇所: `OperationControl::new()` と `Clone`、`RenderRequest::svg` の第1引数を `&str` で渡すこと、`RenderOutput::Svg(Some(svg))` と `svg.into_parts().0` が文字列として扱えること、エラー型を型名で参照せず `Debug` 表記の先頭（`Cancelled` / `ResourceLimitExceeded`）で判別していること。GPUI 0.3.6側は `App::svg_renderer`、`SvgRenderer::{parse_svg, render_parsed}`、`SvgSize::ExactSize`、`App::drop_image`、`Context::on_release` を使う。
+- 日本語の実描画（Merman既定の文字幅計算と実フォントの一致、ラベルのはみ出し・欠落）、明暗テーマの見た目、幅・倍率変更、macOS/Windows実画面、性能・メモリ。`native-fonts` / `system-fonts` は追加していない。必要性はこの確認で判断する。
+- IME変換中の動作、検索移動、undo/redo、保存・再読込の実画面確認。自動テストは `view/mermaid_diagrams.rs` にあるが、実行していない。
+- 依存の第三者ライセンス表示の確認（`cargo tree` / `cargo deny` 相当）。新しいpackageのライセンスは未確認。
+- `unicode-segmentation` 更新後の本文・短い入力欄の文字境界は、手で書き下した境界を固定する回帰テスト（`crates/editor/tests/grapheme_contract.rs`、`short_text_input.rs`）を追加したが、実行していない。実画面での確認も残る。
+- 対応範囲: 引用・リストの中のMermaidブロックは図にしない（通常コード）。旧記法の `stateDiagram` は対象外で、原文に理由を添える。可視範囲が囲みの途中から始まっても、図にするブロックは常に全行を提示する。キーボードで囲みの中へ入ると原文が開く（クリックと同じ）。図内リンクのクリックは扱わない。画像・PDF書き出し、図形のドラッグ編集、専用設定は対象外。
+- 未実装・簡略化: 画面外の図ブロックの高さは、描画されるまでコード表示の見積りのまま（描画後に測定高さへ置き換わり、既存の読み位置補正が働く）。`HeightIndex` の初期見積りを図の高さで先に埋める処理は入れていない。

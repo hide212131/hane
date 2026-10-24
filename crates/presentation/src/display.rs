@@ -182,6 +182,11 @@ pub enum BlockKind {
     Image,
     TableRow,
     TableDelimiter,
+    /// The one source line of a fenced code block shown as a rendered diagram
+    /// that owns the diagram's height. The block's other construct lines stay
+    /// in the block as [`BlockKind::CodeBlock`] rows of zero height; see
+    /// [`crate::apply_diagram`].
+    Diagram,
     /// A source line whose Markdown construct has no specialized presenter yet, or
     /// whose marker derivation failed to tile the source range. Rendered verbatim
     /// as plain text so the source is never lost through the raw-source fallback.
@@ -401,7 +406,7 @@ impl BlockKind {
                 surface: BlockSurface::Table,
                 ..BlockDisplay::default()
             },
-            Self::Image => BlockDisplay {
+            Self::Image | Self::Diagram => BlockDisplay {
                 surface: BlockSurface::Media,
                 ..BlockDisplay::default()
             },
