@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::atomic_file::{AtomicWriteError, atomic_write_bytes, read_to_string_if_exists};
+use crate::prompt_template::{PromptTemplateError, parse_prompt_template};
 use crate::settings_lock::AiSettingsLock;
 
 pub const USER_PROMPTS_SCHEMA_VERSION: u32 = 1;
@@ -58,7 +59,7 @@ pub fn initial_default_draft() -> UserPromptDraft {
     UserPromptDraft {
         id: None,
         title: "校正する".to_owned(),
-        prompt: "以下の文章を校閲して適切な文章にする".to_owned(),
+        prompt: "以下の文章を校閲して適切な文章にしてください。\n\n{{selection}}".to_owned(),
     }
 }
 
@@ -104,6 +105,9 @@ pub enum UserPromptsSaveError {
     TitleTooLong { max_chars: usize },
     PromptEmpty,
     PromptTooLarge { max_bytes: usize },
+    /// The body uses `{{selection}}` / `{{document_context}}` but is not a
+    /// valid template (duplicate or unknown variable).
+    InvalidTemplate(PromptTemplateError),
     IdCounterOverflow,
     RevisionOverflow,
     /// The atomic replace's `rename` already landed, but this process could
@@ -141,6 +145,9 @@ impl std::fmt::Display for UserPromptsSaveError {
             UserPromptsSaveError::PromptEmpty => write!(f, "a prompt body cannot be empty"),
             UserPromptsSaveError::PromptTooLarge { max_bytes } => {
                 write!(f, "a prompt body cannot exceed {max_bytes} bytes")
+            }
+            UserPromptsSaveError::InvalidTemplate(error) => {
+                write!(f, "invalid prompt template: {error}")
             }
             UserPromptsSaveError::IdCounterOverflow => {
                 write!(f, "the saved prompt id counter overflowed")
@@ -289,6 +296,7 @@ impl UserPromptsStore {
                     max_bytes: MAX_PROMPT_BODY_BYTES,
                 });
             }
+            parse_prompt_template(&draft.prompt).map_err(UserPromptsSaveError::InvalidTemplate)?;
             let id = match draft.id {
                 Some(id) => id,
                 None => {
@@ -604,6 +612,42 @@ mod tests {
         let saved = store.save(1, Vec::new()).unwrap();
         assert_eq!(saved.revision, 2);
         assert!(saved.prompts.is_empty());
+    }
+
+    /// Issue #594 T01/T02: invalid templates are rejected on save, while a
+    /// prompt with no recognized variable (even with other double braces)
+    /// keeps saving and loading unchanged.
+    #[test]
+    fn invalid_templates_are_rejected_and_legacy_prompts_are_untouched() {
+        let store = store("template_validation");
+        assert!(matches!(
+            store.save(0, vec![draft(None, "A", "{{selection}} {{selection}}")]),
+            Err(UserPromptsSaveError::InvalidTemplate(_))
+        ));
+        assert!(matches!(
+            store.save(0, vec![draft(None, "A", "{{selection}} {{unknown}}")]),
+            Err(UserPromptsSaveError::InvalidTemplate(_))
+        ));
+        assert!(store.load().unwrap().is_none());
+
+        let saved = store
+            .save(
+                0,
+                vec![
+                    draft(None, "legacy", "{{foo}} を直す"),
+                    draft(None, "template", "{{document_context}}\n{{selection}}"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(saved.prompts[0].prompt, "{{foo}} を直す");
+        assert_eq!(store.load().unwrap().unwrap(), saved);
+    }
+
+    #[test]
+    fn initial_default_draft_is_a_valid_template() {
+        let default = initial_default_draft();
+        let template = parse_prompt_template(&default.prompt).unwrap().unwrap();
+        assert!(template.uses_selection && !template.uses_document_context);
     }
 
     #[test]

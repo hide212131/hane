@@ -41,7 +41,7 @@ use crate::runtime_install::{
 use crate::secrets::{CredentialRef, CredentialStore};
 use crate::settings::{ActiveConnection, AiSettings, AiSettingsStore, SaveError};
 use crate::text_transform::{
-    self, TextTransformOutcome, validate_request as validate_text_transform_request,
+    self, DocumentContext, TextTransformOutcome, validate_request_with_context,
 };
 
 const COMMAND_CAPACITY: usize = 16;
@@ -265,6 +265,7 @@ enum WorkerCommand {
     TextTransform {
         instruction: String,
         selected_text: String,
+        document_context: Option<DocumentContext>,
         reply_tx: SyncSender<TextTransformOutcome>,
     },
 }
@@ -387,7 +388,20 @@ impl AiServiceHandle {
         instruction: String,
         selected_text: String,
     ) -> Result<(OperationId, Receiver<TextTransformOutcome>), AdmissionError> {
-        validate_text_transform_request(&instruction, &selected_text)
+        self.try_submit_text_transform_with_context(instruction, selected_text, None)
+    }
+
+    /// [`Self::try_submit_text_transform`] for a saved prompt that may be a
+    /// template (Issue #594). `document_context` must be `Some` exactly when
+    /// `instruction` uses `{{document_context}}`; an invalid template or a
+    /// mismatch is rejected here, before anything is queued.
+    pub fn try_submit_text_transform_with_context(
+        &self,
+        instruction: String,
+        selected_text: String,
+        document_context: Option<DocumentContext>,
+    ) -> Result<(OperationId, Receiver<TextTransformOutcome>), AdmissionError> {
+        validate_request_with_context(&instruction, &selected_text, document_context.as_ref())
             .map_err(|_| AdmissionError::InvalidInput)?;
         if self.shared.snapshot.lock().unwrap().runtime_isolated {
             return Err(AdmissionError::Unavailable);
@@ -397,6 +411,7 @@ impl AiServiceHandle {
             WorkerCommand::TextTransform {
                 instruction,
                 selected_text,
+                document_context,
                 reply_tx,
             },
             ServiceBusyReason::TextTransform,
@@ -1085,12 +1100,14 @@ fn handle_command(
         WorkerCommand::TextTransform {
             instruction,
             selected_text,
+            document_context,
             reply_tx,
         } => {
             run_text_transform_command(
                 queued.id,
                 instruction,
                 selected_text,
+                document_context,
                 reply_tx,
                 config,
                 paths,
@@ -1313,6 +1330,7 @@ fn run_text_transform_command(
     id: OperationId,
     instruction: String,
     selected_text: String,
+    document_context: Option<DocumentContext>,
     reply_tx: SyncSender<TextTransformOutcome>,
     config: &AiServiceConfig,
     paths: &AiPaths,
@@ -1401,6 +1419,7 @@ fn run_text_transform_command(
         &model,
         &instruction,
         &selected_text,
+        document_context.as_ref(),
         &workspace,
         settings.settings_generation,
     );

@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use hane_ai::{
     AccountState, AdmissionError, AiCommand, AiService, AiServiceConfig,
-    BrowserOpenError, BrowserOpener, FakeCredentialStore, ModelListState,
+    BrowserOpenError, BrowserOpener, DocumentContext, DocumentContextScope,
+    FakeCredentialStore, ModelListState,
     OperationId, SafeOperationResult, ServiceBusyReason, ShellEnvironmentPolicyFormat,
     TextTransformOutcome,
 };
@@ -202,6 +203,97 @@ fn text_transform_succeeds_over_the_app_server_without_sending_the_open_document
     let payload: serde_json::Value = serde_json::from_str(input_text).unwrap();
     assert_eq!(payload["instruction"], instruction);
     assert!(!record.contains("DO_NOT_SEND_DOCUMENT_449"));
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+/// Issue #594 T04/T08: a template using `{{document_context}}` sends the
+/// context as its own structured field, never in the thread instructions.
+#[test]
+fn template_text_transform_sends_document_context_as_structured_user_input() {
+    let (service, data_root) = prepare_connected_service("probe_success");
+    let handle = service.handle();
+    let template = "要約:\n{{selection}}\n文脈:\n{{document_context}}";
+    let selected_text = "対象の文章594";
+    let context_text = "文書全体594 {{selection}}";
+    let (id, reply_rx) = handle
+        .try_submit_text_transform_with_context(
+            template.to_owned(),
+            selected_text.to_owned(),
+            Some(DocumentContext {
+                text: context_text.to_owned(),
+                scope: DocumentContextScope::Full,
+            }),
+        )
+        .unwrap();
+    assert_eq!(wait_for_result(&service, id), SafeOperationResult::Succeeded);
+    assert!(matches!(
+        reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        TextTransformOutcome::Succeeded { .. }
+    ));
+
+    let record = std::fs::read_to_string(
+        data_root.join("ai/codex-chatgpt/.hane-fake-app-server-probe-record"),
+    )
+    .unwrap_or_default();
+    let turn_start = find_turn_start_with_selected_text(&record, selected_text)
+        .expect("turn/start must carry the selected_text");
+    let payload: serde_json::Value =
+        serde_json::from_str(turn_start["input"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["mode"], "template");
+    assert_eq!(payload["user_prompt_template"], template);
+    assert_eq!(payload["document_context"], context_text);
+    assert_eq!(payload["document_context_scope"], "full");
+    // The document text and template never reach thread/start instructions.
+    for line in record.lines().filter(|line| line.starts_with("THREAD_START:")) {
+        assert!(!line.contains("文書全体594"));
+        assert!(!line.contains("要約:"));
+    }
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+/// Issue #594 T01/T06/T07: invalid templates and context mismatches are
+/// rejected at admission without queueing anything.
+#[test]
+fn template_text_transform_rejects_invalid_template_and_context_mismatch() {
+    let (service, data_root) = prepare_connected_service("probe_success");
+    let handle = service.handle();
+    let context = || {
+        Some(DocumentContext {
+            text: "doc".to_owned(),
+            scope: DocumentContextScope::Full,
+        })
+    };
+    assert!(matches!(
+        handle.try_submit_text_transform_with_context(
+            "{{selection}} {{unknown}}".to_owned(),
+            "text".to_owned(),
+            None
+        ),
+        Err(AdmissionError::InvalidInput)
+    ));
+    // Template needs a context but none was supplied.
+    assert!(matches!(
+        handle.try_submit_text_transform_with_context(
+            "{{document_context}}".to_owned(),
+            "text".to_owned(),
+            None
+        ),
+        Err(AdmissionError::InvalidInput)
+    ));
+    // Context supplied for a prompt that does not ask for it.
+    assert!(matches!(
+        handle.try_submit_text_transform_with_context(
+            "{{selection}}".to_owned(),
+            "text".to_owned(),
+            context()
+        ),
+        Err(AdmissionError::InvalidInput)
+    ));
+    assert!(handle.snapshot().busy.is_none());
 
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);

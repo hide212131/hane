@@ -86,6 +86,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+mod ai_document_context;
 mod ai_prompts;
 mod ai_selection;
 mod app_update;
