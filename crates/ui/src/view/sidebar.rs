@@ -1389,236 +1389,76 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Windows: `IFileOperation` with `FOFX_RECYCLEONDELETE`. API errors and an
-/// aborted operation are errors; there is no permanent-delete fallback.
+/// Windows: `SHFileOperationW` with `FOF_ALLOWUNDO`. API errors and an
+/// aborted operation are errors; there is no silent permanent-delete fallback.
 #[cfg(target_os = "windows")]
 fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
-    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
-        CoInitializeEx, CoUninitialize,
-    };
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostQuitMessage,
-        PostThreadMessageW, TranslateMessage, WM_APP, WM_USER,
-    };
-    use windows::Win32::UI::Shell::{
-        FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
-        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
-    };
-    use windows::core::HSTRING;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{FO_DELETE, SHFILEOPSTRUCTW, SHFileOperationW};
+    use windows::core::PCWSTR;
 
-    fn to_io(error: windows::core::Error) -> std::io::Error {
-        std::io::Error::other(error.to_string())
-    }
-
-    fn recycle(path: &Path) -> std::io::Result<()> {
-        // SAFETY: COM calls on an initialized apartment; all interface
-        // pointers are owned by the `windows` crate wrappers.
-        unsafe {
-            let operation: IFileOperation =
-                CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(to_io)?;
-            operation
-                .SetOperationFlags(
-                    FOF_ALLOWUNDO
-                        | FOF_NOERRORUI
-                        | FOF_SILENT
-                        | FOFX_EARLYFAILURE
-                        | FOFX_RECYCLEONDELETE,
-                )
-                .map_err(to_io)?;
-            let item: IShellItem =
-                SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)
-                    .map_err(to_io)?;
-            operation.DeleteItem(&item, None).map_err(to_io)?;
-            if let Err(error) = operation.PerformOperations() {
-                // HRESULT_FROM_WIN32(ERROR_CANCELLED): the user cancelled.
-                if error.code().0 as u32 == 0x8007_04C7 {
-                    return Err(trash_cancelled());
-                }
-                return Err(to_io(error));
-            }
-            if operation.GetAnyOperationsAborted().map_err(to_io)?.as_bool() {
-                return Err(trash_cancelled());
-            }
-            Ok(())
-        }
-    }
-
-    /// The real Win32 message queue of the calling (STA) thread.
-    struct Win32Messages;
-
-    impl MessageSource for Win32Messages {
-        fn start(&mut self) -> std::io::Result<()> {
-            let mut msg = MSG::default();
-            // SAFETY: a PM_NOREMOVE peek forces creation of this thread's
-            // message queue; `msg` is a valid out pointer.
-            unsafe {
-                let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
-            }
-            Ok(())
-        }
-
-        fn post_job(&mut self) -> std::io::Result<()> {
-            // SAFETY: posts to the current thread's own queue created above.
-            unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_APP, WPARAM(0), LPARAM(0)) }
-                .map_err(to_io)
-        }
-
-        fn next(&mut self) -> std::io::Result<PumpMessage> {
-            let mut msg = MSG::default();
-            // SAFETY: `msg` is a valid out pointer; the queue is this thread's.
-            let status = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-            match status.0 {
-                0 => Ok(PumpMessage::Quit),
-                -1 => Err(std::io::Error::other(
-                    windows::core::Error::from_win32().to_string(),
-                )),
-                _ if msg.hwnd.0.is_null() && msg.message == WM_APP => Ok(PumpMessage::RunJob),
-                _ => {
-                    // SAFETY: `msg` was filled in by `GetMessageW`.
-                    unsafe {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                    Ok(PumpMessage::Dispatched)
-                }
-            }
-        }
-
-        fn request_stop(&mut self) {
-            // SAFETY: posts WM_QUIT to this thread's own queue.
-            unsafe { PostQuitMessage(0) };
-        }
-    }
-
-    // `IFileOperation` requires an STA whose thread pumps messages. The
-    // caller's thread (a Windows thread pool worker) is neither, so run on a
-    // dedicated thread that this function owns: it initializes COM as an STA,
-    // starts a message loop, and calls `IFileOperation` only from inside that
-    // loop. The loop keeps running until the operation has returned.
-    let path = path.to_path_buf();
+    // `SHFileOperationW` is a plain synchronous Win32 call. Unlike
+    // `IFileOperation` it needs no COM apartment and no caller-side message
+    // loop, so there is no STA / `RPC_E_CHANGED_MODE` / message-dispatch
+    // precondition that has to hold while it runs. It still recycles
+    // (`FOF_ALLOWUNDO`). Call it from a dedicated thread so the caller (the
+    // UI input path) never waits on filesystem I/O.
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let source = shell_delete_source(&wide)?;
     let worker = std::thread::Builder::new()
         .name("hane-recycle".to_owned())
         .spawn(move || {
-            // SAFETY: balanced with `CoUninitialize` below when initialization
-            // succeeded.
-            let init =
-                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-            let state = if init.is_ok() {
-                ComApartment::Sta
-            } else if init == RPC_E_CHANGED_MODE {
-                ComApartment::WrongMode
-            } else {
-                ComApartment::Failed(init.message())
+            let mut operation = SHFILEOPSTRUCTW {
+                wFunc: FO_DELETE,
+                pFrom: PCWSTR(source.as_ptr()),
+                fFlags: SHELL_DELETE_FLAGS,
+                ..Default::default()
             };
-            let result = run_in_sta_with_pump(state, &mut Win32Messages, || recycle(&path));
-            if init.is_ok() {
-                // SAFETY: matches the successful `CoInitializeEx` above, after
-                // the message loop has stopped.
-                unsafe { CoUninitialize() };
-            }
-            result
+            // SAFETY: `operation` and the double-NUL-terminated `source`
+            // buffer outlive the call; no other field points to memory.
+            let code = unsafe { SHFileOperationW(&mut operation) };
+            let aborted = operation.fAnyOperationsAborted.as_bool();
+            classify_shell_delete(code, aborted)
         })?;
     worker
         .join()
         .unwrap_or_else(|_| Err(std::io::Error::other("ごみ箱への移動処理が異常終了しました")))
 }
 
-/// What one turn of a thread's message loop produced.
+/// `FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT |
+/// FOF_WANTNUKEWARNING`. `FOF_ALLOWUNDO` sends to the Recycle Bin;
+/// `FOF_WANTNUKEWARNING` partially overrides `FOF_NOCONFIRMATION` so an item
+/// that cannot be recycled asks the user (who can cancel) instead of being
+/// deleted permanently without notice.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PumpMessage {
-    /// The loop was told to quit (`WM_QUIT`).
-    Quit,
-    /// The message that authorizes the single `IFileOperation` call.
-    RunJob,
-    /// Any other message, already translated and dispatched.
-    Dispatched,
-}
+const SHELL_DELETE_FLAGS: u16 = 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000;
 
-/// The thread message queue behind the pump, abstracted so the ordering of
-/// start / dispatch / job / stop is testable without Win32.
+/// Builds the double-NUL-terminated `pFrom` list for one path. An interior
+/// NUL would silently turn into a second path, so it is rejected.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-trait MessageSource {
-    /// Makes the thread's message queue exist.
-    fn start(&mut self) -> std::io::Result<()>;
-    /// Queues the message that authorizes the job.
-    fn post_job(&mut self) -> std::io::Result<()>;
-    /// Blocks for the next message; dispatches ordinary ones.
-    fn next(&mut self) -> std::io::Result<PumpMessage>;
-    /// Asks the loop to end after the job has finished.
-    fn request_stop(&mut self);
-}
-
-/// Runs `job` from inside a live message loop and keeps the loop running
-/// until the job has returned. The job never runs if the loop cannot start,
-/// and it runs at most once.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn run_message_pump<S: MessageSource>(
-    source: &mut S,
-    job: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    source.start()?;
-    source.post_job()?;
-    let mut job = Some(job);
-    let mut result = None;
-    loop {
-        match source.next()? {
-            PumpMessage::Quit => break,
-            PumpMessage::RunJob => {
-                if let Some(job) = job.take() {
-                    result = Some(job());
-                    source.request_stop();
-                }
-            }
-            PumpMessage::Dispatched => {}
-        }
+fn shell_delete_source(path: &[u16]) -> std::io::Result<Vec<u16>> {
+    if path.contains(&0) {
+        return Err(std::io::Error::other(
+            "パスにNUL文字が含まれているため、ごみ箱へ移動できません",
+        ));
     }
-    result.unwrap_or_else(|| {
-        Err(std::io::Error::other(
-            "メッセージループが操作の実行前に終了したため、ごみ箱へ移動できません",
-        ))
-    })
+    let mut wide = path.to_vec();
+    wide.extend([0, 0]);
+    Ok(wide)
 }
 
-/// Runs `operation` only on a valid STA, and only from inside a running
-/// message pump. Without both, the operation is never called.
+/// Maps `SHFileOperationW`'s return value and `fAnyOperationsAborted` to
+/// success, user cancel (`Interrupted`) or failure. Never a silent success.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn run_in_sta_with_pump<S: MessageSource>(
-    apartment: ComApartment,
-    source: &mut S,
-    operation: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    run_in_sta(apartment, || run_message_pump(source, operation))
-}
-
-/// Result of initializing COM on the thread that would call `IFileOperation`.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-enum ComApartment {
-    /// Initialized as a single-threaded apartment.
-    Sta,
-    /// `RPC_E_CHANGED_MODE`: the thread already has an incompatible model.
-    WrongMode,
-    /// Any other initialization failure.
-    Failed(String),
-}
-
-/// Runs `operation` only on a valid STA. A thread with a conflicting
-/// apartment model or failed initialization never reaches the operation.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn run_in_sta(
-    apartment: ComApartment,
-    operation: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    match apartment {
-        ComApartment::Sta => operation(),
-        ComApartment::WrongMode => Err(std::io::Error::other(
-            "COMのアパートメントモデルが一致しないため、ごみ箱へ移動できません",
-        )),
-        ComApartment::Failed(message) => Err(std::io::Error::other(message)),
+fn classify_shell_delete(code: i32, any_aborted: bool) -> std::io::Result<()> {
+    match code {
+        // DE_OPCANCELLED, ERROR_CANCELLED
+        0x75 | 0x4C7 => Err(trash_cancelled()),
+        0 if any_aborted => Err(trash_cancelled()),
+        0 => Ok(()),
+        code => Err(std::io::Error::other(format!(
+            "ごみ箱への移動に失敗しました (SHFileOperation: 0x{code:X})"
+        ))),
     }
 }
 
@@ -1856,156 +1696,34 @@ mod tests {
     }
 
     #[test]
-    fn wrong_com_apartment_never_runs_file_operation() {
-        let mut ran = false;
-        let result = run_in_sta(ComApartment::WrongMode, || {
-            ran = true;
-            Ok(())
-        });
-        assert!(result.is_err());
-        assert!(!ran);
-        let mut ran = false;
-        let result = run_in_sta(ComApartment::Failed("init".to_owned()), || {
-            ran = true;
-            Ok(())
-        });
-        assert!(result.is_err());
-        assert!(!ran);
-    }
-
-    #[test]
-    fn sta_runs_file_operation_and_keeps_cancel_distinct_from_failure() {
-        assert!(run_in_sta(ComApartment::Sta, || Ok(())).is_ok());
-        let cancelled = run_in_sta(ComApartment::Sta, || Err(trash_cancelled())).unwrap_err();
-        assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
-        let failed =
-            run_in_sta(ComApartment::Sta, || Err(std::io::Error::other("api"))).unwrap_err();
+    fn shell_delete_result_distinguishes_success_cancel_and_failure() {
+        assert!(classify_shell_delete(0, false).is_ok());
+        for code in [0x75, 0x4C7] {
+            let cancelled = classify_shell_delete(code, false).unwrap_err();
+            assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
+        }
+        // Success status with an aborted flag is a cancel, never a success.
+        let aborted = classify_shell_delete(0, true).unwrap_err();
+        assert_eq!(aborted.kind(), std::io::ErrorKind::Interrupted);
+        let failed = classify_shell_delete(0x7C, false).unwrap_err();
         assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
     }
 
-    /// Records the pump lifecycle so ordering against the job is observable.
-    struct FakeMessages {
-        events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
-        script: std::collections::VecDeque<PumpMessage>,
-        fail_start: bool,
-    }
-
-    impl FakeMessages {
-        fn new(
-            script: &[PumpMessage],
-            fail_start: bool,
-        ) -> (Self, std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>) {
-            let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-            (
-                Self {
-                    events: events.clone(),
-                    script: script.iter().copied().collect(),
-                    fail_start,
-                },
-                events,
-            )
-        }
-    }
-
-    impl MessageSource for FakeMessages {
-        fn start(&mut self) -> std::io::Result<()> {
-            if self.fail_start {
-                return Err(std::io::Error::other("no queue"));
-            }
-            self.events.borrow_mut().push("start");
-            Ok(())
-        }
-        fn post_job(&mut self) -> std::io::Result<()> {
-            self.events.borrow_mut().push("post_job");
-            Ok(())
-        }
-        fn next(&mut self) -> std::io::Result<PumpMessage> {
-            let message = self.script.pop_front().unwrap_or(PumpMessage::Quit);
-            self.events.borrow_mut().push(match message {
-                PumpMessage::Quit => "quit",
-                PumpMessage::RunJob => "run_job_message",
-                PumpMessage::Dispatched => "dispatch",
-            });
-            Ok(message)
-        }
-        fn request_stop(&mut self) {
-            self.events.borrow_mut().push("request_stop");
-            self.script.push_front(PumpMessage::Quit);
-        }
+    #[test]
+    fn shell_delete_flags_recycle_without_permanent_delete_fallback() {
+        // FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+        // | FOF_WANTNUKEWARNING
+        assert_eq!(SHELL_DELETE_FLAGS, 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000);
+        assert_ne!(SHELL_DELETE_FLAGS & 0x0040, 0);
+        assert_ne!(SHELL_DELETE_FLAGS & 0x4000, 0);
     }
 
     #[test]
-    fn file_operation_runs_only_inside_live_pump_and_before_stop() {
-        let (mut source, events) = FakeMessages::new(
-            &[PumpMessage::Dispatched, PumpMessage::RunJob],
-            false,
-        );
-        let log = events.clone();
-        let result = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
-            log.borrow_mut().push("job");
-            Ok(())
-        });
-        assert!(result.is_ok());
-        assert_eq!(
-            *events.borrow(),
-            [
-                "start",
-                "post_job",
-                "dispatch",
-                "run_job_message",
-                "job",
-                "request_stop",
-                "quit"
-            ]
-        );
-    }
-
-    #[test]
-    fn file_operation_not_called_without_pump_or_sta() {
-        let ran = std::cell::Cell::new(false);
-        let (mut source, _) = FakeMessages::new(&[PumpMessage::RunJob], true);
-        let result = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
-            ran.set(true);
-            Ok(())
-        });
-        assert!(result.is_err());
-        assert!(!ran.get());
-
-        // Pump that quits before authorizing the job.
-        let (mut source, _) = FakeMessages::new(&[PumpMessage::Dispatched], false);
-        let result = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
-            ran.set(true);
-            Ok(())
-        });
-        assert!(result.is_err());
-        assert!(!ran.get());
-
-        // Wrong or failed apartment never even starts the pump.
-        let (mut source, events) = FakeMessages::new(&[PumpMessage::RunJob], false);
-        let result = run_in_sta_with_pump(ComApartment::WrongMode, &mut source, || {
-            ran.set(true);
-            Ok(())
-        });
-        assert!(result.is_err());
-        assert!(!ran.get());
-        assert!(events.borrow().is_empty());
-    }
-
-    #[test]
-    fn pump_keeps_cancel_and_failure_distinct_and_stops() {
-        let (mut source, events) = FakeMessages::new(&[PumpMessage::RunJob], false);
-        let cancelled = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
-            Err(trash_cancelled())
-        })
-        .unwrap_err();
-        assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
-        assert!(events.borrow().contains(&"request_stop"));
-        let (mut source, _) = FakeMessages::new(&[PumpMessage::RunJob], false);
-        let failed = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
-            Err(std::io::Error::other("api"))
-        })
-        .unwrap_err();
-        assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
+    fn shell_delete_source_is_double_nul_terminated_and_rejects_interior_nul() {
+        let wide = shell_delete_source(&['a' as u16, 'b' as u16]).unwrap();
+        assert_eq!(wide, ['a' as u16, 'b' as u16, 0, 0]);
+        let error = shell_delete_source(&['a' as u16, 0, 'b' as u16]).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
     }
 
     #[test]
