@@ -1419,7 +1419,7 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
 mod windows_recycle {
     use super::{RECYCLE_OPERATION_FLAGS, RecycleReport, classify_recycle};
     use std::sync::{Arc, Mutex};
-    use windows::Win32::Foundation::{E_ABORT, HRESULT};
+    use windows::Win32::Foundation::E_ABORT;
     use windows::Win32::System::Com::{
         CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
     };
@@ -1427,7 +1427,9 @@ mod windows_recycle {
         FILEOPERATION_FLAGS, FileOperation, IFileOperation, IFileOperationProgressSink,
         IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
     };
-    use windows::core::{PCWSTR, Ref, implement};
+    // `#[implement]` の展開は `windows_core` を名前で参照するため、`windows` の再エクスポートを導入する。
+    use windows::core::{HRESULT, PCWSTR, Ref, implement};
+    use windows::windows_core;
 
     /// `TSF_DELETE_RECYCLE_IF_POSSIBLE`
     const TSF_DELETE_RECYCLE_IF_POSSIBLE: u32 = 0x0000_0080;
