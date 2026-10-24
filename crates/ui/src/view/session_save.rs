@@ -1039,6 +1039,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Runs a real H1 title rename of the first session to completion with the
+    /// shared guard attached, asserting the guard right after
+    /// `finish_title_rename` with no render (the view has no window) and no
+    /// sleep in between. `busy_second` optionally makes a second session
+    /// dirty or saving first; the guard must then stay raised.
+    fn title_rename_completion_guard(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        busy_second: Option<fn(&mut EditorView, SessionId, &mut Context<EditorView>)>,
+    ) {
+        let root = rename_test_root(label);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Old.md");
+        std::fs::write(&path, "body\n").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = crate::ExternalOpenGuard::new();
+        let first = view.update(cx, |view, cx| {
+            view.attach_external_open_guard(guard.clone());
+            let first = view.sessions.active_id();
+            if let Some(busy_second) = busy_second {
+                let second = view.sessions.open_untitled("", "Second");
+                busy_second(view, second, cx);
+                view.sessions.activate(first);
+            }
+            view.sync_external_open_guard();
+            assert_eq!(guard.unsaved(), busy_second.is_some());
+            view.begin_title_rename(first, "New".to_owned(), cx);
+            assert!(view.sessions.get(first).unwrap().save_in_flight());
+            assert!(guard.unsaved(), "the guard is protected while the rename runs");
+            first
+        });
+        // Drives the background rename and `finish_title_rename` only.
+        cx.run_until_parked();
+        view.update(cx, |view, _cx| {
+            let session = view.sessions.get(first).unwrap();
+            assert!(!session.save_in_flight(), "the rename released its slot");
+            assert_eq!(
+                session.path(),
+                Some(root.join("New.md")).as_deref(),
+                "the rename must have completed"
+            );
+            assert_eq!(view.has_unsaved_sessions(), busy_second.is_some());
+            assert_eq!(
+                guard.unsaved(),
+                busy_second.is_some(),
+                "completion must recompute the guard over every session"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Issue #607: with no other busy session, completing the rename releases
+    // the guard immediately.
+    #[gpui::test]
+    fn a_title_rename_completion_releases_the_guard_when_nothing_else_is_busy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        title_rename_completion_guard(cx, "title-rename-complete-clean", None);
+    }
+
+    // Issue #607: another session's unsaved edits keep the guard raised
+    // through the rename completion.
+    #[gpui::test]
+    fn a_title_rename_completion_keeps_the_guard_for_another_dirty_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        title_rename_completion_guard(
+            cx,
+            "title-rename-complete-dirty",
+            Some(|view, second, cx| {
+                // `open_untitled` made the second session active.
+                assert_eq!(view.sessions.active_id(), second);
+                view.editor_mut().insert_text("dirty").unwrap();
+                view.after_input(cx);
+                assert!(view.sessions.get(second).unwrap().is_dirty());
+            }),
+        );
+    }
+
+    // Issue #607: another session's in-flight write keeps the guard raised
+    // through the rename completion.
+    #[gpui::test]
+    fn a_title_rename_completion_keeps_the_guard_for_another_saving_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        title_rename_completion_guard(
+            cx,
+            "title-rename-complete-saving",
+            Some(|view, second, _cx| {
+                let session = view.sessions.get_mut(second).unwrap();
+                assert!(session.begin_rename().is_some());
+                assert!(session.save_in_flight());
+            }),
+        );
+    }
+
     // Issue #607: the same for an inline (sidebar) file rename.
     #[gpui::test]
     fn an_inline_rename_start_publishes_protection(cx: &mut gpui::TestAppContext) {

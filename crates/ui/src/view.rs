@@ -13696,11 +13696,18 @@ mod tests {
             assert!(!view.has_unsaved_sessions());
             assert!(!guard.unsaved(), "completion must publish the clean state");
         });
-        // A dirty second session keeps the guard raised through a completion.
+        // A dirty second session keeps the guard raised when it is recomputed
+        // while the first session is clean.
         view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("", "Second");
             view.editor_mut().insert_text("again").unwrap();
             view.after_input(cx);
-            assert!(guard.unsaved());
+            let second = view.sessions.active_id();
+            assert_ne!(first, second);
+            assert!(view.sessions.get(second).unwrap().is_dirty());
+            assert!(!view.sessions.get(first).unwrap().is_dirty());
+            assert!(!view.sessions.get(first).unwrap().save_in_flight());
             view.sync_external_open_guard();
             assert!(guard.unsaved());
         });
