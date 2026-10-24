@@ -43,6 +43,11 @@ impl DraftId {
         format!("{:016x}.md", self.0)
     }
 
+    /// The sidecar that records the folder the note will be created in.
+    fn target_file_name(self) -> String {
+        format!("{:016x}.target", self.0)
+    }
+
     fn from_file_name(name: &str) -> Option<Self> {
         u64::from_str_radix(name.strip_suffix(".md")?, 16)
             .ok()
@@ -51,11 +56,14 @@ impl DraftId {
 }
 
 /// One draft recovered from a previous run: its id, so it can keep being
-/// journalled and removed under the same name, and the text it last held.
+/// journalled and removed under the same name, the text it last held, and the
+/// folder the note will be created in once it is named. Entries journalled
+/// without a target (older versions) recover to the work folder root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredDraft {
     pub id: DraftId,
     pub text: String,
+    pub target_directory: PathBuf,
 }
 
 /// The outcome of a recovery pass: every draft that could be read, plus how
@@ -76,7 +84,15 @@ pub struct RecoveredDrafts {
 pub trait DraftStore: Send + Sync + 'static {
     /// Writes (or overwrites) one draft's full text, atomically. Called on
     /// the same debounce cadence as autosave, so it must stay cheap.
-    fn write(&self, root: &Path, id: DraftId, text: &str) -> io::Result<()>;
+    /// `target_directory` is the folder the note will be created in; it is
+    /// journalled alongside the text so recovery can restore it.
+    fn write(
+        &self,
+        root: &Path,
+        id: DraftId,
+        target_directory: &Path,
+        text: &str,
+    ) -> io::Result<()>;
 
     /// Deletes one draft, once the note it recovered either got a real
     /// filename or its session closed clean. Already-missing is not an error.
@@ -94,36 +110,82 @@ fn drafts_dir(root: &Path) -> PathBuf {
     root.join(".hane").join("drafts")
 }
 
+/// The target directory as a root-relative string (empty for the root
+/// itself). Relative so the journal survives the work folder being moved.
+/// A target outside the root, or not valid UTF-8, falls back to the root.
+fn encode_target(root: &Path, target_directory: &Path) -> String {
+    target_directory
+        .strip_prefix(root)
+        .ok()
+        .and_then(Path::to_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Inverse of `encode_target`. Anything that is not a plain relative path
+/// below the root (absolute, `..`) is ignored in favour of the root.
+fn decode_target(root: &Path, encoded: &str) -> PathBuf {
+    let relative = Path::new(encoded.trim());
+    let plain = relative
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if plain {
+        root.join(relative)
+    } else {
+        root.to_path_buf()
+    }
+}
+
+fn write_atomically(dir: &Path, name: &str, contents: &str) -> io::Result<()> {
+    let target = dir.join(name);
+    let temporary = dir.join(format!("{name}.tmp"));
+    {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(contents.as_bytes())?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+    fs::rename(&temporary, &target)
+}
+
 /// `DraftStore` backed by the real filesystem.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OsDraftStore;
 
 impl DraftStore for OsDraftStore {
-    fn write(&self, root: &Path, id: DraftId, text: &str) -> io::Result<()> {
+    fn write(
+        &self,
+        root: &Path,
+        id: DraftId,
+        target_directory: &Path,
+        text: &str,
+    ) -> io::Result<()> {
         let dir = drafts_dir(root);
         fs::create_dir_all(&dir)?;
-        let target = dir.join(id.file_name());
-        let temporary = dir.join(format!("{}.tmp", id.file_name()));
-        {
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temporary)?;
-            let mut writer = BufWriter::new(file);
-            writer.write_all(text.as_bytes())?;
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-        }
-        fs::rename(&temporary, &target)
+        // The target goes first: a crash between the two writes leaves a
+        // draft whose text is merely one write old, never one without its
+        // destination.
+        write_atomically(
+            &dir,
+            &id.target_file_name(),
+            &encode_target(root, target_directory),
+        )?;
+        write_atomically(&dir, &id.file_name(), text)
     }
 
     fn remove(&self, root: &Path, id: DraftId) -> io::Result<()> {
-        match fs::remove_file(drafts_dir(root).join(id.file_name())) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        let dir = drafts_dir(root);
+        let ignore_missing = |result: io::Result<()>| match result {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+        ignore_missing(fs::remove_file(dir.join(id.file_name())))?;
+        ignore_missing(fs::remove_file(dir.join(id.target_file_name())))
     }
 
     fn recover(&self, root: &Path) -> io::Result<RecoveredDrafts> {
@@ -170,7 +232,18 @@ impl DraftStore for OsDraftStore {
                 failed += 1;
                 continue;
             };
-            drafts.push(RecoveredDraft { id, text });
+            // A missing or unreadable sidecar (a journal written before
+            // targets were recorded) recovers to the work folder root.
+            let target_directory = fs::read_to_string(dir.join(id.target_file_name()))
+                .map_or_else(
+                    |_| root.to_path_buf(),
+                    |encoded| decode_target(root, &encoded),
+                );
+            drafts.push(RecoveredDraft {
+                id,
+                text,
+                target_directory,
+            });
         }
         Ok(RecoveredDrafts { drafts, failed })
     }
@@ -197,12 +270,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let id = DraftId::generate();
         OsDraftStore
-            .write(&root, id, "today I thought about this design")
+            .write(&root, id, &root, "today I thought about this design")
             .unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(recovered.drafts[0].id, id);
+        assert_eq!(recovered.drafts[0].target_directory, root);
         assert_eq!(
             recovered.drafts[0].text,
             "today I thought about this design"
@@ -217,8 +291,10 @@ mod tests {
         let root = temporary_directory("draft-rewrite");
         fs::create_dir_all(&root).unwrap();
         let id = DraftId::generate();
-        OsDraftStore.write(&root, id, "first").unwrap();
-        OsDraftStore.write(&root, id, "first, then more").unwrap();
+        OsDraftStore.write(&root, id, &root, "first").unwrap();
+        OsDraftStore
+            .write(&root, id, &root, "first, then more")
+            .unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
@@ -232,12 +308,59 @@ mod tests {
         let root = temporary_directory("draft-remove");
         fs::create_dir_all(&root).unwrap();
         let id = DraftId::generate();
-        OsDraftStore.write(&root, id, "gone once named").unwrap();
+        let child = root.join("child");
+        OsDraftStore
+            .write(&root, id, &child, "gone once named")
+            .unwrap();
         OsDraftStore.remove(&root, id).unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert!(recovered.drafts.is_empty());
         assert_eq!(recovered.failed, 0);
+        assert!(!drafts_dir(&root).join(id.target_file_name()).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_child_folder_target_round_trips_through_recover() {
+        let root = temporary_directory("draft-target-roundtrip");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        let child = root.join("projects").join("notes");
+        OsDraftStore.write(&root, id, &child, "# Title").unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, child);
+        assert_eq!(recovered.failed, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_legacy_draft_without_a_target_recovers_to_the_root() {
+        let root = temporary_directory("draft-legacy-target");
+        let dir = drafts_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let id = DraftId::generate();
+        fs::write(dir.join(id.file_name()), "legacy").unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_escaping_target_recovers_to_the_root() {
+        let root = temporary_directory("draft-escaping-target");
+        let dir = drafts_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let id = DraftId::generate();
+        fs::write(dir.join(id.file_name()), "text").unwrap();
+        fs::write(dir.join(id.target_file_name()), "../outside").unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts[0].target_directory, root);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -280,7 +403,9 @@ mod tests {
         let root = temporary_directory("draft-partial-failure");
         fs::create_dir_all(&root).unwrap();
         let readable = DraftId::generate();
-        OsDraftStore.write(&root, readable, "keep me").unwrap();
+        OsDraftStore
+            .write(&root, readable, &root, "keep me")
+            .unwrap();
         let unreadable = DraftId(readable.0.wrapping_add(1));
         let unreadable_path = drafts_dir(&root).join(unreadable.file_name());
         fs::write(&unreadable_path, "lost to a permission error").unwrap();

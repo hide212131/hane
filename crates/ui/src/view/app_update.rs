@@ -2173,7 +2173,7 @@ mod tests {
     struct FailingDraftStore;
 
     impl DraftStore for FailingDraftStore {
-        fn write(&self, _: &Path, _: DraftId, _: &str) -> std::io::Result<()> {
+        fn write(&self, _: &Path, _: DraftId, _: &Path, _: &str) -> std::io::Result<()> {
             Err(std::io::Error::other("disk full"))
         }
         fn remove(&self, _: &Path, _: DraftId) -> std::io::Result<()> {

@@ -63,7 +63,11 @@ impl EditorView {
     /// draft is revisited and edited again.
     pub(super) fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
         let id = self.sessions.active_id();
-        let Some(draft_id) = self.work_folder_drafts.get(&id).map(|draft| draft.draft_id) else {
+        let Some((draft_id, target_directory)) = self
+            .work_folder_drafts
+            .get(&id)
+            .map(|draft| (draft.draft_id, draft.target_directory.clone()))
+        else {
             return;
         };
         let Some(root) = self
@@ -88,7 +92,9 @@ impl EditorView {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
-            let text = view
+            // The target is re-read with the text: a folder rename or trash
+            // can rebase it while the timer is pending.
+            let snapshot = view
                 .read_with(cx, |view, _| {
                     if view.document_instance(id) != instance {
                         return None;
@@ -96,14 +102,21 @@ impl EditorView {
                     let session = view.sessions.get(id)?;
                     let draft = view.work_folder_drafts.get(&id)?;
                     let current = session.revision() == revision && draft.draft_id == draft_id;
-                    current.then(|| session.editor().document().full_text())
+                    current.then(|| {
+                        (
+                            draft.target_directory.clone(),
+                            session.editor().document().full_text(),
+                        )
+                    })
                 })
                 .ok()
                 .flatten();
-            if let Some(text) = text {
+            if let Some((target_directory, text)) = snapshot {
                 let _ = cx
                     .background_executor()
-                    .spawn(async move { draft_store.write(&root, draft_id, &text) })
+                    .spawn(async move {
+                        draft_store.write(&root, draft_id, &target_directory, &text)
+                    })
                     .await;
             }
         })
@@ -131,7 +144,9 @@ impl EditorView {
                 continue;
             };
             let text = session.editor().document().full_text();
-            let _ = self.draft_store.write(root, draft.draft_id, &text);
+            let _ = self
+                .draft_store
+                .write(root, draft.draft_id, &draft.target_directory, &text);
         }
     }
 
@@ -153,7 +168,10 @@ impl EditorView {
                 continue;
             };
             let text = session.editor().document().full_text();
-            match self.draft_store.write(root, draft.draft_id, &text) {
+            match self
+                .draft_store
+                .write(root, draft.draft_id, &draft.target_directory, &text)
+            {
                 Ok(()) => written += 1,
                 Err(error) => failures.push(format!("{}: {error}", session.label())),
             }

@@ -2022,7 +2022,6 @@ impl EditorView {
                 // created above; it stays clean and in place while any
                 // recovered drafts are installed alongside it, so switching
                 // to the first real note below can still reuse it.
-                let root = work_folder.root().to_path_buf();
                 let initial_session = self.sessions.active_id();
                 self.work_folder = Some(work_folder);
                 // A work folder that opened successfully is shown even if the
@@ -2044,15 +2043,14 @@ impl EditorView {
                     Ok(drafts) => {
                         for draft in drafts.drafts {
                             let id = self.sessions.open_untitled(&draft.text, "Untitled");
-                            // The journal does not record which folder a
-                            // draft was destined for, so a recovered draft
-                            // falls back to the work folder root rather than
-                            // wherever it was selected before the crash.
+                            // The journal records the destination folder;
+                            // entries from before that was recorded come
+                            // back with the work folder root.
                             self.work_folder_drafts.insert(
                                 id,
                                 WorkFolderDraft {
                                     draft_id: draft.id,
-                                    target_directory: root.clone(),
+                                    target_directory: draft.target_directory,
                                 },
                             );
                             last_recovered = Some(id);
@@ -13631,6 +13629,7 @@ mod tests {
         let readable = RecoveredDraft {
             id: DraftId::generate(),
             text: "kept".to_owned(),
+            target_directory: root.clone(),
         };
         let partial = RecoveredDrafts {
             drafts: vec![readable.clone()],
@@ -17241,6 +17240,7 @@ mod tests {
             drafts: vec![RecoveredDraft {
                 id: DraftId::generate(),
                 text: "recovered".to_owned(),
+                target_directory: root.clone(),
             }],
             failed: 0,
         };
@@ -17767,6 +17767,141 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.work_folder_drafts.len(), before);
             assert!(view.status.is_some());
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: a note started from a child folder's context menu keeps
+    // that folder as its destination across a restart: the draft journal
+    // records it, and the H1 save after recovery lands inside that folder.
+    #[gpui::test]
+    fn a_recovered_context_menu_draft_is_named_inside_its_child_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-recovery");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = root.join("dev").join(format!("{title_prefix}GPUI.md"));
+
+        let first = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        first.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.sidebar_context_new_note(root.join("dev"), cx);
+            // The journal write a quit or the debounce would perform.
+            view.flush_pending_drafts();
+        });
+
+        // "Restart": a fresh view recovers from the journal on disk.
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, root.join("dev"));
+
+        let restarted_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let second = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        second.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(restarted_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        second.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.join("dev")),
+                "recovery restores the right-clicked folder as the destination"
+            );
+        });
+
+        second.update(cx, |view, cx| {
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        second.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}GPUI")
+        );
+        assert!(!root.join(format!("{title_prefix}GPUI.md")).exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: a journal entry written before targets were recorded
+    // still recovers to the work folder root.
+    #[gpui::test]
+    fn a_legacy_draft_without_a_target_recovers_to_the_work_folder_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("legacy-draft-recovery");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        OsDraftStore
+            .write(&root, DraftId::generate(), &root.join("dev"), &heading)
+            .unwrap();
+        // Drop the target record so only the text file remains, exactly as
+        // an older version journalled it.
+        for entry in std::fs::read_dir(root.join(".hane").join("drafts")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "target") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(work_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.clone()),
+            );
         });
 
         std::fs::remove_dir_all(&root).unwrap();
