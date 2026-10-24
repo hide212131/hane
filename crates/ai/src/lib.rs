@@ -13,6 +13,7 @@ mod models;
 mod owner_lock;
 mod paths;
 mod probe;
+mod prompt_template;
 mod prompts;
 mod protocol;
 mod provider;
@@ -44,6 +45,10 @@ pub use models::{ChatGptModel, ModelListError, fetch_chatgpt_models, saved_model
 pub use owner_lock::{OwnerLock, OwnerLockGuard};
 pub use paths::AiPaths;
 pub use probe::{ProbeDiagnostic, ProbeErrorCode, ProbeResult, ProbeStatus};
+pub use prompt_template::{
+    DOCUMENT_CONTEXT_VARIABLE, PromptTemplate, PromptTemplateError, SELECTION_VARIABLE,
+    parse_prompt_template,
+};
 pub use prompts::{
     MAX_PROMPT_BODY_BYTES, MAX_PROMPT_COUNT, MAX_PROMPT_TITLE_CHARS, USER_PROMPTS_SCHEMA_VERSION,
     UserPrompt, UserPromptDraft, UserPrompts, UserPromptsLoadError, UserPromptsSaveError,
@@ -85,7 +90,9 @@ pub use settings::{
 };
 pub use settings_lock::{AiSettingsExclusiveGuard, AiSettingsLock, AiSettingsSharedGuard};
 pub use text_transform::{
-    MAX_INSTRUCTION_BYTES, MAX_RESULT_BYTES, MAX_SELECTED_TEXT_BYTES, TEXT_TRANSFORM_TIMEOUT,
-    TextTransformErrorCode, TextTransformOutcome,
-    validate_request as validate_text_transform_request,
+    DocumentContext, DocumentContextScope, MAX_INSTRUCTION_BYTES, MAX_RESULT_BYTES,
+    MAX_SELECTED_TEXT_BYTES, PromptSource, TEXT_TRANSFORM_TIMEOUT, TextTransformErrorCode,
+    TextTransformOutcome, validate_request as validate_text_transform_request,
+    validate_request_for_source as validate_text_transform_request_for_source,
+    validate_request_with_context as validate_text_transform_request_with_context,
 };
