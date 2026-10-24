@@ -4451,7 +4451,8 @@ impl EditorView {
 
     /// Decides and applies a left click that resolved to `hit` on `line`.
     ///
-    /// An OS-standard modifier click on link text only reports the destination
+    /// An OS-standard modifier click on link text (or, in reading mode, a plain
+    /// click) only reports the destination
     /// to open and leaves caret, selection and document alone. Any other click
     /// is ordinary selection editing at the nearest caret boundary.
     fn apply_row_click(
@@ -4463,7 +4464,9 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> RowClick {
         let offset = hit.offset;
-        if is_link_open_modifier(modifiers, macos)
+        let opens_link = is_link_open_modifier(modifiers, macos)
+            || (self.editor_mode() == EditorMode::Reading && is_unmodified_click(modifiers));
+        if opens_link
             && let Some(glyph_offset) = hit.glyph_offset
             && let Some(destination) = self.link_destination_at(line, glyph_offset)
         {
@@ -6359,6 +6362,12 @@ fn is_link_open_modifier(modifiers: &gpui::Modifiers, macos: bool) -> bool {
     wanted && !other && !modifiers.shift && !modifiers.alt
 }
 
+/// Whether a left click carries no modifier key at all. In reading mode such a
+/// click on link text opens the link; any modifier keeps the other behaviours.
+fn is_unmodified_click(modifiers: &gpui::Modifiers) -> bool {
+    !modifiers.platform && !modifiers.control && !modifiers.shift && !modifiers.alt
+}
+
 /// The caret target one row into the next or previous block, aiming at `x`.
 ///
 /// Only the one line of the neighbor that the caret can land on is presented, so
@@ -7930,7 +7939,16 @@ mod tests {
                 (command, true, BEFORE_LINK, false),
                 (ctrl, false, BEFORE_LINK, false),
             ];
-            for (modifiers, macos, column, opens) in cases {
+            for (modifiers, macos, column, opens, reading) in cases.into_iter().flat_map(|case| {
+                [(case, false), (case, true)]
+                    .map(|((modifiers, macos, column, opens), reading)| {
+                        // A plain click on the link text also opens it in
+                        // reading mode; everything else is mode independent.
+                        let on_link = column == INSIDE || column == LAST_GLYPH_RIGHT_HALF;
+                        let plain = is_unmodified_click(&modifiers);
+                        (modifiers, macos, column, opens || (reading && plain && on_link), reading)
+                    })
+            }) {
                 let view = gpui::AppContext::new(cx, |cx| {
                     EditorView::new(text.as_str(), "Untitled", cx)
                 });
@@ -7998,6 +8016,9 @@ mod tests {
                     let can_undo_before = view.editor().can_undo();
                     let can_redo_before = view.editor().can_redo();
 
+                    if reading {
+                        view.editor_mode = EditorMode::Reading;
+                    }
                     let outcome = view.apply_row_click(line, hit, &modifiers, macos, cx);
 
                     if opens {
