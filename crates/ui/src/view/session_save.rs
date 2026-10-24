@@ -357,6 +357,9 @@ impl EditorView {
         let Some(root) = from.parent().map(Path::to_path_buf) else {
             return;
         };
+        if self.folder_trash_blocks(&from, false) {
+            return;
+        }
         // Reserved synchronously, before any `await`: a concurrent autosave
         // that fires in the same tick must see the slot already taken and
         // queue behind it, not race the rename to the filesystem. A `None`
@@ -617,6 +620,32 @@ impl EditorView {
         intent: SaveIntent,
         cx: &mut Context<Self>,
     ) {
+        // A folder is being moved to the OS Trash: a write under it would
+        // recreate the original path or mark the session Present again once
+        // the move lands. The content stays in the session, unsaved.
+        if self.folder_trash_in_flight.is_some() {
+            let target_blocked = match &intent {
+                SaveIntent::To(path) | SaveIntent::CreateNew(path) => {
+                    self.folder_trash_blocks(path, false)
+                }
+                _ => false,
+            };
+            let session_blocked = self
+                .sessions
+                .get(id)
+                .and_then(DocumentSession::path)
+                .is_some_and(|path| self.folder_trash_blocks(path, false));
+            if target_blocked || session_blocked {
+                self.title_sync_pending.remove(&id);
+                self.tab_close_after_save.remove(&id);
+                self.status = Some(
+                    "フォルダをゴミ箱へ移動中のため保存できません。完了後にやり直してください"
+                        .to_owned(),
+                );
+                cx.notify();
+                return;
+            }
+        }
         let Some(decision) = self
             .sessions
             .get_mut(id)
@@ -1056,6 +1085,64 @@ mod tests {
                 "the stale rename completion must not clear a close-and-save request armed \
                  for the replacement document"
             );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #585: while a folder is moving to the OS Trash, a Save (or Save
+    // As into that subtree) must not start: a late write would recreate the
+    // original path. The edit stays in the session, unsaved, and a rename of
+    // the folder is refused too.
+    #[gpui::test]
+    fn saving_and_renaming_under_a_folder_being_trashed_are_refused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-race");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let note = folder_path.join("Note.md");
+        std::fs::write(&note, "body\n").unwrap();
+        let loaded = OsFileService.load(&note).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _cx| {
+            view.work_folder = Some(work_folder);
+            let _ = view.sessions.active_mut().editor_mut().insert_text("more\n");
+            view.folder_trash_in_flight = Some(folder_path.clone());
+        });
+
+        // The trash move removes the folder while the save is attempted.
+        std::fs::remove_dir_all(&folder_path).unwrap();
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.save_session(id, SaveIntent::Current, cx);
+            view.save_session(id, SaveIntent::To(folder_path.join("Other.md")), cx);
+            assert!(!view.sessions.active().save_in_flight());
+            assert!(view.sessions.active().is_dirty());
+            assert!(view.inline_rename_has_background_conflict(
+                &folder_path,
+                InlineRenameKind::Folder
+            ));
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !folder_path.exists(),
+            "a refused save must not recreate the trashed folder"
+        );
+        view.update(cx, |view, _cx| {
+            assert!(view.sessions.active().is_dirty());
         });
 
         std::fs::remove_dir_all(&root).unwrap();

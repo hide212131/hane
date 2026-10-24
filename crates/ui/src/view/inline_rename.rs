@@ -352,8 +352,9 @@ impl EditorView {
             InlineRenameKind::File => path == from,
             InlineRenameKind::Folder => rebase_ui_path(path, from, from).is_some(),
         };
-        (kind == InlineRenameKind::Folder
-            && self.pending_new_folders.iter().any(|path| belongs(path)))
+        self.folder_trash_blocks(from, true)
+            || (kind == InlineRenameKind::Folder
+                && self.pending_new_folders.iter().any(|path| belongs(path)))
             || self.sessions.sessions().any(|session| {
                 session.path().is_some_and(belongs)
                     && (session.save_in_flight()

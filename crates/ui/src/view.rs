@@ -964,6 +964,12 @@ pub struct EditorView {
     /// finishes reserve the same name; this set is checked alongside the
     /// tree so the second click picks the next name instead.
     pending_new_folders: HashSet<PathBuf>,
+    /// The folder whose OS Trash move is still running. From the moment the
+    /// unsaved check passes until the result is applied, Save, rename and
+    /// other folder operations touching this subtree are refused, so a late
+    /// write cannot recreate the original path or flip a session back to
+    /// Present while the move lands.
+    folder_trash_in_flight: Option<PathBuf>,
     /// The last laid-out bounds of the inline rename input. Native text-input
     /// callbacks report window coordinates rather than the element hitbox, so
     /// this lets click-to-caret conversion use the same geometry the input
@@ -1795,6 +1801,7 @@ impl EditorView {
             sidebar_date_badge_today: local_today(),
             _date_badge_refresh_task: date_badge_refresh_task,
             pending_new_folders: HashSet::new(),
+            folder_trash_in_flight: None,
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
             editor_mode: EditorMode::default(),

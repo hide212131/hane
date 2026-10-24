@@ -1107,6 +1107,88 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_folder_drops_it_with_descendants_and_keeps_siblings_and_root() {
+        let mut folder = WorkFolder::new(PathBuf::from("/notes"), Vec::new());
+        folder.insert_folder(PathBuf::from("/notes/dev/archive"));
+        folder.insert(PathBuf::from("/notes/dev/GPUI.md"));
+        folder.insert(PathBuf::from("/notes/dev/archive/Old.md"));
+        folder.insert_folder(PathBuf::from("/notes/devtools"));
+        folder.insert(PathBuf::from("/notes/devtools/Keep.md"));
+        folder.insert(PathBuf::from("/notes/Zeta.md"));
+
+        folder.remove_folder(Path::new("/notes/dev"));
+
+        assert!(folder.children_at(Path::new("/notes/dev")).is_none());
+        assert!(
+            folder
+                .children_at(Path::new("/notes/dev/archive"))
+                .is_none()
+        );
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/dev/GPUI.md"))
+                .is_none()
+        );
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/dev/archive/Old.md"))
+                .is_none()
+        );
+        assert!(folder.children_at(Path::new("/notes/devtools")).is_some());
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/devtools/Keep.md"))
+                .is_some()
+        );
+        assert!(folder.entry_for_path(Path::new("/notes/Zeta.md")).is_some());
+        assert_eq!(folder.root(), Path::new("/notes"));
+    }
+
+    #[test]
+    fn removing_a_nested_folder_keeps_its_parent_and_the_parents_files() {
+        let mut folder = WorkFolder::new(PathBuf::from("/notes"), Vec::new());
+        folder.insert_folder(PathBuf::from("/notes/dev/archive"));
+        folder.insert(PathBuf::from("/notes/dev/GPUI.md"));
+        folder.insert(PathBuf::from("/notes/dev/archive/Old.md"));
+
+        folder.remove_folder(Path::new("/notes/dev/archive"));
+
+        assert!(folder.children_at(Path::new("/notes/dev")).is_some());
+        assert!(
+            folder
+                .children_at(Path::new("/notes/dev/archive"))
+                .is_none()
+        );
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/dev/GPUI.md"))
+                .is_some()
+        );
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/dev/archive/Old.md"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn removing_the_root_or_an_unknown_folder_changes_nothing() {
+        let mut folder = WorkFolder::new(PathBuf::from("/notes"), Vec::new());
+        folder.insert_folder(PathBuf::from("/notes/dev"));
+        folder.insert(PathBuf::from("/notes/dev/GPUI.md"));
+
+        folder.remove_folder(Path::new("/notes"));
+        folder.remove_folder(Path::new("/notes/missing"));
+
+        assert!(folder.children_at(Path::new("/notes/dev")).is_some());
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/dev/GPUI.md"))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn renaming_a_folder_the_tree_was_not_scanned_with_is_a_no_op() {
         let mut folder = WorkFolder::new(
             PathBuf::from("/notes"),

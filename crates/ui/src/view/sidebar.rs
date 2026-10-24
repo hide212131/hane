@@ -899,6 +899,14 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Whether `path` is inside (or, for `include_ancestors`, contains) the
+    /// folder whose Trash move is still running.
+    pub(super) fn folder_trash_blocks(&self, path: &Path, include_ancestors: bool) -> bool {
+        self.folder_trash_in_flight.as_ref().is_some_and(|trashed| {
+            path.starts_with(trashed) || (include_ancestors && trashed.starts_with(path))
+        })
+    }
+
     pub(crate) fn dismiss_sidebar_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
         if self.sidebar_context_menu.take().is_some() {
             cx.notify();
@@ -974,6 +982,11 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        if self.folder_trash_in_flight.is_some() {
+            self.status = Some("フォルダをゴミ箱へ移動中です。完了後にやり直してください".to_owned());
+            cx.notify();
+            return;
+        }
         if let Some(session) = self
             .sessions
             .session_for_path(&path)
@@ -1045,6 +1058,12 @@ impl EditorView {
             cx.notify();
             return;
         }
+        if self.folder_trash_in_flight.is_some() {
+            self.status = Some("別のフォルダをゴミ箱へ移動中です。完了後にやり直してください".to_owned());
+            cx.notify();
+            return;
+        }
+        self.folder_trash_in_flight = Some(path.clone());
         self.status = Some("ゴミ箱へ移動しています…".to_owned());
         let generation = self.work_folder_generation;
         cx.spawn(async move |view, cx| {
@@ -1054,6 +1073,9 @@ impl EditorView {
                 .spawn(async move { move_path_to_trash(&trash_path) })
                 .await;
             let _ = view.update(cx, |view, cx| {
+                if view.folder_trash_in_flight.as_ref() == Some(&path) {
+                    view.folder_trash_in_flight = None;
+                }
                 if view.work_folder_generation != generation {
                     return;
                 }
