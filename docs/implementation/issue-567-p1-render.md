@@ -2,7 +2,11 @@
 
 ## 状態と契約の正本
 
-Refs #567、親 #297。台帳RF0-05、実行計画§9.8〜§9.13の受入済み分割を継承する次の一責務である。**実装直前の準備文書で、製品・testの変更、build/test/GUI/性能測定は未実施。Claudeの起動依頼も未投稿。** 利用者の依頼は実装担当への引き継ぎPR作成までである。
+Refs #567、親 #297。台帳RF0-05、実行計画§9.8〜§9.13の受入済み分割を継承する次の一責務である。
+
+**本書は実装前に作成した仕様である（準備時点の履歴）。** 作成時点では製品・testの変更、build/test/GUI/性能測定は未実施で、Claudeの起動依頼も未投稿であり、利用者の依頼は実装担当への引き継ぎPR作成までだった。
+
+**その後の状態（実装コードhead `7412384071cace5889952ce5fe67eaea673d8e69` 時点の履歴）:** 初回依頼はPR Conversationに投稿され、render移動は適用済みである。同headでtrusted run 40051416483のprepare・Claude Sonnet 5.5 worker・finalizer・exact-head verifyが成功し、verifyのworkspace testsとClippyも成功した。PR CI run 40051653682も同head／base `c1f387ded69180aa5cc5f3075d67a99ec067a7b2` でWindows/macOS required jobsが成功し、macOS focused GUIも完了している。**未完了:** Windows focused GUIと、受入に必要な最終review。Issue #567全体も完了していない。本書の修正でPR headは更新されるため、上記のrun・CI・GUI結果は `7412384` 時点のものであり、文書修正後の新headに対する検証結果ではない。
 
 仕事の契約はIssue #567、全域の契約は `docs/refactor-plan.md` と `docs/refactor-execution-plan.md`、運用判断はdefault branchの `docs/aadw-command-policy.md`、実行入口は `docs/aadw-claude-execution.md` を使う。本書は今回の移動仕様を補う。既存ADRを変更する設計判断はない。
 
@@ -79,18 +83,18 @@ helper化、式の書換え、RAII化、cache範囲変更、新しいManager/tra
 6. **性能と構成:** 機械的配置だけなら新しい処理量・性能改善は主張しない。計測位置と上限の不変を確認し、処理量/遅延を変える必要が出たら別PRに分け変更前測定を行う。起動/feature配線を変える場合の通常/release buildも別途必要とし、移動だけを理由に配線を変えない。
 7. **受入記録:** 実行計画へ今回の旧→新、維持理由と後続を記録し、CI/review/GUIのURL・対象head/baseをPRにまとめる。current-head CI成功後の最終full review等はCommander Policyに従う。このP1だけで#567/#297/#315をcloseしない。
 
-既存testの対応（所在は準備baseで確認。未実行）:
+既存testの対応（所在は準備baseで確認。実装コードhead `7412384` のverifyでworkspace testsが成功した。新headでは未確認）:
 
 - `view.rs`: `zoom_scales_the_painted_row_height`、`table_mouse_hit_testing_uses_the_clicked_cell_fragment_y`、`opening_the_find_bar_pushes_rows_down_and_shrinks_the_viewport_by_its_reserved_height`、`caret_and_scrollbar_geometry_match_the_shrunken_viewport_while_the_find_bar_is_open`、`file_drop_on_settings_screen_returns_to_editor_without_discarding_dirty_text`、`height_anchor_recompute_resyncs_a_still_tracking_inertia_coast`。
 - `view/reading_mode.rs`: `a_wrapped_long_line_keeps_its_reading_position_across_mode_switches`、`reading_real_down_keys_cross_tables_and_code_in_a_narrow_viewport`、`zero_movement_wheel_events_keep_the_editing_to_reading_anchor`、`zero_movement_wheel_events_keep_the_reading_to_editing_anchor`、`reading_frames_are_still_painted_and_measured`。
 
 ## 実装担当への渡し方と復旧
 
-製品・testは通常担当Claude Code（`claude-sonnet-5-5`）へ引き継ぐ。本準備PRでは起動しない。開始を指示されたCommanderはdefault branchの実行手順を再読し、open/same-repository/current exact head、write権限、重複worker、current main/競合/resourceを取り直す。本書をbranchから読み、上記移動・不変条件・検証条件を含む依頼をPR Conversationへ一度投稿する。
+製品・testは通常担当Claude Code（`claude-sonnet-5-5`）へ引き継ぐ。初回準備時点の本PRでは起動しなかった（過去の経緯。初回依頼はその後投稿され、実装・verifyは上記のとおり完了している）。開始を指示されたCommanderはdefault branchの実行手順を再読し、open/same-repository/current exact head、write権限、重複worker、current main/競合/resourceを取り直す。本書をbranchから読み、上記移動・不変条件・検証条件を含む依頼をPR Conversationへ一度投稿する。
 
-機械項目は `AADW_ACTION: implement`、`AADW_FAILURE_CLASS: initial`、`AADW_ROOT_CAUSE: issue-567-p1-render-initial`、`AADW_EVIDENCE: https://github.com/hide212131/hane/issues/567`。`AADW_TARGET_HEAD`には投稿直前の40桁headを使う。マーカーとメンションは実行手順の正規templateに従い、準備commitや古いSHAを無条件に流用しない。
+初回依頼の機械項目（履歴。後続の修正依頼の値とは別）は `AADW_ACTION: implement`、`AADW_FAILURE_CLASS: initial`、`AADW_ROOT_CAUSE: issue-567-p1-render-initial`、`AADW_EVIDENCE: https://github.com/hide212131/hane/issues/567`。`AADW_TARGET_HEAD`には投稿直前の40桁headを使う。マーカーとメンションは実行手順の正規templateに従い、準備commitや古いSHAを無条件に流用しない。
 
-workerにはこの移動と直接関連する文書だけを許可し、shell/git/gh/test/build/lint/commit/push、次工程、モデル切替、merge、Issue closeを行わせない。検証はtrusted finalizer/Commander側で行い、`prepare`成功と実Sonnet使用、patch/finalizer、exact-head verifyを区別する。今回それらの受理・成功は主張しない。
+workerにはこの移動と直接関連する文書だけを許可し、shell/git/gh/test/build/lint/commit/push、次工程、モデル切替、merge、Issue closeを行わせない。検証はtrusted finalizer/Commander側で行い、`prepare`成功と実Sonnet使用、patch/finalizer、exact-head verifyを区別する。準備時点ではそれらの受理・成功を主張しなかった。実装コードhead `7412384` では、上記のrun 40051416483でprepare・実Sonnet使用・finalizer・exact-head verifyの成功を確認済みである（新headの結果ではない）。
 
 revert単位はP1の一責務移動PR。新moduleに依存する後続を先に逆順で戻す。製品データ・永続形式・外部設定の移行はない。
 
