@@ -17860,6 +17860,9 @@ mod tests {
 
     // Issue #608: a child folder whose name ends in whitespace is a distinct
     // real folder; recovery must not trim it into a different name.
+    // Windows cannot keep a trailing ASCII space in a real folder name, so this
+    // filesystem fixture only runs on other platforms.
+    #[cfg(not(windows))]
     #[gpui::test]
     fn a_recovered_draft_keeps_a_child_folder_name_with_trailing_whitespace(
         cx: &mut gpui::TestAppContext,
