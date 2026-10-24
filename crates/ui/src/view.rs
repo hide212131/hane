@@ -2107,6 +2107,11 @@ impl EditorView {
     }
 
     pub(crate) fn editor_mut(&mut self) -> &mut Editor {
+        // Every edit goes through here: publish protection before the document
+        // can change, not after, so a receiver cannot read a stale clean state
+        // between the edit and the next sync. The sync that follows the input
+        // (or the next render) restores the real value.
+        self.raise_external_open_guard();
         self.sessions.active_mut().editor_mut()
     }
 
@@ -13495,6 +13500,73 @@ mod tests {
             );
         });
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: the receiver can read between the document changing and the
+    // guard being recomputed. Taking the editor for mutation publishes
+    // protection first, so a request read at that boundary is protected and is
+    // refused even though the sync afterwards is what makes the state exact.
+    #[gpui::test]
+    fn a_folder_read_at_the_edit_boundary_is_protected_and_refused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-edit-boundary");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let queue = SharedExternalOpenQueue::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_inbox(Some(queue.clone()));
+            view.sync_external_open_guard();
+            assert!(!queue.guard().unsaved());
+            // The edit starts: protection is published before the document
+            // changes, and the guard has not been synced since.
+            view.editor_mut().insert_text("unsaved").unwrap();
+            queue.try_push(folder.clone()).unwrap();
+            // Later syncs (clean or not) cannot lower what was captured.
+            view.sync_external_open_guard();
+            let generation = view.work_folder_generation;
+            let accepted = queue.drain_requests_into(|path, protected| {
+                view.submit_external_open_protected(path, protected, cx)
+            });
+            assert_eq!(accepted, 1);
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.editor().document().full_text(), "unsaved");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: starting a save publishes protection before the save slot is
+    // taken, and the recomputation keeps another dirty session protected.
+    #[gpui::test]
+    fn the_guard_stays_raised_for_another_dirty_session_after_a_save_starts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = ExternalOpenGuard::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_guard(guard.clone());
+            view.editor_mut().insert_text("dirty").unwrap();
+            view.after_input(cx);
+            // No path: nothing starts, yet the dirty session stays protected.
+            view.save_current(cx);
+            assert!(guard.unsaved());
+        });
     }
 
     #[gpui::test]

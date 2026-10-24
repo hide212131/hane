@@ -604,6 +604,17 @@ impl ExternalOpenGuard {
         self.unsaved.store(unsaved, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Publishes protection *before* a session turns dirty or starts a save.
+    /// The sequentially consistent store happens before the state change on
+    /// the UI thread, so a receiver either read before the transition (the
+    /// request really arrived while clean) or sees `true`; it can never read a
+    /// stale `false` after the state has changed. The following
+    /// [`EditorView::sync_external_open_guard`] recomputes the real value from
+    /// every session, so other sessions' state is never cleared by it.
+    pub fn raise(&self) {
+        self.set_unsaved(true);
+    }
+
     pub fn unsaved(&self) -> bool {
         self.unsaved.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -700,6 +711,10 @@ impl EditorView {
 
     /// Publishes whether any session is dirty or saving. Called every render,
     /// so a receiver reading it sees the state as of the latest frame.
+    pub(super) fn raise_external_open_guard(&self) {
+        self.external_open_guard.raise();
+    }
+
     pub(super) fn sync_external_open_guard(&self) {
         self.external_open_guard.set_unsaved(self.has_unsaved_sessions());
     }

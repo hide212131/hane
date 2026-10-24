@@ -650,15 +650,19 @@ impl EditorView {
                 return;
             }
         }
+        // Publish protection before the save slot can be taken, so a request
+        // cannot read a clean state after the session has changed.
+        self.raise_external_open_guard();
         let Some(decision) = self
             .sessions
             .get_mut(id)
             .map(|session| session.request_save(intent))
         else {
+            self.sync_external_open_guard();
             return;
         };
-        // The save slot may now be in flight; publish it before a request that
-        // arrives ahead of the next frame can read a stale clean state.
+        // Recompute from every session: this lowers the early publication when
+        // nothing started (e.g. no path) without clearing other sessions' state.
         self.sync_external_open_guard();
         match decision {
             SaveDecision::NeedsPath => {
