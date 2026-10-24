@@ -91,7 +91,8 @@ pub use settings::{
 pub use settings_lock::{AiSettingsExclusiveGuard, AiSettingsLock, AiSettingsSharedGuard};
 pub use text_transform::{
     DocumentContext, DocumentContextScope, MAX_INSTRUCTION_BYTES, MAX_RESULT_BYTES,
-    MAX_SELECTED_TEXT_BYTES, TEXT_TRANSFORM_TIMEOUT, TextTransformErrorCode, TextTransformOutcome,
-    validate_request as validate_text_transform_request,
+    MAX_SELECTED_TEXT_BYTES, PromptSource, TEXT_TRANSFORM_TIMEOUT, TextTransformErrorCode,
+    TextTransformOutcome, validate_request as validate_text_transform_request,
+    validate_request_for_source as validate_text_transform_request_for_source,
     validate_request_with_context as validate_text_transform_request_with_context,
 };

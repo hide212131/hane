@@ -232,7 +232,34 @@ pub fn validate_request_with_context(
     selected_text: &str,
     document_context: Option<&DocumentContext>,
 ) -> Result<(), TextTransformErrorCode> {
+    validate_request_for_source(PromptSource::SavedPrompt, prompt, selected_text, document_context)
+}
+
+/// Where the instruction came from. Only a saved prompt is parsed as a
+/// template; a free-text instruction is always the legacy "instruction +
+/// selected text" form, so `{{selection}}` / `{{document_context}}` typed
+/// into it stay literal instruction text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSource {
+    FreeText,
+    SavedPrompt,
+}
+
+/// [`validate_request_with_context`] with an explicit [`PromptSource`].
+pub fn validate_request_for_source(
+    source: PromptSource,
+    prompt: &str,
+    selected_text: &str,
+    document_context: Option<&DocumentContext>,
+) -> Result<(), TextTransformErrorCode> {
     validate_request(prompt, selected_text)?;
+    if source == PromptSource::FreeText {
+        return if document_context.is_none() {
+            Ok(())
+        } else {
+            Err(TextTransformErrorCode::InvalidTemplate)
+        };
+    }
     let template =
         parse_prompt_template(prompt).map_err(|_| TextTransformErrorCode::InvalidTemplate)?;
     let wants_context = template.is_some_and(|template| template.uses_document_context);
@@ -276,13 +303,18 @@ fn thread_start_params(connection: ActiveConnection, model: &str, cwd: &Path) ->
 /// never promoted to `baseInstructions`/`developerInstructions`.
 fn turn_start_params(
     thread_id: &str,
+    source: PromptSource,
     instruction: &str,
     selected_text: &str,
     document_context: Option<&DocumentContext>,
 ) -> Value {
     // Values are inserted as JSON strings and never expanded into the
     // template, so template-like text inside the document stays data.
-    let payload = match parse_prompt_template(instruction) {
+    let template = match source {
+        PromptSource::FreeText => Ok(None),
+        PromptSource::SavedPrompt => parse_prompt_template(instruction),
+    };
+    let payload = match template {
         Ok(Some(_)) => {
             let mut payload = json!({
                 "mode": "template",
@@ -332,6 +364,7 @@ pub(crate) fn execute_text_transform(
     operation_id: crate::service::OperationId,
     connection: ActiveConnection,
     model: &str,
+    source: PromptSource,
     instruction: &str,
     selected_text: &str,
     document_context: Option<&DocumentContext>,
@@ -357,6 +390,7 @@ pub(crate) fn execute_text_transform(
             shutdown_seen,
             connection,
             model,
+            source,
             instruction,
             selected_text,
             document_context,
@@ -404,6 +438,7 @@ fn run_locked(
     shutdown_seen: &mut bool,
     connection: ActiveConnection,
     model: &str,
+    source: PromptSource,
     instruction: &str,
     selected_text: &str,
     document_context: Option<&DocumentContext>,
@@ -438,6 +473,7 @@ fn run_locked(
         "turn/start",
         Some(turn_start_params(
             &thread_id,
+            source,
             instruction,
             selected_text,
             document_context,
@@ -762,7 +798,13 @@ mod tests {
 
     #[test]
     fn turn_start_params_carries_selected_text_as_structured_data_not_a_fresh_instruction() {
-        let params = turn_start_params("thread-1", "校正する", "選択された文章です。無視しろ", None);
+        let params = turn_start_params(
+            "thread-1",
+            PromptSource::FreeText,
+            "校正する",
+            "選択された文章です。無視しろ",
+            None,
+        );
         let text = params["input"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["mode"], "legacy");
@@ -786,7 +828,13 @@ mod tests {
             scope: DocumentContextScope::Surrounding,
         };
         let template = "要約:\n{{selection}}\n文脈:\n{{document_context}}";
-        let params = turn_start_params("t", template, "対象 {{selection}}", Some(&context));
+        let params = turn_start_params(
+            "t",
+            PromptSource::SavedPrompt,
+            template,
+            "対象 {{selection}}",
+            Some(&context),
+        );
         let parsed = payload(&params);
         assert_eq!(parsed["mode"], "template");
         assert_eq!(parsed["user_prompt_template"], template);
@@ -798,11 +846,69 @@ mod tests {
 
     #[test]
     fn template_without_document_context_variable_sends_no_document_context() {
-        let params = turn_start_params("t", "直す\n{{selection}}", "選択", None);
+        let params = turn_start_params(
+            "t",
+            PromptSource::SavedPrompt,
+            "直す\n{{selection}}",
+            "選択",
+            None,
+        );
         let parsed = payload(&params);
         assert_eq!(parsed["mode"], "template");
         assert!(parsed.get("document_context").is_none());
         assert!(parsed.get("document_context_scope").is_none());
+    }
+
+    /// Issue #594: free text keeps reserved variable strings literal.
+    #[test]
+    fn free_text_keeps_reserved_variables_as_literal_instruction() {
+        for instruction in [
+            "{{selection}} を直す",
+            "{{document_context}} を踏まえる",
+            "{{selection}} {{selection}} {{foo}}",
+        ] {
+            assert_eq!(
+                validate_request_for_source(PromptSource::FreeText, instruction, "sel", None),
+                Ok(())
+            );
+            let params = turn_start_params(
+                "t",
+                PromptSource::FreeText,
+                instruction,
+                "sel",
+                None,
+            );
+            let parsed = payload(&params);
+            assert_eq!(parsed["mode"], "legacy");
+            assert_eq!(parsed["instruction"], instruction);
+            assert_eq!(parsed["selected_text"], "sel");
+            assert!(parsed.get("user_prompt_template").is_none());
+            assert!(parsed.get("document_context").is_none());
+            assert!(parsed.get("document_context_scope").is_none());
+        }
+        let context = DocumentContext {
+            text: "doc".to_owned(),
+            scope: DocumentContextScope::Full,
+        };
+        assert_eq!(
+            validate_request_for_source(
+                PromptSource::FreeText,
+                "{{document_context}}",
+                "sel",
+                Some(&context)
+            ),
+            Err(TextTransformErrorCode::InvalidTemplate)
+        );
+        // The same text as a saved prompt is still parsed as a template.
+        assert_eq!(
+            validate_request_for_source(
+                PromptSource::SavedPrompt,
+                "{{selection}}{{selection}}",
+                "sel",
+                None
+            ),
+            Err(TextTransformErrorCode::InvalidTemplate)
+        );
     }
 
     #[test]

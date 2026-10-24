@@ -255,6 +255,42 @@ fn template_text_transform_sends_document_context_as_structured_user_input() {
     let _ = std::fs::remove_dir_all(data_root);
 }
 
+/// Issue #594: a free-text instruction containing both reserved variables is
+/// sent as a literal legacy instruction with only the exact selected text.
+#[test]
+fn free_text_with_reserved_variables_is_sent_as_literal_legacy_instruction() {
+    let (service, data_root) = prepare_connected_service("probe_success");
+    let handle = service.handle();
+    let instruction = "{{selection}} と {{document_context}} を文字列として扱う {{selection}}";
+    let selected_text = "自由入力の選択594";
+    let (id, reply_rx) = handle
+        .try_submit_text_transform(instruction.to_owned(), selected_text.to_owned())
+        .unwrap();
+    assert_eq!(wait_for_result(&service, id), SafeOperationResult::Succeeded);
+    assert!(matches!(
+        reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        TextTransformOutcome::Succeeded { .. }
+    ));
+
+    let record = std::fs::read_to_string(
+        data_root.join("ai/codex-chatgpt/.hane-fake-app-server-probe-record"),
+    )
+    .unwrap_or_default();
+    let turn_start = find_turn_start_with_selected_text(&record, selected_text)
+        .expect("turn/start must carry the selected_text");
+    let payload: serde_json::Value =
+        serde_json::from_str(turn_start["input"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["mode"], "legacy");
+    assert_eq!(payload["instruction"], instruction);
+    assert_eq!(payload["selected_text"], selected_text);
+    assert!(payload.get("user_prompt_template").is_none());
+    assert!(payload.get("document_context").is_none());
+    assert!(payload.get("document_context_scope").is_none());
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
 /// Issue #594 T01/T06/T07: invalid templates and context mismatches are
 /// rejected at admission without queueing anything.
 #[test]

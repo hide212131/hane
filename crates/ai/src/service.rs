@@ -41,7 +41,7 @@ use crate::runtime_install::{
 use crate::secrets::{CredentialRef, CredentialStore};
 use crate::settings::{ActiveConnection, AiSettings, AiSettingsStore, SaveError};
 use crate::text_transform::{
-    self, DocumentContext, TextTransformOutcome, validate_request_with_context,
+    self, DocumentContext, PromptSource, TextTransformOutcome, validate_request_for_source,
 };
 
 const COMMAND_CAPACITY: usize = 16;
@@ -263,6 +263,7 @@ enum WorkerCommand {
     /// request's own dedicated channel: the result is delivered there only,
     /// never through `AiSnapshot` (section 5.1).
     TextTransform {
+        source: PromptSource,
         instruction: String,
         selected_text: String,
         document_context: Option<DocumentContext>,
@@ -388,7 +389,12 @@ impl AiServiceHandle {
         instruction: String,
         selected_text: String,
     ) -> Result<(OperationId, Receiver<TextTransformOutcome>), AdmissionError> {
-        self.try_submit_text_transform_with_context(instruction, selected_text, None)
+        self.try_submit_text_transform_for_source(
+            PromptSource::FreeText,
+            instruction,
+            selected_text,
+            None,
+        )
     }
 
     /// [`Self::try_submit_text_transform`] for a saved prompt that may be a
@@ -401,14 +407,37 @@ impl AiServiceHandle {
         selected_text: String,
         document_context: Option<DocumentContext>,
     ) -> Result<(OperationId, Receiver<TextTransformOutcome>), AdmissionError> {
-        validate_request_with_context(&instruction, &selected_text, document_context.as_ref())
-            .map_err(|_| AdmissionError::InvalidInput)?;
+        self.try_submit_text_transform_for_source(
+            PromptSource::SavedPrompt,
+            instruction,
+            selected_text,
+            document_context,
+        )
+    }
+
+    /// Admission with an explicit [`PromptSource`]: a free-text instruction is
+    /// never parsed as a template, a saved prompt is.
+    pub fn try_submit_text_transform_for_source(
+        &self,
+        source: PromptSource,
+        instruction: String,
+        selected_text: String,
+        document_context: Option<DocumentContext>,
+    ) -> Result<(OperationId, Receiver<TextTransformOutcome>), AdmissionError> {
+        validate_request_for_source(
+            source,
+            &instruction,
+            &selected_text,
+            document_context.as_ref(),
+        )
+        .map_err(|_| AdmissionError::InvalidInput)?;
         if self.shared.snapshot.lock().unwrap().runtime_isolated {
             return Err(AdmissionError::Unavailable);
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let id = self.enqueue(
             WorkerCommand::TextTransform {
+                source,
                 instruction,
                 selected_text,
                 document_context,
@@ -1098,6 +1127,7 @@ fn handle_command(
             );
         }
         WorkerCommand::TextTransform {
+            source,
             instruction,
             selected_text,
             document_context,
@@ -1105,6 +1135,7 @@ fn handle_command(
         } => {
             run_text_transform_command(
                 queued.id,
+                source,
                 instruction,
                 selected_text,
                 document_context,
@@ -1328,6 +1359,7 @@ fn run_probe_command(
 #[allow(clippy::too_many_arguments)]
 fn run_text_transform_command(
     id: OperationId,
+    source: PromptSource,
     instruction: String,
     selected_text: String,
     document_context: Option<DocumentContext>,
@@ -1417,6 +1449,7 @@ fn run_text_transform_command(
         id,
         settings.active_connection,
         &model,
+        source,
         &instruction,
         &selected_text,
         document_context.as_ref(),

@@ -25,7 +25,7 @@ use gpui::{AppContext, Entity};
 use gpui_component::input::{Input, InputEvent, InputState};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiServiceHandle, AiSnapshot, DocumentContext,
-    DocumentContextScope, OperationId, OwnershipState, TextTransformErrorCode,
+    DocumentContextScope, OperationId, OwnershipState, PromptSource, TextTransformErrorCode,
     TextTransformOutcome, UserPrompt, UserPrompts, UserPromptsLoadError, initial_default_draft,
     parse_prompt_template,
 };
@@ -39,7 +39,6 @@ pub(super) const AI_SELECTION_STALE_MESSAGE: &str =
     "文章が変更されたため、この結果は適用できません。選択し直して実行してください。";
 const AI_SELECTION_NO_SELECTION_MESSAGE: &str = "AIで処理する文章を選択してください";
 const AI_SELECTION_READING_MODE_MESSAGE: &str = "閲覧モードでは置換できません。";
-const AI_SELECTION_FREE_TEXT_TEMPLATE_MESSAGE: &str = "自由入力では {{selection}} や {{document_context}} は使えません。変数は設定のAIプロンプトに保存して実行してください。";
 const AI_SELECTION_CONTEXT_TOO_LARGE_MESSAGE: &str =
     "選択範囲が大きいため、文書の文脈を追加できません。範囲を絞ってお試しください。";
 /// A generous upper bound on top of the service's own
@@ -163,6 +162,9 @@ pub(super) struct AiSelectionState {
     target: Option<SelectionTarget>,
     original_text: String,
     confirmed_instruction: String,
+    /// Whether `confirmed_instruction` came from a saved prompt (template
+    /// parsing applies) rather than the free-text field (always literal).
+    confirmed_from_saved_prompt: bool,
     /// Scope of the document context the in-flight request was built with;
     /// `None` when it carries the selection only.
     context_scope: Option<DocumentContextScope>,
@@ -204,6 +206,7 @@ impl AiSelectionState {
         self.target = None;
         self.original_text.clear();
         self.confirmed_instruction.clear();
+        self.confirmed_from_saved_prompt = false;
         self.context_scope = None;
         self.input = None;
         self.input_subscription = None;
@@ -285,6 +288,7 @@ impl AiSelectionState {
     fn start_request(
         &mut self,
         instruction: String,
+        from_saved_prompt: bool,
         document_context: Option<DocumentContext>,
         cx: &mut Context<EditorView>,
     ) {
@@ -303,7 +307,13 @@ impl AiSelectionState {
         }
         let selected_text = self.original_text.clone();
         let context_scope = document_context.as_ref().map(|context| context.scope);
-        match service.try_submit_text_transform_with_context(
+        let source = if from_saved_prompt {
+            PromptSource::SavedPrompt
+        } else {
+            PromptSource::FreeText
+        };
+        match service.try_submit_text_transform_for_source(
+            source,
             instruction,
             selected_text,
             document_context,
@@ -1061,16 +1071,15 @@ impl EditorView {
             return;
         }
         // The free-text field keeps its pre-#594 meaning: template variables
-        // are only interpreted in saved prompts.
-        if !from_saved_prompt && matches!(parse_prompt_template(&instruction), Ok(Some(_)) | Err(_))
-        {
-            self.ai_selection.message = Some(AI_SELECTION_FREE_TEXT_TEMPLATE_MESSAGE.to_owned());
-            cx.notify();
-            return;
-        }
+        // are only interpreted in saved prompts, so free text is sent as a
+        // literal legacy instruction with no document context.
         // Built from the same revision the freshness check above just
-        // validated, and only when the prompt asks for `{{document_context}}`.
-        let document_context = match self.ai_selection_document_context(target, &instruction) {
+        // validated, and only when a saved prompt asks for `{{document_context}}`.
+        let document_context = match self.ai_selection_document_context(
+            target,
+            &instruction,
+            from_saved_prompt,
+        ) {
             Ok(context) => context,
             Err(message) => {
                 self.ai_selection.message = Some(message);
@@ -1079,8 +1088,9 @@ impl EditorView {
             }
         };
         self.ai_selection.confirmed_instruction = instruction.clone();
+        self.ai_selection.confirmed_from_saved_prompt = from_saved_prompt;
         self.ai_selection
-            .start_request(instruction, document_context, cx);
+            .start_request(instruction, from_saved_prompt, document_context, cx);
         cx.notify();
     }
 
@@ -1092,7 +1102,11 @@ impl EditorView {
         &self,
         target: SelectionTarget,
         instruction: &str,
+        from_saved_prompt: bool,
     ) -> Result<Option<DocumentContext>, String> {
+        if !from_saved_prompt {
+            return Ok(None);
+        }
         let template = parse_prompt_template(instruction).map_err(|error| error.to_string())?;
         if !template.is_some_and(|template| template.uses_document_context) {
             return Ok(None);
@@ -1234,7 +1248,12 @@ impl EditorView {
         let instruction = self.ai_selection.confirmed_instruction.clone();
         // The target was just re-validated as fresh above, so the context is
         // rebuilt from the same revision as the first request.
-        let document_context = match self.ai_selection_document_context(target, &instruction) {
+        let from_saved_prompt = self.ai_selection.confirmed_from_saved_prompt;
+        let document_context = match self.ai_selection_document_context(
+            target,
+            &instruction,
+            from_saved_prompt,
+        ) {
             Ok(context) => context,
             Err(message) => {
                 self.ai_selection.phase = AiSelectionPhase::Composing;
@@ -1245,7 +1264,7 @@ impl EditorView {
             }
         };
         self.ai_selection
-            .start_request(instruction, document_context, cx);
+            .start_request(instruction, from_saved_prompt, document_context, cx);
         cx.notify();
     }
 
