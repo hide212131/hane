@@ -936,6 +936,10 @@ pub struct EditorView {
     /// row (e.g. above the top row or below the bottom one) and keep
     /// autoscrolling it (issue #213).
     text_selection_drag: bool,
+    /// A reading-mode plain press on link text. The link opens on the
+    /// matching mouse-up; a drag first turns it into a text selection that
+    /// starts at the pressed offset and discards the destination.
+    pending_reading_link: Option<PendingReadingLink>,
     /// Which edge of the editor viewport the current text-selection drag is
     /// held against, if any. `None` means no autoscroll is currently ticking.
     text_autoscroll: Option<AutoscrollDirection>,
@@ -1816,6 +1820,7 @@ impl EditorView {
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
             text_selection_drag: false,
+            pending_reading_link: None,
             text_autoscroll: None,
             text_autoscroll_activity: 0,
             sidebar_scrollbar_visible: false,
@@ -2669,6 +2674,7 @@ impl EditorView {
     /// touching the replacement document.
     fn cancel_text_selection_autoscroll(&mut self) {
         self.text_selection_drag = false;
+        self.pending_reading_link = None;
         self.text_autoscroll = None;
         self.text_autoscroll_activity = self.text_autoscroll_activity.wrapping_add(1);
     }
@@ -4422,6 +4428,7 @@ impl EditorView {
         self.blur_document_find_focus(cx);
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
+        self.pending_reading_link = None;
         self.set_text_autoscroll(None, window, cx);
         // The picture of a diagram stands for the whole fenced block. A press on
         // it moves the edit position to the start of the diagram's text instead
@@ -4439,6 +4446,7 @@ impl EditorView {
         ) else {
             return;
         };
+        let offset = hit.offset;
         if let RowClick::OpenLink(destination) = self.apply_row_click(
             line,
             hit,
@@ -4446,13 +4454,55 @@ impl EditorView {
             cfg!(target_os = "macos"),
             cx,
         ) {
-            cx.open_url(&destination);
+            if self.editor_mode() == EditorMode::Reading && is_unmodified_click(&event.modifiers) {
+                // Wait for the mouse-up so a drag from link text can select.
+                self.pending_reading_link = Some(PendingReadingLink {
+                    destination,
+                    offset,
+                });
+            } else {
+                cx.open_url(&destination);
+            }
+        }
+    }
+
+    /// Turns a pending reading-mode link press into an ordinary selection
+    /// drag, discarding the destination. Returns whether one was pending.
+    fn start_drag_from_pending_link(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.pending_reading_link.take() else {
+            return false;
+        };
+        if let Err(error) = self
+            .editor_mut()
+            .set_selection(Selection::caret(pending.offset))
+        {
+            self.report_error("mouse selection", error);
+        } else {
+            self.text_selection_drag = true;
+            self.status = None;
+            self.after_input(cx);
+        }
+        true
+    }
+
+    /// Left mouse-up inside the panel: a still-pending link press was a click.
+    fn on_panel_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = self.pending_reading_link.take();
+        self.finish_panel_drag(event, window, cx);
+        if let Some(pending) = pending {
+            cx.open_url(&pending.destination);
         }
     }
 
     /// Decides and applies a left click that resolved to `hit` on `line`.
     ///
-    /// An OS-standard modifier click on link text only reports the destination
+    /// An OS-standard modifier click on link text (or, in reading mode, a plain
+    /// click) only reports the destination
     /// to open and leaves caret, selection and document alone. Any other click
     /// is ordinary selection editing at the nearest caret boundary.
     fn apply_row_click(
@@ -4464,7 +4514,9 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> RowClick {
         let offset = hit.offset;
-        if is_link_open_modifier(modifiers, macos)
+        let opens_link = is_link_open_modifier(modifiers, macos)
+            || (self.editor_mode() == EditorMode::Reading && is_unmodified_click(modifiers));
+        if opens_link
             && let Some(glyph_offset) = hit.glyph_offset
             && let Some(destination) = self.link_destination_at(line, glyph_offset)
         {
@@ -4496,6 +4548,9 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.dragging() {
+            self.start_drag_from_pending_link(cx);
+        }
         if !self.text_selection_drag || !event.dragging() {
             return;
         }
@@ -6338,6 +6393,14 @@ struct RowHit {
     glyph_offset: Option<SourceOffset>,
 }
 
+/// A link press waiting for its mouse-up (reading mode, no modifier).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReadingLink {
+    destination: std::sync::Arc<str>,
+    /// Caret boundary under the press, where a drag selection anchors.
+    offset: SourceOffset,
+}
+
 /// What a left click on a text row resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RowClick {
@@ -6358,6 +6421,12 @@ fn is_link_open_modifier(modifiers: &gpui::Modifiers, macos: bool) -> bool {
         (modifiers.control, modifiers.platform)
     };
     wanted && !other && !modifiers.shift && !modifiers.alt
+}
+
+/// Whether a left click carries no modifier key at all. In reading mode such a
+/// click on link text opens the link; any modifier keeps the other behaviours.
+fn is_unmodified_click(modifiers: &gpui::Modifiers) -> bool {
+    !modifiers.platform && !modifiers.control && !modifiers.shift && !modifiers.alt
 }
 
 /// The caret target one row into the next or previous block, aiming at `x`.
@@ -6559,6 +6628,9 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let mut changed = false;
+        if event.dragging() {
+            self.start_drag_from_pending_link(cx);
+        }
         if let Some(drag) = self.sidebar_resize_drag {
             let delta = f32::from(event.position.x) - drag.pointer_x;
             let next = sidebar_width_for_drag(
@@ -6724,6 +6796,7 @@ impl EditorView {
             || was_sidebar_scrollbar_drag
             || self.editor_scrollbar_drag.take().is_some();
         self.text_selection_drag = false;
+        self.pending_reading_link = None;
         self.set_text_autoscroll(None, window, cx);
         if was_dragging {
             cx.stop_propagation();
@@ -7657,7 +7730,16 @@ mod tests {
                 (command, true, BEFORE_LINK, false),
                 (ctrl, false, BEFORE_LINK, false),
             ];
-            for (modifiers, macos, column, opens) in cases {
+            for (modifiers, macos, column, opens, reading) in cases.into_iter().flat_map(|case| {
+                [(case, false), (case, true)]
+                    .map(|((modifiers, macos, column, opens), reading)| {
+                        // A plain click on the link text also opens it in
+                        // reading mode; everything else is mode independent.
+                        let on_link = column == INSIDE || column == LAST_GLYPH_RIGHT_HALF;
+                        let plain = is_unmodified_click(&modifiers);
+                        (modifiers, macos, column, opens || (reading && plain && on_link), reading)
+                    })
+            }) {
                 let view = gpui::AppContext::new(cx, |cx| {
                     EditorView::new(text.as_str(), "Untitled", cx)
                 });
@@ -7725,6 +7807,9 @@ mod tests {
                     let can_undo_before = view.editor().can_undo();
                     let can_redo_before = view.editor().can_redo();
 
+                    if reading {
+                        view.editor_mode = EditorMode::Reading;
+                    }
                     let outcome = view.apply_row_click(line, hit, &modifiers, macos, cx);
 
                     if opens {
@@ -7743,6 +7828,48 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// Issue #603: a reading-mode press on link text is held until mouse-up.
+    /// A drag discards it and starts an ordinary selection at the press
+    /// offset; a plain click leaves the pending destination (opened on
+    /// mouse-up) and changes neither selection nor document.
+    #[gpui::test]
+    fn reading_link_press_is_discarded_by_drag_and_kept_for_click(cx: &mut gpui::TestAppContext) {
+        let text = "see [Hane](https://example.com/) end\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            let pressed = SourceOffset(text.find("Hane").unwrap() + 1);
+            let pending = PendingReadingLink {
+                destination: "https://example.com/".into(),
+                offset: pressed,
+            };
+            let text_before = view.editor().document().full_text();
+            let selection_before = view.editor().selection();
+            let revision_before = view.editor().document().revision();
+
+            // Click: nothing has consumed the pending link, state untouched.
+            view.pending_reading_link = Some(pending.clone());
+            assert_eq!(view.pending_reading_link.as_ref(), Some(&pending));
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection(), selection_before);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert!(!view.editor().can_undo());
+            assert!(!view.editor().can_redo());
+
+            // Drag: the destination is dropped and selection drag takes over.
+            assert!(view.start_drag_from_pending_link(cx));
+            assert!(view.pending_reading_link.is_none());
+            assert!(view.text_selection_drag);
+            assert_eq!(view.editor().selection(), Selection::caret(pressed));
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+
+            // A later mouse-up has no destination left to open.
+            assert!(!view.start_drag_from_pending_link(cx));
+        });
     }
 
     /// Issue #502: editing a reference definition in another block must not
