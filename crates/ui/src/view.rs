@@ -2846,13 +2846,45 @@ impl EditorView {
     /// immediately, and is journalled into the recovery drafts as soon as it
     /// holds anything, so a crash before it earns a real name never loses it.
     pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
+        self.new_work_folder_note_in(None, cx);
+    }
+
+    /// Starts the same new note as `new_work_folder_note`, optionally in an
+    /// explicit folder (the sidebar context menu's target) instead of the
+    /// selected folder. An explicit folder that is no longer in the work
+    /// folder tree is refused rather than silently replaced by the root.
+    pub(crate) fn new_work_folder_note_in(
+        &mut self,
+        explicit_directory: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.cancel_inline_rename(cx) {
             return;
         }
         self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
-        let Some(target_directory) = self.target_directory_for_new_entry() else {
-            return;
+        let target_directory = match explicit_directory {
+            Some(directory) => {
+                let exists = self
+                    .work_folder
+                    .as_ref()
+                    .is_some_and(|work_folder| work_folder.children_at(&directory).is_some());
+                if !exists {
+                    self.status = Some(
+                        "対象のフォルダが見つからないため作成できません。一覧を確認してください"
+                            .to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                directory
+            }
+            None => {
+                let Some(directory) = self.target_directory_for_new_entry() else {
+                    return;
+                };
+                directory
+            }
         };
         if self.refuse_new_entry_under_folder_trash(&target_directory, cx) {
             return;
@@ -17952,6 +17984,63 @@ mod tests {
             std::fs::read_to_string(&expected_path).unwrap(),
             format!("{heading}GPUI")
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: the folder context menu's "new file" targets the
+    // right-clicked folder, whatever folder is selected, while the toolbar
+    // path keeps using the selected folder.
+    #[gpui::test]
+    fn folder_context_menu_new_note_uses_the_clicked_folder(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("context-menu-new-note");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.selected_folder = Some(root.join("other"));
+            view.sidebar_context_new_note(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.join("dev")),
+                "the clicked folder is the destination even when another is selected"
+            );
+            assert_eq!(view.selected_folder, Some(root.join("other")));
+            assert!(view.sidebar_context_menu.is_none());
+        });
+
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.join("other")),
+                "the toolbar path still uses the selected folder"
+            );
+        });
+
+        // A stale target is refused, not redirected to the root.
+        let before = view.read_with(cx, |view, _| view.work_folder_drafts.len());
+        view.update(cx, |view, cx| {
+            view.sidebar_context_new_note(root.join("gone"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), before);
+            assert!(view.status.is_some());
+        });
 
         std::fs::remove_dir_all(&root).unwrap();
     }
