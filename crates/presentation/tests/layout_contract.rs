@@ -2329,15 +2329,16 @@ fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
         .iter()
         .find(|row| row.line == inner_line)
         .expect("the nested row is laid out");
-    assert_eq!(row.marker_x_origin, Some(24.0));
-    assert_eq!(row.text_x_origin, 24.0);
-    assert_eq!(row.body_x_origin, 40.0);
+    assert_eq!(hane_presentation::LIST_DEPTH_INDENT, 16.0);
+    assert_eq!(row.marker_x_origin, Some(16.0));
+    assert_eq!(row.text_x_origin, 16.0);
+    assert_eq!(row.body_x_origin, 32.0);
 
     let inner = SourceOffset(source.find("inner").expect("inner in source"));
     let point = layout
         .point_for_source(&block, inner, &shaper())
         .expect("inner has a point");
-    assert_eq!(point.x, 40.0);
+    assert_eq!(point.x, 32.0);
 }
 
 #[test]
