@@ -1189,6 +1189,46 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // Issue #585: a folder create still pending under a folder must stop the
+    // folder's Trash move, otherwise the late create would recreate the
+    // moved path and the tree entry.
+    #[gpui::test]
+    fn trashing_a_folder_with_a_pending_folder_create_is_refused(cx: &mut gpui::TestAppContext) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-pending-create");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.pending_new_folders
+                .insert(folder_path.join("New Folder"));
+
+            view.sidebar_context_trash_folder(folder_path.clone(), cx);
+
+            assert!(view.folder_trash_in_flight.is_none());
+            assert!(view.pending_new_folders.contains(&folder_path.join("New Folder")));
+            assert!(view
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("作成中")));
+        });
+        cx.run_until_parked();
+        assert!(folder_path.exists(), "a refused trash must not move the folder");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[gpui::test]
     fn drafts_in_a_trashed_folder_are_retargeted_to_the_nearest_surviving_ancestor(
         cx: &mut gpui::TestAppContext,

@@ -1065,7 +1065,7 @@ impl EditorView {
     /// flight) blocks the move; if edits land while the move is running the
     /// sessions stay open with their content, marked as missing from disk.
     /// The Work Folder root is never a target.
-    fn sidebar_context_trash_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn sidebar_context_trash_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.sidebar_context_menu = None;
         if !self.cancel_inline_rename(cx) {
             return;
@@ -1089,6 +1089,20 @@ impl EditorView {
         }
         if self.folder_trash_in_flight.is_some() {
             self.status = Some("別のフォルダをゴミ箱へ移動中です。完了後にやり直してください".to_owned());
+            cx.notify();
+            return;
+        }
+        // A folder create still running under `path` would land after the OS
+        // move and recreate the trashed path; refuse until it has finished.
+        if self
+            .pending_new_folders
+            .iter()
+            .any(|pending| pending.starts_with(&path))
+        {
+            self.status = Some(
+                "フォルダを作成中のため、ゴミ箱へ移動できません。完了後にやり直してください"
+                    .to_owned(),
+            );
             cx.notify();
             return;
         }
