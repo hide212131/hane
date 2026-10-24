@@ -2102,7 +2102,12 @@ impl EditorView {
                     // around; that must be the original clean one, not
                     // whichever draft was installed last.
                     self.sessions.activate(initial_session);
+                    // This automatic open is not a request the user made, so
+                    // it must not be carried over as the "later file" of an
+                    // external folder scan that is still in flight.
+                    let explicit_request = self.external_file_open_after_folder_scan.take();
                     self.open_path(&path, cx);
+                    self.external_file_open_after_folder_scan = explicit_request;
                 } else if let Some(last_recovered) = last_recovered {
                     self.reveal_file_tab(last_recovered);
                     self.on_document_replaced();
@@ -13527,6 +13532,82 @@ mod tests {
                 Some(folder.as_path())
             );
             assert_eq!(view.active_session().path(), Some(file_b.as_path()));
+            assert_eq!(view.editor().document().full_text(), "# B\n");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: the default folder's automatic first-entry open that lands
+    // while an external folder scan is in flight is not a user request, so the
+    // external folder's own first entry is shown once its scan completes.
+    #[gpui::test]
+    fn an_automatic_initial_open_is_not_restored_after_the_external_folder_scan(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("auto-open-then-external-folder");
+        let folder_a = root.join("folder-a");
+        let folder_b = root.join("folder-b");
+        std::fs::create_dir_all(&folder_a).unwrap();
+        std::fs::create_dir_all(&folder_b).unwrap();
+        std::fs::write(folder_a.join("A.md"), "# A\n").unwrap();
+        std::fs::write(folder_b.join("B.md"), "# B\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let scan = |folder: &Path| {
+            (
+                OsWorkFolderScanner.scan(folder),
+                Ok(RecoveredDrafts {
+                    drafts: Vec::new(),
+                    failed: 0,
+                }),
+                #[cfg(feature = "instrument")]
+                Instant::now(),
+                #[cfg(not(feature = "instrument"))]
+                (),
+            )
+        };
+        // Folder B's external scan has started; folder A's startup scan is
+        // still the one in flight underneath it.
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+
+        // A's scan completes first and automatically opens its first entry.
+        let scanned_a = scan(&folder_a);
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(generation, scanned_a, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# A\n");
+            assert_eq!(view.external_file_open_after_folder_scan, None);
+        });
+
+        // Then B's scan completes.
+        let scanned_b = scan(&folder_b);
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned_b, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder_b.as_path())
+            );
+            assert_eq!(
+                view.active_session().path(),
+                Some(folder_b.join("B.md").as_path())
+            );
             assert_eq!(view.editor().document().full_text(), "# B\n");
         });
         std::fs::remove_dir_all(&root).unwrap();
