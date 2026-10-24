@@ -443,6 +443,7 @@ impl EditorView {
                     // whatever document now holds `id` may be touched: not
                     // its in-flight marker, not its queued save, not its
                     // pending-close request.
+                    view.sync_external_open_guard();
                     return;
                 }
                 view.title_sync_in_flight.remove(&id);
@@ -508,6 +509,9 @@ impl EditorView {
             }
         }
         self.resolve_pending_tab_close(id, cx);
+        // Publish the exact state from every session before returning, so a
+        // request arriving before the next render does not read a stale value.
+        self.sync_external_open_guard();
         cx.notify();
     }
 
@@ -799,6 +803,7 @@ impl EditorView {
             // of this function would otherwise clear for it. Dropped
             // silently, the same as any other result that no longer
             // belongs to anything open.
+            self.sync_external_open_guard();
             return;
         }
         let Some(outcome) = self
@@ -806,6 +811,7 @@ impl EditorView {
             .get_mut(id)
             .map(|session| session.finish_save(ticket, result))
         else {
+            self.sync_external_open_guard();
             return;
         };
         // Issue #411: a tab's "save and close" request must only ever close
@@ -884,6 +890,10 @@ impl EditorView {
         } else {
             self.tab_close_after_save.remove(&id);
         }
+        // Recompute from every session after the pending-save chain settled, so
+        // the next external request sees the exact state without waiting for a
+        // render; other sessions' dirty / saving state keeps it raised.
+        self.sync_external_open_guard();
         cx.notify();
     }
 

@@ -586,6 +586,8 @@ impl EditorView {
             self.save_session(id, pending, cx);
         }
         self.retry_deferred_title_sync(cx);
+        // Publish the exact state from every session before the next render.
+        self.sync_external_open_guard();
         cx.notify();
     }
 

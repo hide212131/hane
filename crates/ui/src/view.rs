@@ -3256,6 +3256,19 @@ impl EditorView {
                 cx.notify();
                 return;
             }
+            // An editing rename is cancelled before the switch; one whose
+            // filesystem rename is already pending cannot be, so the current
+            // folder and sessions stay as they are.
+            if !self.cancel_inline_rename(cx) {
+                return;
+            }
+            // Cancelling can restart a deferred title rename, which takes a
+            // save slot; that is unsaved work too, so check again.
+            if self.has_unsaved_sessions() {
+                self.status = Some("Save current changes before opening a folder".to_owned());
+                cx.notify();
+                return;
+            }
             self.switch_to_work_folder(path.to_path_buf(), cx);
         } else {
             self.open_path(path, cx);
@@ -13582,6 +13595,116 @@ mod tests {
             view.save_current(cx);
             assert!(guard.unsaved());
         });
+    }
+
+    // Issue #607: a folder open cancels an editing inline rename first.
+    #[gpui::test]
+    fn a_folder_open_cancels_an_editing_inline_rename(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("external-folder-cancels-rename");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: root.join("note.md"),
+                input: ShortTextInput::new("note".to_owned()),
+                fixed_extension: Some(".md".to_owned()),
+                pending: false,
+            });
+            let generation = view.work_folder_generation;
+            view.open_external_path_protected(&folder, false, cx);
+            assert!(view.inline_rename.is_none());
+            assert_ne!(view.work_folder_generation, generation);
+        });
+        cx.run_until_parked();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: a pending filesystem rename cannot be cancelled, so the
+    // folder switch is aborted and the current folder stays.
+    #[gpui::test]
+    fn a_folder_open_is_aborted_while_an_inline_rename_is_pending(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("external-folder-pending-rename");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: root.join("note.md"),
+                input: ShortTextInput::new("note".to_owned()),
+                fixed_extension: Some(".md".to_owned()),
+                pending: true,
+            });
+            let generation = view.work_folder_generation;
+            view.open_external_path_protected(&folder, false, cx);
+            assert!(view.inline_rename.is_some());
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.status.as_deref(), Some("Rename in progress"));
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: each completion boundary publishes the exact guard before
+    // the next request, and another session's dirty state keeps it raised.
+    #[gpui::test]
+    fn save_and_title_rename_completions_sync_the_guard_for_all_sessions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("guard-completion-sync");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = ExternalOpenGuard::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_guard(guard.clone());
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+            assert!(guard.unsaved());
+        });
+        // The write completes without any render in between.
+        cx.run_until_parked();
+        view.update(cx, |view, _cx| {
+            assert!(!view.has_unsaved_sessions());
+            assert!(!guard.unsaved(), "completion must publish the clean state");
+        });
+        // A dirty second session keeps the guard raised through a completion.
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("again").unwrap();
+            view.after_input(cx);
+            assert!(guard.unsaved());
+            view.sync_external_open_guard();
+            assert!(guard.unsaved());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
