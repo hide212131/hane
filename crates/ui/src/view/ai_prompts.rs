@@ -18,6 +18,9 @@ use hane_ai::{AiPaths, UserPromptDraft, UserPrompts, UserPromptsLoadError, UserP
 use hane_session::FileStateStore;
 use std::path::PathBuf;
 
+/// プロンプト本文Textareaを初期表示から複数行見せるための高さ（px）。
+const PROMPT_BODY_HEIGHT: f32 = 220.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeaveTarget {
     Category(super::SettingsCategory),
@@ -683,7 +686,11 @@ impl AiPromptsPage {
                 .child("タイトル")
                 .children(title_input.map(|input| Input::new(&input).aria_label("prompt title")))
                 .child("プロンプト")
-                .children(body_input.map(|input| Textarea::new(&input).aria_label("prompt body")))
+                .children(body_input.map(|input| {
+                    Textarea::new(&input)
+                        .aria_label("prompt body")
+                        .h(px(PROMPT_BODY_HEIGHT))
+                }))
                 .into_any_element()
         };
         div().w_full().flex().gap_4().child(list_column).child(detail)
