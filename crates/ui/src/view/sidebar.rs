@@ -1416,8 +1416,9 @@ mod windows_recycle {
     use std::sync::{Arc, Mutex, mpsc};
     use windows::Win32::Foundation::{E_ABORT, LPARAM, WPARAM};
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoGetInterfaceAndReleaseStream,
-        CoInitializeEx, CoMarshalInterThreadInterfaceInStream, CoUninitialize, IStream,
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        IStream, Marshal::CoMarshalInterThreadInterfaceInStream,
+        StructuredStorage::CoGetInterfaceAndReleaseStream,
     };
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Shell::{
