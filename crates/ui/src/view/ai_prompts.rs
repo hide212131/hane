@@ -14,7 +14,10 @@ use gpui::{
 use gpui_component::{Disableable, Sizable};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
-use hane_ai::{AiPaths, UserPromptDraft, UserPrompts, UserPromptsLoadError, UserPromptsSaveError};
+use hane_ai::{
+    AiPaths, DOCUMENT_CONTEXT_VARIABLE, PromptTemplateError, SELECTION_VARIABLE, UserPromptDraft,
+    UserPrompts, UserPromptsLoadError, UserPromptsSaveError,
+};
 use hane_session::FileStateStore;
 use std::path::PathBuf;
 
@@ -276,6 +279,25 @@ impl AiPromptsPage {
         }
     }
 
+    /// Appends a template variable to the end of the selected prompt body.
+    /// The Textarea API used here has no safe caret-position insertion, so
+    /// this deliberately does not build a separate editor for it.
+    fn insert_variable(
+        &mut self,
+        variable: &str,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+    ) {
+        let Some(body_input) = self.body_input.clone() else {
+            return;
+        };
+        let mut text = textarea_value(&body_input, cx);
+        text.push_str(variable);
+        set_textarea_value(&body_input, &text, window, cx);
+        window.focus(&body_input.read(cx).focus_handle(cx), cx);
+        self.message = None;
+    }
+
     fn request_delete(&mut self, index: usize) {
         self.pending_delete = Some(index);
     }
@@ -356,6 +378,10 @@ impl AiPromptsPage {
                     "プロンプト本文は{}バイト以内にしてください。",
                     hane_ai::MAX_PROMPT_BODY_BYTES
                 ));
+                return;
+            }
+            if let Err(error) = hane_ai::parse_prompt_template(&entry.prompt) {
+                self.message = Some(template_error_message(&error));
                 return;
             }
         }
@@ -677,6 +703,28 @@ impl AiPromptsPage {
         } else {
             let title_input = self.title_input.clone();
             let body_input = self.body_input.clone();
+            let view = cx.entity();
+            let insert_selection = Button::new("ai-prompts-insert-selection")
+                .label("選択部分を挿入")
+                .small()
+                .on_click(move |_, window, app| {
+                    view.update(app, |view, cx| {
+                        view.ai_prompts
+                            .insert_variable(SELECTION_VARIABLE, window, cx);
+                        cx.notify();
+                    });
+                });
+            let view = cx.entity();
+            let insert_document_context = Button::new("ai-prompts-insert-document-context")
+                .label("文書の文脈を挿入")
+                .small()
+                .on_click(move |_, window, app| {
+                    view.update(app, |view, cx| {
+                        view.ai_prompts
+                            .insert_variable(DOCUMENT_CONTEXT_VARIABLE, window, cx);
+                        cx.notify();
+                    });
+                });
             div()
                 .flex_1()
                 .min_w(px(0.0))
@@ -686,11 +734,27 @@ impl AiPromptsPage {
                 .child("タイトル")
                 .children(title_input.map(|input| Input::new(&input).aria_label("prompt title")))
                 .child("プロンプト")
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(insert_selection)
+                        .child(insert_document_context),
+                )
                 .children(body_input.map(|input| {
                     Textarea::new(&input)
                         .aria_label("prompt body")
                         .h(px(PROMPT_BODY_HEIGHT))
                 }))
+                .child(
+                    div()
+                        .id("ai-prompts-variable-help")
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme.quote_foreground))
+                        .child(format!(
+                            "{SELECTION_VARIABLE}: 選択した文章 / {DOCUMENT_CONTEXT_VARIABLE}: 文書全体（長い場合は選択位置周辺）。変数はそれぞれ1回まで使えます。"
+                        )),
+                )
                 .into_any_element()
         };
         div().w_full().flex().gap_4().child(list_column).child(detail)
@@ -810,6 +874,11 @@ fn load_error_message(error: &UserPromptsLoadError) -> String {
     }
 }
 
+/// Names the offending variable only; never includes the prompt body.
+fn template_error_message(error: &PromptTemplateError) -> String {
+    format!("プロンプト本文の変数を確認してください。{error}。")
+}
+
 fn save_error_message(error: &UserPromptsSaveError) -> String {
     match error {
         UserPromptsSaveError::Io(_) => "保存に失敗しました。もう一度お試しください。".to_owned(),
@@ -836,6 +905,7 @@ fn save_error_message(error: &UserPromptsSaveError) -> String {
         UserPromptsSaveError::PromptTooLarge { max_bytes } => {
             format!("プロンプト本文は{max_bytes}バイト以内にしてください。")
         }
+        UserPromptsSaveError::InvalidTemplate(error) => template_error_message(error),
         UserPromptsSaveError::IdCounterOverflow | UserPromptsSaveError::RevisionOverflow => {
             "内部状態の上限に達しました。アプリを再起動してください。".to_owned()
         }
@@ -934,6 +1004,75 @@ mod tests {
                 "二番目",
                 "the input fields must stay in sync with the still-selected prompt"
             );
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Issue #594 T12: both variables can be inserted into the body, and a
+    // duplicated or unknown variable is rejected on save with a specific,
+    // body-free message while nothing is persisted.
+    #[gpui::test]
+    fn variables_can_be_inserted_and_invalid_templates_are_rejected_on_save(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-ai-prompts-template-vars-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Prompts;
+            view.ai_prompts.root = Some(root.clone());
+            view.ai_prompts.loaded = true;
+            view.ai_prompts.load_error = None;
+            view.ai_prompts.revision = 0;
+            view.ai_prompts.baseline = Vec::new();
+            view.ai_prompts.draft = vec![UserPromptDraft {
+                id: None,
+                title: "要約".to_owned(),
+                prompt: "要約する\n".to_owned(),
+            }];
+            view.ai_prompts.selected = 0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts
+                    .insert_variable(SELECTION_VARIABLE, window, cx);
+                view.ai_prompts
+                    .insert_variable(DOCUMENT_CONTEXT_VARIABLE, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let body = view.read_with(cx, |view, app| {
+            textarea_value(view.ai_prompts.body_input.as_ref().unwrap(), app)
+        });
+        assert!(body.contains(SELECTION_VARIABLE));
+        assert!(body.contains(DOCUMENT_CONTEXT_VARIABLE));
+
+        // A second `{{selection}}` makes the template invalid.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts
+                    .insert_variable(SELECTION_VARIABLE, window, cx);
+                view.ai_prompts.save(cx, None);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let message = view.ai_prompts.message.clone().expect("validation message");
+            assert!(message.contains(SELECTION_VARIABLE), "{message}");
+            assert!(!message.contains("要約する"), "must not echo the body");
+            assert_eq!(view.ai_prompts.revision, 0, "nothing was saved");
         });
 
         let _ = std::fs::remove_dir_all(&root);

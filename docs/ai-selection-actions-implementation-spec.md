@@ -1,5 +1,11 @@
 # 選択した文章へのAI指示 — 実装仕様
 
+
+> [!IMPORTANT]
+> **Issue #594による拡張:** この文書はIssue #449 / PR #450で導入した「指示 + 選択文」の基礎契約を記録する。Issue #594では、保存済みAIプロンプトに `{{selection}}` / `{{document_context}}` を明示した場合に限り、設定画面の本文をユーザープロンプトのテンプレートとして扱い、同じDocumentSession・同じrevisionの文書コンテキストを追加できる。具体仕様は `docs/implementation/issue-594-ai-prompt-context.md` を正とする。
+>
+> この拡張は「選択範囲外の文書を常に自動送信する」という変更ではない。テンプレート変数のない既存保存プロンプト、自由入力、固定Probeでは本書の従来契約を維持する。またAI結果の適用先は引き続き元の選択範囲だけとする。本書中の「選択範囲のみ」「文書全体を送らない」という記述は、Issue #594の明示的な `{{document_context}}` 経路には適用しない。
+
 対象Issue: [#449](https://github.com/hide212131/hane/issues/449)
 
 作成日: 2026-10-10。調査基点: `b660df1ee23e0c6420eb0595f83c3a4f25a537dc`。

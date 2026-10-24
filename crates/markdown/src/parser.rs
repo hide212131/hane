@@ -23,7 +23,7 @@ fn heading_level(level: HeadingLevel) -> u8 {
 
 /// The single parser configuration. Every parse in Hane goes through this so
 /// enabling a GFM extension is a one-line change with no second code path.
-fn parser_options() -> Options {
+pub(crate) fn parser_options() -> Options {
     Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES
 }
 

@@ -24,6 +24,7 @@ license = "Apache-2.0"
 rust-version = "1.98.1"
 
 [workspace.dependencies]
+merman = { version = "=0.9.2", default-features = false, features = ["svg", "diagram-flowchart", "diagram-sequence", "diagram-class", "diagram-state", "diagram-er"] }
 hane-ai = { path = "crates/ai" }
 hane-document = { path = "crates/document" }
 hane-editor = { path = "crates/editor" }
@@ -42,7 +43,7 @@ notify = "=7.0.0"
 async-channel = "=2.5.0"
 mach2 = "=0.5.0"
 ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
-unicode-segmentation = "=1.12.0"
+unicode-segmentation = "=1.13.3"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 url = "=2.5.8"
 grep-matcher = "=0.1.8"
