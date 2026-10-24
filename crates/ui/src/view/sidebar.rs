@@ -1947,7 +1947,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     fn recycled_report() -> RecycleReport {
         RecycleReport {
             post_delete_seen: 1,
