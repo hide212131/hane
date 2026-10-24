@@ -911,7 +911,7 @@ impl EditorView {
     /// directory was inside it at the nearest ancestor that still exists in
     /// the tree (the Work Folder root at worst). Other drafts are untouched,
     /// and draft bodies are never modified.
-    fn retarget_drafts_after_folder_trash(&mut self, trashed: &Path) {
+    pub(super) fn retarget_drafts_after_folder_trash(&mut self, trashed: &Path) {
         let Some(work_folder) = self.work_folder.as_ref() else {
             return;
         };
