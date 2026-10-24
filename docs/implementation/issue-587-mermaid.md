@@ -60,7 +60,29 @@ merman = { version = "=0.9.2", default-features = false, features = [
 ] }
 ```
 
-本体はMIT OR Apache-2.0。選択した依存と第三者表示を実際の依存解決結果で確認する。Cargo.tomlだけを変えてCargo.lockを未更新にしない。lockfileを推測で手書きしたり、CIの`--locked`を外したりしない。通常workerはshell/Cargoを実行できないため、固定したmanifestに対して公式Cargoで生成した依存差分を受け渡し、製品変更と一緒に適用する。生成元、Cargo版、指定内容、差分を記録し、生成結果を受け取る前に整合済みと報告しない。
+本体はMIT OR Apache-2.0。選択した依存と第三者表示を実際の依存解決結果で確認する。
+
+### 依存の事前検証と必要な更新
+
+同じmainの隔離コピーを使い、公式Rust/Cargo 1.98.1で依存を解決した。Merman 0.9.2は `unicode-segmentation ^1.13.3`を要求し、Haneの `=1.12.0`とはそのまま併用できなかった。Mermanを導入する変更に限り、workspaceの固定値を `=1.13.3`へ更新する。
+
+直接依存はworkspaceに上記Merman指定、`hane-ui`に `merman.workspace = true`、`roxmltree = "=0.21.1"`、`serde_json = "=1.0.154"`を追加する。XMLの寸法・画像要素確認と、描画前のテーマ設定に使う。機械生成したlockfileでは既存の更新は以下5件に限られ、新しいpackageは36件だった。lockfileに載るoptional packageがすべて実際のビルドへ入るとは扱わない。
+
+| 既存package | 更新 |
+| --- | --- |
+| unicode-segmentation | 1.12.0 → 1.13.3 |
+| serde_json | 1.0.151 → 1.0.154 |
+| indexmap | 2.14.0 → 2.14.2 |
+| thiserror | 2.0.20 → 2.0.21 |
+| thiserror-impl | 2.0.20 → 2.0.21 |
+
+変更前・上記依存だけを変えたコピーの両方で、`cargo test --locked -p hane-document -p hane-editor -p hane-markdown -p hane-presentation --all-features` の既存376テストが成功した。製品コードやテスト期待値は変更していない。これは既存4crateの事前確認で、Mermaid実装・UI・全workspace・実画面の合格ではない。
+
+unicode-segmentation更新にはUnicode 16→17のデータと境界修正が含まれる。既存テストには同じライブラリから期待境界を求めるものもあるため、上記の成功を全入力で境界が以前と同一だった根拠にしない。本文と短い入力欄の日本語・結合文字・複合絵文字・CRLFの移動/選択/削除をcurrent-head回帰と実画面で確認する。文書を新しい形へ自動変換する処理は加えない。
+
+依存差分は初回引き継ぎに公式Cargoの生成結果として添付する。元Cargo.lockのSHA-256は `a8ecc3a4194b4b27ba98b08d334cd04972c813156639aba3d3e7c2b8cf968208`、生成後は `10ae618999b7178be0547fabeaea81bde85bb128f6e0743107636c23abf3c8eb`、manifestとlockの結合差分は `c6891175ac7f0e8fb225b84f0a773c03192ce750c78ed56aa49ec76809850f66`。無関係な既存依存の一括更新は行わない。
+
+Cargo.tomlだけを変えてCargo.lockを未更新にしない。lockfileを推測で手書きしたり、CIの`--locked`を外したりしない。通常workerはshell/Cargoを実行できないため、固定したmanifestに対して公式Cargoで生成した依存差分を受け渡し、製品変更と一緒に適用する。生成元、Cargo版、指定内容、差分を記録し、生成結果を受け取る前に整合済みと報告しない。
 
 v0.9.2で確認したAPIの要点（本書の段階でコンパイルは未実施）:
 
@@ -95,6 +117,25 @@ let output = renderer.render(RenderRequest::svg(source, control, request));
 まず既存GPUIの日本語フォント経路で確認する。実測が必要なら `DeterministicTextMeasurer::with_width_callback(...)` とGPUIのスレッド条件を確認する。`native-fonts`/`system-fonts`は新しいresvg/usvg系依存を増やすため、必要性を報告せず自動追加しない。ラベルのはみ出しや欠落を既知制限として通常の日本語受入から除外しない。
 
 図は縦横比を保って本文幅へ収める。SVGの自然寸法、画面幅、倍率からlayoutの高さを決め、描画と同じ値を使う。寸法が非有限・ゼロ・上限外なら原文へ戻す。文字や線が空白になる画像APIを使わない。
+
+
+### GPUI 0.3.6への接続と画像の破棄
+
+使用中の公開crateのchecksumをCargo.lockと照合して確認したAPIは次のとおり。
+
+- `App::svg_renderer(&self) -> SvgRenderer`。Clone + Send + Syncなので、背景処理で使える。
+- `SvgRenderer::parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error>`。
+- `SvgRenderer::render_parsed(&self, svg: &ParsedSvg, size: impl Into<SvgSize>) -> Result<Arc<RenderImage>, usvg::Error>`。
+- `gpui::img(Arc<RenderImage>)`で多色の図を描く。アイコン用の `gpui::svg()` は使わない。
+- `App::drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>)`でウィンドウ側の保持も解除する。
+
+`SvgSize::Size`は幅だけを採用して縦横比を保ち、height引数は高さ上限にならない。`ExactSize`なら指定どおりになるので、Hane側で縦横比を保つ寸法を先に計算する。`ScaleFactor`の内部2倍化と、内部上限8192pxだけに依存しない。SVGのルート寸法/viewBoxはXMLとして確認し、文字列の部分一致で推測しない。
+
+一枚の画像は最大辺2048px・最大4,194,304画素、保持合計は32 MiBを初期上限とする。画素メモリは幅×高さ×4で数え、表示待ち・表示中・再利用分を含める。同時処理の結果にもこの予算を適用し、入力サイズ上限とは別に扱う。予算に収まらない結果は原文へ戻す。上限超過の追い出し、差し替え、文書/ビューの破棄で `cx.drop_image`を適切なwindow文脈で呼ぶ。古い結果とキャンセルで処理数や画像参照を残さない。
+
+GPUIのusvg 0.46.0は既定でSVGの画像hrefをローカルファイルとして読む。必ずMermanの`resvg_safe()`を通し、その後のSVGを変更せずGPUIへ渡す。このpipelineは外部の画像/paint/filter等の参照を除去するが、承認済みdata URL画像は許す。今回Haneでは埋込画像のデコードも対象外とし、XMLから`image`/`feImage`要素を検出したら原文へ戻す。これで小さいSVG内の巨大な埋込画像も回避する。図内リンクは表示情報にとどめ、既存の文書リンククリック処理へ渡さない。
+
+API一次資料: https://docs.rs/gpui-pre/0.3.6/gpui/struct.SvgRenderer.html
 
 ## 非同期処理と保持上限
 
