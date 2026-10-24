@@ -1278,6 +1278,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Issue #607: a folder dropped while a session is unsaved is held behind
+    // the leave confirmation. Saving the session meanwhile must not turn the
+    // refused drop into a replacement of the original session and folder.
+    #[gpui::test]
+    fn a_folder_drop_held_while_unsaved_is_refused_after_the_session_is_saved(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::view::{FileService as _, OsFileService, SessionSet};
+        let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-protected", true);
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let note = root.join("note.md");
+        std::fs::write(&note, "before").unwrap();
+        let loaded = OsFileService.load(&note).unwrap();
+        view.update(cx, |view, cx| {
+            view.sessions = SessionSet::with_loaded(loaded);
+            view.editor_mut().insert_text("after ").unwrap();
+            view.after_input(cx);
+            assert!(view.has_unsaved_sessions());
+        });
+        let paths = vec![folder.clone()];
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.handle_external_drop(&paths, window, cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.ai_prompts.leave_prompt, Some(LeaveTarget::Close));
+            assert!(view.pending_settings_drop_protected);
+        });
+
+        // The session is saved while the confirmation is open.
+        view.update(cx, |view, cx| view.save_current(cx));
+        cx.run_until_parked();
+        let text = view.update(cx, |view, _| {
+            assert!(!view.has_unsaved_sessions());
+            view.editor().document().full_text()
+        });
+
+        // Same steps as the 「破棄して移動」 button.
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.ai_prompts.leave_prompt = None;
+                view.ai_prompts.draft = view.ai_prompts.baseline.clone();
+                view.close_settings(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.settings_open);
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.editor().document().full_text(), text);
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder")
+            );
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[gpui::test]
     fn continue_editing_cancels_the_held_drop(cx: &mut gpui::TestAppContext) {
         let (view, root, cx) = dirty_prompts_view(cx, "prompts-drop-continue", true);

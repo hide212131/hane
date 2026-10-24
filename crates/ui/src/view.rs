@@ -836,6 +836,8 @@ pub struct EditorView {
     /// applied once, when the settings actually close (save succeeded or
     /// discarded), and dropped on any other navigation.
     pending_settings_drop: Option<ExternalDropTarget>,
+    /// Unsaved / saving state seen when `pending_settings_drop` was received.
+    pending_settings_drop_protected: bool,
     settings_error: Option<String>,
     recent: RecentFiles,
     /// The Markdown index of the directory this window was opened onto, if
@@ -1790,6 +1792,7 @@ impl EditorView {
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
             pending_settings_drop: None,
+            pending_settings_drop_protected: false,
             settings_error: None,
             recent,
             work_folder: None,
@@ -3284,16 +3287,27 @@ impl EditorView {
             // button. Unsaved settings edits keep their leave confirmation;
             // the latest drop is held and applied by `close_settings` once
             // the leave really happens.
+            //
+            // The unsaved / saving state seen at the drop is kept with it, so
+            // sessions saved while the leave confirmation is open do not turn
+            // a refused folder drop into a replacement.
+            self.pending_settings_drop_protected =
+                self.external_open_guard.unsaved() || self.has_unsaved_sessions();
             self.pending_settings_drop = Some(target);
             self.leave_settings(window, cx);
             return;
         }
-        self.apply_external_drop(target, cx);
+        self.apply_external_drop(target, false, cx);
     }
 
-    fn apply_external_drop(&mut self, target: ExternalDropTarget, cx: &mut Context<Self>) {
+    fn apply_external_drop(
+        &mut self,
+        target: ExternalDropTarget,
+        protected: bool,
+        cx: &mut Context<Self>,
+    ) {
         match target {
-            ExternalDropTarget::Open(path) => self.open_external_path(&path, cx),
+            ExternalDropTarget::Open(path) => self.open_external_path_protected(&path, protected, cx),
             ExternalDropTarget::TooMany => {
                 self.status = Some("Drop one item at a time".to_owned());
                 cx.notify();
@@ -3616,7 +3630,8 @@ impl EditorView {
         window.focus(&self.focus_handle, cx);
         cx.notify();
         if let Some(target) = self.pending_settings_drop.take() {
-            self.apply_external_drop(target, cx);
+            let protected = std::mem::take(&mut self.pending_settings_drop_protected);
+            self.apply_external_drop(target, protected, cx);
         }
     }
 
@@ -13309,7 +13324,7 @@ mod tests {
         });
         let default_before = view.read_with(cx, |view, _| view.settings.default_folder.clone());
         view.update(cx, |view, cx| {
-            view.apply_external_drop(ExternalDropTarget::Open(folder.clone()), cx);
+            view.apply_external_drop(ExternalDropTarget::Open(folder.clone()), false, cx);
         });
         cx.run_until_parked();
 

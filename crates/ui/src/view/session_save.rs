@@ -361,7 +361,10 @@ impl EditorView {
         if self.folder_trash_blocks(&from, false) {
             return;
         }
+        // Publish protection before the rename takes the save slot.
+        self.raise_external_open_guard();
         let Some(session) = self.sessions.get_mut(id) else {
+            self.sync_external_open_guard();
             return;
         };
         // Reserved synchronously, before any `await`: a concurrent autosave
@@ -370,7 +373,12 @@ impl EditorView {
         // here means a write is already in flight; the rename is skipped for
         // now rather than racing that write instead, and the next debounce
         // (armed by any further edit) tries again.
-        let Some(ticket) = session.begin_rename() else {
+        let ticket = session.begin_rename();
+        self.sync_external_open_guard();
+        let Some(ticket) = ticket else {
+            return;
+        };
+        let Some(session) = self.sessions.get(id) else {
             return;
         };
         // Captured now, not re-read once the rename lands: a work-folder
@@ -987,6 +995,69 @@ mod tests {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    // Issue #607: the H1 title rename takes the save slot, so the external
+    // open guard must be protected once it starts, even if the last frame
+    // published a clean state.
+    #[gpui::test]
+    fn a_title_rename_start_publishes_protection(cx: &mut gpui::TestAppContext) {
+        let root = rename_test_root("title-rename-guard");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Old.md");
+        std::fs::write(&path, "body\n").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = crate::ExternalOpenGuard::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_guard(guard.clone());
+            view.sync_external_open_guard();
+            assert!(!guard.unsaved());
+            let id = view.sessions.active_id();
+            view.begin_title_rename(id, "New".to_owned(), cx);
+            assert!(view.sessions.active().save_in_flight());
+            assert!(guard.unsaved());
+        });
+        cx.run_until_parked();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Issue #607: the same for an inline (sidebar) file rename.
+    #[gpui::test]
+    fn an_inline_rename_start_publishes_protection(cx: &mut gpui::TestAppContext) {
+        let root = rename_test_root("inline-rename-guard");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Old.md");
+        std::fs::write(&path, "body\n").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = crate::ExternalOpenGuard::new();
+        view.update(cx, |view, _cx| {
+            view.attach_external_open_guard(guard.clone());
+            view.sync_external_open_guard();
+            assert!(!guard.unsaved());
+            let tickets = view
+                .reserve_inline_rename_tickets(&path, InlineRenameKind::File)
+                .expect("the idle session reserves its rename");
+            assert_eq!(tickets.len(), 1);
+            assert!(view.sessions.active().save_in_flight());
+            assert!(guard.unsaved());
+        });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // PR #416 review follow-up: `DocumentSession::adopt` bumps the

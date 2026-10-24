@@ -209,7 +209,8 @@ mod tests {
     #[test]
     fn forwards_a_unicode_file_path_and_acks_only_after_the_editor_takes_it() {
         // One test: the pipe is a per-installation singleton.
-        let receiver = listen(hane_ui::ExternalOpenGuard::new()).expect("start Hane's named pipe");
+        let guard = hane_ui::ExternalOpenGuard::new();
+        let receiver = listen(guard.clone()).expect("start Hane's named pipe");
         let path = PathBuf::from(r"C:\Temp\Hane 日本語.md");
         let sent = path.clone();
         let sender = std::thread::spawn(move || forward(&sent));
@@ -217,13 +218,22 @@ mod tests {
         // A frozen/exiting editor refuses: the sender must not see success.
         let first = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(first.path(), path);
+        // The protected bit is captured at receipt: clean here ...
+        assert!(!first.protected());
+        // ... dirty / saving for the retry (the sender only retries after the
+        // refusal below, so the state is set before it is read) ...
+        guard.set_unsaved(true);
         first.refuse();
         // A request dropped unanswered (receiver torn down at quit) is refused too.
         let second = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(second.protected());
+        // ... and clean again for the last one, whatever happened meanwhile.
+        guard.set_unsaved(false);
         drop(second);
         // The retry is finally taken, and only now does the sender succeed.
         let third = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(third.path(), path);
+        assert!(!third.protected());
         assert!(!sender.is_finished(), "no ACK before the editor accepts");
         third.accept();
         assert!(sender.join().unwrap().expect("send the open request"));
