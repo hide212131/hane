@@ -63,11 +63,7 @@ impl EditorView {
     /// draft is revisited and edited again.
     pub(super) fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
         let id = self.sessions.active_id();
-        let Some((draft_id, target_directory)) = self
-            .work_folder_drafts
-            .get(&id)
-            .map(|draft| (draft.draft_id, draft.target_directory.clone()))
-        else {
+        let Some(draft_id) = self.work_folder_drafts.get(&id).map(|draft| draft.draft_id) else {
             return;
         };
         let Some(root) = self

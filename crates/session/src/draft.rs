@@ -125,7 +125,8 @@ fn encode_target(root: &Path, target_directory: &Path) -> String {
 /// Inverse of `encode_target`. Anything that is not a plain relative path
 /// below the root (absolute, `..`) is ignored in favour of the root.
 fn decode_target(root: &Path, encoded: &str) -> PathBuf {
-    let relative = Path::new(encoded.trim());
+    // Not trimmed: a folder name may validly begin or end with whitespace.
+    let relative = Path::new(encoded);
     let plain = relative
         .components()
         .all(|component| matches!(component, std::path::Component::Normal(_)));
@@ -333,6 +334,20 @@ mod tests {
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(recovered.drafts[0].target_directory, child);
         assert_eq!(recovered.failed, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_target_with_edge_whitespace_round_trips_without_being_renamed() {
+        let root = temporary_directory("draft-target-whitespace");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        let child = root.join(" lead").join("notes ");
+        OsDraftStore.write(&root, id, &child, "# Title").unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, child);
         fs::remove_dir_all(root).unwrap();
     }
 

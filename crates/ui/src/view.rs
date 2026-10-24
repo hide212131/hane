@@ -17836,6 +17836,11 @@ mod tests {
         });
 
         second.update(cx, |view, cx| {
+            // A recovered draft opens with the caret at the start; the user
+            // continues the H1 from its end.
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
             view.editor_mut().insert_text("GPUI").unwrap();
             view.after_input(cx);
         });
@@ -17849,6 +17854,72 @@ mod tests {
             format!("{heading}GPUI")
         );
         assert!(!root.join(format!("{title_prefix}GPUI.md")).exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: a child folder whose name ends in whitespace is a distinct
+    // real folder; recovery must not trim it into a different name.
+    #[gpui::test]
+    fn a_recovered_draft_keeps_a_child_folder_name_with_trailing_whitespace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-whitespace");
+        let child = root.join("notes ");
+        std::fs::create_dir_all(&child).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = child.join(format!("{title_prefix}GPUI.md"));
+        OsDraftStore
+            .write(&root, DraftId::generate(), &child, &heading)
+            .unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, child);
+
+        let restarted_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(restarted_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+        });
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(child.clone())
+            );
+        });
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}GPUI")
+        );
+        assert!(!root.join("notes").exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
