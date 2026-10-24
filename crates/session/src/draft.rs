@@ -12,10 +12,12 @@
 //! directory the caller never names, not by a path it already knows, and a
 //! `WorkFolderScanner` deliberately never looks inside `.hane`.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static DRAFT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -154,6 +156,19 @@ fn write_atomically(dir: &Path, name: &str, contents: &str) -> io::Result<()> {
     fs::rename(&temporary, &target)
 }
 
+type DraftLocks = Mutex<HashMap<(PathBuf, DraftId), Arc<Mutex<()>>>>;
+
+static DRAFT_LOCKS: OnceLock<DraftLocks> = OnceLock::new();
+
+/// The lock serializing every write/remove of one draft in one work folder.
+fn draft_lock(root: &Path, id: DraftId) -> Arc<Mutex<()>> {
+    let mut locks = DRAFT_LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(locks.entry((root.to_path_buf(), id)).or_default())
+}
+
 /// `DraftStore` backed by the real filesystem.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OsDraftStore;
@@ -166,6 +181,12 @@ impl DraftStore for OsDraftStore {
         target_directory: &Path,
         text: &str,
     ) -> io::Result<()> {
+        // The debounced save and the quit/switch flush can write the same
+        // draft from different threads. Both files share fixed temporary
+        // names and must come from one snapshot, so the whole transaction
+        // (sidecar and body) is serialized per draft.
+        let lock = draft_lock(root, id);
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = drafts_dir(root);
         fs::create_dir_all(&dir)?;
         // The target goes first: a crash between the two writes leaves a
@@ -180,6 +201,8 @@ impl DraftStore for OsDraftStore {
     }
 
     fn remove(&self, root: &Path, id: DraftId) -> io::Result<()> {
+        let lock = draft_lock(root, id);
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = drafts_dir(root);
         let ignore_missing = |result: io::Result<()>| match result {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
@@ -300,6 +323,46 @@ mod tests {
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(recovered.drafts[0].text, "first, then more");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writes_to_one_draft_recover_one_consistent_snapshot() {
+        use std::sync::Barrier;
+
+        let root = temporary_directory("draft-concurrent-write");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        let threads = 8;
+        for round in 0..20 {
+            let barrier = Barrier::new(threads);
+            std::thread::scope(|scope| {
+                for n in 0..threads {
+                    let (root, barrier) = (&root, &barrier);
+                    scope.spawn(move || {
+                        let target = root.join(format!("folder-{n}"));
+                        let text = format!("snapshot-{n}");
+                        barrier.wait();
+                        OsDraftStore
+                            .write(root, id, &target, &text)
+                            .unwrap_or_else(|error| {
+                                panic!("round {round} writer {n} failed: {error}")
+                            });
+                    });
+                }
+            });
+
+            let recovered = OsDraftStore.recover(&root).unwrap();
+            assert_eq!(recovered.failed, 0);
+            assert_eq!(recovered.drafts.len(), 1);
+            let draft = &recovered.drafts[0];
+            let n = draft
+                .text
+                .strip_prefix("snapshot-")
+                .expect("body comes from a written snapshot");
+            assert_eq!(draft.target_directory, root.join(format!("folder-{n}")));
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
