@@ -26,7 +26,7 @@ use std::ops::Range;
 /// Horizontal distance between semantic list depths. This is presentation
 /// geometry, not a claim about how many source spaces a Markdown parser
 /// consumed.
-pub const LIST_DEPTH_INDENT: f32 = 24.0;
+pub const LIST_DEPTH_INDENT: f32 = 16.0;
 /// Horizontal inset between nested quote bodies. This is semantic display
 /// geometry; it is independent of how many source spaces follow `>`.
 pub const QUOTE_DEPTH_INDENT: f32 = 24.0;
