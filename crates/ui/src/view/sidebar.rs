@@ -1401,35 +1401,36 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     let source = shell_delete_source(&wide)?;
-    // A dedicated thread owns a fresh STA for the whole operation, so the
-    // caller (the UI input path) never waits on filesystem I/O and never hits
-    // `RPC_E_CHANGED_MODE`. The progress sink is a plain in-process object
-    // living in that same STA; the shell invokes it on the thread that calls
-    // `PerformOperations`, so no cross-apartment dispatch is required while
-    // that call runs (exercised by `windows_recycle_runs_on_sta_thread`).
-    let worker = std::thread::Builder::new()
-        .name("hane-recycle".to_owned())
-        .spawn(move || windows_recycle::recycle_on_sta(&source))?;
-    worker
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("ごみ箱への移動処理が異常終了しました")))
+    // A message-pump STA owns the progress sink and keeps dispatching COM
+    // messages, while a separate worker STA runs `PerformOperations`
+    // synchronously. Fresh apartments also avoid `RPC_E_CHANGED_MODE` on the
+    // caller (the UI input path), which never touches COM itself. See
+    // `windows_recycle` and `windows_recycle_dispatches_sink_on_pump_thread`.
+    windows_recycle::recycle(&source)
 }
 
 #[cfg(target_os = "windows")]
 mod windows_recycle {
     use super::{RECYCLE_OPERATION_FLAGS, RecycleReport, classify_recycle};
-    use std::sync::{Arc, Mutex};
-    use windows::Win32::Foundation::E_ABORT;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use windows::Win32::Foundation::{E_ABORT, LPARAM, WPARAM};
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoGetInterfaceAndReleaseStream,
+        CoInitializeEx, CoMarshalInterThreadInterfaceInStream, CoUninitialize, IStream,
     };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Shell::{
         FILEOPERATION_FLAGS, FileOperation, IFileOperation, IFileOperationProgressSink,
         IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
     };
-    // `#[implement]` の展開は `windows_core` を名前で参照するため、`windows` の再エクスポートを導入する。
-    use windows::core::{HRESULT, PCWSTR, Ref, implement};
-    use windows::windows_core;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+        TranslateMessage, WM_QUIT, WM_USER,
+    };
+    use windows::core::{HRESULT, IUnknown, Interface, PCWSTR, Ref, implement};
+    // `#[implement]` の展開は crate ルートの `windows_core`（Cargo.toml の直接依存。
+    // `windows` 0.61 と同じ 0.61.x）を名前で参照する。
 
     /// `TSF_DELETE_RECYCLE_IF_POSSIBLE`
     const TSF_DELETE_RECYCLE_IF_POSSIBLE: u32 = 0x0000_0080;
@@ -1437,6 +1438,56 @@ mod windows_recycle {
     #[implement(IFileOperationProgressSink)]
     struct RecycleSink {
         report: Arc<Mutex<RecycleReport>>,
+        /// Set by the worker only while it is inside `PerformOperations`.
+        in_operation: Arc<AtomicBool>,
+    }
+
+    /// Carries the marshaled-interface stream (a free-threaded memory stream)
+    /// from the pump STA to the worker STA.
+    struct SendStream(IStream);
+
+    // SAFETY: the stream produced by `CoMarshalInterThreadInterfaceInStream`
+    // is designed to be handed to another apartment and unmarshaled there.
+    unsafe impl Send for SendStream {}
+
+    impl SendStream {
+        /// Taking `self` keeps closures capturing the whole `Send` wrapper.
+        fn into_inner(self) -> IStream {
+            self.0
+        }
+    }
+
+    /// Balances a successful `CoInitializeEx` on drop. Declare it before any
+    /// COM object so it is dropped after them, including on panic.
+    struct ComApartment;
+
+    impl ComApartment {
+        fn enter() -> std::io::Result<Self> {
+            // SAFETY: balanced by `CoUninitialize` in `Drop` on the same thread.
+            let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if init.is_err() {
+                return Err(std::io::Error::other(format!(
+                    "COMの初期化に失敗しました (0x{:X})",
+                    init.0
+                )));
+            }
+            Ok(Self)
+        }
+    }
+
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            // SAFETY: matches the successful `CoInitializeEx` in `enter`.
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    /// What one recycle run observed, for direct API regression tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) struct Observation {
+        pub pump_thread_id: u32,
+        pub worker_thread_id: u32,
+        pub report: RecycleReport,
     }
 
     impl IFileOperationProgressSink_Impl for RecycleSink_Impl {
@@ -1526,6 +1577,9 @@ mod windows_recycle {
             psinewlycreated: Ref<'_, IShellItem>,
         ) -> windows::core::Result<()> {
             if let Ok(mut report) = self.report.lock() {
+                // SAFETY: plain query of the calling thread's ID.
+                report.callback_thread_id = Some(unsafe { GetCurrentThreadId() });
+                report.callback_in_operation = Some(self.in_operation.load(Ordering::SeqCst));
                 report.post_delete_seen += 1;
                 if hrdelete.is_ok() && !psinewlycreated.is_null() {
                     report.recycled += 1;
@@ -1569,32 +1623,184 @@ mod windows_recycle {
         }
     }
 
-    /// Initializes a fresh STA on the current thread, recycles the single
-    /// path in `source` (NUL-terminated) and uninitializes COM again.
-    pub(super) fn recycle_on_sta(source: &[u16]) -> std::io::Result<()> {
-        // SAFETY: balanced with `CoUninitialize` below on this same thread,
-        // after every COM object created in `recycle` has been dropped.
-        let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        if init.is_err() {
-            return Err(std::io::Error::other(format!(
-                "COMの初期化に失敗しました (0x{:X})",
-                init.0
-            )));
+    fn hresult_error(context: &str, error: windows::core::Error) -> std::io::Error {
+        std::io::Error::other(format!(
+            "ごみ箱への移動に失敗しました ({context}: 0x{:X})",
+            error.code().0
+        ))
+    }
+
+    /// Recycles the single path in `source` (double-NUL-terminated).
+    pub(super) fn recycle(source: &[u16]) -> std::io::Result<()> {
+        recycle_observed(source).map(|_| ())
+    }
+
+    /// Message-pump STA: owns the sink, hands a marshaled reference to the
+    /// worker and keeps dispatching COM messages until `WM_QUIT`, which is only
+    /// posted after the worker has finished and released its proxy.
+    fn run_pump(
+        report: Arc<Mutex<RecycleReport>>,
+        in_operation: Arc<AtomicBool>,
+        ready: mpsc::Sender<std::io::Result<(u32, SendStream)>>,
+    ) -> std::io::Result<()> {
+        let apartment = match ComApartment::enter() {
+            Ok(apartment) => apartment,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return Ok(());
+            }
+        };
+        let setup = || -> std::io::Result<(IFileOperationProgressSink, SendStream)> {
+            let sink: IFileOperationProgressSink = RecycleSink {
+                report,
+                in_operation,
+            }
+            .into();
+            let unknown: IUnknown = sink
+                .cast()
+                .map_err(|e| hresult_error("QueryInterface", e))?;
+            // SAFETY: `unknown` is a valid interface of the object whose IID is given.
+            let stream = unsafe {
+                CoMarshalInterThreadInterfaceInStream(&IFileOperationProgressSink::IID, &unknown)
+            }
+            .map_err(|e| hresult_error("CoMarshalInterThreadInterfaceInStream", e))?;
+            Ok((sink, SendStream(stream)))
+        };
+        let (sink, stream) = match setup() {
+            Ok(pair) => pair,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                drop(apartment);
+                return Ok(());
+            }
+        };
+        // Create this thread's message queue before announcing the thread ID,
+        // so a later `PostThreadMessageW(WM_QUIT)` cannot be lost.
+        let mut msg = MSG::default();
+        // SAFETY: `msg` is a valid out-pointer.
+        let _ = unsafe { PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE) };
+        // SAFETY: plain query of the calling thread's ID.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        if ready.send(Ok((thread_id, stream))).is_err() {
+            drop(sink);
+            drop(apartment);
+            return Ok(());
         }
-        let result = recycle(source);
-        // SAFETY: matches the successful `CoInitializeEx` above.
-        unsafe { CoUninitialize() };
+        let mut result = Ok(());
+        loop {
+            // SAFETY: `msg` is a valid out-pointer; standard message loop.
+            let status = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+            if status.0 == 0 {
+                break;
+            }
+            if status.0 < 0 {
+                result = Err(std::io::Error::other(
+                    "ごみ箱処理のメッセージループが失敗しました",
+                ));
+                break;
+            }
+            // SAFETY: `msg` was filled in by `GetMessageW`.
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        // Release the sink before uninitializing this apartment.
+        drop(sink);
+        drop(apartment);
         result
     }
 
-    fn recycle(source: &[u16]) -> std::io::Result<()> {
+    /// Worker STA: unmarshals the sink, advises and runs `PerformOperations`
+    /// synchronously. Returns its thread ID on success.
+    fn run_worker(
+        source: Vec<u16>,
+        stream: SendStream,
+        in_operation: Arc<AtomicBool>,
+        report: Arc<Mutex<RecycleReport>>,
+    ) -> std::io::Result<u32> {
+        // Declared first so it is dropped last, after every COM object.
+        let _apartment = ComApartment::enter()?;
+        // SAFETY: plain query of the calling thread's ID.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let stream = stream.into_inner();
+        // SAFETY: the call releases the stream itself (even on failure), so
+        // the wrapper is forgotten below to avoid a double release.
+        let sink: windows::core::Result<IFileOperationProgressSink> =
+            unsafe { CoGetInterfaceAndReleaseStream(&stream) };
+        std::mem::forget(stream);
+        let sink = sink.map_err(|e| hresult_error("CoGetInterfaceAndReleaseStream", e))?;
+        recycle_in_worker(&source, &sink, &in_operation, &report)?;
+        Ok(thread_id)
+    }
+
+    /// Starts the pump and worker STAs, waits for the worker, then shuts the
+    /// pump down. Both threads are always joined before returning.
+    pub(super) fn recycle_observed(source: &[u16]) -> std::io::Result<Observation> {
         let report = Arc::new(Mutex::new(RecycleReport::default()));
-        let hresult_error = |context: &str, error: windows::core::Error| {
-            std::io::Error::other(format!(
-                "ごみ箱への移動に失敗しました ({context}: 0x{:X})",
-                error.code().0
-            ))
+        let in_operation = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let pump = std::thread::Builder::new()
+            .name("hane-recycle-pump".to_owned())
+            .spawn({
+                let report = Arc::clone(&report);
+                let in_operation = Arc::clone(&in_operation);
+                move || run_pump(report, in_operation, ready_tx)
+            })?;
+        let (pump_thread_id, stream) = match ready_rx.recv() {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                let _ = pump.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = pump.join();
+                return Err(std::io::Error::other(
+                    "ごみ箱処理のメッセージポンプを開始できませんでした",
+                ));
+            }
         };
+        let worker_result = std::thread::Builder::new()
+            .name("hane-recycle-worker".to_owned())
+            .spawn({
+                let report = Arc::clone(&report);
+                let in_operation = Arc::clone(&in_operation);
+                let source = source.to_vec();
+                move || run_worker(source, stream, in_operation, report)
+            })
+            .and_then(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(std::io::Error::other("ごみ箱への移動処理が異常終了しました"))
+                })
+            });
+        // The worker has finished and released its proxy; stop the pump.
+        // SAFETY: the pump created its message queue before announcing its ID.
+        let posted = unsafe { PostThreadMessageW(pump_thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        if posted.is_err() {
+            // Joining would block forever on a pump that never sees WM_QUIT.
+            return Err(std::io::Error::other(
+                "ごみ箱処理のメッセージポンプを停止できませんでした",
+            ));
+        }
+        let pump_result = pump
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("ごみ箱処理のメッセージポンプが異常終了しました")));
+        let worker_thread_id = worker_result?;
+        pump_result?;
+        let report = report.lock().map(|r| r.clone()).unwrap_or_default();
+        Ok(Observation {
+            pump_thread_id,
+            worker_thread_id,
+            report,
+        })
+    }
+
+    fn recycle_in_worker(
+        source: &[u16],
+        sink: &IFileOperationProgressSink,
+        in_operation: &AtomicBool,
+        report: &Mutex<RecycleReport>,
+    ) -> std::io::Result<()> {
         // SAFETY: `source` is NUL-terminated and outlives the call.
         let item: IShellItem = unsafe {
             SHCreateItemFromParsingName(PCWSTR(source.as_ptr()), None::<&windows::Win32::System::Com::IBindCtx>)
@@ -1603,23 +1809,25 @@ mod windows_recycle {
         // SAFETY: plain COM activation in the STA initialized by the caller.
         let operation: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
             .map_err(|e| hresult_error("CoCreateInstance", e))?;
-        let sink: IFileOperationProgressSink = RecycleSink {
-            report: Arc::clone(&report),
-        }
-        .into();
         // SAFETY: all interface pointers are valid for the duration of the calls.
         let (performed, aborted) = unsafe {
             operation
                 .SetOperationFlags(FILEOPERATION_FLAGS(RECYCLE_OPERATION_FLAGS))
                 .map_err(|e| hresult_error("SetOperationFlags", e))?;
             let cookie = operation
-                .Advise(&sink)
+                .Advise(sink)
                 .map_err(|e| hresult_error("Advise", e))?;
             let queued = operation
                 .DeleteItem(&item, None::<&IFileOperationProgressSink>)
                 .map_err(|e| hresult_error("DeleteItem", e));
             let performed = match queued {
-                Ok(()) => operation.PerformOperations().map_err(|e| e.code().0),
+                Ok(()) => {
+                    // The pump STA dispatches sink callbacks while this blocks.
+                    in_operation.store(true, Ordering::SeqCst);
+                    let performed = operation.PerformOperations().map_err(|e| e.code().0);
+                    in_operation.store(false, Ordering::SeqCst);
+                    performed
+                }
                 Err(error) => {
                     let _ = operation.Unadvise(cookie);
                     return Err(error);
@@ -1632,6 +1840,8 @@ mod windows_recycle {
             let _ = operation.Unadvise(cookie);
             (performed, aborted)
         };
+        drop(operation);
+        drop(item);
         let snapshot = report.lock().map(|r| r.clone()).unwrap_or_default();
         classify_recycle(performed, aborted, &snapshot)
     }
@@ -1657,6 +1867,11 @@ struct RecycleReport {
     failed_hresult: Option<i32>,
     /// `PreDeleteItem` refused a non-recycle delete.
     refused: bool,
+    /// Thread that ran the last `PostDeleteItem` callback.
+    callback_thread_id: Option<u32>,
+    /// Whether that callback arrived while the worker was inside
+    /// `PerformOperations`.
+    callback_in_operation: Option<bool>,
 }
 
 /// Maps `PerformOperations`' result (`Err` carries the HRESULT), the aborted
@@ -2018,12 +2233,39 @@ mod tests {
         assert_ne!(RECYCLE_OPERATION_FLAGS & 0x4000, 0);
     }
 
-    /// Directly exercises the real API on a fresh STA thread: the sink must be
-    /// dispatched during `PerformOperations` and observe a Recycle Bin item.
+    /// Directly exercises the real API: the sink is owned by the pump STA, so
+    /// `PostDeleteItem` must arrive on the pump thread (not the worker's) while
+    /// the worker is still inside `PerformOperations`, and report a Recycle
+    /// Bin item.
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_recycle_runs_on_sta_thread() {
+    fn windows_recycle_dispatches_sink_on_pump_thread() {
+        use std::os::windows::ffi::OsStrExt;
+
         let dir = trash_test_dir("windows-recycle");
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("note.md"), "x").unwrap();
+        let wide: Vec<u16> = folder.as_os_str().encode_wide().collect();
+        let source = shell_delete_source(&wide).unwrap();
+        let observed = windows_recycle::recycle_observed(&source).unwrap();
+        assert_ne!(observed.pump_thread_id, observed.worker_thread_id);
+        assert_eq!(
+            observed.report.callback_thread_id,
+            Some(observed.pump_thread_id)
+        );
+        assert_eq!(observed.report.callback_in_operation, Some(true));
+        assert_eq!(observed.report.post_delete_seen, 1);
+        assert_eq!(observed.report.recycled, 1);
+        assert!(!observed.report.refused);
+        assert!(!folder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_move_to_trash_recycles_folder() {
+        let dir = trash_test_dir("windows-native-trash");
         let folder = dir.join("folder");
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("note.md"), "x").unwrap();
