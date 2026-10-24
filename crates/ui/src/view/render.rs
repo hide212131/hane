@@ -423,7 +423,7 @@ impl Render for EditorView {
             .children(sidebar)
             .children(resizer)
             .on_mouse_move(cx.listener(Self::on_panel_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_panel_drag))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_panel_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_drag))
             // The drop listener stops the mouse-up it rides on, so a drop is
             // never read as a body click or a selection.
