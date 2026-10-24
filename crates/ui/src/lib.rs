@@ -16,6 +16,7 @@ mod input_mode;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 mod instrument;
 mod line;
+mod mermaid;
 mod ranges;
 mod shape;
 mod short_text_input;

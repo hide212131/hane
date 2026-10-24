@@ -8,6 +8,7 @@
 )]
 
 use crate::input_mode::KeyboardInputMode;
+use crate::mermaid::DiagramPaint;
 use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{
@@ -18,11 +19,11 @@ use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection, TableProjection};
 use hane_presentation::{
-    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
-    InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, QUOTE_BAR_WIDTH,
-    TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset, block_is_joinable,
-    block_line_context, block_line_span, expected_disclosures, present_block_with_table_projection,
-    trailing_blank_lines,
+    BlockDisplay, BlockKind, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
+    BlockWindow, DiagramPlan, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap,
+    QUOTE_BAR_WIDTH, TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset,
+    apply_diagram, block_is_joinable, block_line_context, block_line_span, diagram_display_size,
+    expected_disclosures, present_block_with_table_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -219,6 +220,52 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
         list_projection,
         table_projection,
     ))
+}
+
+/// [`presented_block`], showing the block as a rendered diagram when `diagram`
+/// is given.
+///
+/// A diagram keeps every physical line of the block, so the whole span is
+/// presented whatever part of it `request.visible` asks for: a block entered
+/// halfway by a scroll still owns the diagram's height and all of its source
+/// ranges. When the plan cannot be applied to the presentation (see
+/// [`apply_diagram`]) the block stays ordinary source.
+pub(crate) fn presented_block_with_diagram(
+    request: BlockPresentationRequest<'_>,
+    diagram: Option<&DiagramPlan>,
+) -> Option<VisualBlock> {
+    let Some(plan) = diagram else {
+        return presented_block(request);
+    };
+    let span = block_line_span(request.editor.document(), request.block)?;
+    let mut visual = presented_block(BlockPresentationRequest {
+        visible: &span,
+        ..request
+    })?;
+    apply_diagram(&mut visual, plan);
+    Some(visual)
+}
+
+/// Whether a caret, selection, composition or the find bar's current match
+/// touches any physical line of `lines`. A rendered diagram gives way to its
+/// source for the whole fenced construct as soon as this is true, so a block is
+/// never half diagram and half source.
+pub(crate) fn lines_are_disclosed(
+    editor: &Editor,
+    lines: &Range<usize>,
+    forced: Option<SourceRange>,
+    policy: DisclosurePolicy,
+) -> bool {
+    if policy == DisclosurePolicy::Reading {
+        return false;
+    }
+    let document = editor.document();
+    lines.clone().any(|line| {
+        document
+            .line_range(LineId(line))
+            .ok()
+            .is_some_and(|range| disclosure_for_line(editor, line, range, forced, policy).is_some())
+    })
 }
 
 /// Disclosure `presented_block` would currently assign to each line of
@@ -704,9 +751,37 @@ pub(crate) fn row_element(
     show_caret: bool,
     find_matches: &[SourceRange],
     find_current_match: Option<SourceRange>,
+    diagram: Option<&DiagramPaint>,
 ) -> Div {
     let row = &layout.lines[row_index];
     let line = &block.lines[row.line];
+    let display = line.display();
+    if line.kind == BlockKind::Diagram {
+        // The rendered diagram stands in for the whole fenced construct. The
+        // row's height was decided by presentation from the same display size.
+        return styled_block(
+            div()
+                .relative()
+                .h(px(row.height))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(theme.line_horizontal_padding)),
+            display,
+            theme,
+            zoom,
+        )
+        .when_some(diagram, |element, paint| {
+            let (width, height) = diagram_display_size(paint.natural, layout.width, zoom);
+            element.child(
+                img(paint.image.clone())
+                    .w(px(width))
+                    .h(px(height))
+                    .object_fit(ObjectFit::Contain),
+            )
+        });
+    }
     let current_quote_bar = quote_bar_identity(row, line);
     let previous_quote_bar = row_index
         .checked_sub(1)
@@ -723,7 +798,6 @@ pub(crate) fn row_element(
             .get(adjacent.line)
             .and_then(|line| quote_bar_identity(adjacent, line))
     });
-    let display = line.display();
     if let Some(image) = &line.image {
         let resolved = resolver.resolve(&image.destination);
         let media_padding = theme.line_horizontal_padding * zoom;

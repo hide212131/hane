@@ -36,6 +36,7 @@
     reason = "the display policy mirrors independent Markdown presentation flags"
 )]
 
+mod diagram;
 mod display;
 mod height_index;
 mod layout;
@@ -45,6 +46,10 @@ pub mod testing;
 
 pub use hane_markdown::TableAlignment;
 
+pub use diagram::{
+    DIAGRAM_VERTICAL_PADDING, DiagramPlan, apply_diagram, diagram_display_size, diagram_height,
+    diagram_owner_line, diagram_row_height,
+};
 pub use display::{
     BlockDisplay, BlockKind, BlockSurface, BlockTint, BlockWeight, ImagePresentation,
     InlineDisplay, LineContext, LinkTarget, ListAlignment, ListId, ListItemId, ListMarkerKind,
