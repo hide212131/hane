@@ -3470,6 +3470,10 @@ impl EditorView {
                 cx.notify();
             }
             OpenDecision::Activate(id) => {
+                // An external folder scan still in flight would reset the
+                // sessions on completion; remember this later request so it is
+                // reopened afterwards instead of the folder's first entry.
+                self.external_file_open_after_folder_scan = Some(path.to_path_buf());
                 self.activate_session(id, cx);
                 self.status = Some("Already open".to_owned());
                 cx.notify();
@@ -3485,6 +3489,7 @@ impl EditorView {
                     cx.notify();
                     return;
                 }
+                self.external_file_open_after_folder_scan = Some(path.to_path_buf());
                 if !self.loading_paths.insert(path.to_path_buf()) {
                     // Already loading this path: the in-flight read will
                     // apply once it lands, and `latest_open_target` above is
@@ -13520,6 +13525,86 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), "# B\n");
         });
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: an in-app open (Open Markdown or a Work Folder entry) made
+    // while an external folder scan is in flight survives that scan.
+    fn in_app_open_after_external_folder_scan(
+        cx: &mut gpui::TestAppContext,
+        name: &str,
+        open: impl FnOnce(&mut EditorView, &Path, &mut Context<EditorView>),
+    ) {
+        let root = draft_test_root(name);
+        let folder = root.join("folder-a");
+        let other = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(folder.join("First.md"), "# First\n").unwrap();
+        let file_c = other.join("C.md");
+        std::fs::write(&file_c, "# C\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+        view.update(cx, |view, cx| open(view, &file_c, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# C\n");
+        });
+
+        let scanned = (
+            OsWorkFolderScanner.scan(&folder),
+            Ok(RecoveredDrafts {
+                drafts: Vec::new(),
+                failed: 0,
+            }),
+            #[cfg(feature = "instrument")]
+            Instant::now(),
+            #[cfg(not(feature = "instrument"))]
+            (),
+        );
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder.as_path())
+            );
+            assert_eq!(view.active_session().path(), Some(file_c.as_path()));
+            assert_eq!(view.editor().document().full_text(), "# C\n");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_open_markdown_file_stays_active_when_an_earlier_folder_scan_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        in_app_open_after_external_folder_scan(cx, "scan-then-open-markdown", |view, path, cx| {
+            view.open_path(path, cx)
+        });
+    }
+
+    #[gpui::test]
+    fn a_work_folder_entry_stays_active_when_an_earlier_folder_scan_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        in_app_open_after_external_folder_scan(cx, "scan-then-folder-entry", |view, path, cx| {
+            view.open_work_folder_entry(path, cx)
+        });
     }
 
     // Issue #607: a dirty or saving session blocks an external folder switch,
