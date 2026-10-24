@@ -348,10 +348,11 @@ impl EditorView {
     /// rename that lands after the file already moved on for some other
     /// reason is safely ignored.
     fn begin_title_rename(&mut self, id: SessionId, title: String, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get_mut(id) else {
-            return;
-        };
-        let Some(from) = session.path().map(Path::to_path_buf) else {
+        let Some(from) = self
+            .sessions
+            .get(id)
+            .and_then(|session| session.path().map(Path::to_path_buf))
+        else {
             return;
         };
         let Some(root) = from.parent().map(Path::to_path_buf) else {
@@ -360,6 +361,9 @@ impl EditorView {
         if self.folder_trash_blocks(&from, false) {
             return;
         }
+        let Some(session) = self.sessions.get_mut(id) else {
+            return;
+        };
         // Reserved synchronously, before any `await`: a concurrent autosave
         // that fires in the same tick must see the slot already taken and
         // queue behind it, not race the rename to the filesystem. A `None`
