@@ -609,7 +609,8 @@ mod tests {
     fn a_description_merman_rejects_stays_source_and_is_rendered_once(
         cx: &mut gpui::TestAppContext,
     ) {
-        let source = "```mermaid\nflowchart TD\n  A[unclosed --> B\n```\n";
+        // The caret starts at offset 0, so a leading paragraph keeps it off the fence.
+        let source = "前の段落\n\n```mermaid\nflowchart TD\n  A[unclosed --> B\n```\n";
         let (view, cx) = open(cx, source);
         let block = fence_block(&view, cx, source);
         assert!(!is_diagram(&view, cx, block.id));
@@ -646,9 +647,10 @@ mod tests {
 
     #[gpui::test]
     fn a_tilde_fence_and_a_second_diagram_are_both_drawn(cx: &mut gpui::TestAppContext) {
-        let source = "~~~ Mermaid\nflowchart TD\n  A --> B\n~~~\n\n```mermaid\nsequenceDiagram\n  太郎->>花子: こんにちは\n```\n";
+        // The caret starts at offset 0, so a leading paragraph keeps it off the fences.
+        let source = "前の段落\n\n~~~ Mermaid\nflowchart TD\n  A --> B\n~~~\n\n```mermaid\nsequenceDiagram\n  太郎->>花子: こんにちは\n```\n";
         let (view, cx) = open(cx, source);
-        let first = block_at(&view, cx, 0);
+        let first = block_at(&view, cx, source.find("~~~").unwrap());
         let second = block_at(&view, cx, source.find("```mermaid").unwrap());
         assert_ne!(first.id, second.id);
         assert!(is_diagram(&view, cx, first.id));
@@ -660,7 +662,8 @@ mod tests {
     fn the_picture_follows_the_text_column_width_without_rendering_again(
         cx: &mut gpui::TestAppContext,
     ) {
-        let source = "```mermaid\nflowchart LR\n  A[とても長いラベルの開始] --> B[とても長いラベルの途中] --> C[とても長いラベルの終了]\n```\n";
+        // The caret starts at offset 0, so a leading paragraph keeps it off the fence.
+        let source = "前の段落\n\n```mermaid\nflowchart LR\n  A[とても長いラベルの開始] --> B[とても長いラベルの途中] --> C[とても長いラベルの終了]\n```\n";
         let (view, cx) = open(cx, source);
         let block = fence_block(&view, cx, source);
         let wide = presented(&view, cx, block.id)
