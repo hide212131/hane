@@ -1020,6 +1020,9 @@ impl EditorView {
                         view.content_search_workspace_changed(cx);
                         view.status = Some("ゴミ箱へ移動しました".to_owned());
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        view.status = Some("ゴミ箱への移動を取り消しました".to_owned());
+                    }
                     Err(error) => {
                         view.status = Some(format!("ゴミ箱へ移動できません: {error}"));
                     }
@@ -1101,6 +1104,9 @@ impl EditorView {
                         }
                         view.content_search_workspace_changed(cx);
                         view.status = Some("ゴミ箱へ移動しました".to_owned());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        view.status = Some("ゴミ箱への移動を取り消しました".to_owned());
                     }
                     Err(error) => {
                         view.status = Some(format!("ゴミ箱へ移動できません: {error}"));
@@ -1280,6 +1286,16 @@ fn move_path_to_trash_with(
     }
 }
 
+/// A user-cancelled move: reported as `Interrupted` so callers can tell it
+/// apart from an API / environment failure. It is never a success.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn trash_cancelled() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "ごみ箱への移動が取り消されました",
+    )
+}
+
 /// macOS: `NSFileManager trashItemAtURL:resultingItemURL:error:`, without
 /// Finder / Apple Events. `NO` or a missing resulting URL is an error.
 #[cfg(target_os = "macos")]
@@ -1411,32 +1427,75 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
                 SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)
                     .map_err(to_io)?;
             operation.DeleteItem(&item, None).map_err(to_io)?;
-            operation.PerformOperations().map_err(to_io)?;
+            if let Err(error) = operation.PerformOperations() {
+                // HRESULT_FROM_WIN32(ERROR_CANCELLED): the user cancelled.
+                if error.code().0 as u32 == 0x8007_04C7 {
+                    return Err(trash_cancelled());
+                }
+                return Err(to_io(error));
+            }
             if operation.GetAnyOperationsAborted().map_err(to_io)?.as_bool() {
-                return Err(std::io::Error::other(
-                    "ごみ箱への移動が中断されました",
-                ));
+                return Err(trash_cancelled());
             }
             Ok(())
         }
     }
 
-    // SAFETY: balanced with `CoUninitialize` below when initialization
-    // succeeded; a mode conflict means COM is already usable on this thread.
-    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-    let initialized = if init.is_ok() {
-        true
-    } else if init == RPC_E_CHANGED_MODE {
-        false
-    } else {
-        return Err(std::io::Error::other(init.message()));
-    };
-    let result = recycle(path);
-    if initialized {
-        // SAFETY: matches the successful `CoInitializeEx` above.
-        unsafe { CoUninitialize() };
+    // `IFileOperation` requires an STA. The caller's thread (a Windows thread
+    // pool worker) is not guaranteed to be one, so run on a dedicated thread
+    // that this function owns and initializes as an STA itself.
+    let path = path.to_path_buf();
+    let worker = std::thread::Builder::new()
+        .name("hane-recycle".to_owned())
+        .spawn(move || {
+            // SAFETY: balanced with `CoUninitialize` below when initialization
+            // succeeded.
+            let init =
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+            let state = if init.is_ok() {
+                ComApartment::Sta
+            } else if init == RPC_E_CHANGED_MODE {
+                ComApartment::WrongMode
+            } else {
+                ComApartment::Failed(init.message())
+            };
+            let result = run_in_sta(state, || recycle(&path));
+            if init.is_ok() {
+                // SAFETY: matches the successful `CoInitializeEx` above.
+                unsafe { CoUninitialize() };
+            }
+            result
+        })?;
+    worker
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("ごみ箱への移動処理が異常終了しました")))
+}
+
+/// Result of initializing COM on the thread that would call `IFileOperation`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+enum ComApartment {
+    /// Initialized as a single-threaded apartment.
+    Sta,
+    /// `RPC_E_CHANGED_MODE`: the thread already has an incompatible model.
+    WrongMode,
+    /// Any other initialization failure.
+    Failed(String),
+}
+
+/// Runs `operation` only on a valid STA. A thread with a conflicting
+/// apartment model or failed initialization never reaches the operation.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn run_in_sta(
+    apartment: ComApartment,
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match apartment {
+        ComApartment::Sta => operation(),
+        ComApartment::WrongMode => Err(std::io::Error::other(
+            "COMのアパートメントモデルが一致しないため、ごみ箱へ移動できません",
+        )),
+        ComApartment::Failed(message) => Err(std::io::Error::other(message)),
     }
-    result
 }
 
 /// Linux and others: `gio trash`.
@@ -1669,6 +1728,45 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(!ran);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrong_com_apartment_never_runs_file_operation() {
+        let mut ran = false;
+        let result = run_in_sta(ComApartment::WrongMode, || {
+            ran = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!ran);
+        let mut ran = false;
+        let result = run_in_sta(ComApartment::Failed("init".to_owned()), || {
+            ran = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!ran);
+    }
+
+    #[test]
+    fn sta_runs_file_operation_and_keeps_cancel_distinct_from_failure() {
+        assert!(run_in_sta(ComApartment::Sta, || Ok(())).is_ok());
+        let cancelled = run_in_sta(ComApartment::Sta, || Err(trash_cancelled())).unwrap_err();
+        assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
+        let failed =
+            run_in_sta(ComApartment::Sta, || Err(std::io::Error::other("api"))).unwrap_err();
+        assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancelled_trash_leaves_path_and_is_not_success() {
+        let dir = trash_test_dir("cancelled");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        let result = move_path_to_trash_with(&path, |_| Err(trash_cancelled()));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
