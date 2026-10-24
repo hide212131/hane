@@ -3270,6 +3270,11 @@ impl EditorView {
             self.instrumentation.work_folder_scan_completed_at = None;
         }
         self.start_folder_watch(&root, cx);
+        // The scan ran before the watch existed, so a change made before the
+        // watch connected was never reported. Queue one re-list, which
+        // `finish_work_folder_scan` runs once the folder is installed (after
+        // the watch is attached), to pick those changes up.
+        self.queue_folder_relist();
         let request = self.begin_listing_request();
         self.accept_listing_result(request);
         let generation = self.work_folder_generation;
@@ -13596,6 +13601,65 @@ mod tests {
         in_app_open_after_external_folder_scan(cx, "scan-then-open-markdown", |view, path, cx| {
             view.open_path(path, cx)
         });
+    }
+
+    // Issue #607: a file added after the external folder scan listed the
+    // folder but before the watch connected is still in the final listing.
+    #[gpui::test]
+    fn a_change_made_before_the_folder_watch_connects_reaches_the_listing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("scan-then-watch-gap");
+        let folder = root.join("folder-a");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("First.md"), "# First\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+
+        let scanned = (
+            OsWorkFolderScanner.scan(&folder),
+            Ok(RecoveredDrafts {
+                drafts: Vec::new(),
+                failed: 0,
+            }),
+            #[cfg(feature = "instrument")]
+            Instant::now(),
+            #[cfg(not(feature = "instrument"))]
+            (),
+        );
+        // Changed after the scan listed the folder and before the watch is
+        // connected; no notification will ever report it.
+        std::fs::write(folder.join("Gap.md"), "# Gap\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let mut names: Vec<String> = view
+                .work_folder
+                .as_ref()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|entry| entry.file_name().to_owned())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, ["First.md", "Gap.md"]);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
