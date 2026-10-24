@@ -348,13 +348,20 @@ impl EditorView {
     /// rename that lands after the file already moved on for some other
     /// reason is safely ignored.
     fn begin_title_rename(&mut self, id: SessionId, title: String, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get_mut(id) else {
-            return;
-        };
-        let Some(from) = session.path().map(Path::to_path_buf) else {
+        let Some(from) = self
+            .sessions
+            .get(id)
+            .and_then(|session| session.path().map(Path::to_path_buf))
+        else {
             return;
         };
         let Some(root) = from.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        if self.folder_trash_blocks(&from, false) {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(id) else {
             return;
         };
         // Reserved synchronously, before any `await`: a concurrent autosave
@@ -617,6 +624,32 @@ impl EditorView {
         intent: SaveIntent,
         cx: &mut Context<Self>,
     ) {
+        // A folder is being moved to the OS Trash: a write under it would
+        // recreate the original path or mark the session Present again once
+        // the move lands. The content stays in the session, unsaved.
+        if self.folder_trash_in_flight.is_some() {
+            let target_blocked = match &intent {
+                SaveIntent::To(path) | SaveIntent::CreateNew(path) => {
+                    self.folder_trash_blocks(path, false)
+                }
+                _ => false,
+            };
+            let session_blocked = self
+                .sessions
+                .get(id)
+                .and_then(DocumentSession::path)
+                .is_some_and(|path| self.folder_trash_blocks(path, false));
+            if target_blocked || session_blocked {
+                self.title_sync_pending.remove(&id);
+                self.tab_close_after_save.remove(&id);
+                self.status = Some(
+                    "フォルダをゴミ箱へ移動中のため保存できません。完了後にやり直してください"
+                        .to_owned(),
+                );
+                cx.notify();
+                return;
+            }
+        }
         let Some(decision) = self
             .sessions
             .get_mut(id)
@@ -1056,6 +1089,282 @@ mod tests {
                 "the stale rename completion must not clear a close-and-save request armed \
                  for the replacement document"
             );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #585: while a folder is moving to the OS Trash, a Save (or Save
+    // As into that subtree) must not start: a late write would recreate the
+    // original path. The edit stays in the session, unsaved, and a rename of
+    // the folder is refused too.
+    #[gpui::test]
+    fn saving_and_renaming_under_a_folder_being_trashed_are_refused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-race");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let note = folder_path.join("Note.md");
+        std::fs::write(&note, "body\n").unwrap();
+        let loaded = OsFileService.load(&note).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _cx| {
+            view.work_folder = Some(work_folder);
+            let _ = view.sessions.active_mut().editor_mut().insert_text("more\n");
+            view.folder_trash_in_flight = Some(folder_path.clone());
+        });
+
+        // The trash move removes the folder while the save is attempted.
+        std::fs::remove_dir_all(&folder_path).unwrap();
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.save_session(id, SaveIntent::Current, cx);
+            view.save_session(id, SaveIntent::To(folder_path.join("Other.md")), cx);
+            assert!(!view.sessions.active().save_in_flight());
+            assert!(view.sessions.active().is_dirty());
+            assert!(view.inline_rename_has_background_conflict(
+                &folder_path,
+                InlineRenameKind::Folder
+            ));
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !folder_path.exists(),
+            "a refused save must not recreate the trashed folder"
+        );
+        view.update(cx, |view, _cx| {
+            assert!(view.sessions.active().is_dirty());
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn new_entries_under_a_folder_being_trashed_are_refused(cx: &mut gpui::TestAppContext) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-new-entry");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.selected_folder = Some(folder_path.clone());
+            view.folder_trash_in_flight = Some(folder_path.clone());
+            let sessions_before = view.sessions.len();
+
+            view.new_work_folder_note(cx);
+            view.new_work_folder_folder(cx);
+
+            assert_eq!(view.sessions.len(), sessions_before);
+            assert!(view.work_folder_drafts.is_empty());
+            assert!(view.pending_new_folders.is_empty());
+            assert!(view.status.is_some());
+        });
+        cx.run_until_parked();
+        assert!(!folder_path.join("New Folder").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #585: a folder create still pending under a folder must stop the
+    // folder's Trash move, otherwise the late create would recreate the
+    // moved path and the tree entry.
+    #[gpui::test]
+    fn trashing_a_folder_with_a_pending_folder_create_is_refused(cx: &mut gpui::TestAppContext) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-pending-create");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.pending_new_folders
+                .insert(folder_path.join("New Folder"));
+
+            view.sidebar_context_trash_folder(folder_path.clone(), cx);
+
+            assert!(view.folder_trash_in_flight.is_none());
+            assert!(view.pending_new_folders.contains(&folder_path.join("New Folder")));
+            assert!(view
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("作成中")));
+        });
+        cx.run_until_parked();
+        assert!(folder_path.exists(), "a refused trash must not move the folder");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #585: an open read still pending under a folder must stop the
+    // folder's Trash move, otherwise the late `finish_open` would create a
+    // session for the trashed file.
+    #[gpui::test]
+    fn trashing_a_folder_with_a_pending_open_is_refused(cx: &mut gpui::TestAppContext) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-pending-open");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let pending = folder_path.join("Pending.md");
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.loading_paths.insert(pending.clone());
+            let sessions_before = view.sessions.len();
+
+            view.sidebar_context_trash_folder(folder_path.clone(), cx);
+
+            assert!(view.folder_trash_in_flight.is_none());
+            assert!(view.loading_paths.contains(&pending));
+            assert_eq!(view.sessions.len(), sessions_before);
+            assert!(view
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("開いている途中")));
+        });
+        cx.run_until_parked();
+        assert!(folder_path.exists(), "a refused trash must not move the folder");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #585: an open requested under a folder whose Trash move is
+    // running must not start a read that would land after the move.
+    #[gpui::test]
+    fn opening_under_a_folder_being_trashed_is_refused(cx: &mut gpui::TestAppContext) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-open-refused");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let note = folder_path.join("Note.md");
+        std::fs::write(&note, "body\n").unwrap();
+        let other = root.join("Other.md");
+        std::fs::write(&other, "other\n").unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.folder_trash_in_flight = Some(folder_path.clone());
+            let sessions_before = view.sessions.len();
+
+            view.open_work_folder_entry(&note, cx);
+
+            assert!(view.loading_paths.is_empty());
+            assert_eq!(view.sessions.len(), sessions_before);
+            assert!(view.sessions.session_for_path(&note).is_none());
+
+            // A path outside the trashed folder still opens normally.
+            view.open_work_folder_entry(&other, cx);
+            assert!(view.loading_paths.contains(&other));
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _cx| {
+            assert!(view.sessions.session_for_path(&note).is_none());
+            assert!(view.sessions.session_for_path(&other).is_some());
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn drafts_in_a_trashed_folder_are_retargeted_to_the_nearest_surviving_ancestor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-drafts");
+        let parent = root.join("a");
+        let trashed = parent.join("b");
+        let other = root.join("c");
+        std::fs::create_dir_all(trashed.join("deep")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _cx| {
+            view.work_folder = Some(work_folder);
+            let inside = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                inside,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: trashed.join("deep"),
+                },
+            );
+            let outside = view.sessions.open_untitled("# keep", "Untitled");
+            view.work_folder_drafts.insert(
+                outside,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: other.clone(),
+                },
+            );
+
+            view.work_folder.as_mut().unwrap().remove_folder(&trashed);
+            view.retarget_drafts_after_folder_trash(&trashed);
+
+            assert_eq!(view.work_folder_drafts[&inside].target_directory, parent);
+            assert_eq!(view.work_folder_drafts[&outside].target_directory, other);
+            assert!(view.sessions.get(outside).is_some());
         });
 
         std::fs::remove_dir_all(&root).unwrap();

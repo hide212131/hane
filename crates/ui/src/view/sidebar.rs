@@ -899,6 +899,40 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Whether `path` is inside (or, for `include_ancestors`, contains) the
+    /// folder whose Trash move is still running.
+    pub(super) fn folder_trash_blocks(&self, path: &Path, include_ancestors: bool) -> bool {
+        self.folder_trash_in_flight.as_ref().is_some_and(|trashed| {
+            path.starts_with(trashed) || (include_ancestors && trashed.starts_with(path))
+        })
+    }
+
+    /// After `trashed` left the tree, points every unnamed draft whose save
+    /// directory was inside it at the nearest ancestor that still exists in
+    /// the tree (the Work Folder root at worst). Other drafts are untouched,
+    /// and draft bodies are never modified.
+    pub(super) fn retarget_drafts_after_folder_trash(&mut self, trashed: &Path) {
+        let Some(work_folder) = self.work_folder.as_ref() else {
+            return;
+        };
+        let root = work_folder.root().to_path_buf();
+        for draft in self.work_folder_drafts.values_mut() {
+            if !draft.target_directory.starts_with(trashed) {
+                continue;
+            }
+            let replacement = trashed
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| {
+                    ancestor.starts_with(&root)
+                        && (*ancestor == root || work_folder.children_at(ancestor).is_some())
+                })
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.clone());
+            draft.target_directory = replacement;
+        }
+    }
+
     pub(crate) fn dismiss_sidebar_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
         if self.sidebar_context_menu.take().is_some() {
             cx.notify();
@@ -974,6 +1008,11 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        if self.folder_trash_in_flight.is_some() {
+            self.status = Some("フォルダをゴミ箱へ移動中です。完了後にやり直してください".to_owned());
+            cx.notify();
+            return;
+        }
         if let Some(session) = self
             .sessions
             .session_for_path(&path)
@@ -1006,6 +1045,124 @@ impl EditorView {
                         }
                         view.content_search_workspace_changed(cx);
                         view.status = Some("ゴミ箱へ移動しました".to_owned());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        view.status = Some("ゴミ箱への移動を取り消しました".to_owned());
+                    }
+                    Err(error) => {
+                        view.status = Some(format!("ゴミ箱へ移動できません: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Moves a whole folder to the OS Trash / Recycle Bin on a background
+    /// thread. Any session under it with unsaved changes (or a write in
+    /// flight) blocks the move; if edits land while the move is running the
+    /// sessions stay open with their content, marked as missing from disk.
+    /// The Work Folder root is never a target.
+    pub(super) fn sidebar_context_trash_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        let Some(root) = self.work_folder.as_ref().map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        if path == root || !path.starts_with(&root) {
+            self.status = Some("このフォルダはゴミ箱へ移動できません".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.sessions.has_unsaved_under(&path) {
+            self.status = Some(
+                "未保存の変更があるファイルを含むため、ゴミ箱へ移動できません。先に保存してください"
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        if self.folder_trash_in_flight.is_some() {
+            self.status = Some("別のフォルダをゴミ箱へ移動中です。完了後にやり直してください".to_owned());
+            cx.notify();
+            return;
+        }
+        // A folder create still running under `path` would land after the OS
+        // move and recreate the trashed path; refuse until it has finished.
+        if self
+            .pending_new_folders
+            .iter()
+            .any(|pending| pending.starts_with(&path))
+        {
+            self.status = Some(
+                "フォルダを作成中のため、ゴミ箱へ移動できません。完了後にやり直してください"
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        // An open read still pending under `path` would land after the OS
+        // move and create a session for the trashed file; refuse until it has
+        // finished.
+        if self
+            .loading_paths
+            .iter()
+            .any(|loading| loading.starts_with(&path))
+        {
+            self.status = Some(
+                "ファイルを開いている途中のため、ゴミ箱へ移動できません。完了後にやり直してください"
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        self.folder_trash_in_flight = Some(path.clone());
+        self.status = Some("ゴミ箱へ移動しています…".to_owned());
+        let generation = self.work_folder_generation;
+        cx.spawn(async move |view, cx| {
+            let trash_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { move_path_to_trash(&trash_path) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.folder_trash_in_flight.as_ref() == Some(&path) {
+                    view.folder_trash_in_flight = None;
+                }
+                if view.work_folder_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        view.sessions.delete_folder(&path);
+                        if let Some(folder) = view.work_folder.as_mut() {
+                            folder.remove_folder(&path);
+                        }
+                        view.retarget_drafts_after_folder_trash(&path);
+                        view.expanded_folders
+                            .retain(|expanded| !expanded.starts_with(&path));
+                        view.pending_new_folders
+                            .retain(|pending| !pending.starts_with(&path));
+                        if view
+                            .selected_folder
+                            .as_ref()
+                            .is_some_and(|selected| selected.starts_with(&path))
+                        {
+                            view.selected_folder = None;
+                            if view.sidebar_focus == SidebarFocus::Folder {
+                                view.sidebar_focus = SidebarFocus::ActiveSession;
+                            }
+                        }
+                        view.content_search_workspace_changed(cx);
+                        view.status = Some("ゴミ箱へ移動しました".to_owned());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        view.status = Some("ゴミ箱への移動を取り消しました".to_owned());
                     }
                     Err(error) => {
                         view.status = Some(format!("ゴミ箱へ移動できません: {error}"));
@@ -1095,6 +1252,16 @@ impl EditorView {
                         );
                     },
                 ));
+                let trash_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-trash",
+                    "ゴミ箱に移動",
+                    true,
+                    cx,
+                    move |view, _, _, cx| {
+                        view.sidebar_context_trash_folder(trash_path.clone(), cx)
+                    },
+                ));
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     let reveal_path = path.clone();
@@ -1173,6 +1340,16 @@ fn move_path_to_trash_with(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// A user-cancelled move: reported as `Interrupted` so callers can tell it
+/// apart from an API / environment failure. It is never a success.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn trash_cancelled() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "ごみ箱への移動が取り消されました",
+    )
 }
 
 /// macOS: `NSFileManager trashItemAtURL:resultingItemURL:error:`, without
@@ -1268,70 +1445,547 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Windows: `IFileOperation` with `FOFX_RECYCLEONDELETE`. API errors and an
-/// aborted operation are errors; there is no permanent-delete fallback.
+/// Windows: `IFileOperation` with `FOFX_RECYCLEONDELETE` (documented as
+/// "send to the Recycle Bin instead of permanently deleting"). Success also
+/// requires the progress sink to observe a successful `PostDeleteItem` with a
+/// Recycle Bin item (`psiNewlyCreated`); a vanished source path alone is never
+/// treated as success. `PreDeleteItem` aborts any item the shell does not
+/// declare as recycle-if-possible, so there is no permanent-delete fallback.
 #[cfg(target_os = "windows")]
 fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
-    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
-        CoInitializeEx, CoUninitialize,
-    };
-    use windows::Win32::UI::Shell::{
-        FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
-        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
-    };
-    use windows::core::HSTRING;
+    use std::os::windows::ffi::OsStrExt;
 
-    fn to_io(error: windows::core::Error) -> std::io::Error {
-        std::io::Error::other(error.to_string())
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let source = shell_delete_source(&wide)?;
+    // A message-pump STA owns the progress sink and keeps dispatching COM
+    // messages, while a separate worker STA runs `PerformOperations`
+    // synchronously. Fresh apartments also avoid `RPC_E_CHANGED_MODE` on the
+    // caller (the UI input path), which never touches COM itself. See
+    // `windows_recycle` and `windows_recycle_uses_separate_pump_and_worker_stas`.
+    windows_recycle::recycle(&source)
+}
+
+#[cfg(target_os = "windows")]
+mod windows_recycle {
+    use super::{RECYCLE_OPERATION_FLAGS, RecycleReport, classify_recycle};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use windows::Win32::Foundation::{E_ABORT, LPARAM, WPARAM};
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        IStream, Marshal::CoMarshalInterThreadInterfaceInStream,
+        StructuredStorage::CoGetInterfaceAndReleaseStream,
+    };
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Shell::{
+        FILEOPERATION_FLAGS, FileOperation, IFileOperation, IFileOperationProgressSink,
+        IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+        TranslateMessage, WM_QUIT, WM_USER,
+    };
+    use windows::core::{HRESULT, IUnknown, Interface, PCWSTR, Ref, implement};
+    // `#[implement]` の展開は crate ルートの `windows_core`（Cargo.toml の直接依存。
+    // `windows` 0.61 と同じ 0.61.x）を名前で参照する。
+
+    /// `TSF_DELETE_RECYCLE_IF_POSSIBLE`
+    const TSF_DELETE_RECYCLE_IF_POSSIBLE: u32 = 0x0000_0080;
+
+    #[implement(IFileOperationProgressSink)]
+    struct RecycleSink {
+        report: Arc<Mutex<RecycleReport>>,
+        /// Set by the worker only while it is inside `PerformOperations`.
+        in_operation: Arc<AtomicBool>,
     }
 
-    fn recycle(path: &Path) -> std::io::Result<()> {
-        // SAFETY: COM calls on an initialized apartment; all interface
-        // pointers are owned by the `windows` crate wrappers.
-        unsafe {
-            let operation: IFileOperation =
-                CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(to_io)?;
-            operation
-                .SetOperationFlags(
-                    FOF_ALLOWUNDO
-                        | FOF_NOERRORUI
-                        | FOF_SILENT
-                        | FOFX_EARLYFAILURE
-                        | FOFX_RECYCLEONDELETE,
-                )
-                .map_err(to_io)?;
-            let item: IShellItem =
-                SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)
-                    .map_err(to_io)?;
-            operation.DeleteItem(&item, None).map_err(to_io)?;
-            operation.PerformOperations().map_err(to_io)?;
-            if operation.GetAnyOperationsAborted().map_err(to_io)?.as_bool() {
-                return Err(std::io::Error::other(
-                    "ごみ箱への移動が中断されました",
-                ));
+    /// Carries the marshaled-interface stream (a free-threaded memory stream)
+    /// from the pump STA to the worker STA.
+    struct SendStream(IStream);
+
+    // SAFETY: the stream produced by `CoMarshalInterThreadInterfaceInStream`
+    // is designed to be handed to another apartment and unmarshaled there.
+    unsafe impl Send for SendStream {}
+
+    impl SendStream {
+        /// Taking `self` keeps closures capturing the whole `Send` wrapper.
+        fn into_inner(self) -> IStream {
+            self.0
+        }
+    }
+
+    /// Balances a successful `CoInitializeEx` on drop. Declare it before any
+    /// COM object so it is dropped after them, including on panic.
+    struct ComApartment;
+
+    impl ComApartment {
+        fn enter() -> std::io::Result<Self> {
+            // SAFETY: balanced by `CoUninitialize` in `Drop` on the same thread.
+            let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if init.is_err() {
+                return Err(std::io::Error::other(format!(
+                    "COMの初期化に失敗しました (0x{:X})",
+                    init.0
+                )));
             }
+            Ok(Self)
+        }
+    }
+
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            // SAFETY: matches the successful `CoInitializeEx` in `enter`.
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    /// What one recycle run observed, for direct API regression tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) struct Observation {
+        pub pump_thread_id: u32,
+        pub worker_thread_id: u32,
+        pub report: RecycleReport,
+    }
+
+    impl IFileOperationProgressSink_Impl for RecycleSink_Impl {
+        fn StartOperations(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn FinishOperations(&self, _hrresult: HRESULT) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreRenameItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostRenameItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _hrrename: HRESULT,
+            _psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreMoveItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostMoveItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _hrmove: HRESULT,
+            _psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreCopyItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostCopyItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _hrcopy: HRESULT,
+            _psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreDeleteItem(
+            &self,
+            dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            if dwflags & TSF_DELETE_RECYCLE_IF_POSSIBLE == 0 {
+                // Not a recycle: refuse before anything is deleted.
+                if let Ok(mut report) = self.report.lock() {
+                    report.refused = true;
+                }
+                return Err(E_ABORT.into());
+            }
+            Ok(())
+        }
+        fn PostDeleteItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            hrdelete: HRESULT,
+            psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            if let Ok(mut report) = self.report.lock() {
+                // SAFETY: plain query of the calling thread's ID.
+                report.callback_thread_id = Some(unsafe { GetCurrentThreadId() });
+                report.callback_in_operation = Some(self.in_operation.load(Ordering::SeqCst));
+                report.post_delete_seen += 1;
+                if hrdelete.is_ok() && !psinewlycreated.is_null() {
+                    report.recycled += 1;
+                } else if hrdelete.is_err() {
+                    report.failed_hresult = Some(hrdelete.0);
+                }
+            }
+            Ok(())
+        }
+        fn PreNewItem(
+            &self,
+            _dwflags: u32,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostNewItem(
+            &self,
+            _dwflags: u32,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _psztemplatename: &PCWSTR,
+            _dwfileattributes: u32,
+            _hrnew: HRESULT,
+            _psinewitem: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn UpdateProgress(&self, _iworktotal: u32, _iworksofar: u32) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn ResetTimer(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PauseTimer(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn ResumeTimer(&self) -> windows::core::Result<()> {
             Ok(())
         }
     }
 
-    // SAFETY: balanced with `CoUninitialize` below when initialization
-    // succeeded; a mode conflict means COM is already usable on this thread.
-    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-    let initialized = if init.is_ok() {
-        true
-    } else if init == RPC_E_CHANGED_MODE {
-        false
-    } else {
-        return Err(std::io::Error::other(init.message()));
-    };
-    let result = recycle(path);
-    if initialized {
-        // SAFETY: matches the successful `CoInitializeEx` above.
-        unsafe { CoUninitialize() };
+    fn hresult_error(context: &str, error: windows::core::Error) -> std::io::Error {
+        std::io::Error::other(format!(
+            "ごみ箱への移動に失敗しました ({context}: 0x{:X})",
+            error.code().0
+        ))
     }
-    result
+
+    /// Recycles the single path in `source` (double-NUL-terminated).
+    pub(super) fn recycle(source: &[u16]) -> std::io::Result<()> {
+        recycle_observed(source).map(|_| ())
+    }
+
+    /// Message-pump STA: owns the sink, hands a marshaled reference to the
+    /// worker and keeps dispatching COM messages until `WM_QUIT`, which is only
+    /// posted after the worker has finished and released its proxy.
+    fn run_pump(
+        report: Arc<Mutex<RecycleReport>>,
+        in_operation: Arc<AtomicBool>,
+        ready: mpsc::Sender<std::io::Result<(u32, SendStream)>>,
+    ) -> std::io::Result<()> {
+        let apartment = match ComApartment::enter() {
+            Ok(apartment) => apartment,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return Ok(());
+            }
+        };
+        let setup = || -> std::io::Result<(IFileOperationProgressSink, SendStream)> {
+            let sink: IFileOperationProgressSink = RecycleSink {
+                report,
+                in_operation,
+            }
+            .into();
+            let unknown: IUnknown = sink
+                .cast()
+                .map_err(|e| hresult_error("QueryInterface", e))?;
+            // SAFETY: `unknown` is a valid interface of the object whose IID is given.
+            let stream = unsafe {
+                CoMarshalInterThreadInterfaceInStream(&IFileOperationProgressSink::IID, &unknown)
+            }
+            .map_err(|e| hresult_error("CoMarshalInterThreadInterfaceInStream", e))?;
+            Ok((sink, SendStream(stream)))
+        };
+        let (sink, stream) = match setup() {
+            Ok(pair) => pair,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                drop(apartment);
+                return Ok(());
+            }
+        };
+        // Create this thread's message queue before announcing the thread ID,
+        // so a later `PostThreadMessageW(WM_QUIT)` cannot be lost.
+        let mut msg = MSG::default();
+        // SAFETY: `msg` is a valid out-pointer.
+        let _ = unsafe { PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE) };
+        // SAFETY: plain query of the calling thread's ID.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        if ready.send(Ok((thread_id, stream))).is_err() {
+            drop(sink);
+            drop(apartment);
+            return Ok(());
+        }
+        let mut result = Ok(());
+        loop {
+            // SAFETY: `msg` is a valid out-pointer; standard message loop.
+            let status = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+            if status.0 == 0 {
+                break;
+            }
+            if status.0 < 0 {
+                result = Err(std::io::Error::other(
+                    "ごみ箱処理のメッセージループが失敗しました",
+                ));
+                break;
+            }
+            // SAFETY: `msg` was filled in by `GetMessageW`.
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        // Release the sink before uninitializing this apartment.
+        drop(sink);
+        drop(apartment);
+        result
+    }
+
+    /// Worker STA: unmarshals the sink, advises and runs `PerformOperations`
+    /// synchronously. Returns its thread ID on success.
+    fn run_worker(
+        source: Vec<u16>,
+        stream: SendStream,
+        in_operation: Arc<AtomicBool>,
+        report: Arc<Mutex<RecycleReport>>,
+    ) -> std::io::Result<u32> {
+        // Declared first so it is dropped last, after every COM object.
+        let _apartment = ComApartment::enter()?;
+        // SAFETY: plain query of the calling thread's ID.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let stream = stream.into_inner();
+        // SAFETY: the call releases the stream itself (even on failure), so
+        // the wrapper is forgotten below to avoid a double release.
+        let sink: windows::core::Result<IFileOperationProgressSink> =
+            unsafe { CoGetInterfaceAndReleaseStream(&stream) };
+        std::mem::forget(stream);
+        let sink = sink.map_err(|e| hresult_error("CoGetInterfaceAndReleaseStream", e))?;
+        recycle_in_worker(&source, &sink, &in_operation, &report)?;
+        Ok(thread_id)
+    }
+
+    /// Starts the pump and worker STAs, waits for the worker, then shuts the
+    /// pump down. Both threads are always joined before returning.
+    pub(super) fn recycle_observed(source: &[u16]) -> std::io::Result<Observation> {
+        let report = Arc::new(Mutex::new(RecycleReport::default()));
+        let in_operation = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let pump = std::thread::Builder::new()
+            .name("hane-recycle-pump".to_owned())
+            .spawn({
+                let report = Arc::clone(&report);
+                let in_operation = Arc::clone(&in_operation);
+                move || run_pump(report, in_operation, ready_tx)
+            })?;
+        let (pump_thread_id, stream) = match ready_rx.recv() {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                let _ = pump.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = pump.join();
+                return Err(std::io::Error::other(
+                    "ごみ箱処理のメッセージポンプを開始できませんでした",
+                ));
+            }
+        };
+        let worker_result = std::thread::Builder::new()
+            .name("hane-recycle-worker".to_owned())
+            .spawn({
+                let report = Arc::clone(&report);
+                let in_operation = Arc::clone(&in_operation);
+                let source = source.to_vec();
+                move || run_worker(source, stream, in_operation, report)
+            })
+            .and_then(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(std::io::Error::other("ごみ箱への移動処理が異常終了しました"))
+                })
+            });
+        // The worker has finished and released its proxy; stop the pump.
+        // SAFETY: the pump created its message queue before announcing its ID.
+        let posted = unsafe { PostThreadMessageW(pump_thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        if posted.is_err() {
+            // Joining would block forever on a pump that never sees WM_QUIT.
+            return Err(std::io::Error::other(
+                "ごみ箱処理のメッセージポンプを停止できませんでした",
+            ));
+        }
+        let pump_result = pump
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("ごみ箱処理のメッセージポンプが異常終了しました")));
+        let worker_thread_id = worker_result?;
+        pump_result?;
+        let report = report.lock().map(|r| r.clone()).unwrap_or_default();
+        Ok(Observation {
+            pump_thread_id,
+            worker_thread_id,
+            report,
+        })
+    }
+
+    fn recycle_in_worker(
+        source: &[u16],
+        sink: &IFileOperationProgressSink,
+        in_operation: &AtomicBool,
+        report: &Mutex<RecycleReport>,
+    ) -> std::io::Result<()> {
+        // SAFETY: `source` is NUL-terminated and outlives the call.
+        let item: IShellItem = unsafe {
+            SHCreateItemFromParsingName(PCWSTR(source.as_ptr()), None::<&windows::Win32::System::Com::IBindCtx>)
+        }
+        .map_err(|e| hresult_error("SHCreateItemFromParsingName", e))?;
+        // SAFETY: plain COM activation in the STA initialized by the caller.
+        let operation: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
+            .map_err(|e| hresult_error("CoCreateInstance", e))?;
+        // SAFETY: all interface pointers are valid for the duration of the calls.
+        let (performed, aborted) = unsafe {
+            operation
+                .SetOperationFlags(FILEOPERATION_FLAGS(RECYCLE_OPERATION_FLAGS))
+                .map_err(|e| hresult_error("SetOperationFlags", e))?;
+            let cookie = operation
+                .Advise(sink)
+                .map_err(|e| hresult_error("Advise", e))?;
+            let queued = operation
+                .DeleteItem(&item, None::<&IFileOperationProgressSink>)
+                .map_err(|e| hresult_error("DeleteItem", e));
+            let performed = match queued {
+                Ok(()) => {
+                    // The pump STA dispatches sink callbacks while this blocks.
+                    in_operation.store(true, Ordering::SeqCst);
+                    let performed = operation.PerformOperations().map_err(|e| e.code().0);
+                    in_operation.store(false, Ordering::SeqCst);
+                    performed
+                }
+                Err(error) => {
+                    let _ = operation.Unadvise(cookie);
+                    return Err(error);
+                }
+            };
+            let aborted = operation
+                .GetAnyOperationsAborted()
+                .map(|b| b.as_bool())
+                .unwrap_or(true);
+            let _ = operation.Unadvise(cookie);
+            (performed, aborted)
+        };
+        drop(operation);
+        drop(item);
+        let snapshot = report.lock().map(|r| r.clone()).unwrap_or_default();
+        classify_recycle(performed, aborted, &snapshot)
+    }
+}
+
+/// `FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT |
+/// FOF_WANTNUKEWARNING | FOFX_RECYCLEONDELETE`. `FOFX_RECYCLEONDELETE` sends
+/// to the Recycle Bin instead of permanently deleting; `FOF_WANTNUKEWARNING`
+/// partially overrides `FOF_NOCONFIRMATION` so an item that cannot be
+/// recycled asks the user (who can cancel) instead of vanishing silently.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const RECYCLE_OPERATION_FLAGS: u32 = 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000 | 0x0008_0000;
+
+/// What the `IFileOperation` progress sink observed.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecycleReport {
+    /// `PostDeleteItem` calls seen.
+    post_delete_seen: u32,
+    /// Of those, successes that reported a Recycle Bin item.
+    recycled: u32,
+    /// HRESULT of a failed delete, if any.
+    failed_hresult: Option<i32>,
+    /// `PreDeleteItem` refused a non-recycle delete.
+    refused: bool,
+    /// Thread that ran the last `PostDeleteItem` callback.
+    callback_thread_id: Option<u32>,
+    /// Whether that callback arrived while the worker was inside
+    /// `PerformOperations`.
+    callback_in_operation: Option<bool>,
+}
+
+/// Maps `PerformOperations`' result (`Err` carries the HRESULT), the aborted
+/// flag and the sink report to success, user cancel (`Interrupted`) or
+/// failure. Success requires exactly one item observed as recycled.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn classify_recycle(
+    performed: Result<(), i32>,
+    any_aborted: bool,
+    report: &RecycleReport,
+) -> std::io::Result<()> {
+    const HRESULT_USER_CANCELLED: i32 = 0x8007_04C7_u32 as i32;
+    const COPYENGINE_E_USER_CANCELLED: i32 = 0x8027_0000_u32 as i32;
+    if any_aborted && !report.refused {
+        return Err(trash_cancelled());
+    }
+    if let Err(hr) = performed {
+        if hr == HRESULT_USER_CANCELLED || hr == COPYENGINE_E_USER_CANCELLED {
+            return Err(trash_cancelled());
+        }
+        return Err(std::io::Error::other(format!(
+            "ごみ箱への移動に失敗しました (IFileOperation: 0x{:X})",
+            hr as u32
+        )));
+    }
+    if report.refused {
+        return Err(std::io::Error::other(
+            "ごみ箱へ移動できないため、削除を中止しました",
+        ));
+    }
+    if let Some(hr) = report.failed_hresult {
+        return Err(std::io::Error::other(format!(
+            "ごみ箱への移動に失敗しました (IFileOperation: 0x{:X})",
+            hr as u32
+        )));
+    }
+    if report.post_delete_seen == 1 && report.recycled == 1 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "ごみ箱への移動を確認できなかったため、成功として扱いません",
+        ))
+    }
+}
+
+/// Builds the double-NUL-terminated `pFrom` list for one path. An interior
+/// NUL would silently turn into a second path, so it is rejected.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn shell_delete_source(path: &[u16]) -> std::io::Result<Vec<u16>> {
+    if path.contains(&0) {
+        return Err(std::io::Error::other(
+            "パスにNUL文字が含まれているため、ごみ箱へ移動できません",
+        ));
+    }
+    let mut wide = path.to_vec();
+    wide.extend([0, 0]);
+    Ok(wide)
 }
 
 /// Linux and others: `gio trash`.
@@ -1564,6 +2218,133 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(!ran);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn recycled_report() -> RecycleReport {
+        RecycleReport {
+            post_delete_seen: 1,
+            recycled: 1,
+            ..RecycleReport::default()
+        }
+    }
+
+    #[test]
+    fn recycle_result_requires_observed_recycle_bin_item() {
+        assert!(classify_recycle(Ok(()), false, &recycled_report()).is_ok());
+        // API success with no observed recycle (e.g. permanent delete) fails.
+        let permanent = RecycleReport {
+            post_delete_seen: 1,
+            ..RecycleReport::default()
+        };
+        let error = classify_recycle(Ok(()), false, &permanent).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+        // No callback at all is not a success either.
+        assert!(classify_recycle(Ok(()), false, &RecycleReport::default()).is_err());
+        // More than one deleted item is unexpected for a single path.
+        let many = RecycleReport {
+            post_delete_seen: 2,
+            recycled: 2,
+            ..RecycleReport::default()
+        };
+        assert!(classify_recycle(Ok(()), false, &many).is_err());
+    }
+
+    #[test]
+    fn recycle_result_distinguishes_cancel_refusal_and_error() {
+        for hr in [0x8007_04C7_u32 as i32, 0x8027_0000_u32 as i32] {
+            let cancelled = classify_recycle(Err(hr), false, &RecycleReport::default()).unwrap_err();
+            assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
+        }
+        // Aborted flag wins over an otherwise complete report.
+        let aborted = classify_recycle(Ok(()), true, &recycled_report()).unwrap_err();
+        assert_eq!(aborted.kind(), std::io::ErrorKind::Interrupted);
+        let failed = classify_recycle(Err(0x8000_4005_u32 as i32), false, &RecycleReport::default())
+            .unwrap_err();
+        assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
+        let refused = RecycleReport {
+            refused: true,
+            ..RecycleReport::default()
+        };
+        // PreDeleteItem refusal aborts the operation but is an error, not a cancel.
+        let error = classify_recycle(Ok(()), true, &refused).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+        let item_failed = RecycleReport {
+            post_delete_seen: 1,
+            failed_hresult: Some(0x8007_0005_u32 as i32),
+            ..RecycleReport::default()
+        };
+        assert!(classify_recycle(Ok(()), false, &item_failed).is_err());
+    }
+
+    #[test]
+    fn recycle_flags_request_recycle_bin_without_permanent_delete_fallback() {
+        // FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+        // | FOF_WANTNUKEWARNING | FOFX_RECYCLEONDELETE
+        assert_eq!(
+            RECYCLE_OPERATION_FLAGS,
+            0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000 | 0x0008_0000
+        );
+        assert_ne!(RECYCLE_OPERATION_FLAGS & 0x0008_0000, 0);
+        assert_ne!(RECYCLE_OPERATION_FLAGS & 0x0040, 0);
+        assert_ne!(RECYCLE_OPERATION_FLAGS & 0x4000, 0);
+    }
+
+    /// Directly exercises the real API: the pump STA and the worker STA are
+    /// separate threads, `PostDeleteItem` arrives while the worker is still
+    /// inside `PerformOperations`, and it reports a Recycle Bin item. The
+    /// callback's thread ID is not part of the public contract, so it is not
+    /// asserted.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_recycle_uses_separate_pump_and_worker_stas() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let dir = trash_test_dir("windows-recycle");
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("note.md"), "x").unwrap();
+        let wide: Vec<u16> = folder.as_os_str().encode_wide().collect();
+        let source = shell_delete_source(&wide).unwrap();
+        let observed = windows_recycle::recycle_observed(&source).unwrap();
+        assert_ne!(observed.pump_thread_id, observed.worker_thread_id);
+        assert!(observed.report.callback_thread_id.is_some());
+        assert_eq!(observed.report.callback_in_operation, Some(true));
+        assert_eq!(observed.report.post_delete_seen, 1);
+        assert_eq!(observed.report.recycled, 1);
+        assert!(!observed.report.refused);
+        assert!(!folder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_move_to_trash_recycles_folder() {
+        let dir = trash_test_dir("windows-native-trash");
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("note.md"), "x").unwrap();
+        native_move_to_trash(&folder).unwrap();
+        assert!(!folder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_delete_source_is_double_nul_terminated_and_rejects_interior_nul() {
+        let wide = shell_delete_source(&['a' as u16, 'b' as u16]).unwrap();
+        assert_eq!(wide, ['a' as u16, 'b' as u16, 0, 0]);
+        let error = shell_delete_source(&['a' as u16, 0, 'b' as u16]).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancelled_trash_leaves_path_and_is_not_success() {
+        let dir = trash_test_dir("cancelled");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        let result = move_path_to_trash_with(&path, |_| Err(trash_cancelled()));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

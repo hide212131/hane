@@ -296,6 +296,156 @@ fn a_rename_moves_the_session_without_touching_the_document() {
 }
 
 #[test]
+fn a_folder_delete_marks_only_the_open_sessions_under_it_missing() {
+    let service = service_with(&[
+        ("/notes/dev/nested/b.md", "b\n"),
+        ("/notes/devices.md", "other\n"),
+    ]);
+    let mut sessions = opened(&service, "/notes/dev/nested/b.md");
+    let inside = sessions.active_id();
+    let outside = sessions.apply_open(None, service.load(Path::new("/notes/devices.md")).unwrap());
+
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+    let outcomes = sessions.delete_folder(Path::new("/notes/dev"));
+    assert_eq!(
+        outcomes,
+        vec![(inside, FileEventOutcome::Missing { dirty: false })],
+        "a sibling sharing a name prefix is not under the folder"
+    );
+    assert_eq!(
+        sessions.get(inside).unwrap().path(),
+        Some(Path::new("/notes/dev/nested/b.md")),
+        "the session stays open with its content"
+    );
+    assert_ne!(
+        sessions.get(inside).unwrap().presence(),
+        sessions.get(outside).unwrap().presence(),
+        "only the session under the folder is marked missing"
+    );
+}
+
+#[test]
+fn a_folder_with_a_dirty_session_under_it_is_reported_unsaved() {
+    let service = service_with(&[("/notes/dev/a.md", "a\n")]);
+    let mut sessions = opened(&service, "/notes/dev/a.md");
+    type_into(sessions.active_mut(), "edit");
+    assert!(sessions.has_unsaved_under(Path::new("/notes/dev")));
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/other")));
+}
+
+#[test]
+fn a_first_save_into_a_nested_folder_blocks_the_folder_trash_until_it_lands() {
+    let service = MemoryFileService::new();
+    let mut sessions = SessionSet::with_untitled("draft\n", "Untitled");
+    let SaveDecision::Write(job) = sessions
+        .active_mut()
+        .request_save(SaveIntent::CreateNew("/notes/dev/nested/new.md".into()))
+    else {
+        panic!("expected an accepted write");
+    };
+    assert!(
+        sessions.active().path().is_none(),
+        "the session has no file until the write lands"
+    );
+    assert!(
+        sessions.has_unsaved_under(Path::new("/notes/dev")),
+        "the running write's target counts, not only the session's file"
+    );
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/other")));
+
+    let result = run_save_job(&service, &job.path, &job.document, job.guard);
+    assert!(matches!(
+        sessions.active_mut().finish_save(job.ticket, result),
+        SaveOutcome::Saved
+    ));
+    assert_eq!(
+        service
+            .load(Path::new("/notes/dev/nested/new.md"))
+            .unwrap()
+            .document
+            .full_text(),
+        "draft\n",
+        "the saved content is kept"
+    );
+    assert!(
+        !sessions.has_unsaved_under(Path::new("/notes/dev")),
+        "the folder is free once the write has landed"
+    );
+}
+
+#[test]
+fn a_save_as_into_a_nested_folder_blocks_the_folder_trash_until_it_lands() {
+    let service = service_with(&[("/elsewhere/a.md", "a\n")]);
+    let mut sessions = opened(&service, "/elsewhere/a.md");
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+    let decision = sessions
+        .active_mut()
+        .request_save(SaveIntent::To("/notes/dev/nested/copy.md".into()));
+    assert!(
+        sessions.has_unsaved_under(Path::new("/notes/dev")),
+        "the Save As target is under the folder while the write runs"
+    );
+
+    let outcome = complete(sessions.active_mut(), &service, decision);
+    assert!(matches!(outcome, SaveOutcome::Saved));
+    assert_eq!(
+        service
+            .load(Path::new("/notes/dev/nested/copy.md"))
+            .unwrap()
+            .document
+            .full_text(),
+        "a\n"
+    );
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+}
+
+#[test]
+fn a_queued_save_into_a_folder_blocks_the_folder_trash_while_the_active_write_is_outside() {
+    for queued in [
+        SaveIntent::To("/notes/dev/nested/queued.md".into()),
+        SaveIntent::CreateNew("/notes/dev/nested/queued.md".into()),
+    ] {
+        let service = service_with(&[("/elsewhere/a.md", "a\n")]);
+        let mut sessions = opened(&service, "/elsewhere/a.md");
+        let SaveDecision::Write(job) = sessions
+            .active_mut()
+            .request_save(SaveIntent::To("/elsewhere/first.md".into()))
+        else {
+            panic!("expected an accepted write");
+        };
+        assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+
+        assert!(matches!(
+            sessions.active_mut().request_save(queued),
+            SaveDecision::Queued
+        ));
+        assert!(
+            sessions.has_unsaved_under(Path::new("/notes/dev")),
+            "the queued destination counts while the active write is outside"
+        );
+        assert!(!sessions.has_unsaved_under(Path::new("/notes/other")));
+
+        let result = run_save_job(&service, &job.path, &job.document, job.guard);
+        assert!(matches!(
+            sessions.active_mut().finish_save(job.ticket, result),
+            SaveOutcome::Saved
+        ));
+        assert!(
+            sessions.has_unsaved_under(Path::new("/notes/dev")),
+            "the queued write still blocks the folder after the active one lands"
+        );
+        assert!(sessions.active_mut().take_pending_save().is_some());
+        assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+        assert!(
+            service
+                .load(Path::new("/notes/dev/nested/queued.md"))
+                .is_err(),
+            "the queued target is not written while blocked"
+        );
+    }
+}
+
+#[test]
 fn a_folder_rename_moves_only_the_open_sessions_under_it() {
     let service = service_with(&[
         ("/notes/dev/a.md", "a\n"),

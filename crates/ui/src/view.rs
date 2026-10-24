@@ -970,6 +970,12 @@ pub struct EditorView {
     /// finishes reserve the same name; this set is checked alongside the
     /// tree so the second click picks the next name instead.
     pending_new_folders: HashSet<PathBuf>,
+    /// The folder whose OS Trash move is still running. From the moment the
+    /// unsaved check passes until the result is applied, Save, rename and
+    /// other folder operations touching this subtree are refused, so a late
+    /// write cannot recreate the original path or flip a session back to
+    /// Present while the move lands.
+    folder_trash_in_flight: Option<PathBuf>,
     /// The last laid-out bounds of the inline rename input. Native text-input
     /// callbacks report window coordinates rather than the element hitbox, so
     /// this lets click-to-caret conversion use the same geometry the input
@@ -1816,6 +1822,7 @@ impl EditorView {
             sidebar_date_badge_today: local_today(),
             _date_badge_refresh_task: date_badge_refresh_task,
             pending_new_folders: HashSet::new(),
+            folder_trash_in_flight: None,
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
             editor_mode: EditorMode::default(),
@@ -2811,6 +2818,24 @@ impl EditorView {
         }
     }
 
+    /// Refuses a new note / folder whose target directory lies inside the
+    /// folder whose Trash move is still running, before any session or
+    /// pending state changes. Returns whether the request was refused.
+    fn refuse_new_entry_under_folder_trash(
+        &mut self,
+        target_directory: &Path,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.folder_trash_blocks(target_directory, false) {
+            return false;
+        }
+        self.status = Some(
+            "フォルダをゴミ箱へ移動中のため作成できません。完了後にやり直してください".to_owned(),
+        );
+        cx.notify();
+        true
+    }
+
     fn new_work_folder_note_heading() -> String {
         let today = local_today();
         format!("# {:04}-{:02}-{:02}_", today.year, today.month, today.day)
@@ -2829,6 +2854,9 @@ impl EditorView {
         let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
         };
+        if self.refuse_new_entry_under_folder_trash(&target_directory, cx) {
+            return;
+        }
         let scroll_y = self.scroll_y;
         self.sessions
             .active_mut()
@@ -2904,10 +2932,13 @@ impl EditorView {
         }
         self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
-        let Some(work_folder) = self.work_folder.as_ref() else {
+        let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
         };
-        let Some(target_directory) = self.target_directory_for_new_entry() else {
+        if self.refuse_new_entry_under_folder_trash(&target_directory, cx) {
+            return;
+        }
+        let Some(work_folder) = self.work_folder.as_ref() else {
             return;
         };
         let siblings = work_folder
@@ -3276,6 +3307,16 @@ impl EditorView {
                 cx.notify();
             }
             OpenDecision::Load { into } => {
+                // A read started now would land after the folder's OS Trash
+                // move and create a session for the trashed file.
+                if self.folder_trash_blocks(path, false) {
+                    self.status = Some(
+                        "フォルダをゴミ箱へ移動中のため、開けません。完了後にやり直してください"
+                            .to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 if !self.loading_paths.insert(path.to_path_buf()) {
                     // Already loading this path: the in-flight read will
                     // apply once it lands, and `latest_open_target` above is
