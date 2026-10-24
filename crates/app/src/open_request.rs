@@ -87,11 +87,19 @@ pub struct OpenRequest {
     path: PathBuf,
     reply: SyncSender<bool>,
     abandoned: Arc<AtomicBool>,
+    /// The editor's unsaved / saving state when the pipe received the request.
+    protected: bool,
 }
 
 impl OpenRequest {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The unsaved / saving state seen at receipt, before the request waited
+    /// for the editor to process it.
+    pub fn protected(&self) -> bool {
+        self.protected
     }
 
     /// True once the pipe gave up waiting and refused the sender; the editor
@@ -138,7 +146,7 @@ pub fn forward(path: &Path) -> io::Result<bool> {
     }
 }
 
-pub fn listen() -> io::Result<Receiver<OpenRequest>> {
+pub fn listen(guard: hane_ui::ExternalOpenGuard) -> io::Result<Receiver<OpenRequest>> {
     let name: Vec<u16> = pipe_name().encode_utf16().chain(Some(0)).collect();
     let handle = unsafe {
         CreateNamedPipeW(
@@ -173,6 +181,7 @@ pub fn listen() -> io::Result<Receiver<OpenRequest>> {
                     path,
                     reply,
                     abandoned: Arc::clone(&abandoned),
+                    protected: guard.unsaved(),
                 };
                 if sender.send(request).is_err() {
                     let _ = pipe.write_all(&[0]);
@@ -200,7 +209,7 @@ mod tests {
     #[test]
     fn forwards_a_unicode_file_path_and_acks_only_after_the_editor_takes_it() {
         // One test: the pipe is a per-installation singleton.
-        let receiver = listen().expect("start Hane's named pipe");
+        let receiver = listen(hane_ui::ExternalOpenGuard::new()).expect("start Hane's named pipe");
         let path = PathBuf::from(r"C:\Temp\Hane 日本語.md");
         let sent = path.clone();
         let sender = std::thread::spawn(move || forward(&sent));

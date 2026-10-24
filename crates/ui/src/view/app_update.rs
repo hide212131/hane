@@ -493,7 +493,8 @@ pub enum ExternalOpenOutcome {
 /// them. A request leaves the queue only when `accept` answers `Accepted`.
 #[derive(Debug, Default)]
 pub struct ExternalOpenQueue {
-    pending: std::collections::VecDeque<PathBuf>,
+    /// Each path with the unsaved / saving state seen when it was received.
+    pending: std::collections::VecDeque<(PathBuf, bool)>,
     /// Set by [`Self::seal_if_empty`] right before the helper is allowed to
     /// replace this process. A sealed queue refuses `try_push`, so the sender
     /// learns that this process can no longer open the request.
@@ -506,16 +507,22 @@ impl ExternalOpenQueue {
     }
 
     pub fn push(&mut self, path: PathBuf) {
-        self.pending.push_back(path);
+        self.pending.push_back((path, false));
     }
 
     /// Queues `path` unless the queue is sealed; a sealed queue hands the path
     /// back so the sender can deliver it to the next process.
     pub fn try_push(&mut self, path: PathBuf) -> Result<(), PathBuf> {
+        self.try_push_protected(path, false)
+    }
+
+    /// Like [`Self::try_push`], recording `protected` (the unsaved / saving
+    /// state at receipt) with the request.
+    pub fn try_push_protected(&mut self, path: PathBuf, protected: bool) -> Result<(), PathBuf> {
         if self.sealed {
             return Err(path);
         }
-        self.pending.push_back(path);
+        self.pending.push_back((path, protected));
         Ok(())
     }
 
@@ -546,9 +553,17 @@ impl ExternalOpenQueue {
     /// Offers queued paths in order. Stops at the first `Busy` answer, leaving
     /// that path (and every later one) queued. Returns how many were accepted.
     pub fn drain_into(&mut self, mut accept: impl FnMut(&Path) -> ExternalOpenOutcome) -> usize {
+        self.drain_requests_into(|path, _| accept(path))
+    }
+
+    /// [`Self::drain_into`] that also passes the state recorded at receipt.
+    pub fn drain_requests_into(
+        &mut self,
+        mut accept: impl FnMut(&Path, bool) -> ExternalOpenOutcome,
+    ) -> usize {
         let mut accepted = 0;
-        while let Some(path) = self.pending.front() {
-            match accept(path) {
+        while let Some((path, protected)) = self.pending.front() {
+            match accept(path, *protected) {
                 ExternalOpenOutcome::Accepted => {
                     self.pending.pop_front();
                     accepted += 1;
@@ -568,6 +583,30 @@ impl ExternalOpenQueue {
 #[derive(Clone, Debug, Default)]
 pub struct SharedExternalOpenQueue {
     inner: Arc<std::sync::Mutex<ExternalOpenQueue>>,
+    guard: ExternalOpenGuard,
+}
+
+/// The window's "any session is dirty or saving" state, shared with whatever
+/// receives external requests (Finder callback, Windows pipe). The receiver
+/// reads it when a request arrives, so the protection that existed then is not
+/// lost while the request waits for the UI to process it.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalOpenGuard {
+    unsaved: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExternalOpenGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_unsaved(&self, unsaved: bool) {
+        self.unsaved.store(unsaved, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn unsaved(&self) -> bool {
+        self.unsaved.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl SharedExternalOpenQueue {
@@ -575,17 +614,25 @@ impl SharedExternalOpenQueue {
         Self::default()
     }
 
+    /// The guard requests are stamped with when they are pushed.
+    pub fn guard(&self) -> ExternalOpenGuard {
+        self.guard.clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ExternalOpenQueue> {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn push(&self, path: PathBuf) {
-        self.lock().push(path);
+        let protected = self.guard.unsaved();
+        self.lock().pending.push_back((path, protected));
     }
 
-    /// See [`ExternalOpenQueue::try_push`].
+    /// See [`ExternalOpenQueue::try_push`]; the request is stamped with the
+    /// guard's state at this moment.
     pub fn try_push(&self, path: PathBuf) -> Result<(), PathBuf> {
-        self.lock().try_push(path)
+        let protected = self.guard.unsaved();
+        self.lock().try_push_protected(path, protected)
     }
 
     /// See [`ExternalOpenQueue::seal_if_empty`].
@@ -609,12 +656,20 @@ impl SharedExternalOpenQueue {
     /// `accept` runs (it may look at this queue again). A request leaves the
     /// queue only after it was accepted.
     pub fn drain_into(&self, mut accept: impl FnMut(&Path) -> ExternalOpenOutcome) -> usize {
+        self.drain_requests_into(|path, _| accept(path))
+    }
+
+    /// [`Self::drain_into`] that also passes the state recorded at receipt.
+    pub fn drain_requests_into(
+        &self,
+        mut accept: impl FnMut(&Path, bool) -> ExternalOpenOutcome,
+    ) -> usize {
         let mut accepted = 0;
         loop {
-            let Some(path) = self.lock().pending.front().cloned() else {
+            let Some((path, protected)) = self.lock().pending.front().cloned() else {
                 break;
             };
-            match accept(&path) {
+            match accept(&path, protected) {
                 ExternalOpenOutcome::Accepted => {
                     self.lock().pending.pop_front();
                     accepted += 1;
@@ -631,7 +686,22 @@ impl EditorView {
     /// (Finder). The final restart check treats a waiting request as a reason
     /// to keep this process running.
     pub fn attach_external_open_inbox(&mut self, inbox: Option<SharedExternalOpenQueue>) {
+        if let Some(inbox) = &inbox {
+            self.external_open_guard = inbox.guard();
+        }
         self.external_open_inbox = inbox;
+    }
+
+    /// Installs the guard a request receiver reads when a request arrives
+    /// (the Windows pipe; the Finder queue brings its own).
+    pub fn attach_external_open_guard(&mut self, guard: ExternalOpenGuard) {
+        self.external_open_guard = guard;
+    }
+
+    /// Publishes whether any session is dirty or saving. Called every render,
+    /// so a receiver reading it sees the state as of the latest frame.
+    pub(super) fn sync_external_open_guard(&self) {
+        self.external_open_guard.set_unsaved(self.has_unsaved_sessions());
     }
 
     /// Closes the external-open entrance if nothing is waiting. Without an
@@ -897,11 +967,22 @@ impl EditorView {
         path: &Path,
         cx: &mut Context<Self>,
     ) -> ExternalOpenOutcome {
+        self.submit_external_open_protected(path, false, cx)
+    }
+
+    /// [`Self::submit_external_open`] for a request that waited in a queue:
+    /// `protected` is the unsaved / saving state seen when it was received.
+    pub fn submit_external_open_protected(
+        &mut self,
+        path: &Path,
+        protected: bool,
+        cx: &mut Context<Self>,
+    ) -> ExternalOpenOutcome {
         if self.restart_freeze {
             return ExternalOpenOutcome::Busy;
         }
         self.external_open_generation = self.external_open_generation.wrapping_add(1);
-        self.open_external_path(path, cx);
+        self.open_external_path_protected(path, protected, cx);
         ExternalOpenOutcome::Accepted
     }
 
