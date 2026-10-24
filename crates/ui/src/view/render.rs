@@ -3,6 +3,7 @@ use super::*;
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
+        self.sync_external_open_guard();
         if self._input_mode_focus_subscription.is_none() {
             let focus_handle = self.focus_handle.clone();
             self._input_mode_focus_subscription =
