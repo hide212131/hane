@@ -109,6 +109,29 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key>
+      <dict>
+        <key>default</key>
+        <string>Haneで開く</string>
+      </dict>
+      <key>NSMessage</key>
+      <string>openFolderInHane</string>
+      <key>NSPortName</key>
+      <string>Hane</string>
+      <key>NSRequiredContext</key>
+      <dict>
+        <key>NSApplicationIdentifier</key>
+        <string>com.apple.finder</string>
+      </dict>
+      <key>NSSendFileTypes</key>
+      <array>
+        <string>public.folder</string>
+      </array>
+    </dict>
+  </array>
   <key>UTImportedTypeDeclarations</key>
   <array>
     <dict>
@@ -191,6 +214,16 @@ fi
 if [[ "$(plist_value UTImportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:0)" != "md" ]] \
   || plist_value UTImportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:1 >/dev/null; then
   echo "Imported Markdown UTI must register only the md extension" >&2
+  exit 1
+fi
+# Folders reach Hane through a Finder-only Service, never as a document type
+# (which would change "Open With" candidates and default applications).
+if [[ "$(plist_value NSServices:0:NSMessage)" != "openFolderInHane" ]] \
+  || [[ "$(plist_value NSServices:0:NSRequiredContext:NSApplicationIdentifier)" != "com.apple.finder" ]] \
+  || [[ "$(plist_value NSServices:0:NSSendFileTypes:0)" != "public.folder" ]] \
+  || plist_value NSServices:0:NSSendFileTypes:1 >/dev/null \
+  || plist_value NSServices:1 >/dev/null; then
+  echo "Info.plist must declare only the Finder folder Service openFolderInHane" >&2
   exit 1
 fi
 if [[ "$(plist_value LSMinimumSystemVersion)" != "11.0" ]]; then

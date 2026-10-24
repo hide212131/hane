@@ -25,6 +25,8 @@ use std::sync::Arc;
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod finder_open;
+#[cfg(target_os = "macos")]
+mod finder_service;
 
 mod app_update;
 mod https_transport;
@@ -345,14 +347,10 @@ pub(crate) fn application_with_finder_open(
     application.on_open_urls(move |urls| {
         for path in urls
             .iter()
-            .filter_map(|url| finder_open::markdown_path_from_url(url))
+            .filter_map(|url| finder_open::openable_path_from_url(url))
         {
-            // A folder is never opened from Finder: that would replace the
-            // sessions without the dirty-file guard `open_path` applies to
-            // documents.
-            if path.is_dir() {
-                continue;
-            }
+            // A folder is queued like a document; the window refuses the
+            // switch while a session is dirty or saving.
             // A sealed queue means the update helper is already authorized to
             // replace this process: the request cannot be opened here, so it
             // is handed to the process that follows instead of being lost.
@@ -695,6 +693,10 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         service as Arc<dyn AppUpdateController>
     });
     register_key_bindings(cx);
+    // Finder's right-click "Haneで開く" service feeds the same queue as
+    // `on_open_urls`; the application object exists by now.
+    #[cfg(target_os = "macos")]
+    finder_service::install(finder_requests.clone());
     let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
     let window = cx
         .open_window(
