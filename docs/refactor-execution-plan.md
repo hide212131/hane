@@ -543,6 +543,16 @@ session I/O、background parse、height/cache、viewportの残りのpointer/pane
 
 session I/O、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は引き続き #301 の後続として実行計画で追跡する。#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置（`view/background_parse.rs` の2メソッド）に依存する後続がある場合は逆順に戻す。
 
+#### 9.13.1 RF2-A: render組立の分離（#567 P1、PR #583）
+
+**旧→新:** `crates/ui/src/view.rs::impl Render for EditorView`（`render`一件）を `crates/ui/src/view/render.rs` へ原文どおり移動し、`view.rs` にprivateな `mod render;` を追加した。新moduleは兄弟moduleと同様に `use super::*;` を使う。親の型・field・初期化・helper・公開API・caller・既存tests/fixtureは元の場所に維持し、親importは変更していない（他の親コードや子moduleのglob importが使うため、移動を理由に削除しない）。
+
+**維持理由:** 処理順、settings early return、parse/cache/layout/height、mode→zoom→height anchor、caret/find補正、follow-up frame、listener登録順、row identity、overlay、metrics記録位置、closureの捕捉、状態寿命を変えないため、本文・コメントは変更していない。helper化、意味変更、最適化、新しいpub化、Manager/trait/状態所有者は追加していない。
+
+**後続境界:** height/cache共有helper、pointer/panel、settings、計測、初期化・非同期要求接続は親に残し、#567の残作業として追跡する。このP1だけで#567/#297/#315は完了しない。rollbackはこの移動PRを一単位で戻す。
+
+**検証:** 実装workerはshell/git/test/build/lint実行権限を持たず、`cargo test` / `cargo clippy` / `git diff --check` / CI / GUI validation / 移動範囲のbyte比較は未実施。結果はCommanderがPRに記録する。
+
 
 ### 9.14 RF2-B: presentationの機械的分割 第1PR — 位置対応 (#302)
 
