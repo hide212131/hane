@@ -1152,6 +1152,95 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[gpui::test]
+    fn new_entries_under_a_folder_being_trashed_are_refused(cx: &mut gpui::TestAppContext) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-new-entry");
+        let folder_path = root.join("dev");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.selected_folder = Some(folder_path.clone());
+            view.folder_trash_in_flight = Some(folder_path.clone());
+            let sessions_before = view.sessions.len();
+
+            view.new_work_folder_note(cx);
+            view.new_work_folder_folder(cx);
+
+            assert_eq!(view.sessions.len(), sessions_before);
+            assert!(view.work_folder_drafts.is_empty());
+            assert!(view.pending_new_folders.is_empty());
+            assert!(view.status.is_some());
+        });
+        cx.run_until_parked();
+        assert!(!folder_path.join("New Folder").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn drafts_in_a_trashed_folder_are_retargeted_to_the_nearest_surviving_ancestor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::WorkFolderScanner as _;
+
+        let root = rename_test_root("folder-trash-drafts");
+        let parent = root.join("a");
+        let trashed = parent.join("b");
+        let other = root.join("c");
+        std::fs::create_dir_all(trashed.join("deep")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let work_folder = hane_session::OsWorkFolderScanner.scan(&root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _cx| {
+            view.work_folder = Some(work_folder);
+            let inside = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                inside,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: trashed.join("deep"),
+                },
+            );
+            let outside = view.sessions.open_untitled("# keep", "Untitled");
+            view.work_folder_drafts.insert(
+                outside,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: other.clone(),
+                },
+            );
+
+            view.work_folder.as_mut().unwrap().remove_folder(&trashed);
+            view.retarget_drafts_after_folder_trash(&trashed);
+
+            assert_eq!(view.work_folder_drafts[&inside].target_directory, parent);
+            assert_eq!(view.work_folder_drafts[&outside].target_directory, other);
+            assert!(view.sessions.get(outside).is_some());
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     // Issue #236: a Save As into the work folder must reach the sidebar index
     // without waiting for a full rescan, for an already-saved document
     // (`Saved`) and for one with newer edits pending (`SavedStale`) alike.

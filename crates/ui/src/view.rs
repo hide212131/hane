@@ -2792,6 +2792,24 @@ impl EditorView {
         }
     }
 
+    /// Refuses a new note / folder whose target directory lies inside the
+    /// folder whose Trash move is still running, before any session or
+    /// pending state changes. Returns whether the request was refused.
+    fn refuse_new_entry_under_folder_trash(
+        &mut self,
+        target_directory: &Path,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.folder_trash_blocks(target_directory, false) {
+            return false;
+        }
+        self.status = Some(
+            "フォルダをゴミ箱へ移動中のため作成できません。完了後にやり直してください".to_owned(),
+        );
+        cx.notify();
+        true
+    }
+
     fn new_work_folder_note_heading() -> String {
         let today = local_today();
         format!("# {:04}-{:02}-{:02}_", today.year, today.month, today.day)
@@ -2810,6 +2828,9 @@ impl EditorView {
         let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
         };
+        if self.refuse_new_entry_under_folder_trash(&target_directory, cx) {
+            return;
+        }
         let scroll_y = self.scroll_y;
         self.sessions
             .active_mut()
@@ -2885,10 +2906,13 @@ impl EditorView {
         }
         self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
-        let Some(work_folder) = self.work_folder.as_ref() else {
+        let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
         };
-        let Some(target_directory) = self.target_directory_for_new_entry() else {
+        if self.refuse_new_entry_under_folder_trash(&target_directory, cx) {
+            return;
+        }
+        let Some(work_folder) = self.work_folder.as_ref() else {
             return;
         };
         let siblings = work_folder

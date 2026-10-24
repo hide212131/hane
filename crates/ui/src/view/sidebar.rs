@@ -907,6 +907,32 @@ impl EditorView {
         })
     }
 
+    /// After `trashed` left the tree, points every unnamed draft whose save
+    /// directory was inside it at the nearest ancestor that still exists in
+    /// the tree (the Work Folder root at worst). Other drafts are untouched,
+    /// and draft bodies are never modified.
+    fn retarget_drafts_after_folder_trash(&mut self, trashed: &Path) {
+        let Some(work_folder) = self.work_folder.as_ref() else {
+            return;
+        };
+        let root = work_folder.root().to_path_buf();
+        for draft in self.work_folder_drafts.values_mut() {
+            if !draft.target_directory.starts_with(trashed) {
+                continue;
+            }
+            let replacement = trashed
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| {
+                    ancestor.starts_with(&root)
+                        && (*ancestor == root || work_folder.children_at(ancestor).is_some())
+                })
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.clone());
+            draft.target_directory = replacement;
+        }
+    }
+
     pub(crate) fn dismiss_sidebar_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
         if self.sidebar_context_menu.take().is_some() {
             cx.notify();
@@ -1088,6 +1114,7 @@ impl EditorView {
                         if let Some(folder) = view.work_folder.as_mut() {
                             folder.remove_folder(&path);
                         }
+                        view.retarget_drafts_after_folder_trash(&path);
                         view.expanded_folders
                             .retain(|expanded| !expanded.starts_with(&path));
                         view.pending_new_folders
