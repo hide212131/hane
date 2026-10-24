@@ -509,9 +509,20 @@ impl DocumentSession {
     /// under it, including a first save or Save As whose destination the
     /// session's current file path does not show yet.
     pub fn writes_under_folder(&self, folder: &Path) -> bool {
-        self.in_flight_target
+        if self
+            .in_flight_target
             .as_deref()
             .is_some_and(|target| target.starts_with(folder))
+        {
+            return true;
+        }
+        // A save queued behind the running write runs next and would recreate
+        // the path after the folder is gone, so its destination counts too.
+        match self.pending_save.as_ref() {
+            Some(SaveIntent::To(path) | SaveIntent::CreateNew(path)) => path.starts_with(folder),
+            Some(SaveIntent::Current | SaveIntent::Overwrite) => self.is_under_folder(folder),
+            None => false,
+        }
     }
 
     /// Follows a folder this app itself just moved to the Trash: a session

@@ -400,6 +400,52 @@ fn a_save_as_into_a_nested_folder_blocks_the_folder_trash_until_it_lands() {
 }
 
 #[test]
+fn a_queued_save_into_a_folder_blocks_the_folder_trash_while_the_active_write_is_outside() {
+    for queued in [
+        SaveIntent::To("/notes/dev/nested/queued.md".into()),
+        SaveIntent::CreateNew("/notes/dev/nested/queued.md".into()),
+    ] {
+        let service = service_with(&[("/elsewhere/a.md", "a\n")]);
+        let mut sessions = opened(&service, "/elsewhere/a.md");
+        let SaveDecision::Write(job) = sessions
+            .active_mut()
+            .request_save(SaveIntent::To("/elsewhere/first.md".into()))
+        else {
+            panic!("expected an accepted write");
+        };
+        assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+
+        assert!(matches!(
+            sessions.active_mut().request_save(queued),
+            SaveDecision::Queued
+        ));
+        assert!(
+            sessions.has_unsaved_under(Path::new("/notes/dev")),
+            "the queued destination counts while the active write is outside"
+        );
+        assert!(!sessions.has_unsaved_under(Path::new("/notes/other")));
+
+        let result = run_save_job(&service, &job.path, &job.document, job.guard);
+        assert!(matches!(
+            sessions.active_mut().finish_save(job.ticket, result),
+            SaveOutcome::Saved
+        ));
+        assert!(
+            sessions.has_unsaved_under(Path::new("/notes/dev")),
+            "the queued write still blocks the folder after the active one lands"
+        );
+        assert!(sessions.active_mut().take_pending_save().is_some());
+        assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+        assert!(
+            service
+                .load(Path::new("/notes/dev/nested/queued.md"))
+                .is_err(),
+            "the queued target is not written while blocked"
+        );
+    }
+}
+
+#[test]
 fn a_folder_rename_moves_only_the_open_sessions_under_it() {
     let service = service_with(&[
         ("/notes/dev/a.md", "a\n"),
