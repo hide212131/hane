@@ -1058,6 +1058,10 @@ pub struct EditorView {
     /// scanned before anything is replaced, so only the newest request may
     /// apply its result, and only if `work_folder_generation` is unchanged.
     external_folder_open_token: u64,
+    /// The newest file an external open asked for after the pending external
+    /// folder scan began. The scan result still switches the Work Folder, but
+    /// the later file is reopened afterwards so it stays the active session.
+    external_file_open_after_folder_scan: Option<PathBuf>,
     /// The OS watch on the current work folder and its re-list bookkeeping;
     /// dropped (releasing the watch) when the folder is replaced or the
     /// window closes.
@@ -1854,6 +1858,7 @@ impl EditorView {
             restoring_path: None,
             work_folder_generation: 0,
             external_folder_open_token: 0,
+            external_file_open_after_folder_scan: None,
             folder_watch: folder_watch::FolderWatchState::default(),
             listing_requests: folder_watch::ListingRequests::default(),
             focus_handle: cx.focus_handle(),
@@ -3197,6 +3202,7 @@ impl EditorView {
         self.external_folder_open_token = self.external_folder_open_token.wrapping_add(1);
         let token = self.external_folder_open_token;
         let generation = self.work_folder_generation;
+        self.external_file_open_after_folder_scan = None;
         self.status = Some("Opening work folder…".to_owned());
         let draft_store = self.draft_store.clone();
         cx.spawn(async move |view, cx| {
@@ -3257,6 +3263,7 @@ impl EditorView {
             cx.notify();
             return;
         }
+        let later_file = self.external_file_open_after_folder_scan.take();
         self.reset_for_work_folder_switch(cx);
         #[cfg(feature = "instrument")]
         {
@@ -3266,7 +3273,15 @@ impl EditorView {
         let request = self.begin_listing_request();
         self.accept_listing_result(request);
         let generation = self.work_folder_generation;
+        // A file requested after this scan began owns the initial session, so
+        // the folder's first entry must not replace it.
+        if let Some(file) = &later_file {
+            self.latest_open_target = Some(file.clone());
+        }
         self.finish_work_folder_scan(generation, scanned, cx);
+        if let Some(file) = later_file {
+            self.open_path(&file, cx);
+        }
     }
 
     fn reset_for_work_folder_switch(&mut self, cx: &mut Context<Self>) {
@@ -3360,6 +3375,7 @@ impl EditorView {
             }
             self.open_external_folder(path.to_path_buf(), cx);
         } else {
+            self.external_file_open_after_folder_scan = Some(path.to_path_buf());
             self.open_path(path, cx);
         }
     }
@@ -13436,6 +13452,72 @@ mod tests {
                 Some(folder.as_path())
             );
             assert_eq!(view.settings.default_folder, default_before);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: a file opened externally after an earlier external folder
+    // scan began stays the active session when that older scan completes, and
+    // the folder still becomes the Work Folder.
+    #[gpui::test]
+    fn a_later_external_file_stays_active_when_an_earlier_folder_scan_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-then-file");
+        let folder = root.join("folder-a");
+        let other = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(folder.join("First.md"), "# First\n").unwrap();
+        let file_b = other.join("B.md");
+        std::fs::write(&file_b, "# B\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        // Folder A's scan has started (token and generation as
+        // `open_external_folder` records them) but has not completed yet.
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+        // The later file request is processed and completes first.
+        view.update(cx, |view, cx| view.open_external_path(&file_b, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# B\n");
+        });
+
+        // Then the older folder scan completes.
+        let scanned = (
+            OsWorkFolderScanner.scan(&folder),
+            Ok(RecoveredDrafts {
+                drafts: Vec::new(),
+                failed: 0,
+            }),
+            #[cfg(feature = "instrument")]
+            Instant::now(),
+            #[cfg(not(feature = "instrument"))]
+            (),
+        );
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder.as_path())
+            );
+            assert_eq!(view.active_session().path(), Some(file_b.as_path()));
+            assert_eq!(view.editor().document().full_text(), "# B\n");
         });
         std::fs::remove_dir_all(&root).unwrap();
     }
