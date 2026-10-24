@@ -3281,6 +3281,16 @@ impl EditorView {
                 cx.notify();
             }
             OpenDecision::Load { into } => {
+                // A read started now would land after the folder's OS Trash
+                // move and create a session for the trashed file.
+                if self.folder_trash_blocks(path, false) {
+                    self.status = Some(
+                        "フォルダをゴミ箱へ移動中のため、開けません。完了後にやり直してください"
+                            .to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 if !self.loading_paths.insert(path.to_path_buf()) {
                     // Already loading this path: the in-flight read will
                     // apply once it lands, and `latest_open_target` above is

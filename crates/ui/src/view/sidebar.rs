@@ -1106,6 +1106,21 @@ impl EditorView {
             cx.notify();
             return;
         }
+        // An open read still pending under `path` would land after the OS
+        // move and create a session for the trashed file; refuse until it has
+        // finished.
+        if self
+            .loading_paths
+            .iter()
+            .any(|loading| loading.starts_with(&path))
+        {
+            self.status = Some(
+                "ファイルを開いている途中のため、ゴミ箱へ移動できません。完了後にやり直してください"
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
         self.folder_trash_in_flight = Some(path.clone());
         self.status = Some("ゴミ箱へ移動しています…".to_owned());
         let generation = self.work_folder_generation;
