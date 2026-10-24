@@ -22,6 +22,8 @@ type Sel = *mut c_void;
 type Class = *mut c_void;
 
 #[link(name = "Foundation", kind = "framework")]
+unsafe extern "C" {}
+
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
 
