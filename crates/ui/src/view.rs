@@ -7872,6 +7872,69 @@ mod tests {
         });
     }
 
+    /// Issue #603: the same reading-mode link press, driven through the real
+    /// mouse-down / mouse-move / mouse-up dispatch. The test platform records
+    /// only the most recent opened URL, so "opened once" is shown as: nothing
+    /// at mouse-down, the destination after mouse-up.
+    #[gpui::test]
+    fn reading_link_click_opens_on_mouse_up_and_drag_selects_through_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = "see [Hane](https://example.com/) end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Visual text is "see Hane end": offset 5 is inside the link, 9 is past it.
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        let (move_point, dragged_to) = row_click(&view, cx, "row-0-0", 0, 0, 9);
+        let (text_before, revision_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+            )
+        });
+        assert!(cx.opened_url().is_none());
+
+        // Drag first (the recorded URL cannot be reset): the URL is not
+        // opened and the selection drag starts at the press position.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        let selection_after_drag = Selection {
+            anchor: pressed,
+            active: dragged_to,
+        };
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert_eq!(view.editor().selection(), selection_after_drag);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+        });
+
+        // Plain click: held at mouse-down, opened at mouse-up, nothing edited.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_some());
+            assert_eq!(view.editor().selection(), selection_after_drag);
+        });
+        cx.simulate_mouse_up(down_point, MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(cx.opened_url().as_deref(), Some(DESTINATION));
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection(), selection_after_drag);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+        });
+    }
+
     /// Issue #502: editing a reference definition in another block must not
     /// leave a cached link presentation that still opens the old destination.
     #[gpui::test]
