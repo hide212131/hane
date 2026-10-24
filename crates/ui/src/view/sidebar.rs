@@ -1398,6 +1398,12 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
         CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
         CoInitializeEx, CoUninitialize,
     };
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostQuitMessage,
+        PostThreadMessageW, TranslateMessage, WM_APP, WM_USER,
+    };
     use windows::Win32::UI::Shell::{
         FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
         FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
@@ -1441,9 +1447,58 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
         }
     }
 
-    // `IFileOperation` requires an STA. The caller's thread (a Windows thread
-    // pool worker) is not guaranteed to be one, so run on a dedicated thread
-    // that this function owns and initializes as an STA itself.
+    /// The real Win32 message queue of the calling (STA) thread.
+    struct Win32Messages;
+
+    impl MessageSource for Win32Messages {
+        fn start(&mut self) -> std::io::Result<()> {
+            let mut msg = MSG::default();
+            // SAFETY: a PM_NOREMOVE peek forces creation of this thread's
+            // message queue; `msg` is a valid out pointer.
+            unsafe {
+                let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+            }
+            Ok(())
+        }
+
+        fn post_job(&mut self) -> std::io::Result<()> {
+            // SAFETY: posts to the current thread's own queue created above.
+            unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_APP, WPARAM(0), LPARAM(0)) }
+                .map_err(to_io)
+        }
+
+        fn next(&mut self) -> std::io::Result<PumpMessage> {
+            let mut msg = MSG::default();
+            // SAFETY: `msg` is a valid out pointer; the queue is this thread's.
+            let status = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+            match status.0 {
+                0 => Ok(PumpMessage::Quit),
+                -1 => Err(std::io::Error::other(
+                    windows::core::Error::from_win32().to_string(),
+                )),
+                _ if msg.hwnd.0.is_null() && msg.message == WM_APP => Ok(PumpMessage::RunJob),
+                _ => {
+                    // SAFETY: `msg` was filled in by `GetMessageW`.
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    Ok(PumpMessage::Dispatched)
+                }
+            }
+        }
+
+        fn request_stop(&mut self) {
+            // SAFETY: posts WM_QUIT to this thread's own queue.
+            unsafe { PostQuitMessage(0) };
+        }
+    }
+
+    // `IFileOperation` requires an STA whose thread pumps messages. The
+    // caller's thread (a Windows thread pool worker) is neither, so run on a
+    // dedicated thread that this function owns: it initializes COM as an STA,
+    // starts a message loop, and calls `IFileOperation` only from inside that
+    // loop. The loop keeps running until the operation has returned.
     let path = path.to_path_buf();
     let worker = std::thread::Builder::new()
         .name("hane-recycle".to_owned())
@@ -1459,9 +1514,10 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
             } else {
                 ComApartment::Failed(init.message())
             };
-            let result = run_in_sta(state, || recycle(&path));
+            let result = run_in_sta_with_pump(state, &mut Win32Messages, || recycle(&path));
             if init.is_ok() {
-                // SAFETY: matches the successful `CoInitializeEx` above.
+                // SAFETY: matches the successful `CoInitializeEx` above, after
+                // the message loop has stopped.
                 unsafe { CoUninitialize() };
             }
             result
@@ -1469,6 +1525,74 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
     worker
         .join()
         .unwrap_or_else(|_| Err(std::io::Error::other("ごみ箱への移動処理が異常終了しました")))
+}
+
+/// What one turn of a thread's message loop produced.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PumpMessage {
+    /// The loop was told to quit (`WM_QUIT`).
+    Quit,
+    /// The message that authorizes the single `IFileOperation` call.
+    RunJob,
+    /// Any other message, already translated and dispatched.
+    Dispatched,
+}
+
+/// The thread message queue behind the pump, abstracted so the ordering of
+/// start / dispatch / job / stop is testable without Win32.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+trait MessageSource {
+    /// Makes the thread's message queue exist.
+    fn start(&mut self) -> std::io::Result<()>;
+    /// Queues the message that authorizes the job.
+    fn post_job(&mut self) -> std::io::Result<()>;
+    /// Blocks for the next message; dispatches ordinary ones.
+    fn next(&mut self) -> std::io::Result<PumpMessage>;
+    /// Asks the loop to end after the job has finished.
+    fn request_stop(&mut self);
+}
+
+/// Runs `job` from inside a live message loop and keeps the loop running
+/// until the job has returned. The job never runs if the loop cannot start,
+/// and it runs at most once.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn run_message_pump<S: MessageSource>(
+    source: &mut S,
+    job: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    source.start()?;
+    source.post_job()?;
+    let mut job = Some(job);
+    let mut result = None;
+    loop {
+        match source.next()? {
+            PumpMessage::Quit => break,
+            PumpMessage::RunJob => {
+                if let Some(job) = job.take() {
+                    result = Some(job());
+                    source.request_stop();
+                }
+            }
+            PumpMessage::Dispatched => {}
+        }
+    }
+    result.unwrap_or_else(|| {
+        Err(std::io::Error::other(
+            "メッセージループが操作の実行前に終了したため、ごみ箱へ移動できません",
+        ))
+    })
+}
+
+/// Runs `operation` only on a valid STA, and only from inside a running
+/// message pump. Without both, the operation is never called.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn run_in_sta_with_pump<S: MessageSource>(
+    apartment: ComApartment,
+    source: &mut S,
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    run_in_sta(apartment, || run_message_pump(source, operation))
 }
 
 /// Result of initializing COM on the thread that would call `IFileOperation`.
@@ -1756,6 +1880,131 @@ mod tests {
         assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
         let failed =
             run_in_sta(ComApartment::Sta, || Err(std::io::Error::other("api"))).unwrap_err();
+        assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    /// Records the pump lifecycle so ordering against the job is observable.
+    struct FakeMessages {
+        events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        script: std::collections::VecDeque<PumpMessage>,
+        fail_start: bool,
+    }
+
+    impl FakeMessages {
+        fn new(
+            script: &[PumpMessage],
+            fail_start: bool,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>) {
+            let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (
+                Self {
+                    events: events.clone(),
+                    script: script.iter().copied().collect(),
+                    fail_start,
+                },
+                events,
+            )
+        }
+    }
+
+    impl MessageSource for FakeMessages {
+        fn start(&mut self) -> std::io::Result<()> {
+            if self.fail_start {
+                return Err(std::io::Error::other("no queue"));
+            }
+            self.events.borrow_mut().push("start");
+            Ok(())
+        }
+        fn post_job(&mut self) -> std::io::Result<()> {
+            self.events.borrow_mut().push("post_job");
+            Ok(())
+        }
+        fn next(&mut self) -> std::io::Result<PumpMessage> {
+            let message = self.script.pop_front().unwrap_or(PumpMessage::Quit);
+            self.events.borrow_mut().push(match message {
+                PumpMessage::Quit => "quit",
+                PumpMessage::RunJob => "run_job_message",
+                PumpMessage::Dispatched => "dispatch",
+            });
+            Ok(message)
+        }
+        fn request_stop(&mut self) {
+            self.events.borrow_mut().push("request_stop");
+            self.script.push_front(PumpMessage::Quit);
+        }
+    }
+
+    #[test]
+    fn file_operation_runs_only_inside_live_pump_and_before_stop() {
+        let (mut source, events) = FakeMessages::new(
+            &[PumpMessage::Dispatched, PumpMessage::RunJob],
+            false,
+        );
+        let log = events.clone();
+        let result = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
+            log.borrow_mut().push("job");
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            *events.borrow(),
+            [
+                "start",
+                "post_job",
+                "dispatch",
+                "run_job_message",
+                "job",
+                "request_stop",
+                "quit"
+            ]
+        );
+    }
+
+    #[test]
+    fn file_operation_not_called_without_pump_or_sta() {
+        let ran = std::cell::Cell::new(false);
+        let (mut source, _) = FakeMessages::new(&[PumpMessage::RunJob], true);
+        let result = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!ran.get());
+
+        // Pump that quits before authorizing the job.
+        let (mut source, _) = FakeMessages::new(&[PumpMessage::Dispatched], false);
+        let result = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!ran.get());
+
+        // Wrong or failed apartment never even starts the pump.
+        let (mut source, events) = FakeMessages::new(&[PumpMessage::RunJob], false);
+        let result = run_in_sta_with_pump(ComApartment::WrongMode, &mut source, || {
+            ran.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!ran.get());
+        assert!(events.borrow().is_empty());
+    }
+
+    #[test]
+    fn pump_keeps_cancel_and_failure_distinct_and_stops() {
+        let (mut source, events) = FakeMessages::new(&[PumpMessage::RunJob], false);
+        let cancelled = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
+            Err(trash_cancelled())
+        })
+        .unwrap_err();
+        assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
+        assert!(events.borrow().contains(&"request_stop"));
+        let (mut source, _) = FakeMessages::new(&[PumpMessage::RunJob], false);
+        let failed = run_in_sta_with_pump(ComApartment::Sta, &mut source, || {
+            Err(std::io::Error::other("api"))
+        })
+        .unwrap_err();
         assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
     }
 
