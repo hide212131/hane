@@ -147,6 +147,9 @@ pub struct DocumentSession {
     saved_revision: Revision,
     autosave_generation: u64,
     in_flight: Option<SaveTicket>,
+    /// The path the running write targets, which differs from the session's
+    /// current file for a first save or a Save As until the write lands.
+    in_flight_target: Option<PathBuf>,
     save_sequence: u64,
     pending_save: Option<SaveIntent>,
     view: SessionViewState,
@@ -178,6 +181,7 @@ impl DocumentSession {
             saved_revision,
             autosave_generation: 0,
             in_flight: None,
+            in_flight_target: None,
             save_sequence: 0,
             pending_save: None,
             view: SessionViewState::default(),
@@ -252,6 +256,7 @@ impl DocumentSession {
         self.generation = self.generation.wrapping_add(1);
         self.autosave_generation = 0;
         self.in_flight = None;
+        self.in_flight_target = None;
         self.pending_save = None;
         self.view = SessionViewState::default();
         self.auto_title = None;
@@ -369,6 +374,7 @@ impl DocumentSession {
             revision: self.revision(),
         };
         self.in_flight = Some(ticket);
+        self.in_flight_target = Some(path.clone());
         SaveDecision::Write(SaveJob {
             path,
             document: self.editor.document().clone(),
@@ -388,6 +394,7 @@ impl DocumentSession {
             return SaveOutcome::Superseded;
         }
         self.in_flight = None;
+        self.in_flight_target = None;
         match result {
             Ok(saved) => {
                 self.file.set_identity(saved.identity, saved.stamp);
@@ -436,6 +443,7 @@ impl DocumentSession {
     pub fn finish_rename(&mut self, ticket: SaveTicket) {
         if self.in_flight == Some(ticket) {
             self.in_flight = None;
+            self.in_flight_target = None;
         }
     }
 
@@ -495,6 +503,15 @@ impl DocumentSession {
         self.file
             .identity()
             .is_some_and(|identity| identity.path().starts_with(folder))
+    }
+
+    /// Whether a write that is running right now targets `folder` or somewhere
+    /// under it, including a first save or Save As whose destination the
+    /// session's current file path does not show yet.
+    pub fn writes_under_folder(&self, folder: &Path) -> bool {
+        self.in_flight_target
+            .as_deref()
+            .is_some_and(|target| target.starts_with(folder))
     }
 
     /// Follows a folder this app itself just moved to the Trash: a session
@@ -734,7 +751,9 @@ impl SessionSet {
     /// or a write in flight, i.e. moving the folder away would put it at risk.
     pub fn has_unsaved_under(&self, folder: &Path) -> bool {
         self.sessions.iter().any(|session| {
-            session.is_under_folder(folder) && (session.is_dirty() || session.save_in_flight())
+            session.writes_under_folder(folder)
+                || (session.is_under_folder(folder)
+                    && (session.is_dirty() || session.save_in_flight()))
         })
     }
 

@@ -334,6 +334,72 @@ fn a_folder_with_a_dirty_session_under_it_is_reported_unsaved() {
 }
 
 #[test]
+fn a_first_save_into_a_nested_folder_blocks_the_folder_trash_until_it_lands() {
+    let service = MemoryFileService::new();
+    let mut sessions = SessionSet::with_untitled("draft\n", "Untitled");
+    let SaveDecision::Write(job) = sessions
+        .active_mut()
+        .request_save(SaveIntent::CreateNew("/notes/dev/nested/new.md".into()))
+    else {
+        panic!("expected an accepted write");
+    };
+    assert!(
+        sessions.active().path().is_none(),
+        "the session has no file until the write lands"
+    );
+    assert!(
+        sessions.has_unsaved_under(Path::new("/notes/dev")),
+        "the running write's target counts, not only the session's file"
+    );
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/other")));
+
+    let result = run_save_job(&service, &job.path, &job.document, job.guard);
+    assert!(matches!(
+        sessions.active_mut().finish_save(job.ticket, result),
+        SaveOutcome::Saved
+    ));
+    assert_eq!(
+        service
+            .load(Path::new("/notes/dev/nested/new.md"))
+            .unwrap()
+            .document
+            .full_text(),
+        "draft\n",
+        "the saved content is kept"
+    );
+    assert!(
+        !sessions.has_unsaved_under(Path::new("/notes/dev")),
+        "the folder is free once the write has landed"
+    );
+}
+
+#[test]
+fn a_save_as_into_a_nested_folder_blocks_the_folder_trash_until_it_lands() {
+    let service = service_with(&[("/elsewhere/a.md", "a\n")]);
+    let mut sessions = opened(&service, "/elsewhere/a.md");
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+    let decision = sessions
+        .active_mut()
+        .request_save(SaveIntent::To("/notes/dev/nested/copy.md".into()));
+    assert!(
+        sessions.has_unsaved_under(Path::new("/notes/dev")),
+        "the Save As target is under the folder while the write runs"
+    );
+
+    let outcome = complete(sessions.active_mut(), &service, decision);
+    assert!(matches!(outcome, SaveOutcome::Saved));
+    assert_eq!(
+        service
+            .load(Path::new("/notes/dev/nested/copy.md"))
+            .unwrap()
+            .document
+            .full_text(),
+        "a\n"
+    );
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+}
+
+#[test]
 fn a_folder_rename_moves_only_the_open_sessions_under_it() {
     let service = service_with(&[
         ("/notes/dev/a.md", "a\n"),
