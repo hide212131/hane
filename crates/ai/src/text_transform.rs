@@ -1235,6 +1235,7 @@ mod tests {
             operation_id,
             ActiveConnection::ChatGpt,
             "model-x",
+            PromptSource::FreeText,
             "校正する",
             "選択された文章",
             None,
