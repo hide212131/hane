@@ -490,6 +490,26 @@ impl DocumentSession {
         }
     }
 
+    /// Whether this session's file lives at `folder` or somewhere under it.
+    pub fn is_under_folder(&self, folder: &Path) -> bool {
+        self.file
+            .identity()
+            .is_some_and(|identity| identity.path().starts_with(folder))
+    }
+
+    /// Follows a folder this app itself just moved to the Trash: a session
+    /// whose file lived under `folder` keeps its content and is marked missing
+    /// from disk, the same way a single-file `FileEvent::Deleted` would.
+    pub fn apply_folder_delete(&mut self, folder: &Path) -> FileEventOutcome {
+        if !self.is_under_folder(folder) {
+            return FileEventOutcome::Ignored;
+        }
+        self.file.mark_missing();
+        FileEventOutcome::Missing {
+            dirty: self.is_dirty(),
+        }
+    }
+
     /// Follows a folder rename this app itself just performed: if this
     /// session's file lives at `from` or somewhere under it, its path moves
     /// to the same position under `to`, the same way a single-file
@@ -705,6 +725,26 @@ impl SessionSet {
             .iter_mut()
             .filter_map(|session| {
                 let outcome = session.apply_file_event(event);
+                (outcome != FileEventOutcome::Ignored).then_some((session.id(), outcome))
+            })
+            .collect()
+    }
+
+    /// Whether any session whose file lives under `folder` has unsaved changes
+    /// or a write in flight, i.e. moving the folder away would put it at risk.
+    pub fn has_unsaved_under(&self, folder: &Path) -> bool {
+        self.sessions.iter().any(|session| {
+            session.is_under_folder(folder) && (session.is_dirty() || session.save_in_flight())
+        })
+    }
+
+    /// Routes a folder deletion to every session whose file lives under
+    /// `folder`: each keeps its content and is marked missing from disk.
+    pub fn delete_folder(&mut self, folder: &Path) -> Vec<(SessionId, FileEventOutcome)> {
+        self.sessions
+            .iter_mut()
+            .filter_map(|session| {
+                let outcome = session.apply_folder_delete(folder);
                 (outcome != FileEventOutcome::Ignored).then_some((session.id(), outcome))
             })
             .collect()

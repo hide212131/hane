@@ -1018,6 +1018,79 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Moves a whole folder to the OS Trash / Recycle Bin on a background
+    /// thread. Any session under it with unsaved changes (or a write in
+    /// flight) blocks the move; if edits land while the move is running the
+    /// sessions stay open with their content, marked as missing from disk.
+    /// The Work Folder root is never a target.
+    fn sidebar_context_trash_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        let Some(root) = self.work_folder.as_ref().map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        if path == root || !path.starts_with(&root) {
+            self.status = Some("このフォルダはゴミ箱へ移動できません".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.sessions.has_unsaved_under(&path) {
+            self.status = Some(
+                "未保存の変更があるファイルを含むため、ゴミ箱へ移動できません。先に保存してください"
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        self.status = Some("ゴミ箱へ移動しています…".to_owned());
+        let generation = self.work_folder_generation;
+        cx.spawn(async move |view, cx| {
+            let trash_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { move_path_to_trash(&trash_path) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.work_folder_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        view.sessions.delete_folder(&path);
+                        if let Some(folder) = view.work_folder.as_mut() {
+                            folder.remove_folder(&path);
+                        }
+                        view.expanded_folders
+                            .retain(|expanded| !expanded.starts_with(&path));
+                        view.pending_new_folders
+                            .retain(|pending| !pending.starts_with(&path));
+                        if view
+                            .selected_folder
+                            .as_ref()
+                            .is_some_and(|selected| selected.starts_with(&path))
+                        {
+                            view.selected_folder = None;
+                            if view.sidebar_focus == SidebarFocus::Folder {
+                                view.sidebar_focus = SidebarFocus::ActiveSession;
+                            }
+                        }
+                        view.content_search_workspace_changed(cx);
+                        view.status = Some("ゴミ箱へ移動しました".to_owned());
+                    }
+                    Err(error) => {
+                        view.status = Some(format!("ゴミ箱へ移動できません: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn sidebar_context_menu_element(
         &self,
         menu: &SidebarContextMenu,
@@ -1093,6 +1166,16 @@ impl EditorView {
                             window,
                             cx,
                         );
+                    },
+                ));
+                let trash_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-trash",
+                    "ゴミ箱に移動",
+                    true,
+                    cx,
+                    move |view, _, _, cx| {
+                        view.sidebar_context_trash_folder(trash_path.clone(), cx)
                     },
                 ));
                 #[cfg(any(target_os = "macos", target_os = "windows"))]

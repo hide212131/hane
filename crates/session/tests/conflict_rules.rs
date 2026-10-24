@@ -296,6 +296,44 @@ fn a_rename_moves_the_session_without_touching_the_document() {
 }
 
 #[test]
+fn a_folder_delete_marks_only_the_open_sessions_under_it_missing() {
+    let service = service_with(&[
+        ("/notes/dev/nested/b.md", "b\n"),
+        ("/notes/devices.md", "other\n"),
+    ]);
+    let mut sessions = opened(&service, "/notes/dev/nested/b.md");
+    let inside = sessions.active_id();
+    let outside = sessions.apply_open(None, service.load(Path::new("/notes/devices.md")).unwrap());
+
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/dev")));
+    let outcomes = sessions.delete_folder(Path::new("/notes/dev"));
+    assert_eq!(
+        outcomes,
+        vec![(inside, FileEventOutcome::Missing { dirty: false })],
+        "a sibling sharing a name prefix is not under the folder"
+    );
+    assert_eq!(
+        sessions.get(inside).unwrap().path(),
+        Some(Path::new("/notes/dev/nested/b.md")),
+        "the session stays open with its content"
+    );
+    assert_ne!(
+        sessions.get(inside).unwrap().presence(),
+        sessions.get(outside).unwrap().presence(),
+        "only the session under the folder is marked missing"
+    );
+}
+
+#[test]
+fn a_folder_with_a_dirty_session_under_it_is_reported_unsaved() {
+    let service = service_with(&[("/notes/dev/a.md", "a\n")]);
+    let mut sessions = opened(&service, "/notes/dev/a.md");
+    type_into(sessions.active_mut(), "edit");
+    assert!(sessions.has_unsaved_under(Path::new("/notes/dev")));
+    assert!(!sessions.has_unsaved_under(Path::new("/notes/other")));
+}
+
+#[test]
 fn a_folder_rename_moves_only_the_open_sessions_under_it() {
     let service = service_with(&[
         ("/notes/dev/a.md", "a\n"),

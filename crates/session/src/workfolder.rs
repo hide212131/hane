@@ -453,6 +453,16 @@ impl WorkFolder {
         let _ = remove_file(&mut self.children, path);
     }
 
+    /// Follows a folder this app itself just moved to the Trash, dropping its
+    /// node and every descendant from the index. The root is never removed, and
+    /// a `path` the folder was not scanned with is a no-op.
+    pub fn remove_folder(&mut self, path: &Path) {
+        if path == self.root {
+            return;
+        }
+        let _ = remove_folder(&mut self.children, path);
+    }
+
     /// Follows a folder rename this app itself just performed: `from` moves to
     /// `to`, and every descendant path (files and subfolders alike) moves with
     /// it, keeping the same structure relative to the new parent so the tree
