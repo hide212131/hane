@@ -1389,49 +1389,316 @@ fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Windows: `SHFileOperationW` with `FOF_ALLOWUNDO`. API errors and an
-/// aborted operation are errors; there is no silent permanent-delete fallback.
+/// Windows: `IFileOperation` with `FOFX_RECYCLEONDELETE` (documented as
+/// "send to the Recycle Bin instead of permanently deleting"). Success also
+/// requires the progress sink to observe a successful `PostDeleteItem` with a
+/// Recycle Bin item (`psiNewlyCreated`); a vanished source path alone is never
+/// treated as success. `PreDeleteItem` aborts any item the shell does not
+/// declare as recycle-if-possible, so there is no permanent-delete fallback.
 #[cfg(target_os = "windows")]
 fn native_move_to_trash(path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::UI::Shell::{FO_DELETE, SHFILEOPSTRUCTW, SHFileOperationW};
-    use windows::core::PCWSTR;
 
-    // `SHFileOperationW` is a plain synchronous Win32 call. Unlike
-    // `IFileOperation` it needs no COM apartment and no caller-side message
-    // loop, so there is no STA / `RPC_E_CHANGED_MODE` / message-dispatch
-    // precondition that has to hold while it runs. It still recycles
-    // (`FOF_ALLOWUNDO`). Call it from a dedicated thread so the caller (the
-    // UI input path) never waits on filesystem I/O.
     let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     let source = shell_delete_source(&wide)?;
+    // A dedicated thread owns a fresh STA for the whole operation, so the
+    // caller (the UI input path) never waits on filesystem I/O and never hits
+    // `RPC_E_CHANGED_MODE`. The progress sink is a plain in-process object
+    // living in that same STA; the shell invokes it on the thread that calls
+    // `PerformOperations`, so no cross-apartment dispatch is required while
+    // that call runs (exercised by `windows_recycle_runs_on_sta_thread`).
     let worker = std::thread::Builder::new()
         .name("hane-recycle".to_owned())
-        .spawn(move || {
-            let mut operation = SHFILEOPSTRUCTW {
-                wFunc: FO_DELETE,
-                pFrom: PCWSTR(source.as_ptr()),
-                fFlags: SHELL_DELETE_FLAGS,
-                ..Default::default()
-            };
-            // SAFETY: `operation` and the double-NUL-terminated `source`
-            // buffer outlive the call; no other field points to memory.
-            let code = unsafe { SHFileOperationW(&mut operation) };
-            let aborted = operation.fAnyOperationsAborted.as_bool();
-            classify_shell_delete(code, aborted)
-        })?;
+        .spawn(move || windows_recycle::recycle_on_sta(&source))?;
     worker
         .join()
         .unwrap_or_else(|_| Err(std::io::Error::other("ごみ箱への移動処理が異常終了しました")))
 }
 
+#[cfg(target_os = "windows")]
+mod windows_recycle {
+    use super::{RECYCLE_OPERATION_FLAGS, RecycleReport, classify_recycle};
+    use std::sync::{Arc, Mutex};
+    use windows::Win32::Foundation::{E_ABORT, HRESULT};
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        FILEOPERATION_FLAGS, FileOperation, IFileOperation, IFileOperationProgressSink,
+        IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
+    };
+    use windows::core::{PCWSTR, Ref, implement};
+
+    /// `TSF_DELETE_RECYCLE_IF_POSSIBLE`
+    const TSF_DELETE_RECYCLE_IF_POSSIBLE: u32 = 0x0000_0080;
+
+    #[implement(IFileOperationProgressSink)]
+    struct RecycleSink {
+        report: Arc<Mutex<RecycleReport>>,
+    }
+
+    impl IFileOperationProgressSink_Impl for RecycleSink_Impl {
+        fn StartOperations(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn FinishOperations(&self, _hrresult: HRESULT) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreRenameItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostRenameItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _hrrename: HRESULT,
+            _psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreMoveItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostMoveItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _hrmove: HRESULT,
+            _psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreCopyItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostCopyItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _hrcopy: HRESULT,
+            _psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PreDeleteItem(
+            &self,
+            dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            if dwflags & TSF_DELETE_RECYCLE_IF_POSSIBLE == 0 {
+                // Not a recycle: refuse before anything is deleted.
+                if let Ok(mut report) = self.report.lock() {
+                    report.refused = true;
+                }
+                return Err(E_ABORT.into());
+            }
+            Ok(())
+        }
+        fn PostDeleteItem(
+            &self,
+            _dwflags: u32,
+            _psiitem: Ref<'_, IShellItem>,
+            hrdelete: HRESULT,
+            psinewlycreated: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            if let Ok(mut report) = self.report.lock() {
+                report.post_delete_seen += 1;
+                if hrdelete.is_ok() && !psinewlycreated.is_null() {
+                    report.recycled += 1;
+                } else if hrdelete.is_err() {
+                    report.failed_hresult = Some(hrdelete.0);
+                }
+            }
+            Ok(())
+        }
+        fn PreNewItem(
+            &self,
+            _dwflags: u32,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PostNewItem(
+            &self,
+            _dwflags: u32,
+            _psidestinationfolder: Ref<'_, IShellItem>,
+            _psznewname: &PCWSTR,
+            _psztemplatename: &PCWSTR,
+            _dwfileattributes: u32,
+            _hrnew: HRESULT,
+            _psinewitem: Ref<'_, IShellItem>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn UpdateProgress(&self, _iworktotal: u32, _iworksofar: u32) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn ResetTimer(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn PauseTimer(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn ResumeTimer(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Initializes a fresh STA on the current thread, recycles the single
+    /// path in `source` (NUL-terminated) and uninitializes COM again.
+    pub(super) fn recycle_on_sta(source: &[u16]) -> std::io::Result<()> {
+        // SAFETY: balanced with `CoUninitialize` below on this same thread,
+        // after every COM object created in `recycle` has been dropped.
+        let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if init.is_err() {
+            return Err(std::io::Error::other(format!(
+                "COMの初期化に失敗しました (0x{:X})",
+                init.0
+            )));
+        }
+        let result = recycle(source);
+        // SAFETY: matches the successful `CoInitializeEx` above.
+        unsafe { CoUninitialize() };
+        result
+    }
+
+    fn recycle(source: &[u16]) -> std::io::Result<()> {
+        let report = Arc::new(Mutex::new(RecycleReport::default()));
+        let hresult_error = |context: &str, error: windows::core::Error| {
+            std::io::Error::other(format!(
+                "ごみ箱への移動に失敗しました ({context}: 0x{:X})",
+                error.code().0
+            ))
+        };
+        // SAFETY: `source` is NUL-terminated and outlives the call.
+        let item: IShellItem = unsafe {
+            SHCreateItemFromParsingName(PCWSTR(source.as_ptr()), None::<&windows::Win32::System::Com::IBindCtx>)
+        }
+        .map_err(|e| hresult_error("SHCreateItemFromParsingName", e))?;
+        // SAFETY: plain COM activation in the STA initialized by the caller.
+        let operation: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
+            .map_err(|e| hresult_error("CoCreateInstance", e))?;
+        let sink: IFileOperationProgressSink = RecycleSink {
+            report: Arc::clone(&report),
+        }
+        .into();
+        // SAFETY: all interface pointers are valid for the duration of the calls.
+        let (performed, aborted) = unsafe {
+            operation
+                .SetOperationFlags(FILEOPERATION_FLAGS(RECYCLE_OPERATION_FLAGS))
+                .map_err(|e| hresult_error("SetOperationFlags", e))?;
+            let cookie = operation
+                .Advise(&sink)
+                .map_err(|e| hresult_error("Advise", e))?;
+            let queued = operation
+                .DeleteItem(&item, None::<&IFileOperationProgressSink>)
+                .map_err(|e| hresult_error("DeleteItem", e));
+            let performed = match queued {
+                Ok(()) => operation.PerformOperations().map_err(|e| e.code().0),
+                Err(error) => {
+                    let _ = operation.Unadvise(cookie);
+                    return Err(error);
+                }
+            };
+            let aborted = operation
+                .GetAnyOperationsAborted()
+                .map(|b| b.as_bool())
+                .unwrap_or(true);
+            let _ = operation.Unadvise(cookie);
+            (performed, aborted)
+        };
+        let snapshot = report.lock().map(|r| r.clone()).unwrap_or_default();
+        classify_recycle(performed, aborted, &snapshot)
+    }
+}
+
 /// `FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT |
-/// FOF_WANTNUKEWARNING`. `FOF_ALLOWUNDO` sends to the Recycle Bin;
-/// `FOF_WANTNUKEWARNING` partially overrides `FOF_NOCONFIRMATION` so an item
-/// that cannot be recycled asks the user (who can cancel) instead of being
-/// deleted permanently without notice.
+/// FOF_WANTNUKEWARNING | FOFX_RECYCLEONDELETE`. `FOFX_RECYCLEONDELETE` sends
+/// to the Recycle Bin instead of permanently deleting; `FOF_WANTNUKEWARNING`
+/// partially overrides `FOF_NOCONFIRMATION` so an item that cannot be
+/// recycled asks the user (who can cancel) instead of vanishing silently.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const SHELL_DELETE_FLAGS: u16 = 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000;
+const RECYCLE_OPERATION_FLAGS: u32 = 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000 | 0x0008_0000;
+
+/// What the `IFileOperation` progress sink observed.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecycleReport {
+    /// `PostDeleteItem` calls seen.
+    post_delete_seen: u32,
+    /// Of those, successes that reported a Recycle Bin item.
+    recycled: u32,
+    /// HRESULT of a failed delete, if any.
+    failed_hresult: Option<i32>,
+    /// `PreDeleteItem` refused a non-recycle delete.
+    refused: bool,
+}
+
+/// Maps `PerformOperations`' result (`Err` carries the HRESULT), the aborted
+/// flag and the sink report to success, user cancel (`Interrupted`) or
+/// failure. Success requires exactly one item observed as recycled.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn classify_recycle(
+    performed: Result<(), i32>,
+    any_aborted: bool,
+    report: &RecycleReport,
+) -> std::io::Result<()> {
+    const HRESULT_USER_CANCELLED: i32 = 0x8007_04C7_u32 as i32;
+    const COPYENGINE_E_USER_CANCELLED: i32 = 0x8027_0000_u32 as i32;
+    if any_aborted && !report.refused {
+        return Err(trash_cancelled());
+    }
+    if let Err(hr) = performed {
+        if hr == HRESULT_USER_CANCELLED || hr == COPYENGINE_E_USER_CANCELLED {
+            return Err(trash_cancelled());
+        }
+        return Err(std::io::Error::other(format!(
+            "ごみ箱への移動に失敗しました (IFileOperation: 0x{:X})",
+            hr as u32
+        )));
+    }
+    if report.refused {
+        return Err(std::io::Error::other(
+            "ごみ箱へ移動できないため、削除を中止しました",
+        ));
+    }
+    if let Some(hr) = report.failed_hresult {
+        return Err(std::io::Error::other(format!(
+            "ごみ箱への移動に失敗しました (IFileOperation: 0x{:X})",
+            hr as u32
+        )));
+    }
+    if report.post_delete_seen == 1 && report.recycled == 1 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "ごみ箱への移動を確認できなかったため、成功として扱いません",
+        ))
+    }
+}
 
 /// Builds the double-NUL-terminated `pFrom` list for one path. An interior
 /// NUL would silently turn into a second path, so it is rejected.
@@ -1445,21 +1712,6 @@ fn shell_delete_source(path: &[u16]) -> std::io::Result<Vec<u16>> {
     let mut wide = path.to_vec();
     wide.extend([0, 0]);
     Ok(wide)
-}
-
-/// Maps `SHFileOperationW`'s return value and `fAnyOperationsAborted` to
-/// success, user cancel (`Interrupted`) or failure. Never a silent success.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn classify_shell_delete(code: i32, any_aborted: bool) -> std::io::Result<()> {
-    match code {
-        // DE_OPCANCELLED, ERROR_CANCELLED
-        0x75 | 0x4C7 => Err(trash_cancelled()),
-        0 if any_aborted => Err(trash_cancelled()),
-        0 => Ok(()),
-        code => Err(std::io::Error::other(format!(
-            "ごみ箱への移動に失敗しました (SHFileOperation: 0x{code:X})"
-        ))),
-    }
 }
 
 /// Linux and others: `gio trash`.
@@ -1696,26 +1948,87 @@ mod tests {
     }
 
     #[test]
-    fn shell_delete_result_distinguishes_success_cancel_and_failure() {
-        assert!(classify_shell_delete(0, false).is_ok());
-        for code in [0x75, 0x4C7] {
-            let cancelled = classify_shell_delete(code, false).unwrap_err();
-            assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
+    fn recycled_report() -> RecycleReport {
+        RecycleReport {
+            post_delete_seen: 1,
+            recycled: 1,
+            ..RecycleReport::default()
         }
-        // Success status with an aborted flag is a cancel, never a success.
-        let aborted = classify_shell_delete(0, true).unwrap_err();
-        assert_eq!(aborted.kind(), std::io::ErrorKind::Interrupted);
-        let failed = classify_shell_delete(0x7C, false).unwrap_err();
-        assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
     }
 
     #[test]
-    fn shell_delete_flags_recycle_without_permanent_delete_fallback() {
+    fn recycle_result_requires_observed_recycle_bin_item() {
+        assert!(classify_recycle(Ok(()), false, &recycled_report()).is_ok());
+        // API success with no observed recycle (e.g. permanent delete) fails.
+        let permanent = RecycleReport {
+            post_delete_seen: 1,
+            ..RecycleReport::default()
+        };
+        let error = classify_recycle(Ok(()), false, &permanent).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+        // No callback at all is not a success either.
+        assert!(classify_recycle(Ok(()), false, &RecycleReport::default()).is_err());
+        // More than one deleted item is unexpected for a single path.
+        let many = RecycleReport {
+            post_delete_seen: 2,
+            recycled: 2,
+            ..RecycleReport::default()
+        };
+        assert!(classify_recycle(Ok(()), false, &many).is_err());
+    }
+
+    #[test]
+    fn recycle_result_distinguishes_cancel_refusal_and_error() {
+        for hr in [0x8007_04C7_u32 as i32, 0x8027_0000_u32 as i32] {
+            let cancelled = classify_recycle(Err(hr), false, &RecycleReport::default()).unwrap_err();
+            assert_eq!(cancelled.kind(), std::io::ErrorKind::Interrupted);
+        }
+        // Aborted flag wins over an otherwise complete report.
+        let aborted = classify_recycle(Ok(()), true, &recycled_report()).unwrap_err();
+        assert_eq!(aborted.kind(), std::io::ErrorKind::Interrupted);
+        let failed = classify_recycle(Err(0x8000_4005_u32 as i32), false, &RecycleReport::default())
+            .unwrap_err();
+        assert_ne!(failed.kind(), std::io::ErrorKind::Interrupted);
+        let refused = RecycleReport {
+            refused: true,
+            ..RecycleReport::default()
+        };
+        // PreDeleteItem refusal aborts the operation but is an error, not a cancel.
+        let error = classify_recycle(Ok(()), true, &refused).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+        let item_failed = RecycleReport {
+            post_delete_seen: 1,
+            failed_hresult: Some(0x8007_0005_u32 as i32),
+            ..RecycleReport::default()
+        };
+        assert!(classify_recycle(Ok(()), false, &item_failed).is_err());
+    }
+
+    #[test]
+    fn recycle_flags_request_recycle_bin_without_permanent_delete_fallback() {
         // FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
-        // | FOF_WANTNUKEWARNING
-        assert_eq!(SHELL_DELETE_FLAGS, 0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000);
-        assert_ne!(SHELL_DELETE_FLAGS & 0x0040, 0);
-        assert_ne!(SHELL_DELETE_FLAGS & 0x4000, 0);
+        // | FOF_WANTNUKEWARNING | FOFX_RECYCLEONDELETE
+        assert_eq!(
+            RECYCLE_OPERATION_FLAGS,
+            0x0040 | 0x0010 | 0x0400 | 0x0004 | 0x4000 | 0x0008_0000
+        );
+        assert_ne!(RECYCLE_OPERATION_FLAGS & 0x0008_0000, 0);
+        assert_ne!(RECYCLE_OPERATION_FLAGS & 0x0040, 0);
+        assert_ne!(RECYCLE_OPERATION_FLAGS & 0x4000, 0);
+    }
+
+    /// Directly exercises the real API on a fresh STA thread: the sink must be
+    /// dispatched during `PerformOperations` and observe a Recycle Bin item.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_recycle_runs_on_sta_thread() {
+        let dir = trash_test_dir("windows-recycle");
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("note.md"), "x").unwrap();
+        native_move_to_trash(&folder).unwrap();
+        assert!(!folder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
