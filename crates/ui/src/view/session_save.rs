@@ -657,6 +657,9 @@ impl EditorView {
         else {
             return;
         };
+        // The save slot may now be in flight; publish it before a request that
+        // arrives ahead of the next frame can read a stale clean state.
+        self.sync_external_open_guard();
         match decision {
             SaveDecision::NeedsPath => {
                 // Guidance, not a save state: the footer's save display is

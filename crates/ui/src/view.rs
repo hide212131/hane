@@ -2769,6 +2769,9 @@ impl EditorView {
     }
 
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
+        // An edit makes the session dirty now; do not wait for the next frame
+        // to tell the external-open receivers.
+        self.sync_external_open_guard();
         // Keep block boundaries current without waiting for the background parse:
         // this re-parses only the edited window, never the document.
         if let Some(update) = self
@@ -13435,6 +13438,62 @@ mod tests {
             assert_ne!(view.work_folder_generation, generation);
         });
         cx.run_until_parked();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: the guard was clean at the last render, a save then started,
+    // and the request arrived before the next render. The save finishes before
+    // the queue is drained, so both the receipt and the processing time would
+    // look clean unless starting the save publishes the guard itself.
+    #[gpui::test]
+    fn a_folder_received_during_a_save_is_refused_after_the_save_finishes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-save-window");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let queue = SharedExternalOpenQueue::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_inbox(Some(queue.clone()));
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            // The last render saw a clean window.
+            queue.guard().set_unsaved(false);
+            view.save_current(cx);
+            assert!(view.sessions.active().save_in_flight());
+            // Finder / Windows IPC receives the request now, mid-save.
+            queue.try_push(folder.clone()).unwrap();
+        });
+        // The save finishes before the queue is drained.
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.has_unsaved_sessions());
+            let generation = view.work_folder_generation;
+            let accepted = queue.drain_requests_into(|path, protected| {
+                view.submit_external_open_protected(path, protected, cx)
+            });
+            assert_eq!(accepted, 1);
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.editor().document().full_text(), "before after");
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder")
+            );
+        });
         std::fs::remove_dir_all(&root).unwrap();
     }
 
