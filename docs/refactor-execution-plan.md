@@ -553,6 +553,16 @@ session I/O、height/cache、viewportの残りのpointer/panel処理、settings�
 
 **検証:** 実装workerはshell/git/test/build/lint実行権限を持たず、`cargo test` / `cargo clippy` / `git diff --check` / CI / GUI validation / 移動範囲のbyte比較は未実施。結果はCommanderがPRに記録する。
 
+#### 9.13.2 RF2-A: 計測用implの分離（#567 P2、PR #611）
+
+**旧→新:** `crates/ui/src/view.rs` の計測有効側impl（`instrument` / `timing-probe`、17メソッド）と通常構成のno-op impl（4メソッド）を、privateな `crates/ui/src/view/measurement.rs` へ原文どおり移動した。親には無条件の `mod measurement;` を追加し（通常構成のno-opを失わないためmodule自体はcfgで隠さない）、新moduleは `use super::*;` を使う。具体仕様は [P2仕様](implementation/issue-567-p2-measurement.md) を正とし、ここでは複製しない。
+
+**維持理由:** 親の `after_input` から呼ぶため、両cfg側の `record_block_index_update` だけを `pub(super)` にした。他の可視性・属性・コメント・本文・順序、field・`InstrumentationState`・metrics出力型・caller・既存testsは変更していない。`EditorView` の状態所有者も動かしていない。
+
+**後続境界:** 型・field・初期化、settings、height/cache、pointer/panel、open/save接続などは親に残り、#567の残作業として追跡する。このP2だけで#567/#297は完了しない。rollbackはこの移動PRを一単位で戻す。
+
+**検証:** 実装workerはshell/git/test/build/lint実行権限を持たず、仕様の検証コマンド（通常・all-features・timing-probe単独・instrument各構成のtest/clippy/release build）、移動範囲のbyte比較、CI、GUI validationは未実施。結果はCommanderがPRに記録する。
+
 
 ### 9.14 RF2-B: presentationの機械的分割 第1PR — 位置対応 (#302)
 
