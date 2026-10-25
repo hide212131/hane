@@ -4439,7 +4439,7 @@ impl EditorView {
         let shaper = WindowShaper::new(window, self.zoom);
         let Some(hit) = self.row_hit_at_window_point(
             line,
-            fragment,
+            fragment.clone(),
             f32::from(event.position.x),
             f32::from(event.position.y),
             &shaper,
@@ -4461,6 +4461,8 @@ impl EditorView {
                     offset,
                     press_x: f32::from(event.position.x),
                     press_y: f32::from(event.position.y),
+                    line,
+                    fragment,
                 });
             } else {
                 cx.open_url(&destination);
@@ -4514,6 +4516,34 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let release_x = f32::from(event.position.x);
+        let release_y = f32::from(event.position.y);
+        let is_drag = self.pending_reading_link.as_ref().is_some_and(|pending| {
+            link_press_is_drag(pending.press_x, pending.press_y, release_x, release_y)
+        });
+        if is_drag {
+            // No move reached the view, but the release is past the shared
+            // threshold: select from the press to the release point.
+            let pending = self.pending_reading_link.clone();
+            self.start_drag_from_pending_link(cx);
+            if let Some(pending) = pending
+                && let Some(offset) = self.offset_at_row_x(
+                    pending.line,
+                    pending.fragment,
+                    release_x,
+                    release_y,
+                    window,
+                )
+            {
+                let selection = Selection {
+                    anchor: pending.offset,
+                    active: offset,
+                };
+                if self.editor_mut().set_selection(selection).is_ok() {
+                    self.after_input(cx);
+                }
+            }
+        }
         let pending = self.pending_reading_link.take();
         self.finish_panel_drag(event, window, cx);
         if let Some(pending) = pending {
@@ -6423,6 +6453,10 @@ struct PendingReadingLink {
     /// movement measured against `LINK_PRESS_DRAG_THRESHOLD`.
     press_x: f32,
     press_y: f32,
+    /// Row the press landed on, used to resolve the release point when no
+    /// mouse-move reached the view before the mouse-up.
+    line: usize,
+    fragment: Range<usize>,
 }
 
 /// Pointer travel, in logical pixels, from a reading-mode link press at which
@@ -7880,6 +7914,8 @@ mod tests {
                 offset: pressed,
                 press_x: 0.0,
                 press_y: 0.0,
+                line: 0,
+                fragment: 0..0,
             };
             let text_before = view.editor().document().full_text();
             let selection_before = view.editor().selection();
@@ -8059,6 +8095,70 @@ mod tests {
                 assert!(!view.editor().can_redo());
             });
         }
+    }
+
+    /// Issue #603: with no mouse-move dispatched at all, the release point is
+    /// compared with the press using the same threshold. At or past it the
+    /// press is a selection drag (URL not opened); below it, a click.
+    #[gpui::test]
+    fn reading_link_release_without_move_uses_threshold_through_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = "see [Hane](https://example.com/) end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        let (text_before, revision_before, selection_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.editor().selection(),
+            )
+        });
+        let moved = |dx: f32| point(down_point.x + px(dx), down_point.y);
+
+        // Exactly the threshold, no MouseMove: drag, URL not opened.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(
+            moved(LINK_PRESS_DRAG_THRESHOLD),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection().anchor, pressed);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+        });
+
+        view.update(cx, |view, _| {
+            view.editor_mut().set_selection(selection_before).unwrap();
+        });
+
+        // Below the threshold, no MouseMove: a click, opened exactly once.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(
+            moved(LINK_PRESS_DRAG_THRESHOLD - 0.5),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        assert_eq!(cx.opened_url().as_deref(), Some(DESTINATION));
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert_eq!(view.editor().selection(), selection_before);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert!(!view.editor().can_undo());
+            assert!(!view.editor().can_redo());
+        });
     }
 
     /// Issue #502: editing a reference definition in another block must not
