@@ -115,7 +115,9 @@ fn drafts_dir(root: &Path) -> PathBuf {
 /// The target directory as a root-relative string (empty for the root
 /// itself). Relative so the journal survives the work folder being moved.
 /// A target outside the root falls back to the root. On Unix the raw path
-/// bytes are kept, so a valid non-UTF-8 folder name is not lost; elsewhere a
+/// bytes are kept, so a valid non-UTF-8 folder name is not lost. On Windows a
+/// UTF-8 path is stored as plain UTF-8 (the original sidecar format); any other
+/// path is stored as its UTF-16 code units behind `WIDE_PREFIX`. Elsewhere a
 /// path that is not valid UTF-8 falls back to the root.
 fn encode_target(root: &Path, target_directory: &Path) -> Vec<u8> {
     let Ok(relative) = target_directory.strip_prefix(root) else {
@@ -126,10 +128,47 @@ fn encode_target(root: &Path, target_directory: &Path) -> Vec<u8> {
         use std::os::unix::ffi::OsStrExt;
         relative.as_os_str().as_bytes().to_vec()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        match relative.to_str() {
+            Some(text) => text.as_bytes().to_vec(),
+            None => encode_wide_units(&relative.as_os_str().encode_wide().collect::<Vec<_>>()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         relative.to_str().unwrap_or("").as_bytes().to_vec()
     }
+}
+
+/// Marks a sidecar holding UTF-16 code units. It starts with a NUL, which no
+/// path can contain, so it never collides with a plain UTF-8 target.
+#[cfg(any(windows, test))]
+const WIDE_PREFIX: &[u8] = b"\0wide:";
+
+/// UTF-16 code units as `WIDE_PREFIX` followed by four lowercase hex digits
+/// per unit.
+#[cfg(any(windows, test))]
+fn encode_wide_units(units: &[u16]) -> Vec<u8> {
+    let mut encoded = WIDE_PREFIX.to_vec();
+    for unit in units {
+        encoded.extend_from_slice(format!("{unit:04x}").as_bytes());
+    }
+    encoded
+}
+
+/// Inverse of `encode_wide_units`; `None` when `encoded` is not that format.
+#[cfg(any(windows, test))]
+fn decode_wide_units(encoded: &[u8]) -> Option<Vec<u16>> {
+    let digits = encoded.strip_prefix(WIDE_PREFIX)?;
+    if digits.len() % 4 != 0 {
+        return None;
+    }
+    digits
+        .chunks(4)
+        .map(|chunk| u16::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok())
+        .collect()
 }
 
 /// Inverse of `encode_target`. Anything that is not a plain relative path
@@ -139,18 +178,31 @@ fn decode_target(root: &Path, encoded: &[u8]) -> PathBuf {
     #[cfg(unix)]
     let relative = {
         use std::os::unix::ffi::OsStrExt;
-        Path::new(std::ffi::OsStr::from_bytes(encoded))
+        PathBuf::from(std::ffi::OsStr::from_bytes(encoded))
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let relative = if encoded.starts_with(WIDE_PREFIX) {
+        use std::os::windows::ffi::OsStringExt;
+        match decode_wide_units(encoded) {
+            Some(units) => PathBuf::from(std::ffi::OsString::from_wide(&units)),
+            None => return root.to_path_buf(),
+        }
+    } else {
+        match std::str::from_utf8(encoded) {
+            Ok(text) => PathBuf::from(text),
+            Err(_) => return root.to_path_buf(),
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
     let relative = match std::str::from_utf8(encoded) {
-        Ok(text) => Path::new(text),
+        Ok(text) => PathBuf::from(text),
         Err(_) => return root.to_path_buf(),
     };
     let plain = relative
         .components()
         .all(|component| matches!(component, std::path::Component::Normal(_)));
     if plain {
-        root.join(relative)
+        root.join(&relative)
     } else {
         root.to_path_buf()
     }
@@ -273,13 +325,18 @@ impl DraftStore for OsDraftStore {
                 failed += 1;
                 continue;
             };
-            // A missing or unreadable sidecar (a journal written before
-            // targets were recorded) recovers to the work folder root.
-            let target_directory = fs::read(dir.join(id.target_file_name()))
-                .map_or_else(
-                    |_| root.to_path_buf(),
-                    |encoded| decode_target(root, &encoded),
-                );
+            // A missing sidecar (a journal written before targets were
+            // recorded) recovers to the work folder root. Any other read
+            // failure must not silently move the note to the root: the
+            // draft is left on disk and reported as failed instead.
+            let target_directory = match fs::read(dir.join(id.target_file_name())) {
+                Ok(encoded) => decode_target(root, &encoded),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => root.to_path_buf(),
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
             drafts.push(RecoveredDraft {
                 id,
                 text,
@@ -455,12 +512,81 @@ mod tests {
         assert_eq!(target.file_name(), child.file_name());
 
         // Creating the real folder only works where the filesystem accepts
-        // invalid UTF-8 names.
-        if fs::create_dir_all(&child).is_ok() {
-            fs::write(target.join("Title.md"), "# Title").unwrap();
-            assert!(child.join("Title.md").is_file());
-            assert!(!root.join("Title.md").exists());
+        // invalid UTF-8 names. Only that specific rejection is tolerated;
+        // permission and other I/O errors fail the test.
+        match fs::create_dir_all(&child) {
+            Ok(()) => {
+                fs::write(target.join("Title.md"), "# Title").unwrap();
+                assert!(child.join("Title.md").is_file());
+                assert!(!root.join("Title.md").exists());
+            }
+            Err(error) if rejects_non_utf8_names(&error) => {}
+            Err(error) => panic!("unexpected error creating {child:?}: {error}"),
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Whether `error` is a filesystem refusing a name's encoding (illegal
+    /// byte sequence / invalid argument), as opposed to a real I/O failure.
+    #[cfg(unix)]
+    fn rejects_non_utf8_names(error: &io::Error) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const EILSEQ: i32 = 92;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        const EILSEQ: i32 = 84;
+        const EINVAL: i32 = 22;
+        matches!(error.raw_os_error(), Some(EILSEQ | EINVAL))
+    }
+
+    #[test]
+    fn wide_units_round_trip_losslessly_on_every_platform() {
+        // An unpaired surrogate is not valid UTF-16, hence not UTF-8 either.
+        let units = [0x006e, 0xd800, 0x006f, 0x3042];
+        let encoded = encode_wide_units(&units);
+        assert!(std::str::from_utf8(&encoded).is_ok());
+        assert_eq!(decode_wide_units(&encoded).unwrap(), units);
+        assert_eq!(decode_wide_units(b"plain/relative"), None);
+        assert_eq!(decode_wide_units(b"\0wide:00z0"), None);
+        assert_eq!(decode_wide_units(b"\0wide:006"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_non_utf8_windows_target_round_trips_through_wide_units() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = temporary_directory("draft-target-wide");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        let name = OsString::from_wide(&[0x006e, 0xd800, 0x006f]);
+        assert!(name.to_str().is_none());
+        let child = root.join(&name);
+        OsDraftStore.write(&root, id, &child, "# Title").unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.failed, 0);
+        assert_eq!(recovered.drafts[0].target_directory, child);
+        assert_ne!(recovered.drafts[0].target_directory, root);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_read_keeps_the_draft_out_of_the_root() {
+        let root = temporary_directory("draft-sidecar-read-error");
+        let dir = drafts_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let id = DraftId::generate();
+        fs::write(dir.join(id.file_name()), "text").unwrap();
+        // A directory in the sidecar's place fails to read with an error
+        // other than NotFound, whatever user the test runs as.
+        fs::create_dir(dir.join(id.target_file_name())).unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert!(recovered.drafts.is_empty());
+        assert_eq!(recovered.failed, 1);
+        assert!(dir.join(id.file_name()).is_file());
         fs::remove_dir_all(root).unwrap();
     }
 
