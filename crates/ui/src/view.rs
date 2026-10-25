@@ -17858,6 +17858,78 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[gpui::test]
+    fn a_recovered_draft_does_not_recreate_a_missing_target_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-missing-target");
+        let target = root.join("dev");
+        std::fs::create_dir_all(&target).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+
+        let first = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        first.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.sidebar_context_new_note(target.clone(), cx);
+            view.flush_pending_drafts();
+        });
+
+        // Simulate the destination being removed while the app is closed.
+        std::fs::remove_dir(&target).unwrap();
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, target);
+        let restarted_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let second = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        second.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(restarted_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        second.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        second.read_with(cx, |view, _| {
+            assert!(view.active_session().path().is_none());
+            assert_eq!(
+                view.status.as_deref(),
+                Some("対象のフォルダが見つからないため作成できません。一覧を確認してください")
+            );
+        });
+        assert!(!target.exists(), "a missing folder must not be recreated");
+        assert!(!OsDraftStore.recover(&root).unwrap().drafts.is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     // Issue #608: a child folder whose name ends in whitespace is a distinct
     // real folder; recovery must not trim it into a different name.
     // Windows cannot keep a trailing ASCII space in a real folder name, so this

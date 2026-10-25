@@ -277,10 +277,28 @@ impl EditorView {
                     .get(&id)
                     .map(|draft| draft.target_directory.clone())
                     .unwrap_or(work_folder_root);
+                if !self.target_directory_is_available(&target_directory) {
+                    self.refuse_missing_title_target_directory(id, cx);
+                    return;
+                }
                 self.begin_title_create(id, target_directory, title, cx);
             }
             TitleSyncAction::Rename(title) => self.begin_title_rename(id, title, cx),
         }
+    }
+
+    fn target_directory_is_available(&self, target_directory: &Path) -> bool {
+        self.work_folder
+            .as_ref()
+            .is_some_and(|work_folder| work_folder.children_at(target_directory).is_some())
+    }
+
+    fn refuse_missing_title_target_directory(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.title_sync_pending.remove(&id);
+        self.status = Some(
+            "対象のフォルダが見つからないため作成できません。一覧を確認してください".to_owned(),
+        );
+        cx.notify();
     }
 
     /// Picks a collision-free `<title>.md` under `target_directory` in the
@@ -344,6 +362,14 @@ impl EditorView {
                     .get(id)
                     .is_none_or(DocumentSession::should_defer_h1_create);
                 if should_skip {
+                    return;
+                }
+                // The destination can disappear while the filename probe is
+                // running. Revalidate against the current tree before the
+                // save path is handed to the filesystem service; otherwise
+                // an atomic write could recreate the missing parent folder.
+                if !view.target_directory_is_available(&root) {
+                    view.refuse_missing_title_target_directory(id, cx);
                     return;
                 }
                 view.title_sync_pending.insert(id, title.clone());
