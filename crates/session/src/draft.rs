@@ -114,21 +114,38 @@ fn drafts_dir(root: &Path) -> PathBuf {
 
 /// The target directory as a root-relative string (empty for the root
 /// itself). Relative so the journal survives the work folder being moved.
-/// A target outside the root, or not valid UTF-8, falls back to the root.
-fn encode_target(root: &Path, target_directory: &Path) -> String {
-    target_directory
-        .strip_prefix(root)
-        .ok()
-        .and_then(Path::to_str)
-        .unwrap_or("")
-        .to_owned()
+/// A target outside the root falls back to the root. On Unix the raw path
+/// bytes are kept, so a valid non-UTF-8 folder name is not lost; elsewhere a
+/// path that is not valid UTF-8 falls back to the root.
+fn encode_target(root: &Path, target_directory: &Path) -> Vec<u8> {
+    let Ok(relative) = target_directory.strip_prefix(root) else {
+        return Vec::new();
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        relative.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        relative.to_str().unwrap_or("").as_bytes().to_vec()
+    }
 }
 
 /// Inverse of `encode_target`. Anything that is not a plain relative path
 /// below the root (absolute, `..`) is ignored in favour of the root.
-fn decode_target(root: &Path, encoded: &str) -> PathBuf {
+fn decode_target(root: &Path, encoded: &[u8]) -> PathBuf {
     // Not trimmed: a folder name may validly begin or end with whitespace.
-    let relative = Path::new(encoded);
+    #[cfg(unix)]
+    let relative = {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(encoded))
+    };
+    #[cfg(not(unix))]
+    let relative = match std::str::from_utf8(encoded) {
+        Ok(text) => Path::new(text),
+        Err(_) => return root.to_path_buf(),
+    };
     let plain = relative
         .components()
         .all(|component| matches!(component, std::path::Component::Normal(_)));
@@ -139,7 +156,7 @@ fn decode_target(root: &Path, encoded: &str) -> PathBuf {
     }
 }
 
-fn write_atomically(dir: &Path, name: &str, contents: &str) -> io::Result<()> {
+fn write_atomically(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
     let target = dir.join(name);
     let temporary = dir.join(format!("{name}.tmp"));
     {
@@ -149,7 +166,7 @@ fn write_atomically(dir: &Path, name: &str, contents: &str) -> io::Result<()> {
             .truncate(true)
             .open(&temporary)?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(contents.as_bytes())?;
+        writer.write_all(contents)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
     }
@@ -197,7 +214,7 @@ impl DraftStore for OsDraftStore {
             &id.target_file_name(),
             &encode_target(root, target_directory),
         )?;
-        write_atomically(&dir, &id.file_name(), text)
+        write_atomically(&dir, &id.file_name(), text.as_bytes())
     }
 
     fn remove(&self, root: &Path, id: DraftId) -> io::Result<()> {
@@ -258,7 +275,7 @@ impl DraftStore for OsDraftStore {
             };
             // A missing or unreadable sidecar (a journal written before
             // targets were recorded) recovers to the work folder root.
-            let target_directory = fs::read_to_string(dir.join(id.target_file_name()))
+            let target_directory = fs::read(dir.join(id.target_file_name()))
                 .map_or_else(
                     |_| root.to_path_buf(),
                     |encoded| decode_target(root, &encoded),
@@ -411,6 +428,30 @@ mod tests {
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(recovered.drafts[0].target_directory, child);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_target_round_trips_losslessly_and_stays_creatable() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temporary_directory("draft-target-non-utf8");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        let child = root.join(OsStr::from_bytes(b"notes-\xff\xfe"));
+        fs::create_dir_all(&child).unwrap();
+        OsDraftStore.write(&root, id, &child, "# Title").unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        let target = &recovered.drafts[0].target_directory;
+        assert_eq!(target, &child);
+        assert_ne!(target, &root);
+        fs::write(target.join("Title.md"), "# Title").unwrap();
+        assert!(child.join("Title.md").is_file());
+        assert!(!root.join("Title.md").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
