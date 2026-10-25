@@ -181,21 +181,34 @@ pub fn run_save_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    if let OverwriteGuard::ExpectStamp(expected) = guard {
-        let current = service.stamp(path);
-        let unchanged = match (expected, current) {
-            (Some(expected), Some(current)) => expected == current,
-            // The file we expected to update is gone: recreating it is the
-            // session's own content, not an overwrite of someone else's.
-            (Some(_), None) | (None, None) => true,
-            // We believed the path was free and it is not.
-            (None, Some(_)) => false,
-        };
-        if !unchanged {
-            return Err(SaveFailure::ExternalChange);
-        }
-    }
+    check_overwrite_guard(service, path, guard)?;
     service.save(path, document).map_err(SaveFailure::Io)
+}
+
+/// Shared `ExpectStamp` check for every job that writes to a path. `Force`
+/// needs no check; `ExpectStamp` fails with `SaveFailure::ExternalChange` when
+/// the disk no longer matches what the session recorded.
+fn check_overwrite_guard(
+    service: &dyn FileService,
+    path: &Path,
+    guard: OverwriteGuard,
+) -> Result<(), SaveFailure> {
+    let OverwriteGuard::ExpectStamp(expected) = guard else {
+        return Ok(());
+    };
+    let unchanged = match (expected, service.stamp(path)) {
+        (Some(expected), Some(current)) => expected == current,
+        // The file we expected to update is gone: recreating it is the
+        // session's own content, not an overwrite of someone else's.
+        (Some(_), None) | (None, None) => true,
+        // We believed the path was free and it is not.
+        (None, Some(_)) => false,
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(SaveFailure::ExternalChange)
+    }
 }
 
 /// Runs the first write of a `SaveIntent::CreateNew` job: the same
@@ -208,16 +221,7 @@ pub fn run_create_new_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    if let OverwriteGuard::ExpectStamp(expected) = guard {
-        let unchanged = match (expected, service.stamp(path)) {
-            (Some(expected), Some(current)) => expected == current,
-            (Some(_), None) | (None, None) => true,
-            (None, Some(_)) => false,
-        };
-        if !unchanged {
-            return Err(SaveFailure::ExternalChange);
-        }
-    }
+    check_overwrite_guard(service, path, guard)?;
     service
         .save_in_existing_directory(path, document)
         .map_err(SaveFailure::Io)
