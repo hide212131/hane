@@ -709,12 +709,14 @@ impl EditorView {
         self.external_open_guard = guard;
     }
 
-    /// Publishes whether any session is dirty or saving. Called every render,
-    /// so a receiver reading it sees the state as of the latest frame.
+    /// Raises the guard to true before a session becomes dirty or a save
+    /// starts. The next `sync_external_open_guard` recomputes the actual state.
     pub(super) fn raise_external_open_guard(&self) {
         self.external_open_guard.raise();
     }
 
+    /// Publishes whether any session is dirty or saving. Called every render,
+    /// so a receiver reading it sees the state as of the latest frame.
     pub(super) fn sync_external_open_guard(&self) {
         self.external_open_guard.set_unsaved(self.has_unsaved_sessions());
     }
