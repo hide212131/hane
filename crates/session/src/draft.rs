@@ -441,17 +441,26 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let id = DraftId::generate();
         let child = root.join(OsStr::from_bytes(b"notes-\xff\xfe"));
-        fs::create_dir_all(&child).unwrap();
+        // The sidecar round-trip does not need the folder to exist, so it
+        // runs on every Unix filesystem, including ones that reject
+        // non-UTF-8 names (e.g. APFS on macOS).
         OsDraftStore.write(&root, id, &child, "# Title").unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.failed, 0);
         let target = &recovered.drafts[0].target_directory;
         assert_eq!(target, &child);
         assert_ne!(target, &root);
-        fs::write(target.join("Title.md"), "# Title").unwrap();
-        assert!(child.join("Title.md").is_file());
-        assert!(!root.join("Title.md").exists());
+        assert_eq!(target.file_name(), child.file_name());
+
+        // Creating the real folder only works where the filesystem accepts
+        // invalid UTF-8 names.
+        if fs::create_dir_all(&child).is_ok() {
+            fs::write(target.join("Title.md"), "# Title").unwrap();
+            assert!(child.join("Title.md").is_file());
+            assert!(!root.join("Title.md").exists());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
