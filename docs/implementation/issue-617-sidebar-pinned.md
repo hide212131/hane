@@ -4,7 +4,7 @@
 
 要求・受入条件の正本は [Issue #617](https://github.com/hide212131/hane/issues/617)。本書は具体的な実装接続・状態・検証の設計である。調査基準は main `32f34f9cdc774a5f5b7ddad986eeca6f62bfc3cd`、2026-10-25 JST。
 
-この準備commitは文書だけであり、製品実装・テスト・build・実GUI確認は未実施。利用者の今回の依頼はIssue・実装担当者向け設計・ブランチ／PRまで。Claude起動依頼は投稿しない。実装開始時にcurrent main、PR head、関連PR/runを取り直す。本PRは文書だけの実装準備用Draft PRとして扱い、別の設計採用PRを実装用へ転用するものではない。実装開始と受入・mergeの判断はdefault branchのCommander Policyに従う。
+準備時点の履歴として、この準備commitは文書だけであり、製品実装・テスト・build・実GUI確認は未実施だった。当時の利用者の依頼はIssue・実装担当者向け設計・ブランチ／PRまでで、Claude起動依頼は投稿していなかった。後続の実装・検証の現在状態は、この文書ではなくcurrent Issue、PR head、関連runを参照する。実装開始時にcurrent main、PR head、関連PR/runを取り直す。別の設計採用PRを実装用へ転用するものではない。実装開始と受入・mergeの判断はdefault branchのCommander Policyに従う。
 
 ChatGPT風という参考は、利用者が指定した「上部の専用エリア」「ホバーで操作ボタン出現」「クリックで登録・解除」を具体化する意味で使う。ChatGPTアプリの現行内部仕様・寸法を調査して同一性を保証する設計ではない。
 
