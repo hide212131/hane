@@ -21140,7 +21140,7 @@ mod tests {
             let (generation, revision) = (session.generation(), session.revision());
             // The filename probe is spawned here but cannot complete until
             // the test yields below.
-            view.run_title_sync(id, generation, revision, cx);
+            view.run_title_sync_for_test(id, generation, revision, cx);
             // A folder rename rebases the draft's target while the probe is
             // pending; the old directory stays in the tree (its path was
             // reused), so only the target comparison can catch it.

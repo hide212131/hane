@@ -235,6 +235,18 @@ impl EditorView {
         .detach();
     }
 
+    /// Test-only entry to `run_title_sync` for the parent module's tests.
+    #[cfg(test)]
+    pub(super) fn run_title_sync_for_test(
+        &mut self,
+        id: SessionId,
+        generation: u64,
+        revision: Revision,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_title_sync(id, generation, revision, cx);
+    }
+
     /// Decides, for the session the timer was armed for, whether its H1
     /// should create, rename, or stop auto-managing its filename — recomputed
     /// fresh against the document as it stands now, since edits may have
