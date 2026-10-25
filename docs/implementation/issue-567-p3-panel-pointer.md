@@ -29,7 +29,7 @@
 | `finish_panel_drag` | `pub(super)` | 兄弟`render`のmouse-up / mouse-up-out listener |
 | `show_sidebar_scrollbar_briefly` | `pub(super)` | 兄弟`sidebar`のwheel listener、親の既存tests |
 
-9箇所のprivate→`pub(super)`は親Viewとその子moduleの既存利用を維持する局所調整。crate/public APIへ拡大しない。本文・コメント・signatureの他の部分・順序・attributesを変えない。callerの位置、listener登録順と捕捉を変えない。新helper化、既存viewport methodsの再構成、test移動は行わない。
+9箇所のprivate→`pub(super)`は親Viewとその子moduleの既存利用を維持する局所調整。crate/public APIへ拡大しない。`text_autoscroll_direction_for`と`finish_panel_drag`の宣言に限り、rustfmtによる改行・末尾commaの追加を許容する。本文・コメント・signatureの意味・他の部分・順序・attributesを変えない。callerの位置、listener登録順と捕捉を変えない。新helper化、既存viewport methodsの再構成、test移動は行わない。
 
 ## 状態所有と維持する契約
 
@@ -49,7 +49,7 @@
 
 ## 検証と受入
 
-1. 実装時baseから抽出した元範囲と移動先を比較する。9箇所の`pub(super)`だけをprivateへ戻した後、本文・コメント・signature・順序がbyte一致すること。各メソッドが一つだけ存在すること。製品差分は親の10メソッド削除と既存viewportへの追加、および局所可視性調整だけにする。
+1. 実装時baseから抽出した元範囲と移動先を比較する。比較用コピーで9箇所の`pub(super)`をprivateへ戻し、`text_autoscroll_direction_for`と`finish_panel_drag`の2つの宣言だけを、改行と末尾commaを含め移動前の正確な宣言へ戻す。両範囲の外側の区切り空行だけを除き、本文・コメント・復元したsignature・順序がbyte一致すること。全空白の削除や本文・コメントの正規化は行わない。各メソッドが一つだけ存在すること。製品差分は親の10メソッド削除と既存viewportへの追加、9箇所の局所可視性調整、上記2宣言の改行・末尾commaだけにする。
 2. 親/兄弟caller、公開API、test名・属性・本体・入力・期待値・配置を維持する。既存の以下の回帰を同headで実行し、結果を残す。移動内容をなぞるだけの新testは追加しない。
 
 - `starting_a_scrollbar_drag_cancels_a_live_inertia_coast_that_has_not_moved_yet`
