@@ -745,6 +745,9 @@ impl EditorView {
                 return;
             }
         }
+        // Publish protection before the save slot can be taken, so a request
+        // cannot read a clean state after the session has changed.
+        self.raise_external_open_guard();
         // A queued intent is replayed through this function again, so the
         // flag is derived from the intent that actually starts the write.
         let create_new = matches!(intent, SaveIntent::CreateNew(_));
