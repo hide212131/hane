@@ -1043,6 +1043,13 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Starts a new note inside the right-clicked folder, passing it as the
+    /// explicit destination instead of changing the sidebar selection.
+    pub(super) fn sidebar_context_new_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_context_menu = None;
+        self.new_work_folder_note_in(Some(path), cx);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sidebar_context_reveal(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.sidebar_context_menu = None;
@@ -1318,6 +1325,16 @@ impl EditorView {
                 ));
             }
             SidebarContextTarget::Folder(path) => {
+                let new_note_path = path.clone();
+                items.push(self.file_tab_context_menu_item(
+                    "sidebar-context-new-file",
+                    "新規ファイル",
+                    true,
+                    cx,
+                    move |view, _, _, cx| {
+                        view.sidebar_context_new_note(new_note_path.clone(), cx)
+                    },
+                ));
                 let rename_path = path.clone();
                 items.push(self.file_tab_context_menu_item(
                     "sidebar-context-rename",
