@@ -945,6 +945,10 @@ pub struct EditorView {
     /// row (e.g. above the top row or below the bottom one) and keep
     /// autoscrolling it (issue #213).
     text_selection_drag: bool,
+    /// A reading-mode plain press on link text. The link opens on the
+    /// matching mouse-up; a drag first turns it into a text selection that
+    /// starts at the pressed offset and discards the destination.
+    pending_reading_link: Option<PendingReadingLink>,
     /// Which edge of the editor viewport the current text-selection drag is
     /// held against, if any. `None` means no autoscroll is currently ticking.
     text_autoscroll: Option<AutoscrollDirection>,
@@ -1836,6 +1840,7 @@ impl EditorView {
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
             text_selection_drag: false,
+            pending_reading_link: None,
             text_autoscroll: None,
             text_autoscroll_activity: 0,
             sidebar_scrollbar_visible: false,
@@ -2707,6 +2712,7 @@ impl EditorView {
     /// touching the replacement document.
     fn cancel_text_selection_autoscroll(&mut self) {
         self.text_selection_drag = false;
+        self.pending_reading_link = None;
         self.text_autoscroll = None;
         self.text_autoscroll_activity = self.text_autoscroll_activity.wrapping_add(1);
     }
@@ -4654,6 +4660,7 @@ impl EditorView {
         self.blur_document_find_focus(cx);
         window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
+        self.pending_reading_link = None;
         self.set_text_autoscroll(None, window, cx);
         // The picture of a diagram stands for the whole fenced block. A press on
         // it moves the edit position to the start of the diagram's text instead
@@ -4664,13 +4671,14 @@ impl EditorView {
         let shaper = WindowShaper::new(window, self.zoom);
         let Some(hit) = self.row_hit_at_window_point(
             line,
-            fragment,
+            fragment.clone(),
             f32::from(event.position.x),
             f32::from(event.position.y),
             &shaper,
         ) else {
             return;
         };
+        let offset = hit.offset;
         if let RowClick::OpenLink(destination) = self.apply_row_click(
             line,
             hit,
@@ -4678,13 +4686,107 @@ impl EditorView {
             cfg!(target_os = "macos"),
             cx,
         ) {
-            cx.open_url(&destination);
+            if self.editor_mode() == EditorMode::Reading && is_unmodified_click(&event.modifiers) {
+                // Wait for the mouse-up so a drag from link text can select.
+                self.pending_reading_link = Some(PendingReadingLink {
+                    destination,
+                    offset,
+                    press_x: f32::from(event.position.x),
+                    press_y: f32::from(event.position.y),
+                    line,
+                    fragment,
+                });
+            } else {
+                cx.open_url(&destination);
+            }
+        }
+    }
+
+    /// Turns a pending reading-mode link press into an ordinary selection
+    /// drag, discarding the destination. Returns whether one was pending.
+    fn start_drag_from_pending_link(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.pending_reading_link.take() else {
+            return false;
+        };
+        if let Err(error) = self
+            .editor_mut()
+            .set_selection(Selection::caret(pending.offset))
+        {
+            self.report_error("mouse selection", error);
+        } else {
+            self.text_selection_drag = true;
+            self.status = None;
+            self.after_input(cx);
+        }
+        true
+    }
+
+    /// Shared by the row and panel mouse-move handlers: with the left button
+    /// held, a pending link press becomes a selection drag once the pointer
+    /// has travelled `LINK_PRESS_DRAG_THRESHOLD`; before that it stays a click.
+    fn promote_pending_link_on_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(pending) = self.pending_reading_link.as_ref() else {
+            return;
+        };
+        if link_press_is_drag(
+            pending.press_x,
+            pending.press_y,
+            f32::from(event.position.x),
+            f32::from(event.position.y),
+        ) {
+            self.start_drag_from_pending_link(cx);
+        }
+    }
+
+    /// Left mouse-up inside the panel: a still-pending link press was a click.
+    fn on_panel_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let release_x = f32::from(event.position.x);
+        let release_y = f32::from(event.position.y);
+        let is_drag = self.pending_reading_link.as_ref().is_some_and(|pending| {
+            link_press_is_drag(pending.press_x, pending.press_y, release_x, release_y)
+        });
+        if is_drag {
+            // No move reached the view, but the release is past the shared
+            // threshold: select from the press to the release point.
+            let pending = self.pending_reading_link.clone();
+            self.start_drag_from_pending_link(cx);
+            if let Some(pending) = pending
+                && let Some(offset) = self.offset_at_row_x(
+                    pending.line,
+                    pending.fragment,
+                    release_x,
+                    release_y,
+                    window,
+                )
+            {
+                let selection = Selection {
+                    anchor: pending.offset,
+                    active: offset,
+                };
+                if self.editor_mut().set_selection(selection).is_ok() {
+                    self.after_input(cx);
+                }
+            }
+        }
+        let pending = self.pending_reading_link.take();
+        self.finish_panel_drag(event, window, cx);
+        if let Some(pending) = pending {
+            cx.open_url(&pending.destination);
         }
     }
 
     /// Decides and applies a left click that resolved to `hit` on `line`.
     ///
-    /// An OS-standard modifier click on link text only reports the destination
+    /// An OS-standard modifier click on link text (or, in reading mode, a plain
+    /// click) only reports the destination
     /// to open and leaves caret, selection and document alone. Any other click
     /// is ordinary selection editing at the nearest caret boundary.
     fn apply_row_click(
@@ -4696,7 +4798,9 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> RowClick {
         let offset = hit.offset;
-        if is_link_open_modifier(modifiers, macos)
+        let opens_link = is_link_open_modifier(modifiers, macos)
+            || (self.editor_mode() == EditorMode::Reading && is_unmodified_click(modifiers));
+        if opens_link
             && let Some(glyph_offset) = hit.glyph_offset
             && let Some(destination) = self.link_destination_at(line, glyph_offset)
         {
@@ -4728,6 +4832,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.promote_pending_link_on_move(event, cx);
         if !self.text_selection_drag || !event.dragging() {
             return;
         }
@@ -6570,6 +6675,34 @@ struct RowHit {
     glyph_offset: Option<SourceOffset>,
 }
 
+/// A link press waiting for its mouse-up (reading mode, no modifier).
+#[derive(Debug, Clone, PartialEq)]
+struct PendingReadingLink {
+    destination: std::sync::Arc<str>,
+    /// Caret boundary under the press, where a drag selection anchors.
+    offset: SourceOffset,
+    /// Window position of the press in logical pixels, the origin of the
+    /// movement measured against `LINK_PRESS_DRAG_THRESHOLD`.
+    press_x: f32,
+    press_y: f32,
+    /// Row the press landed on, used to resolve the release point when no
+    /// mouse-move reached the view before the mouse-up.
+    line: usize,
+    fragment: Range<usize>,
+}
+
+/// Pointer travel, in logical pixels, from a reading-mode link press at which
+/// the press stops being a click and becomes a selection drag.
+const LINK_PRESS_DRAG_THRESHOLD: f32 = 4.0;
+
+/// Whether a pointer at `(x, y)` has moved far enough from the press to count
+/// as a drag. Exactly the threshold already counts as a drag; anything
+/// shorter is still a click. Row and panel mouse-move handlers share this.
+fn link_press_is_drag(press_x: f32, press_y: f32, x: f32, y: f32) -> bool {
+    let (dx, dy) = (x - press_x, y - press_y);
+    dx * dx + dy * dy >= LINK_PRESS_DRAG_THRESHOLD * LINK_PRESS_DRAG_THRESHOLD
+}
+
 /// What a left click on a text row resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RowClick {
@@ -6590,6 +6723,12 @@ fn is_link_open_modifier(modifiers: &gpui::Modifiers, macos: bool) -> bool {
         (modifiers.control, modifiers.platform)
     };
     wanted && !other && !modifiers.shift && !modifiers.alt
+}
+
+/// Whether a left click carries no modifier key at all. In reading mode such a
+/// click on link text opens the link; any modifier keeps the other behaviours.
+fn is_unmodified_click(modifiers: &gpui::Modifiers) -> bool {
+    !modifiers.platform && !modifiers.control && !modifiers.shift && !modifiers.alt
 }
 
 /// The caret target one row into the next or previous block, aiming at `x`.
@@ -6723,277 +6862,6 @@ fn preserve_measured_height_after_fence_delta(
 }
 
 impl EditorView {
-    fn begin_sidebar_resize(
-        &mut self,
-        event: &MouseDownEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.sidebar_resize_drag = Some(SidebarResizeDrag {
-            pointer_x: f32::from(event.position.x),
-            sidebar_width: self.sidebar_width,
-        });
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn begin_editor_scrollbar_drag(
-        &mut self,
-        event: &MouseDownEvent,
-        content_height: f32,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.editor_scrollbar_drag = Some(ScrollbarDrag {
-            pointer_y: f32::from(event.position.y),
-            scroll_y: self.scroll_y,
-            viewport_height: self.viewport_height,
-            content_height,
-        });
-        // `advance_scroll_inertia` only detects a lost coast by comparing
-        // `scroll_y` against its own `last_applied` snapshot, which misses a
-        // drag that starts before the coast's next step has moved `scroll_y`
-        // away from that value. Clearing it explicitly here stops the coast
-        // from fighting the drag once it does resume (issue #389).
-        self.scroll_inertia = None;
-        self.cancel_center_caret();
-        // The drag owns the position; a mode switch's remembered row must not
-        // pull it back on the next render.
-        self.pending_mode_anchor = None;
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn begin_sidebar_scrollbar_drag(
-        &mut self,
-        event: &MouseDownEvent,
-        viewport_height: f32,
-        content_height: f32,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current_scroll = (-f32::from(self.sidebar_scroll.offset().y))
-            .clamp(0.0, (content_height - viewport_height).max(0.0));
-        self.sidebar_scrollbar_drag = Some(ScrollbarDrag {
-            pointer_y: f32::from(event.position.y),
-            scroll_y: current_scroll,
-            viewport_height,
-            content_height,
-        });
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn on_panel_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let mut changed = false;
-        if let Some(drag) = self.sidebar_resize_drag {
-            let delta = f32::from(event.position.x) - drag.pointer_x;
-            let next = sidebar_width_for_drag(
-                drag.sidebar_width,
-                delta,
-                f32::from(window.viewport_size().width),
-            );
-            if next != self.sidebar_width {
-                self.sidebar_width = next;
-                changed = true;
-            }
-        }
-        if let Some(drag) = self.editor_scrollbar_drag {
-            let delta = f32::from(event.position.y) - drag.pointer_y;
-            let next = scroll_y_for_thumb_drag(
-                drag.scroll_y,
-                delta,
-                drag.viewport_height,
-                drag.content_height,
-            );
-            if next != self.scroll_y {
-                self.scroll_y = next;
-                changed = true;
-            }
-        }
-        if let Some(drag) = self.sidebar_scrollbar_drag {
-            let delta = f32::from(event.position.y) - drag.pointer_y;
-            let next = scroll_y_for_thumb_drag(
-                drag.scroll_y,
-                delta,
-                drag.viewport_height,
-                drag.content_height,
-            );
-            self.sidebar_scroll.set_offset(point(px(0.0), px(-next)));
-            changed = true;
-        }
-        // Sidebar resize / scrollbar drags above already claimed this move;
-        // a text-selection drag never sets those, so this only fires for the
-        // drag `on_row_mouse_down` started (issue #213).
-        if self.text_selection_drag
-            && event.dragging()
-            && self.sidebar_resize_drag.is_none()
-            && self.sidebar_scrollbar_drag.is_none()
-            && self.editor_scrollbar_drag.is_none()
-        {
-            let direction = self.text_autoscroll_direction_for(f32::from(event.position.y));
-            self.set_text_autoscroll(direction, window, cx);
-        }
-        if changed {
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
-    /// Which edge of the editor viewport `window_y` (window-space, matching
-    /// `MouseMoveEvent::position`) sits inside, if any. The viewport begins
-    /// right below the header (and below the find bar's row while it is
-    /// open) and is `self.viewport_height` tall, the same frame `render`
-    /// computes it in.
-    fn text_autoscroll_direction_for(&self, window_y: f32) -> Option<AutoscrollDirection> {
-        let local_y = window_y - self.theme.header_height - self.document_find_reserved_height();
-        let near_top = local_y < TEXT_SELECTION_AUTOSCROLL_EDGE;
-        let near_bottom = local_y > self.viewport_height - TEXT_SELECTION_AUTOSCROLL_EDGE;
-        match (near_top, near_bottom) {
-            (true, true) => {
-                // On a very short viewport the two fixed-size edge zones
-                // overlap. Pick the nearer edge so a pointer near the bottom
-                // cannot be misread as an upward drag merely because the top
-                // check happens to run first.
-                if local_y < self.viewport_height / 2.0 {
-                    Some(AutoscrollDirection::Up)
-                } else {
-                    Some(AutoscrollDirection::Down)
-                }
-            }
-            (true, false) => Some(AutoscrollDirection::Up),
-            (false, true) => Some(AutoscrollDirection::Down),
-            (false, false) => None,
-        }
-    }
-
-    /// Starts, stops, or redirects the text-selection autoscroll loop to
-    /// match `direction`, doing nothing when it already matches what is
-    /// currently running.
-    fn set_text_autoscroll(
-        &mut self,
-        direction: Option<AutoscrollDirection>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.text_autoscroll == direction {
-            return;
-        }
-        self.text_autoscroll = direction;
-        self.text_autoscroll_activity = self.text_autoscroll_activity.wrapping_add(1);
-        if let Some(direction) = direction {
-            self.spawn_text_autoscroll(direction, self.text_autoscroll_activity, window, cx);
-        }
-    }
-
-    /// Repeatedly extends the selection by one row toward `direction` and
-    /// lets `after_input`'s `scroll_cursor_into_view` follow it, every
-    /// `TEXT_SELECTION_AUTOSCROLL_INTERVAL`, so a held pointer near an edge
-    /// keeps scrolling without needing to move (issue #213). Stops as soon
-    /// as `activity` is stale (a newer call to `set_text_autoscroll` ran) or
-    /// a tick reaches the start/end of the document and stops moving, rather
-    /// than ticking forever once there is nothing left to extend.
-    fn spawn_text_autoscroll(
-        &mut self,
-        direction: AutoscrollDirection,
-        activity: u64,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.spawn_in(window, async move |view, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(TEXT_SELECTION_AUTOSCROLL_INTERVAL)
-                    .await;
-                let Ok(should_continue) = view.update_in(cx, |view, window, cx| {
-                    view.step_text_autoscroll(direction, activity, window, cx)
-                }) else {
-                    return;
-                };
-                if !should_continue {
-                    return;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// One autoscroll tick. Returns whether the loop driving it should keep
-    /// ticking.
-    fn step_text_autoscroll(
-        &mut self,
-        direction: AutoscrollDirection,
-        activity: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.text_autoscroll_activity != activity || self.text_autoscroll != Some(direction) {
-            return false;
-        }
-        let before = self.editor().selection().active;
-        match direction {
-            AutoscrollDirection::Up => self.move_vertical(false, true, window, cx),
-            AutoscrollDirection::Down => self.move_vertical(true, true, window, cx),
-        }
-        let changed = self.editor().selection().active != before;
-        if !changed {
-            // Reaching the document edge is a terminal condition for the
-            // current hold. Clear the direction as well as ending the task so
-            // a later move into the edge zone can start a fresh loop.
-            self.set_text_autoscroll(None, window, cx);
-        }
-        changed
-    }
-
-    fn finish_panel_drag(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let was_sidebar_scrollbar_drag = self.sidebar_scrollbar_drag.take().is_some();
-        let was_dragging = self.sidebar_resize_drag.take().is_some()
-            || was_sidebar_scrollbar_drag
-            || self.editor_scrollbar_drag.take().is_some();
-        self.text_selection_drag = false;
-        self.set_text_autoscroll(None, window, cx);
-        if was_dragging {
-            cx.stop_propagation();
-            cx.notify();
-        }
-        if was_sidebar_scrollbar_drag {
-            // Keep the just-dragged thumb visible for the same brief window
-            // as a wheel scroll, rather than snapping it away the instant
-            // the mouse comes up.
-            self.show_sidebar_scrollbar_briefly(cx);
-        }
-    }
-
-    /// Shows the sidebar's overlay scrollbar thumb, then hides it again after
-    /// `SIDEBAR_SCROLLBAR_HIDE_DELAY` unless a later scroll or drag
-    /// (identified by `sidebar_scrollbar_activity`) supersedes this call
-    /// first. Called on sidebar wheel/trackpad scrolling and at the end of a
-    /// thumb drag; the idle sidebar shows no track or thumb, only the
-    /// existing thin `sidebar_resizer` boundary line.
-    fn show_sidebar_scrollbar_briefly(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_scrollbar_visible = true;
-        self.sidebar_scrollbar_activity = self.sidebar_scrollbar_activity.wrapping_add(1);
-        let activity = self.sidebar_scrollbar_activity;
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(SIDEBAR_SCROLLBAR_HIDE_DELAY)
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                if view.sidebar_scrollbar_activity == activity {
-                    view.sidebar_scrollbar_visible = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
     /// The keyboard-layout-change handler registered as `_input_mode_subscription`.
     /// Kept as its own method (rather than inlined in the subscription closure)
     /// so regression tests can drive this exact handler through a test-only
@@ -7889,7 +7757,16 @@ mod tests {
                 (command, true, BEFORE_LINK, false),
                 (ctrl, false, BEFORE_LINK, false),
             ];
-            for (modifiers, macos, column, opens) in cases {
+            for (modifiers, macos, column, opens, reading) in cases.into_iter().flat_map(|case| {
+                [(case, false), (case, true)]
+                    .map(|((modifiers, macos, column, opens), reading)| {
+                        // A plain click on the link text also opens it in
+                        // reading mode; everything else is mode independent.
+                        let on_link = column == INSIDE || column == LAST_GLYPH_RIGHT_HALF;
+                        let plain = is_unmodified_click(&modifiers);
+                        (modifiers, macos, column, opens || (reading && plain && on_link), reading)
+                    })
+            }) {
                 let view = gpui::AppContext::new(cx, |cx| {
                     EditorView::new(text.as_str(), "Untitled", cx)
                 });
@@ -7957,6 +7834,9 @@ mod tests {
                     let can_undo_before = view.editor().can_undo();
                     let can_redo_before = view.editor().can_redo();
 
+                    if reading {
+                        view.editor_mode = EditorMode::Reading;
+                    }
                     let outcome = view.apply_row_click(line, hit, &modifiers, macos, cx);
 
                     if opens {
@@ -7975,6 +7855,269 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// Issue #603: a reading-mode press on link text is held until mouse-up.
+    /// A drag discards it and starts an ordinary selection at the press
+    /// offset; a plain click leaves the pending destination (opened on
+    /// mouse-up) and changes neither selection nor document.
+    #[gpui::test]
+    fn reading_link_press_is_discarded_by_drag_and_kept_for_click(cx: &mut gpui::TestAppContext) {
+        let text = "see [Hane](https://example.com/) end\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            let pressed = SourceOffset(text.find("Hane").unwrap() + 1);
+            let pending = PendingReadingLink {
+                destination: "https://example.com/".into(),
+                offset: pressed,
+                press_x: 0.0,
+                press_y: 0.0,
+                line: 0,
+                fragment: 0..0,
+            };
+            let text_before = view.editor().document().full_text();
+            let selection_before = view.editor().selection();
+            let revision_before = view.editor().document().revision();
+
+            // Click: nothing has consumed the pending link, state untouched.
+            view.pending_reading_link = Some(pending.clone());
+            assert_eq!(view.pending_reading_link.as_ref(), Some(&pending));
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection(), selection_before);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert!(!view.editor().can_undo());
+            assert!(!view.editor().can_redo());
+
+            // Drag: the destination is dropped and selection drag takes over.
+            assert!(view.start_drag_from_pending_link(cx));
+            assert!(view.pending_reading_link.is_none());
+            assert!(view.text_selection_drag);
+            assert_eq!(view.editor().selection(), Selection::caret(pressed));
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+
+            // A later mouse-up has no destination left to open.
+            assert!(!view.start_drag_from_pending_link(cx));
+        });
+    }
+
+    /// Issue #603: the same reading-mode link press, driven through the real
+    /// mouse-down / mouse-move / mouse-up dispatch. The test platform records
+    /// only the most recent opened URL, so "opened once" is shown as: nothing
+    /// at mouse-down, the destination after mouse-up.
+    #[gpui::test]
+    fn reading_link_click_opens_on_mouse_up_and_drag_selects_through_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = "see [Hane](https://example.com/) end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Visual text is "see Hane end": offset 5 is inside the link, 9 is past it.
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        let (move_point, dragged_to) = row_click(&view, cx, "row-0-0", 0, 0, 9);
+        let (text_before, revision_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+            )
+        });
+        assert!(cx.opened_url().is_none());
+
+        // Drag first (the recorded URL cannot be reset): the URL is not
+        // opened and the selection drag starts at the press position.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        let selection_after_drag = Selection {
+            anchor: pressed,
+            active: dragged_to,
+        };
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert_eq!(view.editor().selection(), selection_after_drag);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+        });
+
+        // Plain click: held at mouse-down, opened at mouse-up, nothing edited.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_some());
+            assert_eq!(view.editor().selection(), selection_after_drag);
+        });
+        cx.simulate_mouse_up(down_point, MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(cx.opened_url().as_deref(), Some(DESTINATION));
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection(), selection_after_drag);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+        });
+    }
+
+    /// Issue #603: the click / drag boundary is one distance rule. Travel
+    /// shorter than the threshold is a click; exactly the threshold is a drag.
+    #[test]
+    fn link_press_drag_boundary_is_inclusive_at_threshold() {
+        let t = LINK_PRESS_DRAG_THRESHOLD;
+        assert!(!link_press_is_drag(10.0, 10.0, 10.0, 10.0));
+        assert!(!link_press_is_drag(10.0, 10.0, 10.0 + t - 0.5, 10.0));
+        assert!(!link_press_is_drag(10.0, 10.0, 10.0, 10.0 - (t - 0.5)));
+        assert!(link_press_is_drag(10.0, 10.0, 10.0 + t, 10.0));
+        assert!(link_press_is_drag(10.0, 10.0, 10.0, 10.0 - t));
+        assert!(link_press_is_drag(10.0, 10.0, 10.0 + t + 0.5, 10.0));
+        // Diagonal travel is measured as distance, not per axis.
+        assert!(!link_press_is_drag(0.0, 0.0, 2.5, 2.5));
+        assert!(link_press_is_drag(0.0, 0.0, 3.0, 3.0));
+    }
+
+    /// Issue #603: through real mouse-down / move / up dispatch, movement
+    /// below the threshold keeps the pending link (opened once on mouse-up,
+    /// selection untouched) and movement past it starts a selection drag.
+    #[gpui::test]
+    fn reading_link_press_threshold_through_dispatch(cx: &mut gpui::TestAppContext) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = "see [Hane](https://example.com/) end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        let (text_before, revision_before, selection_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.editor().selection(),
+            )
+        });
+        let moved = |dx: f32, dy: f32| point(down_point.x + px(dx), down_point.y + px(dy));
+        let half = LINK_PRESS_DRAG_THRESHOLD - 0.5;
+        let past = LINK_PRESS_DRAG_THRESHOLD + 0.5;
+
+        // Past the threshold (horizontal, then vertical): drag, URL not opened.
+        for end in [moved(past, 0.0), moved(0.0, past)] {
+            cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+            view.read_with(cx, |view, _| {
+                assert!(view.pending_reading_link.is_none());
+                assert!(view.text_selection_drag);
+                assert_eq!(view.editor().selection().anchor, pressed);
+            });
+            cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+            assert!(cx.opened_url().is_none());
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.editor().document().full_text(), text_before);
+                assert_eq!(view.editor().document().revision(), revision_before);
+            });
+            // Restore the baseline selection for the next press.
+            view.update(cx, |view, _| {
+                view.editor_mut().set_selection(selection_before).unwrap();
+            });
+        }
+
+        // Below the threshold: no movement, small, and just-under-boundary
+        // moves all keep the link pending and change nothing until mouse-up.
+        let mut opened_before = None;
+        for end in [down_point, moved(1.0, 0.0), moved(half, 0.0), moved(0.0, half)] {
+            cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+            assert_eq!(cx.opened_url(), opened_before);
+            view.read_with(cx, |view, _| {
+                assert!(view.pending_reading_link.is_some());
+                assert!(!view.text_selection_drag);
+                assert_eq!(view.editor().selection(), selection_before);
+            });
+            cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+            assert_eq!(cx.opened_url().as_deref(), Some(DESTINATION));
+            opened_before = cx.opened_url();
+            view.read_with(cx, |view, _| {
+                assert!(view.pending_reading_link.is_none());
+                assert!(!view.text_selection_drag);
+                assert_eq!(view.editor().selection(), selection_before);
+                assert_eq!(view.editor().document().full_text(), text_before);
+                assert_eq!(view.editor().document().revision(), revision_before);
+                assert!(!view.editor().can_undo());
+                assert!(!view.editor().can_redo());
+            });
+        }
+    }
+
+    /// Issue #603: with no mouse-move dispatched at all, the release point is
+    /// compared with the press using the same threshold. At or past it the
+    /// press is a selection drag (URL not opened); below it, a click.
+    #[gpui::test]
+    fn reading_link_release_without_move_uses_threshold_through_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = "see [Hane](https://example.com/) end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        let (text_before, revision_before, selection_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.editor().selection(),
+            )
+        });
+        let moved = |dx: f32| point(down_point.x + px(dx), down_point.y);
+
+        // Exactly the threshold, no MouseMove: drag, URL not opened.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(
+            moved(LINK_PRESS_DRAG_THRESHOLD),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection().anchor, pressed);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+        });
+
+        view.update(cx, |view, _| {
+            view.editor_mut().set_selection(selection_before).unwrap();
+        });
+
+        // Below the threshold, no MouseMove: a click, opened exactly once.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(
+            moved(LINK_PRESS_DRAG_THRESHOLD - 0.5),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        assert_eq!(cx.opened_url().as_deref(), Some(DESTINATION));
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert_eq!(view.editor().selection(), selection_before);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert!(!view.editor().can_undo());
+            assert!(!view.editor().can_redo());
+        });
     }
 
     /// Issue #502: editing a reference definition in another block must not
