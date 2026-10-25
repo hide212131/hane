@@ -88,7 +88,9 @@ impl EditorView {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
-            let text = view
+            // The target is re-read with the text: a folder rename or trash
+            // can rebase it while the timer is pending.
+            let snapshot = view
                 .read_with(cx, |view, _| {
                     if view.document_instance(id) != instance {
                         return None;
@@ -96,14 +98,30 @@ impl EditorView {
                     let session = view.sessions.get(id)?;
                     let draft = view.work_folder_drafts.get(&id)?;
                     let current = session.revision() == revision && draft.draft_id == draft_id;
-                    current.then(|| session.editor().document().full_text())
+                    current.then(|| {
+                        (
+                            // Ordered with the flush snapshots: a write that
+                            // starts late must not undo a newer one.
+                            hane_session::next_draft_snapshot_sequence(),
+                            draft.target_directory.clone(),
+                            session.editor().document().full_text(),
+                        )
+                    })
                 })
                 .ok()
                 .flatten();
-            if let Some(text) = text {
+            if let Some((sequence, target_directory, text)) = snapshot {
                 let _ = cx
                     .background_executor()
-                    .spawn(async move { draft_store.write(&root, draft_id, &text) })
+                    .spawn(async move {
+                        draft_store.write_snapshot(
+                            &root,
+                            draft_id,
+                            &target_directory,
+                            &text,
+                            sequence,
+                        )
+                    })
                     .await;
             }
         })
@@ -130,8 +148,15 @@ impl EditorView {
             let Some(session) = self.sessions.get(id) else {
                 continue;
             };
+            let sequence = hane_session::next_draft_snapshot_sequence();
             let text = session.editor().document().full_text();
-            let _ = self.draft_store.write(root, draft.draft_id, &text);
+            let _ = self.draft_store.write_snapshot(
+                root,
+                draft.draft_id,
+                &draft.target_directory,
+                &text,
+                sequence,
+            );
         }
     }
 
@@ -152,8 +177,15 @@ impl EditorView {
             let Some(session) = self.sessions.get(id) else {
                 continue;
             };
+            let sequence = hane_session::next_draft_snapshot_sequence();
             let text = session.editor().document().full_text();
-            match self.draft_store.write(root, draft.draft_id, &text) {
+            match self.draft_store.write_snapshot(
+                root,
+                draft.draft_id,
+                &draft.target_directory,
+                &text,
+                sequence,
+            ) {
                 Ok(()) => written += 1,
                 Err(error) => failures.push(format!("{}: {error}", session.label())),
             }
@@ -201,6 +233,18 @@ impl EditorView {
             });
         })
         .detach();
+    }
+
+    /// Test-only entry to `run_title_sync` for the parent module's tests.
+    #[cfg(test)]
+    pub(super) fn run_title_sync_for_test(
+        &mut self,
+        id: SessionId,
+        generation: u64,
+        revision: Revision,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_title_sync(id, generation, revision, cx);
     }
 
     /// Decides, for the session the timer was armed for, whether its H1
@@ -263,10 +307,41 @@ impl EditorView {
                     .get(&id)
                     .map(|draft| draft.target_directory.clone())
                     .unwrap_or(work_folder_root);
+                if !self.target_directory_is_available(&target_directory) {
+                    self.refuse_missing_title_target_directory(id, cx);
+                    return;
+                }
                 self.begin_title_create(id, target_directory, title, cx);
             }
             TitleSyncAction::Rename(title) => self.begin_title_rename(id, title, cx),
         }
+    }
+
+    /// The directory a first-time title create for `id` would save into right
+    /// now: the draft's target folder, else the work folder root.
+    fn current_title_target_directory(&self, id: SessionId) -> Option<PathBuf> {
+        self.work_folder_drafts
+            .get(&id)
+            .map(|draft| draft.target_directory.clone())
+            .or_else(|| {
+                self.work_folder
+                    .as_ref()
+                    .map(|folder| folder.root().to_path_buf())
+            })
+    }
+
+    fn target_directory_is_available(&self, target_directory: &Path) -> bool {
+        self.work_folder
+            .as_ref()
+            .is_some_and(|work_folder| work_folder.children_at(target_directory).is_some())
+    }
+
+    fn refuse_missing_title_target_directory(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.title_sync_pending.remove(&id);
+        self.status = Some(
+            "対象のフォルダが見つからないため作成できません。一覧を確認してください".to_owned(),
+        );
+        cx.notify();
     }
 
     /// Picks a collision-free `<title>.md` under `target_directory` in the
@@ -330,6 +405,26 @@ impl EditorView {
                     .get(id)
                     .is_none_or(DocumentSession::should_defer_h1_create);
                 if should_skip {
+                    return;
+                }
+                // The destination can disappear while the filename probe is
+                // running. Revalidate against the current tree before the
+                // save path is handed to the filesystem service; otherwise
+                // an atomic write could recreate the missing parent folder.
+                if !view.target_directory_is_available(&root) {
+                    view.refuse_missing_title_target_directory(id, cx);
+                    return;
+                }
+                // A folder rename during the probe can rebase the draft's
+                // target to another directory, after which the probed path
+                // may even be reused. The candidate was chosen for the old
+                // directory, so it must not be saved; decide again against
+                // the current target instead.
+                if view.current_title_target_directory(id).as_deref() != Some(root.as_path()) {
+                    if let Some(session) = view.sessions.get(id) {
+                        let (generation, revision) = (session.generation(), session.revision());
+                        view.run_title_sync(id, generation, revision, cx);
+                    }
                     return;
                 }
                 view.title_sync_pending.insert(id, title.clone());
@@ -665,6 +760,9 @@ impl EditorView {
         // Publish protection before the save slot can be taken, so a request
         // cannot read a clean state after the session has changed.
         self.raise_external_open_guard();
+        // A queued intent is replayed through this function again, so the
+        // flag is derived from the intent that actually starts the write.
+        let create_new = matches!(intent, SaveIntent::CreateNew(_));
         let Some(decision) = self
             .sessions
             .get_mut(id)
@@ -730,8 +828,21 @@ impl EditorView {
                     let (result, leaf, ancestors) = cx
                         .background_executor()
                         .spawn(async move {
-                            let result =
-                                run_save_job(files.as_ref(), &job.path, &job.document, job.guard);
+                            // A first write at an automatically picked name must
+                            // not recreate its destination folder: the folder
+                            // may have been deleted after the in-memory tree
+                            // was last checked, and only the filesystem
+                            // operation itself can refuse without a race.
+                            let result = if create_new {
+                                run_create_new_job(
+                                    files.as_ref(),
+                                    &job.path,
+                                    &job.document,
+                                    job.guard,
+                                )
+                            } else {
+                                run_save_job(files.as_ref(), &job.path, &job.document, job.guard)
+                            };
                             // The saved file's own modified time is read and
                             // sequenced here, at the point of the write,
                             // rather than when this completion reaches the
@@ -863,7 +974,17 @@ impl EditorView {
             }
             SaveOutcome::Failed(error) => {
                 self.status = None;
-                if let Some(instance) = instance {
+                // `title_sync_pending` is only set for the automatic first
+                // write, whose refusal to recreate a deleted destination
+                // folder surfaces as `NotFound`. The draft stays recoverable.
+                let missing_target = error.kind() == std::io::ErrorKind::NotFound
+                    && self.title_sync_pending.contains_key(&id);
+                if missing_target {
+                    self.status = Some(
+                        "対象のフォルダが見つからないため作成できません。一覧を確認してください"
+                            .to_owned(),
+                    );
+                } else if let Some(instance) = instance {
                     self.record_save_problem(
                         id,
                         instance,
