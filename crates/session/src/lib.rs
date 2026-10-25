@@ -54,7 +54,7 @@ pub use naming::{
 pub use resource::ResourceResolver;
 pub use service::{
     FileService, LoadedFile, OsFileService, OverwriteGuard, ReadFile, SaveFailure, SavedFile,
-    run_save_job,
+    run_create_new_job, run_save_job,
 };
 pub use session::{
     AutosaveTicket, CloseDecision, DocumentSession, FileEvent, FileEventOutcome, OpenDecision,

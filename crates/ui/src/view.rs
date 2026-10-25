@@ -79,8 +79,8 @@ use hane_session::{
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, ThemePreference, TitleSyncAction, UnsavedChanges, WorkFolder,
     WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync,
-    extract_h1_title, format_relative_date_label, local_today, run_save_job,
-    split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
+    extract_h1_title, format_relative_date_label, local_today, run_create_new_job,
+    run_save_job, split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -17925,6 +17925,107 @@ mod tests {
             );
         });
         assert!(!target.exists(), "a missing folder must not be recreated");
+        assert!(!OsDraftStore.recover(&root).unwrap().drafts.is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Deletes `target` the first time the filename probe stats a candidate
+    /// inside it, i.e. while the probe is in flight and before its completion
+    /// is handled. The in-memory work-folder snapshot is never told, as when
+    /// a watcher rescan has not landed yet.
+    struct DeleteTargetDuringProbe {
+        target: PathBuf,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FileService for DeleteTargetDuringProbe {
+        fn load(&self, path: &Path) -> std::io::Result<LoadedFile> {
+            OsFileService.load(path)
+        }
+
+        fn open_reader(&self, path: &Path) -> std::io::Result<hane_session::ReadFile> {
+            OsFileService.open_reader(path)
+        }
+
+        fn save(&self, path: &Path, document: &RopeBuffer) -> std::io::Result<SavedFile> {
+            OsFileService.save(path, document)
+        }
+
+        fn save_in_existing_directory(
+            &self,
+            path: &Path,
+            document: &RopeBuffer,
+        ) -> std::io::Result<SavedFile> {
+            OsFileService.save_in_existing_directory(path, document)
+        }
+
+        fn stamp(&self, path: &Path) -> Option<hane_session::FileStamp> {
+            if path.parent() == Some(self.target.as_path())
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                std::fs::remove_dir_all(&self.target).unwrap();
+            }
+            OsFileService.stamp(path)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            OsFileService.rename(from, to)
+        }
+
+        fn rename_folder(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            OsFileService.rename_folder(from, to)
+        }
+
+        fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+            OsFileService.create_dir(path)
+        }
+    }
+
+    #[gpui::test]
+    fn a_draft_target_deleted_during_the_filename_probe_is_not_recreated(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-target-deleted-in-flight");
+        let target = root.join("dev");
+        std::fs::create_dir_all(&target).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(DeleteTargetDuringProbe {
+                    target: target.clone(),
+                    armed: std::sync::atomic::AtomicBool::new(true),
+                }),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.sidebar_context_new_note(target.clone(), cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+            view.flush_pending_drafts();
+        });
+        // The debounce starts the probe, which removes the target while it
+        // runs; its completion then sees a snapshot that still lists it.
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert!(view.active_session().path().is_none());
+            assert!(view.active_session().is_dirty());
+            assert_eq!(
+                view.status.as_deref(),
+                Some("対象のフォルダが見つからないため作成できません。一覧を確認してください")
+            );
+        });
+        assert!(!target.exists(), "the deleted folder must not be recreated");
         assert!(!OsDraftStore.recover(&root).unwrap().drafts.is_empty());
 
         std::fs::remove_dir_all(&root).unwrap();

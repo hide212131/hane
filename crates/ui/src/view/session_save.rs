@@ -690,6 +690,9 @@ impl EditorView {
                 return;
             }
         }
+        // A queued intent is replayed through this function again, so the
+        // flag is derived from the intent that actually starts the write.
+        let create_new = matches!(intent, SaveIntent::CreateNew(_));
         let Some(decision) = self
             .sessions
             .get_mut(id)
@@ -751,8 +754,21 @@ impl EditorView {
                     let (result, leaf, ancestors) = cx
                         .background_executor()
                         .spawn(async move {
-                            let result =
-                                run_save_job(files.as_ref(), &job.path, &job.document, job.guard);
+                            // A first write at an automatically picked name must
+                            // not recreate its destination folder: the folder
+                            // may have been deleted after the in-memory tree
+                            // was last checked, and only the filesystem
+                            // operation itself can refuse without a race.
+                            let result = if create_new {
+                                run_create_new_job(
+                                    files.as_ref(),
+                                    &job.path,
+                                    &job.document,
+                                    job.guard,
+                                )
+                            } else {
+                                run_save_job(files.as_ref(), &job.path, &job.document, job.guard)
+                            };
                             // The saved file's own modified time is read and
                             // sequenced here, at the point of the write,
                             // rather than when this completion reaches the
@@ -882,7 +898,17 @@ impl EditorView {
             }
             SaveOutcome::Failed(error) => {
                 self.status = None;
-                if let Some(instance) = instance {
+                // `title_sync_pending` is only set for the automatic first
+                // write, whose refusal to recreate a deleted destination
+                // folder surfaces as `NotFound`. The draft stays recoverable.
+                let missing_target = error.kind() == std::io::ErrorKind::NotFound
+                    && self.title_sync_pending.contains_key(&id);
+                if missing_target {
+                    self.status = Some(
+                        "対象のフォルダが見つからないため作成できません。一覧を確認してください"
+                            .to_owned(),
+                    );
+                } else if let Some(instance) = instance {
                     self.record_save_problem(
                         id,
                         instance,

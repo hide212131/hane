@@ -141,6 +141,19 @@ pub trait FileService: Send + Sync + 'static {
     /// renamed over the target, so a crash never leaves a half-written document.
     fn save(&self, path: &Path, document: &RopeBuffer) -> io::Result<SavedFile>;
 
+    /// Like `save`, but never creates the parent directory: a destination
+    /// directory that no longer exists fails with `ErrorKind::NotFound`
+    /// instead of being recreated. The refusal happens in the same
+    /// filesystem operation that creates the temporary file, so a directory
+    /// deleted at any earlier moment cannot be resurrected by the write.
+    fn save_in_existing_directory(
+        &self,
+        path: &Path,
+        document: &RopeBuffer,
+    ) -> io::Result<SavedFile> {
+        self.save(path, document)
+    }
+
     /// Current stamp, or `None` when the file does not exist.
     fn stamp(&self, path: &Path) -> Option<FileStamp>;
 
@@ -185,6 +198,31 @@ pub fn run_save_job(
     service.save(path, document).map_err(SaveFailure::Io)
 }
 
+/// Runs the first write of a `SaveIntent::CreateNew` job: the same
+/// stamp-based collision guard as `run_save_job`, but the destination
+/// directory must already exist. A directory deleted after the target name
+/// was picked yields `ErrorKind::NotFound` rather than being recreated.
+pub fn run_create_new_job(
+    service: &dyn FileService,
+    path: &Path,
+    document: &RopeBuffer,
+    guard: OverwriteGuard,
+) -> Result<SavedFile, SaveFailure> {
+    if let OverwriteGuard::ExpectStamp(expected) = guard {
+        let unchanged = match (expected, service.stamp(path)) {
+            (Some(expected), Some(current)) => expected == current,
+            (Some(_), None) | (None, None) => true,
+            (None, Some(_)) => false,
+        };
+        if !unchanged {
+            return Err(SaveFailure::ExternalChange);
+        }
+    }
+    service
+        .save_in_existing_directory(path, document)
+        .map_err(SaveFailure::Io)
+}
+
 /// Whether a write must first prove the file has not changed underneath it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverwriteGuard {
@@ -223,7 +261,19 @@ impl FileService for OsFileService {
     }
 
     fn save(&self, path: &Path, document: &RopeBuffer) -> io::Result<SavedFile> {
-        atomic_write(path, |writer| document.write_to(writer))?;
+        atomic_write(path, true, |writer| document.write_to(writer))?;
+        Ok(SavedFile {
+            identity: identity_for(path),
+            stamp: self.stamp(path),
+        })
+    }
+
+    fn save_in_existing_directory(
+        &self,
+        path: &Path,
+        document: &RopeBuffer,
+    ) -> io::Result<SavedFile> {
+        atomic_write(path, false, |writer| document.write_to(writer))?;
         Ok(SavedFile {
             identity: identity_for(path),
             stamp: self.stamp(path),
@@ -500,18 +550,21 @@ fn stamp_from_metadata(metadata: Option<fs::Metadata>) -> Option<FileStamp> {
 }
 
 pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    atomic_write(path, |writer| writer.write_all(bytes))
+    atomic_write(path, true, |writer| writer.write_all(bytes))
 }
 
 fn atomic_write(
     path: &Path,
+    create_parent: bool,
     write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    if create_parent {
+        fs::create_dir_all(parent)?;
+    }
     let stem = path
         .file_name()
         .and_then(|name| name.to_str())
