@@ -32,6 +32,7 @@ mod date_badge;
 mod draft;
 mod identity;
 mod naming;
+mod pins;
 mod resource;
 pub mod search;
 mod service;
@@ -53,6 +54,10 @@ pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileSt
 pub use naming::{
     TitleSyncAction, decide_title_sync, extract_h1_title, unique_folder_name,
     unique_markdown_filename,
+};
+pub use pins::{
+    FilePinStore, MemoryPinStore, PinError, PinKind, PinRepository, PinSnapshot, PinUpdate,
+    PinnedEntry, apply_pin_update, validate_pin_path,
 };
 pub use resource::ResourceResolver;
 pub use service::{

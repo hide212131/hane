@@ -573,6 +573,17 @@ impl EditorView {
                 } else {
                     self.status = Some("Renamed".to_owned());
                 }
+                // After the status above, so a pin save warning is not
+                // overwritten by it.
+                self.follow_pin_rename(
+                    &from,
+                    &target,
+                    match kind {
+                        InlineRenameKind::File => hane_session::PinKind::File,
+                        InlineRenameKind::Folder => hane_session::PinKind::Folder,
+                    },
+                    cx,
+                );
                 self.inline_rename = None;
             }
             Err(error) => {
