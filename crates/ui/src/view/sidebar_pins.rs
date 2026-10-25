@@ -718,10 +718,18 @@ impl EditorView {
                                     .size_4()
                                     .text_color(rgb(color)),
                             )
-                            .child(div().flex_none().child(name))
+                            .child(
+                                div()
+                                    .debug_selector(|| "sidebar-pin-name".to_owned())
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .child(name),
+                            )
                             .children(parent.map(|parent| {
                                 div()
+                                    .debug_selector(|| "sidebar-pin-parent".to_owned())
                                     .min_w(px(0.0))
+                                    .truncate()
                                     .text_color(rgb(self.theme.quote_foreground))
                                     .child(parent)
                             })),
@@ -971,6 +979,65 @@ mod tests {
             if let Some(slot) = slot {
                 assert!(slot.right() <= folder.right().max(file.right()));
             }
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_pin_row_with_a_long_name_and_parent_stays_on_one_row(cx: &mut gpui::TestAppContext) {
+        let root = pin_test_root("long-pin-row");
+        let long_parent = "とても長い日本語の親フォルダ名".repeat(6);
+        let long_file = format!("{}.md", "とても長い日本語のファイル名".repeat(6));
+        std::fs::create_dir_all(root.join(&long_parent)).unwrap();
+        std::fs::write(root.join(&long_parent).join(&long_file), "# Note\n").unwrap();
+        let stores = StateStores::memory();
+        let (view, cx) = open_pin_view(cx, &root, stores.clone());
+        let root = view_root(&view, cx);
+        view.update(cx, |view, cx| {
+            view.toggle_pin(
+                PathBuf::from(&long_parent).join(&long_file),
+                PinKind::File,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        for width in [960.0, 360.0] {
+            cx.simulate_resize(gpui::size(px(width), px(760.0)));
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let row = cx.debug_bounds("sidebar-pin-row").expect("the pin row");
+            let name = cx.debug_bounds("sidebar-pin-name").expect("the pin name");
+            let parent = cx
+                .debug_bounds("sidebar-pin-parent")
+                .expect("the pin parent path");
+            let slot = cx
+                .debug_bounds("sidebar-pin-toggle")
+                .expect("the toggle slot");
+            assert!(
+                (f32::from(row.size.height) - SIDEBAR_ROW_HEIGHT).abs() < 0.001,
+                "the pin row keeps its fixed height at width {width}"
+            );
+            assert!(
+                (f32::from(slot.size.width) - PIN_SLOT_SIZE).abs() < 0.001,
+                "the toggle slot keeps its space at width {width}"
+            );
+            for text in [name, parent] {
+                assert!(
+                    f32::from(text.size.height) <= SIDEBAR_ROW_HEIGHT + 0.001
+                        && text.top() >= row.top()
+                        && text.bottom() <= row.bottom() + px(0.001),
+                    "the text stays on one line inside the row at width {width}"
+                );
+            }
+            assert!(
+                name.right() <= parent.left() + px(0.001)
+                    && parent.right() <= slot.left() + px(0.001)
+                    && slot.right() <= row.right() + px(0.001),
+                "the name and the parent path are clipped before the toggle at width {width}"
+            );
         }
 
         std::fs::remove_dir_all(root).unwrap();
