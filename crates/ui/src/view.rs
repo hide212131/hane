@@ -13877,6 +13877,58 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // Issue #607: a clean loaded session (the normal launch with a file
+    // argument) must stamp the Finder request unprotected and open the folder.
+    // Non-editing `editor_mut` access raises the guard, so the frame-end sync
+    // is what returns it to the real clean value.
+    #[gpui::test]
+    fn a_clean_loaded_session_stamps_unprotected_and_opens_the_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-clean-loaded");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = root.join("seed.md");
+        std::fs::write(&path, "seed").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let queue = SharedExternalOpenQueue::new();
+        view.update(cx, |view, _cx| {
+            view.attach_external_open_inbox(Some(queue.clone()));
+            // A selection change takes the editor mutably without editing.
+            view.editor_mut().set_selection(Selection::caret(SourceOffset(0))).unwrap();
+            assert!(!view.has_unsaved_sessions());
+            view.sync_external_open_guard();
+            assert!(!queue.guard().unsaved());
+        });
+        queue.try_push(folder.clone()).unwrap();
+        let generation = view.read_with(cx, |view, _| view.work_folder_generation);
+        let mut stamped = None;
+        view.update(cx, |view, cx| {
+            queue.drain_requests_into(|path, protected| {
+                stamped = Some(protected);
+                view.submit_external_open_protected(path, protected, cx)
+            });
+        });
+        assert_eq!(stamped, Some(false));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_ne!(view.work_folder_generation, generation);
+            assert_ne!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder")
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     // Issue #607: the guard was clean at the last render, a save then started,
     // and the request arrived before the next render. The save finishes before
     // the queue is drained, so both the receipt and the processing time would

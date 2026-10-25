@@ -2,8 +2,20 @@ use super::*;
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let layout_started = Instant::now();
         self.sync_external_open_guard();
+        let element = self.render_frame(window, cx);
+        // `editor_mut` raises the external-open guard even for access that does
+        // not edit (layout, selection, scroll). Without this second sync a clean
+        // session would keep the guard raised until the next frame, and a Finder
+        // request received in between would be stamped protected and refused.
+        self.sync_external_open_guard();
+        element
+    }
+}
+
+impl EditorView {
+    fn render_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout_started = Instant::now();
         if self._input_mode_focus_subscription.is_none() {
             let focus_handle = self.focus_handle.clone();
             self._input_mode_focus_subscription =
