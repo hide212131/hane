@@ -53,6 +53,8 @@ pub(super) struct SidebarPins {
     /// A save is running. Saves run one at a time in the order the changes
     /// happened, because path updates only make sense in that order.
     saving: bool,
+    /// The kind of the running save, if any.
+    inflight: Option<PinRequest>,
     /// Changes waiting for the running save to finish.
     queued: VecDeque<(Vec<PinUpdate>, PinRequest)>,
     pub(super) scroll: ScrollHandle,
@@ -68,6 +70,7 @@ impl Default for SidebarPins {
             applied_revision: 0,
             unsaved: Vec::new(),
             saving: false,
+            inflight: None,
             queued: VecDeque::new(),
             scroll: ScrollHandle::new(),
         }
@@ -84,8 +87,20 @@ impl SidebarPins {
         self.applied_revision = 0;
         self.unsaved.clear();
         self.saving = false;
+        self.inflight = None;
         self.queued.clear();
         self.scroll.set_offset(point(px(0.0), px(0.0)));
+    }
+
+    /// Whether an explicit pin/unpin is being saved or waits to be saved. A
+    /// path change that happens meanwhile must be saved after it even when the
+    /// display holds nothing it could apply to yet.
+    fn explicit_pending(&self) -> bool {
+        self.inflight == Some(PinRequest::Explicit)
+            || self
+                .queued
+                .iter()
+                .any(|(_, request)| *request == PinRequest::Explicit)
     }
 }
 
@@ -236,6 +251,7 @@ impl EditorView {
             return;
         }
         self.sidebar_pins.saving = true;
+        self.sidebar_pins.inflight = Some(request);
         let generation = self.work_folder_generation;
         let repository = self.stores.pins();
         // Path changes whose save failed earlier go first, so the stored list
@@ -285,6 +301,7 @@ impl EditorView {
         }
         if request != PinRequest::Load {
             self.sidebar_pins.saving = false;
+            self.sidebar_pins.inflight = None;
         }
         match result {
             Ok(snapshot) => {
@@ -303,8 +320,13 @@ impl EditorView {
                     for pending in &self.sidebar_pins.unsaved {
                         let _ = apply_pin_update(&mut entries, pending);
                     }
-                    // ...nor those still waiting behind this save.
-                    for (waiting, _) in &self.sidebar_pins.queued {
+                    // ...nor path changes still waiting behind this save.
+                    // Explicit pin/unpin waiting there is not shown before it
+                    // is saved.
+                    for (waiting, waiting_request) in &self.sidebar_pins.queued {
+                        if *waiting_request != PinRequest::Followup {
+                            continue;
+                        }
                         for pending in waiting {
                             let _ = apply_pin_update(&mut entries, pending);
                         }
@@ -380,7 +402,7 @@ impl EditorView {
                 changed |= applied;
             }
         }
-        if self.sidebar_pins.loaded && !changed {
+        if self.sidebar_pins.loaded && !changed && !self.sidebar_pins.explicit_pending() {
             return;
         }
         if self.sidebar_pins.blocked.is_some() {
@@ -1169,6 +1191,250 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(view.expanded_folders.contains(&root.join("a/b")));
         });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pin repository whose saves can be made to fail.
+    struct SwitchPins {
+        inner: hane_session::MemoryPinStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwitchPins {
+        fn set_failing(&self, failing: bool) {
+            self.fail
+                .store(failing, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl hane_session::PinRepository for SwitchPins {
+        fn load(&self, root: &Path) -> Result<PinSnapshot, hane_session::PinError> {
+            self.inner.load(root)
+        }
+
+        fn update(
+            &self,
+            root: &Path,
+            updates: &[PinUpdate],
+        ) -> Result<PinSnapshot, hane_session::PinError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(hane_session::PinError::Write("injected".to_owned()));
+            }
+            self.inner.update(root, updates)
+        }
+    }
+
+    fn switch_stores() -> (Arc<SwitchPins>, StateStores) {
+        let pins = Arc::new(SwitchPins {
+            inner: hane_session::MemoryPinStore::default(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let state = Arc::new(hane_session::MemoryStateStore::default());
+        let stores = StateStores::with_pins(state.clone(), state, pins.clone());
+        (pins, stores)
+    }
+
+    #[gpui::test]
+    fn a_queued_explicit_pin_is_not_shown_before_it_is_saved(cx: &mut gpui::TestAppContext) {
+        let root = pin_test_root("queued-explicit");
+        std::fs::create_dir_all(&root).unwrap();
+        let (pins, stores) = switch_stores();
+        let (view, cx) = open_pin_view(cx, &root, stores.clone());
+        let root = view_root(&view, cx);
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("Alpha.md"), PinKind::File, cx);
+        });
+        cx.run_until_parked();
+
+        // A result applied while an explicit pin waits in the queue must not
+        // show that pin. A Load result overlays the queue the same way and
+        // never starts a save.
+        let snapshot = stores.pins().load(&root).unwrap();
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            view.sidebar_pins.queued.push_back((
+                vec![PinUpdate::Pin(PinnedEntry::new("Delta.md", PinKind::File))],
+                PinRequest::Explicit,
+            ));
+            view.finish_pin_request(
+                generation,
+                &root,
+                PinRequest::Load,
+                &[],
+                &[],
+                Ok(snapshot),
+                cx,
+            );
+            assert_eq!(
+                pin_paths(&view.sidebar_pins.entries),
+                [PathBuf::from("Alpha.md")],
+                "queued explicit pins are not overlaid"
+            );
+            view.sidebar_pins.queued.clear();
+            view.status = None;
+        });
+
+        // Saves now fail: nothing the user asked for may appear. The first
+        // failing save is the running one, the second waits behind it.
+        pins.set_failing(true);
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("Beta.md"), PinKind::File, cx);
+            view.send_pin_updates(
+                vec![PinUpdate::Pin(PinnedEntry::new("Gamma.md", PinKind::File))],
+                PinRequest::Explicit,
+                cx,
+            );
+            assert_eq!(
+                pin_paths(&view.sidebar_pins.entries),
+                [PathBuf::from("Alpha.md")]
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                pin_paths(&view.sidebar_pins.entries),
+                [PathBuf::from("Alpha.md")],
+                "a failed explicit save leaves the display unchanged"
+            );
+            assert!(!view.sidebar_pins.saving && !view.sidebar_pins.busy);
+            assert!(view.sidebar_pins.queued.is_empty());
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("ピン留めを保存できません"))
+            );
+        });
+        assert_eq!(
+            pin_paths(&stores.pins().load(&root).unwrap().entries),
+            [PathBuf::from("Alpha.md")],
+            "nothing failed was stored"
+        );
+
+        // A later explicit save works again.
+        pins.set_failing(false);
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("Gamma.md"), PinKind::File, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sidebar_pins
+                    .entries
+                    .iter()
+                    .any(|entry| entry.relative_path == Path::new("Gamma.md"))
+            );
+        });
+        assert!(
+            stores
+                .pins()
+                .load(&root)
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("Gamma.md"))
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_rename_during_an_explicit_pin_save_is_not_lost(cx: &mut gpui::TestAppContext) {
+        let root = pin_test_root("rename-in-flight");
+        std::fs::create_dir_all(&root).unwrap();
+        let stores = StateStores::memory();
+        let (view, cx) = open_pin_view(cx, &root, stores.clone());
+        let root = view_root(&view, cx);
+
+        // Pin(A) is being saved when A -> B happens.
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("A.md"), PinKind::File, cx);
+            assert!(view.sidebar_pins.saving);
+            view.follow_pin_rename(&root.join("A.md"), &root.join("B.md"), PinKind::File, cx);
+            assert_eq!(view.sidebar_pins.queued.len(), 1, "the rename is queued");
+            assert!(view.sidebar_pins.entries.is_empty());
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                pin_paths(&view.sidebar_pins.entries),
+                [PathBuf::from("B.md")]
+            );
+            assert!(!view.sidebar_pins.saving && view.sidebar_pins.queued.is_empty());
+        });
+        assert_eq!(
+            pin_paths(&stores.pins().load(&root).unwrap().entries),
+            [PathBuf::from("B.md")]
+        );
+
+        // Pin(A) waits in the queue when A -> B happens.
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("Z.md"), PinKind::File, cx);
+            view.send_pin_updates(
+                vec![PinUpdate::Pin(PinnedEntry::new("A.md", PinKind::File))],
+                PinRequest::Explicit,
+                cx,
+            );
+            view.follow_pin_rename(&root.join("A.md"), &root.join("B2.md"), PinKind::File, cx);
+            assert_eq!(view.sidebar_pins.queued.len(), 2);
+        });
+        cx.run_until_parked();
+        let expected = [
+            PathBuf::from("B2.md"),
+            PathBuf::from("Z.md"),
+            PathBuf::from("B.md"),
+        ];
+        view.read_with(cx, |view, _| {
+            assert_eq!(pin_paths(&view.sidebar_pins.entries), expected);
+            assert!(!view.sidebar_pins.saving && view.sidebar_pins.queued.is_empty());
+        });
+        assert_eq!(
+            pin_paths(&stores.pins().load(&root).unwrap().entries),
+            expected
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_failed_rename_is_sent_again_ahead_of_the_next_save(cx: &mut gpui::TestAppContext) {
+        let root = pin_test_root("rename-resend");
+        std::fs::create_dir_all(&root).unwrap();
+        let (pins, stores) = switch_stores();
+        let (view, cx) = open_pin_view(cx, &root, stores.clone());
+        let root = view_root(&view, cx);
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("A.md"), PinKind::File, cx);
+        });
+        cx.run_until_parked();
+
+        pins.set_failing(true);
+        view.update(cx, |view, cx| {
+            view.follow_pin_rename(&root.join("A.md"), &root.join("B.md"), PinKind::File, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                pin_paths(&view.sidebar_pins.entries),
+                [PathBuf::from("B.md")]
+            );
+            assert_eq!(view.sidebar_pins.unsaved.len(), 1);
+        });
+
+        pins.set_failing(false);
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("C.md"), PinKind::File, cx);
+        });
+        cx.run_until_parked();
+        let expected = [PathBuf::from("C.md"), PathBuf::from("B.md")];
+        view.read_with(cx, |view, _| {
+            assert_eq!(pin_paths(&view.sidebar_pins.entries), expected);
+            assert!(view.sidebar_pins.unsaved.is_empty());
+        });
+        assert_eq!(
+            pin_paths(&stores.pins().load(&root).unwrap().entries),
+            expected
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
