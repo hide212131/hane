@@ -2133,6 +2133,13 @@ impl EditorView {
         self.sessions.active_mut().editor_mut()
     }
 
+    /// Completes the pending input measurements for a painted frame. This only
+    /// drains instrumentation and never changes the document, so unlike
+    /// [`Self::editor_mut`] it must not raise the external-open guard.
+    pub(crate) fn mark_frame_painted(&mut self) -> Vec<InputMeasurement> {
+        self.sessions.active_mut().editor_mut().mark_frame_painted()
+    }
+
     /// The open documents, for a tab strip or filer to render.
     pub fn sessions(&self) -> impl Iterator<Item = &DocumentSession> {
         self.sessions.sessions()
@@ -13915,11 +13922,28 @@ mod tests {
         cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(700.0)));
         // `run_until_parked` and `simulate_resize` never render, so draw the
         // window explicitly to run the production root `Render::render`.
+        // The `cx.notify()` above invalidated the root, so this draw re-runs the
+        // production Render and Paint (`InputCapture::paint` marks the frame)
+        // instead of reusing a cached view.
         cx.update(|window, app| {
             let _ = window.draw(app);
         });
+        let observe = |cx: &mut gpui::VisualTestContext| {
+            let unsaved_sessions = view.read_with(cx, |view, _| view.has_unsaved_sessions());
+            (unsaved_sessions, queue.guard().unsaved())
+        };
+        // Boundary 1: right after the draw, Paint has already run.
+        assert_eq!(observe(cx), (false, false));
+        // Boundary 2: after the executor settled.
         cx.run_until_parked();
-        assert!(!queue.guard().unsaved());
+        assert_eq!(observe(cx), (false, false));
+        // Boundary 3: draw again. Notify first so the Render cache cannot skip
+        // this explicit draw.
+        view.update(cx, |_, cx| cx.notify());
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+        assert_eq!(observe(cx), (false, false));
         queue.try_push(folder.clone()).unwrap();
         let generation = view.read_with(cx, |view, _| view.work_folder_generation);
         let mut stamped = None;
