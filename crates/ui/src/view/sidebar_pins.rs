@@ -58,6 +58,9 @@ pub(super) struct SidebarPins {
     /// Changes waiting for the running save to finish.
     queued: VecDeque<(Vec<PinUpdate>, PinRequest)>,
     pub(super) scroll: ScrollHandle,
+    /// Rows (heading included) the last render put at the top of the ordinary
+    /// list; `0` when the pins have their own area or there are none.
+    pub(super) inline_rows: std::cell::Cell<usize>,
 }
 
 impl Default for SidebarPins {
@@ -73,6 +76,7 @@ impl Default for SidebarPins {
             inflight: None,
             queued: VecDeque::new(),
             scroll: ScrollHandle::new(),
+            inline_rows: std::cell::Cell::new(0),
         }
     }
 }
@@ -90,6 +94,7 @@ impl SidebarPins {
         self.inflight = None;
         self.queued.clear();
         self.scroll.set_offset(point(px(0.0), px(0.0)));
+        self.inline_rows.set(0);
     }
 
     /// Whether an explicit pin/unpin is being saved or waits to be saved. A
@@ -146,6 +151,36 @@ pub(super) fn pin_area_layout(pin_count: usize, list_region_height: f32) -> PinA
             inline_rows: 0,
         }
     }
+}
+
+/// The scroll position (distance from the top, already clamped to the
+/// scrollable range) that brings tree row `index` into a viewport of
+/// `viewport` height, or `None` when nothing needs to move. `inline_rows` pin
+/// rows sit above the root row in the ordinary list and count toward both the
+/// row's top and the content height.
+fn row_scroll_target(
+    index: usize,
+    tree_rows: usize,
+    inline_rows: usize,
+    draft_rows: usize,
+    viewport: f32,
+    current: f32,
+) -> Option<f32> {
+    if viewport <= 0.0 {
+        return None;
+    }
+    let content_height = sidebar_list_content_height(tree_rows + inline_rows, draft_rows, false);
+    let max_scroll = (content_height - viewport).max(0.0);
+    let row_top = (inline_rows + index + 1) as f32 * SIDEBAR_ROW_HEIGHT;
+    let row_bottom = row_top + SIDEBAR_ROW_HEIGHT;
+    let target = if row_top < current {
+        row_top
+    } else if row_bottom > current + viewport {
+        row_bottom - viewport
+    } else {
+        return None;
+    };
+    Some(target.clamp(0.0, max_scroll))
 }
 
 fn pin_display_name(entry: &PinnedEntry) -> String {
@@ -523,24 +558,20 @@ impl EditorView {
             .keys()
             .filter(|id| self.sessions.get(**id).is_some())
             .count();
-        let content_height = sidebar_list_content_height(rows.len(), draft_rows, false);
         let viewport = f32::from(self.sidebar_scroll.bounds().size.height);
-        if viewport <= 0.0 {
-            return;
-        }
-        let max_scroll = (content_height - viewport).max(0.0);
-        let row_top = (index + 1) as f32 * SIDEBAR_ROW_HEIGHT;
-        let row_bottom = row_top + SIDEBAR_ROW_HEIGHT;
         let current = -f32::from(self.sidebar_scroll.offset().y);
-        let target = if row_top < current {
-            row_top
-        } else if row_bottom > current + viewport {
-            row_bottom - viewport
-        } else {
+        let Some(target) = row_scroll_target(
+            index,
+            rows.len(),
+            self.sidebar_pins.inline_rows.get(),
+            draft_rows,
+            viewport,
+            current,
+        ) else {
             return;
         };
         self.sidebar_scroll
-            .set_offset(point(px(0.0), px(-target.clamp(0.0, max_scroll))));
+            .set_offset(point(px(0.0), px(-target)));
     }
 
     /// The toggle slot at the right end of a row. The slot always takes its
@@ -766,6 +797,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn inline_pin_rows_shift_the_row_top_and_the_max_scroll() {
+        let viewport = 4.0 * SIDEBAR_ROW_HEIGHT;
+        // 20 tree rows, last one revealed, with 1 heading + 3 inline pins.
+        let inline = pin_area_layout(3, 100.0).inline_rows;
+        assert_eq!(inline, 4);
+        let target = row_scroll_target(19, 20, inline, 0, viewport, 0.0).unwrap();
+        let content = (1 + 20 + inline) as f32 * SIDEBAR_ROW_HEIGHT;
+        // The row's bottom lands on the viewport bottom, which is the max.
+        assert!(close(target, content - viewport));
+        let row_top = (inline + 19 + 1) as f32 * SIDEBAR_ROW_HEIGHT;
+        assert!(target <= row_top && row_top + SIDEBAR_ROW_HEIGHT <= target + viewport + 0.001);
+        // Without inline rows the same row needs less scrolling.
+        let plain = row_scroll_target(19, 20, 0, 0, viewport, 0.0).unwrap();
+        assert!(close(
+            target - plain,
+            inline as f32 * SIDEBAR_ROW_HEIGHT
+        ));
+    }
+
+    #[test]
+    fn a_visible_row_needs_no_scroll_and_upward_reveal_uses_the_row_top() {
+        let viewport = 4.0 * SIDEBAR_ROW_HEIGHT;
+        assert_eq!(
+            row_scroll_target(0, 20, 4, 0, 10.0 * SIDEBAR_ROW_HEIGHT, 0.0),
+            None
+        );
+        // With 4 inline rows the first tree row is below a 4-row viewport.
+        assert!(row_scroll_target(0, 20, 4, 0, viewport, 0.0).is_some());
+        let up = row_scroll_target(5, 20, 4, 0, viewport, 30.0 * SIDEBAR_ROW_HEIGHT).unwrap();
+        assert!(close(up, 10.0 * SIDEBAR_ROW_HEIGHT));
+        assert_eq!(row_scroll_target(5, 20, 4, 0, 0.0, 0.0), None);
     }
 
     fn pin_test_root(label: &str) -> PathBuf {

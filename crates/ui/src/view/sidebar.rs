@@ -838,6 +838,7 @@ impl EditorView {
             self.sidebar_pins.entries.len(),
             (sidebar_viewport_height - controls_height - footer_height).max(0.0),
         );
+        self.sidebar_pins.inline_rows.set(pin_layout.inline_rows);
         let content_height = sidebar_list_content_height(
             tree_row_count + pin_layout.inline_rows,
             draft_row_count,
