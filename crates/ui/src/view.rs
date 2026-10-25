@@ -4459,6 +4459,8 @@ impl EditorView {
                 self.pending_reading_link = Some(PendingReadingLink {
                     destination,
                     offset,
+                    press_x: f32::from(event.position.x),
+                    press_y: f32::from(event.position.y),
                 });
             } else {
                 cx.open_url(&destination);
@@ -4483,6 +4485,26 @@ impl EditorView {
             self.after_input(cx);
         }
         true
+    }
+
+    /// Shared by the row and panel mouse-move handlers: with the left button
+    /// held, a pending link press becomes a selection drag once the pointer
+    /// has travelled `LINK_PRESS_DRAG_THRESHOLD`; before that it stays a click.
+    fn promote_pending_link_on_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(pending) = self.pending_reading_link.as_ref() else {
+            return;
+        };
+        if link_press_is_drag(
+            pending.press_x,
+            pending.press_y,
+            f32::from(event.position.x),
+            f32::from(event.position.y),
+        ) {
+            self.start_drag_from_pending_link(cx);
+        }
     }
 
     /// Left mouse-up inside the panel: a still-pending link press was a click.
@@ -4548,9 +4570,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.dragging() {
-            self.start_drag_from_pending_link(cx);
-        }
+        self.promote_pending_link_on_move(event, cx);
         if !self.text_selection_drag || !event.dragging() {
             return;
         }
@@ -6394,11 +6414,27 @@ struct RowHit {
 }
 
 /// A link press waiting for its mouse-up (reading mode, no modifier).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct PendingReadingLink {
     destination: std::sync::Arc<str>,
     /// Caret boundary under the press, where a drag selection anchors.
     offset: SourceOffset,
+    /// Window position of the press in logical pixels, the origin of the
+    /// movement measured against `LINK_PRESS_DRAG_THRESHOLD`.
+    press_x: f32,
+    press_y: f32,
+}
+
+/// Pointer travel, in logical pixels, from a reading-mode link press at which
+/// the press stops being a click and becomes a selection drag.
+const LINK_PRESS_DRAG_THRESHOLD: f32 = 4.0;
+
+/// Whether a pointer at `(x, y)` has moved far enough from the press to count
+/// as a drag. Exactly the threshold already counts as a drag; anything
+/// shorter is still a click. Row and panel mouse-move handlers share this.
+fn link_press_is_drag(press_x: f32, press_y: f32, x: f32, y: f32) -> bool {
+    let (dx, dy) = (x - press_x, y - press_y);
+    dx * dx + dy * dy >= LINK_PRESS_DRAG_THRESHOLD * LINK_PRESS_DRAG_THRESHOLD
 }
 
 /// What a left click on a text row resolved to.
@@ -6628,9 +6664,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let mut changed = false;
-        if event.dragging() {
-            self.start_drag_from_pending_link(cx);
-        }
+        self.promote_pending_link_on_move(event, cx);
         if let Some(drag) = self.sidebar_resize_drag {
             let delta = f32::from(event.position.x) - drag.pointer_x;
             let next = sidebar_width_for_drag(
@@ -7844,6 +7878,8 @@ mod tests {
             let pending = PendingReadingLink {
                 destination: "https://example.com/".into(),
                 offset: pressed,
+                press_x: 0.0,
+                press_y: 0.0,
             };
             let text_before = view.editor().document().full_text();
             let selection_before = view.editor().selection();
@@ -7933,6 +7969,96 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), text_before);
             assert_eq!(view.editor().document().revision(), revision_before);
         });
+    }
+
+    /// Issue #603: the click / drag boundary is one distance rule. Travel
+    /// shorter than the threshold is a click; exactly the threshold is a drag.
+    #[test]
+    fn link_press_drag_boundary_is_inclusive_at_threshold() {
+        let t = LINK_PRESS_DRAG_THRESHOLD;
+        assert!(!link_press_is_drag(10.0, 10.0, 10.0, 10.0));
+        assert!(!link_press_is_drag(10.0, 10.0, 10.0 + t - 0.5, 10.0));
+        assert!(!link_press_is_drag(10.0, 10.0, 10.0, 10.0 - (t - 0.5)));
+        assert!(link_press_is_drag(10.0, 10.0, 10.0 + t, 10.0));
+        assert!(link_press_is_drag(10.0, 10.0, 10.0, 10.0 - t));
+        assert!(link_press_is_drag(10.0, 10.0, 10.0 + t + 0.5, 10.0));
+        // Diagonal travel is measured as distance, not per axis.
+        assert!(!link_press_is_drag(0.0, 0.0, 2.5, 2.5));
+        assert!(link_press_is_drag(0.0, 0.0, 3.0, 3.0));
+    }
+
+    /// Issue #603: through real mouse-down / move / up dispatch, movement
+    /// below the threshold keeps the pending link (opened once on mouse-up,
+    /// selection untouched) and movement past it starts a selection drag.
+    #[gpui::test]
+    fn reading_link_press_threshold_through_dispatch(cx: &mut gpui::TestAppContext) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = "see [Hane](https://example.com/) end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        let (text_before, revision_before, selection_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.editor().selection(),
+            )
+        });
+        let moved = |dx: f32, dy: f32| point(down_point.x + px(dx), down_point.y + px(dy));
+        let half = LINK_PRESS_DRAG_THRESHOLD - 0.5;
+        let past = LINK_PRESS_DRAG_THRESHOLD + 0.5;
+
+        // Past the threshold (horizontal, then vertical): drag, URL not opened.
+        for end in [moved(past, 0.0), moved(0.0, past)] {
+            cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+            view.read_with(cx, |view, _| {
+                assert!(view.pending_reading_link.is_none());
+                assert!(view.text_selection_drag);
+                assert_eq!(view.editor().selection().anchor, pressed);
+            });
+            cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+            assert!(cx.opened_url().is_none());
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.editor().document().full_text(), text_before);
+                assert_eq!(view.editor().document().revision(), revision_before);
+            });
+            // Restore the baseline selection for the next press.
+            view.update(cx, |view, _| {
+                view.editor_mut().set_selection(selection_before).unwrap();
+            });
+        }
+
+        // Below the threshold: no movement, small, and just-under-boundary
+        // moves all keep the link pending and change nothing until mouse-up.
+        let mut opened_before = None;
+        for end in [down_point, moved(1.0, 0.0), moved(half, 0.0), moved(0.0, half)] {
+            cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+            assert_eq!(cx.opened_url(), opened_before);
+            view.read_with(cx, |view, _| {
+                assert!(view.pending_reading_link.is_some());
+                assert!(!view.text_selection_drag);
+                assert_eq!(view.editor().selection(), selection_before);
+            });
+            cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+            assert_eq!(cx.opened_url().as_deref(), Some(DESTINATION));
+            opened_before = cx.opened_url();
+            view.read_with(cx, |view, _| {
+                assert!(view.pending_reading_link.is_none());
+                assert!(!view.text_selection_drag);
+                assert_eq!(view.editor().selection(), selection_before);
+                assert_eq!(view.editor().document().full_text(), text_before);
+                assert_eq!(view.editor().document().revision(), revision_before);
+                assert!(!view.editor().can_undo());
+                assert!(!view.editor().can_redo());
+            });
+        }
     }
 
     /// Issue #502: editing a reference definition in another block must not
