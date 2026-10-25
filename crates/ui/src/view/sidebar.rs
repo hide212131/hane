@@ -1,5 +1,6 @@
 use super::*;
 use gpui_component::Icon;
+use hane_session::PinKind;
 
 /// One row of the flattened sidebar tree: a node together with how deeply it
 /// is nested, so indentation can be applied without recursive rendering.
@@ -530,6 +531,12 @@ impl EditorView {
         let tree_row_count = rows.len();
         let empty_filter_row = filtering && tree_row_count == 0;
         let today = local_today();
+        let pinned_relative: HashSet<&Path> = self
+            .sidebar_pins
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_path())
+            .collect();
         let tree = rows
             .into_iter()
             .enumerate()
@@ -555,8 +562,20 @@ impl EditorView {
                             )
                         };
                         let menu_path = path.clone();
+                        let pin_relative = self.pin_relative(&path);
+                        let pinned = pin_relative
+                            .as_deref()
+                            .is_some_and(|relative| pinned_relative.contains(relative));
+                        let pin_slot = self.pin_toggle_slot(
+                            ("work-folder-pin-toggle", index),
+                            pin_relative,
+                            PinKind::File,
+                            pinned,
+                            cx,
+                        );
                         div()
                             .id(("work-folder-entry", index))
+                            .group("sidebar-pin-row")
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |view, event: &MouseDownEvent, _, cx| {
@@ -571,6 +590,9 @@ impl EditorView {
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
                             .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                            .flex()
+                            .flex_row()
+                            .items_center()
                             .rounded_sm()
                             .cursor_pointer()
                             .when(is_active, |element| {
@@ -579,6 +601,9 @@ impl EditorView {
                             .child(
                                 div()
                                     .h_full()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -590,6 +615,7 @@ impl EditorView {
                                     ))
                                     .child(name),
                             )
+                            .child(pin_slot)
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                                 window.focus(&view.focus_handle, cx);
                                 if !event.is_keyboard() && event.click_count() >= 2 {
@@ -637,8 +663,20 @@ impl EditorView {
                                 .child(folder.name().to_owned())
                         };
                         let menu_path = path.clone();
+                        let pin_relative = self.pin_relative(&path);
+                        let pinned = pin_relative
+                            .as_deref()
+                            .is_some_and(|relative| pinned_relative.contains(relative));
+                        let pin_slot = self.pin_toggle_slot(
+                            ("work-folder-pin-toggle", index),
+                            pin_relative,
+                            PinKind::Folder,
+                            pinned,
+                            cx,
+                        );
                         div()
                             .id(("work-folder-folder", index))
+                            .group("sidebar-pin-row")
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |view, event: &MouseDownEvent, _, cx| {
@@ -653,6 +691,9 @@ impl EditorView {
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
                             .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                            .flex()
+                            .flex_row()
+                            .items_center()
                             .rounded_sm()
                             .cursor_pointer()
                             .when(is_selected, |element| {
@@ -661,6 +702,9 @@ impl EditorView {
                             .child(
                                 div()
                                     .h_full()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -672,6 +716,7 @@ impl EditorView {
                                     ))
                                     .child(name),
                             )
+                            .child(pin_slot)
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                                 window.focus(&view.focus_handle, cx);
                                 if !event.is_keyboard() && event.click_count() >= 2 {
@@ -774,9 +819,7 @@ impl EditorView {
                     }))
             })
             .collect::<Vec<_>>();
-        let content_height =
-            sidebar_list_content_height(tree_row_count, draft_row_count, empty_filter_row);
-        let list_top = SIDEBAR_PADDING
+        let controls_height = SIDEBAR_PADDING
             + SIDEBAR_TOOLBAR_HEIGHT
             + SIDEBAR_TOOLBAR_GAP
             + SIDEBAR_TOOLBAR_HEIGHT
@@ -786,12 +829,44 @@ impl EditorView {
             } else {
                 0.0
             };
-        let list_viewport_height = (sidebar_viewport_height
-            - list_top
-            - SIDEBAR_SETTINGS_GAP
-            - SIDEBAR_SETTINGS_HEIGHT
-            - SIDEBAR_PADDING)
-            .max(0.0);
+        let footer_height = SIDEBAR_SETTINGS_GAP + SIDEBAR_SETTINGS_HEIGHT + SIDEBAR_PADDING;
+        // The pin area sits between the filter and the ordinary list and
+        // scrolls on its own; the list's top and viewport (and so its thumb
+        // and hit test) start below it. In a region too low for a separate
+        // area the pins are the first rows of the list instead.
+        let pin_layout = sidebar_pins::pin_area_layout(
+            self.sidebar_pins.entries.len(),
+            (sidebar_viewport_height - controls_height - footer_height).max(0.0),
+        );
+        let content_height = sidebar_list_content_height(
+            tree_row_count + pin_layout.inline_rows,
+            draft_row_count,
+            empty_filter_row,
+        );
+        let list_top = controls_height
+            + if pin_layout.height > 0.0 {
+                pin_layout.height + SIDEBAR_FILTER_GAP
+            } else {
+                0.0
+            };
+        let list_viewport_height = (sidebar_viewport_height - list_top - footer_height).max(0.0);
+        let mut pin_rows = self.pin_area_rows(cx);
+        let inline_pin_rows = if pin_layout.height > 0.0 {
+            Vec::new()
+        } else {
+            std::mem::take(&mut pin_rows)
+        };
+        let pin_area = (pin_layout.height > 0.0).then(|| {
+            div()
+                .id("sidebar-pin-area")
+                .debug_selector(|| "sidebar-pin-area".to_owned())
+                .h(px(pin_layout.height))
+                .flex_none()
+                .mb(px(SIDEBAR_FILTER_GAP))
+                .overflow_y_scroll()
+                .track_scroll(&self.sidebar_pins.scroll)
+                .children(pin_rows)
+        });
         let scrollbar = self.sidebar_scrollbar(list_top, list_viewport_height, content_height, cx);
         let list = div()
             .id("work-folder-sidebar-list")
@@ -800,6 +875,7 @@ impl EditorView {
             .overflow_y_scroll()
             .track_scroll(&self.sidebar_scroll)
             .on_scroll_wheel(cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)))
+            .children(inline_pin_rows)
             .child(root_row)
             .children(tree)
             .children(empty_filter)
@@ -860,6 +936,7 @@ impl EditorView {
                         .child(toolbar)
                         .child(sort_row)
                         .children(filter)
+                        .children(pin_area)
                         .child(list)
                         .child(settings_footer),
                 )
@@ -1045,6 +1122,7 @@ impl EditorView {
                         }
                         view.content_search_workspace_changed(cx);
                         view.status = Some("ゴミ箱へ移動しました".to_owned());
+                        view.follow_pin_removal(&path, false, cx);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                         view.status = Some("ゴミ箱への移動を取り消しました".to_owned());
@@ -1160,6 +1238,7 @@ impl EditorView {
                         }
                         view.content_search_workspace_changed(cx);
                         view.status = Some("ゴミ箱へ移動しました".to_owned());
+                        view.follow_pin_removal(&path, true, cx);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                         view.status = Some("ゴミ箱への移動を取り消しました".to_owned());

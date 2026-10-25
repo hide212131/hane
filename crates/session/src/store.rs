@@ -1,3 +1,4 @@
+use crate::pins::{FilePinStore, MemoryPinStore, PinRepository};
 use crate::service::atomic_write_bytes;
 use crate::workfolder::WorkFolderSortOrder;
 use std::fs;
@@ -154,14 +155,29 @@ pub trait RecentFilesRepository: Send + Sync + 'static {
 pub struct StateStores {
     settings: Arc<dyn SettingsRepository>,
     recent: Arc<dyn RecentFilesRepository>,
+    pins: Arc<dyn PinRepository>,
 }
 
 impl StateStores {
+    /// Settings and recent files over the given repositories, with pins kept
+    /// in memory. Use [`StateStores::with_pins`] to persist them as well.
     pub fn new(
         settings: Arc<dyn SettingsRepository>,
         recent: Arc<dyn RecentFilesRepository>,
     ) -> Self {
-        Self { settings, recent }
+        Self::with_pins(settings, recent, Arc::new(MemoryPinStore::default()))
+    }
+
+    pub fn with_pins(
+        settings: Arc<dyn SettingsRepository>,
+        recent: Arc<dyn RecentFilesRepository>,
+        pins: Arc<dyn PinRepository>,
+    ) -> Self {
+        Self {
+            settings,
+            recent,
+            pins,
+        }
     }
 
     /// Stores backed by the per-user state directory, or in-memory stores when
@@ -169,8 +185,9 @@ impl StateStores {
     pub fn from_environment() -> Self {
         match FileStateStore::from_environment() {
             Ok(store) => {
+                let pins = Arc::new(FilePinStore::at(store.root()));
                 let store = Arc::new(store);
-                Self::new(store.clone(), store)
+                Self::with_pins(store.clone(), store, pins)
             }
             Err(_) => Self::memory(),
         }
@@ -187,6 +204,12 @@ impl StateStores {
 
     pub fn recent_files(&self) -> &dyn RecentFilesRepository {
         self.recent.as_ref()
+    }
+
+    /// A shared handle, so a background task can load or update pins without
+    /// borrowing the view.
+    pub fn pins(&self) -> Arc<dyn PinRepository> {
+        self.pins.clone()
     }
 }
 

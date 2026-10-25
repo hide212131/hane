@@ -118,6 +118,7 @@ mod render;
 mod session_save;
 mod sidebar;
 mod sidebar_filter;
+mod sidebar_pins;
 mod viewport;
 #[cfg(test)]
 use sidebar::{flatten_filtered_work_folder_tree, flatten_work_folder_tree};
@@ -900,6 +901,9 @@ pub struct EditorView {
     sidebar_resize_drag: Option<SidebarResizeDrag>,
     /// Native scroll state for the work-folder list; a custom thumb mirrors it.
     sidebar_scroll: ScrollHandle,
+    /// Pins of the current work folder (Issue #617): the resolved list, the
+    /// in-flight bookkeeping and the pin area's own scroll.
+    sidebar_pins: sidebar_pins::SidebarPins,
     /// Horizontal scroll state for the file-tab strip. Keeping this in a
     /// handle lets GPUI reveal a newly activated tab even when the main panel
     /// is narrower than the open session list.
@@ -1821,6 +1825,7 @@ impl EditorView {
             sidebar_collapsed: false,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
+            sidebar_pins: sidebar_pins::SidebarPins::default(),
             file_tabs_scroll: ScrollHandle::new(),
             file_tab_context_menu: None,
             sidebar_context_menu: None,
@@ -2045,6 +2050,7 @@ impl EditorView {
                 // A work folder that opened successfully is shown even if the
                 // side panel was hidden before (Issue #549).
                 self.sidebar_collapsed = false;
+                self.begin_pin_load(cx);
 
                 // A recovery failure must not look like the drafts were
                 // simply gone: `OsDraftStore::recover` already keeps
@@ -3316,6 +3322,9 @@ impl EditorView {
         self.sidebar_filter = ShortTextInput::default();
         self.sidebar_filter_focused = false;
         self.sidebar_filter_input_bounds = None;
+        // The old root's pins (and any save still running for them) must not
+        // show in, or report into, the new root's panel.
+        self.sidebar_pins.reset();
         self.pending_new_folders.clear();
         self.draft_recovery_warning = None;
         self.title_sync_pending.clear();

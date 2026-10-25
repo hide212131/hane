@@ -20,6 +20,10 @@ pub const ICON_FOLDER_NEW: &str = "icons/work-folder/folder-new.svg";
 pub const ICON_CHEVRON_RIGHT: &str = "icons/work-folder/chevron-right.svg";
 /// Expanded folder disclosure chevron.
 pub const ICON_CHEVRON_DOWN: &str = "icons/work-folder/chevron-down.svg";
+/// The hover action that pins a sidebar row.
+pub const ICON_PIN: &str = "icons/work-folder/pin.svg";
+/// The hover action that unpins a sidebar row.
+pub const ICON_PIN_OFF: &str = "icons/work-folder/pin-off.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
 /// The left side panel open/close button: a rounded wide frame with a thin
 /// vertical divider on its left.
@@ -56,6 +60,14 @@ const CHEVRON_RIGHT_SVG: &[u8] = include_bytes!(concat!(
 const CHEVRON_DOWN_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/work-folder/chevron-down.svg"
+));
+const PIN_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/work-folder/pin.svg"
+));
+const PIN_OFF_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/work-folder/pin-off.svg"
 ));
 const SETTINGS_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -98,6 +110,8 @@ impl AssetSource for WorkFolderIcons {
             ICON_FOLDER_NEW => Some(Cow::Borrowed(FOLDER_NEW_SVG)),
             ICON_CHEVRON_RIGHT => Some(Cow::Borrowed(CHEVRON_RIGHT_SVG)),
             ICON_CHEVRON_DOWN => Some(Cow::Borrowed(CHEVRON_DOWN_SVG)),
+            ICON_PIN => Some(Cow::Borrowed(PIN_SVG)),
+            ICON_PIN_OFF => Some(Cow::Borrowed(PIN_OFF_SVG)),
             ICON_SETTINGS => Some(Cow::Borrowed(SETTINGS_SVG)),
             ICON_SIDEBAR => Some(Cow::Borrowed(SIDEBAR_SVG)),
             ICON_ARROW_LEFT => Some(Cow::Borrowed(ARROW_LEFT_SVG)),
@@ -151,6 +165,8 @@ mod tests {
             ICON_FOLDER_NEW,
             ICON_CHEVRON_RIGHT,
             ICON_CHEVRON_DOWN,
+            ICON_PIN,
+            ICON_PIN_OFF,
             ICON_SETTINGS,
             ICON_SIDEBAR,
             ICON_ARROW_LEFT,

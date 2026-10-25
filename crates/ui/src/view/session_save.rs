@@ -495,6 +495,7 @@ impl EditorView {
                 if let Err(error) = self.stores.recent_files().store(&self.recent) {
                     self.status = Some(format!("Recent files failed: {error}"));
                 }
+                self.follow_pin_rename(&from, &target, hane_session::PinKind::File, cx);
             }
         }
         // The picked name may have been raced away, or the file may have
