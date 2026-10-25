@@ -100,6 +100,9 @@ impl EditorView {
                     let current = session.revision() == revision && draft.draft_id == draft_id;
                     current.then(|| {
                         (
+                            // Ordered with the flush snapshots: a write that
+                            // starts late must not undo a newer one.
+                            hane_session::next_draft_snapshot_sequence(),
                             draft.target_directory.clone(),
                             session.editor().document().full_text(),
                         )
@@ -107,11 +110,17 @@ impl EditorView {
                 })
                 .ok()
                 .flatten();
-            if let Some((target_directory, text)) = snapshot {
+            if let Some((sequence, target_directory, text)) = snapshot {
                 let _ = cx
                     .background_executor()
                     .spawn(async move {
-                        draft_store.write(&root, draft_id, &target_directory, &text)
+                        draft_store.write_snapshot(
+                            &root,
+                            draft_id,
+                            &target_directory,
+                            &text,
+                            sequence,
+                        )
                     })
                     .await;
             }
@@ -139,10 +148,15 @@ impl EditorView {
             let Some(session) = self.sessions.get(id) else {
                 continue;
             };
+            let sequence = hane_session::next_draft_snapshot_sequence();
             let text = session.editor().document().full_text();
-            let _ = self
-                .draft_store
-                .write(root, draft.draft_id, &draft.target_directory, &text);
+            let _ = self.draft_store.write_snapshot(
+                root,
+                draft.draft_id,
+                &draft.target_directory,
+                &text,
+                sequence,
+            );
         }
     }
 
@@ -163,11 +177,15 @@ impl EditorView {
             let Some(session) = self.sessions.get(id) else {
                 continue;
             };
+            let sequence = hane_session::next_draft_snapshot_sequence();
             let text = session.editor().document().full_text();
-            match self
-                .draft_store
-                .write(root, draft.draft_id, &draft.target_directory, &text)
-            {
+            match self.draft_store.write_snapshot(
+                root,
+                draft.draft_id,
+                &draft.target_directory,
+                &text,
+                sequence,
+            ) {
                 Ok(()) => written += 1,
                 Err(error) => failures.push(format!("{}: {error}", session.label())),
             }

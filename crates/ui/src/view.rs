@@ -18109,17 +18109,10 @@ mod tests {
         let root = draft_test_root("legacy-draft-recovery");
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let heading = EditorView::new_work_folder_note_heading();
-        OsDraftStore
-            .write(&root, DraftId::generate(), &root.join("dev"), &heading)
-            .unwrap();
-        // Drop the target record so only the text file remains, exactly as
-        // an older version journalled it.
-        for entry in std::fs::read_dir(root.join(".hane").join("drafts")).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_some_and(|extension| extension == "target") {
-                std::fs::remove_file(path).unwrap();
-            }
-        }
+        // Only the bare text file, exactly as an older version journalled it.
+        let drafts_dir = root.join(".hane").join("drafts");
+        std::fs::create_dir_all(&drafts_dir).unwrap();
+        std::fs::write(drafts_dir.join("0000000000000abc.md"), &heading).unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);

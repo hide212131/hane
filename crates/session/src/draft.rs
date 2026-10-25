@@ -50,11 +50,54 @@ impl DraftId {
         format!("{:016x}.target", self.0)
     }
 
-    fn from_file_name(name: &str) -> Option<Self> {
-        u64::from_str_radix(name.strip_suffix(".md")?, 16)
-            .ok()
-            .map(Self)
+    /// The single-file journal entry: target and text in one atomic rename,
+    /// so recovery can never pair a text with another generation's target.
+    fn entry_file_name(self) -> String {
+        format!("{:016x}.draft", self.0)
     }
+
+    /// Accepts both the current `.draft` entry and the legacy `.md` text file.
+    fn from_file_name(name: &str) -> Option<Self> {
+        let stem = name
+            .strip_suffix(".draft")
+            .or_else(|| name.strip_suffix(".md"))?;
+        u64::from_str_radix(stem, 16).ok().map(Self)
+    }
+}
+
+/// Orders draft snapshots across threads. Taken when a snapshot's text and
+/// target are read, so a snapshot read later always carries a larger number.
+static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// A fresh snapshot sequence number for `DraftStore::write_snapshot`.
+#[must_use]
+pub fn next_draft_snapshot_sequence() -> u64 {
+    SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::SeqCst)
+}
+
+const ENTRY_MAGIC: &[u8] = b"hane-draft-v1\n";
+
+/// `ENTRY_MAGIC`, the target length as 8 little-endian bytes, the encoded
+/// target, then the text.
+fn encode_entry(target: &[u8], text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ENTRY_MAGIC.len() + 8 + target.len() + text.len());
+    bytes.extend_from_slice(ENTRY_MAGIC);
+    bytes.extend_from_slice(&(target.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(target);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes
+}
+
+/// Inverse of `encode_entry`: the encoded target and the text.
+fn decode_entry(bytes: &[u8]) -> Option<(&[u8], String)> {
+    let rest = bytes.strip_prefix(ENTRY_MAGIC)?;
+    let (length, rest) = rest.split_first_chunk::<8>()?;
+    let length = usize::try_from(u64::from_le_bytes(*length)).ok()?;
+    if rest.len() < length {
+        return None;
+    }
+    let (target, text) = rest.split_at(length);
+    Some((target, String::from_utf8(text.to_vec()).ok()?))
 }
 
 /// One draft recovered from a previous run: its id, so it can keep being
@@ -95,6 +138,21 @@ pub trait DraftStore: Send + Sync + 'static {
         target_directory: &Path,
         text: &str,
     ) -> io::Result<()>;
+
+    /// Like `write`, for a snapshot read when `sequence` was taken from
+    /// `next_draft_snapshot_sequence`. A store that can order snapshots skips
+    /// one older than what it already holds, so a late debounce write cannot
+    /// roll back a newer flush. The default ignores the order.
+    fn write_snapshot(
+        &self,
+        root: &Path,
+        id: DraftId,
+        target_directory: &Path,
+        text: &str,
+        _sequence: u64,
+    ) -> io::Result<()> {
+        self.write(root, id, target_directory, text)
+    }
 
     /// Deletes one draft, once the note it recovered either got a real
     /// filename or its session closed clean. Already-missing is not an error.
@@ -225,12 +283,14 @@ fn write_atomically(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
     fs::rename(&temporary, &target)
 }
 
-type DraftLocks = Mutex<HashMap<(PathBuf, DraftId), Arc<Mutex<()>>>>;
+/// Guards one draft; the value is the newest snapshot sequence accepted (or
+/// the sequence of its removal) in this process.
+type DraftLocks = Mutex<HashMap<(PathBuf, DraftId), Arc<Mutex<u64>>>>;
 
 static DRAFT_LOCKS: OnceLock<DraftLocks> = OnceLock::new();
 
 /// The lock serializing every write/remove of one draft in one work folder.
-fn draft_lock(root: &Path, id: DraftId) -> Arc<Mutex<()>> {
+fn draft_lock(root: &Path, id: DraftId) -> Arc<Mutex<u64>> {
     let mut locks = DRAFT_LOCKS
         .get_or_init(Default::default)
         .lock()
@@ -250,35 +310,64 @@ impl DraftStore for OsDraftStore {
         target_directory: &Path,
         text: &str,
     ) -> io::Result<()> {
+        self.write_snapshot(
+            root,
+            id,
+            target_directory,
+            text,
+            next_draft_snapshot_sequence(),
+        )
+    }
+
+    fn write_snapshot(
+        &self,
+        root: &Path,
+        id: DraftId,
+        target_directory: &Path,
+        text: &str,
+        sequence: u64,
+    ) -> io::Result<()> {
         // The debounced save and the quit/switch flush can write the same
-        // draft from different threads. Both files share fixed temporary
-        // names and must come from one snapshot, so the whole transaction
-        // (sidecar and body) is serialized per draft.
+        // draft from different threads, so the transaction is serialized per
+        // draft, and a snapshot older than one already accepted (or than the
+        // draft's removal) is dropped instead of rolling it back.
         let lock = draft_lock(root, id);
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut newest = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if sequence < *newest {
+            return Ok(());
+        }
         let dir = drafts_dir(root);
         fs::create_dir_all(&dir)?;
-        // The target goes first: a crash between the two writes leaves a
-        // draft whose text is merely one write old, never one without its
-        // destination.
+        // Target and text land in one file by one atomic rename, so a crash
+        // leaves either the previous generation or this one, never a mix.
         write_atomically(
             &dir,
-            &id.target_file_name(),
-            &encode_target(root, target_directory),
+            &id.entry_file_name(),
+            &encode_entry(&encode_target(root, target_directory), text),
         )?;
-        write_atomically(&dir, &id.file_name(), text.as_bytes())
+        *newest = sequence;
+        // A legacy pair from an older version is superseded. The new entry
+        // wins on recovery anyway, so a failed cleanup is harmless.
+        let _ = fs::remove_file(dir.join(id.file_name()));
+        let _ = fs::remove_file(dir.join(id.target_file_name()));
+        Ok(())
     }
 
     fn remove(&self, root: &Path, id: DraftId) -> io::Result<()> {
         let lock = draft_lock(root, id);
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut newest = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        // Snapshots read before this removal must not resurrect the draft.
+        *newest = (*newest).max(next_draft_snapshot_sequence());
         let dir = drafts_dir(root);
         let ignore_missing = |result: io::Result<()>| match result {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         };
+        // Legacy files first: if a crash lands in between, the surviving
+        // entry is a consistent one rather than an older legacy generation.
         ignore_missing(fs::remove_file(dir.join(id.file_name())))?;
-        ignore_missing(fs::remove_file(dir.join(id.target_file_name())))
+        ignore_missing(fs::remove_file(dir.join(id.target_file_name())))?;
+        ignore_missing(fs::remove_file(dir.join(id.entry_file_name())))
     }
 
     fn recover(&self, root: &Path) -> io::Result<RecoveredDrafts> {
@@ -292,6 +381,7 @@ impl DraftStore for OsDraftStore {
         };
         let mut drafts = Vec::new();
         let mut failed = 0;
+        let mut seen = std::collections::HashSet::new();
         for entry in entries {
             // One unreadable entry (a permission error on a single file, a
             // race with another process removing it) must not sacrifice
@@ -321,7 +411,30 @@ impl DraftStore for OsDraftStore {
                 // from the result is not a failure.
                 continue;
             };
-            let Ok(text) = fs::read_to_string(&path) else {
+            // Both `NNN.draft` and legacy `NNN.md` name the same id.
+            if !seen.insert(id) {
+                continue;
+            }
+            match fs::read(dir.join(id.entry_file_name())) {
+                Ok(bytes) => {
+                    match decode_entry(&bytes) {
+                        Some((encoded, text)) => drafts.push(RecoveredDraft {
+                            id,
+                            text,
+                            target_directory: decode_target(root, encoded),
+                        }),
+                        None => failed += 1,
+                    }
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            }
+            // Legacy two-file journal.
+            let Ok(text) = fs::read_to_string(dir.join(id.file_name())) else {
                 failed += 1;
                 continue;
             };
@@ -438,6 +551,91 @@ mod tests {
             assert_eq!(draft.target_directory, root.join(format!("folder-{n}")));
         }
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_update_recovers_the_previous_generation_whole() {
+        let root = temporary_directory("draft-interrupted-update");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        let old_target = root.join("old-folder");
+        OsDraftStore.write(&root, id, &old_target, "old text").unwrap();
+
+        // A crash before the rename leaves only a partial temporary file of
+        // the next generation; it must not leak into the recovered draft.
+        let dir = drafts_dir(&root);
+        let partial = encode_entry(&encode_target(&root, &root.join("new-folder")), "new text");
+        fs::write(
+            dir.join(format!("{}.tmp", id.entry_file_name())),
+            &partial[..partial.len() / 2],
+        )
+        .unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.failed, 0);
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].text, "old text");
+        assert_eq!(recovered.drafts[0].target_directory, old_target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_new_write_supersedes_a_legacy_text_and_target_pair() {
+        let root = temporary_directory("draft-supersedes-legacy");
+        let dir = drafts_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let id = DraftId::generate();
+        fs::write(dir.join(id.file_name()), "legacy text").unwrap();
+        fs::write(dir.join(id.target_file_name()), "legacy-folder").unwrap();
+
+        let target = root.join("new-folder");
+        OsDraftStore.write(&root, id, &target, "new text").unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.failed, 0);
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].text, "new text");
+        assert_eq!(recovered.drafts[0].target_directory, target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stale_snapshot_arriving_after_a_newer_flush_does_not_roll_it_back() {
+        let root = temporary_directory("draft-stale-snapshot");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        // The timer snapshot is read first, the flush snapshot after it, but
+        // the flush's write completes before the timer's write starts.
+        let timer_sequence = next_draft_snapshot_sequence();
+        let flush_sequence = next_draft_snapshot_sequence();
+        let new_target = root.join("new-folder");
+        OsDraftStore
+            .write_snapshot(&root, id, &new_target, "newer", flush_sequence)
+            .unwrap();
+        OsDraftStore
+            .write_snapshot(&root, id, &root.join("old-folder"), "older", timer_sequence)
+            .unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].text, "newer");
+        assert_eq!(recovered.drafts[0].target_directory, new_target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_read_before_a_removal_does_not_resurrect_the_draft() {
+        let root = temporary_directory("draft-stale-after-remove");
+        fs::create_dir_all(&root).unwrap();
+        let id = DraftId::generate();
+        let sequence = next_draft_snapshot_sequence();
+        OsDraftStore.remove(&root, id).unwrap();
+        OsDraftStore
+            .write_snapshot(&root, id, &root, "late", sequence)
+            .unwrap();
+
+        assert!(OsDraftStore.recover(&root).unwrap().drafts.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

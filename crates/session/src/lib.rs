@@ -45,7 +45,10 @@ pub use date_badge::{
     CalendarDate, DateBadgeRange, FileNameDateBadge, date_badge_range, format_relative_date_label,
     local_today, split_file_name_for_badge,
 };
-pub use draft::{DraftId, DraftStore, OsDraftStore, RecoveredDraft, RecoveredDrafts};
+pub use draft::{
+    DraftId, DraftStore, OsDraftStore, RecoveredDraft, RecoveredDrafts,
+    next_draft_snapshot_sequence,
+};
 pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
 pub use naming::{
     TitleSyncAction, decide_title_sync, extract_h1_title, unique_folder_name,
