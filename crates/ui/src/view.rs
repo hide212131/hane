@@ -13891,7 +13891,7 @@ mod tests {
         let path = root.join("seed.md");
         std::fs::write(&path, "seed").unwrap();
         let loaded = OsFileService.load(&path).unwrap();
-        let view = gpui::AppContext::new(cx, |cx| {
+        let (view, cx) = cx.add_window_view(|_, cx| {
             EditorView::from_sessions(
                 SessionSet::with_loaded(loaded),
                 Arc::new(OsFileService),
@@ -13902,12 +13902,19 @@ mod tests {
         let queue = SharedExternalOpenQueue::new();
         view.update(cx, |view, _cx| {
             view.attach_external_open_inbox(Some(queue.clone()));
-            // A selection change takes the editor mutably without editing.
-            view.editor_mut().set_selection(Selection::caret(SourceOffset(0))).unwrap();
             assert!(!view.has_unsaved_sessions());
-            view.sync_external_open_guard();
-            assert!(!queue.guard().unsaved());
         });
+        // Raise the guard the way non-editing `editor_mut` access does, then
+        // let the production `Render::render` frame run. Only its frame-end
+        // sync can return the guard to the real clean value.
+        queue.guard().set_unsaved(true);
+        view.update(cx, |view, cx| {
+            view.editor_mut().set_selection(Selection::caret(SourceOffset(0))).unwrap();
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(700.0)));
+        cx.run_until_parked();
+        assert!(!queue.guard().unsaved());
         queue.try_push(folder.clone()).unwrap();
         let generation = view.read_with(cx, |view, _| view.work_folder_generation);
         let mut stamped = None;
