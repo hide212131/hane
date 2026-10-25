@@ -21116,6 +21116,52 @@ mod tests {
     }
 
     #[gpui::test]
+    fn title_create_does_not_save_into_a_directory_the_draft_target_left_during_the_probe(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("title-create-retargeted-during-probe");
+        let old_dir = root.join("Old");
+        let new_dir = root.join("New");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: old_dir.clone(),
+                },
+            );
+            view.editor_mut().insert_text("# Draft").unwrap();
+            let session = view.sessions.get(id).unwrap();
+            let (generation, revision) = (session.generation(), session.revision());
+            // The filename probe is spawned here but cannot complete until
+            // the test yields below.
+            view.run_title_sync(id, generation, revision, cx);
+            // A folder rename rebases the draft's target while the probe is
+            // pending; the old directory stays in the tree (its path was
+            // reused), so only the target comparison can catch it.
+            view.work_folder_drafts
+                .get_mut(&id)
+                .unwrap()
+                .target_directory = new_dir.clone();
+            id
+        });
+        cx.run_until_parked();
+
+        assert!(!old_dir.join("Draft.md").exists());
+        assert!(new_dir.join("Draft.md").exists());
+        view.read_with(cx, |view, _| {
+            assert!(!view.title_sync_in_flight.contains(&id));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn text_autoscroll_uses_the_nearest_edge_when_zones_overlap(cx: &mut gpui::TestAppContext) {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("text", "Untitled", cx));
 

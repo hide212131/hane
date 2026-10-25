@@ -305,6 +305,19 @@ impl EditorView {
         }
     }
 
+    /// The directory a first-time title create for `id` would save into right
+    /// now: the draft's target folder, else the work folder root.
+    fn current_title_target_directory(&self, id: SessionId) -> Option<PathBuf> {
+        self.work_folder_drafts
+            .get(&id)
+            .map(|draft| draft.target_directory.clone())
+            .or_else(|| {
+                self.work_folder
+                    .as_ref()
+                    .map(|folder| folder.root().to_path_buf())
+            })
+    }
+
     fn target_directory_is_available(&self, target_directory: &Path) -> bool {
         self.work_folder
             .as_ref()
@@ -388,6 +401,18 @@ impl EditorView {
                 // an atomic write could recreate the missing parent folder.
                 if !view.target_directory_is_available(&root) {
                     view.refuse_missing_title_target_directory(id, cx);
+                    return;
+                }
+                // A folder rename during the probe can rebase the draft's
+                // target to another directory, after which the probed path
+                // may even be reused. The candidate was chosen for the old
+                // directory, so it must not be saved; decide again against
+                // the current target instead.
+                if view.current_title_target_directory(id).as_deref() != Some(root.as_path()) {
+                    if let Some(session) = view.sessions.get(id) {
+                        let (generation, revision) = (session.generation(), session.revision());
+                        view.run_title_sync(id, generation, revision, cx);
+                    }
                     return;
                 }
                 view.title_sync_pending.insert(id, title.clone());
