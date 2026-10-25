@@ -463,9 +463,19 @@ impl EditorView {
         let (Some(from), Some(to)) = (self.pin_relative(from), self.pin_relative(to)) else {
             return;
         };
-        let update = match kind {
-            PinKind::File => PinUpdate::RenameFile { from, to },
-            PinKind::Folder => PinUpdate::RenameFolder { from, to },
+        // A destination that can never be stored (the root `.hane`) would make
+        // the rename fail to apply and leave the pin on the old path, so the
+        // pin (and everything below a folder) is removed instead.
+        let update = if validate_pin_path(&to).is_err() {
+            PinUpdate::Remove {
+                path: from,
+                folder: matches!(kind, PinKind::Folder),
+            }
+        } else {
+            match kind {
+                PinKind::File => PinUpdate::RenameFile { from, to },
+                PinKind::Folder => PinUpdate::RenameFolder { from, to },
+            }
         };
         self.follow_pin_paths(vec![update], cx);
     }
