@@ -504,3 +504,286 @@ impl EditorView {
         self.apply_direct_zoom_factor(factor, window_offset, cx);
     }
 }
+
+impl EditorView {
+    pub(super) fn begin_sidebar_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_resize_drag = Some(SidebarResizeDrag {
+            pointer_x: f32::from(event.position.x),
+            sidebar_width: self.sidebar_width,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn begin_editor_scrollbar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        content_height: f32,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_scrollbar_drag = Some(ScrollbarDrag {
+            pointer_y: f32::from(event.position.y),
+            scroll_y: self.scroll_y,
+            viewport_height: self.viewport_height,
+            content_height,
+        });
+        // `advance_scroll_inertia` only detects a lost coast by comparing
+        // `scroll_y` against its own `last_applied` snapshot, which misses a
+        // drag that starts before the coast's next step has moved `scroll_y`
+        // away from that value. Clearing it explicitly here stops the coast
+        // from fighting the drag once it does resume (issue #389).
+        self.scroll_inertia = None;
+        self.cancel_center_caret();
+        // The drag owns the position; a mode switch's remembered row must not
+        // pull it back on the next render.
+        self.pending_mode_anchor = None;
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn begin_sidebar_scrollbar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        viewport_height: f32,
+        content_height: f32,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_scroll = (-f32::from(self.sidebar_scroll.offset().y))
+            .clamp(0.0, (content_height - viewport_height).max(0.0));
+        self.sidebar_scrollbar_drag = Some(ScrollbarDrag {
+            pointer_y: f32::from(event.position.y),
+            scroll_y: current_scroll,
+            viewport_height,
+            content_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn on_panel_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        self.promote_pending_link_on_move(event, cx);
+        if let Some(drag) = self.sidebar_resize_drag {
+            let delta = f32::from(event.position.x) - drag.pointer_x;
+            let next = sidebar_width_for_drag(
+                drag.sidebar_width,
+                delta,
+                f32::from(window.viewport_size().width),
+            );
+            if next != self.sidebar_width {
+                self.sidebar_width = next;
+                changed = true;
+            }
+        }
+        if let Some(drag) = self.editor_scrollbar_drag {
+            let delta = f32::from(event.position.y) - drag.pointer_y;
+            let next = scroll_y_for_thumb_drag(
+                drag.scroll_y,
+                delta,
+                drag.viewport_height,
+                drag.content_height,
+            );
+            if next != self.scroll_y {
+                self.scroll_y = next;
+                changed = true;
+            }
+        }
+        if let Some(drag) = self.sidebar_scrollbar_drag {
+            let delta = f32::from(event.position.y) - drag.pointer_y;
+            let next = scroll_y_for_thumb_drag(
+                drag.scroll_y,
+                delta,
+                drag.viewport_height,
+                drag.content_height,
+            );
+            self.sidebar_scroll.set_offset(point(px(0.0), px(-next)));
+            changed = true;
+        }
+        // Sidebar resize / scrollbar drags above already claimed this move;
+        // a text-selection drag never sets those, so this only fires for the
+        // drag `on_row_mouse_down` started (issue #213).
+        if self.text_selection_drag
+            && event.dragging()
+            && self.sidebar_resize_drag.is_none()
+            && self.sidebar_scrollbar_drag.is_none()
+            && self.editor_scrollbar_drag.is_none()
+        {
+            let direction = self.text_autoscroll_direction_for(f32::from(event.position.y));
+            self.set_text_autoscroll(direction, window, cx);
+        }
+        if changed {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    /// Which edge of the editor viewport `window_y` (window-space, matching
+    /// `MouseMoveEvent::position`) sits inside, if any. The viewport begins
+    /// right below the header (and below the find bar's row while it is
+    /// open) and is `self.viewport_height` tall, the same frame `render`
+    /// computes it in.
+    pub(super) fn text_autoscroll_direction_for(
+        &self,
+        window_y: f32,
+    ) -> Option<AutoscrollDirection> {
+        let local_y = window_y - self.theme.header_height - self.document_find_reserved_height();
+        let near_top = local_y < TEXT_SELECTION_AUTOSCROLL_EDGE;
+        let near_bottom = local_y > self.viewport_height - TEXT_SELECTION_AUTOSCROLL_EDGE;
+        match (near_top, near_bottom) {
+            (true, true) => {
+                // On a very short viewport the two fixed-size edge zones
+                // overlap. Pick the nearer edge so a pointer near the bottom
+                // cannot be misread as an upward drag merely because the top
+                // check happens to run first.
+                if local_y < self.viewport_height / 2.0 {
+                    Some(AutoscrollDirection::Up)
+                } else {
+                    Some(AutoscrollDirection::Down)
+                }
+            }
+            (true, false) => Some(AutoscrollDirection::Up),
+            (false, true) => Some(AutoscrollDirection::Down),
+            (false, false) => None,
+        }
+    }
+
+    /// Starts, stops, or redirects the text-selection autoscroll loop to
+    /// match `direction`, doing nothing when it already matches what is
+    /// currently running.
+    pub(super) fn set_text_autoscroll(
+        &mut self,
+        direction: Option<AutoscrollDirection>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.text_autoscroll == direction {
+            return;
+        }
+        self.text_autoscroll = direction;
+        self.text_autoscroll_activity = self.text_autoscroll_activity.wrapping_add(1);
+        if let Some(direction) = direction {
+            self.spawn_text_autoscroll(direction, self.text_autoscroll_activity, window, cx);
+        }
+    }
+
+    /// Repeatedly extends the selection by one row toward `direction` and
+    /// lets `after_input`'s `scroll_cursor_into_view` follow it, every
+    /// `TEXT_SELECTION_AUTOSCROLL_INTERVAL`, so a held pointer near an edge
+    /// keeps scrolling without needing to move (issue #213). Stops as soon
+    /// as `activity` is stale (a newer call to `set_text_autoscroll` ran) or
+    /// a tick reaches the start/end of the document and stops moving, rather
+    /// than ticking forever once there is nothing left to extend.
+    fn spawn_text_autoscroll(
+        &mut self,
+        direction: AutoscrollDirection,
+        activity: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(TEXT_SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
+                let Ok(should_continue) = view.update_in(cx, |view, window, cx| {
+                    view.step_text_autoscroll(direction, activity, window, cx)
+                }) else {
+                    return;
+                };
+                if !should_continue {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One autoscroll tick. Returns whether the loop driving it should keep
+    /// ticking.
+    pub(super) fn step_text_autoscroll(
+        &mut self,
+        direction: AutoscrollDirection,
+        activity: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.text_autoscroll_activity != activity || self.text_autoscroll != Some(direction) {
+            return false;
+        }
+        let before = self.editor().selection().active;
+        match direction {
+            AutoscrollDirection::Up => self.move_vertical(false, true, window, cx),
+            AutoscrollDirection::Down => self.move_vertical(true, true, window, cx),
+        }
+        let changed = self.editor().selection().active != before;
+        if !changed {
+            // Reaching the document edge is a terminal condition for the
+            // current hold. Clear the direction as well as ending the task so
+            // a later move into the edge zone can start a fresh loop.
+            self.set_text_autoscroll(None, window, cx);
+        }
+        changed
+    }
+
+    pub(super) fn finish_panel_drag(
+        &mut self,
+        _: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_sidebar_scrollbar_drag = self.sidebar_scrollbar_drag.take().is_some();
+        let was_dragging = self.sidebar_resize_drag.take().is_some()
+            || was_sidebar_scrollbar_drag
+            || self.editor_scrollbar_drag.take().is_some();
+        self.text_selection_drag = false;
+        self.pending_reading_link = None;
+        self.set_text_autoscroll(None, window, cx);
+        if was_dragging {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        if was_sidebar_scrollbar_drag {
+            // Keep the just-dragged thumb visible for the same brief window
+            // as a wheel scroll, rather than snapping it away the instant
+            // the mouse comes up.
+            self.show_sidebar_scrollbar_briefly(cx);
+        }
+    }
+
+    /// Shows the sidebar's overlay scrollbar thumb, then hides it again after
+    /// `SIDEBAR_SCROLLBAR_HIDE_DELAY` unless a later scroll or drag
+    /// (identified by `sidebar_scrollbar_activity`) supersedes this call
+    /// first. Called on sidebar wheel/trackpad scrolling and at the end of a
+    /// thumb drag; the idle sidebar shows no track or thumb, only the
+    /// existing thin `sidebar_resizer` boundary line.
+    pub(super) fn show_sidebar_scrollbar_briefly(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_scrollbar_visible = true;
+        self.sidebar_scrollbar_activity = self.sidebar_scrollbar_activity.wrapping_add(1);
+        let activity = self.sidebar_scrollbar_activity;
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(SIDEBAR_SCROLLBAR_HIDE_DELAY)
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.sidebar_scrollbar_activity == activity {
+                    view.sidebar_scrollbar_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+}

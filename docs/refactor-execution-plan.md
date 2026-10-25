@@ -563,6 +563,16 @@ session I/O、height/cache、viewportの残りのpointer/panel処理、settings�
 
 **検証:** 実装workerはshell/git/test/build/lint実行権限を持たず、仕様の検証コマンド（通常・all-features・timing-probe単独・instrument各構成のtest/clippy/release build）、移動範囲のbyte比較、CI、GUI validationは未実施。結果はCommanderがPRに記録する。
 
+#### 9.13.3 RF2-A: panel pointer処理の移動（#567 P3、PR #613）
+
+**旧→新:** `crates/ui/src/view.rs` のpanel/pointer処理10メソッド（`begin_sidebar_resize` / `begin_editor_scrollbar_drag` / `begin_sidebar_scrollbar_drag` / `on_panel_mouse_move` / `text_autoscroll_direction_for` / `set_text_autoscroll` / `spawn_text_autoscroll` / `step_text_autoscroll` / `finish_panel_drag` / `show_sidebar_scrollbar_briefly`）を、既存の `crates/ui/src/view/viewport.rs` 末尾の別 `impl EditorView` へ移動した。新moduleは作らず、既存の `use super::*;` を使う。具体仕様は [P3仕様](implementation/issue-567-p3-panel-pointer.md) を正とし、ここでは複製しない。
+
+**維持理由:** 親・兄弟module・既存testから呼ぶ9メソッドだけを `pub(super)` にし、`spawn_text_autoscroll` はprivateのまま。`text_autoscroll_direction_for` と `finish_panel_drag` はrustfmtの行幅に合わせて引数を改行した以外、本文・コメント・順序は変えていない。drag開始時のinertia/center/mode anchor解除、panel move順、edge座標、autoscrollのactivity/timer/停止条件、`finish_panel_drag` のtake/短絡式、thumbの遅延hide条件、field・型・定数・初期化・widget・caller・既存testsの所有と配置は維持した。
+
+**後続境界:** 親implには移動対象外のkeyboard-layout handlerとwidget組立が残る。型・field・初期化、settings、height/cache、open/save接続などは#567の残作業として追跡し、このP3だけで#567/#297は完了しない。rollbackはこの移動PRを一単位で戻す。
+
+**検証:** 実装workerはshell/git/test/build/lint実行権限を持たず、通常・all-featuresのtest/clippy、両OSのCI、focused native GUI validation、移動範囲のbyte比較は未実施。P2のtiming-probe単独Clippy baseline失敗は本PRの対象外。結果はCommanderがPRに記録する。
+
 
 ### 9.14 RF2-B: presentationの機械的分割 第1PR — 位置対応 (#302)
 
