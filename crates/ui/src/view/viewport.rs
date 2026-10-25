@@ -574,6 +574,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let mut changed = false;
+        self.promote_pending_link_on_move(event, cx);
         if let Some(drag) = self.sidebar_resize_drag {
             let delta = f32::from(event.position.x) - drag.pointer_x;
             let next = sidebar_width_for_drag(
@@ -747,6 +748,7 @@ impl EditorView {
             || was_sidebar_scrollbar_drag
             || self.editor_scrollbar_drag.take().is_some();
         self.text_selection_drag = false;
+        self.pending_reading_link = None;
         self.set_text_autoscroll(None, window, cx);
         if was_dragging {
             cx.stop_propagation();
