@@ -42,7 +42,7 @@
 | edge判定 | headerとfind bar予約高さを引く座標系、viewport高さ、狭いviewportで上下edgeが重なる場合の近い方への分岐を保持 |
 | autoscroll開始/方向変更 | 同方向なら何もしない。activityのwrapping更新とtask起動、spawn_in/detach、待ち時間とupdate_in失敗時停止を維持 |
 | tick | activity/方向一致だけ継続。move_verticalはselectionを延長し、source上のactiveが動かないと方向を解除して終了。document置換による取消と競合しない既存経路を保持 |
-| mouse-up/out | `take()`と`||`の短絡を含む既存式をそのまま維持。text selection解除とautoscroll停止、通知、sidebar thumb表示延長の順を変えない |
+| mouse-up/out | `take()`と`\|\|`の短絡を含む既存式をそのまま維持。text selection解除とautoscroll停止、通知、sidebar thumb表示延長の順を変えない |
 | sidebar thumb寿命 | visibleとactivity更新、遅延task、同じactivityだけhideする条件、通知位置を維持 |
 
 新しい状態、job owner、timer、callback、永続形式を追加しない。既存の挙動に疑問を見つけても、機械的移動へ無断で修正を混ぜず、観測と原因を分けて報告する。
