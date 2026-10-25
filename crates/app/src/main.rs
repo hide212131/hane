@@ -25,6 +25,8 @@ use std::sync::Arc;
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod finder_open;
+#[cfg(target_os = "macos")]
+mod finder_service;
 
 mod app_update;
 mod https_transport;
@@ -345,14 +347,10 @@ pub(crate) fn application_with_finder_open(
     application.on_open_urls(move |urls| {
         for path in urls
             .iter()
-            .filter_map(|url| finder_open::markdown_path_from_url(url))
+            .filter_map(|url| finder_open::openable_path_from_url(url))
         {
-            // A folder is never opened from Finder: that would replace the
-            // sessions without the dirty-file guard `open_path` applies to
-            // documents.
-            if path.is_dir() {
-                continue;
-            }
+            // A folder is queued like a document; the window refuses the
+            // switch while a session is dirty or saving.
             // A sealed queue means the update helper is already authorized to
             // replace this process: the request cannot be opened here, so it
             // is handed to the process that follows instead of being lost.
@@ -524,6 +522,8 @@ pub(crate) struct EditorLaunch {
     update_completed: Option<String>,
     #[cfg(target_os = "windows")]
     open_requests: std::sync::mpsc::Receiver<open_request::OpenRequest>,
+    #[cfg(target_os = "windows")]
+    open_guard: hane_ui::ExternalOpenGuard,
     #[cfg(target_os = "macos")]
     finder_requests: FinderReceiver,
     #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -561,7 +561,15 @@ pub(crate) fn prepare_launch<T>(
         }
     }
     #[cfg(target_os = "windows")]
-    let listened = claim_after_ownership(open_request::listen, claim);
+    let open_guard = hane_ui::ExternalOpenGuard::new();
+    #[cfg(target_os = "windows")]
+    let listened = claim_after_ownership(
+        {
+            let guard = open_guard.clone();
+            move || open_request::listen(guard)
+        },
+        claim,
+    );
     #[cfg(not(target_os = "windows"))]
     let listened = claim_after_ownership(|| Ok::<(), std::convert::Infallible>(()), claim);
     #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
@@ -623,6 +631,8 @@ pub(crate) fn prepare_launch<T>(
             update_completed: None,
             #[cfg(target_os = "windows")]
             open_requests,
+            #[cfg(target_os = "windows")]
+            open_guard,
             #[cfg(target_os = "macos")]
             finder_requests,
             #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -666,6 +676,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         update_completed,
         #[cfg(target_os = "windows")]
         open_requests,
+        #[cfg(target_os = "windows")]
+        open_guard,
         #[cfg(target_os = "macos")]
         finder_requests,
         #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -695,6 +707,10 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         service as Arc<dyn AppUpdateController>
     });
     register_key_bindings(cx);
+    // Finder's right-click "Haneで開く" service feeds the same queue as
+    // `on_open_urls`; the application object exists by now.
+    #[cfg(target_os = "macos")]
+    finder_service::install(finder_requests.clone());
     let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
     let window = cx
         .open_window(
@@ -721,6 +737,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                     view.attach_app_update(update_controller.clone());
                     #[cfg(target_os = "macos")]
                     view.attach_external_open_inbox(Some(finder_requests.clone()));
+                    #[cfg(target_os = "windows")]
+                    view.attach_external_open_guard(open_guard.clone());
                     if let Some(version) = update_completed.as_deref() {
                         // Only a process started by a committed update gets
                         // this; an ordinary launch never shows it.
@@ -800,8 +818,9 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             if !pending.is_empty()
                 && window
                     .update(cx, |view, window, cx| {
-                        let accepted =
-                            pending.drain_into(|path| view.submit_external_open(path, cx));
+                        let accepted = pending.drain_requests_into(|path, protected| {
+                            view.submit_external_open_protected(path, protected, cx)
+                        });
                         if accepted > 0 {
                             window.activate_window();
                             if !view.settings_is_open() {
@@ -849,7 +868,11 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                         if request.is_abandoned() {
                             continue;
                         }
-                        match view.submit_external_open(request.path(), cx) {
+                        match view.submit_external_open_protected(
+                            request.path(),
+                            request.protected(),
+                            cx,
+                        ) {
                             hane_ui::ExternalOpenOutcome::Accepted => {
                                 accepted += 1;
                                 request.accept();

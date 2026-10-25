@@ -43,7 +43,31 @@ fn is_markdown(path: &Path) -> bool {
 
 /// Returns the absolute local Markdown path a `file://` URL refers to, or
 /// `None` for anything Hane should not open.
+#[allow(dead_code, reason = "the app opens through `openable_path_from_url`; this stays the Markdown-only contract")]
 pub fn markdown_path_from_url(url: &str) -> Option<PathBuf> {
+    let path = local_path_from_url(url)?;
+    is_markdown(&path).then_some(path)
+}
+
+/// Like [`markdown_path_from_url`], but an existing local folder is accepted
+/// too (it becomes a Work Folder). Anything else, including a folder that no
+/// longer exists, is ignored.
+pub fn openable_path_from_url(url: &str) -> Option<PathBuf> {
+    let path = local_path_from_url(url)?;
+    (is_markdown(&path) || path.is_dir()).then_some(path)
+}
+
+/// The one existing absolute folder of a Finder service request. Several
+/// items, a file, a relative path or a missing path select nothing.
+pub fn single_folder(paths: &[PathBuf]) -> Option<PathBuf> {
+    match paths {
+        [path] if path.is_absolute() && path.is_dir() => Some(path.clone()),
+        _ => None,
+    }
+}
+
+/// The absolute local path a `file://` URL refers to, whatever it points at.
+fn local_path_from_url(url: &str) -> Option<PathBuf> {
     let scheme = url.get(..7)?;
     if !scheme.eq_ignore_ascii_case("file://") {
         return None;
@@ -59,7 +83,7 @@ pub fn markdown_path_from_url(url: &str) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(OsString::from_vec(decoded));
-    (path.is_absolute() && is_markdown(&path)).then_some(path)
+    path.is_absolute().then_some(path)
 }
 
 #[cfg(test)]
@@ -105,5 +129,73 @@ mod tests {
         assert_eq!(markdown_path_from_url("file:///tmp/a%2.md"), None);
         assert_eq!(markdown_path_from_url("file:///tmp/a%00.md"), None);
         assert_eq!(markdown_path_from_url("file://"), None);
+    }
+
+    fn temp_folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hane-finder-open-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn url_of(path: &Path) -> String {
+        use std::fmt::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let mut url = String::from("file://");
+        for byte in path.as_os_str().as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.') {
+                url.push(*byte as char);
+            } else {
+                write!(url, "%{byte:02X}").unwrap();
+            }
+        }
+        url
+    }
+
+    #[test]
+    fn existing_folder_urls_open_including_spaces_and_japanese_names() {
+        let dir = temp_folder("my notes 日本語");
+        assert_eq!(openable_path_from_url(&url_of(&dir)), Some(dir.clone()));
+        assert_eq!(
+            openable_path_from_url(&format!("{}/", url_of(&dir))),
+            Some(PathBuf::from(format!("{}/", dir.display())))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_folder_remote_and_malformed_urls_are_not_opened() {
+        let dir = temp_folder("gone");
+        let url = url_of(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(openable_path_from_url(&url), None);
+        let existing = temp_folder("remote");
+        let remote = url_of(&existing).replacen("file://", "file://server", 1);
+        assert_eq!(openable_path_from_url(&remote), None);
+        assert_eq!(openable_path_from_url("https://example.com/tmp"), None);
+        assert_eq!(openable_path_from_url("file:///tmp/a%2"), None);
+        assert_eq!(openable_path_from_url("file:///tmp/a%00"), None);
+        std::fs::remove_dir_all(&existing).unwrap();
+    }
+
+    #[test]
+    fn openable_urls_still_accept_markdown_and_reject_other_files() {
+        assert_eq!(
+            openable_path_from_url("file:///nope/note.md"),
+            Some(PathBuf::from("/nope/note.md"))
+        );
+        assert_eq!(openable_path_from_url("file:///nope/note.txt"), None);
+    }
+
+    #[test]
+    fn a_service_request_selects_exactly_one_existing_folder() {
+        let dir = temp_folder("service");
+        let other = temp_folder("service-other");
+        assert_eq!(single_folder(std::slice::from_ref(&dir)), Some(dir.clone()));
+        assert_eq!(single_folder(&[dir.clone(), other.clone()]), None);
+        assert_eq!(single_folder(&[]), None);
+        assert_eq!(single_folder(&[PathBuf::from("relative")]), None);
+        assert_eq!(single_folder(&[dir.join("missing")]), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
     }
 }

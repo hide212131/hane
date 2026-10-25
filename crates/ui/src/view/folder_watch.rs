@@ -335,6 +335,11 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Asks for one re-list that runs as soon as the folder is installed.
+    pub(super) fn queue_folder_relist(&mut self) {
+        self.folder_watch.refresh_pending = true;
+    }
+
     /// Resumes a re-list that was requested before the first scan finished.
     pub(super) fn resume_pending_folder_refresh(&mut self, cx: &mut Context<Self>) {
         if self.folder_watch.refresh_pending {
