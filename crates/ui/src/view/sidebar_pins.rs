@@ -935,6 +935,48 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_long_japanese_folder_name_stays_on_one_row_without_overlapping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = pin_test_root("long-folder-name");
+        let long_name = "とても長い日本語のフォルダ名".repeat(8);
+        std::fs::create_dir_all(root.join(&long_name)).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        let (view, cx) = open_pin_view(cx, &root, StateStores::memory());
+
+        for width in [960.0, 360.0] {
+            cx.simulate_resize(gpui::size(px(width), px(760.0)));
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let folder = cx.debug_bounds("sidebar-folder").expect("the folder row");
+            let file = cx.debug_bounds("sidebar-file").expect("the file row");
+            assert!(
+                (f32::from(folder.size.height) - SIDEBAR_ROW_HEIGHT).abs() < 0.001
+                    && (f32::from(file.size.height) - SIDEBAR_ROW_HEIGHT).abs() < 0.001,
+                "rows keep their fixed height at width {width}"
+            );
+            let (upper, lower) = if folder.top() <= file.top() {
+                (folder, file)
+            } else {
+                (file, folder)
+            };
+            assert!(
+                upper.bottom() <= lower.top() + px(0.001),
+                "the long folder name must not wrap into the adjacent row at width {width}"
+            );
+            let slot = cx
+                .debug_bounds("sidebar-pin-toggle")
+                .or_else(|| cx.debug_bounds("work-folder-pin-toggle"));
+            if let Some(slot) = slot {
+                assert!(slot.right() <= folder.right().max(file.right()));
+            }
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn pin_order_is_newest_first_and_unpinning_keeps_the_rest(cx: &mut gpui::TestAppContext) {
         let root = pin_test_root("order");
         std::fs::create_dir_all(root.join("dir")).unwrap();

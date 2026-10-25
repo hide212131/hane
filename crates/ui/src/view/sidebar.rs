@@ -660,6 +660,7 @@ impl EditorView {
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
+                                .truncate()
                                 .child(folder.name().to_owned())
                         };
                         let menu_path = path.clone();
