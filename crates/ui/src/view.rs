@@ -13913,6 +13913,11 @@ mod tests {
             cx.notify();
         });
         cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(700.0)));
+        // `run_until_parked` and `simulate_resize` never render, so draw the
+        // window explicitly to run the production root `Render::render`.
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
         cx.run_until_parked();
         assert!(!queue.guard().unsaved());
         queue.try_push(folder.clone()).unwrap();
