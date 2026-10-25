@@ -1260,6 +1260,82 @@ mod tests {
     }
 
     #[gpui::test]
+    fn renaming_a_pinned_file_to_the_root_hane_directory_removes_the_pin(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = pin_test_root("rename-file-to-hane");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Alpha.md"), "# Alpha\n").unwrap();
+        let stores = StateStores::memory();
+        let (view, cx) = open_pin_view(cx, &root, stores.clone());
+        let root = view_root(&view, cx);
+
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("Alpha.md"), PinKind::File, cx);
+        });
+        cx.run_until_parked();
+        std::fs::rename(root.join("Alpha.md"), root.join(".hane")).unwrap();
+
+        view.update(cx, |view, cx| {
+            view.follow_pin_rename(
+                &root.join("Alpha.md"),
+                &root.join(".hane"),
+                PinKind::File,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_pins.entries.is_empty());
+        });
+        assert!(stores.pins().load(&root).unwrap().entries.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn renaming_a_pinned_folder_to_the_root_hane_directory_removes_descendant_pins(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = pin_test_root("rename-folder-to-hane");
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/Alpha.md"), "# Alpha\n").unwrap();
+        std::fs::write(root.join("Other.md"), "# Other\n").unwrap();
+        let stores = StateStores::memory();
+        let (view, cx) = open_pin_view(cx, &root, stores.clone());
+        let root = view_root(&view, cx);
+
+        for (path, kind) in [
+            ("notes", PinKind::Folder),
+            ("notes/Alpha.md", PinKind::File),
+            ("Other.md", PinKind::File),
+        ] {
+            view.update(cx, |view, cx| {
+                view.toggle_pin(PathBuf::from(path), kind, cx)
+            });
+            cx.run_until_parked();
+        }
+        std::fs::rename(root.join("notes"), root.join(".hane")).unwrap();
+
+        view.update(cx, |view, cx| {
+            view.follow_pin_rename(
+                &root.join("notes"),
+                &root.join(".hane"),
+                PinKind::Folder,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let remaining = [PinnedEntry::new("Other.md", PinKind::File)];
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_pins.entries, remaining);
+        });
+        assert_eq!(stores.pins().load(&root).unwrap().entries, remaining);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn consecutive_renames_are_saved_in_order_and_end_on_the_last_path(
         cx: &mut gpui::TestAppContext,
     ) {
