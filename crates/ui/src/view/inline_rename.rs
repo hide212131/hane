@@ -372,7 +372,7 @@ impl EditorView {
                 }))
     }
 
-    fn reserve_inline_rename_tickets(
+    pub(super) fn reserve_inline_rename_tickets(
         &mut self,
         from: &Path,
         kind: InlineRenameKind,
@@ -396,6 +396,9 @@ impl EditorView {
             return None;
         }
         let mut tickets = Vec::with_capacity(ids.len());
+        // Publish protection before any save slot is taken (rename holds it),
+        // then recompute from every session so nothing else is cleared.
+        self.raise_external_open_guard();
         for id in ids {
             let Some(ticket) = self
                 .sessions
@@ -407,10 +410,12 @@ impl EditorView {
                         session.finish_rename(reserved_ticket);
                     }
                 }
+                self.sync_external_open_guard();
                 return None;
             };
             tickets.push((id, ticket));
         }
+        self.sync_external_open_guard();
         Some(tickets)
     }
 
@@ -581,6 +586,8 @@ impl EditorView {
             self.save_session(id, pending, cx);
         }
         self.retry_deferred_title_sync(cx);
+        // Publish the exact state from every session before the next render.
+        self.sync_external_open_guard();
         cx.notify();
     }
 
