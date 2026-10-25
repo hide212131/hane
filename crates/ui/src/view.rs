@@ -95,8 +95,8 @@ mod ai_selection;
 mod app_update;
 pub use app_update::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot,
-    ExplorerRepairScope, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker,
-    RestartObservation, RestartPreparation, RestartTicketFile, RestartTicketSnapshot,
+    ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate,
+    RestartBlocker, RestartObservation, RestartPreparation, RestartTicketFile, RestartTicketSnapshot,
     SharedExternalOpenQueue,
 };
 mod ai_settings;
@@ -807,6 +807,9 @@ pub struct EditorView {
     external_open_generation: u64,
     /// Documents received from outside that the window has not accepted yet.
     external_open_inbox: Option<SharedExternalOpenQueue>,
+    /// Mirror of "any session is dirty or saving", read by whoever receives an
+    /// external request so the state at receipt travels with the request.
+    external_open_guard: ExternalOpenGuard,
     /// Save As dialogs currently open (they outlive any single UI turn).
     save_as_dialogs_open: usize,
     /// The AI service handle the restart check reads busy state from.
@@ -833,6 +836,8 @@ pub struct EditorView {
     /// applied once, when the settings actually close (save succeeded or
     /// discarded), and dropped on any other navigation.
     pending_settings_drop: Option<ExternalDropTarget>,
+    /// Unsaved / saving state seen when `pending_settings_drop` was received.
+    pending_settings_drop_protected: bool,
     settings_error: Option<String>,
     recent: RecentFiles,
     /// The Markdown index of the directory this window was opened onto, if
@@ -1049,6 +1054,14 @@ pub struct EditorView {
     /// is open now, since `into`/`latest_open_target` alone cannot tell a
     /// same-named stale request in the new folder apart from one in the old.
     work_folder_generation: u64,
+    /// Numbers the latest external folder open (Issue #607). The folder is
+    /// scanned before anything is replaced, so only the newest request may
+    /// apply its result, and only if `work_folder_generation` is unchanged.
+    external_folder_open_token: u64,
+    /// The newest file an external open asked for after the pending external
+    /// folder scan began. The scan result still switches the Work Folder, but
+    /// the later file is reopened afterwards so it stays the active session.
+    external_file_open_after_folder_scan: Option<PathBuf>,
     /// The OS watch on the current work folder and its re-list bookkeeping;
     /// dropped (releasing the watch) when the folder is replaced or the
     /// window closes.
@@ -1773,6 +1786,7 @@ impl EditorView {
             restart_freeze: false,
             external_open_generation: 0,
             external_open_inbox: None,
+            external_open_guard: ExternalOpenGuard::new(),
             save_as_dialogs_open: 0,
             restart_ai_service: None,
             #[cfg(test)]
@@ -1786,6 +1800,7 @@ impl EditorView {
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
             pending_settings_drop: None,
+            pending_settings_drop_protected: false,
             settings_error: None,
             recent,
             work_folder: None,
@@ -1842,6 +1857,8 @@ impl EditorView {
             pending_restore: VecDeque::new(),
             restoring_path: None,
             work_folder_generation: 0,
+            external_folder_open_token: 0,
+            external_file_open_after_folder_scan: None,
             folder_watch: folder_watch::FolderWatchState::default(),
             listing_requests: folder_watch::ListingRequests::default(),
             focus_handle: cx.focus_handle(),
@@ -2083,7 +2100,12 @@ impl EditorView {
                     // around; that must be the original clean one, not
                     // whichever draft was installed last.
                     self.sessions.activate(initial_session);
+                    // This automatic open is not a request the user made, so
+                    // it must not be carried over as the "later file" of an
+                    // external folder scan that is still in flight.
+                    let explicit_request = self.external_file_open_after_folder_scan.take();
                     self.open_path(&path, cx);
+                    self.external_file_open_after_folder_scan = explicit_request;
                 } else if let Some(last_recovered) = last_recovered {
                     self.reveal_file_tab(last_recovered);
                     self.on_document_replaced();
@@ -2101,7 +2123,19 @@ impl EditorView {
     }
 
     pub(crate) fn editor_mut(&mut self) -> &mut Editor {
+        // Every edit goes through here: publish protection before the document
+        // can change, not after, so a receiver cannot read a stale clean state
+        // between the edit and the next sync. The sync that follows the input
+        // (or the next render) restores the real value.
+        self.raise_external_open_guard();
         self.sessions.active_mut().editor_mut()
+    }
+
+    /// Completes the pending input measurements for a painted frame. This only
+    /// drains instrumentation and never changes the document, so unlike
+    /// [`Self::editor_mut`] it must not raise the external-open guard.
+    pub(crate) fn mark_frame_painted(&mut self) -> Vec<InputMeasurement> {
+        self.sessions.active_mut().editor_mut().mark_frame_painted()
     }
 
     /// The open documents, for a tab strip or filer to render.
@@ -2763,6 +2797,9 @@ impl EditorView {
     }
 
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
+        // An edit makes the session dirty now; do not wait for the next frame
+        // to tell the external-open receivers.
+        self.sync_external_open_guard();
         // Keep block boundaries current without waiting for the background parse:
         // this re-parses only the edited window, never the document.
         if let Some(update) = self
@@ -3094,12 +3131,15 @@ impl EditorView {
     }
 
     /// Whether any open session — not just the active one — has unsaved
-    /// edits. The work-folder sidebar deliberately keeps more than one
-    /// session open at a time (`open_work_folder_entry` gives every visited
-    /// note its own session), so a dirty background session is exactly as
-    /// real a reason to block a switch as a dirty active one.
+    /// edits or a write still in flight. The work-folder sidebar deliberately
+    /// keeps more than one session open at a time (`open_work_folder_entry`
+    /// gives every visited note its own session), so a dirty background
+    /// session is exactly as real a reason to block a switch as a dirty active
+    /// one, and a switch must not drop a session whose write has not landed.
     fn has_unsaved_sessions(&self) -> bool {
-        self.sessions.sessions().any(DocumentSession::is_dirty)
+        self.sessions
+            .sessions()
+            .any(|session| session.is_dirty() || session.save_in_flight())
     }
 
     /// Prompts for a directory and switches this window into work-folder mode
@@ -3192,6 +3232,106 @@ impl EditorView {
     /// around: a work folder switch is a new window's worth of state, not
     /// another document alongside the old ones.
     fn switch_to_work_folder(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.reset_for_work_folder_switch(cx);
+        self.begin_work_folder_scan(root, cx);
+    }
+
+    /// Scans `root` in the background *before* replacing anything, then
+    /// switches to it only if the scan succeeded and nothing newer happened
+    /// meanwhile. A scan failure leaves the current sessions and Work Folder
+    /// as they were and only reports the failure in the status.
+    fn open_external_folder(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.external_folder_open_token = self.external_folder_open_token.wrapping_add(1);
+        let token = self.external_folder_open_token;
+        let generation = self.work_folder_generation;
+        self.external_file_open_after_folder_scan = None;
+        self.status = Some("Opening work folder…".to_owned());
+        let draft_store = self.draft_store.clone();
+        cx.spawn(async move |view, cx| {
+            let scan_root = root.clone();
+            let scanned = cx
+                .background_executor()
+                .spawn(async move {
+                    let work_folder = OsWorkFolderScanner.scan(&scan_root);
+                    #[cfg(feature = "instrument")]
+                    let scan_completed_at = Instant::now();
+                    #[cfg(not(feature = "instrument"))]
+                    let scan_completed_at = ();
+                    let drafts = draft_store.recover(&scan_root);
+                    (work_folder, drafts, scan_completed_at)
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_external_folder_open(token, generation, scanned, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_external_folder_open(
+        &mut self,
+        token: u64,
+        generation: u64,
+        scanned: (
+            std::io::Result<WorkFolder>,
+            std::io::Result<RecoveredDrafts>,
+            WorkFolderScanTimestamp,
+        ),
+        cx: &mut Context<Self>,
+    ) {
+        if token != self.external_folder_open_token || generation != self.work_folder_generation {
+            return;
+        }
+        let root = match &scanned.0 {
+            Ok(work_folder) => work_folder.root().to_path_buf(),
+            Err(error) => {
+                self.status = Some(format!("Could not open work folder: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        // The sessions may have become unsaved while the scan ran.
+        if self.has_unsaved_sessions() {
+            self.status = Some("Save current changes before opening a folder".to_owned());
+            cx.notify();
+            return;
+        }
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        if self.has_unsaved_sessions() {
+            self.status = Some("Save current changes before opening a folder".to_owned());
+            cx.notify();
+            return;
+        }
+        let later_file = self.external_file_open_after_folder_scan.take();
+        self.reset_for_work_folder_switch(cx);
+        #[cfg(feature = "instrument")]
+        {
+            self.instrumentation.work_folder_scan_completed_at = None;
+        }
+        self.start_folder_watch(&root, cx);
+        // The scan ran before the watch existed, so a change made before the
+        // watch connected was never reported. Queue one re-list, which
+        // `finish_work_folder_scan` runs once the folder is installed (after
+        // the watch is attached), to pick those changes up.
+        self.queue_folder_relist();
+        let request = self.begin_listing_request();
+        self.accept_listing_result(request);
+        let generation = self.work_folder_generation;
+        // A file requested after this scan began owns the initial session, so
+        // the folder's first entry must not replace it.
+        if let Some(file) = &later_file {
+            self.latest_open_target = Some(file.clone());
+        }
+        self.finish_work_folder_scan(generation, scanned, cx);
+        if let Some(file) = later_file {
+            self.open_path(&file, cx);
+        }
+    }
+
+    fn reset_for_work_folder_switch(&mut self, cx: &mut Context<Self>) {
         // Whatever `schedule_draft_save` still owed the old folder's unnamed
         // notes must land before their `work_folder_drafts` entries are
         // dropped below, or the same debounce gap `flush_pending_drafts` was
@@ -3241,22 +3381,55 @@ impl EditorView {
         self.work_folder_generation = self.work_folder_generation.wrapping_add(1);
         self.on_document_replaced();
         self.resync_document_find_for_active_document(cx);
-        self.begin_work_folder_scan(root, cx);
     }
 
-    /// Handles a path delivered by another Hane process from Explorer.
+    /// The one place that routes a path from outside the window (another
+    /// Hane process, Finder, an OS drop): a folder becomes the Work Folder
+    /// (never saved as the default folder), anything else opens as a file.
+    /// A folder switch is refused while any session is dirty or saving, so the
+    /// current sessions and their edits stay as they are.
     pub fn open_external_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.open_external_path_protected(path, false, cx);
+    }
+
+    /// `protected` is the unsaved / saving state observed when the request was
+    /// received, before it waited in a queue; it keeps refusing a folder switch
+    /// even if the sessions were saved while the request waited.
+    pub(crate) fn open_external_path_protected(
+        &mut self,
+        path: &Path,
+        protected: bool,
+        cx: &mut Context<Self>,
+    ) {
         if path.is_dir() {
-            self.switch_to_work_folder(path.to_path_buf(), cx);
+            if protected || self.has_unsaved_sessions() {
+                self.status = Some("Save current changes before opening a folder".to_owned());
+                cx.notify();
+                return;
+            }
+            // An editing rename is cancelled before the switch; one whose
+            // filesystem rename is already pending cannot be, so the current
+            // folder and sessions stay as they are.
+            if !self.cancel_inline_rename(cx) {
+                return;
+            }
+            // Cancelling can restart a deferred title rename, which takes a
+            // save slot; that is unsaved work too, so check again.
+            if self.has_unsaved_sessions() {
+                self.status = Some("Save current changes before opening a folder".to_owned());
+                cx.notify();
+                return;
+            }
+            self.open_external_folder(path.to_path_buf(), cx);
         } else {
+            self.external_file_open_after_folder_scan = Some(path.to_path_buf());
             self.open_path(path, cx);
         }
     }
 
-    /// Handles files dropped from Finder / Explorer onto the window. Only a
-    /// single path is opened, through `open_path`, so the dirty-session
-    /// refusal still applies. No filesystem metadata is read here, so a
-    /// dropped folder is never taken as a Work folder.
+    /// Handles files and folders dropped from Finder / Explorer onto the
+    /// window. Only a single path is opened, through `open_external_path`, so
+    /// folder / file routing and the dirty-session refusal live in one place.
     fn on_external_paths_drop(
         &mut self,
         paths: &ExternalPaths,
@@ -3279,16 +3452,27 @@ impl EditorView {
             // button. Unsaved settings edits keep their leave confirmation;
             // the latest drop is held and applied by `close_settings` once
             // the leave really happens.
+            //
+            // The unsaved / saving state seen at the drop is kept with it, so
+            // sessions saved while the leave confirmation is open do not turn
+            // a refused folder drop into a replacement.
+            self.pending_settings_drop_protected =
+                self.external_open_guard.unsaved() || self.has_unsaved_sessions();
             self.pending_settings_drop = Some(target);
             self.leave_settings(window, cx);
             return;
         }
-        self.apply_external_drop(target, cx);
+        self.apply_external_drop(target, false, cx);
     }
 
-    fn apply_external_drop(&mut self, target: ExternalDropTarget, cx: &mut Context<Self>) {
+    fn apply_external_drop(
+        &mut self,
+        target: ExternalDropTarget,
+        protected: bool,
+        cx: &mut Context<Self>,
+    ) {
         match target {
-            ExternalDropTarget::Open(path) => self.open_path(&path, cx),
+            ExternalDropTarget::Open(path) => self.open_external_path_protected(&path, protected, cx),
             ExternalDropTarget::TooMany => {
                 self.status = Some("Drop one item at a time".to_owned());
                 cx.notify();
@@ -3333,6 +3517,10 @@ impl EditorView {
                 cx.notify();
             }
             OpenDecision::Activate(id) => {
+                // An external folder scan still in flight would reset the
+                // sessions on completion; remember this later request so it is
+                // reopened afterwards instead of the folder's first entry.
+                self.external_file_open_after_folder_scan = Some(path.to_path_buf());
                 self.activate_session(id, cx);
                 self.status = Some("Already open".to_owned());
                 cx.notify();
@@ -3348,6 +3536,7 @@ impl EditorView {
                     cx.notify();
                     return;
                 }
+                self.external_file_open_after_folder_scan = Some(path.to_path_buf());
                 if !self.loading_paths.insert(path.to_path_buf()) {
                     // Already loading this path: the in-flight read will
                     // apply once it lands, and `latest_open_target` above is
@@ -3408,10 +3597,13 @@ impl EditorView {
                 let search_navigation_verification =
                     self.verify_loaded_search_navigation(path, &loaded);
                 // The read took time, and the target session may have been
-                // edited in the meantime: re-check before replacing it.
-                if into
-                    .is_some_and(|id| self.sessions.get(id).is_some_and(DocumentSession::is_dirty))
-                {
+                // edited or started saving in the meantime: re-check before
+                // replacing it, since `adopt` drops the in-flight save state.
+                if into.is_some_and(|id| {
+                    self.sessions
+                        .get(id)
+                        .is_some_and(|session| session.is_dirty() || session.save_in_flight())
+                }) {
                     self.cancel_pending_search_navigation_for_path(path);
                     self.status =
                         Some("Save current changes before opening another file".to_owned());
@@ -3608,7 +3800,8 @@ impl EditorView {
         window.focus(&self.focus_handle, cx);
         cx.notify();
         if let Some(target) = self.pending_settings_drop.take() {
-            self.apply_external_drop(target, cx);
+            let protected = std::mem::take(&mut self.pending_settings_drop_protected);
+            self.apply_external_drop(target, protected, cx);
         }
     }
 
@@ -13277,6 +13470,894 @@ mod tests {
 
         std::fs::remove_dir_all(&old_root).unwrap();
         std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Issue #607: a folder arriving from outside (drop, Finder, Explorer) opens
+    // as the Work Folder through the single external route, without touching
+    // the saved default folder.
+    #[gpui::test]
+    fn an_external_folder_opens_as_the_work_folder_without_changing_the_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-open");
+        let folder = root.join("my notes 日本語");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("New.md"), "# New\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let default_before = view.read_with(cx, |view, _| view.settings.default_folder.clone());
+        view.update(cx, |view, cx| {
+            view.apply_external_drop(ExternalDropTarget::Open(folder.clone()), false, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder.as_path())
+            );
+            assert_eq!(view.settings.default_folder, default_before);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: a file opened externally after an earlier external folder
+    // scan began stays the active session when that older scan completes, and
+    // the folder still becomes the Work Folder.
+    #[gpui::test]
+    fn a_later_external_file_stays_active_when_an_earlier_folder_scan_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-then-file");
+        let folder = root.join("folder-a");
+        let other = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(folder.join("First.md"), "# First\n").unwrap();
+        let file_b = other.join("B.md");
+        std::fs::write(&file_b, "# B\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        // Folder A's scan has started (token and generation as
+        // `open_external_folder` records them) but has not completed yet.
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+        // The later file request is processed and completes first.
+        view.update(cx, |view, cx| view.open_external_path(&file_b, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# B\n");
+        });
+
+        // Then the older folder scan completes.
+        let scanned = (
+            OsWorkFolderScanner.scan(&folder),
+            Ok(RecoveredDrafts {
+                drafts: Vec::new(),
+                failed: 0,
+            }),
+            #[cfg(feature = "instrument")]
+            Instant::now(),
+            #[cfg(not(feature = "instrument"))]
+            (),
+        );
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder.as_path())
+            );
+            assert_eq!(view.active_session().path(), Some(file_b.as_path()));
+            assert_eq!(view.editor().document().full_text(), "# B\n");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: the default folder's automatic first-entry open that lands
+    // while an external folder scan is in flight is not a user request, so the
+    // external folder's own first entry is shown once its scan completes.
+    #[gpui::test]
+    fn an_automatic_initial_open_is_not_restored_after_the_external_folder_scan(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("auto-open-then-external-folder");
+        let folder_a = root.join("folder-a");
+        let folder_b = root.join("folder-b");
+        std::fs::create_dir_all(&folder_a).unwrap();
+        std::fs::create_dir_all(&folder_b).unwrap();
+        std::fs::write(folder_a.join("A.md"), "# A\n").unwrap();
+        std::fs::write(folder_b.join("B.md"), "# B\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let scan = |folder: &Path| {
+            (
+                OsWorkFolderScanner.scan(folder),
+                Ok(RecoveredDrafts {
+                    drafts: Vec::new(),
+                    failed: 0,
+                }),
+                #[cfg(feature = "instrument")]
+                Instant::now(),
+                #[cfg(not(feature = "instrument"))]
+                (),
+            )
+        };
+        // Folder B's external scan has started; folder A's startup scan is
+        // still the one in flight underneath it.
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+
+        // A's scan completes first and automatically opens its first entry.
+        let scanned_a = scan(&folder_a);
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(generation, scanned_a, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# A\n");
+            assert_eq!(view.external_file_open_after_folder_scan, None);
+        });
+
+        // Then B's scan completes.
+        let scanned_b = scan(&folder_b);
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned_b, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder_b.as_path())
+            );
+            assert_eq!(
+                view.active_session().path(),
+                Some(folder_b.join("B.md").as_path())
+            );
+            assert_eq!(view.editor().document().full_text(), "# B\n");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: an in-app open (Open Markdown or a Work Folder entry) made
+    // while an external folder scan is in flight survives that scan.
+    fn in_app_open_after_external_folder_scan(
+        cx: &mut gpui::TestAppContext,
+        name: &str,
+        open: impl FnOnce(&mut EditorView, &Path, &mut Context<EditorView>),
+    ) {
+        let root = draft_test_root(name);
+        let folder = root.join("folder-a");
+        let other = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(folder.join("First.md"), "# First\n").unwrap();
+        let file_c = other.join("C.md");
+        std::fs::write(&file_c, "# C\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+        view.update(cx, |view, cx| open(view, &file_c, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "# C\n");
+        });
+
+        let scanned = (
+            OsWorkFolderScanner.scan(&folder),
+            Ok(RecoveredDrafts {
+                drafts: Vec::new(),
+                failed: 0,
+            }),
+            #[cfg(feature = "instrument")]
+            Instant::now(),
+            #[cfg(not(feature = "instrument"))]
+            (),
+        );
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder.as_path())
+            );
+            assert_eq!(view.active_session().path(), Some(file_c.as_path()));
+            assert_eq!(view.editor().document().full_text(), "# C\n");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_open_markdown_file_stays_active_when_an_earlier_folder_scan_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        in_app_open_after_external_folder_scan(cx, "scan-then-open-markdown", |view, path, cx| {
+            view.open_path(path, cx)
+        });
+    }
+
+    // Issue #607: a file added after the external folder scan listed the
+    // folder but before the watch connected is still in the final listing.
+    #[gpui::test]
+    fn a_change_made_before_the_folder_watch_connects_reaches_the_listing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("scan-then-watch-gap");
+        let folder = root.join("folder-a");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("First.md"), "# First\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (token, generation) = view.update(cx, |view, _| {
+            view.external_folder_open_token = view.external_folder_open_token.wrapping_add(1);
+            view.external_file_open_after_folder_scan = None;
+            (view.external_folder_open_token, view.work_folder_generation)
+        });
+
+        let scanned = (
+            OsWorkFolderScanner.scan(&folder),
+            Ok(RecoveredDrafts {
+                drafts: Vec::new(),
+                failed: 0,
+            }),
+            #[cfg(feature = "instrument")]
+            Instant::now(),
+            #[cfg(not(feature = "instrument"))]
+            (),
+        );
+        // Changed after the scan listed the folder and before the watch is
+        // connected; no notification will ever report it.
+        std::fs::write(folder.join("Gap.md"), "# Gap\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.finish_external_folder_open(token, generation, scanned, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let mut names: Vec<String> = view
+                .work_folder
+                .as_ref()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|entry| entry.file_name().to_owned())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, ["First.md", "Gap.md"]);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_work_folder_entry_stays_active_when_an_earlier_folder_scan_completes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        in_app_open_after_external_folder_scan(cx, "scan-then-folder-entry", |view, path, cx| {
+            view.open_work_folder_entry(path, cx)
+        });
+    }
+
+    // Issue #607: a dirty or saving session blocks an external folder switch,
+    // and the current session and its edit survive.
+    #[gpui::test]
+    fn an_external_folder_is_refused_while_a_session_is_dirty(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("external-folder-dirty");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("unsaved").unwrap();
+            view.after_input(cx);
+            let generation = view.work_folder_generation;
+            view.open_external_path(&folder, cx);
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder")
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.editor().document().full_text(), "unsaved");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_external_folder_is_refused_while_a_save_is_in_flight(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("external-folder-saving");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+            assert!(view.sessions.active().save_in_flight());
+            let generation = view.work_folder_generation;
+            view.open_external_path(&folder, cx);
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+        });
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before after");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: the request waits in the queue before the UI processes it.
+    // A request received while a session was dirty or saving must keep its
+    // protection even when the state is clean again by the time it is drained.
+    #[gpui::test]
+    fn a_queued_external_folder_keeps_the_protection_seen_at_receipt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-queued");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let queue = SharedExternalOpenQueue::new();
+        view.update(cx, |view, _cx| {
+            view.attach_external_open_inbox(Some(queue.clone()));
+            assert!(!view.has_unsaved_sessions());
+        });
+        // The callback receives the request while the window reports unsaved
+        // work (the state `sync_external_open_guard` publishes each frame).
+        queue.guard().set_unsaved(true);
+        queue.try_push(folder.clone()).unwrap();
+        // By the time the queue is drained the sessions are clean again.
+        queue.guard().set_unsaved(false);
+        view.update(cx, |view, cx| {
+            let generation = view.work_folder_generation;
+            let accepted = queue.drain_requests_into(|path, protected| {
+                view.submit_external_open_protected(path, protected, cx)
+            });
+            assert_eq!(accepted, 1);
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder")
+            );
+        });
+        // A request received while clean is still switched normally.
+        queue.try_push(folder.clone()).unwrap();
+        let generation = view.read_with(cx, |view, _| view.work_folder_generation);
+        view.update(cx, |view, cx| {
+            queue.drain_requests_into(|path, protected| {
+                view.submit_external_open_protected(path, protected, cx)
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_ne!(view.work_folder_generation, generation);
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: a clean loaded session (the normal launch with a file
+    // argument) must stamp the Finder request unprotected and open the folder.
+    // Non-editing `editor_mut` access raises the guard, so the frame-end sync
+    // is what returns it to the real clean value.
+    #[gpui::test]
+    fn a_clean_loaded_session_stamps_unprotected_and_opens_the_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-clean-loaded");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = root.join("seed.md");
+        std::fs::write(&path, "seed").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let queue = SharedExternalOpenQueue::new();
+        view.update(cx, |view, _cx| {
+            view.attach_external_open_inbox(Some(queue.clone()));
+            assert!(!view.has_unsaved_sessions());
+        });
+        // Raise the guard the way non-editing `editor_mut` access does, then
+        // let the production `Render::render` frame run. Only its frame-end
+        // sync can return the guard to the real clean value.
+        queue.guard().set_unsaved(true);
+        view.update(cx, |view, cx| {
+            view.editor_mut().set_selection(Selection::caret(SourceOffset(0))).unwrap();
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(700.0)));
+        // `run_until_parked` and `simulate_resize` never render, so draw the
+        // window explicitly to run the production root `Render::render`.
+        // The `cx.notify()` above invalidated the root, so this draw re-runs the
+        // production Render and Paint (`InputCapture::paint` marks the frame)
+        // instead of reusing a cached view.
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+        let observe = |cx: &mut gpui::VisualTestContext| {
+            let unsaved_sessions = view.read_with(cx, |view, _| view.has_unsaved_sessions());
+            (unsaved_sessions, queue.guard().unsaved())
+        };
+        // Boundary 1: right after the draw, Paint has already run.
+        assert_eq!(observe(cx), (false, false));
+        // Boundary 2: after the executor settled.
+        cx.run_until_parked();
+        assert_eq!(observe(cx), (false, false));
+        // Boundary 3: draw again. Notify first so the Render cache cannot skip
+        // this explicit draw.
+        view.update(cx, |_, cx| cx.notify());
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+        assert_eq!(observe(cx), (false, false));
+        queue.try_push(folder.clone()).unwrap();
+        let generation = view.read_with(cx, |view, _| view.work_folder_generation);
+        let mut stamped = None;
+        view.update(cx, |view, cx| {
+            queue.drain_requests_into(|path, protected| {
+                stamped = Some(protected);
+                view.submit_external_open_protected(path, protected, cx)
+            });
+        });
+        assert_eq!(stamped, Some(false));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_ne!(view.work_folder_generation, generation);
+            assert_ne!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder")
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: the guard was clean at the last render, a save then started,
+    // and the request arrived before the next render. The save finishes before
+    // the queue is drained, so both the receipt and the processing time would
+    // look clean unless starting the save publishes the guard itself.
+    #[gpui::test]
+    fn a_folder_received_during_a_save_is_refused_after_the_save_finishes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-save-window");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let queue = SharedExternalOpenQueue::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_inbox(Some(queue.clone()));
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            // The last render saw a clean window.
+            queue.guard().set_unsaved(false);
+            view.save_current(cx);
+            assert!(view.sessions.active().save_in_flight());
+            // Finder / Windows IPC receives the request now, mid-save.
+            queue.try_push(folder.clone()).unwrap();
+        });
+        // The save finishes before the queue is drained.
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.has_unsaved_sessions());
+            let generation = view.work_folder_generation;
+            let accepted = queue.drain_requests_into(|path, protected| {
+                view.submit_external_open_protected(path, protected, cx)
+            });
+            assert_eq!(accepted, 1);
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.editor().document().full_text(), "before after");
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder")
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: the receiver can read between the document changing and the
+    // guard being recomputed. Taking the editor for mutation publishes
+    // protection first, so a request read at that boundary is protected and is
+    // refused even though the sync afterwards is what makes the state exact.
+    #[gpui::test]
+    fn a_folder_read_at_the_edit_boundary_is_protected_and_refused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("external-folder-edit-boundary");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let queue = SharedExternalOpenQueue::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_inbox(Some(queue.clone()));
+            view.sync_external_open_guard();
+            assert!(!queue.guard().unsaved());
+            // The edit starts: protection is published before the document
+            // changes, and the guard has not been synced since.
+            view.editor_mut().insert_text("unsaved").unwrap();
+            queue.try_push(folder.clone()).unwrap();
+            // Later syncs (clean or not) cannot lower what was captured.
+            view.sync_external_open_guard();
+            let generation = view.work_folder_generation;
+            let accepted = queue.drain_requests_into(|path, protected| {
+                view.submit_external_open_protected(path, protected, cx)
+            });
+            assert_eq!(accepted, 1);
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.editor().document().full_text(), "unsaved");
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: starting a save publishes protection before the save slot is
+    // taken, and the recomputation keeps another dirty session protected.
+    #[gpui::test]
+    fn the_guard_stays_raised_for_another_dirty_session_after_a_save_starts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = ExternalOpenGuard::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_guard(guard.clone());
+            view.editor_mut().insert_text("dirty").unwrap();
+            view.after_input(cx);
+            // No path: nothing starts, yet the dirty session stays protected.
+            view.save_current(cx);
+            assert!(guard.unsaved());
+        });
+    }
+
+    // Issue #607: a folder open cancels an editing inline rename first.
+    #[gpui::test]
+    fn a_folder_open_cancels_an_editing_inline_rename(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("external-folder-cancels-rename");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: root.join("note.md"),
+                input: ShortTextInput::new("note".to_owned()),
+                fixed_extension: Some(".md".to_owned()),
+                pending: false,
+            });
+            view.open_external_path_protected(&folder, false, cx);
+            assert!(view.inline_rename.is_none());
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(folder.as_path())
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: a scan that fails after the directory check keeps the
+    // sessions and Work Folder that were open before the external open.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_failed_external_folder_scan_keeps_the_existing_sessions_and_work_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = draft_test_root("external-folder-scan-failure");
+        let old_root = root.join("old");
+        let unreadable = root.join("unreadable");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&unreadable).unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&unreadable).is_ok() {
+            // Permission bits do not restrict this user (e.g. root); the
+            // failure cannot be produced here.
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("clean text", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(old_work_folder);
+            assert!(!view.has_unsaved_sessions());
+            view.open_external_path(&unreadable, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(old_root.as_path())
+            );
+            assert_eq!(view.sessions().count(), 1);
+            assert_eq!(view.editor().document().full_text(), "clean text");
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("Could not open work folder"))
+            );
+        });
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: a pending filesystem rename cannot be cancelled, so the
+    // folder switch is aborted and the current folder stays.
+    #[gpui::test]
+    fn a_folder_open_is_aborted_while_an_inline_rename_is_pending(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("external-folder-pending-rename");
+        let folder = root.join("other");
+        std::fs::create_dir_all(&folder).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: root.join("note.md"),
+                input: ShortTextInput::new("note".to_owned()),
+                fixed_extension: Some(".md".to_owned()),
+                pending: true,
+            });
+            let generation = view.work_folder_generation;
+            view.open_external_path_protected(&folder, false, cx);
+            assert!(view.inline_rename.is_some());
+            assert_eq!(view.work_folder_generation, generation);
+            assert!(view.work_folder.is_none());
+            assert_eq!(view.status.as_deref(), Some("Rename in progress"));
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #607: each completion boundary publishes the exact guard before
+    // the next request, and another session's dirty state keeps it raised.
+    #[gpui::test]
+    fn save_and_title_rename_completions_sync_the_guard_for_all_sessions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("guard-completion-sync");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = ExternalOpenGuard::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_guard(guard.clone());
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+            assert!(guard.unsaved());
+        });
+        // The write completes without any render in between.
+        cx.run_until_parked();
+        view.update(cx, |view, _cx| {
+            assert!(!view.has_unsaved_sessions());
+            assert!(!guard.unsaved(), "completion must publish the clean state");
+        });
+        // A dirty second session keeps the guard raised when it is recomputed
+        // while the first session is clean.
+        view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("", "Second");
+            view.editor_mut().insert_text("again").unwrap();
+            view.after_input(cx);
+            let second = view.sessions.active_id();
+            assert_ne!(first, second);
+            assert!(view.sessions.get(second).unwrap().is_dirty());
+            assert!(!view.sessions.get(first).unwrap().is_dirty());
+            assert!(!view.sessions.get(first).unwrap().save_in_flight());
+            view.sync_external_open_guard();
+            assert!(guard.unsaved());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn the_external_open_guard_follows_dirty_and_saving_sessions(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let guard = ExternalOpenGuard::new();
+        view.update(cx, |view, cx| {
+            view.attach_external_open_guard(guard.clone());
+            view.sync_external_open_guard();
+            assert!(!guard.unsaved());
+            view.editor_mut().insert_text("unsaved").unwrap();
+            view.after_input(cx);
+            view.sync_external_open_guard();
+            assert!(guard.unsaved());
+        });
+    }
+
+    // Issue #607: a read started while the session was idle can finish after a
+    // save began. `adopt` would clear the in-flight save, so the completion
+    // must leave the session and its save slot alone.
+    #[gpui::test]
+    fn a_read_finishing_after_a_save_started_does_not_replace_the_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("read-after-save-started");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (id, generation) = view.update(cx, |view, _cx| {
+            view.latest_open_target = Some(path.clone());
+            (view.sessions.active_id(), view.work_folder_generation)
+        });
+        // The read for the clean session completes later, under the control
+        // of this test.
+        let read = OsFileService.load(&path).unwrap();
+        view.update(cx, |view, cx| {
+            let _ = view.sessions.active_mut().request_save(SaveIntent::Current);
+            assert!(!view.sessions.active().is_dirty());
+            assert!(view.sessions.active().save_in_flight());
+            view.finish_open(Some(id), generation, &path, Ok(read), cx);
+            assert!(
+                view.sessions.active().save_in_flight(),
+                "the read completion must not clear the in-flight save"
+            );
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening another file")
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     // Issue #414: `begin_work_folder_scan` starts the scan/recovery pair on a
