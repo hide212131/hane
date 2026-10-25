@@ -79,8 +79,8 @@ use hane_session::{
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, ThemePreference, TitleSyncAction, UnsavedChanges, WorkFolder,
     WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync,
-    extract_h1_title, format_relative_date_label, local_today, run_save_job,
-    split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
+    extract_h1_title, format_relative_date_label, local_today, run_create_new_job,
+    run_save_job, split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -2039,7 +2039,6 @@ impl EditorView {
                 // created above; it stays clean and in place while any
                 // recovered drafts are installed alongside it, so switching
                 // to the first real note below can still reuse it.
-                let root = work_folder.root().to_path_buf();
                 let initial_session = self.sessions.active_id();
                 self.work_folder = Some(work_folder);
                 // A work folder that opened successfully is shown even if the
@@ -2061,15 +2060,14 @@ impl EditorView {
                     Ok(drafts) => {
                         for draft in drafts.drafts {
                             let id = self.sessions.open_untitled(&draft.text, "Untitled");
-                            // The journal does not record which folder a
-                            // draft was destined for, so a recovered draft
-                            // falls back to the work folder root rather than
-                            // wherever it was selected before the crash.
+                            // The journal records the destination folder;
+                            // entries from before that was recorded come
+                            // back with the work folder root.
                             self.work_folder_drafts.insert(
                                 id,
                                 WorkFolderDraft {
                                     draft_id: draft.id,
-                                    target_directory: root.clone(),
+                                    target_directory: draft.target_directory,
                                 },
                             );
                             last_recovered = Some(id);
@@ -2884,13 +2882,45 @@ impl EditorView {
     /// immediately, and is journalled into the recovery drafts as soon as it
     /// holds anything, so a crash before it earns a real name never loses it.
     pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
+        self.new_work_folder_note_in(None, cx);
+    }
+
+    /// Starts the same new note as `new_work_folder_note`, optionally in an
+    /// explicit folder (the sidebar context menu's target) instead of the
+    /// selected folder. An explicit folder that is no longer in the work
+    /// folder tree is refused rather than silently replaced by the root.
+    pub(crate) fn new_work_folder_note_in(
+        &mut self,
+        explicit_directory: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.cancel_inline_rename(cx) {
             return;
         }
         self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
-        let Some(target_directory) = self.target_directory_for_new_entry() else {
-            return;
+        let target_directory = match explicit_directory {
+            Some(directory) => {
+                let exists = self
+                    .work_folder
+                    .as_ref()
+                    .is_some_and(|work_folder| work_folder.children_at(&directory).is_some());
+                if !exists {
+                    self.status = Some(
+                        "対象のフォルダが見つからないため作成できません。一覧を確認してください"
+                            .to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                directory
+            }
+            None => {
+                let Some(directory) = self.target_directory_for_new_entry() else {
+                    return;
+                };
+                directory
+            }
         };
         if self.refuse_new_entry_under_folder_trash(&target_directory, cx) {
             return;
@@ -14680,6 +14710,7 @@ mod tests {
         let readable = RecoveredDraft {
             id: DraftId::generate(),
             text: "kept".to_owned(),
+            target_directory: root.clone(),
         };
         let partial = RecoveredDrafts {
             drafts: vec![readable.clone()],
@@ -18290,6 +18321,7 @@ mod tests {
             drafts: vec![RecoveredDraft {
                 id: DraftId::generate(),
                 text: "recovered".to_owned(),
+                target_directory: root.clone(),
             }],
             failed: 0,
         };
@@ -18760,6 +18792,438 @@ mod tests {
             std::fs::read_to_string(&expected_path).unwrap(),
             format!("{heading}GPUI")
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: the folder context menu's "new file" targets the
+    // right-clicked folder, whatever folder is selected, while the toolbar
+    // path keeps using the selected folder.
+    #[gpui::test]
+    fn folder_context_menu_new_note_uses_the_clicked_folder(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("context-menu-new-note");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.selected_folder = Some(root.join("other"));
+            view.sidebar_context_new_note(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.join("dev")),
+                "the clicked folder is the destination even when another is selected"
+            );
+            assert_eq!(view.selected_folder, Some(root.join("other")));
+            assert!(view.sidebar_context_menu.is_none());
+        });
+
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.join("other")),
+                "the toolbar path still uses the selected folder"
+            );
+        });
+
+        // A stale target is refused, not redirected to the root.
+        let before = view.read_with(cx, |view, _| view.work_folder_drafts.len());
+        view.update(cx, |view, cx| {
+            view.sidebar_context_new_note(root.join("gone"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), before);
+            assert!(view.status.is_some());
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: a note started from a child folder's context menu keeps
+    // that folder as its destination across a restart: the draft journal
+    // records it, and the H1 save after recovery lands inside that folder.
+    #[gpui::test]
+    fn a_recovered_context_menu_draft_is_named_inside_its_child_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-recovery");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = root.join("dev").join(format!("{title_prefix}GPUI.md"));
+
+        let first = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        first.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.sidebar_context_new_note(root.join("dev"), cx);
+            // The journal write a quit or the debounce would perform.
+            view.flush_pending_drafts();
+        });
+
+        // "Restart": a fresh view recovers from the journal on disk.
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, root.join("dev"));
+
+        let restarted_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let second = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        second.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(restarted_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        second.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.join("dev")),
+                "recovery restores the right-clicked folder as the destination"
+            );
+        });
+
+        second.update(cx, |view, cx| {
+            // A recovered draft opens with the caret at the start; the user
+            // continues the H1 from its end.
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        second.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}GPUI")
+        );
+        assert!(!root.join(format!("{title_prefix}GPUI.md")).exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_recovered_draft_does_not_recreate_a_missing_target_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-missing-target");
+        let target = root.join("dev");
+        std::fs::create_dir_all(&target).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+
+        let first = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        first.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.sidebar_context_new_note(target.clone(), cx);
+            view.flush_pending_drafts();
+        });
+
+        // Simulate the destination being removed while the app is closed.
+        std::fs::remove_dir(&target).unwrap();
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, target);
+        let restarted_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let second = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        second.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(restarted_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        second.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        second.read_with(cx, |view, _| {
+            assert!(view.active_session().path().is_none());
+            assert_eq!(
+                view.status.as_deref(),
+                Some("対象のフォルダが見つからないため作成できません。一覧を確認してください")
+            );
+        });
+        assert!(!target.exists(), "a missing folder must not be recreated");
+        assert!(!OsDraftStore.recover(&root).unwrap().drafts.is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Deletes `target` the first time the filename probe stats a candidate
+    /// inside it, i.e. while the probe is in flight and before its completion
+    /// is handled. The in-memory work-folder snapshot is never told, as when
+    /// a watcher rescan has not landed yet.
+    struct DeleteTargetDuringProbe {
+        target: PathBuf,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FileService for DeleteTargetDuringProbe {
+        fn load(&self, path: &Path) -> std::io::Result<LoadedFile> {
+            OsFileService.load(path)
+        }
+
+        fn open_reader(&self, path: &Path) -> std::io::Result<hane_session::ReadFile> {
+            OsFileService.open_reader(path)
+        }
+
+        fn save(&self, path: &Path, document: &RopeBuffer) -> std::io::Result<SavedFile> {
+            OsFileService.save(path, document)
+        }
+
+        fn save_in_existing_directory(
+            &self,
+            path: &Path,
+            document: &RopeBuffer,
+        ) -> std::io::Result<SavedFile> {
+            OsFileService.save_in_existing_directory(path, document)
+        }
+
+        fn stamp(&self, path: &Path) -> Option<hane_session::FileStamp> {
+            if path.parent() == Some(self.target.as_path())
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                std::fs::remove_dir_all(&self.target).unwrap();
+            }
+            OsFileService.stamp(path)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            OsFileService.rename(from, to)
+        }
+
+        fn rename_folder(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            OsFileService.rename_folder(from, to)
+        }
+
+        fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+            OsFileService.create_dir(path)
+        }
+    }
+
+    #[gpui::test]
+    fn a_draft_target_deleted_during_the_filename_probe_is_not_recreated(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-target-deleted-in-flight");
+        let target = root.join("dev");
+        std::fs::create_dir_all(&target).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(DeleteTargetDuringProbe {
+                    target: target.clone(),
+                    armed: std::sync::atomic::AtomicBool::new(true),
+                }),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.sidebar_context_new_note(target.clone(), cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+            view.flush_pending_drafts();
+        });
+        // The debounce starts the probe, which removes the target while it
+        // runs; its completion then sees a snapshot that still lists it.
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert!(view.active_session().path().is_none());
+            assert!(view.active_session().is_dirty());
+            assert_eq!(
+                view.status.as_deref(),
+                Some("対象のフォルダが見つからないため作成できません。一覧を確認してください")
+            );
+        });
+        assert!(!target.exists(), "the deleted folder must not be recreated");
+        assert!(!OsDraftStore.recover(&root).unwrap().drafts.is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: a child folder whose name ends in whitespace is a distinct
+    // real folder; recovery must not trim it into a different name.
+    // Windows cannot keep a trailing ASCII space in a real folder name, so this
+    // filesystem fixture only runs on other platforms.
+    #[cfg(not(windows))]
+    #[gpui::test]
+    fn a_recovered_draft_keeps_a_child_folder_name_with_trailing_whitespace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("context-menu-draft-whitespace");
+        let child = root.join("notes ");
+        std::fs::create_dir_all(&child).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = child.join(format!("{title_prefix}GPUI.md"));
+        OsDraftStore
+            .write(&root, DraftId::generate(), &child, &heading)
+            .unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].target_directory, child);
+
+        let restarted_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(restarted_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(heading.len())))
+                .unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
+            view.after_input(cx);
+        });
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(child.clone())
+            );
+        });
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}GPUI")
+        );
+        assert!(!root.join("notes").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #608: a journal entry written before targets were recorded
+    // still recovers to the work folder root.
+    #[gpui::test]
+    fn a_legacy_draft_without_a_target_recovers_to_the_work_folder_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("legacy-draft-recovery");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        // Only the bare text file, exactly as an older version journalled it.
+        let drafts_dir = root.join(".hane").join("drafts");
+        std::fs::create_dir_all(&drafts_dir).unwrap();
+        std::fs::write(drafts_dir.join("0000000000000abc.md"), &heading).unwrap();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan(
+                view.work_folder_generation,
+                (
+                    Ok(work_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
+                cx,
+            );
+        });
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.work_folder_drafts.get(&id).map(|d| d.target_directory.clone()),
+                Some(root.clone()),
+            );
+        });
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -21727,6 +22191,52 @@ mod tests {
 
             assert!(view.title_sync_scheduled.contains_key(&id));
             assert!(view.inline_rename_has_background_conflict(&project, InlineRenameKind::Folder));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn title_create_does_not_save_into_a_directory_the_draft_target_left_during_the_probe(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("title-create-retargeted-during-probe");
+        let old_dir = root.join("Old");
+        let new_dir = root.join("New");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: old_dir.clone(),
+                },
+            );
+            view.editor_mut().insert_text("# Draft").unwrap();
+            let session = view.sessions.get(id).unwrap();
+            let (generation, revision) = (session.generation(), session.revision());
+            // The filename probe is spawned here but cannot complete until
+            // the test yields below.
+            view.run_title_sync_for_test(id, generation, revision, cx);
+            // A folder rename rebases the draft's target while the probe is
+            // pending; the old directory stays in the tree (its path was
+            // reused), so only the target comparison can catch it.
+            view.work_folder_drafts
+                .get_mut(&id)
+                .unwrap()
+                .target_directory = new_dir.clone();
+            id
+        });
+        cx.run_until_parked();
+
+        assert!(!old_dir.join("Draft.md").exists());
+        assert!(new_dir.join("Draft.md").exists());
+        view.read_with(cx, |view, _| {
+            assert!(!view.title_sync_in_flight.contains(&id));
         });
 
         std::fs::remove_dir_all(root).unwrap();
