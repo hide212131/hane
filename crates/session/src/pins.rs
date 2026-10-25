@@ -468,8 +468,10 @@ fn os_from_units(bytes: &[u8]) -> Option<OsString> {
         return None;
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_be_bytes(pair))
         .collect();
     Some(OsString::from_wide(&units))
 }
@@ -494,10 +496,8 @@ fn decode_os(hex: &str) -> Option<OsString> {
         _ => None,
     };
     let mut bytes = Vec::with_capacity(digits.len() / 2);
-    for pair in digits.chunks_exact(2) {
-        let high = nibble(pair[0])?;
-        let low = nibble(pair[1])?;
-        bytes.push((high << 4) | low);
+    for &[high, low] in digits.as_chunks::<2>().0 {
+        bytes.push((nibble(high)? << 4) | nibble(low)?);
     }
     os_from_units(&bytes)
 }

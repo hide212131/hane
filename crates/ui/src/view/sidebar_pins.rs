@@ -8,6 +8,7 @@
 //! reads the file system while rendering: whether a pin still resolves is
 //! answered from the last successfully scanned tree.
 
+use super::sidebar::flatten_work_folder_tree;
 use super::*;
 use gpui_component::Icon;
 use hane_session::{
@@ -49,6 +50,11 @@ pub(super) struct SidebarPins {
     /// Path changes applied to the display whose save failed. They are sent
     /// again ahead of the next update so an old path is never restored.
     unsaved: Vec<PinUpdate>,
+    /// A save is running. Saves run one at a time in the order the changes
+    /// happened, because path updates only make sense in that order.
+    saving: bool,
+    /// Changes waiting for the running save to finish.
+    queued: VecDeque<(Vec<PinUpdate>, PinRequest)>,
     pub(super) scroll: ScrollHandle,
 }
 
@@ -61,6 +67,8 @@ impl Default for SidebarPins {
             blocked: None,
             applied_revision: 0,
             unsaved: Vec::new(),
+            saving: false,
+            queued: VecDeque::new(),
             scroll: ScrollHandle::new(),
         }
     }
@@ -75,6 +83,8 @@ impl SidebarPins {
         self.blocked = None;
         self.applied_revision = 0;
         self.unsaved.clear();
+        self.saving = false;
+        self.queued.clear();
         self.scroll.set_offset(point(px(0.0), px(0.0)));
     }
 }
@@ -218,15 +228,20 @@ impl EditorView {
         else {
             return;
         };
+        if request == PinRequest::Explicit {
+            self.sidebar_pins.busy = true;
+        }
+        if self.sidebar_pins.saving {
+            self.sidebar_pins.queued.push_back((updates, request));
+            return;
+        }
+        self.sidebar_pins.saving = true;
         let generation = self.work_folder_generation;
         let repository = self.stores.pins();
         // Path changes whose save failed earlier go first, so the stored list
         // never falls back to a path that no longer exists.
         let mut batch = self.sidebar_pins.unsaved.clone();
         batch.extend(updates.iter().cloned());
-        if request == PinRequest::Explicit {
-            self.sidebar_pins.busy = true;
-        }
         let sent = batch.clone();
         cx.spawn(async move |view, cx| {
             let task_root = root.clone();
@@ -268,6 +283,9 @@ impl EditorView {
         if request == PinRequest::Explicit {
             self.sidebar_pins.busy = false;
         }
+        if request != PinRequest::Load {
+            self.sidebar_pins.saving = false;
+        }
         match result {
             Ok(snapshot) => {
                 self.sidebar_pins
@@ -285,6 +303,12 @@ impl EditorView {
                     for pending in &self.sidebar_pins.unsaved {
                         let _ = apply_pin_update(&mut entries, pending);
                     }
+                    // ...nor those still waiting behind this save.
+                    for (waiting, _) in &self.sidebar_pins.queued {
+                        for pending in waiting {
+                            let _ = apply_pin_update(&mut entries, pending);
+                        }
+                    }
                     self.sidebar_pins.entries = entries;
                 }
             }
@@ -297,6 +321,11 @@ impl EditorView {
                 }
                 self.status = Some(error.to_string());
             }
+        }
+        if request != PinRequest::Load
+            && let Some((next, next_request)) = self.sidebar_pins.queued.pop_front()
+        {
+            self.send_pin_updates(next, next_request, cx);
         }
         cx.notify();
     }
@@ -1019,6 +1048,51 @@ mod tests {
         assert_eq!(
             pin_paths(&stores.pins().load(&root).unwrap().entries),
             remaining
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn consecutive_renames_are_saved_in_order_and_end_on_the_last_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = pin_test_root("rename-order");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("A.md"), "# A\n").unwrap();
+        let stores = StateStores::memory();
+        let (view, cx) = open_pin_view(cx, &root, stores.clone());
+        let root = view_root(&view, cx);
+        view.update(cx, |view, cx| {
+            view.toggle_pin(PathBuf::from("A.md"), PinKind::File, cx);
+        });
+        cx.run_until_parked();
+
+        // A -> B and B -> C arrive before the first save has finished. The
+        // second one must wait, so the saves cannot complete out of order.
+        view.update(cx, |view, cx| {
+            view.follow_pin_rename(&root.join("A.md"), &root.join("B.md"), PinKind::File, cx);
+            assert!(view.sidebar_pins.saving);
+            view.follow_pin_rename(&root.join("B.md"), &root.join("C.md"), PinKind::File, cx);
+            assert_eq!(view.sidebar_pins.queued.len(), 1);
+            assert_eq!(
+                pin_paths(&view.sidebar_pins.entries),
+                [PathBuf::from("C.md")]
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_pins.saving);
+            assert!(view.sidebar_pins.queued.is_empty());
+            assert_eq!(
+                pin_paths(&view.sidebar_pins.entries),
+                [PathBuf::from("C.md")]
+            );
+        });
+        assert_eq!(
+            pin_paths(&stores.pins().load(&root).unwrap().entries),
+            [PathBuf::from("C.md")]
         );
 
         std::fs::remove_dir_all(root).unwrap();
