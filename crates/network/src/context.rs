@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::child_env::ChildProxyPlan;
 use crate::credential::{
     BasicCredentials, CredentialError, CredentialRef, CredentialSource, CredentialStore,
     load_credentials,
@@ -84,6 +85,18 @@ impl NetworkContext {
         resolve(&self.inner.settings, &self.inner.environment, &destination)
     }
 
+    /// The proxy plan for a Hane-launched child process, built from this one
+    /// snapshot (settings, captured environment, credential store). A
+    /// credential or settings failure is an error: callers must not start the
+    /// child without authentication or directly instead.
+    pub fn child_proxy_plan(&self) -> Result<ChildProxyPlan, NetworkError> {
+        ChildProxyPlan::from_settings(
+            &self.inner.settings,
+            &self.inner.environment,
+            &*self.inner.store,
+        )
+    }
+
     /// Fetch the credentials of a resolved route and check that they can be
     /// carried as HTTP Basic. A store failure is an error, never `None`.
     pub fn credentials(
@@ -144,6 +157,39 @@ mod tests {
         assert_eq!(a, b);
         assert!(matches!(a, ResolvedRoute::HttpProxy { .. }));
         assert!(!format!("{context:?}").contains("pw"));
+    }
+
+    #[test]
+    fn child_plan_uses_the_captured_snapshot_only() {
+        let env = ProxyEnvironment::from_vars(
+            EnvPlatform::MacOs,
+            [("https_proxy", "http://proxy.example:3128")],
+        );
+        let plan = NetworkContext::from_environment(env)
+            .child_proxy_plan()
+            .unwrap();
+        assert!(plan.uses_proxy());
+        let direct = NetworkContext::direct().child_proxy_plan().unwrap();
+        assert!(!direct.uses_proxy());
+    }
+
+    #[test]
+    fn child_plan_reports_credential_failure_instead_of_falling_back() {
+        let manual = ManualProxy::new(
+            "http://p:1",
+            "",
+            ProxyAuth::Basic(CredentialRef::new("c1").unwrap()),
+        )
+        .unwrap();
+        let context = NetworkContext::new(
+            NetworkSettings::manual(manual),
+            ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
+            Arc::new(UnavailableStore),
+        );
+        assert_eq!(
+            context.child_proxy_plan().err(),
+            Some(NetworkError::Credential(CredentialError::Unavailable))
+        );
     }
 
     #[test]

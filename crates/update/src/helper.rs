@@ -285,6 +285,11 @@ pub fn run_session<R: Read, W: Write>(
         startup,
         runtime: None,
     };
+    // Dropped before `leases`, while this helper still owns the transaction.
+    let _secrets = TerminalSecrets {
+        coordination: coord,
+        transaction: &env.transaction,
+    };
 
     write_frame(
         writer,
@@ -386,9 +391,42 @@ struct UnjournaledCleanup<'a> {
 impl Drop for UnjournaledCleanup<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.coordination.remove_unjournaled_transaction(self.transaction);
+            discard_unstarted_transaction(self.coordination, self.transaction);
         }
     }
+}
+
+/// Removes the temporary proxy credentials of the helper's own transaction when
+/// its session ends in any way: aborted, parent still running, applied (the
+/// limited child has already taken its credentials), rolled back or recovered.
+/// A failed removal keeps the record that names them, so the next cleanup of
+/// this transaction retries.
+struct TerminalSecrets<'a> {
+    coordination: &'a Coordination,
+    transaction: &'a TransactionId,
+}
+
+impl Drop for TerminalSecrets<'_> {
+    fn drop(&mut self) {
+        let _ = release_secrets(self.coordination, self.transaction);
+    }
+}
+
+/// The helper's cleanup of a transaction's temporary proxy credentials. Production
+/// uses the OS store; unit tests use an in-memory store so that they never touch
+/// the Keychain / Credential Manager.
+#[cfg(not(test))]
+fn release_secrets(coordination: &Coordination, transaction: &TransactionId) -> bool {
+    crate::state_root::release_transaction_secrets(coordination, transaction)
+}
+
+#[cfg(test)]
+fn release_secrets(coordination: &Coordination, transaction: &TransactionId) -> bool {
+    crate::state_root::release_transaction_secrets_with(
+        coordination,
+        transaction,
+        tests::fake_secrets(),
+    )
 }
 
 /// The parent's death is observed through the OS: its shared runtime lease
@@ -932,9 +970,13 @@ pub struct PreparedRestart {
 }
 
 /// Removes the staged files of a transaction whose helper has exited without
-/// ever writing a journal. Best effort: whatever cannot be verified stays.
-fn discard_unstarted_transaction(coordination: &Coordination, transaction: &TransactionId) {
-    let _ = coordination.remove_unjournaled_transaction(transaction);
+/// ever writing a journal. Best effort: whatever cannot be verified stays. The
+/// temporary proxy credentials go first; if one cannot be removed the directory
+/// (and the record naming it) stays so that a later cleanup can retry.
+pub(crate) fn discard_unstarted_transaction(coordination: &Coordination, transaction: &TransactionId) {
+    if release_secrets(coordination, transaction) {
+        let _ = coordination.remove_unjournaled_transaction(transaction);
+    }
 }
 
 /// Cleans up a transaction that failed before `PreparedRestart` took it over.
@@ -954,7 +996,8 @@ impl Drop for PreparingTransaction<'_> {
             return;
         }
         crate::state_root::discard_binding(self.coordination, self.transaction);
-        crate::state_root::discard_environment(self.coordination, self.transaction);
+        // Releases the temporary proxy credentials and the environment record
+        // first; a failed release keeps the directory for the next cleanup.
         discard_unstarted_transaction(self.coordination, self.transaction);
     }
 }
@@ -1069,7 +1112,9 @@ pub fn prepare_restart(
     let copy = crate::platform::stage_helper_copy(&coordination, &transaction, &source)?;
     stage_candidate(&coordination, &transaction, candidate)?;
     crate::state_root::publish_binding(&coordination, &transaction, state_root)?;
-    crate::state_root::publish_environment(&coordination, &transaction, std::env::vars_os())?;
+    // The limited child's environment is published later, by the handoff that
+    // owns the real OS secret store, before the application can quit
+    // (`state_root::publish_environment_with_secrets`).
     let spawned = match spawn_helper_checked(
         &copy,
         &HelloRequest {
@@ -1106,6 +1151,46 @@ mod tests {
     use super::*;
     use crate::identity::InstallFacts;
     use crate::testing::TempDir;
+
+    /// In-memory stand-in for the OS secret store, shared by every helper test
+    /// (sessions also run on spawned threads). Transaction ids are unique per
+    /// test, so tests do not see each other's entries.
+    #[derive(Default)]
+    pub(super) struct FakeSecrets {
+        entries: Mutex<std::collections::BTreeMap<String, String>>,
+        failing: Mutex<std::collections::BTreeSet<String>>,
+    }
+
+    impl crate::state_root::TransientSecretStore for FakeSecrets {
+        fn put(&self, reference: &str, secret: &str) -> Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(reference.to_owned(), secret.to_owned());
+            Ok(())
+        }
+
+        fn take(&self, reference: &str) -> Result<Option<String>> {
+            Ok(self.entries.lock().unwrap().remove(reference))
+        }
+
+        fn delete(&self, reference: &str) -> Result<()> {
+            if self.failing.lock().unwrap().contains(reference) {
+                return Err(UpdateError::new(ErrorCode::Io, "the store refused the delete"));
+            }
+            self.entries.lock().unwrap().remove(reference);
+            Ok(())
+        }
+    }
+
+    pub(super) fn fake_secrets() -> &'static FakeSecrets {
+        static STORE: std::sync::OnceLock<FakeSecrets> = std::sync::OnceLock::new();
+        STORE.get_or_init(FakeSecrets::default)
+    }
+
+    fn fake_has(reference: &str) -> bool {
+        fake_secrets().entries.lock().unwrap().contains_key(reference)
+    }
 
     /// Each fixture needs its own InstallId: the runtime lease registry is
     /// process-global, so fixtures sharing one id would contend with each other
@@ -1952,6 +2037,35 @@ mod tests {
         assert!(result.is_err());
         assert!(marker.exists());
         assert!(fx.coord.journal_path(&fx.txn).exists());
+    }
+
+    #[test]
+    fn an_unstarted_cleanup_sweeps_orphaned_secrets_without_a_record() {
+        use crate::state_root::TransientSecretStore;
+        let fx = fixture();
+        let marker = stage_marker(&fx.coord, &fx.txn);
+        let reference = format!("{}.3", fx.txn.as_str());
+        fake_secrets().put(&reference, "orphan").unwrap();
+        discard_unstarted_transaction(&fx.coord, &fx.txn);
+        assert!(!fake_has(&reference));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_failed_secret_delete_keeps_the_transaction_for_a_retry() {
+        use crate::state_root::TransientSecretStore;
+        let fx = fixture();
+        let marker = stage_marker(&fx.coord, &fx.txn);
+        let reference = format!("{}.0", fx.txn.as_str());
+        fake_secrets().put(&reference, "secret").unwrap();
+        fake_secrets().failing.lock().unwrap().insert(reference.clone());
+        discard_unstarted_transaction(&fx.coord, &fx.txn);
+        assert!(fake_has(&reference), "the secret stays tracked");
+        assert!(marker.exists(), "the transaction stays for the next cleanup");
+        fake_secrets().failing.lock().unwrap().remove(&reference);
+        discard_unstarted_transaction(&fx.coord, &fx.txn);
+        assert!(!fake_has(&reference));
+        assert!(!marker.exists());
     }
 
     #[test]
