@@ -372,16 +372,17 @@ mod tests {
             );
         }
         for vars in [vec![("no_proxy", "public.invalid")], vec![("no_proxy", "")]] {
-            let plan =
-                ChildProxyPlan::from_settings(&NetworkSettings::default(), &env(&vars), &no_store())
-                    .unwrap();
+            let plan = ChildProxyPlan::from_settings(
+                &NetworkSettings::default(),
+                &env(&vars),
+                &no_store(),
+            )
+            .unwrap();
             assert!(!plan.uses_proxy());
         }
         // Direct mode still ignores the environment.
         let e = env(&[("no_proxy", "*.invalid")]);
-        assert!(
-            ChildProxyPlan::from_settings(&NetworkSettings::direct(), &e, &no_store()).is_ok()
-        );
+        assert!(ChildProxyPlan::from_settings(&NetworkSettings::direct(), &e, &no_store()).is_ok());
     }
 
     #[test]
