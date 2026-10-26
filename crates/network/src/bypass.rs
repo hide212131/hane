@@ -65,6 +65,12 @@ impl BypassList {
         })
     }
 
+    /// Canonical comma separated text. It parses back to an equal list, so
+    /// it is what settings persistence and the settings screen use.
+    pub fn to_text(&self) -> String {
+        self.to_env_value()
+    }
+
     /// Canonical comma separated form for child process environments.
     pub(crate) fn to_env_value(&self) -> String {
         if self.all {

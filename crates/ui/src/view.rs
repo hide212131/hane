@@ -112,6 +112,7 @@ pub(crate) mod input_routing;
 mod measurement;
 mod mermaid_diagrams;
 use mermaid_diagrams::diagram_plan_matches;
+mod network_settings;
 mod reading_mode;
 use reading_mode::{EditorMode, ModeAnchor, command_changes_text};
 mod render;
@@ -779,6 +780,8 @@ pub(crate) enum SettingsCategory {
     General,
     Connection,
     Prompts,
+    /// App-wide HTTP proxy settings (Issue #623).
+    Network,
 }
 
 pub struct EditorView {
@@ -795,6 +798,7 @@ pub struct EditorView {
     settings_focus_handle: FocusHandle,
     ai_settings: ai_settings::AiSettingsPage,
     ai_prompts: ai_prompts::AiPromptsPage,
+    network_settings: network_settings::NetworkSettingsPage,
     ai_selection: ai_selection::AiSelectionState,
     /// The app-owned update service handle, if one is attached. The service
     /// outlives this view; the view only sends explicit user commands to it.
@@ -1789,7 +1793,8 @@ impl EditorView {
             settings_focus_handle: cx.focus_handle(),
             ai_settings: ai_settings::AiSettingsPage::default(),
             ai_prompts: ai_prompts::AiPromptsPage::default(),
-            ai_selection: ai_selection::AiSelectionState::default(),
+            network_settings: network_settings::NetworkSettingsPage::default(),
+            ai_selection:ai_selection::AiSelectionState::default(),
             app_update: None,
             app_update_polling: false,
             restart_freeze: false,

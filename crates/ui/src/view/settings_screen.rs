@@ -53,6 +53,8 @@ impl EditorView {
         self.settings_category = SettingsCategory::General;
         self.ai_settings.begin_settings_session();
         self.ai_prompts.begin_settings_session(cx);
+        self.network_settings
+            .begin_settings_session(&self.settings.network);
         self.settings_error = None;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         let generation = self.file_context_menu_generation;
@@ -87,6 +89,7 @@ impl EditorView {
         self.settings_category = SettingsCategory::General;
         self.ai_settings.close_settings();
         self.ai_prompts.close_settings();
+        self.network_settings.close_settings(&self.settings.network);
         self.file_context_menu_busy = false;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle, cx);
@@ -106,6 +109,9 @@ impl EditorView {
                 return;
             }
             SettingsCategory::Prompts if self.ai_prompts.input_has_focus(window, cx) => return,
+            SettingsCategory::Network if self.network_settings.input_has_focus(window, cx) => {
+                return;
+            }
             _ => {}
         }
         self.request_leave_settings(window, cx);
@@ -126,6 +132,7 @@ impl EditorView {
         // flight; a late save completion must not route again.
         self.ai_settings.cancel_pending_leave();
         self.ai_prompts.cancel_pending_leave();
+        self.network_settings.cancel_pending_leave();
         window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
@@ -152,6 +159,16 @@ impl EditorView {
                 self.ai_prompts.confirm_leave(ai_prompts::LeaveTarget::Close);
                 cx.notify();
             }
+            SettingsCategory::Network if self.network_settings.is_busy() => {
+                self.status =
+                    Some("ネットワーク設定を保存しています。完了してから移動してください".to_owned());
+                cx.notify();
+            }
+            SettingsCategory::Network if self.network_settings.is_dirty(cx) => {
+                self.network_settings
+                    .confirm_leave(network_settings::LeaveTarget::Close);
+                cx.notify();
+            }
             _ => self.close_settings(window, cx),
         }
     }
@@ -174,6 +191,19 @@ impl EditorView {
                 SettingsCategory::Prompts if self.ai_prompts.is_dirty(cx) => {
                     self.ai_prompts
                         .confirm_leave(ai_prompts::LeaveTarget::Category(category));
+                    cx.notify();
+                    return;
+                }
+                SettingsCategory::Network if self.network_settings.is_busy() => {
+                    self.status = Some(
+                        "ネットワーク設定を保存しています。完了してから移動してください".to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                SettingsCategory::Network if self.network_settings.is_dirty(cx) => {
+                    self.network_settings
+                        .confirm_leave(network_settings::LeaveTarget::Category(category));
                     cx.notify();
                     return;
                 }
@@ -263,8 +293,21 @@ impl EditorView {
                 }
             }
         }
+        if let Some(target) = self.network_settings.take_ready_route(cx) {
+            match target {
+                network_settings::LeaveTarget::Category(category) => {
+                    self.select_settings_category(category, window, cx)
+                }
+                network_settings::LeaveTarget::Close => {
+                    self.close_settings(window, cx);
+                }
+            }
+        }
         let body = match self.settings_category {
             SettingsCategory::General => self.general_settings_content(cx).into_any_element(),
+            SettingsCategory::Network => {
+                self.network_settings_render(window, cx).into_any_element()
+            }
             SettingsCategory::Connection => self.ai_settings_render(window, cx).into_any_element(),
             SettingsCategory::Prompts => self.ai_prompts_render(window, cx).into_any_element(),
         };
@@ -325,12 +368,26 @@ impl EditorView {
                 });
             });
 
+        let view = cx.entity();
+        let network_tab = Button::new("settings-category-network")
+            .label("ネットワーク")
+            .ghost()
+            .selected(self.settings_category == SettingsCategory::Network)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(SettingsCategory::Network, window, cx)
+                });
+            });
+
         let content = div()
             .id("settings-content")
             .flex_1()
             .min_w(px(0.0))
             .h_full();
-        let content = if self.settings_category == SettingsCategory::General {
+        let content = if matches!(
+            self.settings_category,
+            SettingsCategory::General | SettingsCategory::Network
+        ) {
             content.overflow_y_scroll().child(body)
         } else {
             content
@@ -370,7 +427,8 @@ impl EditorView {
             .child(back)
             .child(general_tab)
             .child(ai_tab)
-            .child(ai_prompts_tab);
+            .child(ai_prompts_tab)
+            .child(network_tab);
         let content = if narrow {
             content.h_auto().min_h(px(0.0))
         } else {

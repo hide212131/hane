@@ -70,8 +70,8 @@ pub use session::{
     SessionViewState, UnsavedChanges,
 };
 pub use store::{
-    FileStateStore, MemoryStateStore, RecentFiles, RecentFilesRepository, Settings,
-    SettingsRepository, StateStores, ThemePreference, pin_state_root,
+    FileStateStore, InvalidNetworkConfig, MemoryStateStore, NetworkConfig, RecentFiles,
+    RecentFilesRepository, Settings, SettingsRepository, StateStores, ThemePreference, pin_state_root,
 };
 pub use watch::{DEFAULT_MAX_WAIT, DEFAULT_QUIET_PERIOD, FolderWatcher, WatchBatch, WatchTiming};
 pub use workfolder::{

@@ -323,9 +323,13 @@ fn start_ai_service() -> Option<AiService> {
 /// proxy variables are read from the process environment exactly once, on the
 /// first call (which happens at startup, before either service is created);
 /// every later call, including an AI service restart, gets the same snapshot.
-/// Settings are the default (Environment) until a settings store exists, and
-/// no OS secret backend is wired yet, so a manual Basic proxy would be an
-/// error rather than an unauthenticated connection.
+/// The settings are the ones saved on the network settings screen (a file
+/// without them means the Environment mode). A stored configuration that
+/// cannot be read makes every route fail explicitly; it never becomes a Direct
+/// connection. The Manual Basic credentials are read from the OS secret store
+/// only when a route needs them, and a read failure is an error rather than an
+/// unauthenticated connection. A change on the settings screen is used from the
+/// next start of the application.
 fn network_context() -> hane_network::NetworkContext {
     static CONTEXT: std::sync::OnceLock<hane_network::NetworkContext> = std::sync::OnceLock::new();
     CONTEXT
@@ -335,10 +339,18 @@ fn network_context() -> hane_network::NetworkContext {
             let variables = std::env::vars_os().filter_map(|(name, value)| {
                 Some((name.into_string().ok()?, value.to_string_lossy().into_owned()))
             });
-            hane_network::NetworkContext::from_environment(hane_network::ProxyEnvironment::from_vars(
+            let environment = hane_network::ProxyEnvironment::from_vars(
                 hane_network::EnvPlatform::current(),
                 variables,
-            ))
+            );
+            let saved = FileStateStore::from_environment()
+                .map(|store| hane_session::SettingsRepository::load(&store).network)
+                .unwrap_or_default();
+            hane_network::NetworkContext::new(
+                saved.effective_settings(),
+                environment,
+                Arc::new(hane_ui::OsProxyCredentialStore),
+            )
         })
         .clone()
 }

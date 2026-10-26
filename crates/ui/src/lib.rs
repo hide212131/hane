@@ -17,6 +17,7 @@ mod input_mode;
 mod instrument;
 mod line;
 mod mermaid;
+mod proxy_secret;
 mod ranges;
 mod shape;
 mod short_text_input;
@@ -28,6 +29,7 @@ pub use actions::register_key_bindings;
 pub use icons::{AppAssets, WorkFolderIcons};
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
+pub use proxy_secret::{OsProxyCredentialStore, ProxySecretWriter, SecretStoreError};
 pub use view::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
     ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
