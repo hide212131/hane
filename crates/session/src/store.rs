@@ -133,11 +133,20 @@ impl NetworkConfig {
 pub struct InvalidNetworkConfig {
     raw_lines: Vec<String>,
     reason: String,
+    /// Set when `settings.conf` itself could not be read. The file content is
+    /// unknown, so no store may replace it except an explicit valid network
+    /// replacement.
+    read_failure: Option<io::ErrorKind>,
 }
 
 impl InvalidNetworkConfig {
     pub fn reason(&self) -> &str {
         &self.reason
+    }
+
+    /// The error kind of the failed read of `settings.conf`, if that was the cause.
+    pub fn read_failure(&self) -> Option<io::ErrorKind> {
+        self.read_failure
     }
 }
 
@@ -156,13 +165,17 @@ fn parse_network_config(raw_lines: Vec<String>) -> NetworkConfig {
     }
     match parse_network_lines(&raw_lines) {
         Ok(settings) => NetworkConfig::Valid(settings),
-        Err(reason) => NetworkConfig::Invalid(InvalidNetworkConfig { raw_lines, reason }),
+        Err(reason) => NetworkConfig::Invalid(InvalidNetworkConfig {
+            raw_lines,
+            reason,
+            read_failure: None,
+        }),
     }
 }
 
-/// The stored proxy settings could not be read at all. The marker line is
-/// written back by later stores, so it reloads as an invalid setting rather
-/// than as the Environment default.
+/// The stored proxy settings could not be read at all. Storing any other
+/// setting while this state is held fails without touching the file, so the
+/// unreadable original is never replaced by defaults.
 fn unreadable_network_config(kind: io::ErrorKind) -> NetworkConfig {
     let reason = if kind == io::ErrorKind::InvalidData {
         "保存済みの設定ファイルが正しい文字コードではないため、プロキシ設定を読み込めません"
@@ -170,8 +183,9 @@ fn unreadable_network_config(kind: io::ErrorKind) -> NetworkConfig {
         "保存済みの設定ファイルを読み込めないため、プロキシ設定を確認できません"
     };
     NetworkConfig::Invalid(InvalidNetworkConfig {
-        raw_lines: vec!["network_mode=unreadable".to_owned()],
+        raw_lines: Vec::new(),
         reason: reason.to_owned(),
+        read_failure: Some(kind),
     })
 }
 
@@ -441,6 +455,11 @@ impl SettingsRepository for FileStateStore {
     }
 
     fn store(&self, settings: &Settings) -> io::Result<()> {
+        if let NetworkConfig::Invalid(invalid) = &settings.network {
+            if let Some(kind) = invalid.read_failure() {
+                return Err(io::Error::new(kind, invalid.reason().to_owned()));
+            }
+        }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
             "autosave={}\ntheme={}\nsidebar_sort={}\n",
@@ -700,20 +719,57 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_settings_file_stays_invalid_after_storing_other_settings() {
+    fn invalid_utf8_settings_file_is_kept_when_storing_other_settings() {
         let root = temporary_directory("state-unreadable");
+        fs::create_dir_all(&root).unwrap();
+        let original = [0xff, 0xfe, b'\n'];
+        fs::write(root.join("settings.conf"), original).unwrap();
+        let store = FileStateStore::at(&root);
+        let mut settings = SettingsRepository::load(&store);
+        let reason = settings.network.invalid_reason().unwrap().to_owned();
+
+        settings.autosave = false;
+        settings.theme = ThemePreference::Dark;
+        let error = SettingsRepository::store(&store, &settings).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), reason);
+
+        assert_eq!(fs::read(root.join("settings.conf")).unwrap(), original);
+        let reloaded = SettingsRepository::load(&FileStateStore::at(&root));
+        assert_eq!(reloaded.network.invalid_reason(), Some(reason.as_str()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_failure_state_rejects_store_without_touching_the_file() {
+        let root = temporary_directory("state-read-failure");
+        fs::create_dir_all(&root).unwrap();
+        let original = b"autosave=false\ntheme=dark\nnetwork_mode=manual\n";
+        fs::write(root.join("settings.conf"), original).unwrap();
+        let store = FileStateStore::at(&root);
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+            let settings = settings_from_read(Err(io::Error::from(kind)));
+            let error = SettingsRepository::store(&store, &settings).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(fs::read(root.join("settings.conf")).unwrap(), original);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_valid_network_replaces_an_unreadable_settings_file() {
+        let root = temporary_directory("state-unreadable-replace");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("settings.conf"), [0xff, 0xfe, b'\n']).unwrap();
         let store = FileStateStore::at(&root);
         let mut settings = SettingsRepository::load(&store);
-        assert!(settings.network.invalid_reason().is_some());
+        assert!(settings.network.valid().is_none());
 
-        settings.autosave = false;
+        settings.network = NetworkConfig::Valid(NetworkSettings::direct());
         SettingsRepository::store(&store, &settings).unwrap();
 
         let reloaded = SettingsRepository::load(&FileStateStore::at(&root));
-        assert!(!reloaded.autosave);
-        assert!(reloaded.network.valid().is_none());
+        assert_eq!(reloaded.network.valid().unwrap().mode, ProxyMode::Direct);
         fs::remove_dir_all(root).unwrap();
     }
 
