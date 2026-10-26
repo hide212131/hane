@@ -81,20 +81,33 @@ struct SharedParts {
 /// Builds the TLS configuration (reading the system trust store) on the first
 /// request instead of at startup, so launching the app does no update work.
 pub struct LazyHttpsTransport {
-    network: NetworkContext,
-    shared: std::sync::OnceLock<Result<SharedParts, String>>,
+    network: NetworkProvider,
+    shared: Arc<std::sync::OnceLock<Result<SharedParts, String>>>,
 }
 
+/// Yields the network snapshot to use right now. A request made through the
+/// transport itself reads it per request; [`Transport::begin_operation`] reads
+/// it once and keeps that snapshot for every request of the operation.
+pub type NetworkProvider = Arc<dyn Fn() -> NetworkContext + Send + Sync>;
+
 impl LazyHttpsTransport {
-    pub fn new(network: NetworkContext) -> Self {
+    pub fn new(network: NetworkProvider) -> Self {
         Self {
             network,
-            shared: std::sync::OnceLock::new(),
+            shared: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
 
 impl Transport for LazyHttpsTransport {
+    fn begin_operation(&self) -> Option<Arc<dyn Transport>> {
+        let snapshot = (self.network)();
+        Some(Arc::new(Self {
+            network: Arc::new(move || snapshot.clone()),
+            shared: Arc::clone(&self.shared),
+        }))
+    }
+
     fn get(&self, request: &Request) -> Result<Response, TransportError> {
         let parts = self.shared.get_or_init(|| {
             native_tls_config().map(|config| SharedParts {
@@ -106,7 +119,7 @@ impl Transport for LazyHttpsTransport {
             Ok(parts) => HttpsTransport {
                 config: Arc::clone(&parts.config),
                 dns_in_flight: Arc::clone(&parts.dns_in_flight),
-                network: self.network.clone(),
+                network: (self.network)(),
                 lookup: Arc::new(system_lookup),
                 direct_port: HTTPS_PORT,
             }
@@ -1636,6 +1649,22 @@ mod tests {
                 ("objects.githubusercontent.com".to_owned(), origin.addr.port()),
             ]
         );
+    }
+
+    #[test]
+    fn an_operation_takes_the_network_snapshot_once_and_keeps_it() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        let lazy = LazyHttpsTransport::new(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            NetworkContext::default()
+        }));
+        let pinned = lazy.begin_operation().expect("a pinned transport");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        // Pinning again from the pinned transport reuses its snapshot instead
+        // of reading the live provider.
+        let _ = pinned.begin_operation().expect("a pinned transport");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]

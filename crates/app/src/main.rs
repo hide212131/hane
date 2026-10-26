@@ -31,6 +31,7 @@ mod finder_service;
 mod app_update;
 mod https_transport;
 mod limited_start;
+mod network_state;
 #[cfg(target_os = "windows")]
 mod open_request;
 #[cfg(test)]
@@ -269,7 +270,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             updates_root,
             receipts_dir,
         },
-        Arc::new(https_transport::LazyHttpsTransport::new(network_context())),
+        Arc::new(https_transport::LazyHttpsTransport::new(Arc::new(network_context))),
         Arc::new(SystemClock::new()),
     ));
     // Only a supported placement can hand a Ready update to the helper, and
@@ -321,26 +322,86 @@ fn start_ai_service() -> Option<AiService> {
 
 /// The network input shared by the update check and the runtime download. The
 /// proxy variables are read from the process environment exactly once, on the
-/// first call (which happens at startup, before either service is created);
-/// every later call, including an AI service restart, gets the same snapshot.
-/// Settings are the default (Environment) until a settings store exists, and
-/// no OS secret backend is wired yet, so a manual Basic proxy would be an
-/// error rather than an unauthenticated connection.
+/// first call (which happens at startup, before either service is created).
+/// The settings are the ones saved on the network settings screen (a file
+/// without them means the Environment mode). A stored configuration that
+/// cannot be read makes every route fail explicitly; it never becomes a Direct
+/// connection. The Manual Basic credentials are read from the OS secret store
+/// only when a route needs them, and a read failure is an error rather than an
+/// unauthenticated connection. A setting saved on the settings screen replaces
+/// the snapshot (see [`AppNetworkApplier`]): an operation that starts later,
+/// including an AI service restart, gets the new one, and an operation that
+/// already took a snapshot keeps it.
 fn network_context() -> hane_network::NetworkContext {
-    static CONTEXT: std::sync::OnceLock<hane_network::NetworkContext> = std::sync::OnceLock::new();
-    CONTEXT
-        .get_or_init(|| {
-            // A value that is not valid Unicode is kept lossily so a broken
-            // proxy variable fails parsing instead of silently vanishing.
-            let variables = std::env::vars_os().filter_map(|(name, value)| {
-                Some((name.into_string().ok()?, value.to_string_lossy().into_owned()))
-            });
-            hane_network::NetworkContext::from_environment(hane_network::ProxyEnvironment::from_vars(
-                hane_network::EnvPlatform::current(),
-                variables,
-            ))
-        })
-        .clone()
+    network_state().current()
+}
+
+fn network_state() -> &'static network_state::NetworkState {
+    static STATE: std::sync::OnceLock<network_state::NetworkState> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| {
+        // A value that is not valid Unicode is kept lossily so a broken
+        // proxy variable fails parsing instead of silently vanishing.
+        let variables = std::env::vars_os().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.to_string_lossy().into_owned()))
+        });
+        let environment = hane_network::ProxyEnvironment::from_vars(
+            hane_network::EnvPlatform::current(),
+            variables,
+        );
+        let saved = FileStateStore::from_environment()
+            .map(|store| hane_session::SettingsRepository::load(&store).network)
+            .unwrap_or_default();
+        network_state::NetworkState::new(
+            saved.effective_settings(),
+            environment,
+            Arc::new(hane_ui::OsProxyCredentialStore),
+        )
+    })
+}
+
+/// Hands a network setting saved on the settings screen to the services. It
+/// records the setting only: it never starts a login, runtime download, update
+/// check or text transform. The AI service takes a new network revision, so
+/// its next operation that needs the runtime stops the old child, confirms it
+/// is gone and starts a new one with the new snapshot; a result of an
+/// operation begun under the old revision is not published as the new one.
+struct AppNetworkApplier {
+    ai: Arc<AiOwner>,
+    state: &'static network_state::NetworkState,
+}
+
+impl AppNetworkApplier {
+    /// Returns the AI service's new network revision, when a service exists.
+    /// Only the tests need the revision; the application goes through
+    /// [`hane_ui::NetworkSettingsApplier::apply_saved`].
+    #[cfg(test)]
+    fn apply(&self, settings: &hane_network::NetworkSettings) -> Option<u64> {
+        self.apply_retiring(settings, None)
+    }
+
+    /// `retire` runs once the replaced snapshot is released by every operation.
+    fn apply_retiring(
+        &self,
+        settings: &hane_network::NetworkSettings,
+        retire: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<u64> {
+        // The slot lock is held across the snapshot replacement, so a service
+        // that starts concurrently reads either the old snapshot and then this
+        // revision, or the new snapshot.
+        let slot = self.ai.service.slot();
+        let context = self.state.replace(settings.clone(), retire);
+        slot.as_ref().map(|service| service.apply_network(context))
+    }
+}
+
+impl hane_ui::NetworkSettingsApplier for AppNetworkApplier {
+    fn apply_saved(
+        &self,
+        settings: &hane_network::NetworkSettings,
+        retire: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        self.apply_retiring(settings, retire);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -735,6 +796,10 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
     let ai_owner = Arc::new(AiOwner::new(ai_service));
     cx.set_global(AppOwnedAiService(Arc::clone(&ai_owner)));
     let ai_service_handle = ai_owner.handle();
+    let network_applier: Arc<dyn hane_ui::NetworkSettingsApplier> = Arc::new(AppNetworkApplier {
+        ai: Arc::clone(&ai_owner),
+        state: network_state(),
+    });
     let ai_lifecycle: Arc<dyn AiLifecycle> = ai_owner;
     let update_controller: Option<Arc<dyn AppUpdateController>> = update_service.map(|service| {
         // The service belongs to the application, not to a window.
@@ -770,6 +835,7 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                     view.attach_ai_service(ai_service_handle.clone(), cx);
                     view.attach_ai_lifecycle(Some(ai_lifecycle.clone()));
                     view.attach_app_update(update_controller.clone());
+                    view.attach_network_applier(Some(network_applier.clone()));
                     #[cfg(target_os = "macos")]
                     view.attach_external_open_inbox(Some(finder_requests.clone()));
                     #[cfg(target_os = "windows")]
@@ -989,6 +1055,76 @@ mod ownership_claim_tests {
         );
         assert_eq!(outcome, Ok((7, 9)));
         assert_eq!(claims.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod network_applier_tests {
+    use super::{AiOwner, AppNetworkApplier};
+    use crate::network_state::NetworkState;
+    use hane_ai::{
+        AiService, AiServiceConfig, FakeCredentialStore, ShellEnvironmentPolicyFormat,
+        SystemBrowserOpener,
+    };
+    use hane_network::{EnvPlatform, NetworkSettings, ProxyEnvironment, ResolvedRoute, Scheme};
+    use hane_update::testing::TempDir;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn state() -> &'static NetworkState {
+        Box::leak(Box::new(NetworkState::new(
+            NetworkSettings::default(),
+            ProxyEnvironment::from_vars(
+                EnvPlatform::MacOs,
+                [("https_proxy", "http://proxy.example:3128")],
+            ),
+            Arc::new(hane_ui::OsProxyCredentialStore),
+        )))
+    }
+
+    #[test]
+    fn a_saved_setting_advances_the_ai_revision_and_the_snapshot_without_a_restart() {
+        let root = TempDir::new("network-applier");
+        let service = AiService::spawn(AiServiceConfig {
+            app_data_root: root.path().to_path_buf(),
+            binary_path: PathBuf::new(),
+            binary_resolution_error: None,
+            credential_store: Arc::new(FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        })
+        .unwrap();
+        let state = state();
+        let applier = AppNetworkApplier {
+            ai: Arc::new(AiOwner::new(Some(service))),
+            state,
+        };
+        let before = state.current();
+
+        assert_eq!(applier.apply(&NetworkSettings::direct()), Some(1));
+        assert_eq!(applier.apply(&NetworkSettings::default()), Some(2));
+        assert_eq!(applier.apply(&NetworkSettings::direct()), Some(3));
+
+        assert_eq!(
+            state.current().route(Scheme::Https, "api.github.com").unwrap(),
+            ResolvedRoute::Direct
+        );
+        // The snapshot taken before the save is unchanged.
+        assert!(matches!(
+            before.route(Scheme::Https, "api.github.com").unwrap(),
+            ResolvedRoute::HttpProxy { .. }
+        ));
+    }
+
+    #[test]
+    fn a_save_without_an_ai_service_still_replaces_the_snapshot() {
+        let state = state();
+        let applier = AppNetworkApplier {
+            ai: Arc::new(AiOwner::new(None)),
+            state,
+        };
+        assert_eq!(applier.apply(&NetworkSettings::direct()), None);
+        assert_eq!(*state.current().settings(), NetworkSettings::direct());
     }
 }
 

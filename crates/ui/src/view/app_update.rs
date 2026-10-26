@@ -432,6 +432,8 @@ pub enum RestartBlocker {
     AiFormUnsaved,
     /// The AI prompts form has unsaved changes.
     PromptsFormUnsaved,
+    /// The network (proxy) form has unsaved changes.
+    NetworkFormUnsaved,
     /// A settings change (such as the Explorer menu) is being applied.
     SettingsBusy,
     /// A draft could not be written; its content is not safely persisted.
@@ -458,6 +460,7 @@ impl RestartBlocker {
             Self::AiBusy => "AIの処理が実行中です。完了してから再起動してください。".to_owned(),
             Self::AiFormUnsaved => "AI設定に未保存の変更があります。".to_owned(),
             Self::PromptsFormUnsaved => "AIプロンプトに未保存の変更があります。".to_owned(),
+            Self::NetworkFormUnsaved => "ネットワーク設定に未保存の変更があります。".to_owned(),
             Self::SettingsBusy => "設定を反映中です。".to_owned(),
             Self::DraftWriteFailed(detail) => {
                 format!("下書きを書き込めませんでした: {detail}")
@@ -1092,7 +1095,10 @@ impl EditorView {
         if self.ai_prompts.is_dirty(cx) {
             blockers.push(RestartBlocker::PromptsFormUnsaved);
         }
-        if self.file_context_menu_busy {
+        if self.network_settings.is_dirty(cx) {
+            blockers.push(RestartBlocker::NetworkFormUnsaved);
+        }
+        if self.file_context_menu_busy || self.network_settings.is_busy() {
             blockers.push(RestartBlocker::SettingsBusy);
         }
         blockers

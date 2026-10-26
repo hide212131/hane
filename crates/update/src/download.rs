@@ -138,6 +138,15 @@ pub struct TransportError {
 /// body that honors the timeout of each read, and verifies TLS.
 pub trait Transport: Send + Sync {
     fn get(&self, request: &Request) -> std::result::Result<Response, TransportError>;
+
+    /// A transport fixed to the network input current right now. A caller that
+    /// makes several requests for one operation (check, download with its
+    /// redirect hops) uses it for all of them, so a setting saved meanwhile
+    /// never mixes into the operation. `None` means the transport has no such
+    /// input and can be used as is.
+    fn begin_operation(&self) -> Option<std::sync::Arc<dyn Transport>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
