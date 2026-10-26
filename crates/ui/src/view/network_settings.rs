@@ -260,6 +260,21 @@ fn retire_credential(
         .map(|_| "以前の資格情報をOSの秘密ストアから削除できませんでした".to_owned())
 }
 
+/// The deferred retirement handed to the applier. It runs on whichever thread
+/// releases the last snapshot, so a failure is sent to the page instead of
+/// being dropped. The warning text never contains the secret.
+fn retire_reporting(
+    secrets: Arc<dyn ProxySecretWriter>,
+    reference: CredentialRef,
+    warnings: async_channel::Sender<String>,
+) -> Box<dyn FnOnce() + Send> {
+    Box::new(move || {
+        if let Some(warning) = retire_credential(secrets.as_ref(), &reference) {
+            let _ = warnings.try_send(warning);
+        }
+    })
+}
+
 /// The write sequence. Any failure before the settings file is replaced leaves
 /// the old settings (and the old credential) in effect. The old credential is
 /// not removed here; the caller retires it when no operation needs it.
@@ -507,6 +522,24 @@ impl NetworkSettingsPage {
         self.message = Some(PageMessage::Saved(text));
         if let Some(target) = self.pending_target.take() {
             self.route_ready = Some(target);
+        }
+    }
+
+    /// A retirement that ran after the save finished failed. The page keeps
+    /// whatever it shows and adds the warning.
+    fn retire_failed(&mut self, warning: String) {
+        let note = format!("（注意: {warning}）");
+        match &mut self.message {
+            Some(PageMessage::Saved(text) | PageMessage::Failed(text)) => text.push_str(&note),
+            None => self.message = Some(PageMessage::Saved(note)),
+        }
+    }
+
+    #[cfg(test)]
+    fn message_text(&self) -> Option<&str> {
+        match &self.message {
+            Some(PageMessage::Saved(text) | PageMessage::Failed(text)) => Some(text),
+            None => None,
         }
     }
 
@@ -928,9 +961,20 @@ impl EditorView {
                 match (&self.network_applier, report.obsolete_ref) {
                     (Some(applier), obsolete) => {
                         let retire = obsolete.map(|reference| {
-                            Box::new(move || {
-                                let _ = retire_credential(secrets.as_ref(), &reference);
-                            }) as Box<dyn FnOnce() + Send>
+                            let (sender, receiver) = async_channel::bounded(1);
+                            // A failure found once the last holder releases the
+                            // snapshot is delivered to the page; success sends
+                            // nothing.
+                            cx.spawn(async move |view, cx| {
+                                if let Ok(warning) = receiver.recv().await {
+                                    let _ = view.update(cx, |view, cx| {
+                                        view.network_settings.retire_failed(warning);
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .detach();
+                            retire_reporting(secrets, reference, sender)
                         });
                         applier.apply_saved(&settings, retire);
                     }
@@ -1357,6 +1401,84 @@ mod tests {
             stores.settings().load().network,
             NetworkConfig::Valid(prepared.settings)
         );
+    }
+
+    /// Runs the save for a Basic replacement and for leaving Basic, retires
+    /// the old secret as the application would, and returns the page.
+    fn retire_after_save(
+        fail_delete: bool,
+        in_flight: bool,
+    ) -> (NetworkSettingsPage, Arc<FakeSecrets>) {
+        use hane_network::{EnvPlatform, NetworkContext, ProxyEnvironment};
+        let secrets = Arc::new(FakeSecrets {
+            fail_delete,
+            ..FakeSecrets::default()
+        });
+        secrets
+            .entries
+            .lock()
+            .unwrap()
+            .insert("old".to_owned(), "a:b".to_owned());
+        let current = saved_basic("old");
+        let prepared =
+            prepare(&basic_draft("alice", "pw1"), Some(&current), fixed_ref("new")).unwrap();
+        let report = run_save(&prepared, Settings::default(), &memory_stores(), secrets.as_ref())
+            .unwrap();
+        let reference = report.obsolete_ref.expect("the old credential is obsolete");
+        let mut page = NetworkSettingsPage::new(secrets.clone());
+        page.begin_settings_session(&NetworkConfig::Valid(current.clone()));
+        let generation = page.generation;
+        let writer: Arc<dyn ProxySecretWriter> = secrets.clone();
+        let mut warning = None;
+        if in_flight {
+            let (sender, receiver) = async_channel::bounded(1);
+            let snapshot = NetworkContext::new(
+                current,
+                ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
+                Arc::new(crate::proxy_secret::OsProxyCredentialStore),
+            );
+            let held = snapshot.clone();
+            snapshot.on_release(retire_reporting(writer, reference, sender));
+            drop(snapshot);
+            // Nothing is deleted or reported while an operation holds it.
+            assert!(secrets.entries.lock().unwrap().contains_key("old"));
+            assert!(receiver.try_recv().is_err());
+            page.saved_ok(generation, prepared.settings.clone(), None);
+            drop(held);
+            if let Ok(late) = receiver.try_recv() {
+                page.retire_failed(late);
+            }
+        } else {
+            warning = retire_credential(writer.as_ref(), &reference);
+            page.saved_ok(generation, prepared.settings.clone(), warning.clone());
+        }
+        assert_eq!(warning.is_some(), fail_delete && !in_flight);
+        (page, secrets)
+    }
+
+    #[test]
+    fn a_failed_retirement_is_visible_without_an_applier() {
+        let (page, secrets) = retire_after_save(true, false);
+        assert!(page.message_text().unwrap().contains("以前の資格情報"));
+        assert!(!page.message_text().unwrap().contains("pw1"));
+        assert!(secrets.entries.lock().unwrap().contains_key("old"));
+    }
+
+    #[test]
+    fn a_failed_late_retirement_is_visible_after_the_snapshot_is_released() {
+        let (page, secrets) = retire_after_save(true, true);
+        assert!(page.message_text().unwrap().contains("以前の資格情報"));
+        assert!(!page.message_text().unwrap().contains("pw1"));
+        assert!(secrets.entries.lock().unwrap().contains_key("old"));
+    }
+
+    #[test]
+    fn a_successful_retirement_leaves_no_warning() {
+        for in_flight in [false, true] {
+            let (page, secrets) = retire_after_save(false, in_flight);
+            assert!(!page.message_text().unwrap().contains("注意"));
+            assert!(!secrets.entries.lock().unwrap().contains_key("old"));
+        }
     }
 
     #[test]

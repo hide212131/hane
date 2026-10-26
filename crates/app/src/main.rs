@@ -372,6 +372,9 @@ struct AppNetworkApplier {
 
 impl AppNetworkApplier {
     /// Returns the AI service's new network revision, when a service exists.
+    /// Only the tests need the revision; the application goes through
+    /// [`hane_ui::NetworkSettingsApplier::apply_saved`].
+    #[cfg(test)]
     fn apply(&self, settings: &hane_network::NetworkSettings) -> Option<u64> {
         self.apply_retiring(settings, None)
     }
