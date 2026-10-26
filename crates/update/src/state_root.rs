@@ -563,6 +563,14 @@ pub fn release_environment_secrets(
     if let Ok(Some(bytes)) = read_limited(&path, ENVIRONMENT_LIMIT)
         && let Ok(document) = parse_strict::<ChildEnvironment>(&bytes)
     {
+        // A complete record of this transaction that names no secret proves the
+        // publish stored none (a failed publish writes no record and removes its
+        // own secrets), so the OS store is not touched. A missing or damaged
+        // record keeps the full sweep below.
+        if document.transaction_id == transaction.as_str() && document.secret_refs.is_empty() {
+            discard_environment(coordination, transaction);
+            return Ok(());
+        }
         references.extend(
             document
                 .secret_refs
@@ -591,8 +599,20 @@ pub fn release_environment_secrets(
 /// of the transaction is left, so the transaction directory may be removed;
 /// `false` keeps it for the next cleanup.
 pub fn release_transaction_secrets(coordination: &Coordination, transaction: &TransactionId) -> bool {
-    release_environment_secrets(coordination, transaction, &crate::secret_store::OsSecretStore::proxy())
-        .is_ok()
+    release_transaction_secrets_with(
+        coordination,
+        transaction,
+        &crate::secret_store::OsSecretStore::proxy(),
+    )
+}
+
+/// [`release_transaction_secrets`] against an explicit store.
+pub fn release_transaction_secrets_with(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    secrets: &dyn TransientSecretStore,
+) -> bool {
+    release_environment_secrets(coordination, transaction, secrets).is_ok()
 }
 
 #[allow(clippy::type_complexity)]
