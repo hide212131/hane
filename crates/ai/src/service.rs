@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use hane_network::NetworkContext;
+use hane_network::{NetworkContext, NetworkError};
 use serde_json::{Value, json};
 
 use crate::account::{
@@ -1288,23 +1288,32 @@ fn run_probe_command(
         snapshot.probe_diagnostic = None;
     });
 
-    if ensure_runtime(config, paths, settings, shared, state).is_err() {
+    if let Err(ensure_error) = ensure_runtime_classified(config, paths, settings, shared, state) {
         let owner_elsewhere =
             shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere;
         let distribution_error = shared.snapshot.lock().unwrap().runtime_distribution_error;
-        let (status, code) = if owner_elsewhere {
-            (
-                ProbeStatus::Failed(ProbeErrorCode::OwnedElsewhere),
-                ProbeErrorCode::OwnedElsewhere,
-            )
-        } else {
-            (
-                ProbeStatus::Failed(ProbeErrorCode::RuntimeUnavailable),
-                ProbeErrorCode::RuntimeUnavailable,
-            )
+        let network_failure = match ensure_error {
+            EnsureRuntimeError::NetworkPlan(failure) => Some(failure),
+            EnsureRuntimeError::Runtime => None,
         };
+        let code = if owner_elsewhere {
+            ProbeErrorCode::OwnedElsewhere
+        } else {
+            match network_failure {
+                Some(NetworkPlanFailure::InvalidConfiguration) => {
+                    ProbeErrorCode::InvalidConfiguration
+                }
+                Some(NetworkPlanFailure::CredentialUnavailable) => {
+                    ProbeErrorCode::CredentialUnavailable
+                }
+                None => ProbeErrorCode::RuntimeUnavailable,
+            }
+        };
+        let status = ProbeStatus::Failed(code);
         let cause = if owner_elsewhere {
             "runtime_owned_by_another_process".to_owned()
+        } else if let Some(failure) = network_failure {
+            failure.cause().to_owned()
         } else if let Some(error) = distribution_error {
             format!("runtime_distribution_error={error:?}")
         } else {
@@ -1554,13 +1563,23 @@ fn run_text_transform_command(
     };
     publish_busy(shared, id, ServiceBusyReason::TextTransform);
 
-    if ensure_runtime(config, paths, settings, shared, state).is_err() {
+    if let Err(ensure_error) = ensure_runtime_classified(config, paths, settings, shared, state) {
         let owner_elsewhere =
             shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere;
         let code = if owner_elsewhere {
             text_transform::TextTransformErrorCode::OwnedElsewhere
         } else {
-            text_transform::TextTransformErrorCode::RuntimeUnavailable
+            match ensure_error {
+                EnsureRuntimeError::NetworkPlan(NetworkPlanFailure::InvalidConfiguration) => {
+                    text_transform::TextTransformErrorCode::InvalidConfiguration
+                }
+                EnsureRuntimeError::NetworkPlan(NetworkPlanFailure::CredentialUnavailable) => {
+                    text_transform::TextTransformErrorCode::CredentialUnavailable
+                }
+                EnsureRuntimeError::Runtime => {
+                    text_transform::TextTransformErrorCode::RuntimeUnavailable
+                }
+            }
         };
         let _ = reply_tx.try_send(TextTransformOutcome::Failed(code));
         finish(
@@ -2514,7 +2533,9 @@ fn finish_persisted_save(
             )
             .map_err(|_| ())
             .and_then(|mut configured| {
-                attach_network_plan(&mut configured.config, &state.network).map(|()| configured)
+                attach_network_plan(&mut configured.config, &state.network)
+                    .map(|()| configured)
+                    .map_err(|_| ())
             }),
             Err(_) => Err(()),
         };
@@ -2558,10 +2579,61 @@ fn finish_persisted_save(
 /// Sets the child's proxy plan from the command's network snapshot. Fails
 /// explicitly when the plan cannot be built (invalid environment, missing or
 /// unreadable credential); the caller must then not start the child.
-fn attach_network_plan(config: &mut RuntimeConfig, network: &NetworkSnapshot) -> Result<(), ()> {
-    let plan = network.context.child_proxy_plan().map_err(|_| ())?;
+fn attach_network_plan(
+    config: &mut RuntimeConfig,
+    network: &NetworkSnapshot,
+) -> Result<(), NetworkPlanFailure> {
+    let plan = network
+        .context
+        .child_proxy_plan()
+        .map_err(|error| NetworkPlanFailure::from_network_error(&error))?;
     config.network = Some(plan);
     Ok(())
+}
+
+/// Why the child's proxy plan could not be built. Carries no detail from the
+/// underlying error (proxy URL, userinfo, credential ID, backend text), so it
+/// is safe to surface as a diagnostic cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkPlanFailure {
+    InvalidConfiguration,
+    CredentialUnavailable,
+}
+
+impl NetworkPlanFailure {
+    fn from_network_error(error: &NetworkError) -> Self {
+        match error {
+            NetworkError::Credential(_) => Self::CredentialUnavailable,
+            _ => Self::InvalidConfiguration,
+        }
+    }
+
+    fn cause(self) -> &'static str {
+        match self {
+            Self::InvalidConfiguration => "network_plan_invalid_configuration",
+            Self::CredentialUnavailable => "network_plan_credential_unavailable",
+        }
+    }
+}
+
+/// Failure of [`ensure_runtime_classified`]: either the proxy plan could not
+/// be built (the child is not started), or the runtime itself is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnsureRuntimeError {
+    NetworkPlan(NetworkPlanFailure),
+    Runtime,
+}
+
+impl From<()> for EnsureRuntimeError {
+    fn from(_: ()) -> Self {
+        Self::Runtime
+    }
+}
+
+impl From<NetworkPlanFailure> for EnsureRuntimeError {
+    fn from(failure: NetworkPlanFailure) -> Self {
+        Self::NetworkPlan(failure)
+    }
 }
 
 fn stop_runtime_for_recovery(
@@ -2821,6 +2893,18 @@ fn ensure_runtime<'a>(
     shared: &Arc<SharedServiceState>,
     state: &'a mut WorkerState,
 ) -> Result<&'a AiRuntime, ()> {
+    ensure_runtime_classified(config, paths, settings, shared, state).map_err(|_| ())
+}
+
+/// Same gate as [`ensure_runtime`], but keeps a proxy-plan failure distinct
+/// from runtime resolution/start failures so callers can report it.
+fn ensure_runtime_classified<'a>(
+    config: &AiServiceConfig,
+    paths: &AiPaths,
+    settings: &AiSettings,
+    shared: &Arc<SharedServiceState>,
+    state: &'a mut WorkerState,
+) -> Result<&'a AiRuntime, EnsureRuntimeError> {
     // Every AI operation goes through this one gate, so this alone surfaces
     // the resolution diagnostic (or "nothing installed yet") for all of
     // them, and never reaches a spawn attempt with a meaningless binary
@@ -2831,10 +2915,10 @@ fn ensure_runtime<'a>(
             mutate(shared, |snapshot| {
                 snapshot.runtime_distribution_error = Some(code);
             });
-            return Err(());
+            return Err(EnsureRuntimeError::Runtime);
         }
         Err(None) => {
-            return Err(());
+            return Err(EnsureRuntimeError::Runtime);
         }
     };
     let network_revision = state.network.revision;
@@ -2853,7 +2937,7 @@ fn ensure_runtime<'a>(
         );
         let mut configured = match configured {
             Ok(configured) => configured,
-            Err(_) => return Err(()),
+            Err(_) => return Err(EnsureRuntimeError::Runtime),
         };
         // A proxy or credential failure is an explicit error here: the child
         // is never started unauthenticated or directly instead.
@@ -2861,7 +2945,7 @@ fn ensure_runtime<'a>(
         if let Some(runtime) = state.runtime.as_ref() {
             let status = runtime.snapshot();
             if status.restart_blocked {
-                return Err(());
+                return Err(EnsureRuntimeError::Runtime);
             }
             if state.owner_guard.is_some()
                 && matches!(status.state, RuntimeState::Stopped | RuntimeState::Failed)
@@ -2892,7 +2976,7 @@ fn ensure_runtime<'a>(
                     mutate(shared, |snapshot| {
                         snapshot.ownership = OwnershipState::Unknown
                     });
-                    return Err(());
+                    return Err(EnsureRuntimeError::Runtime);
                 }
                 state.runtime = Some(runtime);
             } else {
@@ -2933,13 +3017,16 @@ fn ensure_runtime<'a>(
             mutate(shared, |snapshot| {
                 snapshot.ownership = OwnershipState::Unknown
             });
-            return Err(());
+            return Err(EnsureRuntimeError::Runtime);
         }
     }
     mutate(shared, |snapshot| {
         snapshot.runtime_distribution_error = None;
     });
-    state.runtime.as_ref().ok_or(())
+    state
+        .runtime
+        .as_ref()
+        .ok_or(EnsureRuntimeError::Runtime)
 }
 
 fn chatgpt_active(settings: &AiSettings) -> bool {
@@ -3634,6 +3721,52 @@ mod tests {
         let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
         assert!(attach_network_plan(&mut config, &manual_basic_snapshot(1)).is_err());
         assert!(config.network.is_none());
+    }
+
+    #[test]
+    fn network_plan_credential_failure_is_classified_without_secrets() {
+        let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
+        let failure = attach_network_plan(&mut config, &manual_basic_snapshot(1)).unwrap_err();
+        assert_eq!(failure, NetworkPlanFailure::CredentialUnavailable);
+        assert!(config.network.is_none());
+        let cause = failure.cause();
+        assert_eq!(cause, "network_plan_credential_unavailable");
+        for secret in ["proxy-1", "proxy.test", "3128"] {
+            assert!(!cause.contains(secret));
+        }
+        assert_eq!(
+            EnsureRuntimeError::from(failure),
+            EnsureRuntimeError::NetworkPlan(NetworkPlanFailure::CredentialUnavailable)
+        );
+    }
+
+    #[test]
+    fn network_plan_failure_classification_separates_config_from_credential() {
+        use hane_network::{CredentialError, UrlProblem};
+        for error in [
+            NetworkError::Credential(CredentialError::NotFound),
+            NetworkError::Credential(CredentialError::Unavailable),
+            NetworkError::Credential(CredentialError::Invalid),
+        ] {
+            assert_eq!(
+                NetworkPlanFailure::from_network_error(&error),
+                NetworkPlanFailure::CredentialUnavailable
+            );
+        }
+        for error in [
+            NetworkError::ManualNotConfigured,
+            NetworkError::InvalidCredentialRef,
+            NetworkError::UnsupportedSchema(99),
+            NetworkError::InvalidProxyUrl {
+                source: hane_network::ProxySource::Manual,
+                problem: UrlProblem::UserinfoNotAllowed,
+            },
+        ] {
+            let failure = NetworkPlanFailure::from_network_error(&error);
+            assert_eq!(failure, NetworkPlanFailure::InvalidConfiguration);
+            assert_eq!(failure.cause(), "network_plan_invalid_configuration");
+        }
+        assert_eq!(EnsureRuntimeError::from(()), EnsureRuntimeError::Runtime);
     }
 
     fn shared_for_publish() -> Arc<SharedServiceState> {
