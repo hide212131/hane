@@ -25,10 +25,27 @@ impl CredentialStore for UnavailableStore {
     }
 }
 
+/// Work to run once the last clone of a snapshot is gone.
+type ReleaseAction = Box<dyn FnOnce() + Send>;
+
 struct Inner {
     settings: NetworkSettings,
     environment: ProxyEnvironment,
     store: SharedCredentialStore,
+    on_release: std::sync::Mutex<Vec<ReleaseAction>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let actions = std::mem::take(
+            self.on_release
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for action in actions {
+            action();
+        }
+    }
 }
 
 /// One immutable network input shared by update checks and runtime downloads:
@@ -51,8 +68,21 @@ impl NetworkContext {
                 settings,
                 environment,
                 store,
+                on_release: std::sync::Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Runs `action` when the last clone of this snapshot is dropped, i.e. when
+    /// every operation that took it has finished or been cancelled. Used to
+    /// retire a secret only this snapshot still needs. The caller drops its own
+    /// handle afterwards; the action then runs on whichever thread drops last.
+    pub fn on_release(&self, action: impl FnOnce() + Send + 'static) {
+        self.inner
+            .on_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Box::new(action));
     }
 
     /// Default (Environment) settings over a captured environment, with no
@@ -157,6 +187,22 @@ mod tests {
         assert_eq!(a, b);
         assert!(matches!(a, ResolvedRoute::HttpProxy { .. }));
         assert!(!format!("{context:?}").contains("pw"));
+    }
+
+    #[test]
+    fn release_actions_run_after_the_last_clone_is_dropped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = Arc::new(AtomicUsize::new(0));
+        let context = NetworkContext::default();
+        let clone = context.clone();
+        let counter = Arc::clone(&runs);
+        context.on_release(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        drop(context);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        drop(clone);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[test]

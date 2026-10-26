@@ -1,6 +1,9 @@
 use crate::pins::{FilePinStore, MemoryPinStore, PinRepository};
 use crate::service::atomic_write_bytes;
 use crate::workfolder::WorkFolderSortOrder;
+use hane_network::{
+    CredentialRef, ManualProxy, NetworkSettings, ProxyAuth, ProxyMode, SETTINGS_SCHEMA,
+};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -59,6 +62,11 @@ pub struct Settings {
     /// simply missing the `sidebar_sort` line — gets that same order rather
     /// than an unspecified one.
     pub sidebar_sort: WorkFolderSortOrder,
+    /// App-wide proxy settings (`network_*` keys). A file without those keys
+    /// migrates to the Environment mode; a stored value that cannot be
+    /// understood is kept as [`NetworkConfig::Invalid`] instead of becoming
+    /// a working Direct setting.
+    pub network: NetworkConfig,
 }
 
 impl Default for Settings {
@@ -68,8 +76,208 @@ impl Default for Settings {
             theme: ThemePreference::System,
             default_folder: None,
             sidebar_sort: WorkFolderSortOrder::default(),
+            network: NetworkConfig::default(),
         }
     }
+}
+
+/// The persisted network settings as read from `settings.conf`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NetworkConfig {
+    Valid(NetworkSettings),
+    /// Unknown schema or mode, a broken endpoint, ... The original lines are
+    /// kept so that storing other settings does not erase them; only an
+    /// explicit replacement from the settings screen overwrites them.
+    Invalid(InvalidNetworkConfig),
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self::Valid(NetworkSettings::default())
+    }
+}
+
+impl NetworkConfig {
+    pub fn valid(&self) -> Option<&NetworkSettings> {
+        match self {
+            Self::Valid(settings) => Some(settings),
+            Self::Invalid(_) => None,
+        }
+    }
+
+    pub fn invalid_reason(&self) -> Option<&str> {
+        match self {
+            Self::Valid(_) => None,
+            Self::Invalid(invalid) => Some(invalid.reason()),
+        }
+    }
+
+    /// The settings a connection must use. An invalid stored configuration
+    /// maps to settings whose schema is rejected, so every route resolution
+    /// fails with an explicit error and never falls back to a direct or
+    /// environment-derived connection.
+    pub fn effective_settings(&self) -> NetworkSettings {
+        match self {
+            Self::Valid(settings) => settings.clone(),
+            Self::Invalid(_) => NetworkSettings {
+                schema: 0,
+                ..NetworkSettings::default()
+            },
+        }
+    }
+}
+
+/// Raw `network_*` lines that could not be understood, with a human readable
+/// reason. The reason never contains the stored values.
+#[derive(Clone, Eq, PartialEq)]
+pub struct InvalidNetworkConfig {
+    raw_lines: Vec<String>,
+    reason: String,
+    /// Set when `settings.conf` itself could not be read. The file content is
+    /// unknown, so no store may replace it except an explicit valid network
+    /// replacement.
+    read_failure: Option<io::ErrorKind>,
+}
+
+impl InvalidNetworkConfig {
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// The error kind of the failed read of `settings.conf`, if that was the cause.
+    pub fn read_failure(&self) -> Option<io::ErrorKind> {
+        self.read_failure
+    }
+}
+
+impl std::fmt::Debug for InvalidNetworkConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InvalidNetworkConfig")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+fn parse_network_config(raw_lines: Vec<String>) -> NetworkConfig {
+    if raw_lines.is_empty() {
+        return NetworkConfig::default();
+    }
+    match parse_network_lines(&raw_lines) {
+        Ok(settings) => NetworkConfig::Valid(settings),
+        Err(reason) => NetworkConfig::Invalid(InvalidNetworkConfig {
+            raw_lines,
+            reason,
+            read_failure: None,
+        }),
+    }
+}
+
+/// The stored proxy settings could not be read at all. Storing any other
+/// setting while this state is held fails without touching the file, so the
+/// unreadable original is never replaced by defaults.
+fn unreadable_network_config(kind: io::ErrorKind) -> NetworkConfig {
+    let reason = if kind == io::ErrorKind::InvalidData {
+        "保存済みの設定ファイルが正しい文字コードではないため、プロキシ設定を読み込めません"
+    } else {
+        "保存済みの設定ファイルを読み込めないため、プロキシ設定を確認できません"
+    };
+    NetworkConfig::Invalid(InvalidNetworkConfig {
+        raw_lines: Vec::new(),
+        reason: reason.to_owned(),
+        read_failure: Some(kind),
+    })
+}
+
+fn parse_network_lines(lines: &[String]) -> Result<NetworkSettings, String> {
+    let mut schema = None;
+    let mut mode = None;
+    let mut url = None;
+    let mut bypass = None;
+    let mut auth = None;
+    let mut credential = None;
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err("ネットワーク設定の行の形式が不正です".to_owned());
+        };
+        match key {
+            "network_schema" => schema = Some(value),
+            "network_mode" => mode = Some(value),
+            "network_manual_url" => url = Some(value),
+            "network_manual_bypass" => bypass = Some(value),
+            "network_manual_auth" => auth = Some(value),
+            "network_manual_credential_ref" => credential = Some(value),
+            _ => {}
+        }
+    }
+    let schema = match schema {
+        None => SETTINGS_SCHEMA,
+        Some(text) => text
+            .parse::<u32>()
+            .map_err(|_| "ネットワーク設定のschemaが不正です".to_owned())?,
+    };
+    if schema != SETTINGS_SCHEMA {
+        return Err(format!("未対応のネットワーク設定schemaです（{schema}）"));
+    }
+    match mode {
+        None if url.is_none() && bypass.is_none() && auth.is_none() && credential.is_none() => {
+            Ok(NetworkSettings::default())
+        }
+        None => Err("ネットワーク設定にプロキシ方式がありません".to_owned()),
+        Some("environment") => Ok(NetworkSettings::default()),
+        Some("direct") => Ok(NetworkSettings::direct()),
+        Some("manual") => {
+            let url = url.ok_or_else(|| "手動プロキシのURLが保存されていません".to_owned())?;
+            let auth = match auth.unwrap_or("none") {
+                "none" => ProxyAuth::None,
+                "basic" => {
+                    let reference = credential
+                        .ok_or_else(|| "Basic認証の資格情報参照が保存されていません".to_owned())?;
+                    ProxyAuth::Basic(
+                        CredentialRef::new(reference).map_err(|error| error.to_string())?,
+                    )
+                }
+                _ => return Err("未知のプロキシ認証方式です".to_owned()),
+            };
+            ManualProxy::new(url, bypass.unwrap_or(""), auth)
+                .map(NetworkSettings::manual)
+                .map_err(|error| error.to_string())
+        }
+        Some(_) => Err("未知のプロキシ方式です".to_owned()),
+    }
+}
+
+fn network_lines(config: &NetworkConfig) -> Vec<String> {
+    let settings = match config {
+        NetworkConfig::Invalid(invalid) => return invalid.raw_lines.clone(),
+        NetworkConfig::Valid(settings) => settings,
+    };
+    let mut lines = vec![format!("network_schema={}", settings.schema)];
+    match (settings.mode, &settings.manual) {
+        (ProxyMode::Environment, _) => lines.push("network_mode=environment".to_owned()),
+        (ProxyMode::Direct, _) => lines.push("network_mode=direct".to_owned()),
+        (ProxyMode::Manual, Some(manual)) => {
+            lines.push("network_mode=manual".to_owned());
+            lines.push(format!("network_manual_url={}", manual.endpoint()));
+            lines.push(format!("network_manual_bypass={}", manual.bypass().to_text()));
+            match manual.auth() {
+                ProxyAuth::None => lines.push("network_manual_auth=none".to_owned()),
+                ProxyAuth::Basic(reference) => {
+                    lines.push("network_manual_auth=basic".to_owned());
+                    lines.push(format!(
+                        "network_manual_credential_ref={}",
+                        reference.as_str()
+                    ));
+                }
+            }
+        }
+        // Manual without an endpoint cannot be reloaded; the screen never
+        // produces it, and a missing mode line would silently mean
+        // Environment, so the incomplete value is stored as an explicit
+        // manual mode that loads back as a settings error.
+        (ProxyMode::Manual, None) => lines.push("network_mode=manual".to_owned()),
+    }
+    lines
 }
 
 /// Most-recently-opened files, newest first, deduplicated by path and bounded.
@@ -243,24 +451,15 @@ impl FileStateStore {
 
 impl SettingsRepository for FileStateStore {
     fn load(&self) -> Settings {
-        let mut settings = Settings::default();
-        if let Ok(contents) = fs::read_to_string(self.root.join("settings.conf")) {
-            for line in contents.lines() {
-                if let Some(value) = line.strip_prefix("autosave=") {
-                    settings.autosave = value != "false";
-                } else if let Some(value) = line.strip_prefix("theme=") {
-                    settings.theme = ThemePreference::parse(value);
-                } else if let Some(value) = line.strip_prefix("default_folder=") {
-                    settings.default_folder = Some(PathBuf::from(unescape_line(value)));
-                } else if let Some(value) = line.strip_prefix("sidebar_sort=") {
-                    settings.sidebar_sort = WorkFolderSortOrder::parse(value);
-                }
-            }
-        }
-        settings
+        settings_from_read(fs::read_to_string(self.root.join("settings.conf")))
     }
 
     fn store(&self, settings: &Settings) -> io::Result<()> {
+        if let NetworkConfig::Invalid(invalid) = &settings.network
+            && let Some(kind) = invalid.read_failure()
+        {
+            return Err(io::Error::new(kind, invalid.reason().to_owned()));
+        }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
             "autosave={}\ntheme={}\nsidebar_sort={}\n",
@@ -273,8 +472,45 @@ impl SettingsRepository for FileStateStore {
             contents.push_str(&escape_line(&folder.to_string_lossy()));
             contents.push('\n');
         }
+        for line in network_lines(&settings.network) {
+            contents.push_str(&line);
+            contents.push('\n');
+        }
         atomic_write_bytes(&self.root.join("settings.conf"), contents.as_bytes())
     }
+}
+
+/// Builds settings from the result of reading `settings.conf`. A missing file
+/// is a first launch and uses the defaults; any other read failure keeps the
+/// network configuration invalid instead of falling back to Environment.
+fn settings_from_read(read: io::Result<String>) -> Settings {
+    let mut settings = Settings::default();
+    match read {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            settings.network = unreadable_network_config(error.kind());
+        }
+        Ok(contents) => {
+            let mut network = Vec::new();
+            for line in contents.lines() {
+                if line.starts_with("network_") {
+                    network.push(line.to_owned());
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("autosave=") {
+                    settings.autosave = value != "false";
+                } else if let Some(value) = line.strip_prefix("theme=") {
+                    settings.theme = ThemePreference::parse(value);
+                } else if let Some(value) = line.strip_prefix("default_folder=") {
+                    settings.default_folder = Some(PathBuf::from(unescape_line(value)));
+                } else if let Some(value) = line.strip_prefix("sidebar_sort=") {
+                    settings.sidebar_sort = WorkFolderSortOrder::parse(value);
+                }
+            }
+            settings.network = parse_network_config(network);
+        }
+    }
+    settings
 }
 
 impl RecentFilesRepository for FileStateStore {
@@ -462,6 +698,82 @@ mod tests {
     }
 
     #[test]
+    fn missing_settings_file_uses_the_environment_default() {
+        let settings = settings_from_read(Err(io::Error::from(io::ErrorKind::NotFound)));
+        assert_eq!(settings.network, NetworkConfig::default());
+        assert!(settings.network.valid().is_some());
+    }
+
+    #[test]
+    fn unreadable_settings_file_is_an_invalid_network_config() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+        ] {
+            let settings = settings_from_read(Err(io::Error::from(kind)));
+            assert!(settings.network.valid().is_none(), "{kind:?}");
+            assert!(settings.network.invalid_reason().is_some(), "{kind:?}");
+            assert_eq!(settings.network.effective_settings().schema, 0);
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_settings_file_is_kept_when_storing_other_settings() {
+        let root = temporary_directory("state-unreadable");
+        fs::create_dir_all(&root).unwrap();
+        let original = [0xff, 0xfe, b'\n'];
+        fs::write(root.join("settings.conf"), original).unwrap();
+        let store = FileStateStore::at(&root);
+        let mut settings = SettingsRepository::load(&store);
+        let reason = settings.network.invalid_reason().unwrap().to_owned();
+
+        settings.autosave = false;
+        settings.theme = ThemePreference::Dark;
+        let error = SettingsRepository::store(&store, &settings).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), reason);
+
+        assert_eq!(fs::read(root.join("settings.conf")).unwrap(), original);
+        let reloaded = SettingsRepository::load(&FileStateStore::at(&root));
+        assert_eq!(reloaded.network.invalid_reason(), Some(reason.as_str()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_failure_state_rejects_store_without_touching_the_file() {
+        let root = temporary_directory("state-read-failure");
+        fs::create_dir_all(&root).unwrap();
+        let original = b"autosave=false\ntheme=dark\nnetwork_mode=manual\n";
+        fs::write(root.join("settings.conf"), original).unwrap();
+        let store = FileStateStore::at(&root);
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+            let settings = settings_from_read(Err(io::Error::from(kind)));
+            let error = SettingsRepository::store(&store, &settings).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(fs::read(root.join("settings.conf")).unwrap(), original);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_valid_network_replaces_an_unreadable_settings_file() {
+        let root = temporary_directory("state-unreadable-replace");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("settings.conf"), [0xff, 0xfe, b'\n']).unwrap();
+        let store = FileStateStore::at(&root);
+        let mut settings = SettingsRepository::load(&store);
+        assert!(settings.network.valid().is_none());
+
+        settings.network = NetworkConfig::Valid(NetworkSettings::direct());
+        SettingsRepository::store(&store, &settings).unwrap();
+
+        let reloaded = SettingsRepository::load(&FileStateStore::at(&root));
+        assert_eq!(reloaded.network.valid().unwrap().mode, ProxyMode::Direct);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn settings_survive_a_store_reload() {
         let root = temporary_directory("state");
         let store = FileStateStore::at(&root);
@@ -470,6 +782,7 @@ mod tests {
             theme: ThemePreference::Dark,
             default_folder: Some(PathBuf::from("C:\\notes")),
             sidebar_sort: WorkFolderSortOrder::UpdatedOldest,
+            network: NetworkConfig::default(),
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -548,6 +861,121 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn manual_settings(auth: ProxyAuth) -> NetworkSettings {
+        NetworkSettings::manual(
+            ManualProxy::new("http://proxy.example:3128", "localhost, .corp.example", auth)
+                .unwrap(),
+        )
+    }
+
+    fn load_after_writing(contents: &str) -> Settings {
+        let root = temporary_directory("state-network");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("settings.conf"), contents).unwrap();
+        let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+        fs::remove_dir_all(root).unwrap();
+        loaded
+    }
+
+    #[test]
+    fn a_settings_file_without_network_keys_migrates_to_environment() {
+        let loaded = load_after_writing("autosave=false\ntheme=dark\ndefault_folder=/notes\n");
+        assert_eq!(loaded.network, NetworkConfig::default());
+        assert_eq!(loaded.network.valid().unwrap().mode, ProxyMode::Environment);
+        assert!(!loaded.autosave);
+        assert_eq!(loaded.default_folder, Some(PathBuf::from("/notes")));
+    }
+
+    #[test]
+    fn every_network_mode_round_trips_through_a_store_reload() {
+        let reference = CredentialRef::new("proxy-1").unwrap();
+        for network in [
+            NetworkSettings::default(),
+            NetworkSettings::direct(),
+            manual_settings(ProxyAuth::None),
+            manual_settings(ProxyAuth::Basic(reference)),
+        ] {
+            let root = temporary_directory("state-network-round-trip");
+            let store = FileStateStore::at(&root);
+            let settings = Settings {
+                autosave: false,
+                default_folder: Some(PathBuf::from("/notes")),
+                network: NetworkConfig::Valid(network),
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            assert_eq!(SettingsRepository::load(&store), settings);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_credential_reference_is_stored_but_no_secret_value_is_written() {
+        let root = temporary_directory("state-network-secret");
+        let store = FileStateStore::at(&root);
+        let reference = CredentialRef::new("proxy-ref-1").unwrap();
+        let settings = Settings {
+            network: NetworkConfig::Valid(manual_settings(ProxyAuth::Basic(reference))),
+            ..Settings::default()
+        };
+        SettingsRepository::store(&store, &settings).unwrap();
+        let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+        assert!(text.contains("network_manual_credential_ref=proxy-ref-1"));
+        assert!(!text.contains("password"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn broken_network_values_are_a_settings_error_not_direct() {
+        for contents in [
+            "network_schema=99\nnetwork_mode=direct\n",
+            "network_schema=abc\n",
+            "network_mode=socks\n",
+            "network_manual_url=http://p:1\n",
+            "network_mode=manual\n",
+            "network_mode=manual\nnetwork_manual_url=https://p:1\n",
+            "network_mode=manual\nnetwork_manual_url=http://u:p@proxy:1\n",
+            "network_mode=manual\nnetwork_manual_url=http://p:1\nnetwork_manual_bypass=*.a.com\n",
+            "network_mode=manual\nnetwork_manual_url=http://p:1\nnetwork_manual_auth=basic\n",
+            "network_mode=manual\nnetwork_manual_url=http://p:1\nnetwork_manual_auth=digest\n",
+            "network_mode=manual\nnetwork_manual_url=http://p:1\nnetwork_manual_auth=basic\nnetwork_manual_credential_ref=a b\n",
+        ] {
+            let loaded = load_after_writing(contents);
+            assert!(loaded.network.valid().is_none(), "{contents}");
+            assert!(loaded.network.invalid_reason().is_some(), "{contents}");
+            // Connections must fail explicitly instead of using Direct.
+            assert_ne!(loaded.network.effective_settings().schema, SETTINGS_SCHEMA);
+        }
+    }
+
+    #[test]
+    fn the_settings_error_does_not_echo_stored_values() {
+        let loaded = load_after_writing(
+            "network_mode=manual\nnetwork_manual_url=http://user:topsecret@proxy:1\n",
+        );
+        let reason = loaded.network.invalid_reason().unwrap();
+        assert!(!reason.contains("topsecret"));
+        assert!(!format!("{:?}", loaded.network).contains("topsecret"));
+    }
+
+    #[test]
+    fn storing_other_settings_keeps_an_unreadable_network_section() {
+        let root = temporary_directory("state-network-keep");
+        fs::create_dir_all(&root).unwrap();
+        let original = "network_schema=99\nnetwork_mode=future\n";
+        fs::write(root.join("settings.conf"), format!("autosave=true\n{original}")).unwrap();
+        let store = FileStateStore::at(&root);
+        let mut settings = SettingsRepository::load(&store);
+        settings.autosave = false;
+        SettingsRepository::store(&store, &settings).unwrap();
+        let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+        assert!(text.contains(original));
+        let reloaded = SettingsRepository::load(&store);
+        assert!(!reloaded.autosave);
+        assert!(reloaded.network.invalid_reason().is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn stores_outlive_the_component_that_wrote_them() {
         let stores = StateStores::memory();
@@ -560,6 +988,7 @@ mod tests {
                     theme: ThemePreference::Light,
                     default_folder: None,
                     sidebar_sort: WorkFolderSortOrder::NameAscending,
+                    network: NetworkConfig::default(),
                 })
                 .unwrap();
         }
