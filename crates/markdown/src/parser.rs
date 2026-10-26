@@ -1,6 +1,6 @@
 use crate::markers::{
     ParsedCodeSpan, absolute_range, code_padding, derive_markers, line_break_padding,
-    list_structural_prefixes,
+    list_structural_prefixes, task_markers,
 };
 use crate::syntax::{
     LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,
@@ -236,6 +236,7 @@ pub fn parse_document(
     let code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);
     let list_structural_prefixes = list_structural_prefixes(&tree, source_range, source);
+    let task_markers = task_markers(&tree, &markers.list_item_markers, source_range, source);
     MarkdownParse {
         revision,
         source_range,
@@ -247,6 +248,7 @@ pub fn parse_document(
         fence_marker_edges: markers.fence_marker_edges,
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
+        task_markers,
         list_structural_prefixes,
         code_padding,
         line_break_padding,

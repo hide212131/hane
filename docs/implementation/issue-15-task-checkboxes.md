@@ -47,6 +47,16 @@
 
 通常リストの再実装、自動番号振直し、drag並替え、タスク集計、専用保存形式、閲覧モードの編集許可、AADW/.github/AGENTS/CLAUDE変更、独立したリファクタリングは対象外。新しい専用ショートカットは要求しない。直接のMarkdown編集は引き続き可能。
 
+## 実装メモ（Claude Code worker）
+
+実装は上記の設計に沿って次の構成にした。worker内ではshell・テスト・lint・GUIを実行していないため、検証結果はfinalizer/CI/Commanderの観測を正とする。
+
+- `hane_markdown::MarkdownParse::task_markers`: パーサーの直下 `TaskMarker` を、所有itemの bullet/番号マーカー直後の `[ ]` / `[x]` / `[X]` 三バイトとして再確認した結果。確認できない候補はタスクUI化しない。文書全体の `ListProjection` にも `ListProjectionItem::task` として載せ、viewport部分解析でも同じ結果になる。
+- presentation: 非開示時は bullet/番号のsynthesized labelに続けてチェックボックス字形（`☐` / `☑`）を同じsegmentに含め、実バイトは隠しsegmentとして対応付ける。リスト全体の整列幅（`marker_labels`）も同じ字形で測る。開示時は通常の `ExpandedMarkup` になり、コントロールは出ない。`ListMarkerMetadata::task` が実source範囲と字形のvisual範囲を持つ。
+- `BlockLayout::task_checkbox_at_x`: 描画と同じ行geometryで字形範囲だけをhit testする。折返しの継続行・開示行は答えない。
+- UI（`crates/ui/src/view/task_checkbox.rs`）: 修飾キーなしの左押下だけを扱い、閲覧モード・IME中は何もしない。現在のsession・revisionで `plan_task_toggle` が再検証し、中央1バイトだけを `replace_range_recorded` + `after_input` で置換する（独立した1 Undo単位、選択offsetは不変）。押下で消費するためcaret移動・dragは起きない。
+- 未実施: workspace test/clippy、focused GUI、保存再読込のGUI確認、性能比較。チェックボックスは字形で表現しており、フォント由来の見た目は実機で未確認。
+
 ## 引渡し
 
 Claude Codeが製品コードと直接関連する回帰テストを実装する。Commanderはこの文書とIssueの受入条件を実装用PRへ渡す。開始時とpush直前のexact-head検証は既存trusted runner/finalizer契約に従う。workerは次工程、モデル切替、merge、Issue closeを決めない。

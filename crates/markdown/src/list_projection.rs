@@ -31,10 +31,30 @@ pub struct ListProjection {
     links: Vec<TableProjectionLink>,
 }
 
+/// Checkbox glyph an inactive presentation shows for a confirmed task marker.
+/// Shared by the document-wide alignment labels here and by presentation so
+/// both measure and draw the same text.
+pub const fn task_glyph(checked: bool) -> &'static str {
+    if checked { "\u{2611}" } else { "\u{2610}" }
+}
+
+/// The confirmed task marker of a list item, carried by the document-wide
+/// projection so a viewport parse that cannot see the item still presents and
+/// toggles the same marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListProjectionTask {
+    /// The three bytes `[ ]` / `[x]` / `[X]`.
+    pub marker_range: SourceRange,
+    /// `marker_range` plus its one separator byte.
+    pub hidden_range: SourceRange,
+    pub checked: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ListProjectionItem {
     pub item_range: SourceRange,
     pub marker_range: SourceRange,
+    pub task: Option<ListProjectionTask>,
     pub list_range: SourceRange,
     pub start: Option<u64>,
     pub ordinal: usize,

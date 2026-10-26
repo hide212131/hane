@@ -1,4 +1,4 @@
-use crate::{MarkdownTree, NodeId, NodeKind};
+use crate::{MarkdownTree, NodeId, NodeKind, TaskMarkerParse};
 use hane_document::SourceRange;
 
 /// A single physical line's fence delimiter shape: which byte repeats
@@ -726,6 +726,76 @@ pub(super) fn derive_markers(
         quote_markers: quote_owners,
         list_item_markers: list_item_owners,
     }
+}
+
+/// Confirms each parser-reported task marker. The marker must be the direct
+/// `TaskMarker` child of its own `ListItem` (so a nested item's marker never
+/// belongs to its ancestors), be exactly one of `[ ]`, `[x]` or `[X]` in the
+/// source, and sit immediately after that item's own bullet/number marker. A
+/// candidate failing any check is left as ordinary text.
+///
+/// `list_item_markers` must be in ascending owner order, which is how
+/// [`derive_markers`] produces it.
+pub(super) fn task_markers(
+    tree: &MarkdownTree,
+    list_item_markers: &[(SourceRange, NodeId)],
+    range: SourceRange,
+    source: &str,
+) -> Vec<TaskMarkerParse> {
+    let mut tasks = Vec::new();
+    for (item, node) in tree.iter() {
+        if !matches!(node.kind, NodeKind::ListItem { task: Some(_) }) {
+            continue;
+        }
+        let Some((marker_node, checked)) = tree.children(item).iter().find_map(|child| {
+            match tree.node(*child)?.kind {
+                NodeKind::TaskMarker(checked) => Some((*child, checked)),
+                _ => None,
+            }
+        }) else {
+            continue;
+        };
+        let Some(reported) = tree.node(marker_node).map(|node| node.source_range) else {
+            continue;
+        };
+        let Ok(position) = list_item_markers.binary_search_by_key(&item, |(_, owner)| *owner)
+        else {
+            continue;
+        };
+        // The triple must start right where the item's own marker ends, and
+        // the parser's `TaskMarker` span must cover it. Only the triple is
+        // trusted from the source; the reported span's exact bounds (which
+        // may include trailing whitespace) are not.
+        let list_marker_end = list_item_markers[position].0.end;
+        if list_marker_end.0 < range.start.0
+            || reported.start > list_marker_end
+            || reported.end.0 < list_marker_end.0 + 3
+        {
+            continue;
+        }
+        let marker = SourceRange::new(list_marker_end.0, list_marker_end.0 + 3);
+        let start = marker.start.0 - range.start.0;
+        let literal = match source.as_bytes().get(start..start + 3) {
+            Some([b'[', b' ', b']']) => false,
+            Some([b'[', b'x' | b'X', b']']) => true,
+            _ => continue,
+        };
+        if literal != checked {
+            continue;
+        }
+        let end = if matches!(source.as_bytes().get(start + 3), Some(b' ' | b'\t')) {
+            marker.end.0 + 1
+        } else {
+            marker.end.0
+        };
+        tasks.push(TaskMarkerParse {
+            item,
+            marker_range: marker,
+            hidden_range: SourceRange::new(marker.start.0, end),
+            checked,
+        });
+    }
+    tasks
 }
 
 /// Recovers a list item's own structural indentation on every physical line

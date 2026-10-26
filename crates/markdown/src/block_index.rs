@@ -26,9 +26,10 @@ use crate::block_store::BlockStore;
 use crate::list_projection::ListProjectionMarkers;
 use crate::{
     FenceHeightProjection, ListEditProjection, ListProjection, ListProjectionItem,
-    ListProjectionList, ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree,
-    NodeKind, QuoteProjection, TableAlignment, build_list_edit_projection, is_table_delimiter,
-    markdown_lines, parse_document,
+    ListProjectionList, ListProjectionPrefix, ListProjectionRow, ListProjectionTask,
+    MarkdownParse, MarkdownTree, NodeId, NodeKind, QuoteProjection, TableAlignment,
+    TaskMarkerParse, build_list_edit_projection, is_table_delimiter, markdown_lines,
+    parse_document, task_glyph,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::collections::HashMap;
@@ -226,11 +227,28 @@ fn count_line_endings(slice: &str) -> usize {
     count
 }
 
-fn list_projection_label(start: Option<u64>, ordinal: usize) -> String {
-    match start {
+fn list_projection_label(start: Option<u64>, ordinal: usize, task: Option<bool>) -> String {
+    let mut label = match start {
         None => "\u{2022} ".to_owned(),
         Some(start) => format!("{}. ", start.saturating_add(ordinal as u64)),
+    };
+    if let Some(checked) = task {
+        // A confirmed task item's inactive label also carries its checkbox, so
+        // the list-wide alignment column is measured with it.
+        label.push_str(task_glyph(checked));
+        label.push(' ');
     }
+    label
+}
+
+/// The confirmed task marker owned by `item`, if any. `task_markers` is in
+/// ascending item order.
+fn task_marker_for_item(parsed: &MarkdownParse, item: NodeId) -> Option<&TaskMarkerParse> {
+    parsed
+        .task_markers
+        .binary_search_by_key(&item, |task| task.item)
+        .ok()
+        .and_then(|index| parsed.task_markers.get(index))
 }
 
 fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
@@ -477,7 +495,13 @@ fn build_list_projections(
             .children(list_id)
             .iter()
             .enumerate()
-            .map(|(ordinal, _)| list_projection_label(start, ordinal))
+            .map(|(ordinal, child)| {
+                list_projection_label(
+                    start,
+                    ordinal,
+                    task_marker_for_item(parsed, *child).map(|task| task.checked),
+                )
+            })
             .collect::<Vec<_>>();
         let mut max_marker_label = String::new();
         let mut max_marker_columns = 0;
@@ -522,6 +546,11 @@ fn build_list_projections(
         items[block].push(ListProjectionItem {
             item_range: item.source_range,
             marker_range: *marker_range,
+            task: task_marker_for_item(parsed, *item_id).map(|task| ListProjectionTask {
+                marker_range: task.marker_range,
+                hidden_range: task.hidden_range,
+                checked: task.checked,
+            }),
             list_range: list.source_range,
             start,
             ordinal,

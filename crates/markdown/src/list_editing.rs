@@ -11,7 +11,7 @@
 )]
 
 use crate::{MarkdownParse, NodeId, NodeKind};
-use hane_document::{BufferError, RopeBuffer, SourceOffset, SourceRange};
+use hane_document::{BufferError, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListEditIntent {
@@ -1913,6 +1913,53 @@ fn item_subtree_end(tree: &crate::MarkdownTree, item_id: NodeId, opening_line_en
         .map(|child| child.source_range.end.0)
         .max()
         .map_or(opening_line_end, |end| end.max(opening_line_end))
+}
+
+/// Plans one task checkbox toggle against the current document.
+///
+/// `marker` is the real `[ ]` / `[x]` / `[X]` source range a presentation
+/// resolved for the clicked checkbox and `expected_checked` the state it drew.
+/// Nothing is trusted from that snapshot: the marker is accepted only when
+/// `projection` (built from the current revision) still has a formal task
+/// item whose own bullet/number marker is immediately followed by exactly
+/// these three bytes, with the same checked state. Any disagreement yields
+/// `Ok(None)` and the document is left alone.
+///
+/// The plan replaces only the middle byte (` ` → `x`, `x`/`X` → ` `) and keeps
+/// the selection offsets, since the replacement does not change any length.
+pub fn plan_task_toggle(
+    document: &RopeBuffer,
+    projection: &ListEditProjection,
+    marker: SourceRange,
+    expected_checked: bool,
+    selection: SourceSelection,
+) -> Result<Option<MarkdownEditPlan>, BufferError> {
+    if marker.end.0 != marker.start.0 + 3 {
+        return Ok(None);
+    }
+    let Some((_, item)) = projection.item_at(marker.start) else {
+        return Ok(None);
+    };
+    if !item.is_parser_item
+        || item.task != Some(expected_checked)
+        || item.marker_range.end != marker.start
+        || item.body_range.start.0 < marker.end.0
+    {
+        return Ok(None);
+    }
+    let checked = match document.text(marker)?.as_str() {
+        "[ ]" => false,
+        "[x]" | "[X]" => true,
+        _ => return Ok(None),
+    };
+    if checked != expected_checked {
+        return Ok(None);
+    }
+    Ok(Some(MarkdownEditPlan::Replace {
+        range: SourceRange::new(marker.start.0 + 1, marker.start.0 + 2),
+        replacement: if checked { " " } else { "x" }.to_owned(),
+        selection_after: selection,
+    }))
 }
 
 /// A `TaskMarker` is always pushed as a direct child of its own owning

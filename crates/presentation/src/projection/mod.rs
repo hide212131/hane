@@ -1,7 +1,7 @@
 use crate::display::{
     BlockKind, ImagePresentation, LineContext, LinkTarget, ListAlignment, ListId, ListItemId, ListMarkerKind,
     ListMarkerMetadata, ListOwnerMetadata, ListRowMetadata, ListRowRole,
-    ListStructuralPrefixMetadata, QuoteRowMetadata, StyleKind, StyleRun, TableCellDisplay,
+    ListStructuralPrefixMetadata, ListTaskMetadata, QuoteRowMetadata, StyleKind, StyleRun, TableCellDisplay,
     TableRowDisplay, VisualBlock, VisualLine, code_line_height, estimated_height, syntax_display,
 };
 #[cfg(test)]
@@ -18,7 +18,7 @@ use hane_markdown::{
     BlockIndex, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection, ListProjectionItem,
     ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
     TableAlignment, TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
-    has_delimiter_markers, is_table_delimiter, links_intersecting, parse_document,
+    has_delimiter_markers, is_table_delimiter, links_intersecting, parse_document, task_glyph,
 };
 #[cfg(test)]
 use hane_markdown::{BlockId, Confidence};
@@ -1001,7 +1001,7 @@ fn present_markdown_from_parse(
     }
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
-    for planned in markers_on_line {
+    for (position, planned) in markers_on_line.iter().enumerate() {
         let marker = planned.range;
         if marker.end > range.end {
             continue;
@@ -1069,6 +1069,26 @@ fn present_markdown_from_parse(
                 .global_list_item
                 .map(|item| list_label(item.start, item.ordinal))
         };
+        // A confirmed task marker directly after the list marker is part of
+        // the same opening prefix: the synthesized label also carries the
+        // checkbox, while the real `[ ]` bytes stay mapped (hidden, or
+        // expanded as ordinary source once the item is disclosed).
+        let task = label.as_ref().and_then(|_| {
+            task_after_marker(
+                planned_task(planned, shared.projection),
+                marker,
+                range,
+                markers_on_line
+                    .get(position + 1)
+                    .map(|next| next.range.start),
+            )
+        });
+        let label = match (&task, label) {
+            (Some(task), Some(label)) if !expanded => {
+                Some(label + &task_label_suffix(task.checked))
+            }
+            (_, label) => label,
+        };
         if !expanded && let Some(label) = label {
             let visual_start = visual.len();
             visual.push_str(&label);
@@ -1078,6 +1098,23 @@ fn present_markdown_from_parse(
                 visibility: Visibility::Synthesized,
                 marker_edge: None,
             });
+        }
+        if let Some(task) = task {
+            append_segment(
+                &mut visual,
+                &mut segments,
+                source,
+                range,
+                task.hidden_range,
+                if expanded {
+                    Visibility::ExpandedMarkup
+                } else {
+                    Visibility::HiddenMarkup
+                },
+                Some(MarkerEdge::Opening),
+            );
+            source_cursor = task.hidden_range.end.0;
+            continue;
         }
         // An inactive list item's structural continuation indentation has no
         // visual representation. Layout owns the semantic body column; adding
@@ -1408,6 +1445,57 @@ fn list_label(start: Option<u64>, ordinal: usize) -> String {
     }
 }
 
+/// The confirmed task marker of one list item, by source range so it is the
+/// same value whether it came from the local parse or the document-wide list
+/// projection.
+#[derive(Clone, Copy, Debug)]
+struct PlannedTask {
+    marker_range: SourceRange,
+    hidden_range: SourceRange,
+    checked: bool,
+}
+
+/// The checkbox text appended to an inactive item's bullet/number label. It
+/// is the same text `hane_markdown` measures for the list-wide alignment.
+fn task_label_suffix(checked: bool) -> String {
+    format!("{} ", task_glyph(checked))
+}
+
+/// The task marker of the item whose opening list marker is `planned`. The
+/// local parse's item wins over the formal projection's, matching how the
+/// bullet label itself is chosen.
+fn planned_task(planned: &ProjectedMarker, projection: &ProjectionIndex) -> Option<PlannedTask> {
+    if let Some(owner) = planned.list_owner {
+        return projection
+            .list_item_tasks
+            .get(owner.0)
+            .and_then(|task| *task);
+    }
+    let task = planned.global_list_item?.task?;
+    Some(PlannedTask {
+        marker_range: task.marker_range,
+        hidden_range: task.hidden_range,
+        checked: task.checked,
+    })
+}
+
+/// The task marker to present directly after `marker` on the physical line
+/// `range`. It must start exactly where the list marker ends and fit on the
+/// line without touching the next planned marker, so the hidden bytes tile
+/// the source with no gap or overlap.
+fn task_after_marker(
+    task: Option<PlannedTask>,
+    marker: SourceRange,
+    range: SourceRange,
+    next_marker_start: Option<SourceOffset>,
+) -> Option<PlannedTask> {
+    task.filter(|task| {
+        task.hidden_range.start == marker.end
+            && task.hidden_range.end <= range.end
+            && next_marker_start.is_none_or(|next| next >= task.hidden_range.end)
+    })
+}
+
 fn projected_item_for_marker(
     projection: Option<&ListProjection>,
     marker_range: SourceRange,
@@ -1434,7 +1522,10 @@ fn projected_list_alignment(
     })
 }
 
-fn list_alignments(tree: &MarkdownTree) -> Vec<Option<ListAlignment>> {
+fn list_alignments(
+    tree: &MarkdownTree,
+    tasks: &[Option<PlannedTask>],
+) -> Vec<Option<ListAlignment>> {
     let mut alignments = vec![None; tree.len()];
     for (id, node) in tree.iter() {
         let NodeKind::List { start } = node.kind else {
@@ -1444,7 +1535,13 @@ fn list_alignments(tree: &MarkdownTree) -> Vec<Option<ListAlignment>> {
             .children(id)
             .iter()
             .enumerate()
-            .map(|(ordinal, _)| list_label(start, ordinal))
+            .map(|(ordinal, child)| {
+                let mut label = list_label(start, ordinal);
+                if let Some(task) = tasks.get(child.0).and_then(|task| *task) {
+                    label.push_str(&task_label_suffix(task.checked));
+                }
+                label
+            })
             .collect::<Vec<_>>();
         let mut max_marker_label = String::new();
         let mut max_marker_columns = 0;
@@ -1577,6 +1674,9 @@ struct ProjectionIndex {
     /// preceding-sibling scan.
     list_item_ordinals: Vec<Option<(NodeId, usize)>>,
     list_item_projections: Vec<Option<ListItemProjection>>,
+    /// Confirmed task marker per list item, indexed by [`NodeId::0`]. Only the
+    /// parser's direct-child `TaskMarker` of each item appears here.
+    list_item_tasks: Vec<Option<PlannedTask>>,
 }
 
 /// [`ProjectionIndex::list_item_ordinals`]'s builder: every `List` node's
@@ -1663,7 +1763,17 @@ impl ProjectionIndex {
                 .collect(),
         );
         let list_item_ordinals = list_item_ordinals(&parsed.tree);
-        let list_alignments = list_alignments(&parsed.tree);
+        let mut list_item_tasks = vec![None; parsed.tree.len()];
+        for task in &parsed.task_markers {
+            if let Some(slot) = list_item_tasks.get_mut(task.item.0) {
+                *slot = Some(PlannedTask {
+                    marker_range: task.marker_range,
+                    hidden_range: task.hidden_range,
+                    checked: task.checked,
+                });
+            }
+        }
+        let list_alignments = list_alignments(&parsed.tree, &list_item_tasks);
         let list_item_projections =
             list_item_projections(&parsed.tree, &list_item_ordinals, &list_alignments);
         let list_items = SourceIndex::new(
@@ -1680,10 +1790,15 @@ impl ProjectionIndex {
             list_items,
             list_item_ordinals,
             list_item_projections,
+            list_item_tasks,
         }
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "list marker projection keeps source, visual, disclosure and task inputs together"
+)]
 fn list_marker_metadata(
     planned: &ProjectedMarker,
     parsed: &MarkdownParse,
@@ -1692,6 +1807,7 @@ fn list_marker_metadata(
     source_map: &SourceMap,
     disclosure: Option<SourceRange>,
     list_projection: Option<&ListProjection>,
+    task: Option<PlannedTask>,
 ) -> Option<ListMarkerMetadata> {
     let expanded = marker_is_disclosed(planned, parsed, nodes, disclosure, list_projection);
     let visual_range = if expanded {
@@ -1718,12 +1834,48 @@ fn list_marker_metadata(
     let label = visual
         .get(visual_range.start.0..visual_range.end.0)?
         .to_owned();
+    // Report the task only when this very row mapped its bytes (hidden behind
+    // the checkbox, or expanded as source) — never a control the row did not
+    // actually present.
+    let task = task.and_then(|task| {
+        let mapped = source_map.segments.iter().any(|segment| {
+            segment.source_range == task.hidden_range
+                && segment.visibility
+                    == if expanded {
+                        Visibility::ExpandedMarkup
+                    } else {
+                        Visibility::HiddenMarkup
+                    }
+        });
+        if !mapped {
+            return None;
+        }
+        let checkbox_visual_range = if expanded {
+            None
+        } else {
+            let suffix = task_label_suffix(task.checked);
+            let glyph_len = suffix.len() - 1;
+            if !label.ends_with(&suffix) {
+                return None;
+            }
+            Some(VisualRange::new(
+                visual_range.end.0 - suffix.len(),
+                visual_range.end.0 - suffix.len() + glyph_len,
+            ))
+        };
+        Some(ListTaskMetadata {
+            marker_range: task.marker_range,
+            checked: task.checked,
+            checkbox_visual_range,
+        })
+    });
     Some(ListMarkerMetadata {
         source_range: planned.range,
         anchor: planned.range.start,
         visual_range,
         label,
         synthesized: !expanded,
+        task,
     })
 }
 
@@ -1825,6 +1977,12 @@ fn list_row_metadata(
         ListRowRole::Continuation
     };
     let marker = opening.and_then(|planned| {
+        let next_marker_start = markers_on_line
+            .iter()
+            .find(|next| {
+                (next.range.start, next.range.end) > (planned.range.start, planned.range.end)
+            })
+            .map(|next| next.range.start);
         list_marker_metadata(
             planned,
             parsed,
@@ -1833,6 +1991,12 @@ fn list_row_metadata(
             source_map,
             disclosure,
             list_projection,
+            task_after_marker(
+                planned_task(planned, projection),
+                planned.range,
+                range,
+                next_marker_start,
+            ),
         )
     });
     let structural_prefixes = markers_on_line

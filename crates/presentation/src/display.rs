@@ -256,6 +256,21 @@ pub struct ListMarkerMetadata {
     pub visual_range: VisualRange,
     pub label: String,
     pub synthesized: bool,
+    /// The item's confirmed task marker, when it has one.
+    pub task: Option<ListTaskMetadata>,
+}
+
+/// The GFM task marker (`[ ]`, `[x]`, `[X]`) of the list item owning a row.
+/// `marker_range` is always the real source triple, never a synthetic
+/// position. `checkbox_visual_range` is `Some` only while the marker is
+/// inactive, where it names the checkbox glyph inside the synthesized label;
+/// once the marker is disclosed the source bytes are ordinary editable text
+/// and there is no control to press.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListTaskMetadata {
+    pub marker_range: SourceRange,
+    pub checked: bool,
+    pub checkbox_visual_range: Option<VisualRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,6 +323,14 @@ impl ListRowMetadata {
                 };
                 marker.source_range = range;
                 marker.anchor = range.start;
+                if let Some(task) = &mut marker.task {
+                    // A toggle-sized edit inside the triple can't be carried
+                    // over: the control must be re-resolved from a new parse.
+                    let Some(range) = delta.transform_range(task.marker_range) else {
+                        return false;
+                    };
+                    task.marker_range = range;
+                }
             }
         }
         for prefix in &mut self.structural_prefixes {

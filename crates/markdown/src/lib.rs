@@ -48,10 +48,11 @@ pub use fence_height::FenceHeightProjection;
 pub use list_editing::{
     ListEditIntent, ListEditItem, ListEditPlanResult, ListEditProjection, ListMarker,
     MarkdownEditPlan, SourceSelection, build_list_edit_projection, plan_list_edit,
+    plan_task_toggle,
 };
 pub use list_projection::{
     ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
-    ListProjectionRow, QuoteProjection,
+    ListProjectionRow, ListProjectionTask, QuoteProjection, task_glyph,
 };
 pub use local_block_index::{LocalBlockIndex, local_block_index};
 pub(crate) use markers::markdown_lines;
@@ -63,7 +64,7 @@ pub use mermaid::{MermaidFence, mermaid_fence};
 pub use parser::parse_document;
 pub use syntax::{
     LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,
-    TableParse, links_intersecting,
+    TableParse, TaskMarkerParse, links_intersecting,
 };
 
 #[cfg(test)]
@@ -478,6 +479,111 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(tasks, vec![Some(false), Some(true)]);
+    }
+
+    fn task_markers_of(source: &str) -> Vec<(usize, usize, bool)> {
+        parse_document(Revision(1), SourceRange::new(0, source.len()), source)
+            .task_markers
+            .iter()
+            .map(|task| (task.marker_range.start.0, task.hidden_range.end.0, task.checked))
+            .collect()
+    }
+
+    #[test]
+    fn confirmed_task_markers_cover_the_bracket_triple_and_one_separator() {
+        assert_eq!(
+            task_markers_of("- [ ] todo\n- [x] done\n- [X] big\n"),
+            vec![(2, 6, false), (13, 17, true), (24, 28, true)]
+        );
+        // Ordered, `*`/`+` bullets, CRLF and Unicode bodies.
+        assert_eq!(task_markers_of("1. [ ] a"), vec![(3, 7, false)]);
+        assert_eq!(task_markers_of("* [x] a\r\n+ [ ] b"), vec![(2, 6, true), (11, 15, false)]);
+        assert_eq!(
+            task_markers_of("- [ ] \u{65e5}\u{672c}"),
+            vec![(2, 6, false)]
+        );
+    }
+
+    #[test]
+    fn task_markers_belong_only_to_their_own_direct_item() {
+        let source = "- A\n  - [ ] child\n- [x] B\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert_eq!(parsed.task_markers.len(), 2);
+        let items = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .collect::<Vec<_>>();
+        // The parent "A" has no marker of its own; the child and "B" do.
+        assert!(parsed.task_markers.iter().all(|task| task.item != items[0].0));
+        assert_eq!(parsed.task_markers[0].item, items[1].0);
+        assert_eq!(parsed.task_markers[1].item, items[2].0);
+        for task in &parsed.task_markers {
+            let owner = parsed.tree.node(task.item).expect("owner exists");
+            assert!(owner.source_range.start <= task.marker_range.start);
+            assert!(task.marker_range.end <= owner.source_range.end);
+        }
+    }
+
+    #[test]
+    fn brackets_that_are_not_task_markers_are_ignored() {
+        for source in [
+            "[ ] plain paragraph",
+            "- [] empty",
+            "- [ x] spaced",
+            "- [xx] long",
+            "- [ ]no separator",
+            "```\n- [ ] code\n```",
+            "- text [ ] later",
+            "-   [ ] padded",
+            "- [",
+        ] {
+            assert!(
+                task_markers_of(source).is_empty(),
+                "{source:?} must not carry a task marker"
+            );
+        }
+    }
+
+    #[test]
+    fn task_toggle_plans_replace_only_the_middle_byte() {
+        use hane_document::{RopeBuffer, SourceOffset, TextBuffer};
+
+        fn plan(text: &str, marker: (usize, usize), checked: bool) -> Option<MarkdownEditPlan> {
+            let buffer = RopeBuffer::from_text(text);
+            let parsed = parse_document(buffer.revision(), SourceRange::new(0, text.len()), text);
+            let projection = build_list_edit_projection(&parsed, text);
+            plan_task_toggle(
+                &buffer,
+                &projection,
+                SourceRange::new(marker.0, marker.1),
+                checked,
+                SourceSelection::caret(SourceOffset(text.len())),
+            )
+            .expect("buffer read")
+        }
+        let replace = |range: (usize, usize), replacement: &str| {
+            Some(MarkdownEditPlan::Replace {
+                range: SourceRange::new(range.0, range.1),
+                replacement: replacement.to_owned(),
+                selection_after: SourceSelection::caret(SourceOffset(0)),
+            })
+        };
+        let normalize = |plan: Option<MarkdownEditPlan>| {
+            plan.map(|plan| match plan {
+                MarkdownEditPlan::Replace {
+                    range, replacement, ..
+                } => (range, replacement),
+                MarkdownEditPlan::NoOp { .. } => panic!("unexpected no-op"),
+            })
+        };
+        let text = "- [ ] a\r\n- [X] b\n";
+        assert_eq!(normalize(plan(text, (2, 5), false)), normalize(replace((3, 4), "x")));
+        assert_eq!(normalize(plan(text, (11, 14), true)), normalize(replace((12, 13), " ")));
+        // A stale expectation, a shifted range and a non-marker are refused.
+        assert_eq!(plan(text, (2, 5), true), None);
+        assert_eq!(plan(text, (3, 6), false), None);
+        assert_eq!(plan("[ ] a", (0, 3), false), None);
     }
 
     #[test]

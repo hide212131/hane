@@ -38,12 +38,14 @@ const FIXTURES: &[MarkdownFixture] = &[
                 NodeKind::TaskMarker(true),
             ],
         ],
-        // The checkbox itself is content, not markup: no presenter hides it
-        // yet, so it stays visible; the bullet collapses and is replaced by a
-        // synthesized `•` the same as any other unordered item's marker.
+        // The bullet collapses into a synthesized `•` as for any unordered
+        // item, and the confirmed `[ ]` / `[x]` triple (plus its separator)
+        // is hidden behind a synthesized checkbox glyph that follows it. The
+        // triple is not a derived marker: it is reported by
+        // `MarkdownParse::task_markers`, so `markers` is unchanged.
         markers: &["- ", "- "],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
-        visual_lines: &["\u{2022} [ ] todo", "\u{2022} [x] done"],
+        visual_lines: &["\u{2022} \u{2610} todo", "\u{2022} \u{2611} done"],
         style_runs: &[&[], &[]],
     },
     MarkdownFixture {

@@ -119,6 +119,7 @@ mod session_save;
 mod sidebar;
 mod sidebar_filter;
 mod sidebar_pins;
+mod task_checkbox;
 mod viewport;
 #[cfg(test)]
 use sidebar::{flatten_filtered_work_folder_tree, flatten_work_folder_tree};
@@ -4669,6 +4670,12 @@ impl EditorView {
             return;
         }
         let shaper = WindowShaper::new(window, self.zoom);
+        // An inactive task checkbox is a control: a plain left press on it is
+        // one toggle and is consumed here, so it neither moves the caret nor
+        // starts a drag.
+        if self.press_task_checkbox(line, fragment.clone(), event, &shaper, cx) {
+            return;
+        }
         let Some(hit) = self.row_hit_at_window_point(
             line,
             fragment.clone(),

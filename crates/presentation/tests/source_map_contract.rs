@@ -135,8 +135,8 @@ fn code_span_padding_is_left_alone_when_only_one_side_has_a_space() {
 #[test]
 fn unsupported_and_edge_constructs_never_lose_source() {
     // Constructs Hane does not specialize yet (raw HTML, autolinks, footnote and
-    // reference-link references, task-list checkboxes, backslash escapes, HTML
-    // entities). The display contract guarantees the presented block reproduces
+    // reference-link references, malformed task brackets, backslash escapes,
+    // HTML entities). The display contract guarantees the presented block reproduces
     // the source verbatim: concatenating segment source ranges in order rebuilds
     // the original bytes, and every boundary round-trips.
     let fixtures = [
@@ -145,6 +145,9 @@ fn unsupported_and_edge_constructs_never_lose_source() {
         "footnote ref[^1] here",
         "[label][ref] link",
         "- [ ] 未対応タスク",
+        "- [x] 完了タスク",
+        "- [ ]no separator",
+        "1. [X] 番号付き",
         r"escaped \*not emphasis\* text",
         "A &amp; B entity",
         "pipes | without | delimiter",
