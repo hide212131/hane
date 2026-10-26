@@ -21,9 +21,16 @@
 - `AiRuntime` のnetwork revision（`configured_network_revision` / `reconfigure_with_network_revision` / `call_for_network_revision`）: 再接続は旧childの停止確認後に新childを起動し、旧revisionの呼び出しは `NotReady` になる。
 - `hane_update::state_root`: `child-env.json` の proxy URLからuserinfoを除去し、transaction束縛の一時秘密参照 `TransientSecretStore` に分離する。保存・復元・削除に失敗した場合は認証なしproxyへ落とさず失敗する。`TransientSecretStore` を渡さない `publish_environment` は、userinfo付きproxyで失敗（旧版維持でabort）する。
 
+実装済み（P9のOS秘密ストア配線。コード上のみで、ビルド・test・lint・実OS動作は未実行）:
+
+- `hane_update::secret_store::OsSecretStore`: macOS Keychain / Windows Credential Manager（`keyring`）で `TransientSecretStore` を実装する。service は `hane.network.proxy`、account は transaction 束縛の不透明参照 `update-restart/<transaction>.<n>`。他OSでは `put` / `take` が失敗し、平文fallbackはない。`take` は取得後に削除し、削除に失敗した場合は秘密を返さない。エラー文に秘密・OSメッセージを含めない。
+- `HelperHandoff::issue_ticket`: ticket書込み成功後に `publish_environment_with_secrets` を実storeで呼ぶ。Environment proxyのuserinfoはOSストアへ分離し、`child-env.json` には参照だけを残す。保存失敗は旧アプリ終了前のhandoff abortになる（`prepare_restart` は環境を公開しない）。二重handoffでは先に前回分を解放する。
+- 更新helperの限定child起動（`health::spawn_limited`）: `read_environment_with_secrets` を一度だけ呼び、参照した全秘密を消費する。欠落・読込失敗は起動失敗（既存のrollback契約）で、認証なしproxyでは続行しない。復元値はhelper process memoryとchildの環境にだけ存在する。
+- 終端cleanup: `state_root::release_environment_secrets` が、recordが示す参照と有限の決定的な参照集合を全て削除し、全て成功した場合だけrecordを消す。削除失敗はrecordを残して `Err` を返し、呼び出し側はtransactionディレクトリを消さない。接続先: ハンドオフの abort / authorize失敗、`PreparedRestart` の abort・Drop、`PreparingTransaction`、helper session終了（`TerminalSecrets`: 中止・成功・rollback・recovery）、`UnjournaledCleanup`、起動時の未journal sweep、前回terminal receiptの退役。
+
 未実装・未確認:
 
-- `TransientSecretStore` のWindows Credential Manager / macOS Keychain実装と、`prepare_restart`・限定child起動・各終端経路（成功・中止・rollback・recovery）への配線。これが無い間、Environment modeでuserinfo付きproxyを使う更新handoffは安全側に中止される。
+- 両OSの実Keychain / Credential Managerを使う実機観測、更新/restart GUI。
 - Manual modeの保存済みcredential referenceの更新後再ロード確認、設定UIからの `apply_network` 呼び出し（実装順4）。
 - 両OSのpinned runtimeとテストproxyによる実通信観測、focused reconnect GUI、両OS更新/restart GUI。
 

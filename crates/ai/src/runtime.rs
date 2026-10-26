@@ -460,7 +460,9 @@ enum LifecycleCommand {
     /// `config_generation` as soon as the swap happens, before the restart
     /// itself is even attempted. See [`AiRuntime::reconfigure`].
     /// The last `u64` is the network snapshot revision of the new config.
-    Reconfigure(RuntimeConfig, u64, u64),
+    /// The config is boxed so this variant does not make every lifecycle
+    /// command as large as a `RuntimeConfig`.
+    Reconfigure(Box<RuntimeConfig>, u64, u64),
 }
 
 /// A boxed callback carrying the owner lock guard this coordinator currently
@@ -715,7 +717,7 @@ impl AiRuntime {
         new_network_revision: u64,
     ) -> Result<RuntimeStatus, RuntimeError> {
         self.send_lifecycle(LifecycleCommand::Reconfigure(
-            new_config,
+            Box::new(new_config),
             new_configured_settings_generation,
             new_network_revision,
         ))
@@ -1006,7 +1008,7 @@ fn run_coordinator(
                                 false,
                             ) {
                                 Ok(_) => {
-                                    config = new_config;
+                                    config = *new_config;
                                     // Record the new config's generation as
                                     // soon as the swap itself happens, before
                                     // the restart below is even attempted: a

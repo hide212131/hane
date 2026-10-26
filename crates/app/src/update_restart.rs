@@ -18,6 +18,7 @@
 //! ordinary open path. A saved file that was deleted or moved is skipped; it
 //! never stops the others.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use hane_ui::context_menu::{self, ExplorerRegistration};
@@ -26,9 +27,10 @@ use hane_update::helper::{PreparedRestart, prepare_restart};
 use hane_update::identity::TransactionId;
 use hane_update::platform::Placement;
 use hane_update::platform::lease::Coordination;
+use hane_update::secret_store::OsSecretStore;
 use hane_update::state_root::{
     self, Cleanup, ExplorerTicket, MAX_POSITION, MAX_TICKET_FILES, RestartTicket, TicketContent,
-    TicketFile, TicketRestore, ticket_path_ok,
+    TicketFile, TicketRestore, TransientSecretStore, ticket_path_ok,
 };
 use hane_update::trust::TrustPolicy;
 use hane_update::windows_apply::CandidateSource;
@@ -104,7 +106,16 @@ pub(crate) struct HelperHandoff<S: HelperSession> {
     /// Receives the error of a failed ticket write or helper authorization
     /// before it is turned into text, so its code and detail are recorded.
     on_failure: Box<dyn Fn(&UpdateError) + Send>,
+    /// The OS secret store (Keychain / Credential Manager) that carries the
+    /// proxy userinfo of the running application's environment across the
+    /// restart. The `child-env.json` and the ticket only get opaque references.
+    secrets: Box<dyn TransientSecretStore + Send>,
+    /// The environment of this (the real parent) process, read when the record
+    /// for the limited child is published.
+    ambient: AmbientEnvironment,
 }
+
+type AmbientEnvironment = Box<dyn Fn() -> Vec<(OsString, OsString)> + Send>;
 
 impl<S: HelperSession> HelperHandoff<S> {
     pub(crate) fn new(
@@ -121,6 +132,8 @@ impl<S: HelperSession> HelperHandoff<S> {
             still_valid,
             explorer: Box::new(capture_explorer),
             on_failure,
+            secrets: Box::new(OsSecretStore::proxy()),
+            ambient: Box::new(|| std::env::vars_os().collect()),
         }
     }
 
@@ -131,6 +144,40 @@ impl<S: HelperSession> HelperHandoff<S> {
     ) -> Self {
         self.explorer = explorer;
         self
+    }
+
+    #[cfg(test)]
+    fn with_environment(
+        mut self,
+        secrets: Box<dyn TransientSecretStore + Send>,
+        ambient: AmbientEnvironment,
+    ) -> Self {
+        self.secrets = secrets;
+        self.ambient = ambient;
+        self
+    }
+
+    /// Publishes the allowlisted environment of this process for the limited
+    /// child of `transaction`. The userinfo of a proxy URL goes into the OS
+    /// secret store under a transaction-bound reference; only that reference is
+    /// recorded. A repeated handoff first removes what the earlier one stored.
+    /// Failing here aborts the restart before the application quits: the
+    /// child is never started with an unauthenticated proxy.
+    fn publish_child_environment(&self, transaction: &TransactionId) -> Result<(), UpdateError> {
+        state_root::release_environment_secrets(&self.coordination, transaction, &*self.secrets)?;
+        state_root::publish_environment_with_secrets(
+            &self.coordination,
+            transaction,
+            (self.ambient)(),
+            &*self.secrets,
+        )
+    }
+
+    /// Removes the temporary proxy credentials of `transaction` and the record
+    /// that names them. A failure keeps the record, so the cleanup of the
+    /// transaction (helper abort, startup sweep) retries it.
+    fn release_child_environment(&self, transaction: &TransactionId) {
+        let _ = state_root::release_environment_secrets(&self.coordination, transaction, &*self.secrets);
     }
 }
 
@@ -199,7 +246,12 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
                 }
             },
         )
+        // The child environment is published last, so a refused ticket never
+        // leaves a credential in the OS store. Any failure leaves the
+        // application running and the caller aborts the handoff.
+        .and_then(|()| self.publish_child_environment(&transaction))
         .map_err(|err| {
+            self.release_child_environment(&transaction);
             (self.on_failure)(&err);
             err.to_string()
         })
@@ -207,17 +259,25 @@ impl<S: HelperSession + 'static> PreparedUpdate for HelperHandoff<S> {
 
     fn authorize_exit(mut self: Box<Self>) -> Result<(), String> {
         match self.session.take() {
-            Some(session) => session.authorize_exit().map_err(|err| {
-                (self.on_failure)(&err);
-                err.to_string()
-            }),
+            Some(session) => {
+                let transaction = session.transaction();
+                session.authorize_exit().map_err(|err| {
+                    // The helper is aborted by the failure; nothing will read
+                    // the credentials any more.
+                    self.release_child_environment(&transaction);
+                    (self.on_failure)(&err);
+                    err.to_string()
+                })
+            }
             None => Err("the update helper is gone".to_owned()),
         }
     }
 
     fn abort(mut self: Box<Self>) {
         if let Some(session) = self.session.take() {
-            state_root::discard_ticket(&self.coordination, &session.transaction());
+            let transaction = session.transaction();
+            state_root::discard_ticket(&self.coordination, &transaction);
+            self.release_child_environment(&transaction);
             session.abort();
         }
     }
@@ -564,6 +624,58 @@ mod tests {
         fail_exit: bool,
         valid: Result<(), UpdateError>,
     ) -> (HelperHandoff<FakeSession>, Arc<Mutex<Vec<&'static str>>>) {
+        handoff_with_environment(dir, fail_exit, valid, FakeStore::default(), Vec::new())
+    }
+
+    /// A temporary OS secret store in memory, shared with the test.
+    #[derive(Clone, Default)]
+    struct FakeStore {
+        entries: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+        capacity: Option<usize>,
+        fail_put: bool,
+        fail_delete: Arc<std::sync::atomic::AtomicBool>,
+        fail_take: bool,
+    }
+
+    impl FakeStore {
+        fn len(&self) -> usize {
+            self.entries.lock().unwrap().len()
+        }
+    }
+
+    impl TransientSecretStore for FakeStore {
+        fn put(&self, reference: &str, secret: &str) -> hane_update::Result<()> {
+            let mut entries = self.entries.lock().unwrap();
+            if self.fail_put || self.capacity.is_some_and(|capacity| entries.len() >= capacity) {
+                return Err(UpdateError::new(ErrorCode::Io, "store write failed"));
+            }
+            entries.insert(reference.to_owned(), secret.to_owned());
+            Ok(())
+        }
+
+        fn take(&self, reference: &str) -> hane_update::Result<Option<String>> {
+            if self.fail_take {
+                return Err(UpdateError::new(ErrorCode::Io, "store read failed"));
+            }
+            Ok(self.entries.lock().unwrap().remove(reference))
+        }
+
+        fn delete(&self, reference: &str) -> hane_update::Result<()> {
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(UpdateError::new(ErrorCode::Io, "store delete failed"));
+            }
+            self.entries.lock().unwrap().remove(reference);
+            Ok(())
+        }
+    }
+
+    fn handoff_with_environment(
+        dir: &TempDir,
+        fail_exit: bool,
+        valid: Result<(), UpdateError>,
+        store: FakeStore,
+        ambient: Vec<(OsString, OsString)>,
+    ) -> (HelperHandoff<FakeSession>, Arc<Mutex<Vec<&'static str>>>) {
         let install = InstallId::derive(&InstallFacts {
             os: "test",
             volume_id: "v",
@@ -584,7 +696,8 @@ mod tests {
             dir.path().join("state"),
             Box::new(move || valid.clone()),
             Box::new(|_| {}),
-        );
+        )
+        .with_environment(Box::new(store), Box::new(move || ambient.clone()));
         (handoff, log)
     }
 
@@ -780,6 +893,239 @@ mod tests {
         assert_eq!(seen[0].code, ErrorCode::Io);
         assert!(seen[0].detail.contains("Explorer 連携の状態を確認できません"));
         assert_eq!(err, seen[0].to_string());
+    }
+
+    // ------------------------------------------------ proxy credentials
+
+    const DUMMY_USER: &str = "dummy-proxy-user";
+    const DUMMY_PASS: &str = "dummy-proxy-pass";
+
+    fn proxy_ambient(count: usize) -> Vec<(OsString, OsString)> {
+        ["HTTPS_PROXY", "HTTP_PROXY"]
+            .into_iter()
+            .take(count)
+            .enumerate()
+            .map(|(n, name)| {
+                (
+                    OsString::from(name),
+                    OsString::from(format!("http://{DUMMY_USER}:{DUMMY_PASS}@proxy-{n}.example:8080")),
+                )
+            })
+            .collect()
+    }
+
+    fn one_file() -> RestartTicketSnapshot {
+        RestartTicketSnapshot {
+            work_folder: None,
+            files: vec![file("a.md")],
+            active: Some(0),
+        }
+    }
+
+    /// Everything the handoff left in the transaction directory (binding,
+    /// ticket, environment record), as text.
+    fn transaction_text(handoff: &HelperHandoff<FakeSession>) -> String {
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        let mut text = String::new();
+        let entries = std::fs::read_dir(handoff.coordination.transaction_dir(&transaction)).unwrap();
+        for entry in entries.flatten() {
+            if let Ok(bytes) = std::fs::read(entry.path()) {
+                text.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        text
+    }
+
+    fn record_exists(handoff: &HelperHandoff<FakeSession>) -> bool {
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        handoff
+            .coordination
+            .transaction_dir(&transaction)
+            .join(state_root::ENVIRONMENT_FILE)
+            .exists()
+    }
+
+    fn bound_handoff(
+        dir: &TempDir,
+        fail_exit: bool,
+        store: &FakeStore,
+        ambient: Vec<(OsString, OsString)>,
+    ) -> (HelperHandoff<FakeSession>, Arc<Mutex<Vec<&'static str>>>) {
+        let (handoff, log) = handoff_with_environment(dir, fail_exit, Ok(()), store.clone(), ambient);
+        bind_state_root(&handoff);
+        (handoff, log)
+    }
+
+    #[test]
+    fn the_proxy_userinfo_goes_to_the_os_store_and_is_restored_exactly_once() {
+        let dir = TempDir::new("handoff-secret");
+        let store = FakeStore::default();
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert_eq!(store.len(), 2);
+
+        // Neither the ticket, the environment record nor the binding names it.
+        let text = transaction_text(&handoff);
+        assert!(!text.contains(DUMMY_USER) && !text.contains(DUMMY_PASS));
+        assert!(text.contains("proxy-0.example") || text.contains("proxy-1.example"));
+        assert!(text.contains(handoff.session.as_ref().unwrap().transaction().as_str()));
+
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        let vars =
+            state_root::read_environment_with_secrets(&handoff.coordination, &transaction, &store)
+                .unwrap();
+        assert!(vars.iter().any(|(name, value)| {
+            name == "HTTPS_PROXY" && value.contains(&format!("{DUMMY_USER}:{DUMMY_PASS}@proxy-0.example"))
+        }));
+        assert!(vars.iter().any(|(name, value)| {
+            name == "HTTP_PROXY" && value.contains(&format!("{DUMMY_USER}:{DUMMY_PASS}@proxy-1.example"))
+        }));
+        assert_eq!(store.len(), 0, "every credential is consumed by the restore");
+        assert!(
+            state_root::read_environment_with_secrets(&handoff.coordination, &transaction, &store)
+                .is_err(),
+            "a second restore must not yield an authenticated proxy"
+        );
+    }
+
+    #[test]
+    fn a_proxy_without_userinfo_needs_no_secret() {
+        let dir = TempDir::new("handoff-no-secret");
+        let store = FakeStore::default();
+        let ambient = vec![(
+            OsString::from("HTTPS_PROXY"),
+            OsString::from("http://proxy.example:8080"),
+        )];
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, ambient);
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert_eq!(store.len(), 0);
+        assert!(record_exists(&handoff));
+    }
+
+    #[test]
+    fn a_store_write_failure_aborts_the_handoff_before_the_app_can_quit() {
+        let dir = TempDir::new("handoff-secret-put-failure");
+        let store = FakeStore { fail_put: true, ..FakeStore::default() };
+        let (base, log) = bound_handoff(&dir, false, &store, proxy_ambient(1));
+        let (mut handoff, seen) = recording(base);
+        let text = handoff.issue_ticket(&one_file(), &|| true).unwrap_err();
+        assert!(!text.contains(DUMMY_PASS) && !text.contains(DUMMY_USER));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(!record_exists(&handoff), "no record that could start an unauthenticated child");
+        assert_eq!(store.len(), 0);
+
+        // The window aborts the helper on that failure; it is never authorized.
+        Box::new(handoff).abort();
+        assert_eq!(*log.lock().unwrap(), ["abort"]);
+    }
+
+    #[test]
+    fn a_failure_on_a_later_credential_leaves_no_earlier_credential() {
+        let dir = TempDir::new("handoff-secret-partial");
+        let store = FakeStore { capacity: Some(1), ..FakeStore::default() };
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        let text = handoff.issue_ticket(&one_file(), &|| true).unwrap_err();
+        assert!(!text.contains(DUMMY_PASS));
+        assert_eq!(store.len(), 0);
+        assert!(!record_exists(&handoff));
+        assert!(!transaction_text(&handoff).contains(DUMMY_PASS));
+    }
+
+    #[test]
+    fn a_second_handoff_replaces_the_credentials_of_the_first() {
+        let dir = TempDir::new("handoff-secret-twice");
+        let store = FakeStore::default();
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert_eq!(store.len(), 2, "the same two references, not four");
+
+        // A repeat with fewer credentials leaves nothing of the first behind.
+        handoff.ambient = Box::new(|| proxy_ambient(1));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn an_abort_removes_the_credentials_and_the_record() {
+        let dir = TempDir::new("handoff-secret-abort");
+        let store = FakeStore::default();
+        let (mut handoff, log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        let record = handoff
+            .coordination
+            .transaction_dir(&transaction)
+            .join(state_root::ENVIRONMENT_FILE);
+        Box::new(handoff).abort();
+        assert_eq!(*log.lock().unwrap(), ["abort"]);
+        assert_eq!(store.len(), 0);
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn a_failed_delete_keeps_the_credential_tracked_until_a_retry_succeeds() {
+        let dir = TempDir::new("handoff-secret-delete-failure");
+        let store = FakeStore::default();
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        let coordination = handoff.coordination.clone();
+        let record = coordination.transaction_dir(&transaction).join(state_root::ENVIRONMENT_FILE);
+
+        store.fail_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+        Box::new(handoff).abort();
+        assert_eq!(store.len(), 2, "the credentials could not be removed yet");
+        assert!(record.exists(), "the record that names them stays for the retry");
+
+        // The terminal cleanup of the transaction retries and then clears both.
+        assert!(state_root::release_environment_secrets(&coordination, &transaction, &store).is_err());
+        store.fail_delete.store(false, std::sync::atomic::Ordering::SeqCst);
+        state_root::release_environment_secrets(&coordination, &transaction, &store).unwrap();
+        assert_eq!(store.len(), 0);
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn a_failed_authorization_removes_the_credentials_and_a_granted_one_hands_them_over() {
+        let dir = TempDir::new("handoff-secret-authorize");
+        let store = FakeStore::default();
+        let (mut failing, _log) = bound_handoff(&dir, true, &store, proxy_ambient(2));
+        failing.issue_ticket(&one_file(), &|| true).unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(Box::new(failing).authorize_exit().is_err());
+        assert_eq!(store.len(), 0);
+
+        // After a granted exit the helper owns the credentials and its child
+        // takes them; the old process does not touch them any more.
+        let dir = TempDir::new("handoff-secret-granted");
+        let (mut granted, _log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        granted.issue_ticket(&one_file(), &|| true).unwrap();
+        let transaction = granted.session.as_ref().unwrap().transaction();
+        let coordination = granted.coordination.clone();
+        Box::new(granted).authorize_exit().unwrap();
+        assert_eq!(store.len(), 2);
+
+        // The failing store read of the child is an error and keeps them tracked.
+        let reading = FakeStore { fail_take: true, ..store.clone() };
+        assert!(state_root::read_environment_with_secrets(&coordination, &transaction, &reading).is_err());
+        assert_eq!(store.len(), 2);
+        state_root::release_environment_secrets(&coordination, &transaction, &store).unwrap();
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn a_missing_credential_at_restore_is_an_error_not_an_unauthenticated_proxy() {
+        let dir = TempDir::new("handoff-secret-missing");
+        let store = FakeStore::default();
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        store.entries.lock().unwrap().clear();
+        assert!(
+            state_root::read_environment_with_secrets(&handoff.coordination, &transaction, &store)
+                .is_err()
+        );
     }
 
     #[test]

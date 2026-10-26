@@ -359,6 +359,16 @@ pub(crate) fn retire_prior_receipts(coordination: &Coordination, current: &Trans
                     && matches!(journal.phase, Phase::Committed | Phase::RolledBack)
         );
         if terminal {
+            // A temporary proxy credential still named by this receipt must be
+            // removed first; otherwise it would become untraceable.
+            if !crate::state_root::release_transaction_secrets(coordination, &transaction) {
+                return Err(UpdateError::new(
+                    ErrorCode::InstallModified,
+                    bounded_reason(&format!(
+                        "the previous receipt {name} still holds a temporary proxy credential"
+                    )),
+                ));
+            }
             remove_receipt_dir(&entry.path(), &private, &name).map_err(|err| {
                 UpdateError::new(
                     ErrorCode::InstallModified,
@@ -475,7 +485,9 @@ fn sweep_unjournaled(coordination: &Coordination) {
         let Ok(id) = TransactionId::parse(&name) else {
             continue;
         };
-        let _ = coordination.remove_unjournaled_transaction(&id);
+        // Releases the temporary proxy credentials first; one that cannot be
+        // removed keeps the directory for the next start.
+        crate::helper::discard_unstarted_transaction(coordination, &id);
     }
 }
 

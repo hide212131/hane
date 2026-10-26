@@ -3271,6 +3271,8 @@ version = "0.34.0"
 dependencies = [
  "base64 0.22.1",
  "flate2",
+ "hane-network",
+ "keyring",
  "libc",
  "ring",
  "semver",

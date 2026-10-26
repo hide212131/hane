@@ -238,6 +238,10 @@ struct ChildEnvironment {
     secret_refs: std::collections::BTreeMap<String, String>,
 }
 
+/// The most temporary secrets one transaction may hold. It bounds the references
+/// a terminal cleanup has to sweep.
+const MAX_SECRET_REFS: usize = 8;
+
 /// Proxy variables whose value is a URL that may carry `user:password@`.
 const PROXY_URL_VARS: &[&str] = &["ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"];
 
@@ -438,6 +442,12 @@ fn collect_environment(
             continue;
         }
         if let Some(userinfo) = userinfo.filter(|userinfo| !userinfo.is_empty()) {
+            if stored.len() >= MAX_SECRET_REFS {
+                return Err(UpdateError::new(
+                    ErrorCode::LimitExceeded,
+                    "too many proxy credentials for the restart",
+                ));
+            }
             let reference = secret_ref(transaction, stored.len());
             secrets.put(&reference, &userinfo)?;
             stored.push(reference.clone());
@@ -533,25 +543,58 @@ pub fn read_environment_with_secrets(
     }
 }
 
-/// Deletes the temporary secrets a recorded environment references (best
-/// effort, idempotent) and then the record itself. Used for every terminal path
-/// of a transaction: success, abort, rollback and recovery.
-pub fn discard_environment_with_secrets(
+/// Deletes every temporary secret of `transaction` and then the record itself.
+/// Used for every terminal path of a transaction: success, abort, rollback and
+/// recovery.
+///
+/// The references are the ones the record names plus the bounded, deterministic
+/// set a publish can have used, so a secret whose record was never written (a
+/// failed publish) is found too. When any delete fails the record is kept and
+/// an error is returned: the secret stays tracked and the caller must not drop
+/// the transaction directory, so a later cleanup can retry. Deleting an absent
+/// entry is not an error, which makes the call idempotent.
+pub fn release_environment_secrets(
     coordination: &Coordination,
     transaction: &TransactionId,
     secrets: &dyn TransientSecretStore,
-) {
+) -> Result<()> {
+    let mut references: std::collections::BTreeSet<String> = (0..MAX_SECRET_REFS)
+        .map(|index| secret_ref(transaction, index))
+        .collect();
     let path = environment_path(coordination, transaction);
     if let Ok(Some(bytes)) = read_limited(&path, ENVIRONMENT_LIMIT)
         && let Ok(document) = parse_strict::<ChildEnvironment>(&bytes)
     {
-        for reference in document.secret_refs.values() {
-            if secret_ref_ok(transaction, reference) {
-                let _ = secrets.delete(reference);
-            }
+        references.extend(
+            document
+                .secret_refs
+                .into_values()
+                .filter(|reference| secret_ref_ok(transaction, reference)),
+        );
+    }
+    // Every delete is attempted even after a failure.
+    let mut failed = false;
+    for reference in &references {
+        if secrets.delete(reference).is_err() {
+            failed = true;
         }
     }
+    if failed {
+        return Err(UpdateError::new(
+            ErrorCode::Io,
+            "the temporary proxy credential could not be removed yet",
+        ));
+    }
     discard_environment(coordination, transaction);
+    Ok(())
+}
+
+/// [`release_environment_secrets`] against the OS store. `true` means no secret
+/// of the transaction is left, so the transaction directory may be removed;
+/// `false` keeps it for the next cleanup.
+pub fn release_transaction_secrets(coordination: &Coordination, transaction: &TransactionId) -> bool {
+    release_environment_secrets(coordination, transaction, &crate::secret_store::OsSecretStore::proxy())
+        .is_ok()
 }
 
 #[allow(clippy::type_complexity)]
@@ -1484,11 +1527,152 @@ mod tests {
         let secrets = MemorySecrets::new(8);
         publish_environment_with_secrets(&fx.coordination, &fx.transaction, proxy_ambient(), &secrets)
             .unwrap();
-        discard_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets);
+        release_environment_secrets(&fx.coordination, &fx.transaction, &secrets).unwrap();
         assert_eq!(secrets.len(), 0);
         assert!(recorded_environment(&fx).is_none());
         // Idempotent.
-        discard_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets);
+        release_environment_secrets(&fx.coordination, &fx.transaction, &secrets).unwrap();
+    }
+
+    /// A store whose `delete` can be made to fail, wrapping the memory store.
+    struct FlakyDelete {
+        inner: MemorySecrets,
+        fail_delete: std::cell::Cell<bool>,
+        fail_take: bool,
+    }
+
+    impl FlakyDelete {
+        fn new() -> Self {
+            Self {
+                inner: MemorySecrets::new(8),
+                fail_delete: std::cell::Cell::new(false),
+                fail_take: false,
+            }
+        }
+    }
+
+    impl TransientSecretStore for FlakyDelete {
+        fn put(&self, reference: &str, secret: &str) -> Result<()> {
+            self.inner.put(reference, secret)
+        }
+
+        fn take(&self, reference: &str) -> Result<Option<String>> {
+            if self.fail_take {
+                return Err(secret_store_unavailable());
+            }
+            self.inner.take(reference)
+        }
+
+        fn delete(&self, reference: &str) -> Result<()> {
+            if self.fail_delete.get() {
+                return Err(secret_store_unavailable());
+            }
+            self.inner.delete(reference)
+        }
+    }
+
+    fn two_credentials() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        [
+            ("HTTPS_PROXY", format!("http://{DUMMY_USER}:{DUMMY_PASS}@a.example:1")),
+            ("HTTP_PROXY", format!("http://{DUMMY_USER}:{DUMMY_PASS}@b.example:2")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+        .collect()
+    }
+
+    #[test]
+    fn a_failed_secret_delete_keeps_the_record_and_a_retry_cleans_up() {
+        let fx = fixture();
+        let secrets = FlakyDelete::new();
+        publish_environment_with_secrets(&fx.coordination, &fx.transaction, two_credentials(), &secrets)
+            .unwrap();
+        assert_eq!(secrets.inner.len(), 2);
+
+        secrets.fail_delete.set(true);
+        assert!(release_environment_secrets(&fx.coordination, &fx.transaction, &secrets).is_err());
+        // Still tracked: the record names the references and the secrets remain.
+        assert!(recorded_environment(&fx).is_some());
+        assert_eq!(secrets.inner.len(), 2);
+
+        secrets.fail_delete.set(false);
+        release_environment_secrets(&fx.coordination, &fx.transaction, &secrets).unwrap();
+        assert_eq!(secrets.inner.len(), 0);
+        assert!(recorded_environment(&fx).is_none());
+    }
+
+    #[test]
+    fn a_secret_whose_record_was_never_written_is_still_released() {
+        let fx = fixture();
+        let secrets = FlakyDelete::new();
+        // A partly published handoff: the secret exists, no record names it.
+        secrets.put(&secret_ref(&fx.transaction, 1), DUMMY_PASS).unwrap();
+        assert!(recorded_environment(&fx).is_none());
+        release_environment_secrets(&fx.coordination, &fx.transaction, &secrets).unwrap();
+        assert_eq!(secrets.inner.len(), 0);
+    }
+
+    #[test]
+    fn publishing_again_replaces_the_secrets_of_the_first_publish() {
+        let fx = fixture();
+        let secrets = MemorySecrets::new(8);
+        publish_environment_with_secrets(&fx.coordination, &fx.transaction, two_credentials(), &secrets)
+            .unwrap();
+        release_environment_secrets(&fx.coordination, &fx.transaction, &secrets).unwrap();
+        publish_environment_with_secrets(&fx.coordination, &fx.transaction, proxy_ambient(), &secrets)
+            .unwrap();
+        assert_eq!(secrets.len(), 1);
+    }
+
+    #[test]
+    fn a_read_failure_never_yields_an_unauthenticated_proxy_and_stays_releasable() {
+        let fx = fixture();
+        let mut secrets = FlakyDelete::new();
+        publish_environment_with_secrets(&fx.coordination, &fx.transaction, proxy_ambient(), &secrets)
+            .unwrap();
+        secrets.fail_take = true;
+        assert!(read_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets).is_err());
+        // The secret was not consumed and is still tracked for the cleanup.
+        assert_eq!(secrets.inner.len(), 1);
+        assert!(recorded_environment(&fx).is_some());
+        release_environment_secrets(&fx.coordination, &fx.transaction, &secrets).unwrap();
+        assert_eq!(secrets.inner.len(), 0);
+    }
+
+    #[test]
+    fn more_credentials_than_the_bound_abort_and_leave_nothing() {
+        let fx = fixture();
+        let secrets = MemorySecrets::new(64);
+        let names = [
+            "ALL_PROXY", "all_proxy", "All_Proxy", "HTTP_PROXY", "http_proxy", "Http_Proxy",
+            "HTTPS_PROXY", "https_proxy", "Https_Proxy",
+        ];
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = names
+            .iter()
+            .map(|name| {
+                (
+                    std::ffi::OsString::from(*name),
+                    std::ffi::OsString::from(format!("http://{DUMMY_USER}:{DUMMY_PASS}@p.example:1")),
+                )
+            })
+            .collect();
+        assert!(
+            publish_environment_with_secrets(&fx.coordination, &fx.transaction, ambient, &secrets)
+                .is_err()
+        );
+        assert_eq!(secrets.len(), 0);
+        assert!(recorded_environment(&fx).is_none());
+    }
+
+    #[test]
+    fn no_secret_reaches_the_record_or_an_error_when_a_later_credential_fails() {
+        let fx = fixture();
+        let secrets = MemorySecrets::new(1);
+        let err = publish_environment_with_secrets(&fx.coordination, &fx.transaction, two_credentials(), &secrets)
+            .unwrap_err();
+        assert!(!format!("{err:?} {err}").contains(DUMMY_PASS));
+        assert_eq!(secrets.len(), 0);
+        assert!(recorded_environment(&fx).is_none());
     }
 
     #[test]

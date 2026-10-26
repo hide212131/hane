@@ -285,6 +285,11 @@ pub fn run_session<R: Read, W: Write>(
         startup,
         runtime: None,
     };
+    // Dropped before `leases`, while this helper still owns the transaction.
+    let _secrets = TerminalSecrets {
+        coordination: coord,
+        transaction: &env.transaction,
+    };
 
     write_frame(
         writer,
@@ -386,8 +391,24 @@ struct UnjournaledCleanup<'a> {
 impl Drop for UnjournaledCleanup<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.coordination.remove_unjournaled_transaction(self.transaction);
+            discard_unstarted_transaction(self.coordination, self.transaction);
         }
+    }
+}
+
+/// Removes the temporary proxy credentials of the helper's own transaction when
+/// its session ends in any way: aborted, parent still running, applied (the
+/// limited child has already taken its credentials), rolled back or recovered.
+/// A failed removal keeps the record that names them, so the next cleanup of
+/// this transaction retries.
+struct TerminalSecrets<'a> {
+    coordination: &'a Coordination,
+    transaction: &'a TransactionId,
+}
+
+impl Drop for TerminalSecrets<'_> {
+    fn drop(&mut self) {
+        let _ = crate::state_root::release_transaction_secrets(self.coordination, self.transaction);
     }
 }
 
@@ -932,9 +953,13 @@ pub struct PreparedRestart {
 }
 
 /// Removes the staged files of a transaction whose helper has exited without
-/// ever writing a journal. Best effort: whatever cannot be verified stays.
-fn discard_unstarted_transaction(coordination: &Coordination, transaction: &TransactionId) {
-    let _ = coordination.remove_unjournaled_transaction(transaction);
+/// ever writing a journal. Best effort: whatever cannot be verified stays. The
+/// temporary proxy credentials go first; if one cannot be removed the directory
+/// (and the record naming it) stays so that a later cleanup can retry.
+pub(crate) fn discard_unstarted_transaction(coordination: &Coordination, transaction: &TransactionId) {
+    if crate::state_root::release_transaction_secrets(coordination, transaction) {
+        let _ = coordination.remove_unjournaled_transaction(transaction);
+    }
 }
 
 /// Cleans up a transaction that failed before `PreparedRestart` took it over.
@@ -954,7 +979,8 @@ impl Drop for PreparingTransaction<'_> {
             return;
         }
         crate::state_root::discard_binding(self.coordination, self.transaction);
-        crate::state_root::discard_environment(self.coordination, self.transaction);
+        // Releases the temporary proxy credentials and the environment record
+        // first; a failed release keeps the directory for the next cleanup.
         discard_unstarted_transaction(self.coordination, self.transaction);
     }
 }
@@ -1069,7 +1095,9 @@ pub fn prepare_restart(
     let copy = crate::platform::stage_helper_copy(&coordination, &transaction, &source)?;
     stage_candidate(&coordination, &transaction, candidate)?;
     crate::state_root::publish_binding(&coordination, &transaction, state_root)?;
-    crate::state_root::publish_environment(&coordination, &transaction, std::env::vars_os())?;
+    // The limited child's environment is published later, by the handoff that
+    // owns the real OS secret store, before the application can quit
+    // (`state_root::publish_environment_with_secrets`).
     let spawned = match spawn_helper_checked(
         &copy,
         &HelloRequest {

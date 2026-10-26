@@ -285,19 +285,10 @@ pub struct AiService {
 /// the revision; every operation the worker starts afterwards uses the new
 /// snapshot, while an operation already running keeps the snapshot it began
 /// with.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct NetworkSnapshot {
     revision: u64,
     context: NetworkContext,
-}
-
-impl Default for NetworkSnapshot {
-    fn default() -> Self {
-        Self {
-            revision: 0,
-            context: NetworkContext::default(),
-        }
-    }
 }
 
 impl AiServiceHandle {
