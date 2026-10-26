@@ -644,6 +644,19 @@ mod tests {
     }
 
     #[test]
+    fn proxy_urls_and_proxy_authorization_values_are_masked() {
+        let out = redactor().redact(
+            "CONNECT api.github.com:443 via http://proxyuser:proxypw@proxy.example:3128 \
+             Proxy-Authorization: Basic cHJveHl1c2VyOnByb3h5cHc=",
+            1000,
+        );
+        for leak in ["proxyuser", "proxypw", "cHJveHl1c2VyOnByb3h5cHc"] {
+            assert!(!out.contains(leak), "{leak} leaked in {out}");
+        }
+        assert!(out.contains("http://proxy.example:3128"), "{out}");
+    }
+
+    #[test]
     fn quoted_authorization_scheme_credentials_are_masked() {
         let out = redactor().redact(r#"{"Authorization": "Bearer abc"}"#, 1000);
         assert!(!out.contains("abc"), "{out}");

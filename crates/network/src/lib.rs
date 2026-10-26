@@ -4,10 +4,12 @@
 //! it never reads the process environment, resolves DNS, opens connections or
 //! touches an OS secret store. Callers inject the environment map and a
 //! [`CredentialStore`]. It does not depend on the AI, session, UI or update
-//! crates, and nothing here is wired into real traffic yet.
+//! crates. [`NetworkContext`] bundles the injected, immutable inputs that the
+//! update and runtime-download callers share; it still does no I/O itself.
 
 mod bypass;
 mod child_env;
+mod context;
 mod credential;
 mod endpoint;
 mod environment;
@@ -18,6 +20,7 @@ mod settings;
 
 pub use bypass::BypassList;
 pub use child_env::{ChildEnvironment, ChildProxyPlan};
+pub use context::{NetworkContext, SharedCredentialStore};
 pub use credential::{
     BasicCredentials, CredentialError, CredentialRef, CredentialSource, CredentialStore,
     PROXY_CREDENTIAL_SERVICE, Secret, load_credentials,

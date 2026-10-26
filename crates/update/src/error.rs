@@ -6,6 +6,13 @@ use std::io;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     NetworkUnavailable,
+    /// The HTTP proxy settings or its credential could not be used. Never
+    /// retried as a direct connection.
+    ProxyConfiguration,
+    /// The proxy refused or failed the CONNECT tunnel (not an origin answer).
+    ProxyConnect,
+    /// The proxy demanded authentication (407) that was missing or rejected.
+    ProxyAuthentication,
     Timeout,
     Truncated,
     Cancelled,
@@ -54,6 +61,9 @@ impl ErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::NetworkUnavailable => "network_unavailable",
+            ErrorCode::ProxyConfiguration => "proxy_configuration",
+            ErrorCode::ProxyConnect => "proxy_connect",
+            ErrorCode::ProxyAuthentication => "proxy_authentication",
             ErrorCode::Timeout => "timeout",
             ErrorCode::Truncated => "truncated",
             ErrorCode::Cancelled => "cancelled",

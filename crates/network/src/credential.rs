@@ -50,6 +50,22 @@ impl BasicCredentials {
     pub fn password(&self) -> &Secret {
         &self.password
     }
+
+    /// Whether these credentials can be carried as HTTP Basic without header
+    /// or config injection: a non-empty user name without `:` and no control
+    /// character (CR, LF, NUL, ...) anywhere.
+    pub fn check_for_basic(&self) -> Result<(), NetworkError> {
+        let user = self.username.expose();
+        let pass = self.password.expose();
+        if user.is_empty()
+            || user.contains(':')
+            || user.chars().chain(pass.chars()).any(char::is_control)
+        {
+            Err(NetworkError::Credential(CredentialError::Invalid))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Opaque id of a credential in the OS secret store (service
