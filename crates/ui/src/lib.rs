@@ -32,7 +32,7 @@ pub use instrument::InstrumentationConfig;
 pub use proxy_secret::{OsProxyCredentialStore, ProxySecretWriter, SecretStoreError};
 pub use view::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
-    ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate, RestartBlocker, RestartObservation,
+    ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, NetworkSettingsApplier, PreparedUpdate, RestartBlocker, RestartObservation,
     RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
 };
 

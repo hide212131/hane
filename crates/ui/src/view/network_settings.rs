@@ -27,6 +27,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Receives a network setting after the settings file holds it. The
+/// application makes it the snapshot of every operation started afterwards;
+/// an operation already running keeps the snapshot it began with. Implementors
+/// must not communicate.
+pub trait NetworkSettingsApplier: Send + Sync {
+    fn apply_saved(&self, settings: &NetworkSettings);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeaveTarget {
     Category(SettingsCategory),
@@ -470,7 +478,7 @@ impl NetworkSettingsPage {
         }
         self.busy = false;
         self.reset_form(&NetworkConfig::Valid(settings));
-        let mut text = "保存しました。通信は行っていません。新しい設定は、アプリを再起動したあとの接続から使われます。実行中の接続には影響しません。".to_owned();
+        let mut text = "保存しました。通信は行っていません。新しい設定は、これから開始する接続から使われます。実行中の接続は開始時の設定のまま続きます。AIは次の利用時に新しい設定で再接続されます。".to_owned();
         if let Some(warning) = warning {
             text.push_str("（注意: ");
             text.push_str(&warning);
@@ -838,6 +846,11 @@ impl NetworkSettingsPage {
 }
 
 impl EditorView {
+    /// Installs the application's hook for saved network settings.
+    pub fn attach_network_applier(&mut self, applier: Option<Arc<dyn NetworkSettingsApplier>>) {
+        self.network_applier = applier;
+    }
+
     pub(super) fn network_settings_render(
         &mut self,
         window: &mut Window,
@@ -886,6 +899,11 @@ impl EditorView {
                 // The file now holds the new settings whether or not the page
                 // is still showing this save.
                 self.settings.network = NetworkConfig::Valid(settings.clone());
+                // Advances the application's network revision. This only
+                // records the setting; it starts no connection.
+                if let Some(applier) = &self.network_applier {
+                    applier.apply_saved(&settings);
+                }
                 self.network_settings
                     .saved_ok(generation, settings, report.warning);
             }

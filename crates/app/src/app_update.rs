@@ -658,8 +658,10 @@ impl Inner {
             UpdateError::new(ErrorCode::TargetUnsupported, "no update distribution")
         })?;
         let current = parse_current_version(&self.config.current_version)?;
+        // The network input is fixed here for the whole check.
+        let pinned = self.transport.begin_operation();
         let fetcher = Fetcher {
-            transport: &*self.transport,
+            transport: pinned.as_deref().unwrap_or(&*self.transport),
             clock: &*self.clock,
         };
         let deadline = fetcher.metadata_deadline();
@@ -850,8 +852,10 @@ impl Inner {
             inner: DirPartStore::new(work, ARCHIVE_FILE)?,
             received: Arc::clone(received),
         };
+        // The network input is fixed here for the whole download.
+        let pinned = self.transport.begin_operation();
         let fetcher = Fetcher {
-            transport: &*self.transport,
+            transport: pinned.as_deref().unwrap_or(&*self.transport),
             clock: &*self.clock,
         };
         *step = "download";
