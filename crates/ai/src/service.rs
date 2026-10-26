@@ -3545,6 +3545,7 @@ mod tests {
                 ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
                 Arc::new(MissingProxyCredential),
             ),
+            latest: Arc::new(AtomicU64::new(revision)),
         }
     }
 
