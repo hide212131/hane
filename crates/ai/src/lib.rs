@@ -71,7 +71,8 @@ pub use runtime_distribution::{
     classify_spawn_error, resolve_runtime_binary,
 };
 pub use runtime_install::{
-    ArchiveDownloader, ArchiveExtractor, CurlArchiveDownloader, RuntimeInstallErrorCode,
+    ArchiveDownloader, ArchiveExtractor, CurlArchiveDownloader, DownloadFailure,
+    RuntimeInstallErrorCode,
     RuntimeInstallSpec, RuntimeInstallState, TarArchiveExtractor, install_runtime,
     install_spec_for_current_target,
 };
