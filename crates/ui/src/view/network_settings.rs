@@ -381,8 +381,8 @@ impl NetworkSettingsPage {
         }
     }
 
-    /// Moves retirement failures that happened while no settings screen was
-    /// showing them into the page message.
+    /// Moves retirement failures that have not been shown yet into the page
+    /// message. Call it only while the Network category is displayed.
     fn show_pending_warnings(&mut self) {
         let warnings = std::mem::take(
             &mut *self
@@ -414,7 +414,8 @@ impl NetworkSettingsPage {
         self.route_ready = None;
         self.pending_target = None;
         self.reset_form(config);
-        self.show_pending_warnings();
+        // Pending retirement failures stay queued until the Network category
+        // is actually shown (see `network_settings_render`).
     }
 
     pub(super) fn close_settings(&mut self, config: &NetworkConfig) {
@@ -939,6 +940,8 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // Only the displayed Network category consumes the queued warnings.
+        self.network_settings.show_pending_warnings();
         self.network_settings.render(window, cx, self.theme)
     }
 
@@ -1000,7 +1003,9 @@ impl EditorView {
                             cx.spawn(async move |view, cx| {
                                 while receiver.recv().await.is_ok() {
                                     let _ = view.update(cx, |view, cx| {
-                                        if view.settings_open {
+                                        if view.settings_open
+                                            && view.settings_category == SettingsCategory::Network
+                                        {
                                             view.network_settings.show_pending_warnings();
                                             cx.notify();
                                         }
@@ -1546,7 +1551,16 @@ mod tests {
         drop(receiver);
         drop(held);
 
+        // A session that only shows another category (General) neither
+        // shows nor drops the warning, even if it is opened and closed again.
+        page.begin_settings_session(&NetworkConfig::Valid(current.clone()));
+        assert!(page.message_text().is_none());
+        page.close_settings(&NetworkConfig::Valid(current.clone()));
+        assert!(page.message_text().is_none());
+
+        // Displaying the Network category shows it.
         page.begin_settings_session(&NetworkConfig::Valid(current));
+        page.show_pending_warnings();
         let text = page.message_text().expect("the failure is shown");
         assert!(text.contains("以前の資格情報"));
         assert!(!text.contains("a:b"));
@@ -1554,6 +1568,22 @@ mod tests {
         page.message = None;
         page.show_pending_warnings();
         assert!(page.message_text().is_none());
+    }
+
+    /// A save or validation message already on the page is kept when a
+    /// queued retirement warning is added.
+    #[test]
+    fn a_queued_warning_keeps_the_existing_page_message() {
+        let mut page = NetworkSettingsPage::new(Arc::new(FakeSecrets::default()));
+        page.message = Some(PageMessage::Failed("保存できませんでした".to_owned()));
+        page.pending_warnings
+            .lock()
+            .unwrap()
+            .push("以前の資格情報をOSの秘密ストアから削除できませんでした".to_owned());
+        page.show_pending_warnings();
+        let text = page.message_text().unwrap();
+        assert!(text.contains("保存できませんでした"));
+        assert!(text.contains("以前の資格情報"));
     }
 
     #[test]
