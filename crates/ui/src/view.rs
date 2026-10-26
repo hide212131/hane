@@ -104,6 +104,8 @@ mod background_parse;
 mod basic_editing_keys;
 mod content_search;
 mod document_find;
+mod editor_context_menu;
+use editor_context_menu::EditorContextMenu;
 mod folder_watch;
 mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
@@ -918,6 +920,14 @@ pub struct EditorView {
     /// The sidebar row context menu, if open. It names the row that was
     /// right-clicked, never the active session or the sidebar selection.
     sidebar_context_menu: Option<SidebarContextMenu>,
+    /// The document body's right-click menu, if open. It carries the document
+    /// instance, revision, directional selection and clipboard URL snapshot
+    /// taken when it opened; every item re-checks them before acting.
+    editor_context_menu: Option<EditorContextMenu>,
+    /// Source of the per-menu tokens that tie item callbacks to one opened menu.
+    editor_context_menu_generation: u64,
+    /// Closes the body menu when the window loses activation.
+    editor_context_menu_activation: Option<gpui::Subscription>,
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
@@ -1834,6 +1844,9 @@ impl EditorView {
             file_tabs_scroll: ScrollHandle::new(),
             file_tab_context_menu: None,
             sidebar_context_menu: None,
+            editor_context_menu: None,
+            editor_context_menu_generation: 0,
+            editor_context_menu_activation: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
             save_problems: HashMap::new(),
@@ -2548,6 +2561,7 @@ impl EditorView {
             return;
         };
         self.sidebar_context_menu = None;
+        self.editor_context_menu = None;
         self.file_tab_context_menu = Some(FileTabContextMenu {
             position,
             id,
@@ -2727,6 +2741,7 @@ impl EditorView {
         // owns) must not survive into whatever replaced it (Issue #449
         // section 3.3/4).
         self.ai_selection.reset();
+        self.editor_context_menu = None;
         self.cancel_text_selection_autoscroll();
         // A coast belongs to the document it started on. Relying on the
         // `scroll_y` staleness check in `advance_scroll_inertia` alone is not
@@ -3384,6 +3399,7 @@ impl EditorView {
         // from acting on the replacement document.
         self.file_tab_context_menu = None;
         self.sidebar_context_menu = None;
+        self.editor_context_menu = None;
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
         self.save_problems.clear();

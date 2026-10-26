@@ -51,6 +51,19 @@ impl EditorView {
         let mut scroll_inertia_tracks_layout = self
             .scroll_inertia
             .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
+        // The body menu belongs to one document instance, revision and
+        // selection, and is never shown together with another menu or a
+        // modal. Anything that changed since it opened closes it. This runs
+        // before the settings early return so that opening settings drops the
+        // menu instead of leaving it to revive when the snapshot matches again.
+        if self.editor_context_menu.as_ref().is_some_and(|menu| {
+            !self.editor_context_menu_is_current(menu)
+                || !window.is_window_active()
+                || self.file_tab_context_menu.is_some()
+                || self.sidebar_context_menu.is_some()
+        }) {
+            self.editor_context_menu = None;
+        }
         if self.settings_open {
             return self
                 .settings_screen_element(window, cx)
@@ -467,6 +480,10 @@ impl EditorView {
                 .min_h(px(0.0))
                 .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(Self::on_editor_right_mouse_down),
+                )
                 .on_scroll_wheel(cx.listener(Self::on_scroll))
                 .on_pinch(cx.listener(Self::on_pinch))
                 .child(InputCapture { input: cx.entity() })
@@ -561,6 +578,16 @@ impl EditorView {
                     .position(menu.position)
                     .snap_to_window()
                     .child(self.file_tab_context_menu_element(menu, cx)),
+            )
+        } else {
+            rendered
+        };
+        let rendered = if let Some(menu) = self.editor_context_menu.as_ref() {
+            rendered.child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window()
+                    .child(self.editor_context_menu_element(menu, cx)),
             )
         } else {
             rendered

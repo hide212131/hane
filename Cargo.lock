@@ -3202,6 +3202,7 @@ dependencies = [
  "hane-document",
  "pulldown-cmark",
  "serde_json",
+ "url",
 ]
 
 [[package]]

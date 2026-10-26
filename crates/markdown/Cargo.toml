@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 hane-document.workspace = true
 pulldown-cmark.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 serde_json = "1"
