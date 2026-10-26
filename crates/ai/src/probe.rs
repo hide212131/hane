@@ -441,7 +441,7 @@ fn run_locked(
     loop {
         if let Some(terminal) = drain_probe_events(events_rx, &mut collector, deferred_events) {
             note_terminal_failure(failure, &collector, &terminal);
-            return settle_terminal(terminal);
+            return settle_terminal(terminal, network, failure);
         }
         if collector.has_unsafe_tool_activity() {
             note_failure(failure, "turn", "tool_activity_detected".to_owned());
@@ -505,7 +505,7 @@ fn run_locked(
             Ok(event) => {
                 if let Some(terminal) = observe_or_defer(event, &mut collector, deferred_events) {
                     note_terminal_failure(failure, &collector, &terminal);
-                    return settle_terminal(terminal);
+                    return settle_terminal(terminal, network, failure);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -581,8 +581,18 @@ fn status_for_error(code: ProbeErrorCode) -> ProbeStatus {
     }
 }
 
-fn settle_terminal(terminal: ProbeTerminal) -> (ProbeStatus, bool, Option<String>) {
+fn settle_terminal(
+    terminal: ProbeTerminal,
+    network: &NetworkRevisionGuard,
+    failure: &mut Option<ProbeFailure>,
+) -> (ProbeStatus, bool, Option<String>) {
     match terminal {
+        // A success that arrives after a newer network revision was saved
+        // must not be published as the result for that revision.
+        ProbeTerminal::Completed(_) if !network.is_current() => {
+            note_failure(failure, "turn", "network_revision_changed".to_owned());
+            (ProbeStatus::Failed(ProbeErrorCode::StaleGeneration), false, None)
+        }
         ProbeTerminal::Completed(text) => (ProbeStatus::Succeeded, false, Some(text)),
         ProbeTerminal::Failed(code) => (ProbeStatus::Failed(code), false, None),
         ProbeTerminal::Interrupted => (ProbeStatus::Canceled, false, None),
@@ -1069,6 +1079,47 @@ mod tests {
             )),
             Some(ProbeTerminal::Completed("OK".into()))
         );
+    }
+
+    /// The network revision is saved after `turn/start`, then the old turn
+    /// completes successfully: neither success nor its result is published.
+    #[test]
+    fn a_turn_completed_after_a_newer_network_revision_is_saved_is_not_a_success() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let latest = Arc::new(AtomicU64::new(3));
+        let network = NetworkRevisionGuard::new(3, Arc::clone(&latest));
+        let mut collector = new_collector();
+        assert!(network.is_current());
+        latest.store(4, Ordering::SeqCst);
+        collector.observe(event(7, "item/completed", json!({
+            "threadId":"thread-1", "turnId":"turn-1", "item":{"id":"a","type":"agentMessage","text":"OK"}
+        })));
+        let terminal = collector
+            .observe(event(
+                7,
+                "turn/completed",
+                json!({
+                    "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+                }),
+            ))
+            .expect("terminal outcome");
+        let mut failure = None;
+        let (status, isolated, result) = settle_terminal(terminal, &network, &mut failure);
+        assert_eq!(status, ProbeStatus::Failed(ProbeErrorCode::StaleGeneration));
+        assert!(!isolated);
+        assert_eq!(result, None);
+        assert_eq!(failure, Some(("turn", "network_revision_changed".to_owned())));
+
+        let current = NetworkRevisionGuard::fixed(0);
+        let (status, _, result) = settle_terminal(
+            ProbeTerminal::Completed("OK".into()),
+            &current,
+            &mut None,
+        );
+        assert_eq!(status, ProbeStatus::Succeeded);
+        assert_eq!(result, Some("OK".into()));
     }
 
     #[test]

@@ -522,7 +522,7 @@ fn run_locked(
 
     loop {
         if let Some(terminal) = drain_events(events_rx, &mut collector, deferred_events) {
-            return settle_terminal(terminal, collector.text_overflowed());
+            return settle_terminal(terminal, collector.text_overflowed(), network);
         }
         if cancellation_requested(cancel_rx, operation_id, shutdown_rx, shutdown_seen) {
             return interrupt_or_stop(
@@ -561,7 +561,7 @@ fn run_locked(
         match events_rx.recv_timeout(EVENT_POLL) {
             Ok(event) => {
                 if let Some(terminal) = observe_or_defer(event, &mut collector, deferred_events) {
-                    return settle_terminal(terminal, collector.text_overflowed());
+                    return settle_terminal(terminal, collector.text_overflowed(), network);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -638,8 +638,18 @@ fn outcome_for_error(code: TextTransformErrorCode) -> TextTransformOutcome {
     }
 }
 
-fn settle_terminal(terminal: ProbeTerminal, overflowed: bool) -> (TextTransformOutcome, bool) {
+fn settle_terminal(
+    terminal: ProbeTerminal,
+    overflowed: bool,
+    network: &NetworkRevisionGuard,
+) -> (TextTransformOutcome, bool) {
     match terminal {
+        // A turn that finished after a newer network revision was saved must
+        // never publish its body as a result for that revision.
+        ProbeTerminal::Completed(_) if !network.is_current() => (
+            TextTransformOutcome::Failed(TextTransformErrorCode::StaleGeneration),
+            false,
+        ),
         ProbeTerminal::Completed(text) => (validate_result_text(text, overflowed), false),
         ProbeTerminal::Failed(code) => (
             TextTransformOutcome::Failed(map_probe_error_code(code)),
@@ -1081,11 +1091,51 @@ mod tests {
                 }),
             ))
             .expect("terminal outcome");
-        let (outcome, isolated) = settle_terminal(terminal, collector.text_overflowed());
+        let (outcome, isolated) = settle_terminal(
+            terminal,
+            collector.text_overflowed(),
+            &NetworkRevisionGuard::fixed(0),
+        );
         assert!(!isolated);
         assert_eq!(
             outcome,
             TextTransformOutcome::Failed(TextTransformErrorCode::ResultTooLarge)
+        );
+    }
+
+    /// The network revision is saved after `turn/start`, then the old turn
+    /// completes successfully: its body must not be published.
+    #[test]
+    fn a_turn_completed_after_a_newer_network_revision_is_saved_returns_no_body() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let latest = Arc::new(AtomicU64::new(3));
+        let network = NetworkRevisionGuard::new(3, Arc::clone(&latest));
+        let mut collector =
+            ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), 64);
+        assert!(network.is_current());
+        // turn/start has happened; now a new revision is saved.
+        latest.store(4, Ordering::SeqCst);
+        collector.observe(event(7, "item/completed", serde_json::json!({
+            "threadId":"thread-1", "turnId":"turn-1",
+            "item":{"id":"a","type":"agentMessage","text":"old body"}
+        })));
+        let terminal = collector
+            .observe(event(
+                7,
+                "turn/completed",
+                serde_json::json!({
+                    "threadId":"thread-1", "turn":{"id":"turn-1","status":"completed","error":null}
+                }),
+            ))
+            .expect("terminal outcome");
+        let (outcome, isolated) =
+            settle_terminal(terminal, collector.text_overflowed(), &network);
+        assert!(!isolated);
+        assert_eq!(
+            outcome,
+            TextTransformOutcome::Failed(TextTransformErrorCode::StaleGeneration)
         );
     }
 
@@ -1122,7 +1172,11 @@ mod tests {
                 }),
             ))
             .expect("terminal outcome");
-        let (outcome, isolated) = settle_terminal(terminal, collector.text_overflowed());
+        let (outcome, isolated) = settle_terminal(
+            terminal,
+            collector.text_overflowed(),
+            &NetworkRevisionGuard::fixed(0),
+        );
         assert!(!isolated);
         assert_eq!(
             outcome,
@@ -1151,7 +1205,11 @@ mod tests {
                 }),
             ))
             .expect("terminal outcome");
-        let (outcome, isolated) = settle_terminal(terminal, collector.text_overflowed());
+        let (outcome, isolated) = settle_terminal(
+            terminal,
+            collector.text_overflowed(),
+            &NetworkRevisionGuard::fixed(0),
+        );
         assert!(!isolated);
         assert_eq!(outcome, TextTransformOutcome::Succeeded { text: body });
     }
