@@ -63,6 +63,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use hane_network::ChildProxyPlan;
 use serde_json::Value;
 
 use crate::owner_lock::{OwnerLock, OwnerLockGuard};
@@ -204,6 +205,11 @@ pub struct RuntimeConfig {
     /// intentionally independent of the Editor's current document/worktree.
     pub working_directory: Option<PathBuf>,
     pub extra_env: Vec<(String, String)>,
+    /// The proxy plan built from one network snapshot. The child's proxy
+    /// variables come only from this plan; every proxy variable of the
+    /// parent process is removed. `None` means no proxy (Direct). Its Debug
+    /// output is redacted.
+    pub network: Option<ChildProxyPlan>,
     pub owner_lock_path: PathBuf,
     pub start_timeout: Duration,
     pub stop_grace_timeout: Duration,
@@ -224,6 +230,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("inherit_parent_home", &self.inherit_parent_home)
             .field("working_directory", &self.working_directory)
             .field("extra_env", &redacted_env)
+            .field("network", &self.network)
             .field("owner_lock_path", &self.owner_lock_path)
             .field("start_timeout", &self.start_timeout)
             .field("stop_grace_timeout", &self.stop_grace_timeout)
@@ -241,6 +248,7 @@ impl RuntimeConfig {
             inherit_parent_home: true,
             working_directory: None,
             extra_env: Vec::new(),
+            network: None,
             owner_lock_path: owner_lock_path.into(),
             start_timeout: Duration::from_secs(20),
             stop_grace_timeout: Duration::from_secs(5),
@@ -274,9 +282,11 @@ impl RuntimeConfig {
         let mut cmd = StdCommand::new(&self.binary_path);
         cmd.args(&self.args);
         cmd.env_clear();
-        cmd.envs(filtered_parent_environment(std::env::vars_os()).filter(|(key, _)| {
-            self.inherit_parent_home || !is_parent_home_variable(key)
-        }));
+        cmd.envs(child_environment(
+            std::env::vars_os(),
+            self.inherit_parent_home,
+            self.network.as_ref(),
+        ));
         cmd.env("CODEX_HOME", codex_home);
         cmd.envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         cmd.current_dir(working_directory);
@@ -342,6 +352,48 @@ fn filtered_parent_environment(
     })
 }
 
+/// Proxy variable names removed from the parent environment, compared
+/// case-insensitively. The child's proxy configuration comes only from the
+/// network snapshot's plan.
+const PARENT_PROXY_VARS: &[&str] = &[
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "SOCKS_PROXY",
+];
+
+fn is_parent_proxy_variable(key: &OsString) -> bool {
+    let key = key.to_string_lossy();
+    PARENT_PROXY_VARS
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+}
+
+/// The child's inherited environment: the allowlisted parent variables
+/// without any proxy variable, plus the proxy variables of `plan` (none for
+/// Direct / `None`).
+fn child_environment(
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+    inherit_parent_home: bool,
+    plan: Option<&ChildProxyPlan>,
+) -> Vec<(OsString, OsString)> {
+    let mut vars: Vec<(OsString, OsString)> = filtered_parent_environment(parent)
+        .filter(|(key, _)| inherit_parent_home || !is_parent_home_variable(key))
+        .filter(|(key, _)| !is_parent_proxy_variable(key))
+        .collect();
+    if let Some(plan) = plan {
+        vars.extend(
+            plan.apply(Vec::<(String, String)>::new())
+                .into_pairs()
+                .into_iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        );
+    }
+    vars
+}
+
 fn is_parent_home_variable(key: &OsString) -> bool {
     key.to_string_lossy().eq_ignore_ascii_case("HOME")
         || key.to_string_lossy().eq_ignore_ascii_case("USERPROFILE")
@@ -362,6 +414,11 @@ struct SharedState {
     /// `crate::connect`) can bind its check to what this runtime has
     /// actually applied, not only to its own bookkeeping.
     config_generation: u64,
+    /// The network snapshot revision the currently applied `RuntimeConfig`
+    /// was built from. Updated together with `config_generation` when a
+    /// `reconfigure` swaps `config`, so a response from a child started for
+    /// an older revision is recognizable as stale.
+    network_revision: u64,
     ready_transport: Option<Arc<RpcCore>>,
     /// When `Some`, a `start()` is already in flight and this holds the
     /// reply channels of every additional concurrent caller that attached to
@@ -402,7 +459,8 @@ enum LifecycleCommand {
     /// the new `RuntimeConfig` was built for; it becomes this coordinator's
     /// `config_generation` as soon as the swap happens, before the restart
     /// itself is even attempted. See [`AiRuntime::reconfigure`].
-    Reconfigure(RuntimeConfig, u64),
+    /// The last `u64` is the network snapshot revision of the new config.
+    Reconfigure(RuntimeConfig, u64, u64),
 }
 
 /// A boxed callback carrying the owner lock guard this coordinator currently
@@ -445,6 +503,26 @@ impl AiRuntime {
         AiRuntime::spawn_with_configured_settings_generation(config, 0, handler, events_tx)
     }
 
+    /// Same as [`Self::spawn_with_configured_settings_generation`], and also
+    /// records the network snapshot revision the initial config was built
+    /// from. See [`Self::configured_network_revision`].
+    pub fn spawn_with_configured_generations(
+        config: RuntimeConfig,
+        configured_settings_generation: u64,
+        configured_network_revision: u64,
+        handler: Arc<dyn ServerRequestHandler>,
+        events_tx: SyncSender<RuntimeEvent>,
+    ) -> AiRuntime {
+        let runtime = AiRuntime::spawn_with_configured_settings_generation(
+            config,
+            configured_settings_generation,
+            handler,
+            events_tx,
+        );
+        runtime.shared.lock().unwrap().network_revision = configured_network_revision;
+        runtime
+    }
+
     /// Same as [`Self::spawn`], but additionally records
     /// `configured_settings_generation` as the `settings_generation` this
     /// initial `RuntimeConfig` was built for, exactly as a later
@@ -464,6 +542,7 @@ impl AiRuntime {
             generation: 0,
             operation_generation: 0,
             config_generation: configured_settings_generation,
+            network_revision: 0,
             ready_transport: None,
             start_inflight: None,
             restart_inflight: None,
@@ -615,10 +694,61 @@ impl AiRuntime {
         new_config: RuntimeConfig,
         new_configured_settings_generation: u64,
     ) -> Result<RuntimeStatus, RuntimeError> {
+        // Keeps the current network revision: only a caller that supplies a
+        // new snapshot uses `reconfigure_with_network_revision`.
+        let network_revision = self.shared.lock().unwrap().network_revision;
+        self.reconfigure_with_network_revision(
+            new_config,
+            new_configured_settings_generation,
+            network_revision,
+        )
+    }
+
+    /// Same as [`Self::reconfigure`], and records `new_network_revision` as
+    /// the network snapshot revision of `new_config`. The old child is
+    /// confirmed stopped before the new one starts, exactly as for
+    /// `reconfigure`.
+    pub fn reconfigure_with_network_revision(
+        &self,
+        new_config: RuntimeConfig,
+        new_configured_settings_generation: u64,
+        new_network_revision: u64,
+    ) -> Result<RuntimeStatus, RuntimeError> {
         self.send_lifecycle(LifecycleCommand::Reconfigure(
             new_config,
             new_configured_settings_generation,
+            new_network_revision,
         ))
+    }
+
+    /// The network snapshot revision of the `RuntimeConfig` currently applied
+    /// to this coordinator.
+    pub fn configured_network_revision(&self) -> u64 {
+        self.shared.lock().unwrap().network_revision
+    }
+
+    /// Like [`Self::call`], but only while this runtime is `Ready` for
+    /// `network_revision`. A caller that started an operation under an older
+    /// network snapshot gets `NotReady` instead of a child started for a
+    /// newer one, so a response is never attributed to the wrong settings.
+    pub fn call_for_network_revision(
+        &self,
+        network_revision: u64,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, RuntimeError> {
+        let core = {
+            let guard = self.shared.lock().unwrap();
+            match (guard.status, &guard.ready_transport) {
+                (RuntimeState::Ready, Some(core)) if guard.network_revision == network_revision => {
+                    core.clone()
+                }
+                _ => return Err(RuntimeError::NotReady),
+            }
+        };
+        core.call(method, params, timeout)
+            .map_err(RuntimeError::Rpc)
     }
 
     /// Returns the `settings_generation` the `RuntimeConfig` *currently
@@ -835,6 +965,7 @@ fn run_coordinator(
                     LifecycleCommand::Reconfigure(
                         new_config,
                         new_configured_settings_generation,
+                        new_network_revision,
                     ) => {
                         // A currently held `owner_guard` proves ownership of
                         // `config.owner_lock_path`, not of whatever path
@@ -891,6 +1022,7 @@ fn run_coordinator(
                                         let mut state = shared.lock().unwrap();
                                         state.config_generation =
                                             new_configured_settings_generation;
+                                        state.network_revision = new_network_revision;
                                     }
                                     do_start(
                                         op_gen,
@@ -1122,7 +1254,7 @@ fn handle_lifecycle(
                 reply,
             )
         }
-        LifecycleCommand::Reconfigure(_, _) => {
+        LifecycleCommand::Reconfigure(_, _, _) => {
             unreachable!(
                 "Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle"
             )
@@ -1909,6 +2041,99 @@ mod tests {
                 "unexpected inherited variable: {blocked}"
             );
         }
+    }
+
+    fn parent_with_conflicting_proxies() -> Vec<(OsString, OsString)> {
+        [
+            ("PATH", "/usr/bin"),
+            ("SSL_CERT_FILE", "/tmp/ca.pem"),
+            ("ALL_PROXY", "http://conflict:1"),
+            ("Http_Proxy", "http://conflict:2"),
+            ("HTTPS_PROXY", "http://conflict:3"),
+            ("no_proxy", "conflict"),
+            ("socks_proxy", "socks5://conflict:4"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect()
+    }
+
+    fn proxy_plan(vars: &[(&str, &str)]) -> ChildProxyPlan {
+        use hane_network::{EnvPlatform, NetworkContext, ProxyEnvironment};
+        NetworkContext::from_environment(ProxyEnvironment::from_vars(
+            EnvPlatform::MacOs,
+            vars.iter().copied(),
+        ))
+        .child_proxy_plan()
+        .expect("plan")
+    }
+
+    #[test]
+    fn child_environment_without_a_plan_removes_every_parent_proxy_variable() {
+        let env: std::collections::HashMap<_, _> =
+            child_environment(parent_with_conflicting_proxies(), true, None)
+                .into_iter()
+                .collect();
+        assert_eq!(env.len(), 2);
+        assert!(env.contains_key(OsStr::new("PATH")));
+        assert!(env.contains_key(OsStr::new("SSL_CERT_FILE")));
+    }
+
+    #[test]
+    fn child_environment_uses_only_the_plan_and_keeps_loopback_direct() {
+        let plan = proxy_plan(&[("https_proxy", "http://proxy.test:3128")]);
+        let env: std::collections::HashMap<_, _> =
+            child_environment(parent_with_conflicting_proxies(), true, Some(&plan))
+                .into_iter()
+                .collect();
+        assert_eq!(
+            env.get(OsStr::new("HTTPS_PROXY")),
+            Some(&OsString::from("http://proxy.test:3128"))
+        );
+        assert_eq!(
+            env.get(OsStr::new("https_proxy")),
+            Some(&OsString::from("http://proxy.test:3128"))
+        );
+        assert_eq!(
+            env.get(OsStr::new("NO_PROXY")),
+            Some(&OsString::from("localhost,127.0.0.1,::1"))
+        );
+        for gone in ["ALL_PROXY", "Http_Proxy", "socks_proxy"] {
+            assert!(!env.contains_key(OsStr::new(gone)), "{gone}");
+        }
+        assert!(env.contains_key(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn runtime_config_debug_does_not_show_proxy_values() {
+        let mut config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+        config.network = Some(proxy_plan(&[(
+            "https_proxy",
+            "http://dummy-user:dummy-pass@proxy.test:3128",
+        )]));
+        let text = format!("{config:?}");
+        assert!(!text.contains("dummy-user"));
+        assert!(!text.contains("dummy-pass"));
+        assert!(!text.contains("proxy.test"));
+    }
+
+    #[test]
+    fn network_revision_follows_reconfigure_and_gates_calls() {
+        let (events_tx, _events_rx) = mpsc::sync_channel(8);
+        let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+        let runtime = AiRuntime::spawn_with_configured_generations(
+            config,
+            3,
+            5,
+            Arc::new(crate::rpc::RejectAllServerRequests),
+            events_tx,
+        );
+        assert_eq!(runtime.configured_network_revision(), 5);
+        // Not Ready: a call for any revision is rejected, never retried.
+        assert!(matches!(
+            runtime.call_for_network_revision(5, "x", None, Duration::from_millis(10)),
+            Err(RuntimeError::NotReady)
+        ));
     }
 
     #[test]

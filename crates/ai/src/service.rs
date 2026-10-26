@@ -29,7 +29,9 @@ use crate::paths::AiPaths;
 use crate::probe::{ProbeDiagnostic, ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
-use crate::runtime::{AiRuntime, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime::{
+    AiRuntime, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState,
+};
 use crate::runtime_distribution;
 use crate::runtime_distribution::{
     EXPLICIT_OVERRIDE_ENV_VAR, RuntimeDistributionErrorCode, classify_handshake_failure,
@@ -276,6 +278,26 @@ pub struct AiService {
     handle: AiServiceHandle,
     shutdown_tx: mpsc::Sender<()>,
     worker: Option<JoinHandle<()>>,
+    network: Arc<Mutex<NetworkSnapshot>>,
+}
+
+/// One network snapshot and its revision. A saved network setting advances
+/// the revision; every operation the worker starts afterwards uses the new
+/// snapshot, while an operation already running keeps the snapshot it began
+/// with.
+#[derive(Clone)]
+struct NetworkSnapshot {
+    revision: u64,
+    context: NetworkContext,
+}
+
+impl Default for NetworkSnapshot {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            context: NetworkContext::default(),
+        }
+    }
 }
 
 impl AiServiceHandle {
@@ -603,16 +625,41 @@ impl AiService {
             cancel_tx,
             shared: shared.clone(),
         };
+        let network = Arc::new(Mutex::new(NetworkSnapshot {
+            revision: 0,
+            context: network,
+        }));
+        let worker_network = network.clone();
         let worker = thread::Builder::new()
             .name("hane-ai-service".to_string())
             .spawn(move || {
-                service_worker(config, network, command_rx, cancel_rx, shutdown_rx, shared)
+                service_worker(
+                    config,
+                    worker_network,
+                    command_rx,
+                    cancel_rx,
+                    shutdown_rx,
+                    shared,
+                )
             })?;
         Ok(AiService {
             handle,
             shutdown_tx,
             worker: Some(worker),
+            network,
         })
+    }
+
+    /// Records a saved network setting and returns its new revision. Only
+    /// operations that start afterwards use it; this never starts a login,
+    /// runtime download or text transform by itself. The next operation that
+    /// needs the runtime stops the old child, confirms it is gone, and starts
+    /// a new one with the new snapshot.
+    pub fn apply_network(&self, context: NetworkContext) -> u64 {
+        let mut snapshot = self.network.lock().unwrap();
+        snapshot.revision = snapshot.revision.saturating_add(1);
+        snapshot.context = context;
+        snapshot.revision
     }
 
     pub fn handle(&self) -> AiServiceHandle {
@@ -659,11 +706,14 @@ struct WorkerState {
     /// (e.g. a corrupted or tampered prior install); surfaced the same way
     /// `AiServiceConfig::binary_resolution_error` already is.
     runtime_binary_error: Option<RuntimeDistributionErrorCode>,
+    /// The network snapshot of the command being handled, taken once when
+    /// the worker dequeued it.
+    network: NetworkSnapshot,
 }
 
 fn service_worker(
     config: AiServiceConfig,
-    network: NetworkContext,
+    network_cell: Arc<Mutex<NetworkSnapshot>>,
     command_rx: Receiver<QueuedCommand>,
     cancel_rx: Receiver<OperationId>,
     shutdown_rx: Receiver<()>,
@@ -686,6 +736,7 @@ fn service_worker(
         deferred_runtime_events: VecDeque::new(),
         runtime_binary: None,
         runtime_binary_error: None,
+        network: network_cell.lock().unwrap().clone(),
     };
     resolve_runtime_binary_at_startup(&paths, &mut state, &shared);
     let mut settings = AiSettings::default();
@@ -731,20 +782,25 @@ fn service_worker(
         }
 
         match command_rx.recv_timeout(EVENT_POLL) {
-            Ok(queued) => handle_command(
-                queued,
-                &config,
-                &network,
-                &paths,
-                &settings_store,
-                &journal,
-                &shared,
-                &mut state,
-                &mut settings,
-                &cancel_rx,
-                &shutdown_rx,
-                &mut shutdown,
-            ),
+            Ok(queued) => {
+                // One consistent snapshot for the whole command.
+                state.network = network_cell.lock().unwrap().clone();
+                let network = state.network.context.clone();
+                handle_command(
+                    queued,
+                    &config,
+                    &network,
+                    &paths,
+                    &settings_store,
+                    &journal,
+                    &shared,
+                    &mut state,
+                    &mut settings,
+                    &cancel_rx,
+                    &shutdown_rx,
+                    &mut shutdown,
+                );
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => shutdown = true,
         }
@@ -2369,13 +2425,20 @@ fn finish_persisted_save(
                 paths.runtime_owner_lock_path(),
                 config.shell_env_format,
             )
-            .map_err(|_| ()),
+            .map_err(|_| ())
+            .and_then(|mut configured| {
+                attach_network_plan(&mut configured.config, &state.network).map(|()| configured)
+            }),
             Err(_) => Err(()),
         };
         match new_config {
             Ok(configured) => {
                 if runtime
-                    .reconfigure(configured.config, configured.settings_generation)
+                    .reconfigure_with_network_revision(
+                        configured.config,
+                        configured.settings_generation,
+                        state.network.revision,
+                    )
                     .is_err()
                 {
                     apply_failed = true;
@@ -2403,6 +2466,15 @@ fn finish_persisted_save(
         },
         LoginState::Idle,
     );
+}
+
+/// Sets the child's proxy plan from the command's network snapshot. Fails
+/// explicitly when the plan cannot be built (invalid environment, missing or
+/// unreadable credential); the caller must then not start the child.
+fn attach_network_plan(config: &mut RuntimeConfig, network: &NetworkSnapshot) -> Result<(), ()> {
+    let plan = network.context.child_proxy_plan().map_err(|_| ())?;
+    config.network = Some(plan);
+    Ok(())
 }
 
 fn stop_runtime_for_recovery(
@@ -2678,8 +2750,10 @@ fn ensure_runtime<'a>(
             return Err(());
         }
     };
+    let network_revision = state.network.revision;
     let needs_config = state.runtime.as_ref().is_none_or(|runtime| {
         runtime.configured_settings_generation() != settings.settings_generation
+            || runtime.configured_network_revision() != network_revision
     });
     if needs_config {
         let configured = build_runtime_config_for_active_connection(
@@ -2690,10 +2764,13 @@ fn ensure_runtime<'a>(
             paths.runtime_owner_lock_path(),
             config.shell_env_format,
         );
-        let configured = match configured {
+        let mut configured = match configured {
             Ok(configured) => configured,
             Err(_) => return Err(()),
         };
+        // A proxy or credential failure is an explicit error here: the child
+        // is never started unauthenticated or directly instead.
+        attach_network_plan(&mut configured.config, &state.network)?;
         if let Some(runtime) = state.runtime.as_ref() {
             let status = runtime.snapshot();
             if status.restart_blocked {
@@ -2710,9 +2787,10 @@ fn ensure_runtime<'a>(
                 let old_runtime = state.runtime.take();
                 drop(old_runtime);
                 let (event_tx, event_rx) = mpsc::sync_channel(128);
-                let runtime = AiRuntime::spawn_with_configured_settings_generation(
+                let runtime = AiRuntime::spawn_with_configured_generations(
                     configured.config,
                     configured.settings_generation,
+                    network_revision,
                     Arc::new(RejectAllServerRequests),
                     event_tx,
                 );
@@ -2732,14 +2810,19 @@ fn ensure_runtime<'a>(
                 state.runtime = Some(runtime);
             } else {
                 runtime
-                    .reconfigure(configured.config, configured.settings_generation)
+                    .reconfigure_with_network_revision(
+                        configured.config,
+                        configured.settings_generation,
+                        network_revision,
+                    )
                     .map_err(|_| ())?;
             }
         } else {
             let (event_tx, event_rx) = mpsc::sync_channel(128);
-            let runtime = AiRuntime::spawn_with_configured_settings_generation(
+            let runtime = AiRuntime::spawn_with_configured_generations(
                 configured.config,
                 configured.settings_generation,
+                network_revision,
                 Arc::new(RejectAllServerRequests),
                 event_tx,
             );
@@ -3426,6 +3509,51 @@ mod tests {
         assert_eq!(code, RuntimeInstallErrorCode::PermissionDenied);
     }
 
+    struct MissingProxyCredential;
+
+    impl hane_network::CredentialStore for MissingProxyCredential {
+        fn load(
+            &self,
+            _: &hane_network::CredentialRef,
+        ) -> Result<hane_network::BasicCredentials, hane_network::CredentialError> {
+            Err(hane_network::CredentialError::NotFound)
+        }
+    }
+
+    fn manual_basic_snapshot(revision: u64) -> NetworkSnapshot {
+        use hane_network::{
+            EnvPlatform, ManualProxy, NetworkSettings, ProxyAuth, ProxyEnvironment,
+        };
+        let manual = ManualProxy::new(
+            "http://proxy.test:3128",
+            "",
+            ProxyAuth::Basic(hane_network::CredentialRef::new("proxy-1").unwrap()),
+        )
+        .unwrap();
+        NetworkSnapshot {
+            revision,
+            context: NetworkContext::new(
+                NetworkSettings::manual(manual),
+                ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
+                Arc::new(MissingProxyCredential),
+            ),
+        }
+    }
+
+    #[test]
+    fn network_plan_failure_is_explicit_and_never_falls_back_to_direct() {
+        let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
+        assert!(attach_network_plan(&mut config, &manual_basic_snapshot(1)).is_err());
+        assert!(config.network.is_none());
+    }
+
+    #[test]
+    fn network_plan_is_taken_from_the_commands_snapshot() {
+        let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
+        attach_network_plan(&mut config, &NetworkSnapshot::default()).unwrap();
+        assert!(config.network.is_some());
+    }
+
     fn test_handle(snapshot: AiSnapshot) -> AiServiceHandle {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);
         let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
@@ -3472,6 +3600,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
 
         reset_early_login_buffer(&mut state);
@@ -3620,6 +3749,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let config = AiServiceConfig {
             app_data_root: data_root.clone(),
@@ -3697,6 +3827,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let config = AiServiceConfig {
             app_data_root: data_root.clone(),
@@ -3775,6 +3906,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -3832,6 +3964,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -3878,6 +4011,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {

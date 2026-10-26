@@ -230,6 +230,109 @@ struct ChildEnvironment {
     install_id: String,
     transaction_id: String,
     vars: std::collections::BTreeMap<String, String>,
+    /// Variable name -> opaque, transaction-bound reference of the temporary OS
+    /// secret holding the proxy `user:password` that was removed from that
+    /// variable's URL. The reference is not a secret; the userinfo itself is
+    /// never written to this file.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    secret_refs: std::collections::BTreeMap<String, String>,
+}
+
+/// Proxy variables whose value is a URL that may carry `user:password@`.
+const PROXY_URL_VARS: &[&str] = &["ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"];
+
+fn is_proxy_url_var(name: &str) -> bool {
+    PROXY_URL_VARS
+        .iter()
+        .any(|proxy| name.eq_ignore_ascii_case(proxy))
+}
+
+/// Temporary OS secret store for the proxy userinfo of one restart
+/// transaction (Keychain on macOS, Credential Manager on Windows). Entries are
+/// addressed by an opaque reference derived from the transaction id and are
+/// consumed exactly once. Implementations must never write a secret anywhere
+/// but the OS store and must not put it into an error message.
+pub trait TransientSecretStore {
+    fn put(&self, reference: &str, secret: &str) -> Result<()>;
+    /// Returns the secret and removes it (one-time claim). `Ok(None)` when no
+    /// such entry exists.
+    fn take(&self, reference: &str) -> Result<Option<String>>;
+    /// Removing an absent entry is not an error.
+    fn delete(&self, reference: &str) -> Result<()>;
+}
+
+/// The store used when no OS secret backend is supplied. Every `put` fails, so
+/// a proxy with userinfo aborts the handoff instead of being written to a file
+/// or restored without authentication.
+pub struct UnavailableSecretStore;
+
+fn secret_store_unavailable() -> UpdateError {
+    UpdateError::new(
+        ErrorCode::Io,
+        "the proxy credential for the restart cannot be handed over safely",
+    )
+}
+
+impl TransientSecretStore for UnavailableSecretStore {
+    fn put(&self, _: &str, _: &str) -> Result<()> {
+        Err(secret_store_unavailable())
+    }
+
+    fn take(&self, _: &str) -> Result<Option<String>> {
+        Err(secret_store_unavailable())
+    }
+
+    fn delete(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The opaque reference of the `index`-th secret of `transaction`.
+fn secret_ref(transaction: &TransactionId, index: usize) -> String {
+    format!("{}.{index}", transaction.as_str())
+}
+
+fn secret_ref_ok(transaction: &TransactionId, reference: &str) -> bool {
+    reference
+        .strip_prefix(transaction.as_str())
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|index| {
+            !index.is_empty() && index.len() <= 4 && index.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// Splits a proxy value into the value without userinfo and the userinfo. A
+/// value with `@` only after the authority (path, query) is refused rather
+/// than stored.
+fn split_userinfo(value: &str) -> Result<(String, Option<String>)> {
+    let (scheme, rest) = match value.find("://") {
+        Some(index) => value.split_at(index + 3),
+        None => ("", value),
+    };
+    let end = rest
+        .find(|c| matches!(c, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.rfind('@') {
+        Some(at) => Ok((
+            format!("{scheme}{}{tail}", &authority[at + 1..]),
+            Some(authority[..at].to_owned()),
+        )),
+        None if tail.contains('@') => {
+            Err(mismatch("a proxy value has credentials outside its authority"))
+        }
+        None => Ok((value.to_owned(), None)),
+    }
+}
+
+fn join_userinfo(value: &str, userinfo: &str) -> String {
+    match value.find("://") {
+        Some(index) => {
+            let (scheme, rest) = value.split_at(index + 3);
+            format!("{scheme}{userinfo}@{rest}")
+        }
+        None => format!("{userinfo}@{value}"),
+    }
 }
 
 fn environment_path(coordination: &Coordination, transaction: &TransactionId) -> PathBuf {
@@ -265,27 +368,98 @@ fn env_value_ok(name: &str, value: &str) -> bool {
 /// or with control characters is simply left out. Names are matched against the
 /// allowlist ASCII case-insensitively, like the normal AI runtime does, and the
 /// original spelling of the name is kept.
+///
+/// A proxy variable with `user:password@` never has its userinfo written: this
+/// form fails with an error instead (the handoff is aborted and the running
+/// version stays). Use [`publish_environment_with_secrets`] to carry the
+/// userinfo through a temporary OS secret.
 pub fn publish_environment(
     coordination: &Coordination,
     transaction: &TransactionId,
     ambient: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<()> {
-    let vars = ambient
-        .into_iter()
-        .filter_map(|(name, value)| {
-            let name = name.into_string().ok()?;
-            if !env_name_allowed(&name) {
-                return None;
-            }
-            let value = value.into_string().ok()?;
-            env_value_ok(&name, &value).then_some((name, value))
-        })
-        .collect();
+    publish_environment_with_secrets(coordination, transaction, ambient, &UnavailableSecretStore)
+}
+
+/// Like [`publish_environment`], but the userinfo of a proxy URL is moved into
+/// `secrets` under a reference bound to `transaction`; only that non-secret
+/// reference is recorded. When anything fails, every secret stored so far is
+/// deleted again and nothing is left behind.
+pub fn publish_environment_with_secrets(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    ambient: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    secrets: &dyn TransientSecretStore,
+) -> Result<()> {
+    let mut vars = std::collections::BTreeMap::new();
+    let mut secret_refs = std::collections::BTreeMap::new();
+    let mut stored: Vec<String> = Vec::new();
+    let result = collect_environment(
+        transaction,
+        ambient,
+        secrets,
+        &mut vars,
+        &mut secret_refs,
+        &mut stored,
+    )
+    .and_then(|()| write_environment(coordination, transaction, vars, secret_refs));
+    if result.is_err() {
+        for reference in &stored {
+            let _ = secrets.delete(reference);
+        }
+    }
+    result
+}
+
+fn collect_environment(
+    transaction: &TransactionId,
+    ambient: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    secrets: &dyn TransientSecretStore,
+    vars: &mut std::collections::BTreeMap<String, String>,
+    secret_refs: &mut std::collections::BTreeMap<String, String>,
+    stored: &mut Vec<String>,
+) -> Result<()> {
+    for (name, value) in ambient {
+        let Ok(name) = name.into_string() else {
+            continue;
+        };
+        if !env_name_allowed(&name) {
+            continue;
+        }
+        let Ok(value) = value.into_string() else {
+            continue;
+        };
+        let (value, userinfo) = if is_proxy_url_var(&name) {
+            split_userinfo(&value)?
+        } else {
+            (value, None)
+        };
+        if !env_value_ok(&name, &value) {
+            continue;
+        }
+        if let Some(userinfo) = userinfo.filter(|userinfo| !userinfo.is_empty()) {
+            let reference = secret_ref(transaction, stored.len());
+            secrets.put(&reference, &userinfo)?;
+            stored.push(reference.clone());
+            secret_refs.insert(name.clone(), reference);
+        }
+        vars.insert(name, value);
+    }
+    Ok(())
+}
+
+fn write_environment(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    vars: std::collections::BTreeMap<String, String>,
+    secret_refs: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let document = ChildEnvironment {
         schema: BINDING_SCHEMA,
         install_id: coordination.install_id().as_str().to_owned(),
         transaction_id: transaction.as_str().to_owned(),
         vars,
+        secret_refs,
     };
     let bytes = serde_json::to_vec(&document)
         .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
@@ -315,16 +489,87 @@ pub fn discard_environment(coordination: &Coordination, transaction: &Transactio
 /// Helper side: the recorded variables, re-checked against the allowlist and
 /// the limits. A missing record means no variables; a damaged, foreign or
 /// non-allowlisted one is an error.
+///
+/// A record that references a temporary proxy secret is refused here: without
+/// the secret store the child must not start with an unauthenticated proxy. Use
+/// [`read_environment_with_secrets`] for it.
 pub fn read_environment(
     coordination: &Coordination,
     transaction: &TransactionId,
 ) -> Result<Vec<(String, String)>> {
+    let (vars, secret_refs) = load_environment(coordination, transaction)?;
+    if secret_refs.is_empty() {
+        Ok(vars)
+    } else {
+        Err(secret_store_unavailable())
+    }
+}
+
+/// Like [`read_environment`], but restores the proxy userinfo from `secrets`.
+/// Every referenced secret is consumed exactly once, also when one of them is
+/// missing; a missing or unreadable secret is an error, never an
+/// unauthenticated proxy.
+pub fn read_environment_with_secrets(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    secrets: &dyn TransientSecretStore,
+) -> Result<Vec<(String, String)>> {
+    let (mut vars, secret_refs) = load_environment(coordination, transaction)?;
+    let mut failed = false;
+    for (name, reference) in &secret_refs {
+        match secrets.take(reference) {
+            Ok(Some(userinfo)) => {
+                if let Some((_, value)) = vars.iter_mut().find(|(key, _)| key == name) {
+                    *value = join_userinfo(value, &userinfo);
+                }
+            }
+            Ok(None) | Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(secret_store_unavailable())
+    } else {
+        Ok(vars)
+    }
+}
+
+/// Deletes the temporary secrets a recorded environment references (best
+/// effort, idempotent) and then the record itself. Used for every terminal path
+/// of a transaction: success, abort, rollback and recovery.
+pub fn discard_environment_with_secrets(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    secrets: &dyn TransientSecretStore,
+) {
+    let path = environment_path(coordination, transaction);
+    if let Ok(Some(bytes)) = read_limited(&path, ENVIRONMENT_LIMIT)
+        && let Ok(document) = parse_strict::<ChildEnvironment>(&bytes)
+    {
+        for reference in document.secret_refs.values() {
+            if secret_ref_ok(transaction, reference) {
+                let _ = secrets.delete(reference);
+            }
+        }
+    }
+    discard_environment(coordination, transaction);
+}
+
+#[allow(clippy::type_complexity)]
+fn load_environment(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+) -> Result<(
+    Vec<(String, String)>,
+    std::collections::BTreeMap<String, String>,
+)> {
     let path = environment_path(coordination, transaction);
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         // Only a genuinely absent record means "no variables"; any other
         // metadata failure (I/O, ACL) must not be mistaken for an empty one.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), std::collections::BTreeMap::new()));
+        }
         Err(err) => return Err(err.into()),
     }
     let bytes = read_private(&path, ENVIRONMENT_LIMIT, "the child environment")?;
@@ -345,9 +590,20 @@ pub fn read_environment(
         if !env_name_allowed(&name) || !env_value_ok(&name, &value) {
             return Err(mismatch("the child environment names a variable that is not allowed"));
         }
+        // A stored proxy value never carries credentials; a hand-written one
+        // that does is refused.
+        if is_proxy_url_var(&name) && !matches!(split_userinfo(&value), Ok((_, None))) {
+            return Err(mismatch("the child environment holds proxy credentials"));
+        }
         vars.push((name, value));
     }
-    Ok(vars)
+    for (name, reference) in &document.secret_refs {
+        let known = vars.iter().any(|(key, _)| key == name);
+        if !known || !is_proxy_url_var(name) || !secret_ref_ok(transaction, reference) {
+            return Err(mismatch("the child environment has an invalid secret reference"));
+        }
+    }
+    Ok((vars, document.secret_refs))
 }
 
 // ---------------------------------------------------------------- ticket
@@ -1111,6 +1367,200 @@ mod tests {
             assert!(vars.iter().all(|(key, _)| key != name), "{name} must stay out");
         }
         assert_eq!(vars.len(), network.len());
+    }
+
+    struct MemorySecrets {
+        entries: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+        capacity: usize,
+    }
+
+    impl MemorySecrets {
+        fn new(capacity: usize) -> Self {
+            Self { entries: Default::default(), capacity }
+        }
+
+        fn len(&self) -> usize {
+            self.entries.borrow().len()
+        }
+    }
+
+    impl TransientSecretStore for MemorySecrets {
+        fn put(&self, reference: &str, secret: &str) -> Result<()> {
+            if self.entries.borrow().len() >= self.capacity {
+                return Err(secret_store_unavailable());
+            }
+            self.entries.borrow_mut().insert(reference.to_owned(), secret.to_owned());
+            Ok(())
+        }
+
+        fn take(&self, reference: &str) -> Result<Option<String>> {
+            Ok(self.entries.borrow_mut().remove(reference))
+        }
+
+        fn delete(&self, reference: &str) -> Result<()> {
+            self.entries.borrow_mut().remove(reference);
+            Ok(())
+        }
+    }
+
+    const DUMMY_USER: &str = "dummy-proxy-user";
+    const DUMMY_PASS: &str = "dummy-proxy-pass";
+
+    fn proxy_ambient() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        [
+            ("HTTPS_PROXY", format!("http://{DUMMY_USER}:{DUMMY_PASS}@proxy.example:8443")),
+            ("http_proxy", "http://plain.example:8080".to_owned()),
+            ("HOME", "/home/u".to_owned()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+        .collect()
+    }
+
+    fn recorded_environment(fx: &Fixture) -> Option<Vec<u8>> {
+        fs::read(fx.coordination.transaction_dir(&fx.transaction).join(ENVIRONMENT_FILE)).ok()
+    }
+
+    #[test]
+    fn proxy_userinfo_is_never_written_and_without_a_secret_store_the_handoff_aborts() {
+        let fx = fixture();
+        let err = publish_environment(&fx.coordination, &fx.transaction, proxy_ambient());
+        assert!(err.is_err());
+        assert!(recorded_environment(&fx).is_none());
+        assert!(!format!("{err:?}").contains(DUMMY_PASS));
+    }
+
+    #[test]
+    fn proxy_userinfo_travels_through_a_one_time_transaction_bound_secret() {
+        let fx = fixture();
+        let secrets = MemorySecrets::new(8);
+        publish_environment_with_secrets(&fx.coordination, &fx.transaction, proxy_ambient(), &secrets)
+            .unwrap();
+        assert_eq!(secrets.len(), 1);
+
+        let text = String::from_utf8(recorded_environment(&fx).unwrap()).unwrap();
+        assert!(!text.contains(DUMMY_USER) && !text.contains(DUMMY_PASS));
+        assert!(text.contains("proxy.example:8443"));
+        assert!(text.contains(fx.transaction.as_str()));
+
+        // Without the store the record is refused rather than restored bare.
+        assert!(read_environment(&fx.coordination, &fx.transaction).is_err());
+        assert_eq!(secrets.len(), 1);
+
+        let vars =
+            read_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets).unwrap();
+        assert!(vars.contains(&(
+            "HTTPS_PROXY".to_owned(),
+            format!("http://{DUMMY_USER}:{DUMMY_PASS}@proxy.example:8443")
+        )));
+        assert!(vars.contains(&("http_proxy".to_owned(), "http://plain.example:8080".to_owned())));
+        // Consumed exactly once.
+        assert_eq!(secrets.len(), 0);
+        assert!(read_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets).is_err());
+    }
+
+    #[test]
+    fn a_failed_secret_store_leaves_no_record_and_no_secret() {
+        let fx = fixture();
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("HTTPS_PROXY", format!("http://{DUMMY_USER}:{DUMMY_PASS}@a.example:1")),
+            ("HTTP_PROXY", format!("http://{DUMMY_USER}:{DUMMY_PASS}@b.example:2")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+        .collect();
+        let secrets = MemorySecrets::new(1);
+        assert!(
+            publish_environment_with_secrets(&fx.coordination, &fx.transaction, ambient, &secrets)
+                .is_err()
+        );
+        assert_eq!(secrets.len(), 0);
+        assert!(recorded_environment(&fx).is_none());
+    }
+
+    #[test]
+    fn every_terminal_path_discards_the_secret_and_the_record() {
+        let fx = fixture();
+        let secrets = MemorySecrets::new(8);
+        publish_environment_with_secrets(&fx.coordination, &fx.transaction, proxy_ambient(), &secrets)
+            .unwrap();
+        discard_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets);
+        assert_eq!(secrets.len(), 0);
+        assert!(recorded_environment(&fx).is_none());
+        // Idempotent.
+        discard_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets);
+    }
+
+    #[test]
+    fn a_missing_secret_is_an_error_and_the_other_secrets_are_still_consumed() {
+        let fx = fixture();
+        let secrets = MemorySecrets::new(8);
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("HTTPS_PROXY", format!("http://{DUMMY_USER}:{DUMMY_PASS}@a.example:1")),
+            ("HTTP_PROXY", format!("http://{DUMMY_USER}:{DUMMY_PASS}@b.example:2")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+        .collect();
+        publish_environment_with_secrets(&fx.coordination, &fx.transaction, ambient, &secrets)
+            .unwrap();
+        assert_eq!(secrets.len(), 2);
+        let first = secret_ref(&fx.transaction, 0);
+        secrets.delete(&first).unwrap();
+        assert!(
+            read_environment_with_secrets(&fx.coordination, &fx.transaction, &secrets).is_err()
+        );
+        assert_eq!(secrets.len(), 0);
+    }
+
+    #[test]
+    fn a_forged_or_foreign_secret_reference_and_inline_credentials_are_refused() {
+        let fx = fixture();
+        let install = install_id();
+        let other = TransactionId::generate().unwrap();
+        for (vars, refs) in [
+            (
+                serde_json::json!({ "HTTPS_PROXY": "http://proxy.example:1" }),
+                serde_json::json!({ "HTTPS_PROXY": secret_ref(&other, 0) }),
+            ),
+            (
+                serde_json::json!({ "HTTPS_PROXY": "http://proxy.example:1" }),
+                serde_json::json!({ "NO_PROXY": secret_ref(&fx.transaction, 0) }),
+            ),
+            (
+                serde_json::json!({ "HTTPS_PROXY": "http://proxy.example:1" }),
+                serde_json::json!({ "HTTPS_PROXY": "../escape" }),
+            ),
+            (
+                serde_json::json!({ "HTTPS_PROXY": "http://a:b@proxy.example:1" }),
+                serde_json::json!({}),
+            ),
+        ] {
+            let doc = serde_json::json!({
+                "schema": 1,
+                "install_id": install.as_str(),
+                "transaction_id": fx.transaction.as_str(),
+                "vars": vars,
+                "secret_refs": refs,
+            });
+            fx.write_private(ENVIRONMENT_FILE, &serde_json::to_vec(&doc).unwrap());
+            assert!(
+                read_environment_with_secrets(&fx.coordination, &fx.transaction, &MemorySecrets::new(1))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_outside_the_authority_are_not_stored() {
+        for value in ["http://proxy.example/path?token=a@b", "proxy.example:1/#x@y"] {
+            assert!(split_userinfo(value).is_err(), "{value}");
+        }
+        assert_eq!(
+            split_userinfo("user:pw@proxy.example:1").unwrap(),
+            ("proxy.example:1".to_owned(), Some("user:pw".to_owned()))
+        );
+        assert_eq!(join_userinfo("proxy.example:1", "user:pw"), "user:pw@proxy.example:1");
     }
 
     #[test]

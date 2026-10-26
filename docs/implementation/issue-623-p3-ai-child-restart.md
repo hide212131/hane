@@ -2,12 +2,30 @@
 
 ## 状態
 
-この文書は実装担当向けの準備仕様です。製品コード・テストは未変更です。
+この文書は実装担当向けの準備仕様です。実装順3の初回実装の範囲と未実施事項は次節に記録します。
 
 - 対象Issue: [#623](https://github.com/hide212131/hane/issues/623)
 - 基準main: `746363579ff0ed2713e39d7b14c6d09bf38c2e8d`
 - 採用設計: `docs/design/http-proxy.md` の §§4.2、6.2、7、8、9（P7〜P9）
 - 先行段階: 共通network core #625と更新CONNECT/curl #628はmainへ反映済み
+
+## 実装状況（実装順3の初回実装）
+
+ビルド・test・lint・実runtime/GUIは、この実装の作成時点では未実行です。結果はCIと別のCommander操作で確認し、未確認項目をpassと扱いません。
+
+実装済み（コード上）:
+
+- `NetworkContext::child_proxy_plan()`: 一つのsnapshotから `ChildProxyPlan` を作る。credential取得失敗はエラー。
+- `RuntimeConfig::network`: pinned runtime childのproxy環境は、このplanだけから作る。親のproxy変数（`ALL_PROXY` / `FTP_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` / `SOCKS_PROXY`）は大小文字を区別せず全て除去する。planなしはDirect。
+- `AiService::apply_network`: network revisionを進める。以後に開始するコマンドだけが新snapshotを使い、設定変更だけではlogin・runtime取得・本文変換を開始しない。
+- `AiRuntime` のnetwork revision（`configured_network_revision` / `reconfigure_with_network_revision` / `call_for_network_revision`）: 再接続は旧childの停止確認後に新childを起動し、旧revisionの呼び出しは `NotReady` になる。
+- `hane_update::state_root`: `child-env.json` の proxy URLからuserinfoを除去し、transaction束縛の一時秘密参照 `TransientSecretStore` に分離する。保存・復元・削除に失敗した場合は認証なしproxyへ落とさず失敗する。`TransientSecretStore` を渡さない `publish_environment` は、userinfo付きproxyで失敗（旧版維持でabort）する。
+
+未実装・未確認:
+
+- `TransientSecretStore` のWindows Credential Manager / macOS Keychain実装と、`prepare_restart`・限定child起動・各終端経路（成功・中止・rollback・recovery）への配線。これが無い間、Environment modeでuserinfo付きproxyを使う更新handoffは安全側に中止される。
+- Manual modeの保存済みcredential referenceの更新後再ロード確認、設定UIからの `apply_network` 呼び出し（実装順4）。
+- 両OSのpinned runtimeとテストproxyによる実通信観測、focused reconnect GUI、両OS更新/restart GUI。
 
 ## 今回の範囲
 
