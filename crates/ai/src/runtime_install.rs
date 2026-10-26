@@ -37,13 +37,15 @@
 //! the box, and reusing it keeps this module free of new third-party
 //! dependencies.
 
-use std::io;
+use std::ffi::OsString;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hane_network::{BasicCredentials, NetworkContext, ProxyEndpoint, ResolvedRoute, Scheme};
 use serde::Deserialize;
 use url::Url;
 
@@ -377,11 +379,137 @@ pub trait ArchiveExtractor: Send + Sync {
 /// following redirects one hop at a time (never `curl -L`) so every hop's
 /// target host can be checked against `spec.allowed_hosts` before it is
 /// ever requested.
-#[derive(Debug, Default)]
-pub struct CurlArchiveDownloader;
+///
+/// Every hop resolves its route from the shared [`NetworkContext`] snapshot;
+/// curl itself is never left to pick a proxy from its own environment or
+/// configuration files.
+#[derive(Debug)]
+pub struct CurlArchiveDownloader {
+    network: NetworkContext,
+    last_failure: Mutex<Option<DownloadFailure>>,
+    /// Test seam, empty in production (only `with_test_seams` can fill it):
+    /// extra curl arguments (CA bundle, `--connect-to`) and parent-environment
+    /// entries. The production command construction and route decision are
+    /// unchanged.
+    seam_args: Vec<OsString>,
+    seam_envs: Vec<(OsString, OsString)>,
+}
 
-impl ArchiveDownloader for CurlArchiveDownloader {
-    fn download(
+/// Secret-free facts about why the last download attempt failed, so a proxy
+/// refusal, an origin status and a curl failure stay distinguishable. It never
+/// holds curl's stderr, headers, the proxy URL or a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadFailure {
+    /// The proxy settings or credential could not be used.
+    ProxyConfiguration,
+    /// The proxy answered the CONNECT with 407.
+    ProxyAuthentication,
+    /// The proxy answered the CONNECT with another failure status.
+    ProxyConnect(u16),
+    /// The origin (not the proxy) answered with this status.
+    OriginStatus(u16),
+    /// curl failed with this exit code (`-1` when it had none).
+    CurlExit(i32),
+    /// curl could not be started or driven.
+    CurlIo,
+}
+
+impl Default for CurlArchiveDownloader {
+    fn default() -> Self {
+        Self::new(NetworkContext::default())
+    }
+}
+
+impl CurlArchiveDownloader {
+    pub fn new(network: NetworkContext) -> Self {
+        Self {
+            network,
+            last_failure: Mutex::new(None),
+            seam_args: Vec::new(),
+            seam_envs: Vec::new(),
+        }
+    }
+
+    /// Test-only: adds curl arguments (for example `--cacert` and
+    /// `--connect-to` to reach a local fixture) and environment entries that
+    /// stand in for the parent process environment. Everything else, in
+    /// particular the route decision and the proxy options, is the production
+    /// code path.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_seams(
+        mut self,
+        args: Vec<OsString>,
+        envs: Vec<(OsString, OsString)>,
+    ) -> Self {
+        self.seam_args = args;
+        self.seam_envs = envs;
+        self
+    }
+
+    /// The failure recorded by the most recent `download` call, if it failed.
+    pub fn last_failure(&self) -> Option<DownloadFailure> {
+        *self.last_failure.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_failure(&self, failure: Option<DownloadFailure>) {
+        *self.last_failure.lock().unwrap_or_else(|e| e.into_inner()) = failure;
+    }
+
+    fn configuration_failure(&self) -> RuntimeInstallErrorCode {
+        self.set_failure(Some(DownloadFailure::ProxyConfiguration));
+        RuntimeInstallErrorCode::NetworkDownloadFailed
+    }
+
+    /// Resolves the route for `url` and builds the curl invocation for one
+    /// hop, plus the secret config (if any) to feed through stdin.
+    fn prepare_hop(
+        &self,
+        url: &str,
+        spec: &RuntimeInstallSpec,
+        dest: &Path,
+        header_path: &Path,
+    ) -> Result<CurlHop, RuntimeInstallErrorCode> {
+        let parsed = Url::parse(url).map_err(|_| RuntimeInstallErrorCode::DisallowedRedirectHost)?;
+        let host = parsed.host_str().unwrap_or_default();
+        let route = self
+            .network
+            .route(Scheme::Https, host)
+            .map_err(|_| self.configuration_failure())?;
+        let (proxy, credentials) = match route {
+            ResolvedRoute::Direct => (None, None),
+            ResolvedRoute::HttpProxy {
+                endpoint,
+                credentials,
+            } => {
+                let credentials = self
+                    .network
+                    .credentials(&credentials)
+                    .map_err(|_| self.configuration_failure())?;
+                (Some(endpoint), credentials)
+            }
+        };
+        let mut command = build_curl_command(
+            proxy.as_ref(),
+            credentials.is_some(),
+            spec.archive_size,
+            url,
+            dest,
+            header_path,
+            &self.seam_args,
+        );
+        let mut parent_names: Vec<OsString> = std::env::vars_os().map(|(name, _)| name).collect();
+        for (name, value) in &self.seam_envs {
+            command.env(name, value);
+            parent_names.push(name.clone());
+        }
+        strip_proxy_environment(&mut command, parent_names);
+        Ok(CurlHop {
+            command,
+            stdin: credentials.as_ref().map(curl_proxy_user_config),
+        })
+    }
+
+    fn download_hops(
         &self,
         spec: &RuntimeInstallSpec,
         dest: &Path,
@@ -394,35 +522,25 @@ impl ArchiveDownloader for CurlArchiveDownloader {
             }
             check_allowed_url(&current_url, &spec.allowed_hosts)?;
             let header_path = dest.with_extension("headers");
-            let mut command = Command::new("curl");
-            apply_no_console_window(&mut command);
-            command.arg("--silent");
-            // Keep the proxy's CONNECT response out of the -D header dump.
-            // The response is still parsed defensively below because curl can
-            // expose more than one HTTP response block in proxy setups.
-            command.arg("--suppress-connect-headers");
-            command.arg("--proto").arg("=https");
-            apply_download_timeout_args(&mut command);
-            command
-                .arg("--max-filesize")
-                .arg(spec.archive_size.to_string());
-            command.arg("-D").arg(&header_path);
-            command.arg("-o").arg(dest);
-            command.arg("-A").arg("hane-runtime-install/1");
-            command.arg("--").arg(&current_url);
-            let status = match run_cancelable(command, is_canceled) {
-                Ok(status) => status,
+            let hop = self.prepare_hop(&current_url, spec, dest, &header_path)?;
+            let outcome = match run_cancelable_io(hop.command, hop.stdin, true, is_canceled) {
+                Ok(outcome) => outcome,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     return Err(RuntimeInstallErrorCode::Canceled);
                 }
                 Err(error) => {
+                    self.set_failure(Some(DownloadFailure::CurlIo));
                     return Err(map_io_error(
                         &error,
                         RuntimeInstallErrorCode::NetworkDownloadFailed,
                     ));
                 }
             };
-            if !status.success() {
+            if !outcome.status.success() {
+                self.set_failure(Some(classify_curl_failure(
+                    outcome.status.code(),
+                    &outcome.write_out,
+                )));
                 return Err(RuntimeInstallErrorCode::NetworkDownloadFailed);
             }
             let headers = match std::fs::read_to_string(&header_path) {
@@ -446,9 +564,142 @@ impl ArchiveDownloader for CurlArchiveDownloader {
                 current_url = resolve_redirect_url(&current_url, &location)?;
                 continue;
             }
+            self.set_failure(Some(DownloadFailure::OriginStatus(status_code)));
             return Err(RuntimeInstallErrorCode::NetworkDownloadFailed);
         }
         Err(RuntimeInstallErrorCode::NetworkDownloadFailed)
+    }
+}
+
+impl ArchiveDownloader for CurlArchiveDownloader {
+    fn download(
+        &self,
+        spec: &RuntimeInstallSpec,
+        dest: &Path,
+        is_canceled: &dyn Fn() -> bool,
+    ) -> Result<(), RuntimeInstallErrorCode> {
+        self.set_failure(None);
+        let result = self.download_hops(spec, dest, is_canceled);
+        if result.is_err() {
+            // Never leave a partial archive or a header dump behind.
+            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(dest.with_extension("headers"));
+        }
+        result
+    }
+}
+
+/// One prepared curl invocation. `stdin` holds the secret `--config -` text
+/// when the proxy needs Basic credentials; it is never part of the argv.
+struct CurlHop {
+    command: Command,
+    stdin: Option<Vec<u8>>,
+}
+
+/// Proxy-related variable names removed from curl's inherited environment
+/// (compared case-insensitively). Certificate and PATH variables stay.
+const CURL_PROXY_VARS: [&str; 6] = [
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ftp_proxy",
+    "socks_proxy",
+    "no_proxy",
+];
+
+fn strip_proxy_environment(command: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        let is_proxy = name
+            .to_str()
+            .is_some_and(|text| CURL_PROXY_VARS.iter().any(|p| text.eq_ignore_ascii_case(p)));
+        if is_proxy {
+            command.env_remove(&name);
+        }
+    }
+}
+
+/// Builds the argv of one curl hop. The first option is `--disable` so no
+/// curlrc can add a proxy or disable verification; the proxy is chosen only
+/// here (`--proxy ""` for a direct route) and `--noproxy ""` stops curl from
+/// applying a bypass list of its own. Neither `-k`, `--proxy-insecure` nor
+/// `-L` is ever added. Credentials are not an argument: `--config -` reads
+/// them from stdin.
+fn build_curl_command(
+    proxy: Option<&ProxyEndpoint>,
+    has_credentials: bool,
+    max_filesize: u64,
+    url: &str,
+    dest: &Path,
+    header_path: &Path,
+    extra_args: &[OsString],
+) -> Command {
+    let mut command = Command::new("curl");
+    apply_no_console_window(&mut command);
+    command.arg("--disable");
+    command.arg("--silent");
+    // Keep the proxy's CONNECT response out of the -D header dump.
+    // The response is still parsed defensively below because curl can
+    // expose more than one HTTP response block in proxy setups.
+    command.arg("--suppress-connect-headers");
+    command.arg("--proto").arg("=https");
+    command.arg("--noproxy").arg("");
+    match proxy {
+        None => {
+            command.arg("--proxy").arg("");
+        }
+        Some(endpoint) => {
+            command.arg("--proxy").arg(endpoint.to_string());
+            if has_credentials {
+                command.arg("--proxy-basic").arg("--config").arg("-");
+            }
+        }
+    }
+    apply_download_timeout_args(&mut command);
+    command.arg("--max-filesize").arg(max_filesize.to_string());
+    command.arg("-D").arg(header_path);
+    command.arg("-o").arg(dest);
+    // The CONNECT status and the origin status are reported separately so a
+    // proxy refusal is not mistaken for an origin answer.
+    command.arg("-w").arg("%{http_connect} %{http_code}");
+    command.arg("-A").arg("hane-runtime-install/1");
+    command.args(extra_args);
+    command.arg("--").arg(url);
+    command
+}
+
+/// The curl config text that carries the proxy credential. Backslash and
+/// double quote are escaped as curl's config parser requires; control
+/// characters and a `:` in the user name were rejected before this point.
+fn curl_proxy_user_config(credentials: &BasicCredentials) -> Vec<u8> {
+    fn push_escaped(out: &mut String, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                other => out.push(other),
+            }
+        }
+    }
+    let mut config = String::from("proxy-user = \"");
+    push_escaped(&mut config, credentials.username().expose());
+    config.push(':');
+    push_escaped(&mut config, credentials.password().expose());
+    config.push_str("\"\n");
+    config.into_bytes()
+}
+
+/// Sorts a failed curl run into the secret-free categories using only the
+/// exit code and the `%{http_connect}` value that `-w` printed.
+fn classify_curl_failure(exit_code: Option<i32>, write_out: &str) -> DownloadFailure {
+    let connect = write_out
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    match connect {
+        407 => DownloadFailure::ProxyAuthentication,
+        0 | 200 => DownloadFailure::CurlExit(exit_code.unwrap_or(-1)),
+        other => DownloadFailure::ProxyConnect(other),
     }
 }
 
@@ -525,24 +776,103 @@ fn apply_download_timeout_args(command: &mut Command) {
 /// only cares about `-o`/`-D` file outputs and the exit status) and polls
 /// for completion, killing it promptly once `is_canceled` returns `true`.
 fn run_cancelable(
-    mut command: Command,
+    command: Command,
     is_canceled: &dyn Fn() -> bool,
 ) -> io::Result<std::process::ExitStatus> {
+    run_cancelable_io(command, None, false, is_canceled).map(|outcome| outcome.status)
+}
+
+struct RunOutcome {
+    status: std::process::ExitStatus,
+    /// What the child wrote to stdout (only captured on request, and only the
+    /// first few bytes: it is curl's `-w` text, never a body or a secret).
+    write_out: String,
+}
+
+/// Like [`run_cancelable`], optionally feeding `input` to the child's stdin.
+/// The input is written on its own thread and the pipe is closed after the
+/// write, so a child that never reads, exits early or is cancelled can not
+/// block this function: the child is always reaped and the pipe released
+/// before it returns. stderr is always discarded.
+fn run_cancelable_io(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    capture_stdout: bool,
+    is_canceled: &dyn Fn() -> bool,
+) -> io::Result<RunOutcome> {
     command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null());
     let mut child = command.spawn()?;
+    let mut writer: Option<std::thread::JoinHandle<io::Result<()>>> = None;
+    if let Some(bytes) = input
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        writer = Some(std::thread::spawn(move || {
+            let result = stdin.write_all(&bytes).and_then(|()| stdin.flush());
+            drop(stdin);
+            result
+        }));
+    }
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
+        if let Err(error) = take_writer_result(&mut writer, false) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The child's end of the pipe is closed, so the writer ends.
+                let _ = take_writer_result(&mut writer, true);
+                let mut write_out = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = (&mut stdout).take(256).read_to_string(&mut write_out);
+                }
+                return Ok(RunOutcome { status, write_out });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = take_writer_result(&mut writer, true);
+                return Err(error);
+            }
         }
         if is_canceled() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = take_writer_result(&mut writer, true);
             return Err(io::Error::new(io::ErrorKind::Interrupted, "canceled"));
         }
         std::thread::sleep(SUBPROCESS_POLL_INTERVAL);
+    }
+}
+
+/// Collects the stdin writer's result. A broken pipe only means the child
+/// stopped reading (it reports its own outcome through the exit status), so it
+/// is not an error; any other write failure is.
+fn take_writer_result(
+    writer: &mut Option<std::thread::JoinHandle<io::Result<()>>>,
+    wait: bool,
+) -> io::Result<()> {
+    let Some(handle) = writer.as_ref() else {
+        return Ok(());
+    };
+    if !wait && !handle.is_finished() {
+        return Ok(());
+    }
+    match writer.take().map(std::thread::JoinHandle::join) {
+        Some(Ok(Err(error))) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+        _ => Ok(()),
     }
 }
 
@@ -1266,5 +1596,215 @@ mod tests {
             ),
             Err(RuntimeInstallErrorCode::AmbiguousEntrypoint)
         );
+    }
+
+    fn argv(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn proxy_endpoint(url: &str) -> ProxyEndpoint {
+        use hane_network::{
+            EnvPlatform, NetworkContext, ProxyEnvironment, ResolvedRoute, Scheme,
+        };
+        let context = NetworkContext::from_environment(ProxyEnvironment::from_vars(
+            EnvPlatform::MacOs,
+            [("https_proxy", url)],
+        ));
+        match context.route(Scheme::Https, "github.com").unwrap() {
+            ResolvedRoute::HttpProxy { endpoint, .. } => endpoint,
+            ResolvedRoute::Direct => panic!("expected a proxy route"),
+        }
+    }
+
+    #[test]
+    fn curl_command_starts_with_disable_and_never_weakens_tls_or_follows_redirects() {
+        let endpoint = proxy_endpoint("http://proxy.example:3128");
+        for (proxy, credentials) in [(None, false), (Some(&endpoint), false), (Some(&endpoint), true)]
+        {
+            let command = build_curl_command(
+                proxy,
+                credentials,
+                10,
+                "https://github.com/a",
+                Path::new("dest"),
+                Path::new("dest.headers"),
+                &[],
+            );
+            let args = argv(&command);
+            assert_eq!(args[0], "--disable");
+            for forbidden in ["-k", "--insecure", "--proxy-insecure", "-L", "--location"] {
+                assert!(!args.iter().any(|arg| arg == forbidden), "{forbidden}");
+            }
+            let position = |name: &str| args.iter().position(|arg| arg == name).unwrap();
+            assert_eq!(args[position("--proto") + 1], "=https");
+            assert_eq!(args[position("--noproxy") + 1], "");
+            assert!(args.contains(&"--suppress-connect-headers".to_owned()));
+            assert!(args.contains(&"--connect-timeout".to_owned()));
+            assert!(args.contains(&"--speed-time".to_owned()));
+            assert_eq!(args[args.len() - 2], "--");
+            assert_eq!(args[args.len() - 1], "https://github.com/a");
+            match proxy {
+                None => assert_eq!(args[position("--proxy") + 1], ""),
+                Some(_) => assert_eq!(args[position("--proxy") + 1], "http://proxy.example:3128"),
+            }
+            assert_eq!(args.contains(&"--config".to_owned()), credentials);
+            if credentials {
+                assert_eq!(args[position("--config") + 1], "-");
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_credentials_never_appear_in_the_argv_and_are_escaped_for_the_config() {
+        let credentials = BasicCredentials::new("user", "p:\"\\ss word#");
+        let config = String::from_utf8(curl_proxy_user_config(&credentials)).unwrap();
+        assert_eq!(config, "proxy-user = \"user:p:\\\"\\\\ss word#\"\n");
+
+        let endpoint = proxy_endpoint("http://proxy.example:3128");
+        let command = build_curl_command(
+            Some(&endpoint),
+            true,
+            10,
+            "https://github.com/a",
+            Path::new("dest"),
+            Path::new("dest.headers"),
+            &[],
+        );
+        let joined = argv(&command).join(" ");
+        assert!(!joined.contains("ss word"));
+        assert!(!joined.contains("user:"));
+        assert!(!format!("{command:?}").contains("ss word"));
+    }
+
+    #[test]
+    fn proxy_variables_are_removed_from_the_child_in_any_case() {
+        let mut command = Command::new("curl");
+        strip_proxy_environment(
+            &mut command,
+            [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "All_Proxy",
+                "NO_PROXY",
+                "ftp_proxy",
+                "SOCKS_PROXY",
+                "SSL_CERT_FILE",
+                "PATH",
+            ]
+            .map(OsString::from),
+        );
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(removed.len(), 6, "{removed:?}");
+        assert!(!removed.iter().any(|name| name == "SSL_CERT_FILE" || name == "PATH"));
+    }
+
+    #[test]
+    fn curl_failures_are_sorted_without_secret_text() {
+        assert_eq!(
+            classify_curl_failure(Some(56), "407 000"),
+            DownloadFailure::ProxyAuthentication
+        );
+        assert_eq!(
+            classify_curl_failure(Some(56), "403 000"),
+            DownloadFailure::ProxyConnect(403)
+        );
+        assert_eq!(
+            classify_curl_failure(Some(60), "200 000"),
+            DownloadFailure::CurlExit(60)
+        );
+        assert_eq!(
+            classify_curl_failure(None, ""),
+            DownloadFailure::CurlExit(-1)
+        );
+    }
+
+    #[test]
+    fn an_unusable_credential_never_reaches_curl() {
+        use hane_network::{
+            CredentialError, CredentialRef, CredentialStore, EnvPlatform, ManualProxy,
+            NetworkSettings, ProxyAuth, ProxyEnvironment,
+        };
+        struct Missing;
+        impl CredentialStore for Missing {
+            fn load(&self, _: &CredentialRef) -> Result<BasicCredentials, CredentialError> {
+                Err(CredentialError::NotFound)
+            }
+        }
+        let manual = ManualProxy::new(
+            "http://proxy.example:3128",
+            "",
+            ProxyAuth::Basic(CredentialRef::new("c1").unwrap()),
+        )
+        .unwrap();
+        let downloader = CurlArchiveDownloader::new(NetworkContext::new(
+            NetworkSettings::manual(manual),
+            ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
+            Arc::new(Missing),
+        ));
+        let spec = install_spec_for_target(WINDOWS_X64_TARGET).unwrap();
+        let dir = std::env::temp_dir().join(format!("hane-curl-config-{}", std::process::id()));
+        let result = downloader.download(&spec, &dir.join("archive"), &|| false);
+        assert_eq!(result, Err(RuntimeInstallErrorCode::NetworkDownloadFailed));
+        assert_eq!(
+            downloader.last_failure(),
+            Some(DownloadFailure::ProxyConfiguration)
+        );
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_input_to_a_child_that_exits_without_reading_does_not_block() {
+        // 4 MiB is far more than a pipe buffer, so the write can only finish
+        // because the child's exit closes the pipe.
+        let started = std::time::Instant::now();
+        let outcome =
+            run_cancelable_io(shell("exit 3"), Some(vec![b'x'; 4 << 20]), true, &|| false).unwrap();
+        assert_eq!(outcome.status.code(), Some(3));
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_reads_its_stdin_to_eof_sees_the_whole_input() {
+        let outcome = run_cancelable_io(
+            shell("wc -c | tr -d ' '"),
+            Some(b"proxy-user = \"a:b\"\n".to_vec()),
+            true,
+            &|| false,
+        )
+        .unwrap();
+        assert!(outcome.status.success());
+        assert_eq!(outcome.write_out.trim(), "19");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_child_that_never_reads_stdin_kills_it_and_returns() {
+        let started = std::time::Instant::now();
+        let canceled = move || started.elapsed() > Duration::from_millis(300);
+        let error = run_cancelable_io(
+            shell("sleep 30"),
+            Some(vec![b'x'; 4 << 20]),
+            false,
+            &canceled,
+        )
+        .err()
+        .expect("the run was cancelled");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

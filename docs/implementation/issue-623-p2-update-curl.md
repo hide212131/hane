@@ -2,7 +2,7 @@
 
 ## 目的と基準
 
-HTTP proxyが必要な環境で、更新確認・署名付きcatalog・ZIP stagingとAI runtime archive取得が共通network routeに従うようにする。これはClaude実装待ちの準備文書であり、製品実装・検証は未実施。
+HTTP proxyが必要な環境で、更新確認・署名付きcatalog・ZIP stagingとAI runtime archive取得が共通network routeに従うようにする。本文書は実装順2の仕様であり、末尾の「実装結果」に実装した範囲と未検証事項を記録する。
 
 - Issue: #623。採用仕様の正本: `docs/design/http-proxy.md` §4、§5、§6.1、§9 P3/P4/P5/P6。
 - 基準main: `b3dd52e22061bc79305fbf80082b4821a887dd94`（共通core #625 merge済み）。
@@ -62,6 +62,29 @@ HTTP proxyが必要な環境で、更新確認・署名付きcatalog・ZIP stagi
 fixtureは実サービス・実ユーザーsecretを使わない。TLS用test root/署名test key、DNS/接続先/portの注入はtest専用の境界へ置き、production allowlist/port/TLS検証を緩めない。curlのDirect fixtureにephemeral port mappingが必要な場合もtest-only seamを使い、同じproduction command構築/route判定を通す。mock command/環境値だけを実通信の証拠にしない。
 
 current headでworkspace all-features tests/Clippyと通常default Release build、両OS required CIを記録する。real curl fixtureがOSツール不足等でskipされた場合は未検証として取り戻し、P3/P6をpassにしない。settings GUI/AI runtime通信はこの段階の試験ではなく、後続段階で必要。
+
+## 実装結果
+
+worker環境ではshell・build・testを実行できないため、以下はすべて**コードを書いただけで未実行**である。P3〜P6はtrusted verifyのCI結果でpassを確認するまで未達として扱う。
+
+| 項目 | 実装 | 主な場所 |
+|---|---|---|
+| 注入 | `NetworkContext`（settings・起動時captureした`ProxyEnvironment`・credential storeの不変snapshot）。既定はEnvironment、store未実装は`Unavailable`としてerror。`main.rs`の`network_context()`が`OnceLock`で一度だけ環境を取り込み、更新`LazyHttpsTransport::new`と`AiService::spawn_with_network`が同じsnapshotを共有 | `crates/network/src/context.rs`、`crates/app/src/main.rs` |
+| Basic検証 | `BasicCredentials::check_for_basic`（空・`:`を含むuser、制御文字を拒否） | `crates/network/src/credential.rs` |
+| 更新CONNECT | 要求ごとに`route`を再解決。proxyはhost/portだけをDNS/TCP、`CONNECT origin:443`、1byteずつ読む厳格な応答検証（HTTP/1.0/1.1・3桁・CRLF・計16KiB・行1KiB・1xx最大4・101拒否・200のみ成功）、origin名のSNIでTLS。単一の`deadline_ms`を共有 | `crates/app/src/https_transport.rs` |
+| error分類 | `TransportFailure`/`ErrorCode`に`ProxyConfiguration`/`ProxyConnect`/`ProxyAuthentication`を追加し、UIの日本語表示へ接続 | `crates/update/src/{download,error}.rs`、`crates/ui/src/view/app_update.rs` |
+| curl | `CurlArchiveDownloader::new(NetworkContext)`。毎hop `check_allowed_url`後にroute解決、先頭`--disable`、`--noproxy ""`、Directは`--proxy ""`、proxyは`--proxy <endpoint>`、Basicは`--proxy-basic --config -`でstdinへ`proxy-user`を引用符/backslash escapeして渡す。親環境のproxy変数は大小文字を問わず除去。`-w`で`%{http_connect}`を取得し`DownloadFailure`（`ProxyAuthentication`/`ProxyConnect`/`OriginStatus`/`CurlExit`等、秘密なし）を記録 | `crates/ai/src/runtime_install.rs` |
+| stdin/pipe | stdinはthreadで書き込み後に閉鎖。子の早期終了・取消・書込失敗でblockせず、子をreapしてpipeを解放 | 同上 `run_cancelable_io` |
+| test seam | `hane-ai`の`test-support` feature（`with_test_seams`: CA・`--connect-to`・親環境の代替）、`HttpsTransport`のlookup/direct port。production経路・allowlist・TLS検証は変更しない | 同上、`crates/app/src/test_tls.rs` |
+
+試験: P4（応答検証・分類・単一deadline・Direct retryなし・origin認証非漏えい・hop別再解決・設定error）は`https_transport.rs`のfixture試験、P6は`proxy_curl_tests.rs`の実curl試験（curl不在はskipではなく失敗）と`runtime_install.rs`の単体試験。
+
+未実装・未検証:
+
+- P3の「署名済catalog→ZIP staging」を専用proxy+TLS fixture上で通す試験は未追加（`Transport`層のproxy経路試験のみ。既存の署名/hash/size/cancel/part cleanup試験は変更なし）。
+- P5の許可外hostへのCONNECT未実行を`Fetcher`経由で確認する試験は未追加（`Fetcher`のredirect検証は既存試験のまま）。
+- macOSの実curl（Secure Transport等）で`--cacert`が信頼anchorとして働くか、WindowsのSchannelで`--ssl-revoke-best-effort`が必要十分かは未確認。
+- workspace all-features tests/Clippy、default Release build、両OS required CIは未実行。
 
 ## 対象外とworker制約
 

@@ -33,6 +33,10 @@ mod https_transport;
 mod limited_start;
 #[cfg(target_os = "windows")]
 mod open_request;
+#[cfg(test)]
+mod proxy_curl_tests;
+#[cfg(test)]
+mod test_tls;
 mod update_diagnostics;
 mod update_gate;
 mod update_restart;
@@ -263,7 +267,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             updates_root,
             receipts_dir,
         },
-        Arc::new(https_transport::LazyHttpsTransport::default()),
+        Arc::new(https_transport::LazyHttpsTransport::new(network_context())),
         Arc::new(SystemClock::new()),
     ));
     // Only a supported placement can hand a Ready update to the helper, and
@@ -299,15 +303,42 @@ fn start_ai_service() -> Option<AiService> {
         }
         None => (PathBuf::new(), None),
     };
-    AiService::spawn(AiServiceConfig {
-        app_data_root: state.root().to_path_buf(),
-        binary_path,
-        binary_resolution_error,
-        credential_store: Arc::new(OsCredentialStore::new("com.hide212131.hane.ai")),
-        browser_opener: Arc::new(SystemBrowserOpener),
-        shell_env_format: ShellEnvironmentPolicyFormat::Filters,
-    })
+    AiService::spawn_with_network(
+        AiServiceConfig {
+            app_data_root: state.root().to_path_buf(),
+            binary_path,
+            binary_resolution_error,
+            credential_store: Arc::new(OsCredentialStore::new("com.hide212131.hane.ai")),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        },
+        network_context(),
+    )
     .ok()
+}
+
+/// The network input shared by the update check and the runtime download. The
+/// proxy variables are read from the process environment exactly once, on the
+/// first call (which happens at startup, before either service is created);
+/// every later call, including an AI service restart, gets the same snapshot.
+/// Settings are the default (Environment) until a settings store exists, and
+/// no OS secret backend is wired yet, so a manual Basic proxy would be an
+/// error rather than an unauthenticated connection.
+fn network_context() -> hane_network::NetworkContext {
+    static CONTEXT: std::sync::OnceLock<hane_network::NetworkContext> = std::sync::OnceLock::new();
+    CONTEXT
+        .get_or_init(|| {
+            // A value that is not valid Unicode is kept lossily so a broken
+            // proxy variable fails parsing instead of silently vanishing.
+            let variables = std::env::vars_os().filter_map(|(name, value)| {
+                Some((name.into_string().ok()?, value.to_string_lossy().into_owned()))
+            });
+            hane_network::NetworkContext::from_environment(hane_network::ProxyEnvironment::from_vars(
+                hane_network::EnvPlatform::current(),
+                variables,
+            ))
+        })
+        .clone()
 }
 
 #[cfg(target_os = "macos")]
@@ -619,6 +650,8 @@ pub(crate) fn prepare_launch<T>(
     let config = hane_ui::InstrumentationConfig::from_environment();
     // AI is an optional app-owned service. Failure to resolve its state or
     // start its worker must never prevent the Markdown editor from opening.
+    // Capture the proxy environment once, before either service exists.
+    let _ = network_context();
     let ai_service = start_ai_service();
     let update_service = start_update_service();
     Some((
