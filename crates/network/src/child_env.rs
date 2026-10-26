@@ -86,12 +86,13 @@ impl ChildProxyPlan {
                 })
             }
             ProxyMode::Environment => {
+                // Validate the bypass list even when no proxy is set.
+                let bypass = environment.bypass()?;
                 let http = Self::from_env(environment, Scheme::Http)?;
                 let https = Self::from_env(environment, Scheme::Https)?;
                 if http.is_none() && https.is_none() {
                     return Ok(Self::direct());
                 }
-                let bypass = environment.bypass()?;
                 Ok(Self {
                     http,
                     https,
@@ -357,6 +358,29 @@ mod tests {
         assert_eq!(
             plan.apply(Vec::<(String, String)>::new()).get("no_proxy"),
             Some("*")
+        );
+    }
+
+    #[test]
+    fn invalid_bypass_is_an_error_without_proxy() {
+        for platform in [EnvPlatform::MacOs, EnvPlatform::Windows] {
+            let e = ProxyEnvironment::from_vars(platform, [("no_proxy", "*.invalid")]);
+            assert!(
+                ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store())
+                    .is_err(),
+                "{platform:?}"
+            );
+        }
+        for vars in [vec![("no_proxy", "public.invalid")], vec![("no_proxy", "")]] {
+            let plan =
+                ChildProxyPlan::from_settings(&NetworkSettings::default(), &env(&vars), &no_store())
+                    .unwrap();
+            assert!(!plan.uses_proxy());
+        }
+        // Direct mode still ignores the environment.
+        let e = env(&[("no_proxy", "*.invalid")]);
+        assert!(
+            ChildProxyPlan::from_settings(&NetworkSettings::direct(), &e, &no_store()).is_ok()
         );
     }
 

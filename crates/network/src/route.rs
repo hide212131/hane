@@ -79,13 +79,15 @@ pub fn resolve(
             })
         }
         ProxyMode::Environment => {
-            let Some(proxy) = environment.proxy_for(destination.scheme)? else {
-                return Ok(ResolvedRoute::Direct);
-            };
+            // The bypass list is validated first, with or without a proxy,
+            // and a matching destination never parses an unused proxy value.
             let bypass = environment.bypass()?;
             if bypass.matches(&destination.host) {
                 return Ok(ResolvedRoute::Direct);
             }
+            let Some(proxy) = environment.proxy_for(destination.scheme)? else {
+                return Ok(ResolvedRoute::Direct);
+            };
             let credentials = match proxy.userinfo {
                 Some((user, pass)) => CredentialSource::Inline(BasicCredentials::new(user, pass)),
                 None => CredentialSource::None,
@@ -185,6 +187,78 @@ mod tests {
         // Loopback stays Direct even when the environment is broken.
         let loopback = dest(Scheme::Https, "localhost");
         assert_eq!(resolve(&s, &e, &loopback), Ok(ResolvedRoute::Direct));
+    }
+
+    #[test]
+    fn invalid_bypass_is_an_error_with_or_without_proxy() {
+        let s = NetworkSettings::default();
+        for platform in [EnvPlatform::MacOs, EnvPlatform::Windows] {
+            for scheme in [Scheme::Http, Scheme::Https] {
+                for name in ["no_proxy", "NO_PROXY"] {
+                    if platform == EnvPlatform::Windows && name == "NO_PROXY" {
+                        continue;
+                    }
+                    for proxy in [None, Some(("https_proxy", "http://p:1"))] {
+                        let mut vars = vec![(name, "*.invalid")];
+                        vars.extend(proxy);
+                        let e = ProxyEnvironment::from_vars(platform, vars);
+                        let r = resolve(&s, &e, &dest(scheme, "public.invalid"));
+                        assert!(
+                            matches!(r, Err(NetworkError::InvalidBypass { .. })),
+                            "{platform:?} {scheme:?} {name} {proxy:?}: {r:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_or_empty_bypass_without_proxy_is_direct() {
+        let s = NetworkSettings::default();
+        for vars in [
+            vec![("no_proxy", "public.invalid")],
+            vec![("no_proxy", "")],
+            vec![("NO_PROXY", "other.invalid")],
+        ] {
+            let r = resolve(&s, &env(&vars), &dest(Scheme::Https, "public.invalid"));
+            assert_eq!(r, Ok(ResolvedRoute::Direct), "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn matching_bypass_skips_unused_proxy_values() {
+        let s = NetworkSettings::default();
+        let d = dest(Scheme::Https, "public.invalid");
+        for proxy in [
+            ("https_proxy", "socks5://proxy.invalid"),
+            ("https_proxy", "http://bad host"),
+            ("https_proxy", "http://u%zz:p@proxy.invalid"),
+        ] {
+            for bypass in ["public.invalid", "*", ".invalid"] {
+                let e = env(&[proxy, ("no_proxy", bypass)]);
+                assert_eq!(resolve(&s, &e, &d), Ok(ResolvedRoute::Direct), "{bypass}");
+            }
+            // A non-matching bypass still reports the broken selected proxy.
+            let e = env(&[proxy, ("no_proxy", "other.invalid")]);
+            assert!(
+                matches!(
+                    resolve(&s, &e, &d),
+                    Err(NetworkError::InvalidProxyUrl { .. })
+                ),
+                "{proxy:?}"
+            );
+        }
+        // A broken higher-priority proxy does not fall through to a lower one.
+        let e = env(&[
+            ("https_proxy", "socks5://proxy.invalid"),
+            ("all_proxy", "http://ok:1"),
+            ("no_proxy", "other.invalid"),
+        ]);
+        assert!(matches!(
+            resolve(&s, &e, &d),
+            Err(NetworkError::InvalidProxyUrl { .. })
+        ));
     }
 
     #[test]
