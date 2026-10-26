@@ -23,7 +23,7 @@ use hane_network::{
     BasicCredentials, CredentialRef, ManualProxy, NetworkSettings, ProxyAuth, ProxyMode,
 };
 use hane_session::{NetworkConfig, Settings, StateStores};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -263,17 +263,30 @@ fn retire_credential(
 /// The deferred retirement handed to the applier. It runs on whichever thread
 /// releases the last snapshot, so a failure is sent to the page instead of
 /// being dropped. The warning text never contains the secret.
+///
+/// The warning is stored in `pending`, which outlives the settings screen, so a
+/// failure after the screen closed is still shown the next time it opens.
+/// `wake` only tells an open page to look; a failed wake loses nothing.
 fn retire_reporting(
     secrets: Arc<dyn ProxySecretWriter>,
     reference: CredentialRef,
-    warnings: async_channel::Sender<String>,
+    pending: PendingWarnings,
+    wake: async_channel::Sender<()>,
 ) -> Box<dyn FnOnce() + Send> {
     Box::new(move || {
         if let Some(warning) = retire_credential(secrets.as_ref(), &reference) {
-            let _ = warnings.try_send(warning);
+            pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(warning);
+            let _ = wake.try_send(());
         }
     })
 }
+
+/// Retirement failures not yet shown to the user. Shared with the deferred
+/// retirement, which may run after the settings screen is gone.
+pub(super) type PendingWarnings = Arc<Mutex<Vec<String>>>;
 
 /// The write sequence. Any failure before the settings file is replaced leaves
 /// the old settings (and the old credential) in effect. The old credential is
@@ -333,6 +346,7 @@ pub(super) struct NetworkSettingsPage {
     leave_prompt: Option<LeaveTarget>,
     route_ready: Option<LeaveTarget>,
     pending_target: Option<LeaveTarget>,
+    pending_warnings: PendingWarnings,
 }
 
 impl Default for NetworkSettingsPage {
@@ -363,6 +377,21 @@ impl NetworkSettingsPage {
             leave_prompt: None,
             route_ready: None,
             pending_target: None,
+            pending_warnings: PendingWarnings::default(),
+        }
+    }
+
+    /// Moves retirement failures that happened while no settings screen was
+    /// showing them into the page message.
+    fn show_pending_warnings(&mut self) {
+        let warnings = std::mem::take(
+            &mut *self
+                .pending_warnings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for warning in warnings {
+            self.retire_failed(warning);
         }
     }
 
@@ -385,6 +414,7 @@ impl NetworkSettingsPage {
         self.route_ready = None;
         self.pending_target = None;
         self.reset_form(config);
+        self.show_pending_warnings();
     }
 
     pub(super) fn close_settings(&mut self, config: &NetworkConfig) {
@@ -961,20 +991,24 @@ impl EditorView {
                 match (&self.network_applier, report.obsolete_ref) {
                     (Some(applier), obsolete) => {
                         let retire = obsolete.map(|reference| {
-                            let (sender, receiver) = async_channel::bounded(1);
+                            let (sender, receiver) = async_channel::unbounded();
+                            let pending = self.network_settings.pending_warnings.clone();
                             // A failure found once the last holder releases the
-                            // snapshot is delivered to the page; success sends
-                            // nothing.
+                            // snapshot is kept in `pending`; an open settings
+                            // screen shows it now, a closed one on next open.
+                            // Success stores nothing.
                             cx.spawn(async move |view, cx| {
-                                if let Ok(warning) = receiver.recv().await {
+                                while receiver.recv().await.is_ok() {
                                     let _ = view.update(cx, |view, cx| {
-                                        view.network_settings.retire_failed(warning);
-                                        cx.notify();
+                                        if view.settings_open {
+                                            view.network_settings.show_pending_warnings();
+                                            cx.notify();
+                                        }
                                     });
                                 }
                             })
                             .detach();
-                            retire_reporting(secrets, reference, sender)
+                            retire_reporting(secrets, reference, pending, sender)
                         });
                         applier.apply_saved(&settings, retire);
                     }
@@ -1431,22 +1465,27 @@ mod tests {
         let writer: Arc<dyn ProxySecretWriter> = secrets.clone();
         let mut warning = None;
         if in_flight {
-            let (sender, receiver) = async_channel::bounded(1);
+            let (sender, receiver) = async_channel::unbounded();
             let snapshot = NetworkContext::new(
                 current,
                 ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
                 Arc::new(crate::proxy_secret::OsProxyCredentialStore),
             );
             let held = snapshot.clone();
-            snapshot.on_release(retire_reporting(writer, reference, sender));
+            snapshot.on_release(retire_reporting(
+                writer,
+                reference,
+                page.pending_warnings.clone(),
+                sender,
+            ));
             drop(snapshot);
             // Nothing is deleted or reported while an operation holds it.
             assert!(secrets.entries.lock().unwrap().contains_key("old"));
             assert!(receiver.try_recv().is_err());
             page.saved_ok(generation, prepared.settings.clone(), None);
             drop(held);
-            if let Ok(late) = receiver.try_recv() {
-                page.retire_failed(late);
+            if receiver.try_recv().is_ok() {
+                page.show_pending_warnings();
             }
         } else {
             warning = retire_credential(writer.as_ref(), &reference);
@@ -1470,6 +1509,51 @@ mod tests {
         assert!(page.message_text().unwrap().contains("以前の資格情報"));
         assert!(!page.message_text().unwrap().contains("pw1"));
         assert!(secrets.entries.lock().unwrap().contains_key("old"));
+    }
+
+    /// The settings screen closes while an operation still holds the old
+    /// snapshot; the later deletion failure is shown when the screen reopens,
+    /// even though nobody is listening at that moment.
+    #[test]
+    fn a_failed_retirement_after_the_screen_closed_is_shown_on_the_next_open() {
+        use hane_network::{EnvPlatform, NetworkContext, ProxyEnvironment};
+        let secrets = Arc::new(FakeSecrets {
+            fail_delete: true,
+            ..FakeSecrets::default()
+        });
+        let current = saved_basic("old");
+        let mut page = NetworkSettingsPage::new(secrets.clone());
+        page.begin_settings_session(&NetworkConfig::Valid(current.clone()));
+        let reference = CredentialRef::new("old").unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let snapshot = NetworkContext::new(
+            current.clone(),
+            ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
+            Arc::new(crate::proxy_secret::OsProxyCredentialStore),
+        );
+        let held = snapshot.clone();
+        let writer: Arc<dyn ProxySecretWriter> = secrets.clone();
+        snapshot.on_release(retire_reporting(
+            writer,
+            reference,
+            page.pending_warnings.clone(),
+            sender,
+        ));
+        drop(snapshot);
+
+        page.close_settings(&NetworkConfig::Valid(current.clone()));
+        // The listener is gone with the closed screen.
+        drop(receiver);
+        drop(held);
+
+        page.begin_settings_session(&NetworkConfig::Valid(current));
+        let text = page.message_text().expect("the failure is shown");
+        assert!(text.contains("以前の資格情報"));
+        assert!(!text.contains("a:b"));
+        // Shown once only.
+        page.message = None;
+        page.show_pending_warnings();
+        assert!(page.message_text().is_none());
     }
 
     #[test]
