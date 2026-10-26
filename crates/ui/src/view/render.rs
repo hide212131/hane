@@ -81,6 +81,7 @@ impl EditorView {
         // modal. Anything that changed since it opened closes it.
         if self.editor_context_menu.as_ref().is_some_and(|menu| {
             !self.editor_context_menu_is_current(menu)
+                || !window.is_window_active()
                 || self.file_tab_context_menu.is_some()
                 || self.sidebar_context_menu.is_some()
         }) {

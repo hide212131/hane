@@ -20,6 +20,13 @@ use hane_markdown::{
 #[derive(Clone, Debug)]
 pub(super) struct EditorContextMenu {
     pub(super) position: gpui::Point<Pixels>,
+    /// Identifies this one opened menu. A dismissed or replaced menu's
+    /// callbacks carry a token that no open menu has, so they do nothing even
+    /// when the document snapshot is identical.
+    pub(super) token: u64,
+    /// Whether the body was editable when the menu opened; a mode switch
+    /// closes the menu.
+    pub(super) editable: bool,
     pub(super) id: SessionId,
     pub(super) instance: DocumentInstance,
     pub(super) revision: Revision,
@@ -48,11 +55,11 @@ impl EditorView {
     pub(super) fn on_editor_right_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.open_editor_context_menu(event.position, cx);
+        self.open_editor_context_menu(event.position, window, cx);
     }
 
     /// Whether the body may own a context menu now: not while settings, a
@@ -69,10 +76,27 @@ impl EditorView {
             && matches!(self.input_target(), InputTarget::Body)
     }
 
-    fn open_editor_context_menu(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    fn open_editor_context_menu(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.editor_context_menu_may_open() {
             return;
         }
+        if self.editor_context_menu_activation.is_none() {
+            // Losing activation closes the menu for good: re-activating the
+            // window must not bring an old menu's callbacks back.
+            self.editor_context_menu_activation =
+                Some(cx.observe_window_activation(window, |view, window, cx| {
+                    if !window.is_window_active() {
+                        view.dismiss_editor_context_menu(cx);
+                    }
+                }));
+        }
+        self.editor_context_menu_generation += 1;
+        let token = self.editor_context_menu_generation;
         let id = self.sessions.active_id();
         let Some(instance) = self.document_instance(id) else {
             return;
@@ -92,6 +116,8 @@ impl EditorView {
         self.sidebar_context_menu = None;
         self.editor_context_menu = Some(EditorContextMenu {
             position,
+            token,
+            editable: self.body_editable(),
             id,
             instance,
             revision,
@@ -120,11 +146,21 @@ impl EditorView {
         plan_link_insertion(&source, range, url)
     }
 
-    /// Whether `menu` still describes the live state: the same document
+    /// Whether `menu` is the menu that is open right now and still describes
+    /// the live state.
+    pub(super) fn editor_context_menu_is_current(&self, menu: &EditorContextMenu) -> bool {
+        self.editor_context_menu
+            .as_ref()
+            .is_some_and(|open| open.token == menu.token)
+            && self.editor_context_menu_state_matches(menu)
+    }
+
+    /// Whether the live state still matches `menu`: the same document
     /// instance is active with the same revision and directional selection, no
     /// IME composition is running, and nothing else owns the keyboard.
-    pub(super) fn editor_context_menu_is_current(&self, menu: &EditorContextMenu) -> bool {
-        self.sessions.active_id() == menu.id
+    pub(super) fn editor_context_menu_state_matches(&self, menu: &EditorContextMenu) -> bool {
+        self.body_editable() == menu.editable
+            && self.sessions.active_id() == menu.id
             && self.document_instance(menu.id) == Some(menu.instance)
             && self.sessions.get(menu.id).is_some_and(|session| {
                 session.revision() == menu.revision
@@ -253,7 +289,9 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current = self.editor_context_menu_is_current(menu);
+        // Consuming the open menu here makes every other callback of it (and
+        // of any earlier menu) a no-op.
+        let current = window.is_window_active() && self.editor_context_menu_is_current(menu);
         self.editor_context_menu = None;
         if !current {
             cx.notify();
@@ -283,8 +321,10 @@ impl EditorView {
     fn insert_link_from_menu(&mut self, menu: &EditorContextMenu, cx: &mut Context<Self>) {
         if !self.body_editable()
             || self.editor().ime().is_some()
-            || !self.editor_context_menu_is_current(menu)
+            || !self.editor_context_menu_state_matches(menu)
         {
+            // The caller already consumed the menu's token; only the live
+            // state is re-checked here.
             return;
         }
         let Some(url) = menu.link_url.as_deref() else {
@@ -544,6 +584,103 @@ mod tests {
         let edited = text_of(&view, cx);
         run_item(&view, cx, &menu, EditorMenuAction::InsertLink);
         assert_eq!(text_of(&view, cx), edited);
+    }
+
+    /// A7: a callback of a dismissed menu, or of an earlier menu replaced by a
+    /// reopened one with the identical snapshot, does nothing; the current
+    /// menu still works.
+    #[gpui::test]
+    fn a_dismissed_or_replaced_menu_callback_is_a_no_op(cx: &mut gpui::TestAppContext) {
+        let text = "label text\n";
+        let (view, cx) = open_view(cx, text);
+        let selection = Selection {
+            anchor: SourceOffset(0),
+            active: SourceOffset(5),
+        };
+        select(&view, cx, selection);
+        cx.write_to_clipboard(ClipboardItem::new_string(URL.to_owned()));
+
+        right_click_row(cx);
+        let first = view
+            .read_with(cx, |view, _| view.editor_context_menu.clone())
+            .expect("menu open");
+        close_menu(&view, cx);
+        run_item(&view, cx, &first, EditorMenuAction::InsertLink);
+        assert_eq!(text_of(&view, cx), text);
+        view.read_with(cx, |view, _| assert!(!view.editor().can_undo()));
+
+        // Reopen with the same snapshot: the old callback neither edits nor
+        // consumes the new menu.
+        cx.write_to_clipboard(ClipboardItem::new_string("https://b.example/".to_owned()));
+        right_click_row(cx);
+        run_item(&view, cx, &first, EditorMenuAction::InsertLink);
+        assert_eq!(text_of(&view, cx), text);
+        assert!(menu_is_open(&view, cx));
+
+        click_item(cx, "editor-context-insert-link");
+        assert_eq!(text_of(&view, cx), "[label](https://b.example/) text\n");
+        assert!(!menu_is_open(&view, cx));
+    }
+
+    /// Losing window activation closes the menu; re-activating does not
+    /// bring it or its callbacks back.
+    #[gpui::test]
+    fn deactivating_the_window_invalidates_the_menu(cx: &mut gpui::TestAppContext) {
+        let text = "label text\n";
+        let (view, cx) = open_view(cx, text);
+        select(
+            &view,
+            cx,
+            Selection {
+                anchor: SourceOffset(0),
+                active: SourceOffset(5),
+            },
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(URL.to_owned()));
+        right_click_row(cx);
+        let menu = view
+            .read_with(cx, |view, _| view.editor_context_menu.clone())
+            .expect("menu open");
+
+        cx.deactivate_window();
+        assert!(!menu_is_open(&view, cx));
+        run_item(&view, cx, &menu, EditorMenuAction::InsertLink);
+        assert_eq!(text_of(&view, cx), text);
+    }
+
+    /// Switching to reading mode closes an open menu, and it stays closed
+    /// after switching back.
+    #[gpui::test]
+    fn a_mode_switch_closes_the_menu_for_good(cx: &mut gpui::TestAppContext) {
+        let text = "label text\n";
+        let (view, cx) = open_view(cx, text);
+        select(
+            &view,
+            cx,
+            Selection {
+                anchor: SourceOffset(0),
+                active: SourceOffset(5),
+            },
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(URL.to_owned()));
+        right_click_row(cx);
+        let menu = view
+            .read_with(cx, |view, _| view.editor_context_menu.clone())
+            .expect("menu open");
+
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!menu_is_open(&view, cx));
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Editing;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        run_item(&view, cx, &menu, EditorMenuAction::InsertLink);
+        assert_eq!(text_of(&view, cx), text);
     }
 
     /// A8: reading mode offers copy but no link insertion.

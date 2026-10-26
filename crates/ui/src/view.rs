@@ -923,6 +923,10 @@ pub struct EditorView {
     /// instance, revision, directional selection and clipboard URL snapshot
     /// taken when it opened; every item re-checks them before acting.
     editor_context_menu: Option<EditorContextMenu>,
+    /// Source of the per-menu tokens that tie item callbacks to one opened menu.
+    editor_context_menu_generation: u64,
+    /// Closes the body menu when the window loses activation.
+    editor_context_menu_activation: Option<gpui::Subscription>,
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
@@ -1840,6 +1844,8 @@ impl EditorView {
             file_tab_context_menu: None,
             sidebar_context_menu: None,
             editor_context_menu: None,
+            editor_context_menu_generation: 0,
+            editor_context_menu_activation: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
             save_problems: HashMap::new(),
