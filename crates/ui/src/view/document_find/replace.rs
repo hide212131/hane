@@ -91,6 +91,10 @@ pub(super) struct DocumentReplaceState {
     pub(super) job_active: bool,
     pub(super) job_cancel: Option<Arc<AtomicBool>>,
     pub(super) notice: Option<ReplaceNotice>,
+    /// The last paste into the replacement field carried a line break and was
+    /// refused before the widget normalized it; `text` is still the older
+    /// value, so replace stays blocked until a valid change or the row closes.
+    pub(super) paste_rejected: bool,
     pub(super) post_advance: Option<PostReplaceAdvance>,
 }
 
@@ -151,8 +155,23 @@ impl EditorView {
         self.document_find.replace.subscription = Some(subscription);
     }
 
+    /// A paste whose original clipboard text contains CR/LF was refused. The
+    /// field value does not change (no `Change` event), so the attempt is
+    /// recorded here and any prepared replace-all is invalidated.
+    fn document_replace_paste_rejected(&mut self, cx: &mut Context<Self>) {
+        let state = &mut self.document_find.replace;
+        state.paste_rejected = true;
+        state.text_generation = state.text_generation.wrapping_add(1);
+        state.notice = None;
+        if let Some(cancel) = state.job_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        cx.notify();
+    }
+
     fn document_replace_text_changed(&mut self, text: String, cx: &mut Context<Self>) {
         let state = &mut self.document_find.replace;
+        state.paste_rejected = false;
         state.text = text;
         state.text_generation = state.text_generation.wrapping_add(1);
         state.notice = None;
@@ -358,6 +377,7 @@ impl EditorView {
         state.scope_mode = ReplaceScopeMode::Document;
         state.scope_generation = state.scope_generation.wrapping_add(1);
         state.notice = None;
+        state.paste_rejected = false;
         state.post_advance = None;
     }
 
@@ -391,7 +411,9 @@ impl EditorView {
 
     fn document_replace_text_error(&self) -> Option<&'static str> {
         let text = &self.document_find.replace.text;
-        if text.contains(['\n', '\r']) {
+        if self.document_find.paste_rejected {
+            Some("検索語に改行は使えません。単一行で入力し直してください")
+        } else if self.document_find.replace.paste_rejected || text.contains(['\n', '\r']) {
             Some("置換後文字列に改行は使えません")
         } else if text.len() > MAX_QUERY_BYTES {
             Some("置換後文字列が長すぎます（4,096バイトまで）")
@@ -793,7 +815,15 @@ impl EditorView {
             return None;
         }
         let input = self.document_find.replace.input.as_ref()?;
+        let view = cx.entity().downgrade();
         let replace_input = Input::new(input)
+            .on_paste(move |item, _, cx| {
+                if !clipboard_has_line_break(item) {
+                    return false;
+                }
+                view.update(cx, |view, cx| view.document_replace_paste_rejected(cx))
+                    .is_ok()
+            })
             .id("document-replace-input")
             .h(px(DOCUMENT_FIND_BAR_HEIGHT))
             .appearance(false)
@@ -1212,6 +1242,133 @@ mod tests {
         replace_current(&view, cx);
         assert_eq!(text(&view, cx), "foo\n");
         assert_eq!(notice(&view, cx), "置換後文字列に改行は使えません");
+    }
+
+    fn paste(cx: &mut gpui::VisualTestContext, clipboard: &str) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(clipboard.to_owned()));
+        cx.simulate_keystrokes("secondary-v");
+        cx.run_until_parked();
+    }
+
+    fn body_state(
+        view: &Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (String, Selection, String, bool, bool) {
+        view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().selection(),
+                format!("{:?}", view.sessions.active().revision()),
+                view.editor().can_undo(),
+                view.editor().can_redo(),
+            )
+        })
+    }
+
+    /// Real clipboard → real Paste keystroke → the rendered `Input`'s
+    /// `on_paste`, for the replacement field (the pasted line break must be
+    /// refused, never joined into `ab`).
+    #[gpui::test]
+    fn a_line_break_paste_into_the_replace_field_is_refused_and_recoverable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("foo foo\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        open_find(&view, cx, "foo", "bar");
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.toggle_document_replace(window, cx));
+        });
+        cx.run_until_parked();
+        let before = body_state(&view, cx);
+
+        for payload in ["a\nb", "a\rb", "a\r\nb"] {
+            let generation = view.read_with(cx, |view, _| view.document_find.replace.text_generation);
+            // A plan prepared before the refused paste must never publish.
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.document_replace_all(window, cx));
+            });
+            paste(cx, payload);
+            view.read_with(cx, |view, _| {
+                assert!(view.document_find.replace.paste_rejected, "{payload:?}");
+                assert_ne!(view.document_find.replace.text_generation, generation);
+                assert_eq!(view.document_find.replace.text, "bar", "{payload:?}");
+                assert!(!view.document_find.replace.job_active, "{payload:?}");
+            });
+            replace_all(&view, cx);
+            replace_current(&view, cx);
+            assert_eq!(body_state(&view, cx), before, "{payload:?}");
+            assert_eq!(notice(&view, cx), "置換後文字列に改行は使えません");
+            let input_value = view.read_with(cx, |view, cx| {
+                view.document_find
+                    .replace
+                    .input
+                    .as_ref()
+                    .map(|input| input.read(cx).value().to_string())
+            });
+            assert_ne!(input_value.as_deref(), Some("ab"), "{payload:?}");
+        }
+
+        // A valid single-line paste recovers.
+        paste(cx, "baz");
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.replace.paste_rejected);
+            assert_eq!(view.document_find.replace.text, "baz");
+        });
+        replace_all(&view, cx);
+        assert_eq!(text(&view, cx), "baz baz\n");
+    }
+
+    /// Same contract for the search field: the refused line break leaves the
+    /// old query, blocks replace, and a valid paste recovers.
+    #[gpui::test]
+    fn a_line_break_paste_into_the_search_field_is_refused_and_recoverable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("foo foo\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        open_find(&view, cx, "foo", "bar");
+        let input = view.read_with(cx, |view, _| view.document_find.input.clone().unwrap());
+        cx.update(|window, app| {
+            input.update(app, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        let before = body_state(&view, cx);
+
+        for payload in ["a\nb", "a\rb", "a\r\nb"] {
+            let generation = view.read_with(cx, |view, _| view.document_find.query_generation);
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.document_replace_all(window, cx));
+            });
+            paste(cx, payload);
+            view.read_with(cx, |view, _| {
+                assert!(view.document_find.paste_rejected, "{payload:?}");
+                assert_ne!(view.document_find.query_generation, generation);
+                assert_eq!(view.document_find.query_text, "foo", "{payload:?}");
+                assert!(view.document_find.replace.job_cancel.is_none(), "{payload:?}");
+            });
+            replace_all(&view, cx);
+            replace_current(&view, cx);
+            assert_eq!(body_state(&view, cx), before, "{payload:?}");
+            assert_eq!(
+                notice(&view, cx),
+                "検索語に改行は使えません。単一行で入力し直してください"
+            );
+        }
+
+        paste(cx, "foo");
+        settle_debounce(cx);
+        view.read_with(cx, |view, _| {
+            assert!(!view.document_find.paste_rejected);
+            assert_eq!(view.document_find.query_text, "foo");
+        });
+        replace_all(&view, cx);
+        assert_eq!(text(&view, cx), "bar bar\n");
     }
 
     #[gpui::test]

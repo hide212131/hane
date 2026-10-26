@@ -176,9 +176,22 @@ pub(super) struct DocumentFindState {
     /// Enter, so a second, separate Enter (not composing) navigates
     /// normally.
     enter_was_composing: bool,
+    /// The last paste into the search field carried a line break and was
+    /// refused before the widget's single-line normalization could silently
+    /// join it. Stays set (blocking replace) until a valid change or the bar
+    /// closes.
+    paste_rejected: bool,
     /// Replace row, target scope, and in-flight replace-all preparation
     /// (Issue #589).
     replace: replace::DocumentReplaceState,
+}
+
+/// Whether the original clipboard text contains a CR or LF. Checked before the
+/// single-line widget normalizes (drops) line breaks, which would otherwise
+/// join the lines without any notice.
+fn clipboard_has_line_break(item: &gpui::ClipboardItem) -> bool {
+    item.text()
+        .is_some_and(|text| text.contains(['\n', '\r']))
 }
 
 impl EditorView {
@@ -531,6 +544,7 @@ impl EditorView {
             });
         }
         self.document_find.open = false;
+        self.document_find.paste_rejected = false;
         self.document_find.input_focused = false;
         self.document_find.replace.input_focused = false;
         self.reset_document_replace_for_close();
@@ -572,7 +586,18 @@ impl EditorView {
         self.restart_document_find(cx, true, true);
     }
 
+    /// A paste whose original clipboard text contains CR/LF was refused by the
+    /// search field. The field value is unchanged, so no `Change` event will
+    /// follow; invalidate in-flight and prepared work here instead.
+    fn document_find_paste_rejected(&mut self, cx: &mut Context<Self>) {
+        self.document_find.paste_rejected = true;
+        self.cancel_document_find_work();
+        self.document_find.replace.notice = None;
+        cx.notify();
+    }
+
     fn document_find_query_changed(&mut self, text: String, cx: &mut Context<Self>) {
+        self.document_find.paste_rejected = false;
         self.document_find.query_text = text;
         self.restart_document_find(cx, true, true);
     }
@@ -899,6 +924,9 @@ impl EditorView {
     /// notice appended after a Next/Previous that just wrapped past either
     /// end of the match list.
     fn document_find_status_text(&self) -> String {
+        if self.document_find.paste_rejected {
+            return "改行を含む文字列は貼り付けられません".to_owned();
+        }
         match &self.document_find.result {
             DocumentFindResult::Empty | DocumentFindResult::Invalid(FindQueryError::Empty) => {
                 String::new()
@@ -945,7 +973,15 @@ impl EditorView {
             .input
             .as_ref()
             .expect("the find bar's input is initialized before it is opened");
+        let view = cx.entity().downgrade();
         let search_input = Input::new(input)
+            .on_paste(move |item, _, cx| {
+                if !clipboard_has_line_break(item) {
+                    return false;
+                }
+                view.update(cx, |view, cx| view.document_find_paste_rejected(cx))
+                    .is_ok()
+            })
             .id("document-find-input")
             .h(px(DOCUMENT_FIND_BAR_HEIGHT))
             .appearance(false)
