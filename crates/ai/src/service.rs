@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use hane_network::NetworkContext;
+use hane_network::{NetworkContext, NetworkError};
 use serde_json::{Value, json};
 
 use crate::account::{
@@ -29,7 +29,10 @@ use crate::paths::AiPaths;
 use crate::probe::{ProbeDiagnostic, ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
-use crate::runtime::{AiRuntime, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime::{
+    AiRuntime, NetworkRevisionGuard, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind,
+    RuntimeState,
+};
 use crate::runtime_distribution;
 use crate::runtime_distribution::{
     EXPLICIT_OVERRIDE_ENV_VAR, RuntimeDistributionErrorCode, classify_handshake_failure,
@@ -276,6 +279,36 @@ pub struct AiService {
     handle: AiServiceHandle,
     shutdown_tx: mpsc::Sender<()>,
     worker: Option<JoinHandle<()>>,
+    network: Arc<Mutex<NetworkSnapshot>>,
+}
+
+/// One network snapshot and its revision. A saved network setting advances
+/// the revision; every operation the worker starts afterwards uses the new
+/// snapshot, while an operation already running keeps the snapshot it began
+/// with.
+#[derive(Clone, Default)]
+struct NetworkSnapshot {
+    revision: u64,
+    context: NetworkContext,
+    /// The latest saved revision, shared by every clone of this snapshot. The
+    /// worker's copy keeps `revision` fixed for the command it is running,
+    /// while this still follows `apply_network`, so an operation can tell that
+    /// a newer setting was saved after it began.
+    latest: Arc<AtomicU64>,
+    /// Held while `latest` advances and while an operation's final revision
+    /// check and result publication run, so a save cannot land between them.
+    publish_gate: Arc<Mutex<()>>,
+}
+
+impl NetworkSnapshot {
+    /// The guard for an operation started under this snapshot.
+    fn revision_guard(&self) -> NetworkRevisionGuard {
+        NetworkRevisionGuard::new(
+            self.revision,
+            self.latest.clone(),
+            self.publish_gate.clone(),
+        )
+    }
 }
 
 impl AiServiceHandle {
@@ -603,16 +636,50 @@ impl AiService {
             cancel_tx,
             shared: shared.clone(),
         };
+        let network = Arc::new(Mutex::new(NetworkSnapshot {
+            revision: 0,
+            context: network,
+            latest: Arc::new(AtomicU64::new(0)),
+            publish_gate: Arc::default(),
+        }));
+        let worker_network = network.clone();
         let worker = thread::Builder::new()
             .name("hane-ai-service".to_string())
             .spawn(move || {
-                service_worker(config, network, command_rx, cancel_rx, shutdown_rx, shared)
+                service_worker(
+                    config,
+                    worker_network,
+                    command_rx,
+                    cancel_rx,
+                    shutdown_rx,
+                    shared,
+                )
             })?;
         Ok(AiService {
             handle,
             shutdown_tx,
             worker: Some(worker),
+            network,
         })
+    }
+
+    /// Records a saved network setting and returns its new revision. Only
+    /// operations that start afterwards use it; this never starts a login,
+    /// runtime download or text transform by itself. The next operation that
+    /// needs the runtime stops the old child, confirms it is gone, and starts
+    /// a new one with the new snapshot.
+    pub fn apply_network(&self, context: NetworkContext) -> u64 {
+        let mut snapshot = self.network.lock().unwrap();
+        snapshot.revision = snapshot.revision.saturating_add(1);
+        snapshot.context = context;
+        {
+            let _gate = snapshot
+                .publish_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snapshot.latest.store(snapshot.revision, Ordering::SeqCst);
+        }
+        snapshot.revision
     }
 
     pub fn handle(&self) -> AiServiceHandle {
@@ -659,11 +726,14 @@ struct WorkerState {
     /// (e.g. a corrupted or tampered prior install); surfaced the same way
     /// `AiServiceConfig::binary_resolution_error` already is.
     runtime_binary_error: Option<RuntimeDistributionErrorCode>,
+    /// The network snapshot of the command being handled, taken once when
+    /// the worker dequeued it.
+    network: NetworkSnapshot,
 }
 
 fn service_worker(
     config: AiServiceConfig,
-    network: NetworkContext,
+    network_cell: Arc<Mutex<NetworkSnapshot>>,
     command_rx: Receiver<QueuedCommand>,
     cancel_rx: Receiver<OperationId>,
     shutdown_rx: Receiver<()>,
@@ -686,6 +756,7 @@ fn service_worker(
         deferred_runtime_events: VecDeque::new(),
         runtime_binary: None,
         runtime_binary_error: None,
+        network: network_cell.lock().unwrap().clone(),
     };
     resolve_runtime_binary_at_startup(&paths, &mut state, &shared);
     let mut settings = AiSettings::default();
@@ -731,20 +802,25 @@ fn service_worker(
         }
 
         match command_rx.recv_timeout(EVENT_POLL) {
-            Ok(queued) => handle_command(
-                queued,
-                &config,
-                &network,
-                &paths,
-                &settings_store,
-                &journal,
-                &shared,
-                &mut state,
-                &mut settings,
-                &cancel_rx,
-                &shutdown_rx,
-                &mut shutdown,
-            ),
+            Ok(queued) => {
+                // One consistent snapshot for the whole command.
+                state.network = network_cell.lock().unwrap().clone();
+                let network = state.network.context.clone();
+                handle_command(
+                    queued,
+                    &config,
+                    &network,
+                    &paths,
+                    &settings_store,
+                    &journal,
+                    &shared,
+                    &mut state,
+                    &mut settings,
+                    &cancel_rx,
+                    &shutdown_rx,
+                    &mut shutdown,
+                );
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => shutdown = true,
         }
@@ -1212,23 +1288,32 @@ fn run_probe_command(
         snapshot.probe_diagnostic = None;
     });
 
-    if ensure_runtime(config, paths, settings, shared, state).is_err() {
+    if let Err(ensure_error) = ensure_runtime_classified(config, paths, settings, shared, state) {
         let owner_elsewhere =
             shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere;
         let distribution_error = shared.snapshot.lock().unwrap().runtime_distribution_error;
-        let (status, code) = if owner_elsewhere {
-            (
-                ProbeStatus::Failed(ProbeErrorCode::OwnedElsewhere),
-                ProbeErrorCode::OwnedElsewhere,
-            )
-        } else {
-            (
-                ProbeStatus::Failed(ProbeErrorCode::RuntimeUnavailable),
-                ProbeErrorCode::RuntimeUnavailable,
-            )
+        let network_failure = match ensure_error {
+            EnsureRuntimeError::NetworkPlan(failure) => Some(failure),
+            EnsureRuntimeError::Runtime => None,
         };
+        let code = if owner_elsewhere {
+            ProbeErrorCode::OwnedElsewhere
+        } else {
+            match network_failure {
+                Some(NetworkPlanFailure::InvalidConfiguration) => {
+                    ProbeErrorCode::InvalidConfiguration
+                }
+                Some(NetworkPlanFailure::CredentialUnavailable) => {
+                    ProbeErrorCode::CredentialUnavailable
+                }
+                None => ProbeErrorCode::RuntimeUnavailable,
+            }
+        };
+        let status = ProbeStatus::Failed(code);
         let cause = if owner_elsewhere {
             "runtime_owned_by_another_process".to_owned()
+        } else if let Some(failure) = network_failure {
+            failure.cause().to_owned()
         } else if let Some(error) = distribution_error {
             format!("runtime_distribution_error={error:?}")
         } else {
@@ -1311,6 +1396,7 @@ fn run_probe_command(
         &workspace,
         settings.settings_generation,
         snapshot.auth_epoch,
+        &state.network.revision_guard(),
     );
     // The process may still be running after an isolation result. Keep its
     // working directory in that case until a later confirmed stop.
@@ -1338,36 +1424,103 @@ fn run_probe_command(
         );
         return;
     }
-    let operation_result = match &execution.status {
-        ProbeStatus::Succeeded => SafeOperationResult::Succeeded,
-        ProbeStatus::Canceled => SafeOperationResult::Canceled,
-        ProbeStatus::TimedOut => SafeOperationResult::TimedOut,
-        ProbeStatus::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
-        ProbeStatus::Stale => {
-            SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code())
-        }
-        ProbeStatus::Isolated => {
-            SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code())
-        }
-        ProbeStatus::NotRun | ProbeStatus::Running => {
-            SafeOperationResult::Failed(ProbeErrorCode::ProtocolMismatch.stable_code())
-        }
-    };
     let owns_runtime_lock = runtime
         .with_owner_lock(|owner| owner.is_some())
         .unwrap_or(false);
     sync_runtime_snapshot(shared, runtime);
-    mutate(shared, |snapshot| {
-        snapshot.probe_status = execution.status;
-        snapshot.probe_result = execution.result;
-        snapshot.probe_diagnostic = execution.diagnostic;
-        snapshot.ownership = if owns_runtime_lock {
-            OwnershipState::Owned
-        } else {
-            OwnershipState::Unknown
-        };
-    });
+    let operation_result = publish_probe_execution(
+        shared,
+        id,
+        &state.network.revision_guard(),
+        execution.status,
+        execution.result,
+        execution.diagnostic,
+        owns_runtime_lock,
+    );
     finish(shared, id, operation_result, LoginState::Idle);
+}
+
+/// Publishes the probe's final status/result. The last network revision check
+/// and the snapshot update run under one gate with `apply_network`, so a
+/// success is never published once a newer revision was saved: it becomes a
+/// stale failure with no result instead.
+fn publish_probe_execution(
+    shared: &Arc<SharedServiceState>,
+    id: OperationId,
+    network: &NetworkRevisionGuard,
+    status: ProbeStatus,
+    result: Option<ProbeResult>,
+    diagnostic: Option<ProbeDiagnostic>,
+    owns_runtime_lock: bool,
+) -> SafeOperationResult {
+    network.publish_if_current(|current| {
+        let (status, result, diagnostic) = if !current && status == ProbeStatus::Succeeded {
+            (
+                ProbeStatus::Failed(ProbeErrorCode::StaleGeneration),
+                None,
+                Some(probe_diagnostic(
+                    id,
+                    "turn",
+                    ProbeErrorCode::StaleGeneration,
+                    "network_revision_changed".to_owned(),
+                )),
+            )
+        } else {
+            (status, result, diagnostic)
+        };
+        let operation_result = match &status {
+            ProbeStatus::Succeeded => SafeOperationResult::Succeeded,
+            ProbeStatus::Canceled => SafeOperationResult::Canceled,
+            ProbeStatus::TimedOut => SafeOperationResult::TimedOut,
+            ProbeStatus::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
+            ProbeStatus::Stale => {
+                SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code())
+            }
+            ProbeStatus::Isolated => {
+                SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code())
+            }
+            ProbeStatus::NotRun | ProbeStatus::Running => {
+                SafeOperationResult::Failed(ProbeErrorCode::ProtocolMismatch.stable_code())
+            }
+        };
+        mutate(shared, |snapshot| {
+            snapshot.probe_status = status;
+            snapshot.probe_result = result;
+            snapshot.probe_diagnostic = diagnostic;
+            snapshot.ownership = if owns_runtime_lock {
+                OwnershipState::Owned
+            } else {
+                OwnershipState::Unknown
+            };
+        });
+        operation_result
+    })
+}
+
+/// Delivers the text transform outcome under the same gate as
+/// [`publish_probe_execution`]: a success body is replaced by a stale failure
+/// when a newer network revision was saved first.
+fn publish_text_transform_outcome(
+    reply_tx: &SyncSender<TextTransformOutcome>,
+    network: &NetworkRevisionGuard,
+    outcome: TextTransformOutcome,
+) -> SafeOperationResult {
+    network.publish_if_current(|current| {
+        let outcome = match outcome {
+            TextTransformOutcome::Succeeded { .. } if !current => TextTransformOutcome::Failed(
+                text_transform::TextTransformErrorCode::StaleGeneration,
+            ),
+            other => other,
+        };
+        let operation_result = match &outcome {
+            TextTransformOutcome::Succeeded { .. } => SafeOperationResult::Succeeded,
+            TextTransformOutcome::Canceled => SafeOperationResult::Canceled,
+            TextTransformOutcome::TimedOut => SafeOperationResult::TimedOut,
+            TextTransformOutcome::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
+        };
+        let _ = reply_tx.try_send(outcome);
+        operation_result
+    })
 }
 
 /// Runs one selection AI text transform turn. Mirrors `run_probe_command`'s
@@ -1410,13 +1563,23 @@ fn run_text_transform_command(
     };
     publish_busy(shared, id, ServiceBusyReason::TextTransform);
 
-    if ensure_runtime(config, paths, settings, shared, state).is_err() {
+    if let Err(ensure_error) = ensure_runtime_classified(config, paths, settings, shared, state) {
         let owner_elsewhere =
             shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere;
         let code = if owner_elsewhere {
             text_transform::TextTransformErrorCode::OwnedElsewhere
         } else {
-            text_transform::TextTransformErrorCode::RuntimeUnavailable
+            match ensure_error {
+                EnsureRuntimeError::NetworkPlan(NetworkPlanFailure::InvalidConfiguration) => {
+                    text_transform::TextTransformErrorCode::InvalidConfiguration
+                }
+                EnsureRuntimeError::NetworkPlan(NetworkPlanFailure::CredentialUnavailable) => {
+                    text_transform::TextTransformErrorCode::CredentialUnavailable
+                }
+                EnsureRuntimeError::Runtime => {
+                    text_transform::TextTransformErrorCode::RuntimeUnavailable
+                }
+            }
         };
         let _ = reply_tx.try_send(TextTransformOutcome::Failed(code));
         finish(
@@ -1474,6 +1637,7 @@ fn run_text_transform_command(
         document_context.as_ref(),
         &workspace,
         settings.settings_generation,
+        &state.network.revision_guard(),
     );
     // Mirrors `run_probe_command`: an isolated child's working directory
     // must survive until a later confirmed stop.
@@ -1506,12 +1670,6 @@ fn run_text_transform_command(
         );
         return;
     }
-    let operation_result = match &execution.outcome {
-        TextTransformOutcome::Succeeded { .. } => SafeOperationResult::Succeeded,
-        TextTransformOutcome::Canceled => SafeOperationResult::Canceled,
-        TextTransformOutcome::TimedOut => SafeOperationResult::TimedOut,
-        TextTransformOutcome::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
-    };
     let owns_runtime_lock = runtime
         .with_owner_lock(|owner| owner.is_some())
         .unwrap_or(false);
@@ -1523,7 +1681,11 @@ fn run_text_transform_command(
             OwnershipState::Unknown
         };
     });
-    let _ = reply_tx.try_send(execution.outcome);
+    let operation_result = publish_text_transform_outcome(
+        &reply_tx,
+        &state.network.revision_guard(),
+        execution.outcome,
+    );
     finish(shared, id, operation_result, LoginState::Idle);
 }
 
@@ -2369,13 +2531,22 @@ fn finish_persisted_save(
                 paths.runtime_owner_lock_path(),
                 config.shell_env_format,
             )
-            .map_err(|_| ()),
+            .map_err(|_| ())
+            .and_then(|mut configured| {
+                attach_network_plan(&mut configured.config, &state.network)
+                    .map(|()| configured)
+                    .map_err(|_| ())
+            }),
             Err(_) => Err(()),
         };
         match new_config {
             Ok(configured) => {
                 if runtime
-                    .reconfigure(configured.config, configured.settings_generation)
+                    .reconfigure_with_network_revision(
+                        configured.config,
+                        configured.settings_generation,
+                        state.network.revision,
+                    )
                     .is_err()
                 {
                     apply_failed = true;
@@ -2403,6 +2574,66 @@ fn finish_persisted_save(
         },
         LoginState::Idle,
     );
+}
+
+/// Sets the child's proxy plan from the command's network snapshot. Fails
+/// explicitly when the plan cannot be built (invalid environment, missing or
+/// unreadable credential); the caller must then not start the child.
+fn attach_network_plan(
+    config: &mut RuntimeConfig,
+    network: &NetworkSnapshot,
+) -> Result<(), NetworkPlanFailure> {
+    let plan = network
+        .context
+        .child_proxy_plan()
+        .map_err(|error| NetworkPlanFailure::from_network_error(&error))?;
+    config.network = Some(plan);
+    Ok(())
+}
+
+/// Why the child's proxy plan could not be built. Carries no detail from the
+/// underlying error (proxy URL, userinfo, credential ID, backend text), so it
+/// is safe to surface as a diagnostic cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkPlanFailure {
+    InvalidConfiguration,
+    CredentialUnavailable,
+}
+
+impl NetworkPlanFailure {
+    fn from_network_error(error: &NetworkError) -> Self {
+        match error {
+            NetworkError::Credential(_) => Self::CredentialUnavailable,
+            _ => Self::InvalidConfiguration,
+        }
+    }
+
+    fn cause(self) -> &'static str {
+        match self {
+            Self::InvalidConfiguration => "network_plan_invalid_configuration",
+            Self::CredentialUnavailable => "network_plan_credential_unavailable",
+        }
+    }
+}
+
+/// Failure of [`ensure_runtime_classified`]: either the proxy plan could not
+/// be built (the child is not started), or the runtime itself is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnsureRuntimeError {
+    NetworkPlan(NetworkPlanFailure),
+    Runtime,
+}
+
+impl From<()> for EnsureRuntimeError {
+    fn from(_: ()) -> Self {
+        Self::Runtime
+    }
+}
+
+impl From<NetworkPlanFailure> for EnsureRuntimeError {
+    fn from(failure: NetworkPlanFailure) -> Self {
+        Self::NetworkPlan(failure)
+    }
 }
 
 fn stop_runtime_for_recovery(
@@ -2662,6 +2893,18 @@ fn ensure_runtime<'a>(
     shared: &Arc<SharedServiceState>,
     state: &'a mut WorkerState,
 ) -> Result<&'a AiRuntime, ()> {
+    ensure_runtime_classified(config, paths, settings, shared, state).map_err(|_| ())
+}
+
+/// Same gate as [`ensure_runtime`], but keeps a proxy-plan failure distinct
+/// from runtime resolution/start failures so callers can report it.
+fn ensure_runtime_classified<'a>(
+    config: &AiServiceConfig,
+    paths: &AiPaths,
+    settings: &AiSettings,
+    shared: &Arc<SharedServiceState>,
+    state: &'a mut WorkerState,
+) -> Result<&'a AiRuntime, EnsureRuntimeError> {
     // Every AI operation goes through this one gate, so this alone surfaces
     // the resolution diagnostic (or "nothing installed yet") for all of
     // them, and never reaches a spawn attempt with a meaningless binary
@@ -2672,14 +2915,16 @@ fn ensure_runtime<'a>(
             mutate(shared, |snapshot| {
                 snapshot.runtime_distribution_error = Some(code);
             });
-            return Err(());
+            return Err(EnsureRuntimeError::Runtime);
         }
         Err(None) => {
-            return Err(());
+            return Err(EnsureRuntimeError::Runtime);
         }
     };
+    let network_revision = state.network.revision;
     let needs_config = state.runtime.as_ref().is_none_or(|runtime| {
         runtime.configured_settings_generation() != settings.settings_generation
+            || runtime.configured_network_revision() != network_revision
     });
     if needs_config {
         let configured = build_runtime_config_for_active_connection(
@@ -2690,14 +2935,17 @@ fn ensure_runtime<'a>(
             paths.runtime_owner_lock_path(),
             config.shell_env_format,
         );
-        let configured = match configured {
+        let mut configured = match configured {
             Ok(configured) => configured,
-            Err(_) => return Err(()),
+            Err(_) => return Err(EnsureRuntimeError::Runtime),
         };
+        // A proxy or credential failure is an explicit error here: the child
+        // is never started unauthenticated or directly instead.
+        attach_network_plan(&mut configured.config, &state.network)?;
         if let Some(runtime) = state.runtime.as_ref() {
             let status = runtime.snapshot();
             if status.restart_blocked {
-                return Err(());
+                return Err(EnsureRuntimeError::Runtime);
             }
             if state.owner_guard.is_some()
                 && matches!(status.state, RuntimeState::Stopped | RuntimeState::Failed)
@@ -2710,9 +2958,10 @@ fn ensure_runtime<'a>(
                 let old_runtime = state.runtime.take();
                 drop(old_runtime);
                 let (event_tx, event_rx) = mpsc::sync_channel(128);
-                let runtime = AiRuntime::spawn_with_configured_settings_generation(
+                let runtime = AiRuntime::spawn_with_configured_generations(
                     configured.config,
                     configured.settings_generation,
+                    network_revision,
                     Arc::new(RejectAllServerRequests),
                     event_tx,
                 );
@@ -2727,19 +2976,24 @@ fn ensure_runtime<'a>(
                     mutate(shared, |snapshot| {
                         snapshot.ownership = OwnershipState::Unknown
                     });
-                    return Err(());
+                    return Err(EnsureRuntimeError::Runtime);
                 }
                 state.runtime = Some(runtime);
             } else {
                 runtime
-                    .reconfigure(configured.config, configured.settings_generation)
+                    .reconfigure_with_network_revision(
+                        configured.config,
+                        configured.settings_generation,
+                        network_revision,
+                    )
                     .map_err(|_| ())?;
             }
         } else {
             let (event_tx, event_rx) = mpsc::sync_channel(128);
-            let runtime = AiRuntime::spawn_with_configured_settings_generation(
+            let runtime = AiRuntime::spawn_with_configured_generations(
                 configured.config,
                 configured.settings_generation,
+                network_revision,
                 Arc::new(RejectAllServerRequests),
                 event_tx,
             );
@@ -2763,13 +3017,16 @@ fn ensure_runtime<'a>(
             mutate(shared, |snapshot| {
                 snapshot.ownership = OwnershipState::Unknown
             });
-            return Err(());
+            return Err(EnsureRuntimeError::Runtime);
         }
     }
     mutate(shared, |snapshot| {
         snapshot.runtime_distribution_error = None;
     });
-    state.runtime.as_ref().ok_or(())
+    state
+        .runtime
+        .as_ref()
+        .ok_or(EnsureRuntimeError::Runtime)
 }
 
 fn chatgpt_active(settings: &AiSettings) -> bool {
@@ -3426,6 +3683,255 @@ mod tests {
         assert_eq!(code, RuntimeInstallErrorCode::PermissionDenied);
     }
 
+    struct MissingProxyCredential;
+
+    impl hane_network::CredentialStore for MissingProxyCredential {
+        fn load(
+            &self,
+            _: &hane_network::CredentialRef,
+        ) -> Result<hane_network::BasicCredentials, hane_network::CredentialError> {
+            Err(hane_network::CredentialError::NotFound)
+        }
+    }
+
+    fn manual_basic_snapshot(revision: u64) -> NetworkSnapshot {
+        use hane_network::{
+            EnvPlatform, ManualProxy, NetworkSettings, ProxyAuth, ProxyEnvironment,
+        };
+        let manual = ManualProxy::new(
+            "http://proxy.test:3128",
+            "",
+            ProxyAuth::Basic(hane_network::CredentialRef::new("proxy-1").unwrap()),
+        )
+        .unwrap();
+        NetworkSnapshot {
+            revision,
+            context: NetworkContext::new(
+                NetworkSettings::manual(manual),
+                ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>()),
+                Arc::new(MissingProxyCredential),
+            ),
+            latest: Arc::new(AtomicU64::new(revision)),
+            publish_gate: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn network_plan_failure_is_explicit_and_never_falls_back_to_direct() {
+        let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
+        assert!(attach_network_plan(&mut config, &manual_basic_snapshot(1)).is_err());
+        assert!(config.network.is_none());
+    }
+
+    #[test]
+    fn network_plan_credential_failure_is_classified_without_secrets() {
+        let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
+        let failure = attach_network_plan(&mut config, &manual_basic_snapshot(1)).unwrap_err();
+        assert_eq!(failure, NetworkPlanFailure::CredentialUnavailable);
+        assert!(config.network.is_none());
+        let cause = failure.cause();
+        assert_eq!(cause, "network_plan_credential_unavailable");
+        for secret in ["proxy-1", "proxy.test", "3128"] {
+            assert!(!cause.contains(secret));
+        }
+        assert_eq!(
+            EnsureRuntimeError::from(failure),
+            EnsureRuntimeError::NetworkPlan(NetworkPlanFailure::CredentialUnavailable)
+        );
+    }
+
+    #[test]
+    fn network_plan_failure_classification_separates_config_from_credential() {
+        use hane_network::{CredentialError, UrlProblem};
+        for error in [
+            NetworkError::Credential(CredentialError::NotFound),
+            NetworkError::Credential(CredentialError::Unavailable),
+            NetworkError::Credential(CredentialError::Invalid),
+        ] {
+            assert_eq!(
+                NetworkPlanFailure::from_network_error(&error),
+                NetworkPlanFailure::CredentialUnavailable
+            );
+        }
+        for error in [
+            NetworkError::ManualNotConfigured,
+            NetworkError::InvalidCredentialRef,
+            NetworkError::UnsupportedSchema(99),
+            NetworkError::InvalidProxyUrl {
+                source: hane_network::ProxySource::Manual,
+                problem: UrlProblem::UserinfoNotAllowed,
+            },
+        ] {
+            let failure = NetworkPlanFailure::from_network_error(&error);
+            assert_eq!(failure, NetworkPlanFailure::InvalidConfiguration);
+            assert_eq!(failure.cause(), "network_plan_invalid_configuration");
+        }
+        assert_eq!(EnsureRuntimeError::from(()), EnsureRuntimeError::Runtime);
+    }
+
+    fn shared_for_publish() -> Arc<SharedServiceState> {
+        // Match `probe_success_result()` so `mutate()` does not mark it Stale.
+        let mut snapshot = AiSnapshot::default();
+        snapshot.settings.active_connection = crate::settings::ActiveConnection::ChatGpt;
+        snapshot.settings.chatgpt.model_id = Some("model".to_owned());
+        Arc::new(SharedServiceState {
+            snapshot: Mutex::new(snapshot),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        })
+    }
+
+    fn probe_success_result() -> ProbeResult {
+        ProbeResult {
+            text: "ok".to_owned(),
+            connection: crate::settings::ActiveConnection::ChatGpt,
+            model: "model".to_owned(),
+            settings_generation: 0,
+            runtime_generation: 0,
+            auth_epoch: 0,
+            profile_version: 1,
+        }
+    }
+
+    /// The network revision is saved after the operation's terminal check but
+    /// before publication: a save is only possible through the same gate, so
+    /// the final check observes it and the success is not published.
+    #[test]
+    fn probe_success_is_not_published_when_a_newer_network_revision_is_saved_first() {
+        let shared = shared_for_publish();
+        let network = NetworkSnapshot::default();
+        let guard = network.revision_guard();
+        assert!(guard.is_current());
+        // The terminal check has passed; now the setting is saved.
+        {
+            let _gate = network.publish_gate.lock().unwrap();
+            network.latest.store(network.revision + 1, Ordering::SeqCst);
+        }
+
+        let result = publish_probe_execution(
+            &shared,
+            OperationId(1),
+            &guard,
+            ProbeStatus::Succeeded,
+            Some(probe_success_result()),
+            None,
+            true,
+        );
+
+        assert_eq!(
+            result,
+            SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code())
+        );
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(
+            snapshot.probe_status,
+            ProbeStatus::Failed(ProbeErrorCode::StaleGeneration)
+        );
+        assert!(snapshot.probe_result.is_none());
+        assert_eq!(
+            snapshot.probe_diagnostic.as_ref().map(|d| d.stage),
+            Some("turn")
+        );
+    }
+
+    #[test]
+    fn probe_success_is_published_while_the_network_revision_is_current() {
+        let shared = shared_for_publish();
+        let guard = NetworkSnapshot::default().revision_guard();
+
+        let result = publish_probe_execution(
+            &shared,
+            OperationId(1),
+            &guard,
+            ProbeStatus::Succeeded,
+            Some(probe_success_result()),
+            None,
+            true,
+        );
+
+        assert_eq!(result, SafeOperationResult::Succeeded);
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(snapshot.probe_status, ProbeStatus::Succeeded);
+        assert!(snapshot.probe_result.is_some());
+    }
+
+    #[test]
+    fn text_transform_body_is_not_replied_when_a_newer_network_revision_is_saved_first() {
+        let network = NetworkSnapshot::default();
+        let guard = network.revision_guard();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        {
+            let _gate = network.publish_gate.lock().unwrap();
+            network.latest.store(network.revision + 1, Ordering::SeqCst);
+        }
+
+        let result = publish_text_transform_outcome(
+            &reply_tx,
+            &guard,
+            TextTransformOutcome::Succeeded {
+                text: "body".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            result,
+            SafeOperationResult::Failed(
+                text_transform::TextTransformErrorCode::StaleGeneration.stable_code()
+            )
+        );
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            TextTransformOutcome::Failed(text_transform::TextTransformErrorCode::StaleGeneration)
+        );
+        assert!(reply_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn text_transform_body_is_replied_while_the_network_revision_is_current() {
+        let guard = NetworkSnapshot::default().revision_guard();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+
+        let result = publish_text_transform_outcome(
+            &reply_tx,
+            &guard,
+            TextTransformOutcome::Succeeded {
+                text: "body".to_owned(),
+            },
+        );
+
+        assert_eq!(result, SafeOperationResult::Succeeded);
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            TextTransformOutcome::Succeeded {
+                text: "body".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn network_revision_save_waits_for_an_in_progress_publication() {
+        let network = NetworkSnapshot::default();
+        let guard = network.revision_guard();
+        let latest = network.latest.clone();
+        let gate = network.publish_gate.clone();
+        // While the publication holds the gate, a save cannot advance `latest`.
+        guard.publish_if_current(|current| {
+            assert!(current);
+            assert!(gate.try_lock().is_err());
+            assert_eq!(latest.load(Ordering::SeqCst), network.revision);
+        });
+        assert!(gate.try_lock().is_ok());
+    }
+
+    #[test]
+    fn network_plan_is_taken_from_the_commands_snapshot() {
+        let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
+        attach_network_plan(&mut config, &NetworkSnapshot::default()).unwrap();
+        assert!(config.network.is_some());
+    }
+
     fn test_handle(snapshot: AiSnapshot) -> AiServiceHandle {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);
         let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
@@ -3472,6 +3978,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
 
         reset_early_login_buffer(&mut state);
@@ -3620,6 +4127,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let config = AiServiceConfig {
             app_data_root: data_root.clone(),
@@ -3697,6 +4205,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let config = AiServiceConfig {
             app_data_root: data_root.clone(),
@@ -3775,6 +4284,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -3832,6 +4342,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -3878,6 +4389,7 @@ mod tests {
             deferred_runtime_events: VecDeque::new(),
             runtime_binary: None,
             runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
