@@ -441,6 +441,52 @@ mod tests {
         });
     }
 
+    /// A loose list (blank lines between items) toggles through the same real
+    /// row geometry and press events. The caret sits in the independent
+    /// trailing paragraph so the item stays undisclosed; the capital `[X]` is
+    /// restored byte for byte by Undo, and Redo repeats the toggle.
+    #[gpui::test]
+    fn pressing_a_loose_task_checkbox_toggles_and_undo_restores_the_capital(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "- [ ] A\n\n- [X] B\n\ntail\n";
+        let (view, cx) = open_window(cx, source, source.len() - 1);
+
+        let row = cx
+            .debug_bounds("row-2-2")
+            .expect("the loose item's row is painted");
+        let (glyph_x, body_x) = drawn_checkbox_x(&view, cx, 2);
+
+        click(cx, glyph_x, row.center().y);
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [ ] A\n\n- [ ] B\n\ntail\n");
+            assert!(!view.text_selection_drag, "the press starts no selection drag");
+        });
+        // A further frame draws the same state and does not toggle again.
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [ ] A\n\n- [ ] B\n\ntail\n");
+        });
+
+        view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), source, "the original capital is restored");
+        });
+        view.update(cx, |view, cx| view.dispatch(EditorCommand::Redo, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [ ] A\n\n- [ ] B\n\ntail\n");
+        });
+
+        // A body press beside the glyph never toggles.
+        let row = cx
+            .debug_bounds("row-2-2")
+            .expect("the loose item's row is still painted");
+        click(cx, body_x, row.center().y);
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [ ] A\n\n- [ ] B\n\ntail\n");
+        });
+    }
+
     /// Dragging a selection across rows, ending over the other item's glyph,
     /// selects text and toggles nothing.
     #[gpui::test]

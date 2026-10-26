@@ -229,6 +229,83 @@ fn checkbox_hit_area_is_the_drawn_glyph_on_its_own_row() {
     assert!(layout.task_checkbox_at_x(&block, 1, child_left + 1.0, &shaper).is_none());
 }
 
+/// Loose lists (blank lines between items) stay one list block, so the
+/// single-block `present` helper is the right context for these fixtures.
+#[test]
+fn loose_task_items_show_checkboxes_with_their_own_marker_ranges() {
+    let source = "- [ ] A\n\n- [x] B\n\n- [X] C";
+    let block = present(source, None, None);
+    for (line, glyph, range, checked) in [
+        (0, '\u{2610}', (2, 5), false),
+        (2, '\u{2611}', (11, 14), true),
+        (4, '\u{2611}', (20, 23), true),
+    ] {
+        let visual = &block.lines[line].visual_text;
+        assert!(visual.contains(glyph), "line {line}: {visual:?}");
+        assert!(!visual.contains('['), "line {line} hides the ASCII brackets: {visual:?}");
+        let task = task_of(&block, line).expect("loose task");
+        assert_eq!(task.checked, checked, "line {line}");
+        assert_eq!(task.marker_range, SourceRange::new(range.0, range.1), "line {line}");
+        assert!(task.checkbox_visual_range.is_some(), "line {line}");
+        assert!(
+            block.lines[line]
+                .source_map
+                .segments
+                .iter()
+                .any(|segment| segment.source_range.start.0 <= range.0
+                    && range.1 <= segment.source_range.end.0),
+            "line {line}: the real marker bytes stay covered by the SourceMap"
+        );
+    }
+    // Viewing never rewrites the capital.
+    assert_eq!(&source[20..23], "[X]");
+
+    // Touching one item's own line discloses only that item.
+    let touched = present(source, Some(12), None);
+    assert_eq!(touched.lines[2].visual_text, "- [x] B");
+    let task = task_of(&touched, 2).expect("disclosed row still knows its task");
+    assert_eq!(task.checkbox_visual_range, None, "no control while disclosed");
+    assert!(task_of(&touched, 0).and_then(|task| task.checkbox_visual_range).is_some());
+    assert!(task_of(&touched, 4).and_then(|task| task.checkbox_visual_range).is_some());
+}
+
+#[test]
+fn loose_ordered_nested_quoted_and_multibyte_items_keep_their_own_markers() {
+    let ordered = present("1. [ ] a\n\n2. [x] b", None, None);
+    assert_eq!(ordered.lines[0].visual_text, "1. \u{2610} a");
+    assert_eq!(ordered.lines[2].visual_text, "2. \u{2611} b");
+    assert_eq!(
+        task_of(&ordered, 2).map(|task| task.marker_range),
+        Some(SourceRange::new(13, 16))
+    );
+
+    // The parent never borrows the child's marker.
+    let nested = present("- A\n\n  - [x] child\n\n- [ ] B", None, None);
+    assert_eq!(nested.lines[0].visual_text, "\u{2022} A");
+    assert!(task_of(&nested, 0).is_none());
+    assert_eq!(
+        task_of(&nested, 2).map(|task| (task.checked, task.marker_range)),
+        Some((true, SourceRange::new(9, 12)))
+    );
+    assert_eq!(
+        task_of(&nested, 4).map(|task| (task.checked, task.marker_range)),
+        Some((false, SourceRange::new(22, 25)))
+    );
+
+    let quoted = present("> - [ ] a\n>\n> - [x] b", None, None);
+    assert_eq!(task_of(&quoted, 0).map(|task| task.checked), Some(false));
+    assert_eq!(task_of(&quoted, 2).map(|task| task.checked), Some(true));
+
+    // CRLF and Japanese bodies: `- [ ] a\r\n\r\n- [x] 日本`.
+    let crlf = present("- [ ] a\r\n\r\n- [x] \u{65e5}\u{672c}", None, None);
+    assert_eq!(crlf.lines[0].visual_text, "\u{2022} \u{2610} a");
+    assert_eq!(crlf.lines[2].visual_text, "\u{2022} \u{2611} \u{65e5}\u{672c}");
+    assert_eq!(
+        task_of(&crlf, 2).map(|task| task.marker_range),
+        Some(SourceRange::new(13, 16))
+    );
+}
+
 #[test]
 fn wrapped_continuation_rows_and_disclosed_rows_have_no_checkbox() {
     let shaper = FixedAdvanceShaper::default();

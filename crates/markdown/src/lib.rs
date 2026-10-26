@@ -535,7 +535,7 @@ mod tests {
         );
         assert_eq!(
             task_markers_of("1. [ ] a\r\n\r\n2. [x] \u{65e5}\u{672c}\r\n"),
-            vec![(3, 7, false), (14, 18, true)]
+            vec![(3, 7, false), (15, 19, true)]
         );
         let source = "- A\n\n  - [ ] child\n\n- [x] B\n";
         let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
@@ -619,6 +619,64 @@ mod tests {
         assert_eq!(plan(text, (2, 5), true), None);
         assert_eq!(plan(text, (3, 6), false), None);
         assert_eq!(plan("[ ] a", (0, 3), false), None);
+    }
+
+    #[test]
+    fn loose_task_toggle_changes_only_the_middle_byte() {
+        use hane_document::{RopeBuffer, SourceOffset, TextBuffer};
+
+        /// Plans the toggle of the marker at `marker` and applies it to the text.
+        fn toggled(text: &str, marker: (usize, usize), checked: bool) -> String {
+            let buffer = RopeBuffer::from_text(text);
+            let parsed = parse_document(buffer.revision(), SourceRange::new(0, text.len()), text);
+            let projection = build_list_edit_projection(&parsed, text);
+            let plan = plan_task_toggle(
+                &buffer,
+                &projection,
+                SourceRange::new(marker.0, marker.1),
+                checked,
+                SourceSelection::caret(SourceOffset(text.len())),
+            )
+            .expect("buffer read")
+            .expect("loose task marker is accepted");
+            let MarkdownEditPlan::Replace {
+                range, replacement, ..
+            } = plan
+            else {
+                panic!("unexpected no-op");
+            };
+            let mut out = text.to_owned();
+            out.replace_range(range.start.0..range.end.0, &replacement);
+            out
+        }
+
+        // Blank lines, siblings and the capital `[X]` survive byte for byte.
+        let lf = "- [ ] A\n\n- [x] B\n\n- [X] C\n";
+        assert_eq!(toggled(lf, (2, 5), false), "- [x] A\n\n- [x] B\n\n- [X] C\n");
+        assert_eq!(toggled(lf, (11, 14), true), "- [ ] A\n\n- [ ] B\n\n- [X] C\n");
+        assert_eq!(toggled(lf, (20, 23), true), "- [ ] A\n\n- [x] B\n\n- [ ] C\n");
+
+        // CRLF and Japanese bodies: `1. [ ] a\r\n\r\n2. [x] 日本\r\n`.
+        let crlf = "1. [ ] a\r\n\r\n2. [x] \u{65e5}\u{672c}\r\n";
+        assert_eq!(
+            toggled(crlf, (3, 6), false),
+            "1. [x] a\r\n\r\n2. [x] \u{65e5}\u{672c}\r\n"
+        );
+        assert_eq!(
+            toggled(crlf, (15, 18), true),
+            "1. [ ] a\r\n\r\n2. [ ] \u{65e5}\u{672c}\r\n"
+        );
+
+        // Parent and child keep their own marker; a continuation line is untouched.
+        let nested = "- A\n\n  - [x] child\n\n    more\n\n- [ ] B\n";
+        assert_eq!(
+            toggled(nested, (9, 12), true),
+            "- A\n\n  - [ ] child\n\n    more\n\n- [ ] B\n"
+        );
+        assert_eq!(
+            toggled(nested, (32, 35), false),
+            "- A\n\n  - [x] child\n\n    more\n\n- [x] B\n"
+        );
     }
 
     #[test]
