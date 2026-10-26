@@ -455,10 +455,10 @@ impl SettingsRepository for FileStateStore {
     }
 
     fn store(&self, settings: &Settings) -> io::Result<()> {
-        if let NetworkConfig::Invalid(invalid) = &settings.network {
-            if let Some(kind) = invalid.read_failure() {
-                return Err(io::Error::new(kind, invalid.reason().to_owned()));
-            }
+        if let NetworkConfig::Invalid(invalid) = &settings.network
+            && let Some(kind) = invalid.read_failure()
+        {
+            return Err(io::Error::new(kind, invalid.reason().to_owned()));
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
