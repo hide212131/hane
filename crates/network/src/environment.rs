@@ -88,13 +88,14 @@ impl ProxyEnvironment {
         }
     }
 
-    /// First non-empty variable in priority order. Empty / whitespace-only
-    /// values count as unset; a non-empty value is final even if it is
-    /// invalid, so a broken higher-priority value never falls through.
+    /// First non-empty variable in priority order. Only undefined or
+    /// zero-length values count as unset; any other value (including
+    /// whitespace / control characters only) is final even if it is invalid,
+    /// so a broken higher-priority value never falls through.
     fn first_set(&self, names: &'static [&'static str]) -> Option<(&'static str, &str)> {
         names.iter().find_map(|&n| {
             let v = self.vars.get(n)?;
-            (!v.trim().is_empty()).then_some((n, v.as_str()))
+            (!v.is_empty()).then_some((n, v.as_str()))
         })
     }
 
@@ -218,11 +219,32 @@ mod tests {
             EnvPlatform::MacOs,
             &[
                 ("https_proxy", ""),
-                ("HTTPS_PROXY", "  "),
+                ("HTTPS_PROXY", ""),
                 ("all_proxy", "http://c:1"),
             ],
         );
         assert_eq!(selected(&e, Scheme::Https), Some("http://c:1".into()));
+
+        // Whitespace / control-only values are set but invalid: they neither
+        // become Direct nor fall through to a lower-priority valid value.
+        for blank in ["\r\n", "  ", "\t"] {
+            let e = env(EnvPlatform::MacOs, &[("https_proxy", blank)]);
+            assert!(
+                matches!(
+                    e.proxy_for(Scheme::Https),
+                    Err(NetworkError::InvalidProxyUrl {
+                        source: ProxySource::Environment("https_proxy"),
+                        ..
+                    })
+                ),
+                "blank {blank:?}"
+            );
+            let e = env(
+                EnvPlatform::MacOs,
+                &[("https_proxy", blank), ("all_proxy", "http://c:1")],
+            );
+            assert!(e.proxy_for(Scheme::Https).is_err(), "fallthrough {blank:?}");
+        }
 
         let e = env(
             EnvPlatform::MacOs,
