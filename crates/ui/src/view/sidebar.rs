@@ -974,6 +974,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.file_tab_context_menu = None;
+        self.editor_context_menu = None;
         self.sidebar_context_menu = Some(SidebarContextMenu { position, target });
         cx.notify();
     }

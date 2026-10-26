@@ -781,6 +781,9 @@ command_actions! {
             // cancel its composition.
             return;
         }
+        if view.dismiss_editor_context_menu(cx) {
+            return;
+        }
         if view.dismiss_file_tab_context_menu(cx) {
             return;
         }

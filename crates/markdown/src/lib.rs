@@ -31,6 +31,7 @@
 mod block_index;
 mod block_store;
 mod fence_height;
+mod link_insertion;
 mod list_editing;
 mod list_projection;
 mod local_block_index;
@@ -45,6 +46,9 @@ pub use block_index::{
     TableProjectionRow,
 };
 pub use fence_height::FenceHeightProjection;
+pub use link_insertion::{
+    LinkInsertionPlan, LinkInsertionRefusal, clipboard_http_url, plan_link_insertion,
+};
 pub use list_editing::{
     ListEditIntent, ListEditItem, ListEditPlanResult, ListEditProjection, ListMarker,
     MarkdownEditPlan, SourceSelection, build_list_edit_projection, plan_list_edit,
