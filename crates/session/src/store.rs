@@ -160,6 +160,21 @@ fn parse_network_config(raw_lines: Vec<String>) -> NetworkConfig {
     }
 }
 
+/// The stored proxy settings could not be read at all. The marker line is
+/// written back by later stores, so it reloads as an invalid setting rather
+/// than as the Environment default.
+fn unreadable_network_config(kind: io::ErrorKind) -> NetworkConfig {
+    let reason = if kind == io::ErrorKind::InvalidData {
+        "保存済みの設定ファイルが正しい文字コードではないため、プロキシ設定を読み込めません"
+    } else {
+        "保存済みの設定ファイルを読み込めないため、プロキシ設定を確認できません"
+    };
+    NetworkConfig::Invalid(InvalidNetworkConfig {
+        raw_lines: vec!["network_mode=unreadable".to_owned()],
+        reason: reason.to_owned(),
+    })
+}
+
 fn parse_network_lines(lines: &[String]) -> Result<NetworkSettings, String> {
     let mut schema = None;
     let mut mode = None;
@@ -422,27 +437,7 @@ impl FileStateStore {
 
 impl SettingsRepository for FileStateStore {
     fn load(&self) -> Settings {
-        let mut settings = Settings::default();
-        if let Ok(contents) = fs::read_to_string(self.root.join("settings.conf")) {
-            let mut network = Vec::new();
-            for line in contents.lines() {
-                if line.starts_with("network_") {
-                    network.push(line.to_owned());
-                    continue;
-                }
-                if let Some(value) = line.strip_prefix("autosave=") {
-                    settings.autosave = value != "false";
-                } else if let Some(value) = line.strip_prefix("theme=") {
-                    settings.theme = ThemePreference::parse(value);
-                } else if let Some(value) = line.strip_prefix("default_folder=") {
-                    settings.default_folder = Some(PathBuf::from(unescape_line(value)));
-                } else if let Some(value) = line.strip_prefix("sidebar_sort=") {
-                    settings.sidebar_sort = WorkFolderSortOrder::parse(value);
-                }
-            }
-            settings.network = parse_network_config(network);
-        }
-        settings
+        settings_from_read(fs::read_to_string(self.root.join("settings.conf")))
     }
 
     fn store(&self, settings: &Settings) -> io::Result<()> {
@@ -464,6 +459,39 @@ impl SettingsRepository for FileStateStore {
         }
         atomic_write_bytes(&self.root.join("settings.conf"), contents.as_bytes())
     }
+}
+
+/// Builds settings from the result of reading `settings.conf`. A missing file
+/// is a first launch and uses the defaults; any other read failure keeps the
+/// network configuration invalid instead of falling back to Environment.
+fn settings_from_read(read: io::Result<String>) -> Settings {
+    let mut settings = Settings::default();
+    match read {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            settings.network = unreadable_network_config(error.kind());
+        }
+        Ok(contents) => {
+            let mut network = Vec::new();
+            for line in contents.lines() {
+                if line.starts_with("network_") {
+                    network.push(line.to_owned());
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("autosave=") {
+                    settings.autosave = value != "false";
+                } else if let Some(value) = line.strip_prefix("theme=") {
+                    settings.theme = ThemePreference::parse(value);
+                } else if let Some(value) = line.strip_prefix("default_folder=") {
+                    settings.default_folder = Some(PathBuf::from(unescape_line(value)));
+                } else if let Some(value) = line.strip_prefix("sidebar_sort=") {
+                    settings.sidebar_sort = WorkFolderSortOrder::parse(value);
+                }
+            }
+            settings.network = parse_network_config(network);
+        }
+    }
+    settings
 }
 
 impl RecentFilesRepository for FileStateStore {
@@ -648,6 +676,45 @@ mod tests {
     fn recent_path_escaping_round_trips() {
         let path = "folder\\name\nnotes.md";
         assert_eq!(unescape_line(&escape_line(path)), path);
+    }
+
+    #[test]
+    fn missing_settings_file_uses_the_environment_default() {
+        let settings = settings_from_read(Err(io::Error::from(io::ErrorKind::NotFound)));
+        assert_eq!(settings.network, NetworkConfig::default());
+        assert!(settings.network.valid().is_some());
+    }
+
+    #[test]
+    fn unreadable_settings_file_is_an_invalid_network_config() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+        ] {
+            let settings = settings_from_read(Err(io::Error::from(kind)));
+            assert!(settings.network.valid().is_none(), "{kind:?}");
+            assert!(settings.network.invalid_reason().is_some(), "{kind:?}");
+            assert_eq!(settings.network.effective_settings().schema, 0);
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_settings_file_stays_invalid_after_storing_other_settings() {
+        let root = temporary_directory("state-unreadable");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("settings.conf"), [0xff, 0xfe, b'\n']).unwrap();
+        let store = FileStateStore::at(&root);
+        let mut settings = SettingsRepository::load(&store);
+        assert!(settings.network.invalid_reason().is_some());
+
+        settings.autosave = false;
+        SettingsRepository::store(&store, &settings).unwrap();
+
+        let reloaded = SettingsRepository::load(&FileStateStore::at(&root));
+        assert!(!reloaded.autosave);
+        assert!(reloaded.network.valid().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
