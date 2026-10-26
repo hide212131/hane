@@ -329,6 +329,18 @@ pub(crate) fn ensure_prior_receipts_current(
 /// leaves no receipt, which is safe because the install was just verified
 /// against the receipt that was retired.
 pub(crate) fn retire_prior_receipts(coordination: &Coordination, current: &TransactionId) -> Result<()> {
+    retire_prior_receipts_with(coordination, current, &|coordination, transaction| {
+        crate::state_root::release_transaction_secrets(coordination, transaction)
+    })
+}
+
+/// [`retire_prior_receipts`] with the secret release injected, so tests never
+/// touch the OS secret store.
+pub(crate) fn retire_prior_receipts_with(
+    coordination: &Coordination,
+    current: &TransactionId,
+    release: &dyn Fn(&Coordination, &TransactionId) -> bool,
+) -> Result<()> {
     let private = coordination.dir().join(PRIVATE_DIR);
     let entries = match fs::read_dir(&private) {
         Ok(entries) => entries,
@@ -359,6 +371,16 @@ pub(crate) fn retire_prior_receipts(coordination: &Coordination, current: &Trans
                     && matches!(journal.phase, Phase::Committed | Phase::RolledBack)
         );
         if terminal {
+            // A temporary proxy credential still named by this receipt must be
+            // removed first; otherwise it would become untraceable.
+            if !release(coordination, &transaction) {
+                return Err(UpdateError::new(
+                    ErrorCode::InstallModified,
+                    bounded_reason(&format!(
+                        "the previous receipt {name} still holds a temporary proxy credential"
+                    )),
+                ));
+            }
             remove_receipt_dir(&entry.path(), &private, &name).map_err(|err| {
                 UpdateError::new(
                     ErrorCode::InstallModified,
@@ -475,7 +497,9 @@ fn sweep_unjournaled(coordination: &Coordination) {
         let Ok(id) = TransactionId::parse(&name) else {
             continue;
         };
-        let _ = coordination.remove_unjournaled_transaction(&id);
+        // Releases the temporary proxy credentials first; one that cannot be
+        // removed keeps the directory for the next start.
+        crate::helper::discard_unstarted_transaction(coordination, &id);
     }
 }
 
@@ -1275,6 +1299,131 @@ mod tests {
                 "settle={settle}: no runtime lease is held by the gate"
             );
         }
+    }
+
+    /// In-memory stand-in for the OS secret store; `fail_delete` makes every
+    /// delete fail and `calls` counts store accesses.
+    #[derive(Default)]
+    struct FakeSecrets {
+        entries: RefCell<std::collections::BTreeMap<String, String>>,
+        fail_delete: Cell<bool>,
+        calls: Cell<usize>,
+    }
+
+    impl crate::state_root::TransientSecretStore for FakeSecrets {
+        fn put(&self, reference: &str, secret: &str) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            self.entries.borrow_mut().insert(reference.to_owned(), secret.to_owned());
+            Ok(())
+        }
+
+        fn take(&self, reference: &str) -> Result<Option<String>> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.entries.borrow_mut().remove(reference))
+        }
+
+        fn delete(&self, reference: &str) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail_delete.get() {
+                return Err(UpdateError::new(ErrorCode::Io, "the fake store refuses to delete"));
+            }
+            self.entries.borrow_mut().remove(reference);
+            Ok(())
+        }
+    }
+
+    fn retire_with(coord: &Coordination, current: &TransactionId, secrets: &FakeSecrets) -> Result<()> {
+        retire_prior_receipts_with(coord, current, &|coordination, transaction| {
+            crate::state_root::release_transaction_secrets_with(coordination, transaction, secrets)
+        })
+    }
+
+    /// Shadows the production entry point so these tests never reach the
+    /// macOS Keychain or the Windows Credential Manager.
+    fn retire_prior_receipts(coord: &Coordination, current: &TransactionId) -> Result<()> {
+        retire_with(coord, current, &FakeSecrets::default())
+    }
+
+    fn publish_record(
+        coord: &Coordination,
+        transaction: &TransactionId,
+        secrets: &FakeSecrets,
+        userinfo: bool,
+    ) {
+        let value = if userinfo {
+            "http://dummy-user:dummy-pass@proxy.example:8443"
+        } else {
+            "http://proxy.example:8443"
+        };
+        crate::state_root::publish_environment_with_secrets(
+            coord,
+            transaction,
+            [(std::ffi::OsString::from("HTTPS_PROXY"), std::ffi::OsString::from(value))],
+            secrets,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_credential_free_receipt_is_retired_without_touching_the_secret_store() {
+        let dir = TempDir::new("gate-retire-credential-free");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let prior = TransactionId::generate().unwrap();
+        write_versioned(&coord, &prior, ("1.0.0", "2.0.0"), Phase::Committed);
+        let secrets = FakeSecrets::default();
+        publish_record(&coord, &prior, &secrets, false);
+        secrets.fail_delete.set(true);
+        let next = TransactionId::generate().unwrap();
+        retire_with(&coord, &next, &secrets).unwrap();
+        assert_eq!(secrets.calls.get(), 0);
+        assert!(!coord.transaction_dir(&prior).exists());
+    }
+
+    #[test]
+    fn a_recorded_secret_that_cannot_be_deleted_keeps_the_receipt_until_a_retry() {
+        let dir = TempDir::new("gate-retire-recorded-secret");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let prior = TransactionId::generate().unwrap();
+        write_versioned(&coord, &prior, ("1.0.0", "2.0.0"), Phase::Committed);
+        let secrets = FakeSecrets::default();
+        publish_record(&coord, &prior, &secrets, true);
+        assert_eq!(secrets.entries.borrow().len(), 1);
+        let next = TransactionId::generate().unwrap();
+
+        secrets.fail_delete.set(true);
+        assert!(retire_with(&coord, &next, &secrets).is_err());
+        assert!(coord.journal_path(&prior).exists(), "the receipt stays tracked");
+        assert_eq!(secrets.entries.borrow().len(), 1);
+
+        secrets.fail_delete.set(false);
+        retire_with(&coord, &next, &secrets).unwrap();
+        assert!(secrets.entries.borrow().is_empty());
+        assert!(!coord.transaction_dir(&prior).exists());
+    }
+
+    #[test]
+    fn an_orphan_secret_without_a_record_is_still_swept_on_retirement() {
+        use crate::state_root::TransientSecretStore;
+        let dir = TempDir::new("gate-retire-orphan-secret");
+        let placement = placement(&dir);
+        let coord = placement.coordination().unwrap();
+        let prior = TransactionId::generate().unwrap();
+        write_versioned(&coord, &prior, ("1.0.0", "2.0.0"), Phase::Committed);
+        let secrets = FakeSecrets::default();
+        // A crash during publish: the secret exists, no record names it.
+        secrets.put(&format!("{}.0", prior.as_str()), "dummy-pass").unwrap();
+        let next = TransactionId::generate().unwrap();
+
+        secrets.fail_delete.set(true);
+        assert!(retire_with(&coord, &next, &secrets).is_err());
+        assert!(coord.journal_path(&prior).exists());
+
+        secrets.fail_delete.set(false);
+        retire_with(&coord, &next, &secrets).unwrap();
+        assert!(secrets.entries.borrow().is_empty());
+        assert!(!coord.transaction_dir(&prior).exists());
     }
 
     #[test]

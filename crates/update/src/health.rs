@@ -543,7 +543,16 @@ fn capability_for(request: &LaunchRequest<'_>, nonce: &Nonce) -> Result<Capabili
 fn spawn_limited(request: &LaunchRequest<'_>) -> Result<(Child, ChildLink, u32)> {
     let nonce = Nonce::generate()?;
     let capability = capability_for(request, &nonce)?;
-    let profile = state_root::read_environment(request.coordination, request.transaction)?;
+    // The only restore of the proxy credentials: each referenced OS secret is
+    // taken once for this transaction. A missing or unreadable one fails the
+    // launch (the update is rolled back) instead of starting a child with an
+    // unauthenticated proxy. The restored values live in this process and in
+    // the child's environment only; nothing is written back.
+    let profile = state_root::read_environment_with_secrets(
+        request.coordination,
+        request.transaction,
+        &crate::secret_store::OsSecretStore::proxy(),
+    )?;
     publish_capability(request.coordination, request.transaction, &capability)?;
     let mut child = match child_command(request.exe, &profile).spawn() {
         Ok(child) => child,
