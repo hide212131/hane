@@ -276,7 +276,7 @@ fn escape_label_brackets(source: &str, selection: SourceRange, parse: &MarkdownP
         let in_code = codes
             .iter()
             .any(|code| code.start.0 <= at && at < code.end.0);
-        if (ch == '[' || ch == ']') && !in_code && backslashes % 2 == 0 {
+        if (ch == '[' || ch == ']') && !in_code && backslashes.is_multiple_of(2) {
             out.push('\\');
         }
         out.push(ch);
