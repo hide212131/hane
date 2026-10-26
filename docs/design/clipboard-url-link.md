@@ -73,9 +73,9 @@ workspaceにある `url` crate（調査時 `=2.5.8`）を利用し、正規表�
 
 IME中はリンク項目を表示せず、操作が変換確定・取消を勝手に行わない。guardに失敗した場合はhistory、dirty、revision、選択、原文のどれも変えない。
 
-リンク挿入は独立した1回のundo transactionとする。前後の通常入力とhistoryを結合しない。1回のUndoで原文と元の向き込みSelectionへ戻り、1回のRedoでリンクと実行後キャレットを復元する。現行 `EditorCommand::Insert` は前後の入力とgroupingされ得るため、その呼び出しだけで完了としない。Editor側に原子的な選択置換APIと明示的なhistory境界を追加または再利用し、UIからbufferを直接編集しない。
+リンク挿入は独立した1回のundo transactionとする。前後の通常入力とhistoryを結合しない。1回のUndoで原文と元の向き込みSelectionへ戻り、1回のRedoでリンクと実行後キャレットを復元する。現行 `EditorCommand::Insert` は前後の入力とgroupingされ得るため、その呼び出しだけで完了としない。既存の `Editor::replace_range_recorded(range, replacement, selection_after)` を利用する。このAPIが持つ独立したhistory境界とSelection復元を使い、リンク専用の置換・history APIを重複追加しない。UIからbufferを直接編集しない。IMEをcommitするAPIなので、呼ぶ前にcompositionなしを確認する。
 
-成功した `EditSummary` は通常の入力後処理へ接続する。dirty、保存・recovery、再解析、表示cache、find結果、選択描画は既存の編集経路と同じ更新を受ける。保存して再読込したときも同じMarkdown原文とリンク先を保持する。
+成功した `EditSummary` は既存の `EditorView::after_input` に接続する。dirty、保存・recovery、再解析、表示cache、find結果、選択描画は既存の編集経路と同じ更新を受ける。保存して再読込したときも同じMarkdown原文とリンク先を保持する。
 
 ## 実装担当が読む場所と変更責務
 
@@ -85,7 +85,7 @@ IME中はリンク項目を表示せず、操作が変換確定・取消を勝�
 | `crates/ui/src/view.rs` | `on_row_mouse_down` は選択・リンクを開く処理を行うため右クリックから呼ばない。`file_tab_context_menu_*` の表示部品を参考にする。本文メニューの詳細は新しい `view/editor_context_menu.rs` 等へ分離する |
 | `crates/ui/src/view/input_routing.rs`、`actions.rs` | コピー・切り取り・貼り付けの現在のroutingを使い、他の入力欄へ誤配送しない。Escapeの優先順位へ本文メニューを加える |
 | `crates/ui/src/view/reading_mode.rs` | `body_editable` と `command_changes_text` による防御を保つ。新しい編集commandを足すなら分類を更新する |
-| `crates/editor/src/lib.rs`、`history.rs`、`selection.rs` | GPUI非依存の原子的置換・history境界・Selection復元。URLのclipboard取得やメニュー状態は持たせない |
+| `crates/editor/src/lib.rs`、`history.rs`、`selection.rs` | 既存 `replace_range_recorded` とそのhistory境界・Selection復元を再利用する。リンク専用の置換APIを追加しない。URLのclipboard取得やメニュー状態は持たせない |
 | `crates/markdown/src/syntax.rs` と関連module | 既存 `LinkParse`、`links_intersecting`、block/inline source rangeを利用した適用可否とリンク生成。構文判定・エスケープの単体テストを置く |
 | `crates/session/src/session.rs` と既存UI document identity | 文書instance/revisionを参照する。新たな永続的メニュー状態は作らない |
 
@@ -114,6 +114,8 @@ IME中はリンク項目を表示せず、操作が変換確定・取消を勝�
 
 調査時点で同目的のopen PRはない。#596（書式付きclipboard）、#598（ファイルdropによるリンク挿入）、#603（閲覧モードのリンク操作）、#614 / #615（リンクcursor）は関連するが本機能の代替ではない。通常貼り付け・ファイルリンク・リンクcursorの実装を本PRへ混ぜない。
 
-open PR #622（本文置換）は選択置換・history・入力後処理と重なる。実装着手時にそのcurrent diffと採用済みAPIを確認し、原子的置換の重複APIを作らない。#626（タスクcheckbox）は本文クリックと重なるため、右クリックをcheckbox toggleへ伝播させない。#620（設定画面分離）と#625（network core）は調査時点で本機能の直接の前提ではない。全域refactor #297完了は待たず、共有契約に実際の競合があるときだけ順序を調整する。
+open PR #622（本文置換）は選択置換・history・入力後処理と重なる。再確認時のheadは `901eb21c897983e3da4a9939eda30ac195df714c`。置換planは既存 `replace_range_recorded` を使っており、本機能も同じAPIを使う。実装着手時にcurrent diffと採用済みAPIを確認し、原子的置換の重複APIを作らない。#626（タスクcheckbox、再確認時head `f8ec7dfc04f946e275b7f98898fb6fab38b9f3fc`）も `replace_range_recorded` と `after_input` を使う。本文クリックと重なるため、Left限定guardを保ち、右クリックをcheckbox toggleへ伝播させない。#620（設定画面分離）と#625（network core）は調査時点で本機能の直接の前提ではない。全域refactor #297完了は待たず、共有契約に実際の競合があるときだけ順序を調整する。
 
 設計採用後はこのファイルを実装branchから読める状態にして、別の実装用Draft PRへ引き渡す。依頼にはこのパス、対象head、A1〜A10、今回の対象外を含める。製品コードと直接関連するテストはClaude Codeが担当し、起動と結果確認はdefault branch上の `docs/aadw-claude-execution.md` とCommander Policyに従う。設計用PRへ実装起動コメントを投稿して転用しない。
+
+2026-10-26再確認: current main `b3dd52e22061bc79305fbf80082b4821a887dd94` の既存編集APIと上記関連headを照合した。調査基準以後のmain差分はnetwork coreとCargo依存であり、本設計の本文入力・history契約を変更していない。#622 / #626はこの時点では未merge。実装開始時には再びcurrent main/headを確認する。
