@@ -526,6 +526,41 @@ mod tests {
     }
 
     #[test]
+    fn loose_task_markers_are_owned_by_their_list_item() {
+        // Blank lines make the list loose, so the parser keeps each item's
+        // paragraph and reports the marker inside it.
+        assert_eq!(
+            task_markers_of("- [ ] A\n\n- [x] B\n\n- [X] C\n"),
+            vec![(2, 6, false), (11, 15, true), (20, 24, true)]
+        );
+        assert_eq!(
+            task_markers_of("1. [ ] a\r\n\r\n2. [x] \u{65e5}\u{672c}\r\n"),
+            vec![(3, 7, false), (14, 18, true)]
+        );
+        let source = "- A\n\n  - [ ] child\n\n- [x] B\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let items = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(parsed.task_markers.len(), 2);
+        assert!(parsed.task_markers.iter().all(|task| task.item != items[0].0));
+        assert_eq!(parsed.task_markers[0].item, items[1].0);
+        assert_eq!(parsed.task_markers[1].item, items[2].0);
+        for (id, node) in parsed.tree.iter() {
+            if matches!(node.kind, NodeKind::TaskMarker(_)) {
+                let parent = node.parent.expect("marker has an owner");
+                assert!(matches!(
+                    parsed.tree.node(parent).expect("owner").kind,
+                    NodeKind::ListItem { task: Some(_) }
+                ));
+                assert!(parsed.tree.children(parent).contains(&id));
+            }
+        }
+    }
+
+    #[test]
     fn brackets_that_are_not_task_markers_are_ignored() {
         for source in [
             "[ ] plain paragraph",

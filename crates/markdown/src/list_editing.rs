@@ -1962,10 +1962,10 @@ pub fn plan_task_toggle(
     }))
 }
 
-/// A `TaskMarker` is always pushed as a direct child of its own owning
-/// `ListItem` (the parser emits `Event::TaskListMarker` while that item is
-/// still the open container, before any nested paragraph or sublist opens),
-/// so only `id`'s direct children can ever be its task marker. Recursing into
+/// A `TaskMarker` is always a direct child of its own owning `ListItem`: the
+/// parser emits `Event::TaskListMarker` while that item is open (tight) or
+/// inside its own empty first paragraph (loose), and `build_tree` normalizes
+/// the loose case onto the item, so only `id`'s direct children can ever be its task marker. Recursing into
 /// descendants would also match a nested item's own task marker — e.g. for
 /// `- A\n  - [ ] child`, the child item's `[ ]` is not `A`'s marker — which
 /// would wrongly shrink `A`'s non-empty body down to an empty range.
