@@ -31,8 +31,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// application makes it the snapshot of every operation started afterwards;
 /// an operation already running keeps the snapshot it began with. Implementors
 /// must not communicate.
+///
+/// `retire` removes the credential the previous settings used and the new ones
+/// do not. The implementor must run it only after the replaced snapshot is
+/// released (or at once if nothing holds it), never earlier.
 pub trait NetworkSettingsApplier: Send + Sync {
-    fn apply_saved(&self, settings: &NetworkSettings);
+    fn apply_saved(
+        &self,
+        settings: &NetworkSettings,
+        retire: Option<Box<dyn FnOnce() + Send>>,
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,12 +242,27 @@ fn fresh_credential_ref() -> CredentialRef {
 }
 
 pub(super) struct SaveReport {
-    /// The save succeeded but the old credential could not be removed.
-    pub warning: Option<String>,
+    /// The previously saved credential that the new settings no longer use. It
+    /// is still in the OS store: an operation that began under the old settings
+    /// may keep reading it, so it is retired only once that snapshot is
+    /// released (see [`retire_credential`]).
+    pub obsolete_ref: Option<CredentialRef>,
+}
+
+/// Removes `reference` from the OS store; the failure text is fixed.
+fn retire_credential(
+    secrets: &dyn ProxySecretWriter,
+    reference: &CredentialRef,
+) -> Option<String> {
+    secrets
+        .delete(reference)
+        .err()
+        .map(|_| "以前の資格情報をOSの秘密ストアから削除できませんでした".to_owned())
 }
 
 /// The write sequence. Any failure before the settings file is replaced leaves
-/// the old settings (and the old credential) in effect.
+/// the old settings (and the old credential) in effect. The old credential is
+/// not removed here; the caller retires it when no operation needs it.
 pub(super) fn run_save(
     prepared: &PreparedSave,
     mut base: Settings,
@@ -264,12 +287,9 @@ pub(super) fn run_save(
             "設定を保存できませんでした: {error}。以前の設定のままです"
         ));
     }
-    let warning = prepared
-        .obsolete_ref
-        .as_ref()
-        .and_then(|reference| secrets.delete(reference).err())
-        .map(|_| "以前の資格情報をOSの秘密ストアから削除できませんでした".to_owned());
-    Ok(SaveReport { warning })
+    Ok(SaveReport {
+        obsolete_ref: prepared.obsolete_ref.clone(),
+    })
 }
 
 struct NetworkInputs {
@@ -901,11 +921,25 @@ impl EditorView {
                 self.settings.network = NetworkConfig::Valid(settings.clone());
                 // Advances the application's network revision. This only
                 // records the setting; it starts no connection.
-                if let Some(applier) = &self.network_applier {
-                    applier.apply_saved(&settings);
+                // The old credential is retired when the replaced snapshot is
+                // released, so an operation already running keeps reading it.
+                let secrets = self.network_settings.secrets.clone();
+                let mut warning = None;
+                match (&self.network_applier, report.obsolete_ref) {
+                    (Some(applier), obsolete) => {
+                        let retire = obsolete.map(|reference| {
+                            Box::new(move || {
+                                let _ = retire_credential(secrets.as_ref(), &reference);
+                            }) as Box<dyn FnOnce() + Send>
+                        });
+                        applier.apply_saved(&settings, retire);
+                    }
+                    (None, Some(reference)) => {
+                        warning = retire_credential(secrets.as_ref(), &reference);
+                    }
+                    (None, None) => {}
                 }
-                self.network_settings
-                    .saved_ok(generation, settings, report.warning);
+                self.network_settings.saved_ok(generation, settings, warning);
             }
             Err(message) => self.network_settings.save_failed(generation, message),
         }
@@ -1178,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_save_writes_the_secret_then_settings_then_removes_the_old_one() {
+    fn a_successful_save_writes_the_secret_and_settings_and_keeps_the_old_one_for_retirement() {
         let secrets = FakeSecrets::default();
         secrets
             .entries
@@ -1190,13 +1224,68 @@ mod tests {
         let prepared =
             prepare(&basic_draft("alice", "pw1"), Some(&current), fixed_ref("new")).unwrap();
         let report = run_save(&prepared, Settings::default(), &stores, &secrets).unwrap();
-        assert!(report.warning.is_none());
-        let entries = secrets.entries.lock().unwrap();
-        assert_eq!(entries.keys().map(String::as_str).collect::<Vec<_>>(), ["new"]);
+        assert_eq!(report.obsolete_ref.as_ref().map(CredentialRef::as_str), Some("old"));
+        {
+            // The old secret is still readable by an operation on the old snapshot.
+            let entries = secrets.entries.lock().unwrap();
+            assert_eq!(
+                entries.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["new", "old"]
+            );
+        }
         assert_eq!(
             stores.settings().load().network,
             NetworkConfig::Valid(prepared.settings.clone())
         );
+        assert!(retire_credential(&secrets, report.obsolete_ref.as_ref().unwrap()).is_none());
+        let entries = secrets.entries.lock().unwrap();
+        assert_eq!(entries.keys().map(String::as_str).collect::<Vec<_>>(), ["new"]);
+    }
+
+    /// Replacing the credential or leaving Basic retires the old secret only
+    /// after the snapshot taken under the old settings is released.
+    #[test]
+    fn the_old_secret_outlives_a_snapshot_that_still_uses_it() {
+        use hane_network::{EnvPlatform, NetworkContext, ProxyEnvironment};
+        let environment = || {
+            ProxyEnvironment::from_vars(EnvPlatform::MacOs, std::iter::empty::<(&str, &str)>())
+        };
+        let drafts = [
+            basic_draft("alice", "pw1"),
+            NetworkDraft {
+                mode: ProxyMode::Direct,
+                ..basic_draft("", "")
+            },
+        ];
+        for draft in drafts {
+            let secrets = Arc::new(FakeSecrets::default());
+            secrets
+                .entries
+                .lock()
+                .unwrap()
+                .insert("old".to_owned(), "a:b".to_owned());
+            let current = saved_basic("old");
+            let old_snapshot = NetworkContext::new(
+                current.clone(),
+                environment(),
+                Arc::new(crate::proxy_secret::OsProxyCredentialStore),
+            );
+            let in_flight = old_snapshot.clone();
+            let prepared = prepare(&draft, Some(&current), fixed_ref("new")).unwrap();
+            let report =
+                run_save(&prepared, Settings::default(), &memory_stores(), secrets.as_ref())
+                    .unwrap();
+            let reference = report.obsolete_ref.expect("the old credential is obsolete");
+            let writer = Arc::clone(&secrets);
+            old_snapshot.on_release(move || {
+                let _ = retire_credential(writer.as_ref(), &reference);
+            });
+            // The settings were replaced: the application drops its handle.
+            drop(old_snapshot);
+            assert!(secrets.entries.lock().unwrap().contains_key("old"));
+            drop(in_flight);
+            assert!(!secrets.entries.lock().unwrap().contains_key("old"));
+        }
     }
 
     #[test]
@@ -1263,7 +1352,7 @@ mod tests {
         let prepared =
             prepare(&basic_draft("alice", "pw1"), Some(&current), fixed_ref("new")).unwrap();
         let report = run_save(&prepared, Settings::default(), &stores, &secrets).unwrap();
-        assert!(report.warning.is_some());
+        assert!(retire_credential(&secrets, report.obsolete_ref.as_ref().unwrap()).is_some());
         assert_eq!(
             stores.settings().load().network,
             NetworkConfig::Valid(prepared.settings)

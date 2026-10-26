@@ -373,18 +373,31 @@ struct AppNetworkApplier {
 impl AppNetworkApplier {
     /// Returns the AI service's new network revision, when a service exists.
     fn apply(&self, settings: &hane_network::NetworkSettings) -> Option<u64> {
+        self.apply_retiring(settings, None)
+    }
+
+    /// `retire` runs once the replaced snapshot is released by every operation.
+    fn apply_retiring(
+        &self,
+        settings: &hane_network::NetworkSettings,
+        retire: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<u64> {
         // The slot lock is held across the snapshot replacement, so a service
         // that starts concurrently reads either the old snapshot and then this
         // revision, or the new snapshot.
         let slot = self.ai.service.slot();
-        let context = self.state.replace(settings.clone());
+        let context = self.state.replace(settings.clone(), retire);
         slot.as_ref().map(|service| service.apply_network(context))
     }
 }
 
 impl hane_ui::NetworkSettingsApplier for AppNetworkApplier {
-    fn apply_saved(&self, settings: &hane_network::NetworkSettings) {
-        self.apply(settings);
+    fn apply_saved(
+        &self,
+        settings: &hane_network::NetworkSettings,
+        retire: Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        self.apply_retiring(settings, retire);
     }
 }
 

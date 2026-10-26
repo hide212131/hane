@@ -39,9 +39,25 @@ impl NetworkState {
 
     /// Makes `settings` (over the same captured environment and secret store)
     /// the snapshot of every later operation. Performs no I/O.
-    pub(crate) fn replace(&self, settings: NetworkSettings) -> NetworkContext {
+    ///
+    /// `retire` runs once the replaced snapshot is no longer held by any
+    /// operation (at once if none is), so a secret that only the old snapshot
+    /// references stays readable until its operations finish or are cancelled.
+    pub(crate) fn replace(
+        &self,
+        settings: NetworkSettings,
+        retire: Option<Box<dyn FnOnce() + Send>>,
+    ) -> NetworkContext {
         let next = NetworkContext::new(settings, self.environment.clone(), Arc::clone(&self.store));
-        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = next.clone();
+        let previous = std::mem::replace(
+            &mut *self.current.lock().unwrap_or_else(PoisonError::into_inner),
+            next.clone(),
+        );
+        if let Some(retire) = retire {
+            previous.on_release(retire);
+        }
+        // Dropped after the lock is released; runs `retire` if it was the last.
+        drop(previous);
         next
     }
 }
@@ -68,7 +84,7 @@ mod tests {
             ResolvedRoute::HttpProxy { .. }
         ));
 
-        state.replace(NetworkSettings::direct());
+        state.replace(NetworkSettings::direct(), None);
 
         // A new operation sees the saved setting without a restart.
         assert_eq!(
