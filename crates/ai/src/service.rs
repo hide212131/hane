@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use hane_network::NetworkContext;
 use serde_json::{Value, json};
 
 use crate::account::{
@@ -574,7 +575,19 @@ pub struct AiServiceConfig {
 }
 
 impl AiService {
+    /// Starts the service with no proxy environment (direct connections).
+    /// The application entry point uses [`AiService::spawn_with_network`].
     pub fn spawn(config: AiServiceConfig) -> std::io::Result<AiService> {
+        Self::spawn_with_network(config, NetworkContext::default())
+    }
+
+    /// Starts the service with the network snapshot (settings, proxy
+    /// environment captured once at startup, credential store) that the
+    /// explicit runtime download uses for every request and redirect hop.
+    pub fn spawn_with_network(
+        config: AiServiceConfig,
+        network: NetworkContext,
+    ) -> std::io::Result<AiService> {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::sync_channel(4);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -592,7 +605,9 @@ impl AiService {
         };
         let worker = thread::Builder::new()
             .name("hane-ai-service".to_string())
-            .spawn(move || service_worker(config, command_rx, cancel_rx, shutdown_rx, shared))?;
+            .spawn(move || {
+                service_worker(config, network, command_rx, cancel_rx, shutdown_rx, shared)
+            })?;
         Ok(AiService {
             handle,
             shutdown_tx,
@@ -648,6 +663,7 @@ struct WorkerState {
 
 fn service_worker(
     config: AiServiceConfig,
+    network: NetworkContext,
     command_rx: Receiver<QueuedCommand>,
     cancel_rx: Receiver<OperationId>,
     shutdown_rx: Receiver<()>,
@@ -718,6 +734,7 @@ fn service_worker(
             Ok(queued) => handle_command(
                 queued,
                 &config,
+                &network,
                 &paths,
                 &settings_store,
                 &journal,
@@ -743,6 +760,7 @@ fn service_worker(
 fn handle_command(
     queued: QueuedCommand,
     config: &AiServiceConfig,
+    network: &NetworkContext,
     paths: &AiPaths,
     settings_store: &AiSettingsStore,
     journal: &CredentialJournal,
@@ -1065,6 +1083,7 @@ fn handle_command(
         WorkerCommand::Action(AiCommand::InstallRuntime) => {
             run_install_runtime_command(
                 queued.id,
+                network,
                 paths,
                 shared,
                 state,
@@ -1697,6 +1716,7 @@ fn attempt_isolation_recovery(
 #[allow(clippy::too_many_arguments)]
 fn run_install_runtime_command(
     id: OperationId,
+    network: &NetworkContext,
     paths: &AiPaths,
     shared: &Arc<SharedServiceState>,
     state: &mut WorkerState,
@@ -1782,7 +1802,7 @@ fn run_install_runtime_command(
         }
         false
     };
-    let downloader = CurlArchiveDownloader;
+    let downloader = CurlArchiveDownloader::new(network.clone());
     let extractor = TarArchiveExtractor;
     let install_result = install_runtime(
         &spec,

@@ -222,6 +222,15 @@ fn failure_text(code: &str) -> &'static str {
         "network_unavailable" | "timeout" | "truncated" => {
             "ネットワークに接続できませんでした。接続を確認してから再試行してください。"
         }
+        "proxy_configuration" => {
+            "プロキシの設定または資格情報を利用できませんでした。ネットワーク設定を確認してください。"
+        }
+        "proxy_authentication" => {
+            "プロキシに認証を拒否されました。プロキシの資格情報を確認してください。"
+        }
+        "proxy_connect" => {
+            "プロキシ経由で接続できませんでした。プロキシの設定と接続先の許可を確認してください。"
+        }
         "rate_limited" => {
             "GitHubの利用制限に達しました。しばらくしてから再試行してください。"
         }
