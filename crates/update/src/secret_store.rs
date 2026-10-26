@@ -94,6 +94,14 @@ fn bundled_helper_path(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(contents.join("Helpers").join("hane-updater"))
 }
 
+/// The applications a Keychain entry trusts: the running app executable and its
+/// bundle's `hane-updater`, nothing else. `None` outside the bundle layout.
+#[cfg(any(target_os = "macos", test))]
+fn trusted_application_paths(exe: &std::path::Path) -> Option<[std::path::PathBuf; 2]> {
+    let helper = bundled_helper_path(exe)?;
+    Some([exe.to_path_buf(), helper])
+}
+
 /// Keychain items created by the app carry, by default, an access list that
 /// trusts only the creating executable; the update helper is another executable
 /// and would be refused (or prompted) when it takes and deletes the item. The
@@ -113,29 +121,40 @@ mod keychain_acl {
 
     use core_foundation_sys::array::{CFArrayCreate, kCFTypeArrayCallBacks};
     use core_foundation_sys::base::{CFIndex, CFRelease, kCFAllocatorDefault};
-    use core_foundation_sys::string::{CFStringCreateWithCString, kCFStringEncodingUTF8};
+    use core_foundation_sys::data::CFDataCreate;
+    use core_foundation_sys::dictionary::{
+        CFDictionaryCreate, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+    };
+    use core_foundation_sys::string::{
+        CFStringCreateWithBytes, CFStringCreateWithCString, kCFStringEncodingUTF8,
+    };
 
-    use super::{BackendError, bundled_helper_path};
+    use super::{BackendError, trusted_application_paths};
 
     type OsStatus = i32;
     type Ref = *const c_void;
+
+    /// `errSecDuplicateItem`: an entry of the same service / account exists.
+    const DUPLICATE_ITEM: OsStatus = -25299;
 
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
         fn SecTrustedApplicationCreateFromPath(path: *const c_char, app: *mut Ref) -> OsStatus;
         fn SecAccessCreate(descriptor: Ref, trusted_list: Ref, access: *mut Ref) -> OsStatus;
-        fn SecKeychainAddGenericPassword(
-            keychain: Ref,
-            service_len: u32,
-            service: *const c_void,
-            account_len: u32,
-            account: *const c_void,
-            password_len: u32,
-            password: *const c_void,
-            item: *mut Ref,
-        ) -> OsStatus;
-        fn SecKeychainItemSetAccess(item: Ref, access: Ref) -> OsStatus;
-        fn SecKeychainItemDelete(item: Ref) -> OsStatus;
+        fn SecItemAdd(attributes: Ref, result: *mut Ref) -> OsStatus;
+
+        #[link_name = "kSecClass"]
+        static SEC_CLASS: Ref;
+        #[link_name = "kSecClassGenericPassword"]
+        static SEC_CLASS_GENERIC_PASSWORD: Ref;
+        #[link_name = "kSecAttrService"]
+        static SEC_ATTR_SERVICE: Ref;
+        #[link_name = "kSecAttrAccount"]
+        static SEC_ATTR_ACCOUNT: Ref;
+        #[link_name = "kSecAttrAccess"]
+        static SEC_ATTR_ACCESS: Ref;
+        #[link_name = "kSecValueData"]
+        static SEC_VALUE_DATA: Ref;
     }
 
     /// Releases a Core Foundation object on drop.
@@ -154,25 +173,26 @@ mod keychain_acl {
         if status == 0 { Ok(()) } else { Err(BackendError) }
     }
 
-    /// The access list: this executable (a null path means the caller) and the
-    /// bundled helper, nothing else.
+    /// The access list: this executable and the bundled helper, nothing else.
     fn access() -> Result<Owned, BackendError> {
         let exe = std::env::current_exe().map_err(|_| BackendError)?;
-        let helper = bundled_helper_path(&exe).filter(|path| path.is_file()).ok_or(BackendError)?;
-        let helper = CString::new(helper.as_os_str().as_bytes()).map_err(|_| BackendError)?;
+        let paths = trusted_application_paths(&exe).filter(|paths| paths.iter().all(|path| path.is_file()));
+        let [me, updater] = paths.ok_or(BackendError)?;
+        let me = CString::new(me.as_os_str().as_bytes()).map_err(|_| BackendError)?;
+        let updater = CString::new(updater.as_os_str().as_bytes()).map_err(|_| BackendError)?;
 
-        let mut me: Ref = ptr::null();
-        let mut updater: Ref = ptr::null();
-        // SAFETY: valid out pointers; `helper` is a NUL-terminated path.
+        let mut me_app: Ref = ptr::null();
+        let mut updater_app: Ref = ptr::null();
+        // SAFETY: valid out pointer; `me` is a NUL-terminated path.
         unsafe {
-            ok(SecTrustedApplicationCreateFromPath(ptr::null(), &mut me))?;
+            ok(SecTrustedApplicationCreateFromPath(me.as_ptr(), &mut me_app))?;
         }
-        let me = Owned(me);
+        let me = Owned(me_app);
         // SAFETY: as above.
         unsafe {
-            ok(SecTrustedApplicationCreateFromPath(helper.as_ptr(), &mut updater))?;
+            ok(SecTrustedApplicationCreateFromPath(updater.as_ptr(), &mut updater_app))?;
         }
-        let updater = Owned(updater);
+        let updater = Owned(updater_app);
 
         let mut apps: [Ref; 2] = [me.0, updater.0];
         // SAFETY: `apps` holds two live CFTypes; the array retains them.
@@ -199,10 +219,27 @@ mod keychain_acl {
         Ok(Owned(access))
     }
 
-    /// Stores `secret` as a generic password of `service` / `account` whose
-    /// access list is [`access`]. `clear` removes a stale entry of the same
-    /// account and is called only when one exists. On any failure no entry is
-    /// left behind. Errors carry no detail.
+    fn string(text: &str) -> Result<Owned, BackendError> {
+        // SAFETY: the pointer and length describe a live UTF-8 byte slice.
+        let string = Owned(unsafe {
+            CFStringCreateWithBytes(
+                kCFAllocatorDefault,
+                text.as_ptr(),
+                text.len() as CFIndex,
+                kCFStringEncodingUTF8,
+                0,
+            )
+            .cast()
+        });
+        if string.0.is_null() { Err(BackendError) } else { Ok(string) }
+    }
+
+    /// Stores `secret` as a generic password of `service` / `account`, created
+    /// with the access list [`access`] in the same `SecItemAdd` call: the entry
+    /// never exists with the default list, and no prompt or later widening is
+    /// involved. `clear` removes a stale entry of the same account and is called
+    /// only when the add reports a duplicate. On failure no entry is left
+    /// behind. Errors carry no detail.
     pub(super) fn create(
         service: &str,
         account: &str,
@@ -210,38 +247,48 @@ mod keychain_acl {
         clear: impl Fn() -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
         let access = access()?;
-        let mut item: Ref = ptr::null();
-        let mut add = |item: &mut Ref| {
-            // SAFETY: the pointers and lengths describe live byte slices.
-            ok(unsafe {
-                SecKeychainAddGenericPassword(
-                    ptr::null(),
-                    service.len() as u32,
-                    service.as_ptr().cast(),
-                    account.len() as u32,
-                    account.as_ptr().cast(),
-                    secret.len() as u32,
-                    secret.as_ptr().cast(),
-                    item,
-                )
-            })
+        let service = string(service)?;
+        let account = string(account)?;
+        // SAFETY: the pointer and length describe the live bytes of `secret`.
+        let data = Owned(unsafe {
+            CFDataCreate(kCFAllocatorDefault, secret.as_ptr(), secret.len() as CFIndex).cast()
+        });
+        if data.0.is_null() {
+            return Err(BackendError);
+        }
+        // SAFETY: the framework constants are valid for the process lifetime.
+        let (mut keys, mut values): ([Ref; 5], [Ref; 5]) = unsafe {
+            (
+                [SEC_CLASS, SEC_ATTR_SERVICE, SEC_ATTR_ACCOUNT, SEC_VALUE_DATA, SEC_ATTR_ACCESS],
+                [SEC_CLASS_GENERIC_PASSWORD, service.0, account.0, data.0, access.0],
+            )
         };
-        // A failed first add (typically an existing entry) is retried once
-        // after the stale entry is cleared.
-        if add(&mut item).is_err() {
+        // SAFETY: five live keys and values; the dictionary retains them.
+        let attributes = Owned(unsafe {
+            CFDictionaryCreate(
+                kCFAllocatorDefault,
+                keys.as_mut_ptr(),
+                values.as_mut_ptr(),
+                keys.len() as CFIndex,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+            .cast()
+        });
+        if attributes.0.is_null() {
+            return Err(BackendError);
+        }
+        let add = || {
+            // SAFETY: live attribute dictionary; no result is requested.
+            unsafe { SecItemAdd(attributes.0, ptr::null_mut()) }
+        };
+        // A duplicate is retried once after the stale entry is cleared.
+        let status = add();
+        if status == DUPLICATE_ITEM {
             clear()?;
-            item = ptr::null();
-            add(&mut item)?;
+            return ok(add());
         }
-        let item = Owned(item);
-        // SAFETY: live item and access objects.
-        let applied = ok(unsafe { SecKeychainItemSetAccess(item.0, access.0) });
-        if applied.is_err() {
-            // The default access list must not remain on a secret.
-            // SAFETY: live item.
-            unsafe { SecKeychainItemDelete(item.0) };
-        }
-        applied
+        ok(status)
     }
 }
 
@@ -451,6 +498,30 @@ mod tests {
         ] {
             assert_eq!(bundled_helper_path(Path::new(exe)), None, "{exe}");
         }
+    }
+
+    #[test]
+    fn the_keychain_access_list_names_exactly_the_app_and_its_bundled_helper() {
+        use std::path::{Path, PathBuf};
+        let exe = Path::new("/Applications/Hane.app/Contents/MacOS/hane");
+        assert_eq!(
+            trusted_application_paths(exe),
+            Some([
+                PathBuf::from("/Applications/Hane.app/Contents/MacOS/hane"),
+                PathBuf::from("/Applications/Hane.app/Contents/Helpers/hane-updater"),
+            ])
+        );
+        // Without the bundle layout there is no access list, so `put` fails and
+        // the handoff aborts instead of storing under a default or wider list.
+        assert_eq!(trusted_application_paths(Path::new("/tmp/hane")), None);
+    }
+
+    #[test]
+    fn a_failed_put_aborts_without_a_stored_secret_or_a_fallback() {
+        let store = store(FakeBackend { fail_set: true, ..Default::default() });
+        assert!(store.put("txn.2", DUMMY_SECRET).is_err());
+        assert!(store.backend.entries.borrow().is_empty());
+        assert_eq!(store.take("txn.2").unwrap(), None);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
