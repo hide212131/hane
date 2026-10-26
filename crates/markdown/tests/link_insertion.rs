@@ -350,6 +350,66 @@ fn text_outside_the_selection_keeps_its_syntax() {
 }
 
 #[test]
+fn a_link_that_would_break_surrounding_emphasis_is_refused_unchanged() {
+    // `*` next to `[` stops opening emphasis, so the outer italic would be lost.
+    let source = "x*a b*";
+    assert_eq!(
+        insert_range(source, 2, 3, URL),
+        Err(LinkInsertionRefusal::Unverified)
+    );
+    // Emphasis that survives the link keeps being linked inside.
+    assert_eq!(
+        insert("*a b* c", "b", URL).unwrap(),
+        "*a [b](https://example.com/hane)* c"
+    );
+    assert_eq!(
+        insert("**a b** c", "a", URL).unwrap(),
+        "**[a](https://example.com/hane) b** c"
+    );
+    // The whole decorated run can still be linked.
+    assert_eq!(
+        insert("x *a b* y", "*a b*", URL).unwrap(),
+        "x [*a b*](https://example.com/hane) y"
+    );
+}
+
+#[test]
+fn a_selection_cutting_a_character_reference_is_refused() {
+    for (source, start, end) in [
+        ("&amp; tail", 1, 4),
+        ("&amp; tail", 0, 3),
+        ("&amp; tail", 2, 6),
+        ("&#38; tail", 1, 3),
+        ("&#x26; tail", 0, 4),
+        ("a &amp; b", 3, 7),
+    ] {
+        assert_eq!(
+            insert_range(source, start, end, URL),
+            Err(LinkInsertionRefusal::UnsafeBoundary),
+            "{source:?} {start}..{end}"
+        );
+    }
+    // A whole reference, or text beside one, is still linked.
+    assert_eq!(
+        insert("&amp; tail", "&amp;", URL).unwrap(),
+        "[&amp;](https://example.com/hane) tail"
+    );
+    assert_eq!(
+        insert("a &#38; b", "&#38; b", URL).unwrap(),
+        "a [&#38; b](https://example.com/hane)"
+    );
+    assert_eq!(
+        insert("&#x26; tail", "tail", URL).unwrap(),
+        "&#x26; [tail](https://example.com/hane)"
+    );
+    // A bare ampersand is ordinary text.
+    assert_eq!(
+        insert("a & b", "& b", URL).unwrap(),
+        "a [& b](https://example.com/hane)"
+    );
+}
+
+#[test]
 fn every_refusal_has_a_status_message() {
     for refusal in [
         LinkInsertionRefusal::EmptySelection,

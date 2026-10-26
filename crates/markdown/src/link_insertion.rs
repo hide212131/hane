@@ -24,7 +24,7 @@ pub enum LinkInsertionRefusal {
     ExistingSyntax,
     /// The selection cuts through emphasis, strong, strikethrough or code.
     PartialSyntax,
-    /// An end of the selection splits a backslash escape.
+    /// An end of the selection splits a backslash escape or character reference.
     UnsafeBoundary,
     /// The generated Markdown was not read back as the intended single link.
     Unverified,
@@ -105,7 +105,11 @@ pub fn plan_link_insertion(
     if label.trim().is_empty() {
         return Err(Refusal::EmptySelection);
     }
-    if splits_escape(source, start) || splits_escape(source, end) {
+    if splits_escape(source, start)
+        || splits_escape(source, end)
+        || splits_char_reference(source, start)
+        || splits_char_reference(source, end)
+    {
         return Err(Refusal::UnsafeBoundary);
     }
     let trailing_backslashes = label.bytes().rev().take_while(|byte| *byte == b'\\').count();
@@ -153,6 +157,51 @@ fn splits_escape(source: &str, pos: usize) -> bool {
         .take_while(|byte| **byte == b'\\')
         .count();
     run % 2 == 1 && bytes[pos].is_ascii_punctuation()
+}
+
+/// Whether `pos` falls inside a character reference (`&amp;`, `&#38;`,
+/// `&#x26;`), between its `&` and its closing `;`.
+fn splits_char_reference(source: &str, pos: usize) -> bool {
+    let bytes = source.as_bytes();
+    if pos == 0 || pos >= bytes.len() {
+        return false;
+    }
+    let mut amp = None;
+    for index in (pos.saturating_sub(34)..pos).rev() {
+        match bytes[index] {
+            b'&' => {
+                amp = Some(index);
+                break;
+            }
+            byte if byte.is_ascii_alphanumeric() || byte == b'#' => {}
+            _ => break,
+        }
+    }
+    let Some(amp) = amp else {
+        return false;
+    };
+    let escapes = bytes[..amp]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    if escapes % 2 == 1 {
+        return false;
+    }
+    char_reference_len(&bytes[amp + 1..]).is_some_and(|len| pos < amp + 1 + len)
+}
+
+/// Length of a character reference body (after `&`, through `;`), if `rest`
+/// starts with one.
+fn char_reference_len(rest: &[u8]) -> Option<usize> {
+    let (prefix, max_digits, is_digit): (usize, usize, fn(&u8) -> bool) = match rest {
+        [b'#', b'x' | b'X', ..] => (2, 6, u8::is_ascii_hexdigit),
+        [b'#', ..] => (1, 7, u8::is_ascii_digit),
+        _ => (0, 31, u8::is_ascii_alphanumeric),
+    };
+    let digits = rest[prefix..].iter().take_while(|byte| is_digit(byte)).count();
+    let terminated = rest.get(prefix + digits) == Some(&b';');
+    ((1..=max_digits).contains(&digits) && terminated).then_some(prefix + digits + 1)
 }
 
 /// The heading, paragraph, tight list item or table cell holding the whole
@@ -387,27 +436,32 @@ fn verify(
         return false;
     }
 
-    // Blocks keep their structure, and every other non-text node keeps its
-    // kind and (shifted) range.
+    // Blocks keep their structure, and every non-text node that is not wholly
+    // inside the selection keeps its kind and (shifted) range. This includes the
+    // ancestors that enclose the selection, so surrounding emphasis or strong
+    // text must still be read as the same decoration.
     let old_blocks: Vec<NodeKind> = old.tree.blocks().map(|(_, node)| node.kind).collect();
     let new_blocks: Vec<NodeKind> = new.tree.blocks().map(|(_, node)| node.kind).collect();
     if old_blocks != new_blocks {
         return false;
     }
+    let shift = |offset: usize| {
+        if offset >= end {
+            offset - old_len + new_len
+        } else {
+            offset
+        }
+    };
     let outside_old: Vec<(NodeKind, usize, usize)> = old
         .tree
         .iter()
         .filter(|(_, node)| {
             node.kind != NodeKind::Text
-                && (node.source_range.end.0 <= start || node.source_range.start.0 >= end)
+                && !(start <= node.source_range.start.0 && node.source_range.end.0 <= end)
         })
         .map(|(_, node)| {
             let (s, e) = (node.source_range.start.0, node.source_range.end.0);
-            if s >= end {
-                (node.kind, s - old_len + new_len, e - old_len + new_len)
-            } else {
-                (node.kind, s, e)
-            }
+            (node.kind, shift(s), shift(e))
         })
         .collect();
     let outside_new: Vec<(NodeKind, usize, usize)> = new
@@ -415,10 +469,39 @@ fn verify(
         .iter()
         .filter(|(_, node)| {
             node.kind != NodeKind::Text
-                && (node.source_range.end.0 <= inserted.start.0
-                    || node.source_range.start.0 >= inserted.end.0)
+                && !(inserted.start.0 <= node.source_range.start.0
+                    && node.source_range.end.0 <= inserted.end.0)
         })
         .map(|(_, node)| (node.kind, node.source_range.start.0, node.source_range.end.0))
         .collect();
-    outside_old == outside_new
+    if outside_old != outside_new {
+        return false;
+    }
+
+    // The rendered text (character references resolved, escapes removed) is
+    // exactly what it was before, inside the label and around it.
+    display_text(source) == display_text(&next)
+}
+
+/// The text the parser renders for `source`: text and code content with
+/// character references and escapes resolved. Code is fenced by control
+/// characters so text cannot be mistaken for it.
+fn display_text(source: &str) -> String {
+    use pulldown_cmark::{Event, Parser};
+
+    let mut out = String::with_capacity(source.len());
+    for event in Parser::new_ext(source, crate::parser::parser_options()) {
+        match event {
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => out.push_str(&text),
+            Event::Code(text) => {
+                out.push('\u{1}');
+                out.push_str(&text);
+                out.push('\u{2}');
+            }
+            Event::SoftBreak => out.push('\n'),
+            Event::HardBreak => out.push_str("\u{3}\n"),
+            _ => {}
+        }
+    }
+    out
 }
