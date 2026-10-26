@@ -573,6 +573,16 @@ session I/O、height/cache、viewportの残りのpointer/panel処理、settings�
 
 **検証:** 実装workerはshell/git/test/build/lint実行権限を持たず、通常・all-featuresのtest/clippy、両OSのCI、focused native GUI validation、移動範囲のbyte比較は未実施。P2のtiming-probe単独Clippy baseline失敗は本PRの対象外。結果はCommanderがPRに記録する。
 
+#### 9.13.4 RF2-A: 設定画面と設定操作の移動（#567 P4、PR #620）
+
+**旧→新:** `crates/ui/src/view.rs` の2範囲20メソッド（autosave操作2、settings accessor2、設定遷移・画面・一般設定の16メソッド）を、新しいprivateな `crates/ui/src/view/settings_screen.rs` の `impl EditorView` へ元の順で移動した。親には `mod settings_screen;` を追加し、間にある `attach_ai_service` は親に残した。具体仕様は [P4仕様](implementation/issue-567-p4-settings-screen.md) を正とし、ここでは複製しない。
+
+**維持理由:** 可視性を変えたのは親の `handle_external_drop`、兄弟AI moduleのtests、兄弟 `render` から呼ばれる `leave_settings` / `request_settings_category` / `settings_screen_element` の3つだけで、`pub(super)` に限る。本文・コメント・属性・順序は変えていない。Windows stack対策の `settings_screen_shell` / `display_and_save_settings` の `#[inline(never)]` とコメント、body構築後にshellへ渡す呼出順は維持した。型・field・初期化、`settings_layout_is_narrow`、`store_settings`、caller、AI/update実装、既存testsは親・既存moduleに残した。
+
+**後続境界:** height/cache共有helper、初期化・非同期I/O要求接続、関連testsの配置などは#567の残作業として追跡し、このP4だけで#567/#297は完了しない。rollbackはこの移動PRを一単位で戻す。
+
+**検証:** 実装workerはshell/git/test/build/lint実行権限を持たず、通常・all-featuresのtest/clippy、通常Release build、両OSのCI、focused native GUI validation、移動範囲のbyte比較は未実施。P2のtiming-probe単独Clippy baseline失敗は本PRの対象外。結果はCommanderがPRに記録する。
+
 
 ### 9.14 RF2-B: presentationの機械的分割 第1PR — 位置対応 (#302)
 
