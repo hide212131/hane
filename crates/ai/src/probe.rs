@@ -1089,7 +1089,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let latest = Arc::new(AtomicU64::new(3));
-        let network = NetworkRevisionGuard::new(3, Arc::clone(&latest));
+        let network = NetworkRevisionGuard::new(3, Arc::clone(&latest), Arc::new(std::sync::Mutex::new(())));
         let mut collector = new_collector();
         assert!(network.is_current());
         latest.store(4, Ordering::SeqCst);

@@ -1111,7 +1111,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let latest = Arc::new(AtomicU64::new(3));
-        let network = NetworkRevisionGuard::new(3, Arc::clone(&latest));
+        let network = NetworkRevisionGuard::new(3, Arc::clone(&latest), Arc::new(std::sync::Mutex::new(())));
         let mut collector =
             ProbeCollector::with_max_text_bytes(7, "thread-1".to_owned(), "turn-1".to_owned(), 64);
         assert!(network.is_current());

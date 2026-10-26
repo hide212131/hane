@@ -295,12 +295,19 @@ struct NetworkSnapshot {
     /// while this still follows `apply_network`, so an operation can tell that
     /// a newer setting was saved after it began.
     latest: Arc<AtomicU64>,
+    /// Held while `latest` advances and while an operation's final revision
+    /// check and result publication run, so a save cannot land between them.
+    publish_gate: Arc<Mutex<()>>,
 }
 
 impl NetworkSnapshot {
     /// The guard for an operation started under this snapshot.
     fn revision_guard(&self) -> NetworkRevisionGuard {
-        NetworkRevisionGuard::new(self.revision, self.latest.clone())
+        NetworkRevisionGuard::new(
+            self.revision,
+            self.latest.clone(),
+            self.publish_gate.clone(),
+        )
     }
 }
 
@@ -633,6 +640,7 @@ impl AiService {
             revision: 0,
             context: network,
             latest: Arc::new(AtomicU64::new(0)),
+            publish_gate: Arc::default(),
         }));
         let worker_network = network.clone();
         let worker = thread::Builder::new()
@@ -664,7 +672,13 @@ impl AiService {
         let mut snapshot = self.network.lock().unwrap();
         snapshot.revision = snapshot.revision.saturating_add(1);
         snapshot.context = context;
-        snapshot.latest.store(snapshot.revision, Ordering::SeqCst);
+        {
+            let _gate = snapshot
+                .publish_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snapshot.latest.store(snapshot.revision, Ordering::SeqCst);
+        }
         snapshot.revision
     }
 
@@ -1401,36 +1415,103 @@ fn run_probe_command(
         );
         return;
     }
-    let operation_result = match &execution.status {
-        ProbeStatus::Succeeded => SafeOperationResult::Succeeded,
-        ProbeStatus::Canceled => SafeOperationResult::Canceled,
-        ProbeStatus::TimedOut => SafeOperationResult::TimedOut,
-        ProbeStatus::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
-        ProbeStatus::Stale => {
-            SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code())
-        }
-        ProbeStatus::Isolated => {
-            SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code())
-        }
-        ProbeStatus::NotRun | ProbeStatus::Running => {
-            SafeOperationResult::Failed(ProbeErrorCode::ProtocolMismatch.stable_code())
-        }
-    };
     let owns_runtime_lock = runtime
         .with_owner_lock(|owner| owner.is_some())
         .unwrap_or(false);
     sync_runtime_snapshot(shared, runtime);
-    mutate(shared, |snapshot| {
-        snapshot.probe_status = execution.status;
-        snapshot.probe_result = execution.result;
-        snapshot.probe_diagnostic = execution.diagnostic;
-        snapshot.ownership = if owns_runtime_lock {
-            OwnershipState::Owned
-        } else {
-            OwnershipState::Unknown
-        };
-    });
+    let operation_result = publish_probe_execution(
+        shared,
+        id,
+        &state.network.revision_guard(),
+        execution.status,
+        execution.result,
+        execution.diagnostic,
+        owns_runtime_lock,
+    );
     finish(shared, id, operation_result, LoginState::Idle);
+}
+
+/// Publishes the probe's final status/result. The last network revision check
+/// and the snapshot update run under one gate with `apply_network`, so a
+/// success is never published once a newer revision was saved: it becomes a
+/// stale failure with no result instead.
+fn publish_probe_execution(
+    shared: &Arc<SharedServiceState>,
+    id: OperationId,
+    network: &NetworkRevisionGuard,
+    status: ProbeStatus,
+    result: Option<ProbeResult>,
+    diagnostic: Option<ProbeDiagnostic>,
+    owns_runtime_lock: bool,
+) -> SafeOperationResult {
+    network.publish_if_current(|current| {
+        let (status, result, diagnostic) = if !current && status == ProbeStatus::Succeeded {
+            (
+                ProbeStatus::Failed(ProbeErrorCode::StaleGeneration),
+                None,
+                Some(probe_diagnostic(
+                    id,
+                    "turn",
+                    ProbeErrorCode::StaleGeneration,
+                    "network_revision_changed".to_owned(),
+                )),
+            )
+        } else {
+            (status, result, diagnostic)
+        };
+        let operation_result = match &status {
+            ProbeStatus::Succeeded => SafeOperationResult::Succeeded,
+            ProbeStatus::Canceled => SafeOperationResult::Canceled,
+            ProbeStatus::TimedOut => SafeOperationResult::TimedOut,
+            ProbeStatus::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
+            ProbeStatus::Stale => {
+                SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code())
+            }
+            ProbeStatus::Isolated => {
+                SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code())
+            }
+            ProbeStatus::NotRun | ProbeStatus::Running => {
+                SafeOperationResult::Failed(ProbeErrorCode::ProtocolMismatch.stable_code())
+            }
+        };
+        mutate(shared, |snapshot| {
+            snapshot.probe_status = status;
+            snapshot.probe_result = result;
+            snapshot.probe_diagnostic = diagnostic;
+            snapshot.ownership = if owns_runtime_lock {
+                OwnershipState::Owned
+            } else {
+                OwnershipState::Unknown
+            };
+        });
+        operation_result
+    })
+}
+
+/// Delivers the text transform outcome under the same gate as
+/// [`publish_probe_execution`]: a success body is replaced by a stale failure
+/// when a newer network revision was saved first.
+fn publish_text_transform_outcome(
+    reply_tx: &SyncSender<TextTransformOutcome>,
+    network: &NetworkRevisionGuard,
+    outcome: TextTransformOutcome,
+) -> SafeOperationResult {
+    network.publish_if_current(|current| {
+        let outcome = match outcome {
+            TextTransformOutcome::Succeeded { .. } if !current => TextTransformOutcome::Failed(
+                text_transform::TextTransformErrorCode::StaleGeneration,
+            ),
+            other => other,
+        };
+        let operation_result = match &outcome {
+            TextTransformOutcome::Succeeded { .. } => SafeOperationResult::Succeeded,
+            TextTransformOutcome::Canceled => SafeOperationResult::Canceled,
+            TextTransformOutcome::TimedOut => SafeOperationResult::TimedOut,
+            TextTransformOutcome::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
+        };
+        let _ = reply_tx.try_send(outcome);
+        operation_result
+    })
 }
 
 /// Runs one selection AI text transform turn. Mirrors `run_probe_command`'s
@@ -1570,12 +1651,6 @@ fn run_text_transform_command(
         );
         return;
     }
-    let operation_result = match &execution.outcome {
-        TextTransformOutcome::Succeeded { .. } => SafeOperationResult::Succeeded,
-        TextTransformOutcome::Canceled => SafeOperationResult::Canceled,
-        TextTransformOutcome::TimedOut => SafeOperationResult::TimedOut,
-        TextTransformOutcome::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
-    };
     let owns_runtime_lock = runtime
         .with_owner_lock(|owner| owner.is_some())
         .unwrap_or(false);
@@ -1587,7 +1662,11 @@ fn run_text_transform_command(
             OwnershipState::Unknown
         };
     });
-    let _ = reply_tx.try_send(execution.outcome);
+    let operation_result = publish_text_transform_outcome(
+        &reply_tx,
+        &state.network.revision_guard(),
+        execution.outcome,
+    );
     finish(shared, id, operation_result, LoginState::Idle);
 }
 
@@ -3546,6 +3625,7 @@ mod tests {
                 Arc::new(MissingProxyCredential),
             ),
             latest: Arc::new(AtomicU64::new(revision)),
+            publish_gate: Arc::default(),
         }
     }
 
@@ -3554,6 +3634,158 @@ mod tests {
         let mut config = RuntimeConfig::new("unused-runtime-binary", "unused.lock");
         assert!(attach_network_plan(&mut config, &manual_basic_snapshot(1)).is_err());
         assert!(config.network.is_none());
+    }
+
+    fn shared_for_publish() -> Arc<SharedServiceState> {
+        Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot::default()),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        })
+    }
+
+    fn probe_success_result() -> ProbeResult {
+        ProbeResult {
+            text: "ok".to_owned(),
+            connection: crate::settings::ActiveConnection::ChatGpt,
+            model: "model".to_owned(),
+            settings_generation: 0,
+            runtime_generation: 0,
+            auth_epoch: 0,
+            profile_version: 1,
+        }
+    }
+
+    /// The network revision is saved after the operation's terminal check but
+    /// before publication: a save is only possible through the same gate, so
+    /// the final check observes it and the success is not published.
+    #[test]
+    fn probe_success_is_not_published_when_a_newer_network_revision_is_saved_first() {
+        let shared = shared_for_publish();
+        let network = NetworkSnapshot::default();
+        let guard = network.revision_guard();
+        assert!(guard.is_current());
+        // The terminal check has passed; now the setting is saved.
+        {
+            let _gate = network.publish_gate.lock().unwrap();
+            network.latest.store(network.revision + 1, Ordering::SeqCst);
+        }
+
+        let result = publish_probe_execution(
+            &shared,
+            OperationId(1),
+            &guard,
+            ProbeStatus::Succeeded,
+            Some(probe_success_result()),
+            None,
+            true,
+        );
+
+        assert_eq!(
+            result,
+            SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code())
+        );
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(
+            snapshot.probe_status,
+            ProbeStatus::Failed(ProbeErrorCode::StaleGeneration)
+        );
+        assert!(snapshot.probe_result.is_none());
+        assert_eq!(
+            snapshot.probe_diagnostic.as_ref().map(|d| d.stage),
+            Some("turn")
+        );
+    }
+
+    #[test]
+    fn probe_success_is_published_while_the_network_revision_is_current() {
+        let shared = shared_for_publish();
+        let guard = NetworkSnapshot::default().revision_guard();
+
+        let result = publish_probe_execution(
+            &shared,
+            OperationId(1),
+            &guard,
+            ProbeStatus::Succeeded,
+            Some(probe_success_result()),
+            None,
+            true,
+        );
+
+        assert_eq!(result, SafeOperationResult::Succeeded);
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(snapshot.probe_status, ProbeStatus::Succeeded);
+        assert!(snapshot.probe_result.is_some());
+    }
+
+    #[test]
+    fn text_transform_body_is_not_replied_when_a_newer_network_revision_is_saved_first() {
+        let network = NetworkSnapshot::default();
+        let guard = network.revision_guard();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        {
+            let _gate = network.publish_gate.lock().unwrap();
+            network.latest.store(network.revision + 1, Ordering::SeqCst);
+        }
+
+        let result = publish_text_transform_outcome(
+            &reply_tx,
+            &guard,
+            TextTransformOutcome::Succeeded {
+                text: "body".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            result,
+            SafeOperationResult::Failed(
+                text_transform::TextTransformErrorCode::StaleGeneration.stable_code()
+            )
+        );
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            TextTransformOutcome::Failed(text_transform::TextTransformErrorCode::StaleGeneration)
+        );
+        assert!(reply_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn text_transform_body_is_replied_while_the_network_revision_is_current() {
+        let guard = NetworkSnapshot::default().revision_guard();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+
+        let result = publish_text_transform_outcome(
+            &reply_tx,
+            &guard,
+            TextTransformOutcome::Succeeded {
+                text: "body".to_owned(),
+            },
+        );
+
+        assert_eq!(result, SafeOperationResult::Succeeded);
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            TextTransformOutcome::Succeeded {
+                text: "body".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn network_revision_save_waits_for_an_in_progress_publication() {
+        let network = NetworkSnapshot::default();
+        let guard = network.revision_guard();
+        let latest = network.latest.clone();
+        let gate = network.publish_gate.clone();
+        // While the publication holds the gate, a save cannot advance `latest`.
+        guard.publish_if_current(|current| {
+            assert!(current);
+            assert!(gate.try_lock().is_err());
+            assert_eq!(latest.load(Ordering::SeqCst), network.revision);
+        });
+        assert!(gate.try_lock().is_ok());
     }
 
     #[test]

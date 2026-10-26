@@ -502,11 +502,22 @@ enum CoordinatorMessage {
 pub(crate) struct NetworkRevisionGuard {
     started: u64,
     latest: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes advancing `latest` with the final check + publication of an
+    /// operation result. See [`Self::publish_if_current`].
+    publish_gate: Arc<Mutex<()>>,
 }
 
 impl NetworkRevisionGuard {
-    pub(crate) fn new(started: u64, latest: Arc<std::sync::atomic::AtomicU64>) -> Self {
-        Self { started, latest }
+    pub(crate) fn new(
+        started: u64,
+        latest: Arc<std::sync::atomic::AtomicU64>,
+        publish_gate: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            started,
+            latest,
+            publish_gate,
+        }
     }
 
     /// A guard for a revision that nothing else advances.
@@ -515,12 +526,26 @@ impl NetworkRevisionGuard {
         Self::new(
             started,
             Arc::new(std::sync::atomic::AtomicU64::new(started)),
+            Arc::new(Mutex::new(())),
         )
     }
 
     /// `true` while no newer network revision has been saved.
     pub(crate) fn is_current(&self) -> bool {
         self.latest.load(Ordering::SeqCst) == self.started
+    }
+
+    /// Runs `publish` with `is_current` evaluated while holding the gate that
+    /// saving a newer revision also takes. A save therefore happens either
+    /// before the check (`publish(false)`) or after `publish` returned, never
+    /// between the check and the publication. `publish` must not save a
+    /// network setting.
+    pub(crate) fn publish_if_current<R>(&self, publish: impl FnOnce(bool) -> R) -> R {
+        let _gate = self
+            .publish_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        publish(self.is_current())
     }
 
     /// Calls `method` only while the runtime is `Ready` for the
@@ -2198,7 +2223,7 @@ mod tests {
             events_tx,
         );
         let latest = Arc::new(std::sync::atomic::AtomicU64::new(5));
-        let guard = NetworkRevisionGuard::new(5, latest.clone());
+        let guard = NetworkRevisionGuard::new(5, latest.clone(), Arc::new(Mutex::new(())));
         assert!(guard.is_current());
         latest.store(6, Ordering::SeqCst);
         assert!(!guard.is_current());
