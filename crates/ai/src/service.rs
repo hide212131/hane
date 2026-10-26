@@ -3637,8 +3637,12 @@ mod tests {
     }
 
     fn shared_for_publish() -> Arc<SharedServiceState> {
+        // Match `probe_success_result()` so `mutate()` does not mark it Stale.
+        let mut snapshot = AiSnapshot::default();
+        snapshot.settings.active_connection = crate::settings::ActiveConnection::ChatGpt;
+        snapshot.settings.chatgpt.model_id = Some("model".to_owned());
         Arc::new(SharedServiceState {
-            snapshot: Mutex::new(AiSnapshot::default()),
+            snapshot: Mutex::new(snapshot),
             busy: Mutex::new(None),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
