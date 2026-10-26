@@ -2,7 +2,7 @@
 
 ## 目的と基準
 
-Refs #567（RF2-A）、親 #297。P4のPR #620はmerge済み（`c843a2d1a357a766ef2a3bd3750d2d4476e90c3f`）。本P5は高さ索引の同期・disclosure追従をmoduleで見分けられる配置にする。設計時のmainは `3b3bdd6735042445710bbced43852c66e75a5bd4`。
+Refs #567（RF2-A）、親 #297。P4のPR #620はmerge済み（`c843a2d1a357a766ef2a3bd3750d2d4476e90c3f`）。本P5は高さ索引の同期・disclosure追従をmoduleで見分けられる配置にする。実装準備時の基準mainは `dd786e17b54cd15e4dd5309ff90dfa43520561e5`。PR branchはこのmainを取り込み済みである。
 
 本書を置く準備commitは文書だけであり、製品実装・検証・受入の完了を意味しない。実装開始時にcurrent main、PR head、#567、関連PR、同じ対象の実行中runを取り直す。判断はdefault branchのCommander Policy、実装依頼はClaude実行手順に従う。
 
@@ -12,7 +12,7 @@ Jev `jev-1.14.0` は、残る初期化・I/O整理・契約文書照合と比較
 
 `crates/ui/src/view.rs` の次の10メソッドを、既存の兄弟moduleと同じ形式の新しいprivate module `crates/ui/src/view/height_sync.rs` へ、元の順序・doc comment・属性・本体を保って移動する。新ファイルは `use super::*;` と `impl EditorView { ... }` だけで包む。親にはprivateな `mod height_sync;` を一つ追加する。再exportや新しいpublic moduleは追加しない。
 
-基準sourceの範囲は4845〜5456行。開始は `/// Initial height of every entry, from the line height alone.`、終了は `/// Source offset of the item currently at the top of the viewport.` の直前。UTF-8で26,791 bytes、SHA-256は `bf19513848d4094aa49ee9ba5cb67ec97c5df58fd7a82ae02a05febd2c0b62d6`。行番号だけを移動命令とせず、current codeのシンボルと範囲が一致することを確認する。
+current main `dd786e17b54cd15e4dd5309ff90dfa43520561e5` の基準source範囲は4855〜5465行。開始は `/// Initial height of every entry, from the line height alone.`、終了は `/// Source offset of the item currently at the top of the viewport.` の直前。UTF-8で26,791 bytes、SHA-256は `bf19513848d4094aa49ee9ba5cb67ec97c5df58fd7a82ae02a05febd2c0b62d6`。行番号だけを移動命令とせず、current codeのシンボルと範囲が一致することを確認する。
 
 | メソッド | 移動後の可視性 | 範囲外の呼出元・理由 |
 | --- | --- | --- |
@@ -56,7 +56,7 @@ height以外のcached_block/block_layout、render範囲、row geometry/hit test�
 1. 機械的比較: 新moduleから外側wrapper/importと8つの `pub(super)` だけを取り除いて旧範囲とbyte比較。親の差分はmodule宣言追加と旧範囲撤去だけ。既存tests・caller・型/field/初期化が同一で、変更ファイルがRust 2つと本書/実行記録に限定されることを確認する。
 2. 通常構成の `cargo test --workspace --locked`、all-featuresの `cargo test --workspace --locked --all-features`、`cargo clippy --workspace --locked --all-targets --all-features -- -D warnings`。macOS/Windowsのcurrent-head required CIを確認する。workerの実行権限制限を緩めず、trusted verification/CIとCommanderの検証を分けて記録する。
 3. Rust toolchainはrepository指定に合わせ、通常構成の `cargo build --release --locked -p hane` を確認する。instrument版を通常Releaseの代替にしない。fmt/diff確認で既存差分を見つけても無関係なformatを混ぜない。
-4. 安定候補でcurrent-head CI成功後にPolicy所定の最終review、次表のfocused native GUIを実施する。旧P4のGUI Unknown受入をP5へ継承しない。失敗/blocked/unknownを成功へ変えない。
+4. 安定候補でcurrent-head CI成功後にPolicy所定の最終reviewを実施する。focused native GUI G1〜G4は検証仕様として残す。ユーザーは2026-10-27、未確認のGUI条件をUnknownと明示したまま受け入れて進行することを本P5について承認した。GUIを実施済み/Passとは記録せず、current-head CI・reviewなど他の必須条件は別に満たす。失敗/blocked/Unknownを成功へ変えない。
 
 既存回帰testの代表例（すべて親view.rsのまま）:
 
