@@ -22,6 +22,14 @@ Jevは設定UI分離PR #620との重複を避け、設計§8の実装順序の�
 
 この準備commit時点では製品実装・test/build/lint/GUI/実通信は未実施。trusted finalizerによるpush後のexact-head verifyとmacOS/Windows CIを別に確認する。
 
+## 実装状況（共通core）
+
+`crates/network`（`hane-network`、std のみ・外部依存なし）に設定型、`ProxyEnvironment`（注入mapと `EnvPlatform`）、`resolve`、除外一覧、`CredentialStore` 契約、`ChildProxyPlan` を実装した。実process環境・DNS・通信・OS秘密ストアには触れない。`Cargo.lock` には依存なしの `hane-network` エントリのみを手で追加したため、trusted側の `cargo` 実行で整合を確認する。
+
+- 子環境adapterは proxy系（http/https/all/ftp/socks/no_proxy、大小文字無視）だけを除去し、選んだmodeから `http_proxy`/`https_proxy`/`no_proxy`（大小両表記）を再生成する。loopbackは常にno_proxyへ追加する。実runtimeでの解釈一致は未検証で、P7の対象。
+- 未実装（後続）: settings.conf 保存・移行、OS秘密backend、更新CONNECT/curl/AI接続、revision・再接続、設定UI、runtime pin。
+- worker では test/build/lint/fmt を実行していない。`cargo fmt --check`、workspace test、Clippy はtrusted検証で確認が必要。
+
 ## Issue全体の残条件
 
 設計§9とIssue #623のP1〜P10を維持する。今回P2の純粋契約とP1/P10の基盤を実装するが、設定保存・OS秘密backend/UI（P1）、更新CONNECTと検証済みstaging（P3〜P5）、curl実通信（P6）、pinned runtime実通信（P7）、revision/停止再接続（P8）、更新後の安全な継承（P9）、起動無通信/GUI/診断（P10）は残る。部分PRをmergeしてもIssueをcloseしない。
