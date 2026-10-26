@@ -63,6 +63,9 @@ struct ReplaceIdentity {
     query_generation: u64,
     scope_generation: u64,
     text_generation: u64,
+    /// Bumped when a preparation is cancelled, so a plan that finished before
+    /// the cancel but is delivered after it is discarded.
+    cancel_generation: u64,
 }
 
 #[derive(Default)]
@@ -76,6 +79,8 @@ pub(super) struct DocumentReplaceState {
     pub(super) text: String,
     /// Bumped on every committed change of `text`.
     pub(super) text_generation: u64,
+    /// See `ReplaceIdentity::cancel_generation`.
+    pub(super) cancel_generation: u64,
     pub(super) scope_mode: ReplaceScopeMode,
     pub(super) scope: Option<ReplaceSelectionScope>,
     /// Bumped whenever the scope mode, captured range, or its validity
@@ -365,6 +370,7 @@ impl EditorView {
             return false;
         };
         cancel.store(true, Ordering::Relaxed);
+        state.cancel_generation = state.cancel_generation.wrapping_add(1);
         self.set_replace_notice("置換の準備を取り消しました", cx);
         true
     }
@@ -435,6 +441,7 @@ impl EditorView {
             query_generation: self.document_find.query_generation,
             scope_generation: self.document_find.replace.scope_generation,
             text_generation: self.document_find.replace.text_generation,
+            cancel_generation: self.document_find.replace.cancel_generation,
         }
     }
 
@@ -1150,6 +1157,100 @@ mod tests {
             assert!(!view.document_find.replace.job_active);
         });
         assert_eq!(text(&view, cx), "zfoo foo\n");
+    }
+
+    /// A plan that was already completed in the background when the cancel was
+    /// accepted must not be published by its later UI continuation. The
+    /// delivery order is injected deterministically (no timing dependence).
+    #[gpui::test]
+    fn a_completed_plan_delivered_after_a_successful_cancel_is_discarded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("foo foo\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        open_find(&view, cx, "foo", "bar");
+        let before = body_state(&view, cx);
+        let dirty_before = view.read_with(cx, |view, _| view.sessions.active().is_dirty());
+        let scope_before = view.read_with(cx, |view, _| {
+            (
+                view.document_find.replace.scope_mode,
+                view.document_find.replace.scope.clone(),
+            )
+        });
+
+        let (identity, plan) = view.read_with(cx, |view, _| {
+            let plan = plan_replace_all(
+                view.editor().document(),
+                &view.document_find.matches,
+                "bar",
+                || false,
+            )
+            .unwrap();
+            (view.replace_identity(), plan)
+        });
+        // The completed background result waits for its UI continuation.
+        view.update(cx, |view, cx| {
+            view.document_find.replace.job_active = true;
+            view.document_find.replace.job_cancel = Some(Arc::new(AtomicBool::new(false)));
+            assert!(view.cancel_document_replace_preparation(cx));
+            assert!(view.document_replace_info_text().contains("取り消しました"));
+            view.finish_document_replace_all(identity, Ok(plan), cx);
+        });
+
+        assert_eq!(text(&view, cx), "foo foo\n");
+        assert_eq!(body_state(&view, cx), before);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active().is_dirty(), dirty_before);
+            assert_eq!(
+                (
+                    view.document_find.replace.scope_mode,
+                    view.document_find.replace.scope.clone()
+                ),
+                scope_before
+            );
+            assert!(!view.document_find.replace.job_active);
+            assert!(view.document_find.open);
+        });
+        assert!(notice(&view, cx).contains("取り消しました"));
+
+        // A new, independent request after the cancel still succeeds.
+        replace_all(&view, cx);
+        assert_eq!(text(&view, cx), "bar bar\n");
+        assert_eq!(notice(&view, cx), "文書全体: 2件を変更");
+        view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
+        assert_eq!(text(&view, cx), "foo foo\n");
+    }
+
+    #[gpui::test]
+    fn a_normal_completion_without_cancel_still_publishes_its_plan(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("foo foo\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        open_find(&view, cx, "foo", "bar");
+        let (identity, plan) = view.read_with(cx, |view, _| {
+            let plan = plan_replace_all(
+                view.editor().document(),
+                &view.document_find.matches,
+                "bar",
+                || false,
+            )
+            .unwrap();
+            (view.replace_identity(), plan)
+        });
+        view.update(cx, |view, cx| {
+            view.document_find.replace.job_active = true;
+            view.document_find.replace.job_cancel = Some(Arc::new(AtomicBool::new(false)));
+            view.finish_document_replace_all(identity, Ok(plan), cx);
+        });
+        assert_eq!(text(&view, cx), "bar bar\n");
+        assert!(view.read_with(cx, |view, _| view.editor().can_undo()));
     }
 
     #[gpui::test]
