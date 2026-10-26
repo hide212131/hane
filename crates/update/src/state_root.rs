@@ -313,9 +313,7 @@ fn split_userinfo(value: &str) -> Result<(String, Option<String>)> {
         Some(index) => value.split_at(index + 3),
         None => ("", value),
     };
-    let end = rest
-        .find(|c| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
     match authority.rfind('@') {
         Some(at) => Ok((
