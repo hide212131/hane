@@ -206,29 +206,55 @@ fn read_connect_line<S: Read>(stream: &mut S, used: &mut usize) -> Result<Vec<u8
     }
 }
 
-/// `HTTP/1.0` or `HTTP/1.1`, one space, a three-digit status, then nothing or
-/// a space and a reason phrase.
+/// `HTTP/1.0` or `HTTP/1.1`, one space, a three-digit status, a required
+/// space, then an optional reason phrase (HTAB, SP, visible ASCII or obs-text).
 fn parse_connect_status(line: &[u8]) -> Result<u16, TransportError> {
-    let text = std::str::from_utf8(line).map_err(|_| connect_malformed("status line"))?;
-    let rest = text
-        .strip_prefix("HTTP/1.1 ")
-        .or_else(|| text.strip_prefix("HTTP/1.0 "))
+    let rest = line
+        .strip_prefix(b"HTTP/1.1 ")
+        .or_else(|| line.strip_prefix(b"HTTP/1.0 "))
         .ok_or_else(|| connect_malformed("status line"))?;
     let digits = rest.get(..3).ok_or_else(|| connect_malformed("status code"))?;
-    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !digits.iter().all(u8::is_ascii_digit) {
         return Err(connect_malformed("status code"));
     }
-    let after = &rest[3..];
-    if !(after.is_empty() || after.starts_with(' ')) {
-        return Err(connect_malformed("status code"));
+    let Some((&b' ', reason)) = rest[3..].split_first() else {
+        return Err(connect_malformed("status line"));
+    };
+    if !reason
+        .iter()
+        .all(|&b| b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80)
+    {
+        return Err(connect_malformed("reason phrase"));
     }
-    let status: u16 = digits
-        .parse()
-        .map_err(|_| connect_malformed("status code"))?;
+    let status = digits
+        .iter()
+        .fold(0u16, |acc, &b| acc * 10 + u16::from(b - b'0'));
     if !(100..=599).contains(&status) {
         return Err(connect_malformed("status code"));
     }
     Ok(status)
+}
+
+/// RFC 9110 `tchar`.
+fn is_header_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// Reads the header lines up to the empty line. Any framing that implies a
@@ -245,9 +271,7 @@ fn read_connect_headers<S: Read>(stream: &mut S, used: &mut usize) -> Result<(),
             return Err(connect_malformed("header"));
         };
         if name.is_empty()
-            || name
-                .bytes()
-                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+            || !name.bytes().all(is_header_token_byte)
             || text
                 .bytes()
                 .any(|b| b.is_ascii_control() && b != b'\t')
@@ -1248,7 +1272,10 @@ mod tests {
     #[test]
     fn connect_answer_accepts_a_final_200_after_at_most_four_interim_answers() {
         assert!(answer(b"HTTP/1.1 200 Connection established\r\n\r\n").is_ok());
-        assert!(answer(b"HTTP/1.0 200\r\nProxy-Agent: x\r\nContent-Length: 0\r\n\r\n").is_ok());
+        assert!(answer(b"HTTP/1.0 200 \r\nProxy-Agent: x\r\nContent-Length: 0\r\n\r\n").is_ok());
+        assert!(answer(b"HTTP/1.1 200 \r\n\r\n").is_ok());
+        assert!(answer(b"HTTP/1.1 200 Caf\xc3\xa9\tok\r\n\r\n").is_ok());
+        assert!(answer(b"HTTP/1.1 200 OK\r\nX-Tok_en.~!#$%&'*+^`|: v\r\n\r\n").is_ok());
         let mut four = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(4);
         four.extend_from_slice(b"HTTP/1.1 200 OK\r\n\r\n");
         assert!(answer(&four).is_ok());
@@ -1280,6 +1307,15 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
             b"HTTP/1.1 200 OK\r\nbad header\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 O\0K\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 O\x7fK\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 O\x01K\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nBad(Name: v\r\n\r\n".to_vec(),
+            "HTTP/1.1 200 OK\r\nN\u{e9}me: v\r\n\r\n".as_bytes().to_vec(),
+            b"HTTP/1.1 200 OK\r\n Name: v\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nName : v\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nBad\"Name: v\r\n\r\n".to_vec(),
             b"HTTP/1.1 200 OK\r\nX: a\rb\r\n\r\n".to_vec(),
             b"HTTP/1.1 200 OK\r\nX: y".to_vec(),
             b"HTTP/1.1 200 OK\r\n".to_vec(),
