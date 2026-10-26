@@ -20,6 +20,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hane_ui::context_menu::{self, ExplorerRegistration};
 use hane_ui::{ExplorerRepairScope, PreparedUpdate, RestartTicketSnapshot};
@@ -113,6 +114,8 @@ pub(crate) struct HelperHandoff<S: HelperSession> {
     /// The environment of this (the real parent) process, read when the record
     /// for the limited child is published.
     ambient: AmbientEnvironment,
+    /// Whether this handoff already tried to publish the child environment.
+    publish_attempted: AtomicBool,
 }
 
 type AmbientEnvironment = Box<dyn Fn() -> Vec<(OsString, OsString)> + Send>;
@@ -134,6 +137,7 @@ impl<S: HelperSession> HelperHandoff<S> {
             on_failure,
             secrets: Box::new(OsSecretStore::proxy()),
             ambient: Box::new(|| std::env::vars_os().collect()),
+            publish_attempted: AtomicBool::new(false),
         }
     }
 
@@ -164,7 +168,14 @@ impl<S: HelperSession> HelperHandoff<S> {
     /// Failing here aborts the restart before the application quits: the
     /// child is never started with an unauthenticated proxy.
     fn publish_child_environment(&self, transaction: &TransactionId) -> Result<(), UpdateError> {
-        state_root::release_environment_secrets(&self.coordination, transaction, &*self.secrets)?;
+        // The very first publish of this handoff with no record on disk has
+        // nothing to clean up, so a credential-free update never touches the OS
+        // store. Once a publish was attempted (it may have failed or stopped
+        // half way) or a record exists, the earlier state is released first.
+        let attempted = self.publish_attempted.swap(true, Ordering::SeqCst);
+        if attempted || state_root::environment_recorded(&self.coordination, transaction) {
+            state_root::release_environment_secrets(&self.coordination, transaction, &*self.secrets)?;
+        }
         state_root::publish_environment_with_secrets(
             &self.coordination,
             transaction,
@@ -635,9 +646,15 @@ mod tests {
         fail_put: bool,
         fail_delete: Arc<std::sync::atomic::AtomicBool>,
         fail_take: bool,
+        /// Every `take` and `delete` that reached the store.
+        removals: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeStore {
+        fn removals(&self) -> usize {
+            self.removals.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn len(&self) -> usize {
             self.entries.lock().unwrap().len()
         }
@@ -654,6 +671,7 @@ mod tests {
         }
 
         fn take(&self, reference: &str) -> hane_update::Result<Option<String>> {
+            self.removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail_take {
                 return Err(UpdateError::new(ErrorCode::Io, "store read failed"));
             }
@@ -661,6 +679,7 @@ mod tests {
         }
 
         fn delete(&self, reference: &str) -> hane_update::Result<()> {
+            self.removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(UpdateError::new(ErrorCode::Io, "store delete failed"));
             }
@@ -1000,6 +1019,57 @@ mod tests {
         handoff.issue_ticket(&one_file(), &|| true).unwrap();
         assert_eq!(store.len(), 0);
         assert!(record_exists(&handoff));
+    }
+
+    #[test]
+    fn a_first_credential_free_handoff_never_touches_the_os_store() {
+        let dir = TempDir::new("handoff-first-no-store");
+        let store = FakeStore::default();
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, Vec::new());
+        assert!(!record_exists(&handoff));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert!(record_exists(&handoff));
+        assert_eq!(store.removals(), 0, "no delete or take for a first, credential-free handoff");
+
+        // A repeat with a valid credential-free record needs no sweep either.
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert_eq!(store.removals(), 0);
+    }
+
+    #[test]
+    fn a_failed_first_publish_is_swept_and_retried_even_without_a_record() {
+        let dir = TempDir::new("handoff-partial-sweep");
+        let store = FakeStore { capacity: Some(1), ..FakeStore::default() };
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, proxy_ambient(2));
+        // Delete failures leave the first credential behind with no record.
+        store.fail_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(handoff.issue_ticket(&one_file(), &|| true).is_err());
+        assert!(!record_exists(&handoff));
+        assert_eq!(store.len(), 1, "the orphan is still in the store");
+        assert!(store.removals() > 0, "the orphan sweep was attempted");
+
+        // The retry sweeps the orphan first; without it the full store would
+        // refuse the new credential.
+        store.fail_delete.store(false, std::sync::atomic::Ordering::SeqCst);
+        handoff.ambient = Box::new(|| proxy_ambient(1));
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(record_exists(&handoff));
+    }
+
+    #[test]
+    fn a_damaged_record_is_swept_before_the_first_publish() {
+        let dir = TempDir::new("handoff-damaged-record");
+        let store = FakeStore::default();
+        let (mut handoff, _log) = bound_handoff(&dir, false, &store, Vec::new());
+        let transaction = handoff.session.as_ref().unwrap().transaction();
+        let record = handoff
+            .coordination
+            .transaction_dir(&transaction)
+            .join(state_root::ENVIRONMENT_FILE);
+        std::fs::write(&record, b"not json").unwrap();
+        handoff.issue_ticket(&one_file(), &|| true).unwrap();
+        assert!(store.removals() > 0, "a damaged record keeps the orphan sweep");
     }
 
     #[test]

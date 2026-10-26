@@ -489,6 +489,16 @@ fn write_environment(
     Ok(())
 }
 
+/// Whether anything is recorded at the environment path of `transaction`, a
+/// damaged or foreign file included. Only a genuinely absent path is `false`;
+/// a metadata failure is treated as present so the caller keeps cleaning up.
+pub fn environment_recorded(coordination: &Coordination, transaction: &TransactionId) -> bool {
+    match fs::symlink_metadata(environment_path(coordination, transaction)) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Removes a recorded environment that is no longer wanted.
 pub fn discard_environment(coordination: &Coordination, transaction: &TransactionId) {
     let _ = fs::remove_file(environment_path(coordination, transaction));
