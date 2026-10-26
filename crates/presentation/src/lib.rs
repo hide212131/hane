@@ -54,8 +54,9 @@ pub use display::{
     BlockDisplay, BlockKind, BlockSurface, BlockTint, BlockWeight, ImagePresentation,
     InlineDisplay, LineContext, LinkTarget, ListAlignment, ListId, ListItemId, ListMarkerKind,
     ListMarkerMetadata, ListOwnerMetadata, ListRowMetadata, ListRowRole,
-    ListStructuralPrefixMetadata, QuoteRowMetadata, StyleKind, StyleRun, TableCellDisplay,
-    TableRowDisplay, VisualBlock, VisualLine, block_is_joinable, block_line_context,
+    ListStructuralPrefixMetadata, ListTaskMetadata, QuoteRowMetadata, StyleKind, StyleRun,
+    TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, block_is_joinable,
+    block_line_context,
     code_line_height,
 };
 pub use height_index::{HeightIndex, ScrollAnchor, anchored_scroll_y};

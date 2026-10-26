@@ -1,6 +1,6 @@
 use crate::markers::{
     ParsedCodeSpan, absolute_range, code_padding, derive_markers, line_break_padding,
-    list_structural_prefixes,
+    list_structural_prefixes, task_markers,
 };
 use crate::syntax::{
     LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,
@@ -141,6 +141,39 @@ fn build_tree(
             Event::TaskListMarker(checked) => {
                 // pulldown reports the checkbox as a child event, so the item kind
                 // is only complete once the marker arrives.
+                //
+                // A tight item reports the marker while the item itself is open.
+                // A loose item (blank line between items) keeps its paragraph
+                // event, so the marker arrives inside that item's own, still
+                // empty, first paragraph. Normalize that case here so the
+                // marker is always a direct child of its owning item and every
+                // later consumer keeps a single direct-child lookup.
+                let owner_paragraph = open.last().copied().filter(|paragraph| {
+                    let node = &nodes[paragraph.0];
+                    matches!(node.kind, NodeKind::Paragraph)
+                        && node.children.is_empty()
+                        && node.parent.is_some_and(|item| {
+                            matches!(nodes[item.0].kind, NodeKind::ListItem { task: None })
+                                && nodes[item.0].children.first() == Some(paragraph)
+                        })
+                });
+                if let Some(paragraph) = owner_paragraph {
+                    let item = nodes[paragraph.0].parent.unwrap_or(MarkdownTree::ROOT);
+                    if let NodeKind::ListItem { task } = &mut nodes[item.0].kind {
+                        *task = Some(checked);
+                    }
+                    let id = NodeId(nodes.len());
+                    let depth = nodes[item.0].depth + 1;
+                    nodes.push(MarkdownNode {
+                        kind: NodeKind::TaskMarker(checked),
+                        source_range: range,
+                        parent: Some(item),
+                        children: Vec::new(),
+                        depth,
+                    });
+                    nodes[item.0].children.insert(0, id);
+                    continue;
+                }
                 if let Some(item) = open.last()
                     && let NodeKind::ListItem { task } = &mut nodes[item.0].kind
                 {
@@ -236,6 +269,7 @@ pub fn parse_document(
     let code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);
     let list_structural_prefixes = list_structural_prefixes(&tree, source_range, source);
+    let task_markers = task_markers(&tree, &markers.list_item_markers, source_range, source);
     MarkdownParse {
         revision,
         source_range,
@@ -247,6 +281,7 @@ pub fn parse_document(
         fence_marker_edges: markers.fence_marker_edges,
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
+        task_markers,
         list_structural_prefixes,
         code_padding,
         line_break_padding,

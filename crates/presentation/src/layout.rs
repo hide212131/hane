@@ -17,7 +17,10 @@
 //! with a fixed advance width, which is what makes the coordinate contract
 //! verifiable without a window.
 
-use crate::{BlockKind, LineContext, ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
+use crate::{
+    BlockKind, LineContext, ListId, ListTaskMetadata, VisualBlock, VisualLine, VisualOffset,
+    VisualRange,
+};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
 use hane_markdown::{BlockId, TableAlignment, TableProjection, is_table_delimiter};
 use std::collections::{HashMap, HashSet};
@@ -728,6 +731,39 @@ impl BlockLayout {
                 .visual_to_source(VisualOffset(visual), Bias::After)
                 .map_or(row.source_range.start, |candidate| candidate.source_offset),
         )
+    }
+
+    /// The inactive task checkbox drawn under `x` on one row, if any.
+    ///
+    /// The hit area is the checkbox glyph's own span, measured with the same
+    /// row geometry that paints it, so wrapping, zoom, nesting and quote
+    /// insets can never put the control and its hit test in different places.
+    /// Only a row that actually presents the glyph answers: a disclosed
+    /// marker shows source bytes and has no control to press, and a glyph on
+    /// another wrapped row never answers for this one.
+    pub fn task_checkbox_at_x(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        x: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<ListTaskMetadata> {
+        let row = self.lines.get(row_index)?;
+        if row.fragment != 0 || !row.table_cells.is_empty() {
+            return None;
+        }
+        let line = block.lines.get(row.line)?;
+        let task = line.list.as_ref()?.marker.as_ref()?.task?;
+        let glyph = task.checkbox_visual_range?;
+        if glyph.start.0 >= glyph.end.0
+            || glyph.start.0 < row.line_visual_range.start
+            || glyph.end.0 > row.line_visual_range.end
+        {
+            return None;
+        }
+        let left = row.x_for_visual(line, glyph.start.0, shaper);
+        let right = row.x_for_visual(line, glyph.end.0, shaper);
+        (x >= left && x < right).then_some(task)
     }
 
     /// The caret target one row above or below `offset`, aiming at `x`.

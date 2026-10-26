@@ -260,6 +260,23 @@ pub fn links_intersecting(links: &[LinkParse], range: SourceRange) -> &[LinkPars
     }
 }
 
+/// A GFM task marker (`[ ]`, `[x]` or `[X]`) confirmed as the direct
+/// [`NodeKind::TaskMarker`] child of its own list item and written directly
+/// after that item's bullet/number marker on the item's opening line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskMarkerParse {
+    /// The owning list item. A nested item's marker is never attributed to
+    /// its ancestors.
+    pub item: NodeId,
+    /// The three source bytes of the marker itself; the middle byte is the
+    /// only one a toggle may change.
+    pub marker_range: SourceRange,
+    /// `marker_range` plus the single following space/tab separator, the span
+    /// an inactive presentation hides behind the synthesized checkbox.
+    pub hidden_range: SourceRange,
+    pub checked: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownParse {
     pub revision: Revision,
@@ -290,6 +307,9 @@ pub struct MarkdownParse {
     /// by comparing source starts either; kept explicit for the same reason
     /// as `quote_markers`.
     pub list_item_markers: Vec<(SourceRange, NodeId)>,
+    /// Confirmed task markers in item (document) order. Derived from the
+    /// parser's `TaskListMarker` events, never from a text pattern.
+    pub task_markers: Vec<TaskMarkerParse>,
     /// A list item's own structural indentation on every physical line its
     /// content occupies past the marker's own opening line, paired with the
     /// owning item and the column width (not necessarily its byte length, as
