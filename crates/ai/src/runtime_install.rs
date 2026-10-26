@@ -1701,7 +1701,19 @@ mod tests {
             .filter(|(_, value)| value.is_none())
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(removed.len(), 6, "{removed:?}");
+        // Windowsの環境変数名は大文字小文字を区別せず、HTTPS_PROXY と https_proxy は
+        // 一つのentryに畳み込まれる。他OSでは別名として6件になる。
+        let expected = if cfg!(windows) { 5 } else { 6 };
+        assert_eq!(removed.len(), expected, "{removed:?}");
+        for proxy in ["HTTPS_PROXY", "All_Proxy", "NO_PROXY", "ftp_proxy", "SOCKS_PROXY"] {
+            assert!(
+                removed.iter().any(|name| name.eq_ignore_ascii_case(proxy)),
+                "{proxy} is not removed: {removed:?}"
+            );
+        }
+        if !cfg!(windows) {
+            assert!(removed.iter().any(|name| name == "https_proxy"), "{removed:?}");
+        }
         assert!(!removed.iter().any(|name| name == "SSL_CERT_FILE" || name == "PATH"));
     }
 
