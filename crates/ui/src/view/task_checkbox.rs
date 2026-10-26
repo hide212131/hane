@@ -304,36 +304,47 @@ mod tests {
         });
     }
 
-    /// A real press on the drawn glyph toggles once; a press on the body text
-    /// beside it only moves the caret, and the release changes nothing.
-    #[gpui::test]
-    fn pressing_the_drawn_checkbox_toggles_once_and_body_presses_do_not(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    /// Opens a painted window over `source` with the caret at `caret`, so the
+    /// fixture decides which items are disclosed before the first frame.
+    fn open_window<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        source: &'static str,
+        caret: usize,
+    ) -> (TestView, &'a mut gpui::VisualTestContext) {
         cx.update(crate::actions::register_key_bindings);
-        let (view, cx) = cx.add_window_view(|_, cx| {
-            EditorView::new("- [ ] A\n- [x] B\n", "Untitled", cx)
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = EditorView::new(source, "Untitled", cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(caret)))
+                .unwrap();
+            view
         });
         cx.simulate_resize(gpui::size(px(800.0), px(400.0)));
         cx.run_until_parked();
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(100));
         cx.run_until_parked();
+        (view, cx)
+    }
 
-        let row = cx
-            .debug_bounds("row-0-0")
-            .expect("the first row is painted");
-        let (glyph_x, body_x) = cx.update(|window, app| {
+    /// Window x of the drawn checkbox glyph's centre and of the body text just
+    /// right of it, from the real `BlockLayout` row of source `line`.
+    fn drawn_checkbox_x(
+        view: &TestView,
+        cx: &mut gpui::VisualTestContext,
+        line: usize,
+    ) -> (f32, f32) {
+        cx.update(|window, app| {
             let view = view.read(app);
             let shaper = WindowShaper::new(window, view.zoom);
-            let (block_id, visual_line) = *view.line_owners.get(&0).expect("line 0 is rendered");
+            let (block_id, visual_line) = *view.line_owners.get(&line).expect("line is rendered");
             let visual = view.block_cache.get(&block_id).expect("block is cached");
             let layout = &view.layout_cache.get(&block_id).expect("layout is cached").layout;
             let row = layout
                 .lines
                 .iter()
                 .find(|row| row.line == visual_line && row.fragment == 0)
-                .expect("first row");
+                .expect("row");
             let line = &visual.lines[visual_line];
             let glyph = line
                 .list
@@ -348,37 +359,140 @@ mod tests {
             let right = row.text_x_origin
                 + shaper.x_for_offset(line, row.line_visual_range.clone(), glyph.end.0);
             (origin + (left + right) / 2.0, origin + row.body_x_origin + 2.0)
-        });
+        })
+    }
 
-        cx.simulate_mouse_down(
-            point(px(glyph_x), row.center().y),
-            MouseButton::Left,
-            gpui::Modifiers::none(),
-        );
-        cx.simulate_mouse_up(
-            point(px(glyph_x), row.center().y),
-            MouseButton::Left,
-            gpui::Modifiers::none(),
-        );
+    /// Window x of the centre of the disclosed `[ ]` source text on `line`.
+    fn disclosed_marker_x(
+        view: &TestView,
+        cx: &mut gpui::VisualTestContext,
+        line: usize,
+    ) -> f32 {
+        cx.update(|window, app| {
+            let view = view.read(app);
+            let shaper = WindowShaper::new(window, view.zoom);
+            let (block_id, visual_line) = *view.line_owners.get(&line).expect("line is rendered");
+            let visual = view.block_cache.get(&block_id).expect("block is cached");
+            let layout = &view.layout_cache.get(&block_id).expect("layout is cached").layout;
+            let row = layout
+                .lines
+                .iter()
+                .find(|row| row.line == visual_line && row.fragment == 0)
+                .expect("row");
+            let line = &visual.lines[visual_line];
+            assert!(
+                line.list
+                    .as_ref()
+                    .and_then(|list| list.marker.as_ref())
+                    .and_then(|marker| marker.task)
+                    .and_then(|task| task.checkbox_visual_range)
+                    .is_none(),
+                "a disclosed item has no checkbox control"
+            );
+            let origin = view.main_column_left + view.theme.line_horizontal_padding;
+            let left = row.text_x_origin
+                + shaper.x_for_offset(line, row.line_visual_range.clone(), 2);
+            let right = row.text_x_origin
+                + shaper.x_for_offset(line, row.line_visual_range.clone(), 5);
+            origin + (left + right) / 2.0
+        })
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, x: f32, y: Pixels) {
+        cx.simulate_mouse_down(point(px(x), y), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point(px(x), y), MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
+    }
+
+    /// The caret sits in a separate trailing paragraph, so both items are
+    /// undisclosed and drawn as controls. A real press on the drawn glyph
+    /// toggles once; a press on the body text beside it only moves the caret,
+    /// and neither the release nor a redraw changes anything more.
+    #[gpui::test]
+    fn pressing_the_drawn_checkbox_toggles_once_and_body_presses_do_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "- [ ] A\n- [x] B\n\ntail\n";
+        let (view, cx) = open_window(cx, source, source.len() - 1);
+
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("the first row is painted");
+        let (glyph_x, body_x) = drawn_checkbox_x(&view, cx, 0);
+
+        click(cx, glyph_x, row.center().y);
         view.read_with(cx, |view, _| {
-            assert_eq!(text(view), "- [x] A\n- [x] B\n");
+            assert_eq!(text(view), "- [x] A\n- [x] B\n\ntail\n");
             assert!(!view.text_selection_drag, "the press starts no selection drag");
         });
+        // A further frame draws the same state and does not toggle again.
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [x] A\n- [x] B\n\ntail\n");
+        });
+
+        click(cx, body_x, row.center().y);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                text(view),
+                "- [x] A\n- [x] B\n\ntail\n",
+                "a body press never toggles"
+            );
+        });
+    }
+
+    /// Dragging a selection across rows, ending over the other item's glyph,
+    /// selects text and toggles nothing.
+    #[gpui::test]
+    fn selection_drag_over_a_checkbox_does_not_toggle(cx: &mut gpui::TestAppContext) {
+        let source = "- [ ] A\n- [x] B\n\ntail\n";
+        let (view, cx) = open_window(cx, source, source.len() - 1);
+
+        let first = cx.debug_bounds("row-0-0").expect("first row is painted");
+        let second = cx.debug_bounds("row-1-1").expect("second row is painted");
+        let (_, body_x) = drawn_checkbox_x(&view, cx, 0);
+        let (glyph_x, _) = drawn_checkbox_x(&view, cx, 1);
 
         cx.simulate_mouse_down(
-            point(px(body_x), row.center().y),
+            point(px(body_x), first.center().y),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(glyph_x), second.center().y),
             MouseButton::Left,
             gpui::Modifiers::none(),
         );
         cx.simulate_mouse_up(
-            point(px(body_x), row.center().y),
+            point(px(glyph_x), second.center().y),
             MouseButton::Left,
             gpui::Modifiers::none(),
         );
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(text(view), "- [x] A\n- [x] B\n", "a body press never toggles");
+            assert_eq!(text(view), source, "a drag never toggles");
+        });
+    }
+
+    /// A touched item shows its original source and has no control, so a press
+    /// on the `[ ]` text is an ordinary caret move for direct editing.
+    #[gpui::test]
+    fn pressing_disclosed_marker_text_moves_the_caret_without_toggling(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "- [ ] A\n- [x] B\n";
+        let (view, cx) = open_window(cx, source, 0);
+
+        let row = cx
+            .debug_bounds("row-0-0")
+            .expect("the first row is painted");
+        let marker_x = disclosed_marker_x(&view, cx, 0);
+
+        click(cx, marker_x, row.center().y);
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), source, "the disclosed marker never toggles");
+            let caret = view.editor().selection().active.0;
+            assert!((2..=5).contains(&caret), "the caret moved into the marker");
         });
     }
 }
