@@ -36,6 +36,8 @@ mod open_request;
 #[cfg(test)]
 mod proxy_curl_tests;
 #[cfg(test)]
+mod proxy_update_tests;
+#[cfg(test)]
 mod test_tls;
 mod update_diagnostics;
 mod update_gate;

@@ -927,6 +927,43 @@ impl Transport for HttpsTransport {
     }
 }
 
+/// Lookups recorded by a transport built with [`HttpsTransport::with_test_seams`].
+#[cfg(test)]
+pub(crate) type LookupLog = Arc<std::sync::Mutex<Vec<(String, u16)>>>;
+
+#[cfg(test)]
+impl HttpsTransport {
+    /// The production transport with a test trust root and a fixed name table.
+    /// Names outside `table` fail to resolve, which blocks a direct connection;
+    /// every lookup is recorded. Route decision, CONNECT, TLS verification and
+    /// the allowlists of the caller are the production ones.
+    pub(crate) fn with_test_seams(
+        roots: RootCertStore,
+        network: NetworkContext,
+        table: Vec<(&'static str, SocketAddr)>,
+        direct_port: u16,
+    ) -> (Self, LookupLog) {
+        let lookups: LookupLog = Arc::default();
+        let seen = Arc::clone(&lookups);
+        let lookup: Lookup = Arc::new(move |host: &str, port: u16| {
+            seen.lock().unwrap().push((host.to_owned(), port));
+            table
+                .iter()
+                .find(|(name, _)| *name == host)
+                .map(|(_, address)| vec![*address])
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "blocked in test"))
+        });
+        let transport = Self {
+            config: tls_config(roots).unwrap(),
+            dns_in_flight: Arc::new(AtomicBool::new(false)),
+            network,
+            lookup,
+            direct_port,
+        };
+        (transport, lookups)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

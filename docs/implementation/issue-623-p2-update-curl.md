@@ -81,8 +81,8 @@ worker環境ではshell・build・testを実行できないため、以下はす
 
 未実装・未検証:
 
-- P3の「署名済catalog→ZIP staging」を専用proxy+TLS fixture上で通す試験は未追加（`Transport`層のproxy経路試験のみ。既存の署名/hash/size/cancel/part cleanup試験は変更なし）。
-- P5の許可外hostへのCONNECT未実行を`Fetcher`経由で確認する試験は未追加（`Fetcher`のredirect検証は既存試験のまま）。
+- P3/P5の`Fetcher`経由の横断試験を`crates/app/src/proxy_update_tests.rs`に追加した（本番`HttpsTransport`＋`Fetcher`、実proxy＋TLS fixture、`hane_update::testing`の署名key/policy/ZIP・catalog builder）。内容は、API→catalog/署名検証→ZIPのsize/hash確認付きstaging成功（CONNECT 5回・origin request記録・proxy認証がoriginへ届かないこと・origin名が解決不能でも成功）、許可redirect、許可外redirect（別host/http/port/userinfo/類似host）で許可外へCONNECTしないこと、不正署名、hash/size不一致、proxy 407、proxy経由転送中のcancelとpart cleanup。ただしこれらは**コードを書いただけで未実行**であり、trusted verifyのCI結果で確認するまで未達として扱う。test用境界は`https_transport.rs`の`cfg(test)`な`HttpsTransport::with_test_seams`（trust rootと名前表の注入のみ）で、本番のroute/CONNECT/TLS検証/allowlistは変更していない。
+- 上記試験は`Fetcher`と`HttpsTransport`の結合に限る。ZIPの展開検査（`scan_archive`/`stage_archive`）はproxy経路の試験に含めていない。
 - macOSの実curl（Secure Transport等）で`--cacert`が信頼anchorとして働くか、WindowsのSchannelで`--ssl-revoke-best-effort`が必要十分かは未確認。
 - workspace all-features tests/Clippy、default Release build、両OS required CIは未実行。
 
