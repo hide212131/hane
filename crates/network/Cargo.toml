@@ -1,0 +1,10 @@
+[package]
+name = "hane-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Pure proxy settings / route resolution core. std only: no I/O, no GPUI, and no
+# dependency on AI, session, UI or update crates.
+[dependencies]

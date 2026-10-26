@@ -117,6 +117,13 @@ pub enum TransportFailure {
     Disconnected,
     Tls,
     Other,
+    /// Proxy settings or credential unusable; never falls back to Direct.
+    ProxyConfiguration,
+    /// The proxy answered the CONNECT with a failure other than 407, or its
+    /// response was malformed.
+    ProxyConnect,
+    /// The proxy answered 407.
+    ProxyAuthentication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +164,9 @@ fn cancelled() -> UpdateError {
 fn transport_error(err: TransportError) -> UpdateError {
     let code = match err.kind {
         TransportFailure::Timeout => ErrorCode::Timeout,
+        TransportFailure::ProxyConfiguration => ErrorCode::ProxyConfiguration,
+        TransportFailure::ProxyConnect => ErrorCode::ProxyConnect,
+        TransportFailure::ProxyAuthentication => ErrorCode::ProxyAuthentication,
         TransportFailure::Disconnected | TransportFailure::Tls | TransportFailure::Other => {
             ErrorCode::NetworkUnavailable
         }
@@ -599,6 +609,36 @@ mod io_error_tests {
                 error.detail
             );
             assert!(!error.detail.contains("os_error"), "{}", error.detail);
+        }
+    }
+
+    #[test]
+    fn proxy_failures_map_to_their_own_codes_not_to_a_generic_network_error() {
+        for (kind, code, text) in [
+            (
+                TransportFailure::ProxyConfiguration,
+                ErrorCode::ProxyConfiguration,
+                "proxy_configuration",
+            ),
+            (
+                TransportFailure::ProxyConnect,
+                ErrorCode::ProxyConnect,
+                "proxy_connect",
+            ),
+            (
+                TransportFailure::ProxyAuthentication,
+                ErrorCode::ProxyAuthentication,
+                "proxy_authentication",
+            ),
+            (TransportFailure::Timeout, ErrorCode::Timeout, "timeout"),
+            (TransportFailure::Tls, ErrorCode::NetworkUnavailable, "network_unavailable"),
+        ] {
+            let error = transport_error(TransportError {
+                kind,
+                detail: "fixed".to_owned(),
+            });
+            assert_eq!(error.code, code);
+            assert_eq!(error.code.as_str(), text);
         }
     }
 

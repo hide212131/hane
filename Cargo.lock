@@ -3145,10 +3145,12 @@ dependencies = [
  "hane-document",
  "hane-markdown",
  "hane-metrics",
+ "hane-network",
  "hane-presentation",
  "hane-session",
  "hane-ui",
  "hane-update",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "windows-sys 0.59.0",
@@ -3158,6 +3160,7 @@ dependencies = [
 name = "hane-ai"
 version = "0.34.0"
 dependencies = [
+ "hane-network",
  "keyring",
  "libc",
  "serde",
@@ -3208,6 +3211,10 @@ dependencies = [
  "libc",
  "mach2",
 ]
+
+[[package]]
+name = "hane-network"
+version = "0.34.0"
 
 [[package]]
 name = "hane-presentation"

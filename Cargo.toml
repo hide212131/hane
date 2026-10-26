@@ -7,6 +7,7 @@ members = [
     "crates/editor",
     "crates/markdown",
     "crates/metrics",
+    "crates/network",
     "crates/presentation",
     "crates/session",
     "crates/ui",
@@ -30,6 +31,7 @@ hane-document = { path = "crates/document" }
 hane-editor = { path = "crates/editor" }
 hane-markdown = { path = "crates/markdown" }
 hane-metrics = { path = "crates/metrics" }
+hane-network = { path = "crates/network" }
 hane-presentation = { path = "crates/presentation" }
 hane-session = { path = "crates/session" }
 hane-ui = { path = "crates/ui" }
