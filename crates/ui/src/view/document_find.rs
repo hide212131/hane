@@ -31,8 +31,12 @@
 use super::*;
 use gpui::{AppContext, Entity};
 use gpui_component::input::{Input, InputEvent, InputState};
-use hane_editor::{FindNavigation, FindOptions, FindQuery, FindQueryError, FindScan, find_scan};
+use hane_editor::{
+    FindNavigation, FindOptions, FindQuery, FindQueryError, FindScan, find_scan, find_scan_range,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+mod replace;
 
 const DOCUMENT_FIND_BAR_HEIGHT: f32 = SIDEBAR_FILTER_HEIGHT;
 
@@ -68,6 +72,10 @@ pub(super) enum DocumentFindResult {
     Invalid(FindQueryError),
     /// A valid query is debouncing or its scan has not completed yet.
     Pending,
+    /// The target is "選択範囲内" but no usable captured range exists (never
+    /// captured, empty, or invalidated). Never falls back to the whole
+    /// document.
+    NeedsScope,
     /// A scan for the current query/options/document completed.
     Ready,
 }
@@ -168,6 +176,22 @@ pub(super) struct DocumentFindState {
     /// Enter, so a second, separate Enter (not composing) navigates
     /// normally.
     enter_was_composing: bool,
+    /// The last paste into the search field carried a line break and was
+    /// refused before the widget's single-line normalization could silently
+    /// join it. Stays set (blocking replace) until a valid change or the bar
+    /// closes.
+    paste_rejected: bool,
+    /// Replace row, target scope, and in-flight replace-all preparation
+    /// (Issue #589).
+    replace: replace::DocumentReplaceState,
+}
+
+/// Whether the original clipboard text contains a CR or LF. Checked before the
+/// single-line widget normalizes (drops) line breaks, which would otherwise
+/// join the lines without any notice.
+fn clipboard_has_line_break(item: &gpui::ClipboardItem) -> bool {
+    item.text()
+        .is_some_and(|text| text.contains(['\n', '\r']))
 }
 
 impl EditorView {
@@ -180,6 +204,7 @@ impl EditorView {
             cx.subscribe(&input, |view, input, event: &InputEvent, cx| match event {
                 InputEvent::Focus => {
                     view.document_find.input_focused = true;
+                    view.document_find.replace.input_focused = false;
                     view.sidebar_keyboard_focus = false;
                     cx.notify();
                 }
@@ -222,17 +247,37 @@ impl EditorView {
         self.document_find.input_subscription = Some(subscription);
     }
 
+    /// Whether the search field or the replace field holds keyboard focus.
+    /// Every body-key guard in `actions.rs` uses this, so both fields are
+    /// isolated from the document body's editing actions.
     pub(crate) fn document_find_input_is_focused(&self) -> bool {
-        self.document_find.input_focused
+        self.document_find.input_focused || self.document_find.replace.input_focused
     }
 
-    /// Clears the document-find input's focus flag without closing the bar,
+    /// The bar field that currently holds focus (and whether it is the
+    /// replace field), if any.
+    fn focused_find_bar_input(&self) -> Option<(Entity<InputState>, bool)> {
+        if self.document_find.input_focused {
+            self.document_find.input.clone().map(|input| (input, false))
+        } else if self.document_find.replace.input_focused {
+            self.document_find
+                .replace
+                .input
+                .clone()
+                .map(|input| (input, true))
+        } else {
+            None
+        }
+    }
+
+    /// Clears the document-find inputs' focus flags without closing the bar,
     /// so a click into the document body stops routing document-editing
-    /// keys to the (still visible) find input in `actions.rs` instead of
+    /// keys to the (still visible) find inputs in `actions.rs` instead of
     /// the editor.
     pub(crate) fn blur_document_find_focus(&mut self, cx: &mut Context<Self>) {
-        if self.document_find.input_focused {
+        if self.document_find_input_is_focused() {
             self.document_find.input_focused = false;
+            self.document_find.replace.input_focused = false;
             cx.notify();
         }
     }
@@ -252,6 +297,8 @@ impl EditorView {
         }
         if self.document_find.input_focused {
             !self.document_find.escape_was_composing
+        } else if self.document_find.replace.input_focused {
+            !self.document_find.replace.escape_was_composing
         } else {
             self.editor().ime().is_none()
         }
@@ -270,15 +317,20 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.document_find.open || !self.document_find.input_focused {
+        if !self.document_find.open {
             return;
         }
-        let Some(input) = self.document_find.input.clone() else {
+        let Some((input, is_replace)) = self.focused_find_bar_input() else {
             return;
         };
-        self.document_find.escape_was_composing = input.update(cx, |state, cx| {
+        let composing = input.update(cx, |state, cx| {
             <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         });
+        if is_replace {
+            self.document_find.replace.escape_was_composing = composing;
+        } else {
+            self.document_find.escape_was_composing = composing;
+        }
     }
 
     /// Snapshots whether the find input currently has an active IME marked
@@ -295,15 +347,20 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.document_find.open || !self.document_find.input_focused {
+        if !self.document_find.open {
             return;
         }
-        let Some(input) = self.document_find.input.clone() else {
+        let Some((input, is_replace)) = self.focused_find_bar_input() else {
             return;
         };
-        self.document_find.enter_was_composing = input.update(cx, |state, cx| {
+        let composing = input.update(cx, |state, cx| {
             <InputState as gpui::EntityInputHandler>::marked_text_range(state, window, cx).is_some()
         });
+        if is_replace {
+            self.document_find.replace.enter_was_composing = composing;
+        } else {
+            self.document_find.enter_was_composing = composing;
+        }
     }
 
     /// Whether the find input currently has an active IME marked range.
@@ -322,10 +379,10 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.document_find.open || !self.document_find.input_focused {
+        if !self.document_find.open {
             return false;
         }
-        let Some(input) = self.document_find.input.clone() else {
+        let Some((input, _)) = self.focused_find_bar_input() else {
             return false;
         };
         input.update(cx, |state, cx| {
@@ -438,6 +495,7 @@ impl EditorView {
         // this bar's input visibly holds focus.
         self.blur_content_search_focus(cx);
         self.document_find.input_focused = true;
+        self.document_find.replace.input_focused = false;
         self.sidebar_keyboard_focus = false;
         let text = self
             .document_find
@@ -471,7 +529,12 @@ impl EditorView {
         if !self.document_find.open {
             return false;
         }
-        if self.document_find.input_focused
+        // While a replace-all plan is being prepared, the first Escape (or
+        // close) only cancels the preparation; the bar stays open.
+        if self.cancel_document_replace_preparation(cx) {
+            return true;
+        }
+        if self.document_find_input_is_focused()
             && self.document_find.synced_target == Some(self.document_find_target())
             && let Some(range) = self.document_find_current_match()
         {
@@ -481,7 +544,10 @@ impl EditorView {
             });
         }
         self.document_find.open = false;
+        self.document_find.paste_rejected = false;
         self.document_find.input_focused = false;
+        self.document_find.replace.input_focused = false;
+        self.reset_document_replace_for_close();
         self.cancel_document_find_work();
         self.pending_find_visibility_after_layout = false;
         window.focus(&self.focus_handle, cx);
@@ -520,7 +586,18 @@ impl EditorView {
         self.restart_document_find(cx, true, true);
     }
 
+    /// A paste whose original clipboard text contains CR/LF was refused by the
+    /// search field. The field value is unchanged, so no `Change` event will
+    /// follow; invalidate in-flight and prepared work here instead.
+    fn document_find_paste_rejected(&mut self, cx: &mut Context<Self>) {
+        self.document_find.paste_rejected = true;
+        self.cancel_document_find_work();
+        self.document_find.replace.notice = None;
+        cx.notify();
+    }
+
     fn document_find_query_changed(&mut self, text: String, cx: &mut Context<Self>) {
+        self.document_find.paste_rejected = false;
         self.document_find.query_text = text;
         self.restart_document_find(cx, true, true);
     }
@@ -605,6 +682,11 @@ impl EditorView {
         if let Some(cancel) = self.document_find.job_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
+        // Any query/option/document/scope change or close also invalidates a
+        // replace-all plan that is still being prepared.
+        if let Some(cancel) = self.document_find.replace.job_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The single entry point for "the query, options, or target document
@@ -616,6 +698,7 @@ impl EditorView {
     /// this (eventually) starts; see that field's doc for what it controls.
     fn restart_document_find(&mut self, cx: &mut Context<Self>, debounce: bool, reposition: bool) {
         self.document_find.synced_target = Some(self.document_find_target());
+        self.invalidate_stale_document_replace_state();
         self.cancel_document_find_work();
         self.document_find.reposition_on_next_result = reposition;
         match FindQuery::parse(&self.document_find.query_text) {
@@ -701,11 +784,15 @@ impl EditorView {
     /// coordinates all agree with where the body actually starts once this
     /// bar's row has pushed it down (Issue #413).
     pub(super) fn document_find_reserved_height(&self) -> f32 {
-        if self.document_find.open {
-            DOCUMENT_FIND_BAR_HEIGHT + SIDEBAR_FILTER_GAP * 2.0
-        } else {
-            0.0
+        if !self.document_find.open {
+            return 0.0;
         }
+        let rows = if self.document_find.replace.expanded {
+            2.0
+        } else {
+            1.0
+        };
+        (DOCUMENT_FIND_BAR_HEIGHT + SIDEBAR_FILTER_GAP * 2.0) * rows
     }
 
     fn document_find_target(&self) -> DocumentFindTarget {
@@ -738,6 +825,22 @@ impl EditorView {
         };
         let target = self.document_find_target();
         let query_generation = self.document_find.query_generation;
+        // "選択範囲内" scans only the explicitly captured range; without a
+        // usable one it never falls back to the whole document.
+        let scope_range = match self.document_find.replace.scope_mode {
+            replace::ReplaceScopeMode::Document => None,
+            replace::ReplaceScopeMode::Selection => match self.document_replace_scope_range() {
+                Some(range) => Some(range),
+                None => {
+                    self.document_find.result = DocumentFindResult::NeedsScope;
+                    self.document_find.matches.clear();
+                    self.document_find.truncated = false;
+                    self.document_find.current = None;
+                    return;
+                }
+            },
+        };
+        let scope_generation = self.document_find.replace.scope_generation;
         // Cloning shares the underlying rope's persistent tree; the scan
         // itself (window-bounded, never a whole-document `String`) runs on
         // the background executor below, not here on the UI thread.
@@ -749,11 +852,24 @@ impl EditorView {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    find_scan(&buffer, &query, options, || cancel.load(Ordering::Relaxed))
+                    let is_cancelled = || cancel.load(Ordering::Relaxed);
+                    match scope_range {
+                        None => find_scan(&buffer, &query, options, is_cancelled),
+                        Some(range) => {
+                            find_scan_range(&buffer, &query, options, range, is_cancelled)
+                                .unwrap_or(FindScan::Cancelled)
+                        }
+                    }
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.finish_document_find_scan(target, query_generation, outcome, cx);
+                view.finish_document_find_scan(
+                    target,
+                    query_generation,
+                    scope_generation,
+                    outcome,
+                    cx,
+                );
             });
         })
         .detach();
@@ -763,16 +879,21 @@ impl EditorView {
         &mut self,
         target: DocumentFindTarget,
         query_generation: u64,
+        scope_generation: u64,
         outcome: FindScan,
         cx: &mut Context<Self>,
     ) {
         self.document_find.job_active = false;
         self.document_find.job_cancel = None;
         if query_generation == self.document_find.query_generation
+            && scope_generation == self.document_find.replace.scope_generation
             && target == self.document_find_target()
             && let FindScan::Completed(results) = outcome
         {
-            self.document_find.current = if self.document_find.reposition_on_next_result {
+            let advance = self.take_document_replace_advance(target);
+            self.document_find.current = if let Some(inserted) = advance {
+                replace::index_after_replacement(&results.matches, inserted)
+            } else if self.document_find.reposition_on_next_result {
                 FindNavigation::initial_index(
                     &results.matches,
                     self.document_find.search_anchor,
@@ -803,6 +924,9 @@ impl EditorView {
     /// notice appended after a Next/Previous that just wrapped past either
     /// end of the match list.
     fn document_find_status_text(&self) -> String {
+        if self.document_find.paste_rejected {
+            return "改行を含む文字列は貼り付けられません".to_owned();
+        }
         match &self.document_find.result {
             DocumentFindResult::Empty | DocumentFindResult::Invalid(FindQueryError::Empty) => {
                 String::new()
@@ -814,6 +938,7 @@ impl EditorView {
                 "検索語が長すぎます".to_owned()
             }
             DocumentFindResult::Pending => "検索中…".to_owned(),
+            DocumentFindResult::NeedsScope => "範囲未取得".to_owned(),
             DocumentFindResult::Ready => {
                 let state = &self.document_find;
                 if state.matches.is_empty() {
@@ -848,7 +973,15 @@ impl EditorView {
             .input
             .as_ref()
             .expect("the find bar's input is initialized before it is opened");
+        let view = cx.entity().downgrade();
         let search_input = Input::new(input)
+            .on_paste(move |item, _, cx| {
+                if !clipboard_has_line_break(item) {
+                    return false;
+                }
+                view.update(cx, |view, cx| view.document_find_paste_rejected(cx))
+                    .is_ok()
+            })
             .id("document-find-input")
             .h(px(DOCUMENT_FIND_BAR_HEIGHT))
             .appearance(false)
@@ -961,35 +1094,59 @@ impl EditorView {
             .trigger(close_button)
             .content(|_, _, _| div().px_2().py_1().child("検索を閉じる (Esc)"))
             .into_any_element();
+        let replace_toggle = self
+            .document_replace_button(
+                "document-replace-toggle",
+                if self.document_find.replace.expanded {
+                    "置換 ▴"
+                } else {
+                    "置換 ▾"
+                },
+                true,
+            )
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.toggle_document_replace(window, cx);
+            }));
+        let find_row = div()
+            .id("document-find-row")
+            .flex_none()
+            .w_full()
+            .h(px(DOCUMENT_FIND_BAR_HEIGHT + SIDEBAR_FILTER_GAP * 2.0))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py(px(SIDEBAR_FILTER_GAP))
+            .child(search_box)
+            .child(status)
+            .child(previous)
+            .child(next)
+            .child(case_toggle)
+            .child(replace_toggle)
+            .child(close);
         Some(
             // A fixed-height flex sibling directly under the tab bar, inside
             // the body area, rather than an absolute overlay: it pushes the
             // document viewport down instead of covering its first row.
             // `self.viewport_height` and every window-to-content y
             // conversion (`document_find_reserved_height`) are kept in sync
-            // with this row's height so scrolling, the scrollbar, caret
-            // visibility, IME caret geometry, zoom anchoring, and click/drag
-            // hit-testing all agree with the body's actual on-screen bounds
-            // while this bar is open (Issue #413).
+            // with this bar's height (one row, or two while the replace row
+            // is expanded) so scrolling, the scrollbar, caret visibility, IME
+            // caret geometry, zoom anchoring, and click/drag hit-testing all
+            // agree with the body's actual on-screen bounds while this bar
+            // is open (Issue #413).
             div()
                 .id("document-find-bar")
                 .debug_selector(|| "document-find-bar".to_owned())
                 .flex_none()
                 .w_full()
-                .h(px(DOCUMENT_FIND_BAR_HEIGHT + SIDEBAR_FILTER_GAP * 2.0))
+                .h(px(self.document_find_reserved_height()))
                 .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py(px(SIDEBAR_FILTER_GAP))
+                .flex_col()
                 .bg(rgb(self.theme.header_background))
                 .text_color(rgb(self.theme.header_foreground))
-                .child(search_box)
-                .child(status)
-                .child(previous)
-                .child(next)
-                .child(case_toggle)
-                .child(close),
+                .child(find_row)
+                .children(self.document_replace_row(cx)),
         )
     }
 }
@@ -1581,9 +1738,11 @@ mod tests {
                 revision: real_target.revision,
             };
             let query_generation = view.document_find.query_generation;
+            let scope_generation = view.document_find.replace.scope_generation;
             view.finish_document_find_scan(
                 stale_target,
                 query_generation,
+                scope_generation,
                 FindScan::Completed(hane_editor::FindResults {
                     matches: vec![SourceRange::new(0, 6)],
                     truncated: false,

@@ -106,13 +106,55 @@ pub fn scan(
     buffer: &RopeBuffer,
     query: &FindQuery,
     options: FindOptions,
+    is_cancelled: impl FnMut() -> bool,
+) -> FindScan {
+    let total = buffer.len_bytes().0;
+    scan_bounded(buffer, query, options, 0, total, is_cancelled)
+}
+
+/// Like [`scan`], but only reports matches fully contained in the half-open
+/// source byte range `range`, scanning directly from `range.start` so a match
+/// that begins before the range (or ends after it) can neither be reported
+/// nor shift where a non-overlapping match inside the range starts. The
+/// match cap and cancellation apply to this range only; the returned
+/// positions are absolute source byte offsets.
+///
+/// # Errors
+///
+/// Returns the buffer's error when `range` is out of bounds or not on
+/// character boundaries.
+pub fn scan_range(
+    buffer: &RopeBuffer,
+    query: &FindQuery,
+    options: FindOptions,
+    range: SourceRange,
+    is_cancelled: impl FnMut() -> bool,
+) -> Result<FindScan, hane_document::BufferError> {
+    buffer.validate_range(range)?;
+    buffer.validate_offset(range.start)?;
+    buffer.validate_offset(range.end)?;
+    Ok(scan_bounded(
+        buffer,
+        query,
+        options,
+        range.start.0,
+        range.end.0,
+        is_cancelled,
+    ))
+}
+
+fn scan_bounded(
+    buffer: &RopeBuffer,
+    query: &FindQuery,
+    options: FindOptions,
+    scan_start: usize,
+    total: usize,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> FindScan {
     let query_chars: Vec<char> = query.as_str().chars().collect();
-    let total = buffer.len_bytes().0;
     let mut matches: Vec<SourceRange> = Vec::new();
     let mut truncated = false;
-    let mut window_search_start = 0usize;
+    let mut window_search_start = scan_start;
     let mut checks_since_cancel_poll = 0u32;
 
     'windows: while window_search_start < total {
@@ -478,6 +520,77 @@ mod tests {
             calls > 1
         });
         assert_eq!(outcome, FindScan::Cancelled);
+    }
+
+    fn ranged(text: &str, query: &str, range: SourceRange) -> FindResults {
+        let buffer = RopeBuffer::from_text(text);
+        let query = FindQuery::parse(query).unwrap();
+        match scan_range(&buffer, &query, FindOptions { case_sensitive: true }, range, || false)
+            .unwrap()
+        {
+            FindScan::Completed(results) => results,
+            FindScan::Cancelled => panic!("never cancelled"),
+        }
+    }
+
+    #[test]
+    fn scan_range_only_returns_matches_fully_inside_the_range() {
+        // "a b a b a": matches at 0, 4, 8 for "a".
+        let result = ranged("a b a b a", "a", SourceRange::new(2, 8));
+        assert_eq!(result.matches, vec![SourceRange::new(4, 5)]);
+        // A match straddling either edge is excluded.
+        let result = ranged("xxabcxx", "abc", SourceRange::new(3, 7));
+        assert!(result.matches.is_empty());
+        let result = ranged("xxabcxx", "abc", SourceRange::new(0, 4));
+        assert!(result.matches.is_empty());
+    }
+
+    #[test]
+    fn scan_range_starts_matching_at_the_range_start_not_at_an_outer_match() {
+        // Full-document "aa" matches in "aaa" are [0,2); the range [1,3) must
+        // still find its own "aa".
+        let result = ranged("aaa", "aa", SourceRange::new(1, 3));
+        assert_eq!(result.matches, vec![SourceRange::new(1, 3)]);
+    }
+
+    #[test]
+    fn scan_range_cap_ignores_matches_outside_the_range() {
+        let mut text = "a".repeat(MAX_MATCHES + 10);
+        text.push_str("|b|");
+        let start = text.len() - 3;
+        let result = ranged(&text, "b", SourceRange::new(start, text.len()));
+        assert_eq!(result.matches, vec![SourceRange::new(start + 1, start + 2)]);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn scan_range_rejects_invalid_ranges_and_handles_empty_ranges() {
+        let buffer = RopeBuffer::from_text("日本語");
+        let query = FindQuery::parse("本").unwrap();
+        let options = FindOptions::default();
+        assert!(scan_range(&buffer, &query, options, SourceRange::new(1, 3), || false).is_err());
+        assert!(scan_range(&buffer, &query, options, SourceRange::new(0, 99), || false).is_err());
+        let FindScan::Completed(results) =
+            scan_range(&buffer, &query, options, SourceRange::empty(3), || false).unwrap()
+        else {
+            panic!("never cancelled");
+        };
+        assert!(results.matches.is_empty());
+    }
+
+    #[test]
+    fn scan_range_across_window_boundaries_matches_the_full_scan() {
+        let mut text = "b".repeat(WINDOW_CORE_BYTES - 2);
+        text.push_str("needle");
+        text.push_str(&"b".repeat(1024));
+        let result = ranged(&text, "needle", SourceRange::new(10, text.len()));
+        assert_eq!(
+            result.matches,
+            vec![SourceRange::new(
+                WINDOW_CORE_BYTES - 2,
+                WINDOW_CORE_BYTES - 2 + 6
+            )]
+        );
     }
 
     #[test]

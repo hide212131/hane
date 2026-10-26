@@ -29,12 +29,15 @@ mod find;
 mod history;
 mod ime;
 mod movement;
+mod replace;
 mod selection;
 
 pub use find::{
     FindNavigation, FindOptions, FindQuery, FindQueryError, FindResults, FindScan, MAX_MATCHES,
     MAX_QUERY_BYTES, NavigationStep, matches_in_range, scan as find_scan,
+    scan_range as find_scan_range,
 };
+pub use replace::{ReplacePlan, ReplacePlanError, plan_replace_all};
 pub use ime::{ImeCancelOutcome, ImeState, utf16_range_to_byte};
 pub use movement::ForwardStop;
 pub use selection::Selection;
