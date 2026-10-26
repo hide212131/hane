@@ -19,14 +19,12 @@ mod settings;
 pub use bypass::BypassList;
 pub use child_env::{ChildEnvironment, ChildProxyPlan};
 pub use credential::{
-    BasicCredentials, CredentialError, CredentialRef, CredentialSource, CredentialStore, Secret,
-    PROXY_CREDENTIAL_SERVICE, load_credentials,
+    BasicCredentials, CredentialError, CredentialRef, CredentialSource, CredentialStore,
+    PROXY_CREDENTIAL_SERVICE, Secret, load_credentials,
 };
 pub use endpoint::ProxyEndpoint;
 pub use environment::{EnvPlatform, ProxyEnvironment};
 pub use error::{BypassProblem, NetworkError, ProxySource, UrlProblem};
 pub use host::Host;
 pub use route::{Destination, ResolvedRoute, Scheme, resolve};
-pub use settings::{
-    ManualProxy, NetworkSettings, ProxyAuth, ProxyMode, SETTINGS_SCHEMA,
-};
+pub use settings::{ManualProxy, NetworkSettings, ProxyAuth, ProxyMode, SETTINGS_SCHEMA};

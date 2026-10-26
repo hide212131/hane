@@ -36,10 +36,11 @@ impl ManualProxy {
     /// Validate user input. The URL must be `http://host[:port]` without
     /// userinfo, path, query or fragment.
     pub fn new(url: &str, bypass: &str, auth: ProxyAuth) -> Result<Self, NetworkError> {
-        let parsed = parse_proxy_url(url, false).map_err(|problem| NetworkError::InvalidProxyUrl {
-            source: ProxySource::Manual,
-            problem,
-        })?;
+        let parsed =
+            parse_proxy_url(url, false).map_err(|problem| NetworkError::InvalidProxyUrl {
+                source: ProxySource::Manual,
+                problem,
+            })?;
         let bypass = BypassList::parse(bypass).map_err(|problem| NetworkError::InvalidBypass {
             source: ProxySource::Manual,
             problem,

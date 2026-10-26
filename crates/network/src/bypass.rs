@@ -1,6 +1,6 @@
 use std::net::IpAddr;
-use std::str::FromStr;
 use std::net::Ipv6Addr;
+use std::str::FromStr;
 
 use crate::error::BypassProblem;
 use crate::host::{Host, normalize_dns};
@@ -54,7 +54,10 @@ impl BypassList {
         }
         self.entries.iter().any(|e| match (e, host) {
             (Entry::Domain(d), Host::Dns(h)) => {
-                h == d || (h.len() > d.len() && h.ends_with(d.as_str()) && h.as_bytes()[h.len() - d.len() - 1] == b'.')
+                h == d
+                    || (h.len() > d.len()
+                        && h.ends_with(d.as_str())
+                        && h.as_bytes()[h.len() - d.len() - 1] == b'.')
             }
             (Entry::Ip(IpAddr::V4(a)), Host::Ipv4(b)) => a == b,
             (Entry::Ip(IpAddr::V6(a)), Host::Ipv6(b)) => a == b,

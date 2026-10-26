@@ -125,10 +125,7 @@ pub fn load_credentials(
     match source {
         CredentialSource::None => Ok(None),
         CredentialSource::Inline(c) => Ok(Some(c.clone())),
-        CredentialSource::Stored(r) => store
-            .load(r)
-            .map(Some)
-            .map_err(NetworkError::Credential),
+        CredentialSource::Stored(r) => store.load(r).map(Some).map_err(NetworkError::Credential),
     }
 }
 
@@ -180,6 +177,9 @@ mod tests {
                 Err(NetworkError::Credential(e))
             );
         }
-        assert_eq!(load_credentials(&CredentialSource::None, &Failing(CredentialError::NotFound)), Ok(None));
+        assert_eq!(
+            load_credentials(&CredentialSource::None, &Failing(CredentialError::NotFound)),
+            Ok(None)
+        );
     }
 }

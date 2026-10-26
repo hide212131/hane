@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::credential::{BasicCredentials, CredentialStore, load_credentials, CredentialSource};
+use crate::credential::{BasicCredentials, CredentialSource, CredentialStore, load_credentials};
 use crate::endpoint::{ProxyEndpoint, percent_encode};
 use crate::environment::ProxyEnvironment;
 use crate::error::NetworkError;
@@ -254,9 +254,12 @@ mod tests {
 
     #[test]
     fn direct_strips_all_proxy_variables() {
-        let plan =
-            ChildProxyPlan::from_settings(&NetworkSettings::direct(), &env(&[("https_proxy", "http://p:1")]), &no_store())
-                .unwrap();
+        let plan = ChildProxyPlan::from_settings(
+            &NetworkSettings::direct(),
+            &env(&[("https_proxy", "http://p:1")]),
+            &no_store(),
+        )
+        .unwrap();
         assert!(!plan.uses_proxy());
         let out = plan.apply(parent());
         assert_eq!(out.iter().count(), 3);
@@ -270,7 +273,8 @@ mod tests {
             ("all_proxy", "http://fallback:80"),
             ("no_proxy", "internal.example"),
         ]);
-        let plan = ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).unwrap();
+        let plan =
+            ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).unwrap();
         let out = plan.apply(parent());
         assert_others_untouched(&out);
         assert_eq!(out.get("https_proxy"), Some("http://secure:3128"));
@@ -280,13 +284,18 @@ mod tests {
         assert_eq!(out.get("ALL_PROXY"), None);
         assert_eq!(out.get("Http_Proxy"), None);
         assert_eq!(out.get("socks_proxy"), None);
-        assert_eq!(out.get("no_proxy"), Some("internal.example,localhost,127.0.0.1,::1"));
+        assert_eq!(
+            out.get("no_proxy"),
+            Some("internal.example,localhost,127.0.0.1,::1")
+        );
         assert_eq!(out.get("NO_PROXY"), out.get("no_proxy"));
     }
 
     #[test]
     fn environment_without_proxy_is_just_stripped() {
-        let plan = ChildProxyPlan::from_settings(&NetworkSettings::default(), &env(&[]), &no_store()).unwrap();
+        let plan =
+            ChildProxyPlan::from_settings(&NetworkSettings::default(), &env(&[]), &no_store())
+                .unwrap();
         let out = plan.apply(parent());
         assert_eq!(out.iter().count(), 3);
     }
@@ -294,7 +303,8 @@ mod tests {
     #[test]
     fn environment_credentials_are_re_encoded() {
         let e = env(&[("https_proxy", "http://u%40:p%2540@p:1")]);
-        let plan = ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).unwrap();
+        let plan =
+            ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).unwrap();
         let out = plan.apply(Vec::<(String, String)>::new());
         assert_eq!(out.get("https_proxy"), Some("http://u%40:p%2540@p:1"));
         assert_eq!(out.get("http_proxy"), None);
@@ -304,7 +314,12 @@ mod tests {
     #[test]
     fn manual_uses_manual_values_and_store() {
         let reference = CredentialRef::new("c1").unwrap();
-        let m = ManualProxy::new("http://[2001:db8::1]:8080", "a.com", ProxyAuth::Basic(reference)).unwrap();
+        let m = ManualProxy::new(
+            "http://[2001:db8::1]:8080",
+            "a.com",
+            ProxyAuth::Basic(reference),
+        )
+        .unwrap();
         let s = NetworkSettings::manual(m);
         let e = env(&[("https_proxy", "http://env:1"), ("no_proxy", "env.example")]);
 
@@ -321,7 +336,12 @@ mod tests {
 
     #[test]
     fn credential_failure_is_an_error() {
-        let m = ManualProxy::new("http://p:1", "", ProxyAuth::Basic(CredentialRef::new("c1").unwrap())).unwrap();
+        let m = ManualProxy::new(
+            "http://p:1",
+            "",
+            ProxyAuth::Basic(CredentialRef::new("c1").unwrap()),
+        )
+        .unwrap();
         let r = ChildProxyPlan::from_settings(&NetworkSettings::manual(m), &env(&[]), &no_store());
         assert_eq!(
             r.err(),
@@ -332,15 +352,23 @@ mod tests {
     #[test]
     fn wildcard_bypass_is_kept() {
         let e = env(&[("https_proxy", "http://p:1"), ("no_proxy", "*")]);
-        let plan = ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).unwrap();
-        assert_eq!(plan.apply(Vec::<(String, String)>::new()).get("no_proxy"), Some("*"));
+        let plan =
+            ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).unwrap();
+        assert_eq!(
+            plan.apply(Vec::<(String, String)>::new()).get("no_proxy"),
+            Some("*")
+        );
     }
 
     #[test]
     fn invalid_environment_is_an_error() {
         let e = env(&[("https_proxy", "http://p:1"), ("no_proxy", "10.0.0.0/8")]);
-        assert!(ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).is_err());
+        assert!(
+            ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).is_err()
+        );
         let e = env(&[("http_proxy", "ftp://p:1")]);
-        assert!(ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).is_err());
+        assert!(
+            ChildProxyPlan::from_settings(&NetworkSettings::default(), &e, &no_store()).is_err()
+        );
     }
 }

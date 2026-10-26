@@ -18,7 +18,11 @@ pub enum EnvPlatform {
 
 impl EnvPlatform {
     pub fn current() -> Self {
-        if cfg!(windows) { Self::Windows } else { Self::MacOs }
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::MacOs
+        }
     }
 }
 
@@ -105,10 +109,7 @@ impl ProxyEnvironment {
 
     /// The proxy selected for a destination scheme, or `None` when no
     /// variable is set. Invalid selected values are errors.
-    pub(crate) fn proxy_for(
-        &self,
-        scheme: Scheme,
-    ) -> Result<Option<ParsedProxy>, NetworkError> {
+    pub(crate) fn proxy_for(&self, scheme: Scheme) -> Result<Option<ParsedProxy>, NetworkError> {
         let Some((name, value)) = self.first_set(self.proxy_names(scheme)) else {
             return Ok(None);
         };
@@ -159,9 +160,7 @@ mod tests {
     }
 
     fn selected(e: &ProxyEnvironment, scheme: Scheme) -> Option<String> {
-        e.proxy_for(scheme)
-            .unwrap()
-            .map(|p| p.endpoint.to_string())
+        e.proxy_for(scheme).unwrap().map(|p| p.endpoint.to_string())
     }
 
     #[test]
@@ -217,7 +216,11 @@ mod tests {
     fn empty_values_are_unset_but_invalid_values_fail_closed() {
         let e = env(
             EnvPlatform::MacOs,
-            &[("https_proxy", ""), ("HTTPS_PROXY", "  "), ("all_proxy", "http://c:1")],
+            &[
+                ("https_proxy", ""),
+                ("HTTPS_PROXY", "  "),
+                ("all_proxy", "http://c:1"),
+            ],
         );
         assert_eq!(selected(&e, Scheme::Https), Some("http://c:1".into()));
 
@@ -238,7 +241,11 @@ mod tests {
     fn unrelated_variables_are_not_captured() {
         let e = env(
             EnvPlatform::MacOs,
-            &[("PATH", "/bin"), ("Http_Proxy", "http://x:1"), ("SSL_CERT_FILE", "/c")],
+            &[
+                ("PATH", "/bin"),
+                ("Http_Proxy", "http://x:1"),
+                ("SSL_CERT_FILE", "/c"),
+            ],
         );
         assert_eq!(e.vars.len(), 0);
     }
@@ -260,7 +267,10 @@ mod tests {
 
     #[test]
     fn debug_hides_values() {
-        let e = env(EnvPlatform::MacOs, &[("https_proxy", "http://user:hunter2@p:1")]);
+        let e = env(
+            EnvPlatform::MacOs,
+            &[("https_proxy", "http://user:hunter2@p:1")],
+        );
         let text = format!("{e:?}");
         assert!(!text.contains("hunter2") && !text.contains("user"));
     }

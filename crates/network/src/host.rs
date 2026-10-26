@@ -86,7 +86,11 @@ mod tests {
         let cases: &[(&str, bool, Option<Host>)] = &[
             ("Example.COM", false, Some(Host::Dns("example.com".into()))),
             ("example.com.", false, Some(Host::Dns("example.com".into()))),
-            ("10.0.0.1", false, Some(Host::Ipv4(Ipv4Addr::new(10, 0, 0, 1)))),
+            (
+                "10.0.0.1",
+                false,
+                Some(Host::Ipv4(Ipv4Addr::new(10, 0, 0, 1))),
+            ),
             ("[::1]", false, Some(Host::Ipv6(Ipv6Addr::LOCALHOST))),
             ("::1", false, None),
             ("::1", true, Some(Host::Ipv6(Ipv6Addr::LOCALHOST))),
@@ -109,7 +113,13 @@ mod tests {
 
     #[test]
     fn loopback_table() {
-        let yes = ["localhost", "localhost.", "127.0.0.1", "127.255.0.9", "[::1]"];
+        let yes = [
+            "localhost",
+            "localhost.",
+            "127.0.0.1",
+            "127.255.0.9",
+            "[::1]",
+        ];
         let no = ["a.localhost", "128.0.0.1", "[::2]", "example.com"];
         for h in yes {
             assert!(Host::parse(h, false).unwrap().is_loopback(), "{h}");

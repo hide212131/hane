@@ -35,7 +35,10 @@ pub(crate) struct ParsedProxy {
 }
 
 /// Parse an `http://` proxy URL. `allow_userinfo` is false for manual settings.
-pub(crate) fn parse_proxy_url(input: &str, allow_userinfo: bool) -> Result<ParsedProxy, UrlProblem> {
+pub(crate) fn parse_proxy_url(
+    input: &str,
+    allow_userinfo: bool,
+) -> Result<ParsedProxy, UrlProblem> {
     let text = input.trim();
     if text.is_empty() {
         return Err(UrlProblem::Empty);
@@ -172,7 +175,10 @@ mod tests {
     #[test]
     fn accepted_endpoints() {
         let cases = [
-            ("http://proxy.example.com:3128", "http://proxy.example.com:3128"),
+            (
+                "http://proxy.example.com:3128",
+                "http://proxy.example.com:3128",
+            ),
             ("HTTP://Proxy.Example.com", "http://proxy.example.com:80"),
             ("http://proxy.example.com./", "http://proxy.example.com:80"),
             ("http://10.1.2.3:8080", "http://10.1.2.3:8080"),

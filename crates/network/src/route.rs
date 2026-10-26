@@ -87,9 +87,7 @@ pub fn resolve(
                 return Ok(ResolvedRoute::Direct);
             }
             let credentials = match proxy.userinfo {
-                Some((user, pass)) => {
-                    CredentialSource::Inline(BasicCredentials::new(user, pass))
-                }
+                Some((user, pass)) => CredentialSource::Inline(BasicCredentials::new(user, pass)),
                 None => CredentialSource::None,
             };
             Ok(ResolvedRoute::HttpProxy {
@@ -136,7 +134,11 @@ mod tests {
             (Scheme::Http, "example.com", Some("http://plain:3128")),
             (Scheme::Https, "api.internal.example", None),
             (Scheme::Https, "internal.example", None),
-            (Scheme::Https, "notinternal.example", Some("http://secure:3128")),
+            (
+                Scheme::Https,
+                "notinternal.example",
+                Some("http://secure:3128"),
+            ),
             (Scheme::Https, "10.0.0.5", None),
             (Scheme::Https, "10.0.0.6", Some("http://secure:3128")),
             (Scheme::Https, "localhost", None),
@@ -152,7 +154,11 @@ mod tests {
 
     #[test]
     fn environment_without_variables_is_direct() {
-        let r = resolve(&NetworkSettings::default(), &env(&[]), &dest(Scheme::Https, "a.com"));
+        let r = resolve(
+            &NetworkSettings::default(),
+            &env(&[]),
+            &dest(Scheme::Https, "a.com"),
+        );
         assert_eq!(r, Ok(ResolvedRoute::Direct));
     }
 
@@ -160,7 +166,10 @@ mod tests {
     fn invalid_environment_fails_closed() {
         let s = NetworkSettings::default();
         let d = dest(Scheme::Https, "a.com");
-        let e = env(&[("https_proxy", "http://bad host"), ("all_proxy", "http://ok:1")]);
+        let e = env(&[
+            ("https_proxy", "http://bad host"),
+            ("all_proxy", "http://ok:1"),
+        ]);
         assert_eq!(
             resolve(&s, &e, &d),
             Err(NetworkError::InvalidProxyUrl {
@@ -181,7 +190,12 @@ mod tests {
     #[test]
     fn environment_userinfo_becomes_inline_credentials() {
         let e = env(&[("https_proxy", "http://u%3Aser:pw@p:1")]);
-        let r = resolve(&NetworkSettings::default(), &e, &dest(Scheme::Https, "a.com")).unwrap();
+        let r = resolve(
+            &NetworkSettings::default(),
+            &e,
+            &dest(Scheme::Https, "a.com"),
+        )
+        .unwrap();
         let ResolvedRoute::HttpProxy { credentials, .. } = &r else {
             panic!("expected proxy");
         };
@@ -195,7 +209,11 @@ mod tests {
     #[test]
     fn direct_mode_ignores_environment() {
         let e = env(&[("https_proxy", "http://p:1"), ("no_proxy", "*.bad")]);
-        let r = resolve(&NetworkSettings::direct(), &e, &dest(Scheme::Https, "a.com"));
+        let r = resolve(
+            &NetworkSettings::direct(),
+            &e,
+            &dest(Scheme::Https, "a.com"),
+        );
         assert_eq!(r, Ok(ResolvedRoute::Direct));
     }
 
@@ -215,8 +233,12 @@ mod tests {
     #[test]
     fn manual_basic_returns_reference_only_and_bypass_has_none() {
         let reference = CredentialRef::new("cred-1").unwrap();
-        let m = ManualProxy::new("http://[2001:db8::1]", "skip.example", ProxyAuth::Basic(reference.clone()))
-            .unwrap();
+        let m = ManualProxy::new(
+            "http://[2001:db8::1]",
+            "skip.example",
+            ProxyAuth::Basic(reference.clone()),
+        )
+        .unwrap();
         let s = NetworkSettings::manual(m);
         let r = resolve(&s, &env(&[]), &dest(Scheme::Https, "a.com")).unwrap();
         assert_eq!(
@@ -229,7 +251,10 @@ mod tests {
                 credentials: CredentialSource::Stored(reference),
             }
         );
-        assert_eq!(proxy_endpoint(&r).as_deref(), Some("http://[2001:db8::1]:80"));
+        assert_eq!(
+            proxy_endpoint(&r).as_deref(),
+            Some("http://[2001:db8::1]:80")
+        );
         // Bypassed destinations carry no credential reference to fetch.
         let r = resolve(&s, &env(&[]), &dest(Scheme::Https, "skip.example")).unwrap();
         assert_eq!(r, ResolvedRoute::Direct);
