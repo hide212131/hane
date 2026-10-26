@@ -289,9 +289,19 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Consuming the open menu here makes every other callback of it (and
-        // of any earlier menu) a no-op.
-        let current = window.is_window_active() && self.editor_context_menu_is_current(menu);
+        // The token is the single owner of the menu's lifetime. A callback
+        // whose token is not the open menu's (dismissed, replaced, or already
+        // consumed) must not touch the current menu either.
+        if self
+            .editor_context_menu
+            .as_ref()
+            .is_none_or(|open| open.token != menu.token)
+        {
+            return;
+        }
+        // Consume exactly once; the other callbacks of this menu then find no
+        // open menu with their token.
+        let current = window.is_window_active() && self.editor_context_menu_state_matches(menu);
         self.editor_context_menu = None;
         if !current {
             cx.notify();
@@ -366,7 +376,11 @@ mod tests {
         let text = text.to_owned();
         let (view, cx) = cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx));
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        // The menu is only valid in an active window; activate it through the
+        // platform path so `is_window_active` is genuinely true.
+        cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
+        assert!(cx.update(|window, _| window.is_window_active()));
         (view, cx)
     }
 
@@ -643,6 +657,46 @@ mod tests {
             .expect("menu open");
 
         cx.deactivate_window();
+        assert!(!menu_is_open(&view, cx));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(!menu_is_open(&view, cx));
+        run_item(&view, cx, &menu, EditorMenuAction::InsertLink);
+        assert_eq!(text_of(&view, cx), text);
+        view.read_with(cx, |view, _| assert!(!view.editor().can_undo()));
+    }
+
+    /// Opening settings drops the menu even though the render returns early,
+    /// and closing settings does not bring it back.
+    #[gpui::test]
+    fn settings_invalidate_the_menu_for_good(cx: &mut gpui::TestAppContext) {
+        let text = "label text\n";
+        let (view, cx) = open_view(cx, text);
+        select(
+            &view,
+            cx,
+            Selection {
+                anchor: SourceOffset(0),
+                active: SourceOffset(5),
+            },
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(URL.to_owned()));
+        right_click_row(cx);
+        let menu = view
+            .read_with(cx, |view, _| view.editor_context_menu.clone())
+            .expect("menu open");
+
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!menu_is_open(&view, cx));
+        view.update(cx, |view, cx| {
+            view.settings_open = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
         assert!(!menu_is_open(&view, cx));
         run_item(&view, cx, &menu, EditorMenuAction::InsertLink);
         assert_eq!(text_of(&view, cx), text);

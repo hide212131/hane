@@ -51,6 +51,19 @@ impl EditorView {
         let mut scroll_inertia_tracks_layout = self
             .scroll_inertia
             .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
+        // The body menu belongs to one document instance, revision and
+        // selection, and is never shown together with another menu or a
+        // modal. Anything that changed since it opened closes it. This runs
+        // before the settings early return so that opening settings drops the
+        // menu instead of leaving it to revive when the snapshot matches again.
+        if self.editor_context_menu.as_ref().is_some_and(|menu| {
+            !self.editor_context_menu_is_current(menu)
+                || !window.is_window_active()
+                || self.file_tab_context_menu.is_some()
+                || self.sidebar_context_menu.is_some()
+        }) {
+            self.editor_context_menu = None;
+        }
         if self.settings_open {
             return self
                 .settings_screen_element(window, cx)
@@ -75,17 +88,6 @@ impl EditorView {
             .is_some_and(|confirm| self.document_instance(confirm.id) != Some(confirm.instance))
         {
             self.tab_close_confirm = None;
-        }
-        // The body menu belongs to one document instance, revision and
-        // selection, and is never shown together with another menu or a
-        // modal. Anything that changed since it opened closes it.
-        if self.editor_context_menu.as_ref().is_some_and(|menu| {
-            !self.editor_context_menu_is_current(menu)
-                || !window.is_window_active()
-                || self.file_tab_context_menu.is_some()
-                || self.sidebar_context_menu.is_some()
-        }) {
-            self.editor_context_menu = None;
         }
         self.begin_mermaid_frame(window, cx);
         self.schedule_document_parse(cx);
