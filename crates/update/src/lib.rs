@@ -55,6 +55,7 @@ pub mod protocol;
 pub mod release;
 pub(crate) mod relocation;
 pub mod root_guard;
+pub mod secret_store;
 #[cfg(windows)]
 pub(crate) mod scratch;
 pub mod startup;
