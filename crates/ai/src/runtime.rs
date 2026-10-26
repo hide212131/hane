@@ -490,6 +490,54 @@ enum CoordinatorMessage {
     Shutdown,
 }
 
+/// The network snapshot revision an AI operation started under, plus a view
+/// of the latest *saved* revision. [`AiRuntime`] only knows the revision it
+/// was last configured with, so it cannot see a network setting saved while
+/// an operation is already running; this guard can. Callers stop before
+/// `thread/start` / `turn/start` once a newer revision is saved
+/// ([`Self::is_current`]), and every RPC goes through
+/// [`AiRuntime::call_for_network_revision`] so a reply is never attributed to
+/// a runtime configured for another revision.
+#[derive(Clone, Debug)]
+pub(crate) struct NetworkRevisionGuard {
+    started: u64,
+    latest: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl NetworkRevisionGuard {
+    pub(crate) fn new(started: u64, latest: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self { started, latest }
+    }
+
+    /// A guard for a revision that nothing else advances.
+    #[cfg(test)]
+    pub(crate) fn fixed(started: u64) -> Self {
+        Self::new(
+            started,
+            Arc::new(std::sync::atomic::AtomicU64::new(started)),
+        )
+    }
+
+    /// `true` while no newer network revision has been saved.
+    pub(crate) fn is_current(&self) -> bool {
+        self.latest.load(Ordering::SeqCst) == self.started
+    }
+
+    /// Calls `method` only while the runtime is `Ready` for the
+    /// operation-start revision. This does not check the saved revision, so an
+    /// in-flight turn can still be interrupted; callers starting new work
+    /// check [`Self::is_current`] first.
+    pub(crate) fn call(
+        &self,
+        runtime: &AiRuntime,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, RuntimeError> {
+        runtime.call_for_network_revision(self.started, method, params, timeout)
+    }
+}
+
 pub struct AiRuntime {
     cmd_tx: Sender<CoordinatorMessage>,
     coordinator: Option<JoinHandle<()>>,
@@ -2134,6 +2182,29 @@ mod tests {
         // Not Ready: a call for any revision is rejected, never retried.
         assert!(matches!(
             runtime.call_for_network_revision(5, "x", None, Duration::from_millis(10)),
+            Err(RuntimeError::NotReady)
+        ));
+    }
+
+    #[test]
+    fn network_revision_guard_detects_saved_revision_and_gates_calls() {
+        let (events_tx, _events_rx) = mpsc::sync_channel(8);
+        let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+        let runtime = AiRuntime::spawn_with_configured_generations(
+            config,
+            3,
+            5,
+            Arc::new(crate::rpc::RejectAllServerRequests),
+            events_tx,
+        );
+        let latest = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let guard = NetworkRevisionGuard::new(5, latest.clone());
+        assert!(guard.is_current());
+        latest.store(6, Ordering::SeqCst);
+        assert!(!guard.is_current());
+        // The runtime is not Ready, so the call is rejected rather than sent.
+        assert!(matches!(
+            guard.call(&runtime, "x", None, Duration::from_millis(10)),
             Err(RuntimeError::NotReady)
         ));
     }

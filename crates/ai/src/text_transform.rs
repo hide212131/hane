@@ -65,7 +65,9 @@ use crate::connect::{ConnectError, with_generation_checked_lock};
 use crate::probe::{ProbeCollector, ProbeTerminal, thread_id_from_response, turn_id_from_response};
 use crate::prompt_template::parse_prompt_template;
 use crate::rpc::RpcError;
-use crate::runtime::{AiRuntime, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState};
+use crate::runtime::{
+    AiRuntime, NetworkRevisionGuard, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState,
+};
 use crate::settings::{ActiveConnection, AiSettingsStore};
 
 /// Section 5.2 step 1's per-field limits. Enforced both at admission (before
@@ -370,6 +372,7 @@ pub(crate) fn execute_text_transform(
     document_context: Option<&DocumentContext>,
     cwd: &Path,
     settings_generation: u64,
+    network: &NetworkRevisionGuard,
 ) -> TextTransformExecution {
     if cancellation_requested(cancel_rx, operation_id, shutdown_rx, shutdown_seen) {
         return TextTransformExecution {
@@ -396,6 +399,7 @@ pub(crate) fn execute_text_transform(
             document_context,
             runtime_generation,
             cwd,
+            network,
             &mut deferred_events,
         )
     });
@@ -444,10 +448,18 @@ fn run_locked(
     document_context: Option<&DocumentContext>,
     runtime_generation: u64,
     cwd: &Path,
+    network: &NetworkRevisionGuard,
     deferred_events: &mut Vec<RuntimeEvent>,
 ) -> (TextTransformOutcome, bool) {
     let deadline = Instant::now() + TEXT_TRANSFORM_TIMEOUT;
-    let thread_response = match runtime.call(
+    if !network.is_current() {
+        return (
+            TextTransformOutcome::Failed(TextTransformErrorCode::StaleGeneration),
+            false,
+        );
+    }
+    let thread_response = match network.call(
+        runtime,
         "thread/start",
         Some(thread_start_params(connection, model, cwd)),
         bounded_rpc_timeout(deadline),
@@ -469,7 +481,14 @@ fn run_locked(
         return (TextTransformOutcome::Canceled, false);
     }
 
-    let turn_response = match runtime.call(
+    if !network.is_current() {
+        return (
+            TextTransformOutcome::Failed(TextTransformErrorCode::StaleGeneration),
+            false,
+        );
+    }
+    let turn_response = match network.call(
+        runtime,
         "turn/start",
         Some(turn_start_params(
             &thread_id,
@@ -512,6 +531,7 @@ fn run_locked(
                 &mut collector,
                 &thread_id,
                 &turn_id,
+                network,
                 deferred_events,
                 TextTransformErrorCode::Canceled,
             );
@@ -533,6 +553,7 @@ fn run_locked(
                 &mut collector,
                 &thread_id,
                 &turn_id,
+                network,
                 deferred_events,
                 TextTransformErrorCode::TimedOut,
             );
@@ -670,12 +691,14 @@ fn map_probe_error_code(code: crate::probe::ProbeErrorCode) -> TextTransformErro
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interrupt_or_stop(
     runtime: &AiRuntime,
     events_rx: &Receiver<RuntimeEvent>,
     collector: &mut ProbeCollector,
     thread_id: &str,
     turn_id: &str,
+    network: &NetworkRevisionGuard,
     deferred_events: &mut Vec<RuntimeEvent>,
     error_code: TextTransformErrorCode,
 ) -> (TextTransformOutcome, bool) {
@@ -684,7 +707,8 @@ fn interrupt_or_stop(
     // exactly like the fixed Probe (section 5.3: an ACK-only interrupt must
     // never release the shared lock).
     let deadline = Instant::now() + INTERRUPT_TERMINAL_TIMEOUT;
-    let _ = runtime.call(
+    let _ = network.call(
+        runtime,
         "turn/interrupt",
         Some(turn_interrupt_params(thread_id, turn_id)),
         INTERRUPT_TERMINAL_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
@@ -1241,6 +1265,7 @@ mod tests {
             None,
             Path::new("/nonexistent/unused-cwd"),
             0,
+            &NetworkRevisionGuard::fixed(0),
         );
         (execution, runtime, shutdown_seen)
     }

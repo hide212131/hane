@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::CUSTOM_PROVIDER_ID;
 use crate::connect::{ConnectError, with_generation_checked_lock};
 use crate::rpc::RpcError;
-use crate::runtime::{AiRuntime, RuntimeError, RuntimeState};
+use crate::runtime::{AiRuntime, NetworkRevisionGuard, RuntimeError, RuntimeState};
 use crate::runtime::{RuntimeEvent, RuntimeEventKind};
 use crate::settings::ActiveConnection;
 use crate::settings::AiSettingsStore;
@@ -272,6 +272,7 @@ pub(crate) fn execute_probe(
     cwd: &Path,
     settings_generation: u64,
     auth_epoch: u64,
+    network: &NetworkRevisionGuard,
 ) -> ProbeExecution {
     if cancellation_requested(cancel_rx, operation_id, shutdown_rx, shutdown_seen) {
         return ProbeExecution {
@@ -300,6 +301,7 @@ pub(crate) fn execute_probe(
             shutdown_seen,
             &context,
             cwd,
+            network,
             &mut deferred_events,
             &mut failure,
         )
@@ -375,11 +377,17 @@ fn run_locked(
     shutdown_seen: &mut bool,
     context: &ProbeRuntimeContext,
     cwd: &Path,
+    network: &NetworkRevisionGuard,
     deferred_events: &mut Vec<RuntimeEvent>,
     failure: &mut Option<ProbeFailure>,
 ) -> (ProbeStatus, bool, Option<String>) {
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    let thread_response = match runtime.call(
+    if !network.is_current() {
+        note_failure(failure, "thread/start", "network_revision_changed".to_owned());
+        return (ProbeStatus::Failed(ProbeErrorCode::StaleGeneration), false, None);
+    }
+    let thread_response = match network.call(
+        runtime,
         "thread/start",
         Some(thread_start_params(context.connection, &context.model, cwd)),
         bounded_rpc_timeout(deadline),
@@ -401,7 +409,12 @@ fn run_locked(
         return (ProbeStatus::Canceled, false, None);
     }
 
-    let turn_response = match runtime.call(
+    if !network.is_current() {
+        note_failure(failure, "turn/start", "network_revision_changed".to_owned());
+        return (ProbeStatus::Failed(ProbeErrorCode::StaleGeneration), false, None);
+    }
+    let turn_response = match network.call(
+        runtime,
         "turn/start",
         Some(turn_start_params(&thread_id)),
         bounded_rpc_timeout(deadline),
@@ -438,6 +451,7 @@ fn run_locked(
                 &mut collector,
                 &thread_id,
                 &turn_id,
+                network,
                 deferred_events,
                 ProbeErrorCode::SafetyProfileUnsupported,
             );
@@ -450,6 +464,7 @@ fn run_locked(
                 &mut collector,
                 &thread_id,
                 &turn_id,
+                network,
                 deferred_events,
                 ProbeErrorCode::Canceled,
             );
@@ -481,6 +496,7 @@ fn run_locked(
                 &mut collector,
                 &thread_id,
                 &turn_id,
+                network,
                 deferred_events,
                 ProbeErrorCode::TimedOut,
             );
@@ -573,19 +589,22 @@ fn settle_terminal(terminal: ProbeTerminal) -> (ProbeStatus, bool, Option<String
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps the interrupt target and revision guard explicit.
 fn interrupt_or_stop(
     runtime: &AiRuntime,
     events_rx: &Receiver<RuntimeEvent>,
     collector: &mut ProbeCollector,
     thread_id: &str,
     turn_id: &str,
+    network: &NetworkRevisionGuard,
     deferred_events: &mut Vec<RuntimeEvent>,
     error_code: ProbeErrorCode,
 ) -> (ProbeStatus, bool, Option<String>) {
     // An interrupt acknowledgement is not terminal. Keep the shared lock
     // until a matching terminal notification or confirmed child stop.
     let deadline = Instant::now() + INTERRUPT_TERMINAL_TIMEOUT;
-    let _ = runtime.call(
+    let _ = network.call(
+        runtime,
         "turn/interrupt",
         Some(turn_interrupt_params(thread_id, turn_id)),
         INTERRUPT_TERMINAL_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),

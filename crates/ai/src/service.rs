@@ -30,7 +30,8 @@ use crate::probe::{ProbeDiagnostic, ProbeErrorCode, ProbeResult, ProbeStatus, ex
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
 use crate::runtime::{
-    AiRuntime, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState,
+    AiRuntime, NetworkRevisionGuard, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind,
+    RuntimeState,
 };
 use crate::runtime_distribution;
 use crate::runtime_distribution::{
@@ -289,6 +290,18 @@ pub struct AiService {
 struct NetworkSnapshot {
     revision: u64,
     context: NetworkContext,
+    /// The latest saved revision, shared by every clone of this snapshot. The
+    /// worker's copy keeps `revision` fixed for the command it is running,
+    /// while this still follows `apply_network`, so an operation can tell that
+    /// a newer setting was saved after it began.
+    latest: Arc<AtomicU64>,
+}
+
+impl NetworkSnapshot {
+    /// The guard for an operation started under this snapshot.
+    fn revision_guard(&self) -> NetworkRevisionGuard {
+        NetworkRevisionGuard::new(self.revision, self.latest.clone())
+    }
 }
 
 impl AiServiceHandle {
@@ -619,6 +632,7 @@ impl AiService {
         let network = Arc::new(Mutex::new(NetworkSnapshot {
             revision: 0,
             context: network,
+            latest: Arc::new(AtomicU64::new(0)),
         }));
         let worker_network = network.clone();
         let worker = thread::Builder::new()
@@ -650,6 +664,7 @@ impl AiService {
         let mut snapshot = self.network.lock().unwrap();
         snapshot.revision = snapshot.revision.saturating_add(1);
         snapshot.context = context;
+        snapshot.latest.store(snapshot.revision, Ordering::SeqCst);
         snapshot.revision
     }
 
@@ -1358,6 +1373,7 @@ fn run_probe_command(
         &workspace,
         settings.settings_generation,
         snapshot.auth_epoch,
+        &state.network.revision_guard(),
     );
     // The process may still be running after an isolation result. Keep its
     // working directory in that case until a later confirmed stop.
@@ -1521,6 +1537,7 @@ fn run_text_transform_command(
         document_context.as_ref(),
         &workspace,
         settings.settings_generation,
+        &state.network.revision_guard(),
     );
     // Mirrors `run_probe_command`: an isolated child's working directory
     // must survive until a later confirmed stop.
