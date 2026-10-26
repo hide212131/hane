@@ -3270,6 +3270,7 @@ name = "hane-update"
 version = "0.34.0"
 dependencies = [
  "base64 0.22.1",
+ "core-foundation-sys",
  "flate2",
  "hane-network",
  "keyring",

@@ -287,5 +287,19 @@ if [[ -e "$bundle/Contents/Resources/hane-install.json" || -e "$bundle/Contents/
 fi
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$bundle"
 
+# The proxy credential of an update restart is a Keychain item whose access list
+# trusts the app executable and Contents/Helpers/hane-updater by code
+# requirement (crates/update/src/secret_store.rs). For these ad-hoc signatures
+# that requirement is the code directory hash, so each executable must carry its
+# own valid, individually verifiable signature with a cdhash the update helper
+# copy (a byte-identical copy of the installed helper) keeps.
+for binary in "$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"; do
+  /usr/bin/codesign --verify --strict "$binary"
+  if ! /usr/bin/codesign -dvvv "$binary" 2>&1 | grep -q '^CDHash='; then
+    echo "$binary must carry a code directory hash for the Keychain access list" >&2
+    exit 1
+  fi
+done
+
 touch "$bundle"
 echo "Built: $bundle"

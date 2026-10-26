@@ -30,6 +30,9 @@ hane-network.workspace = true
 # store uses; no secret-service backend is pulled in on other platforms.
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = "2"
+# Raw CoreFoundation types for the Keychain access list (secret_store.rs); already
+# resolved in Cargo.lock.
+core-foundation-sys = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = "2"

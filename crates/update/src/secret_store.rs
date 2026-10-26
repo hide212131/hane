@@ -7,6 +7,11 @@
 //! file or plaintext fallback: where no native backend exists every `put` and
 //! `take` fails, so the handoff aborts instead of continuing without the
 //! credential. Errors carry fixed text only, never the secret or an OS message.
+//!
+//! On macOS the app creates the entry and the separate update helper takes and
+//! deletes it, so the entry is created with an access list naming only the app
+//! and the bundled helper (`keychain_acl`); if that list cannot be built or
+//! applied, `put` fails and the handoff aborts.
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use hane_network::PROXY_CREDENTIAL_SERVICE;
@@ -41,9 +46,23 @@ impl KeyringBackend {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl SecretBackend for KeyringBackend {
     fn set(&self, account: &str, secret: &str) -> std::result::Result<(), BackendError> {
-        Self::entry(account)?
-            .set_password(secret)
-            .map_err(|_| BackendError)
+        // macOS: the entry is created with an access list that names only this
+        // app and its update helper, so the helper can read and delete it later
+        // without a prompt (see `keychain_acl`).
+        #[cfg(target_os = "macos")]
+        {
+            keychain_acl::create(PROXY_CREDENTIAL_SERVICE, account, secret, || {
+                // A stale entry of the same reference is replaced.
+                let _ = Self::entry(account)?.delete_password();
+                Ok(())
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::entry(account)?
+                .set_password(secret)
+                .map_err(|_| BackendError)
+        }
     }
 
     fn get(&self, account: &str) -> std::result::Result<Option<String>, BackendError> {
@@ -59,6 +78,170 @@ impl SecretBackend for KeyringBackend {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err(BackendError),
         }
+    }
+}
+
+/// Where the update helper of the bundle that contains `exe` lives:
+/// `Hane.app/Contents/MacOS/hane` -> `Hane.app/Contents/Helpers/hane-updater`.
+/// `None` when `exe` is not inside such a bundle layout.
+#[cfg(any(target_os = "macos", test))]
+fn bundled_helper_path(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let macos_dir = exe.parent()?;
+    let contents = macos_dir.parent()?;
+    if macos_dir.file_name()? != "MacOS" || contents.file_name()? != "Contents" {
+        return None;
+    }
+    Some(contents.join("Helpers").join("hane-updater"))
+}
+
+/// Keychain items created by the app carry, by default, an access list that
+/// trusts only the creating executable; the update helper is another executable
+/// and would be refused (or prompted) when it takes and deletes the item. The
+/// item is therefore created with an explicit access list of exactly two
+/// applications: this executable and the bundle's `hane-updater`.
+///
+/// Trust is by code requirement, not by path: for the ad-hoc signatures of
+/// `scripts/bundle-macos.sh` that is the code directory hash. The helper runs
+/// from a byte-identical copy of the installed helper (`stage_helper_copy`), so
+/// it satisfies the same requirement; any other executable does not.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "legacy Keychain access-list calls through Security.framework")]
+mod keychain_acl {
+    use std::ffi::{CString, c_char, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
+
+    use core_foundation_sys::array::{CFArrayCreate, kCFTypeArrayCallBacks};
+    use core_foundation_sys::base::{CFIndex, CFRelease, kCFAllocatorDefault};
+    use core_foundation_sys::string::{CFStringCreateWithCString, kCFStringEncodingUTF8};
+
+    use super::{BackendError, bundled_helper_path};
+
+    type OsStatus = i32;
+    type Ref = *const c_void;
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecTrustedApplicationCreateFromPath(path: *const c_char, app: *mut Ref) -> OsStatus;
+        fn SecAccessCreate(descriptor: Ref, trusted_list: Ref, access: *mut Ref) -> OsStatus;
+        fn SecKeychainAddGenericPassword(
+            keychain: Ref,
+            service_len: u32,
+            service: *const c_void,
+            account_len: u32,
+            account: *const c_void,
+            password_len: u32,
+            password: *const c_void,
+            item: *mut Ref,
+        ) -> OsStatus;
+        fn SecKeychainItemSetAccess(item: Ref, access: Ref) -> OsStatus;
+        fn SecKeychainItemDelete(item: Ref) -> OsStatus;
+    }
+
+    /// Releases a Core Foundation object on drop.
+    struct Owned(Ref);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a non-null object this guard owns one reference to.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    fn ok(status: OsStatus) -> Result<(), BackendError> {
+        if status == 0 { Ok(()) } else { Err(BackendError) }
+    }
+
+    /// The access list: this executable (a null path means the caller) and the
+    /// bundled helper, nothing else.
+    fn access() -> Result<Owned, BackendError> {
+        let exe = std::env::current_exe().map_err(|_| BackendError)?;
+        let helper = bundled_helper_path(&exe).filter(|path| path.is_file()).ok_or(BackendError)?;
+        let helper = CString::new(helper.as_os_str().as_bytes()).map_err(|_| BackendError)?;
+
+        let mut me: Ref = ptr::null();
+        let mut updater: Ref = ptr::null();
+        // SAFETY: valid out pointers; `helper` is a NUL-terminated path.
+        unsafe {
+            ok(SecTrustedApplicationCreateFromPath(ptr::null(), &mut me))?;
+        }
+        let me = Owned(me);
+        // SAFETY: as above.
+        unsafe {
+            ok(SecTrustedApplicationCreateFromPath(helper.as_ptr(), &mut updater))?;
+        }
+        let updater = Owned(updater);
+
+        let mut apps: [Ref; 2] = [me.0, updater.0];
+        // SAFETY: `apps` holds two live CFTypes; the array retains them.
+        let list = Owned(unsafe {
+            CFArrayCreate(kCFAllocatorDefault, apps.as_mut_ptr(), apps.len() as CFIndex, &kCFTypeArrayCallBacks)
+                .cast()
+        });
+        if list.0.is_null() {
+            return Err(BackendError);
+        }
+        let label = c"Hane update restart proxy credential";
+        // SAFETY: `label` is a NUL-terminated UTF-8 string.
+        let label = Owned(unsafe {
+            CFStringCreateWithCString(kCFAllocatorDefault, label.as_ptr(), kCFStringEncodingUTF8).cast()
+        });
+        if label.0.is_null() {
+            return Err(BackendError);
+        }
+        let mut access: Ref = ptr::null();
+        // SAFETY: live descriptor and list, valid out pointer.
+        unsafe {
+            ok(SecAccessCreate(label.0, list.0, &mut access))?;
+        }
+        Ok(Owned(access))
+    }
+
+    /// Stores `secret` as a generic password of `service` / `account` whose
+    /// access list is [`access`]. `clear` removes a stale entry of the same
+    /// account and is called only when one exists. On any failure no entry is
+    /// left behind. Errors carry no detail.
+    pub(super) fn create(
+        service: &str,
+        account: &str,
+        secret: &str,
+        clear: impl Fn() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let access = access()?;
+        let mut item: Ref = ptr::null();
+        let mut add = |item: &mut Ref| {
+            // SAFETY: the pointers and lengths describe live byte slices.
+            ok(unsafe {
+                SecKeychainAddGenericPassword(
+                    ptr::null(),
+                    service.len() as u32,
+                    service.as_ptr().cast(),
+                    account.len() as u32,
+                    account.as_ptr().cast(),
+                    secret.len() as u32,
+                    secret.as_ptr().cast(),
+                    item,
+                )
+            })
+        };
+        // A failed first add (typically an existing entry) is retried once
+        // after the stale entry is cleared.
+        if add(&mut item).is_err() {
+            clear()?;
+            item = ptr::null();
+            add(&mut item)?;
+        }
+        let item = Owned(item);
+        // SAFETY: live item and access objects.
+        let applied = ok(unsafe { SecKeychainItemSetAccess(item.0, access.0) });
+        if applied.is_err() {
+            // The default access list must not remain on a secret.
+            // SAFETY: live item.
+            unsafe { SecKeychainItemDelete(item.0) };
+        }
+        applied
     }
 }
 
@@ -249,6 +432,25 @@ mod tests {
             assert!(store.delete(reference).is_err());
         }
         assert!(store.backend.entries.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_helper_trusted_by_the_keychain_entry_is_the_bundled_one_only() {
+        use std::path::Path;
+        assert_eq!(
+            bundled_helper_path(Path::new("/Applications/Hane.app/Contents/MacOS/hane")),
+            Some(Path::new("/Applications/Hane.app/Contents/Helpers/hane-updater").to_path_buf())
+        );
+        // Outside the bundle layout no helper is named, so no entry is created
+        // with a guessed trust list.
+        for exe in [
+            "/tmp/hane",
+            "/tmp/target/release/hane",
+            "/Applications/Hane.app/Contents/Other/hane",
+            "/Applications/Hane.app/Elsewhere/MacOS/hane",
+        ] {
+            assert_eq!(bundled_helper_path(Path::new(exe)), None, "{exe}");
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
