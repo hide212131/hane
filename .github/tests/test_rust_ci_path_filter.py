@@ -65,6 +65,54 @@ class Tests(unittest.TestCase):
         self.assertFalse(path_filter.changed_paths_require_windows_gui_lock_test(["README.md", "docs/gui-test-recovery.md"]))
         self.assertFalse(path_filter.requires_windows_gui_lock_test("docs/gui-test-recovery.md"))
 
+    def test_macos_and_windows_gui_lock_inputs_do_not_mix(self):
+        mac_paths = ["scripts/gui_validate.py", "scripts/tests/test_gui_validate.py", "./scripts/gui_validate.py"]
+        windows_paths = ["scripts/windows_gui_lock_launcher.py", "scripts/tests/test_windows_gui_lock_launcher.py"]
+        for path in mac_paths:
+            with self.subTest(path=path):
+                self.assertTrue(path_filter.requires_macos_gui_validator_lock_test(path))
+                self.assertFalse(path_filter.requires_windows_gui_lock_test(path))
+                self.assertFalse(path_filter.requires_rust_ci(path))
+        for path in windows_paths:
+            with self.subTest(path=path):
+                self.assertTrue(path_filter.requires_windows_gui_lock_test(path))
+                self.assertFalse(path_filter.requires_macos_gui_validator_lock_test(path))
+        self.assertFalse(path_filter.requires_macos_gui_validator_lock_test("docs/gui-test-recovery.md"))
+        self.assertTrue(path_filter.changed_paths_require_macos_gui_validator_lock_test(["README.md", mac_paths[0]]))
+        self.assertFalse(path_filter.changed_paths_require_macos_gui_validator_lock_test(["README.md"]))
+
+    def test_macos_cli_selects_only_macos_paths(self):
+        command = [
+            sys.executable,
+            str(SCRIPTS / "rust_ci_path_filter.py"),
+            "--null",
+            "--macos-gui-validator-lock",
+        ]
+        cases = [
+            (b"README.md\0scripts/gui_validate.py\0", b"true\n"),
+            (b"scripts/tests/test_gui_validate.py\0", b"true\n"),
+            (b"scripts/windows_gui_lock_launcher.py\0", b"false\n"),
+            (b"README.md\0docs/gui-test-recovery.md\0", b"false\n"),
+        ]
+        for data, expected in cases:
+            with self.subTest(data=data):
+                run = subprocess.run(
+                    command,
+                    input=data,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+                self.assertEqual(run.stdout, expected)
+        windows_run = subprocess.run(
+            [sys.executable, str(SCRIPTS / "rust_ci_path_filter.py"), "--null", "--windows-gui-lock"],
+            input=b"scripts/gui_validate.py\0",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        self.assertEqual(windows_run.stdout, b"false\n")
+
     def test_similarly_named_paths_do_not_match_prefixes(self):
         self.assertFalse(path_filter.requires_rust_ci("crates-old/example.rs"))
         self.assertFalse(path_filter.requires_rust_ci("vendor-notes/readme.txt"))

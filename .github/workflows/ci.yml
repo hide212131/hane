@@ -56,6 +56,7 @@ jobs:
     outputs:
       required: ${{ steps.filter.outputs.required }}
       windows_gui_lock_required: ${{ steps.filter.outputs.windows_gui_lock_required }}
+      macos_gui_validator_lock_required: ${{ steps.filter.outputs.macos_gui_validator_lock_required }}
     steps:
       - name: Check out Pull Request
         uses: actions/checkout@v6
@@ -150,6 +151,11 @@ jobs:
               | python3 .github/scripts/rust_ci_path_filter.py --null --windows-gui-lock
           )"
           echo "windows_gui_lock_required=$windows_gui_lock_required" >> "$GITHUB_OUTPUT"
+          macos_gui_validator_lock_required="$(
+            git diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" \
+              | python3 .github/scripts/rust_ci_path_filter.py --null --macos-gui-validator-lock
+          )"
+          echo "macos_gui_validator_lock_required=$macos_gui_validator_lock_required" >> "$GITHUB_OUTPUT"
 
   release_checks:
     name: Lightweight release checks
@@ -353,7 +359,7 @@ jobs:
       needs.release_only_detector.result == 'success' &&
       needs.release_only_detector.outputs.release_only != 'true' &&
       needs.rust_ci_changes.result == 'success' &&
-      needs.rust_ci_changes.outputs.windows_gui_lock_required == 'true'
+      needs.rust_ci_changes.outputs.macos_gui_validator_lock_required == 'true'
     runs-on: macos-latest
     timeout-minutes: 10
     permissions:

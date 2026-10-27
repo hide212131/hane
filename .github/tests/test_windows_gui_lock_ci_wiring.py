@@ -53,8 +53,22 @@ class WindowsGuiLockCiWiringTests(unittest.TestCase):
             filter_step["run"],
         )
 
+    def test_macos_path_filter_output_is_connected_to_ci(self):
+        rust_ci = job("rust_ci_changes")
+        self.assertEqual(
+            rust_ci["outputs"]["macos_gui_validator_lock_required"],
+            "${{ steps.filter.outputs.macos_gui_validator_lock_required }}",
+        )
+        run = step(rust_ci, "Detect Rust CI inputs")["run"]
+        self.assertIn("rust_ci_path_filter.py --null --macos-gui-validator-lock", run)
+        self.assertIn(
+            'echo "macos_gui_validator_lock_required=$macos_gui_validator_lock_required" >> "$GITHUB_OUTPUT"',
+            run,
+        )
+
     def test_windows_job_runs_the_windows_process_lifecycle_tests(self):
         windows_job = job("windows_gui_lock_tests")
+        self.assertNotIn("macos_gui_validator_lock_required", windows_job["if"])
         self.assertEqual(windows_job["runs-on"], "windows-latest")
         self.assertEqual(windows_job["needs"], ["release_only_detector", "rust_ci_changes"])
         self.assertIn("needs.rust_ci_changes.outputs.windows_gui_lock_required == 'true'", windows_job["if"])
@@ -71,7 +85,11 @@ class WindowsGuiLockCiWiringTests(unittest.TestCase):
         macos_job = job("macos_gui_validator_lock_tests")
         self.assertEqual(macos_job["runs-on"], "macos-latest")
         self.assertEqual(macos_job["needs"], ["release_only_detector", "rust_ci_changes"])
-        self.assertIn("needs.rust_ci_changes.outputs.windows_gui_lock_required == 'true'", macos_job["if"])
+        self.assertIn(
+            "needs.rust_ci_changes.outputs.macos_gui_validator_lock_required == 'true'",
+            macos_job["if"],
+        )
+        self.assertNotIn("windows_gui_lock_required", macos_job["if"])
         self.assertIn("needs.release_only_detector.outputs.release_only != 'true'", macos_job["if"])
         python_step = step(macos_job, "Install Python")
         self.assertEqual(python_step["uses"], "actions/setup-python@v6")
