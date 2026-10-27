@@ -51,7 +51,7 @@ IssueのA10で破棄の対象とするtimer/task/subscriptionは、app/service�
 
 | 状態/結果 | 自動確認と次回期限 |
 |---|---|
-| 初回、Idle | 通常window表示30秒後に開始。初回がrestore/手動確認と重なれば完了を待って一つにまとめる |
+| 初回、Idle | 通常window表示から30秒が経過し、起動時のReady候補のlocal復元・再検証も完了するまでrequest数は0。両条件成立後にmetadataを一組だけ要求する。restore/手動checkと重なるrequestは完了を待って一つにまとめる |
 | UpToDate / Availableの確認成功 | 確認完了から1時間後。Availableも毎時再確認するが、表示中の候補は下記の方法で保つ |
 | network/timeout/rate limit等の自動失敗 | 最初の失敗完了から1時間後、連続2回目は2時間後、3回目以降は4時間後。成功で失敗数を0に戻す。短周期の自動再試行をしない |
 | Downloading / Verifying / Ready / Discarding | 新しい自動確認を開始しない。期限切れは一つのpendingに集約。Readyを破棄するなどして確認可能に戻ったときに一度だけ実行し、以後はその完了から日程を立てる |
@@ -59,7 +59,7 @@ IssueのA10で破棄の対象とするtimer/task/subscriptionは、app/service�
 | restart freeze / helper handoff | 自動確認停止。停止前の遅延結果を既存ticket guardで拒否し、Readyを差し替えない |
 | Unavailable / serviceなし | 自動確認しない。期限待ちthreadを常駐させる必要もない |
 
-明示的な「もう一度確認」「再試行」はbackoff期限を待たずに実行できる。ただし実行中のcheckに合流し、同時操作を増やさない。手動確認が成功すれば失敗数を戻し、次回はその完了から1時間後。失敗すれば同じ連続失敗数と日程を更新する。設定の開閉、文書切替、外部open、focus復帰を追加のnetworkトリガーにしない。
+「もう一度確認」「再試行」はbackoff中でなければ即時に開始し、実行中checkへ合流する。自動・手動どちらの失敗も共通の連続失敗数を1増やし、失敗完了から1時間（初回）、2時間（2回目）、4時間（3回目以降）を次回の自動・手動checkの実行可能時刻とする。backoff中の手動retryはrequestを開始せず、期限を短縮・resetできない。手動確認が成功すれば失敗数を0へ戻し、次回自動確認をその完了から1時間後に予定する。設定の開閉、文書切替、外部open、focus復帰を追加のnetworkトリガーにしない。
 
 ## 5. 既知候補を保つ確認と通知API
 
@@ -130,9 +130,9 @@ Full / Compactでは短い文言の専用更新ボタンを右側へ追加する
 
 | 試験 | 条件・確認する不変条件 | 対応 |
 |---|---|---|
-| T1 起動 | 29.999秒までrequest 0、30秒でmetadata一組。通常window失敗/health child/helper/debug/非対応配置では0 | A1/A6 |
+| T1 起動 | 30秒経過とReady候補復元・再検証完了の両方が揃うまでrequest 0、両条件成立時にmetadata一組。Ready復元が30秒を超える場合も復元完了前は0。通常window失敗/health child/helper/debug/非対応配置では0 | A1/A6/A10 |
 | T2 日程 | check完了直前/1時間直前/期限、長時間休止からの復帰、壁時計前進/後退、window再接続/文書切替。未実行の連続dispatchなし | A2 |
-| T3 失敗 | network/timeout/403/429/署名不正、連続失敗の1/2/4/4時間、成功reset、手動retry。最新版と誤表示せずZIP取得0 | A6/A8 |
+| T3 失敗 | network/timeout/403/429/署名不正、手動/自動共通の失敗数と1/2/4時間backoff、期限中の手動retryで期限を短縮できないこと、成功reset。最新版と誤表示せずZIP取得0 | A6/A8 |
 | T4 競合 | 初回restoreが30秒を超える、同時手動/自動、Available再check中のクリック、候補変更直後の古いクリック、取消後の遅延完了、Download/Ready/Discard/restart freeze | A7/A10 |
 | T5 変化通知 | 購読前後のrace、容量1の合流、二つの独立購読、service差し替え、view解放、runner起動失敗、全terminal transition。待機中に継続pollなし | A4/A9/A10 |
 | T6 案内 | Startup Available/Readyだけ一度、あとで→毎時同版/新版、初回UpToDate/失敗→定期発見、手動合流、次回起動。強制focus/Download/quitなし | A3/A6 |
