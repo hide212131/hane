@@ -71,6 +71,22 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual(wl.launch_with_lock(Path("x.lock"), ["candidate.exe"]), wl.EXIT_BLOCKED)
         popen.assert_not_called()
 
+    def test_log_failure_does_not_break_wait_status_or_release(self):
+        for exc in (OSError("stderr closed"), ValueError("I/O operation on closed file")):
+            child = mock.Mock()
+            child.pid = 1234
+            child.wait.return_value = 7
+            with self.subTest(exc=type(exc).__name__), \
+                    mock.patch("builtins.print", side_effect=exc), \
+                    mock.patch.object(wl, "acquire_exclusive", return_value=99), \
+                    mock.patch.object(wl, "_close_handle") as close, \
+                    mock.patch.object(wl.os, "set_handle_inheritable", create=True), \
+                    mock.patch.object(wl.subprocess, "STARTUPINFO", create=True), \
+                    mock.patch.object(wl.subprocess, "Popen", return_value=child):
+                self.assertEqual(wl.launch_with_lock(Path("x.lock"), ["candidate.exe"]), 7)
+            child.wait.assert_called_once()
+            close.assert_called_once_with(99)
+
     def test_production_cli_has_no_lock_override(self):
         # Anything before "--" is a usage error; there is no path option.
         self.assertEqual(wl.main(["--lock", "x.lock", "--", "candidate.exe"]), wl.EXIT_USAGE)

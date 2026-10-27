@@ -42,7 +42,11 @@ class LockError(Exception):
 
 
 def _log(message: str) -> None:
-    print(f"[windows-gui-lock] {message}", file=sys.stderr, flush=True)
+    # Diagnostics must never interrupt lock handling or the candidate's exit status.
+    try:
+        print(f"[windows-gui-lock] {message}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def _profile_directory() -> Path:
