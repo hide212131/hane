@@ -790,23 +790,34 @@ impl EditorView {
                                 div()
                                     .h_full()
                                     .flex_1()
-                                    // The nesting indent lives inside the
-                                    // shrinkable name area so it can never
-                                    // push the create/pin slots off the right
-                                    // edge of a narrow sidebar.
-                                    .pl(px(12.0 * row.depth as f32))
                                     .min_w(px(0.0))
                                     .overflow_hidden()
                                     .flex()
                                     .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(entry_icon(
-                                        icons::ICON_FOLDER,
-                                        Some(disclosure),
-                                        self.theme.sidebar_foreground,
-                                    ))
-                                    .child(name),
+                                    // The padding must not sit on the
+                                    // shrinkable outer area: padding is a
+                                    // minimum width, so a deep indent would
+                                    // keep it wide and push the create/pin
+                                    // slots off the right edge. The outer area
+                                    // only clips; the indent lives on the
+                                    // inner content.
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .pl(px(12.0 * row.depth as f32))
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(entry_icon(
+                                                icons::ICON_FOLDER,
+                                                Some(disclosure),
+                                                self.theme.sidebar_foreground,
+                                            ))
+                                            .child(name),
+                                    ),
                             )
                             .child(create_slot)
                             .child(pin_slot)
