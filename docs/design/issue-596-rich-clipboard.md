@@ -93,7 +93,7 @@ Markdownのescapeはtext/label/destination/codeで分ける。`* _ ~ [ ] ( ) < >
 
 ## 5. Markdown → HTMLと原文往復
 
-Copyのplainは`editor().selected_text()`で得た原文をそのまま保持する。選択はbyteのSourceRangeを正とし、disclosureで隠れたmarkerや改行も失わない。HTMLと専用metadataは同じsource revisionとselectionから生成する。Cutにも同じコピー生成器を使うが、書込成功と対象鮮度の確認後にだけ範囲を一回削除する。閲覧モードCutは従来どおりclipboardにも触れない。
+Copyは閲覧モードでも利用でき、本文・selection・revision・Undo/Redoを変更しない。Copyのplainは`editor().selected_text()`で得た原文をそのまま保持する。選択はbyteのSourceRangeを正とし、disclosureで隠れたmarkerや改行も失わない。HTMLと専用metadataは同じsource revisionとselectionから生成する。Cutにも同じコピー生成器を使うが、書込成功と対象鮮度の確認後にだけ範囲を一回削除する。閲覧モードCutは従来どおりclipboardにも触れない。
 
 HTMLは対応する意味要素だけを生成する。`h1..h6/p/strong/em/del/code/pre/ul/ol/li/blockquote/a/br`、必要に応じた`ol start`と安全な`href`に限定する。theme・style・font・classを付けない。本文のraw HTMLはescapeした文字として扱い、scriptを外部アプリへ渡さない。未対応の表・数式・画像記法等は原文をescapeした文字として残す。
 
@@ -107,11 +107,11 @@ HTMLは対応する意味要素だけを生成する。`h1..h6/p/strong/em/del/c
 
 clipboardのOS snapshot取得とfocus判定はUI threadで短く行い、HTML parse・Markdown exportをbackgroundへ渡す。DOM/HTML変換で文書全体のlayoutやshapingを実行しない。既存snapshotとjob executorを使い、永続queueや独自状態機械を追加しない。
 
-変換jobは`SessionId + DocumentInstance + Revision + Selection(anchor/active) + operation generation`を捕捉する。選択の方向も比較し、範囲だけの一致で受理しない。完了時にはactive sessionが同じ、instance/revision/selectionが一致、本文にfocusがあり編集可能、IME未確定なし、同一最新generationであることを確認する。再読込・タブ切替・caret移動・新しい操作・文書closeで無効化し、古い結果をrebaseして挿入しない。閉じたsessionの再利用もDocumentInstanceで拒否する。新しいCopy/Cut/Pasteで旧jobを無効化する。
+変換jobは`SessionId + DocumentInstance + Revision + Selection(anchor/active) + operation generation`を捕捉する。選択の方向も比較し、範囲だけの一致で受理しない。完了時の共通条件としてactive sessionが同じ、instance/revision/selectionが一致、本文にfocusがある、同一最新generationであることを確認する。Copyは編集可能であることを要求せず、閲覧モードでも同じ鮮度確認後にclipboardへ書き込める。Cut/Pasteはさらに本文が編集可能でIME未確定がないことを、clipboard書込・本文適用の直前に確認する。再読込・タブ切替・caret移動・新しい操作・文書closeで無効化し、古い結果をrebaseして挿入しない。閉じたsessionの再利用もDocumentInstanceで拒否する。新しいCopy/Cut/Pasteで旧jobを無効化する。
 
 IME未確定中のPaste/Cutは未確定文字や選択を変更せず「変換を確定してから貼り付けてください」と案内する。Copyはsnapshotが安全に取得できる場合の原文だけを利用し、compositionを確定・cancelしない。OSの確定callbackで再試行・二重適用する仕組みは作らない。短い入力欄のIME処理は従来経路を保つ。
 
-成功時は`Editor::replace_range_recorded(range, result, collapsed_selection_at_end)`を一回呼び、成功後に`EditorView::after_input`を一回呼ぶ。IMEがないことを事前条件とし、既存API内のcomposition処理に依存しない。既存`EditKind::Replace`でtyping groupと独立させ、直前・直後のtypingを一回Undoへ巻き込まないことを検証する。選択外のsource、保存状態、revision、cache通知は既存の更新経路に従う。失敗時に空置換を適用しない。
+Pasteの本文適用またはCutの選択範囲削除に成功する場合は`Editor::replace_range_recorded(range, result, collapsed_selection_at_end)`を一回呼び、成功後に`EditorView::after_input`を一回呼ぶ。IMEがないことを事前条件とし、既存API内のcomposition処理に依存しない。既存`EditKind::Replace`でtyping groupと独立させ、直前・直後のtypingを一回Undoへ巻き込まないことを検証する。選択外のsource、保存状態、revision、cache通知は既存の更新経路に従う。失敗時に空置換を適用しない。
 
 OSデータをRustへcopyする前にnative lengthを確認する。HTML入力・metadataは各8 MiB、DOMは100,000 node、深さ128、生成結果16 MiBを初期の処理上限とする。上限超過では同snapshotのplainへfallbackし、plainがなければ中止。plain-onlyの既存サイズ制限は増やさない。制限はUTF-8 bytesで数え、DOM構築中のnode/depthを制限できるTreeSinkを用いる（構築後だけのチェックでは不十分）。中止後のDOM破棄で深い再帰を起こさない。copy側もHTML上限超過時は原文だけを書き、長大選択を空にしない。metadataの上限も超えるときは専用formatを省略し、HTMLも併記しないことでHane内でもplain原文を優先できるようにする。処理中はstatusに変換中を表示し、無効化・成功・失敗時に同じgenerationの表示だけを解除する。clipboardの内容をログに出さない。
 
@@ -134,7 +134,7 @@ API shapeの共有だけを理由にGPUI coreをforkしない。platformの公�
 | 外部へ書式付きコピーとplain原文 | export全構文・Unicode・部分選択・HTML escape、native同時publish | Hane→ブラウザcontenteditable／文書アプリ、Hane→コードエディタで原文一致 |
 | Hane内往復の原文不変 | marker検証、unknown version、不一致plain、CRLF、reference・`__`等の非正規記法 | Hane内・別Haneプロセスへコピー→貼り付け、保存→再読込で原文一致 |
 | 外部HTMLをMarkdownへ変換 | §4全行のgolden fixture、入れ子・コードfence・日本語・リンク・entity・malformed HTML | ブラウザfixtureとWord/Google Docs等の実アプリから見出し／リスト／引用／コード／リンクを貼る |
-| 入力欄・閲覧・IME・Undo/Redo・複数tab | 既存input_routing/reading_mode/IME回帰に新action追加。新旧job逆順、selectionのみ変更、reload、close、focus移動、失敗で不変 | 両OSの未確定日本語で安全な拒否→確定→貼付、選択置換→Undo→Redo、typing前後のUndo独立、tab切替中の変換 |
+| 入力欄・閲覧・IME・Undo/Redo・複数tab | 既存input_routing/reading_mode/IME回帰に新action追加。閲覧モードの非同期Copy成功と本文状態の不変、Cut/Pasteの拒否を確認。新旧job逆順、selectionのみ変更、reload、close、focus移動、失敗で不変 | 両OSの未確定日本語で安全な拒否→確定→貼付、選択置換→Undo→Redo、typing前後のUndo独立、tab切替中の変換 |
 | 危険HTMLと外部取得の禁止 | script/iframe/SVG、危険href・制御文字・style、サイズ/深さ/node上限、ネットワーク入口なしを確認 | 外部resource付きfixtureをofflineで貼り、文字構造だけが入ることを確認 |
 | 実clipboardとcurrent-headの品質 | native形式encode/decode・空/欠損/HTML-only・競合・書込失敗・不正CF_HTML offset、既存plain/image/files回帰 | macOS/Windowsの実clipboardで混在形式、HTML-only、plain操作、読み取り競合、Cut書込失敗を確認 |
 
@@ -144,7 +144,7 @@ Golden例（LF表記）:
 - `<p>a<br>b</p>` → `a\\\nb`（a、backslash、LF、b）。
 - `<p>&lt;script&gt; *x*</p>` → literal textとして表示されるMarkdown。実script要素とは区別する。
 - `<a href="javascript:alert(1)">文字</a>` → `文字`。
-- 選択`A__羽__B`内の`__羽__` → plain `__羽__` / HTML `<strong>羽</strong>`。選択`羽`だけ → HTMLの文字`羽`だけ。
+- 元文書`A__羽__B`内の`__羽__`を選択 → plain `__羽__` / HTMLの文字`__羽__`。現行parserはこの文脈のunderscoreを装飾と解釈しないため、`<strong>`を生成しない。選択`羽`だけ → HTMLの文字`羽`だけ。選択sliceだけを再parseせず、元文書のparser/source treeの意味に従う。
 
 実装前測定は同じOS・Release・fixture・測定条件で、現行plain Copy/Paste（1 KiB/100 KiB/1 MiB）と10 MiB文書内の短い選択のcopyについてUI占有時間・完了時間・RSSを記録する。実装後は同じplain測定に加え同程度のHTMLを測り、document全体長に比例したUI thread処理・保持量が増えていないことを確認する。#23原本の性能基準は維持し、この設計で未測定値の新gateを成功扱いしない。
 
