@@ -2918,11 +2918,21 @@ mod tests {
                 )
                 .into_boxed_str(),
             );
+            // The pin button is likewise keyed by the target's own row (an
+            // ordinary tree row, never a Pinned-area row), because the shared
+            // `sidebar-pin-toggle` key is overwritten by neighbouring rows.
+            let pin_selector: &'static str = Box::leak(
+                format!(
+                    "sidebar-pin-toggle-row:work-folder-pin-toggle:{}",
+                    index - 1
+                )
+                .into_boxed_str(),
+            );
             let snapshot = |cx: &mut gpui::VisualTestContext| {
                 (
                     cx.debug_bounds("sidebar-folder-create-folder"),
                     cx.debug_bounds("sidebar-folder-create-note"),
-                    cx.debug_bounds("sidebar-pin-toggle"),
+                    cx.debug_bounds(pin_selector),
                     cx.debug_bounds(slot_selector),
                 )
             };
