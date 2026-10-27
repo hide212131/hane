@@ -2,13 +2,32 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import unittest
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+
+
+def load_workflow() -> dict:
+    result = subprocess.run(
+        [
+            "ruby",
+            "-rjson",
+            "-ryaml",
+            "-e",
+            "puts JSON.generate(YAML.safe_load(File.read(ARGV.fetch(0))))",
+            str(ROOT / ".github/workflows/ci.yml"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+WORKFLOW = load_workflow()
 
 
 def job(name: str) -> dict:

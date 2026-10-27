@@ -1,6 +1,4 @@
-# Shared CI / release tooling. The Ed25519 implementation is the maintained
-# `cryptography` package; Hane adds no cryptography of its own. PyYAML parses
-# workflow definitions in the CI wiring regression tests. All workflows install
-# this one file so the automation dependencies stay consistent.
+# Release / CI tooling for scripts/release_catalog.py. The Ed25519 implementation
+# is the maintained `cryptography` package; Hane adds no cryptography of its own.
+# CI and the release workflows install this one file so both use the same version.
 cryptography==50.0.2
-PyYAML==6.0.3
