@@ -55,6 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       required: ${{ steps.filter.outputs.required }}
+      windows_gui_lock_required: ${{ steps.filter.outputs.windows_gui_lock_required }}
+      macos_gui_validator_lock_required: ${{ steps.filter.outputs.macos_gui_validator_lock_required }}
     steps:
       - name: Check out Pull Request
         uses: actions/checkout@v6
@@ -64,6 +66,9 @@ jobs:
 
       - name: Test Rust CI path filter
         run: python3 .github/tests/test_rust_ci_path_filter.py
+
+      - name: Test Windows GUI lock CI wiring
+        run: python3 .github/tests/test_windows_gui_lock_ci_wiring.py
 
       - name: Test AADW action and diagnostic contract
         run: python3 .github/tests/test_aadw_action_contract.py
@@ -141,6 +146,16 @@ jobs:
               | python3 .github/scripts/rust_ci_path_filter.py --null
           )"
           echo "required=$required" >> "$GITHUB_OUTPUT"
+          windows_gui_lock_required="$(
+            git diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" \
+              | python3 .github/scripts/rust_ci_path_filter.py --null --windows-gui-lock
+          )"
+          echo "windows_gui_lock_required=$windows_gui_lock_required" >> "$GITHUB_OUTPUT"
+          macos_gui_validator_lock_required="$(
+            git diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" \
+              | python3 .github/scripts/rust_ci_path_filter.py --null --macos-gui-validator-lock
+          )"
+          echo "macos_gui_validator_lock_required=$macos_gui_validator_lock_required" >> "$GITHUB_OUTPUT"
 
   release_checks:
     name: Lightweight release checks
@@ -306,6 +321,62 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  windows_gui_lock_tests:
+    name: Windows GUI lock lifecycle tests
+    needs: [release_only_detector, rust_ci_changes]
+    if: >-
+      github.event_name == 'pull_request' &&
+      always() &&
+      needs.release_only_detector.result == 'success' &&
+      needs.release_only_detector.outputs.release_only != 'true' &&
+      needs.rust_ci_changes.result == 'success' &&
+      needs.rust_ci_changes.outputs.windows_gui_lock_required == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Pull Request
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run Windows GUI lock lifecycle tests
+        run: python scripts/tests/test_windows_gui_lock_launcher.py
+
+  macos_gui_validator_lock_tests:
+    name: macOS GUI validator lock tests
+    needs: [release_only_detector, rust_ci_changes]
+    if: >-
+      github.event_name == 'pull_request' &&
+      always() &&
+      needs.release_only_detector.result == 'success' &&
+      needs.release_only_detector.outputs.release_only != 'true' &&
+      needs.rust_ci_changes.result == 'success' &&
+      needs.rust_ci_changes.outputs.macos_gui_validator_lock_required == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Pull Request
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run existing macOS GUI validator lock tests
+        run: python scripts/tests/test_gui_validate.py
 
   merge_release_pr:
     name: Merge release PR and start Release builds
