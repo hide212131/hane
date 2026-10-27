@@ -1,20 +1,25 @@
 # Issue #639: Windows GUI lock launcher — implementation record
 
-- Status: implementation candidate prepared; current-head Windows/macOS CI and papa-win lifecycle verification remain.
+- 状態: PR #641を含むmainを同期済み。同期後current-headのWindows/macOS専用CI、最終レビュー、papa-win実機確認は未完了。
 - Issue: https://github.com/hide212131/hane/issues/639
 - Parent work to unblock: PR #638 / Issue #567 P6 Windows focused GUI.
-- Base/current main at preparation: `a50c44669d6a116dfbe13439bb258db39d9bf92b`.
-- Current implementation head: `fcdbd3ef47d0c0bf00d6395c98412d89f4099a27`.
+- 準備時点のbase: `a50c44669d6a116dfbe13439bb258db39d9bf92b`。
+- 同期したmain / PR #641のmerge commit: `c4986bece1e67ffb18f4f2238a3b11f8f3769281`。
+- 同期直前のPR head: `5d666aa807c76d76f06adef89da0883177f54ed2`。
+- main同期commit（この記録の更新前）: `7f0f085fca08258210769b73ead479b9a487522e`。競合はなく、launcherと直接テストの内容は同期前と同一。
+- launcher / 直接テストの実装commit: `fcdbd3ef47d0c0bf00d6395c98412d89f4099a27`。文書更新を含む最終headと実行結果は[PR #640](https://github.com/hide212131/hane/pull/640)に記録する。
 - The PR contains the Windows launcher, its process tests, this record, and the recovery-guide update. The current implementation is not yet proof that Windows GUI was run.
 - AADW run [40443432550](https://github.com/hide212131/hane/actions/runs/40443432550) completed prepare, Claude Sonnet 5.5 verification, finalizer, workspace regression tests, and lint successfully.
-- CI run [40443655916](https://github.com/hide212131/hane/actions/runs/40443655916) succeeded before the focused Windows/macOS Python jobs were added. After PR #641 merges, synchronize this PR with main and require those jobs on this exact implementation.
-- papa-win real-canonical-lock lifecycle verification remains outstanding. Do not launch a GUI candidate until the current-head Windows/macOS jobs pass and the shared desktop is available.
+- CI run [40443655916](https://github.com/hide212131/hane/actions/runs/40443655916)と[40489256945](https://github.com/hide212131/hane/actions/runs/40489256945)は専用ジョブ追加前の履歴であり、今回のOSロック受入証拠には使わない。同期後current headで`Windows GUI lock lifecycle tests`と`macOS GUI validator lock tests`が実際に実行・成功することを確認する。
+- 同期時の静的確認で、mainのmacOSジョブ条件はmacOS専用入力だけを対象とし、本PRのWindows launcher / 直接テストの変更では起動しないことが分かった。親担当へ配線の修正調整を依頼済み。macOSジョブのskipを成功扱いせず、両OSの実行証拠が揃うまでWindows実機確認へ進まない。
+- papa-winの実canonical lock確認は未実施。上記専用CI成功前はWindows GUI・lock・候補へ触れない。成功後に既存Windows担当と共有作業を調整して取得・保持・解放を記録する。
+- 最終候補のcurrent-head CI成功後にCodeRabbit full reviewを依頼し、対象head・範囲・完了状態を確認する。このチャットはPRのmergeとIssue #639のcloseを行わず、受入証拠を親担当へ引き渡す。
 
-## Current source and confirmed gap
+## 準備時点の既存経路と確認した不足（履歴）
 
 `scripts/gui_validate.py` uses `pwd.getpwuid(...).pw_dir/.cache/hane/gui-validation.lock`, `fcntl.flock(LOCK_EX | LOCK_NB)`, and `subprocess.Popen(pass_fds=(lock_fd,))`. The same Python CLI also uses macOS-only build/window/screenshot tools and its operation guide explicitly limits actual launch/capture to macOS.
 
-Windows GUI acceptance is operated directly in the connected Windows ChatGPT/Codex environment. The Windows task needs to acquire the same canonical lock before it starts an isolated Hane candidate, then keep the lock alive for the candidate's whole lifetime. No supported Windows lock-and-launch entrypoint exists today.
+Windows GUI acceptance is operated directly in the connected Windows ChatGPT/Codex environment. The Windows task needs to acquire the same canonical lock before it starts an isolated Hane candidate, then keep the lock alive for the candidate's whole lifetime. 準備時点ではWindows用の正規lock-and-launch入口がなく、本PRで以下の入口を実装した。
 
 ## Accepted implementation direction
 
