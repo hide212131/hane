@@ -3034,13 +3034,45 @@ impl EditorView {
     /// created, the folder is added to the tree and shown expanded, so it is
     /// immediately visible without waiting for a rescan.
     pub fn new_work_folder_folder(&mut self, cx: &mut Context<Self>) {
+        self.new_work_folder_folder_in(None, cx);
+    }
+
+    /// Creates the same new folder as `new_work_folder_folder`, optionally in
+    /// an explicit folder (a sidebar row's hover button) instead of the
+    /// selected folder. An explicit folder that is no longer in the work
+    /// folder tree is refused rather than silently replaced by the root.
+    pub(crate) fn new_work_folder_folder_in(
+        &mut self,
+        explicit_directory: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.cancel_inline_rename(cx) {
             return;
         }
         self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
-        let Some(target_directory) = self.target_directory_for_new_entry() else {
-            return;
+        let target_directory = match explicit_directory {
+            Some(directory) => {
+                let exists = self
+                    .work_folder
+                    .as_ref()
+                    .is_some_and(|work_folder| work_folder.children_at(&directory).is_some());
+                if !exists {
+                    self.status = Some(
+                        "対象のフォルダが見つからないため作成できません。一覧を確認してください"
+                            .to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                directory
+            }
+            None => {
+                let Some(directory) = self.target_directory_for_new_entry() else {
+                    return;
+                };
+                directory
+            }
         };
         if self.refuse_new_entry_under_folder_trash(&target_directory, cx) {
             return;
@@ -3129,6 +3161,16 @@ impl EditorView {
                     folder.touch(&path, modified, modified_seq);
                 }
                 self.touch_work_folder_ancestors(&ancestors);
+                // A folder created from a row's hover button may sit in a
+                // collapsed parent; open it so the result is visible.
+                if let Some(parent) = path.parent()
+                    && self
+                        .work_folder
+                        .as_ref()
+                        .is_some_and(|folder| parent != folder.root())
+                {
+                    self.expanded_folders.insert(parent.to_path_buf());
+                }
                 self.expanded_folders.insert(path);
                 self.content_search_workspace_changed(cx);
                 self.status = None;
@@ -17587,6 +17629,45 @@ mod tests {
                 view.expanded_folders.contains(&expected),
                 "a freshly created folder must show expanded"
             );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #642: a row's hover button creates in that row's folder, not in
+    // the selected one, and opens a collapsed parent so the result is visible.
+    #[gpui::test]
+    fn new_folder_in_an_explicit_directory_ignores_the_selection(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("new-folder-explicit");
+        std::fs::create_dir_all(root.join("a/inner")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.selected_folder = Some(root.join("b"));
+            view.new_work_folder_folder_in(Some(root.join("a/inner")), cx);
+            view.new_work_folder_folder_in(Some(root.join("a/inner")), cx);
+            view.new_work_folder_folder_in(Some(root.join("missing")), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(root.join("a/inner/New Folder").is_dir());
+        assert!(root.join("a/inner/New Folder 2").is_dir());
+        assert!(!root.join("b/New Folder").exists());
+        assert!(!root.join("missing").exists());
+        view.read_with(cx, |view, _| {
+            assert!(view.expanded_folders.contains(&root.join("a/inner")));
+            assert_eq!(view.selected_folder, Some(root.join("b")));
         });
 
         std::fs::remove_dir_all(&root).unwrap();

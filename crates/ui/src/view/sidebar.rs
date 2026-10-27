@@ -302,6 +302,75 @@ impl EditorView {
         )
     }
 
+    /// The hover-only "new folder" / "new file" buttons at the right end of a
+    /// parent folder row (Issue #642). The slot always takes its space, so the
+    /// row and its name never move; the buttons show on row hover (the
+    /// `sidebar-pin-row` group). Each button creates inside `directory`, the
+    /// row's own folder, whatever is selected. Mouse-down is stopped here so
+    /// the row's expand / rename never sees the click.
+    fn folder_create_slot(
+        &self,
+        id: (&'static str, usize),
+        directory: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let create_button = |button_id: (&'static str, usize),
+                             label: &'static str,
+                             icon_path: &'static str| {
+            Button::new(button_id)
+                .ghost()
+                .w(px(sidebar_pins::PIN_SLOT_SIZE))
+                .h_full()
+                .tooltip(label)
+                .accessibility_label(label)
+                .icon(
+                    Icon::empty()
+                        .path(icon_path)
+                        .size(px(14.0))
+                        .text_color(rgb(self.theme.sidebar_foreground)),
+                )
+        };
+        let folder_view = cx.entity();
+        let folder_directory = directory.clone();
+        let note_view = cx.entity();
+        div()
+            .debug_selector(|| "sidebar-folder-create-slot".to_owned())
+            .w(px(sidebar_pins::PIN_SLOT_SIZE * 2.0))
+            .h(px(sidebar_pins::PIN_SLOT_SIZE))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .invisible()
+            .group_hover("sidebar-pin-row", |style| style.visible())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .debug_selector(|| "sidebar-folder-create-folder".to_owned())
+                    .child(
+                        create_button((id.0, id.1 * 2), "新規フォルダ", icons::ICON_FOLDER_NEW)
+                            .on_click(move |_, _, app| {
+                                let directory = folder_directory.clone();
+                                folder_view.update(app, |view, cx| {
+                                    view.new_work_folder_folder_in(Some(directory), cx)
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "sidebar-folder-create-note".to_owned())
+                    .child(
+                        create_button((id.0, id.1 * 2 + 1), "新規ファイル", icons::ICON_FILE_NEW)
+                            .on_click(move |_, _, app| {
+                                let directory = directory.clone();
+                                note_view.update(app, |view, cx| {
+                                    view.new_work_folder_note_in(Some(directory), cx)
+                                });
+                            }),
+                    ),
+            )
+    }
+
     /// The folder/file tree for the sidebar, when this window was opened onto
     /// a work folder. File and folder rows reserve the same disclosure slot,
     /// so their file/folder icons line up and a folder does not shift when its
@@ -492,11 +561,20 @@ impl EditorView {
             && self.selected_folder.is_none())
             || (self.sidebar_focus == SidebarFocus::ActiveSession
                 && !self.active_session_has_sidebar_row());
+        let root_create_slot = self.folder_create_slot(
+            ("work-folder-root-create", 0),
+            work_folder.root().to_path_buf(),
+            cx,
+        );
         let root_row = div()
             .id("work-folder-root")
+            .group("sidebar-pin-row")
             .debug_selector(|| "sidebar-root".to_owned())
             .h(px(SIDEBAR_ROW_HEIGHT))
             .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+            .flex()
+            .flex_row()
+            .items_center()
             .rounded_sm()
             .cursor_pointer()
             .when(root_is_selected, |element| {
@@ -505,6 +583,9 @@ impl EditorView {
             .child(
                 div()
                     .h_full()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -516,6 +597,7 @@ impl EditorView {
                     ))
                     .child(work_folder_root_display_name(work_folder.root())),
             )
+            .child(root_create_slot)
             .on_click(cx.listener(|view, _, window, cx| {
                 window.focus(&view.focus_handle, cx);
                 view.select_work_folder_root(cx);
@@ -675,6 +757,11 @@ impl EditorView {
                             pinned,
                             cx,
                         );
+                        let create_slot = self.folder_create_slot(
+                            ("work-folder-create", index),
+                            path.clone(),
+                            cx,
+                        );
                         div()
                             .id(("work-folder-folder", index))
                             .group("sidebar-pin-row")
@@ -717,6 +804,7 @@ impl EditorView {
                                     ))
                                     .child(name),
                             )
+                            .child(create_slot)
                             .child(pin_slot)
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                                 window.focus(&view.focus_handle, cx);
