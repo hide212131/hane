@@ -2887,6 +2887,19 @@ mod tests {
             );
         });
 
+        // Creating the folder blurred the filter; click the currently
+        // rendered filter again to bring input focus back.
+        let filter_point = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sidebar_filter_focused,
+                "clicking the filter restores input focus"
+            );
+            assert_eq!(view.sidebar_filter.text(), "needle");
+        });
+
         // Clear the filter through the real input path.
         cx.simulate_keystrokes(if cfg!(target_os = "macos") {
             "cmd-a"
