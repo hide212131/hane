@@ -2624,6 +2624,8 @@ mod tests {
         let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
         let point = match directory {
             None => {
+                cx.simulate_mouse_move(root_row.center(), None, gpui::Modifiers::none());
+                cx.run_until_parked();
                 // The root row has no pin slot: its create slot is the row's
                 // right-most element, the folder button first, the note second.
                 let slot_width = sidebar_pins::PIN_SLOT_SIZE;
@@ -2656,17 +2658,20 @@ mod tests {
                 } else {
                     "sidebar-folder-create-folder"
                 };
-                // Several rows share the selector and only one is reported;
-                // locate which one it is and move to the wanted row.
-                let reported = cx.debug_bounds(selector).expect("a folder create button");
-                let reported_index =
-                    ((reported.top() - root_row.top()) / row_height).round() as i32;
-                assert!(reported_index > 0, "a folder row's button is reported");
-                let offset = target_index as i32 - reported_index;
-                gpui::point(
-                    reported.center().x,
-                    reported.center().y + row_height * offset as f32,
-                )
+                // The buttons only exist while their row is hovered: move onto
+                // the wanted row first so the reported bounds are its button.
+                let row_center = gpui::point(
+                    root_row.center().x,
+                    root_row.center().y + row_height * target_index as f32,
+                );
+                cx.simulate_mouse_move(row_center, None, gpui::Modifiers::none());
+                cx.run_until_parked();
+                let button = cx.debug_bounds(selector).expect("a folder create button");
+                assert!(
+                    button.top() <= row_center.y && row_center.y <= button.bottom(),
+                    "the hovered row's button is the one reported"
+                );
+                button.center()
             }
         };
         cx.simulate_click(point, gpui::Modifiers::none());
