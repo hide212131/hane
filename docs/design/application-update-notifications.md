@@ -43,7 +43,7 @@
 
 自動確認の対象はrelease build、対応stable版/OS、configured trust policy、更新可能な既知の配置に限定する。debug build・非対応配置・App Translocation・service未接続時は日程をarmしない。既存のUnavailable理由を設定で参照できる。テストはclock/runner/eligibilityを注入し、製品のtrust/placement gateを公開flagで迂回しない。
 
-通常終了、serviceの差し替え、app解放では待機を取消し、購読receiver/taskを閉じる。再起動prepareに入る前に自動確認を一時停止する。再起動が保留/取消になったら、保持する候補と日程を復帰させる。既存のserviceの停止・helper handoff順序を変えない。終了許可後に新しいcheckをdispatchしない。
+IssueのA10で破棄の対象とするtimer/task/subscriptionは、app/service終了時、serviceの差し替え時、app解放時のものである。これらの終了・差し替えでは待機を取消し、購読receiver/taskを閉じる。個々の確認・取得の完了時は、その操作用taskと一時的な進捗pollを終了し、通常稼働中の次回確認timerと状態変化の購読は維持する。再起動prepareに入る前に自動確認を一時停止する。再起動が保留/取消になったら、保持する候補と日程を復帰させる。既存のserviceの停止・helper handoff順序を変えない。終了許可後に新しいcheckをdispatchしない。
 
 ## 4. 日程と操作の競合
 
@@ -157,7 +157,7 @@ macOS / Windowsの通常CI、focused GPUI event testとnative GUIを使う。GUI
 
 Windows GUIは接続先WindowsのChatGPTアプリから直接実行する。Mac経由のVM操作は使わない。GUI占有・取得障害時は既存復旧手順に従い、未実施/Unknownの項目と再開条件を残す。fixtureのpassを二版更新・実IMEのpassへ読み替えない。
 
-負荷は実装前基準SHAと実装候補SHA、同じrelease profile/fixture/OSで比較する。起動から編集可能までの既存timing-probe、30秒を含む起動直後のCPU/入力遅延、10分間のidle CPU・wake/再描画数、metadata request数と転送量、長時間常駐時のRSSを記録する。自動確認待機中の新增の短周期wake/再描画が0、1回の確認中も本文入力を待たせないことを確認する。大きな性能回帰は原因を調べ、平均CPUの小ささだけで入力停止を隠さない。今回の文書設計に製品性能の実測済み主張はない。
+負荷は実装前基準SHAと実装候補SHA、同じrelease profile/fixture/OSで比較する。起動から編集可能までの既存timing-probe、30秒を含む起動直後のCPU/入力遅延、10分間のidle CPU・wake/再描画数、metadata request数と転送量、長時間常駐時のRSSを記録する。自動確認待機中に追加する短周期wake/再描画が0、1回の確認中も本文入力を待たせないことを確認する。大きな性能回帰は原因を調べ、平均CPUの小ささだけで入力停止を隠さない。今回の文書設計に製品性能の実測済み主張はない。
 
 ## 11. ロールバックと今回の完了境界
 
