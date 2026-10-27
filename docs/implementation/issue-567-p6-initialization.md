@@ -17,7 +17,7 @@ Refs #567（RF2-A）、親 #297。P5のPR #635はmerge済み（`5676eb901d6d66bd
 
 新moduleは `use super::*;` と `impl EditorView { ... }` で包む。親にprivateな `mod initialization;` を一つ追加する。再export・public module・trait・constructor wrapperは追加しない。
 
-基準sourceは1671〜1944行（274行）。開始は `pub fn new(text:`、終了は `/// Opens `path` as the first editor session.` の直前。移動範囲はUTF-8で13,035 bytes、SHA-256 `97abca9a0daee050ee7029f86743560facda6f2c32a0dcd10e098233a82a9ae4`。行番号だけでなくシンボル境界を確認し、`open` のdoc commentを誤って移さない。
+基準sourceは1671〜1944行（274行）。開始は `pub fn new(text:`、終了は ``/// Opens `path` as the first editor session.`` の直前。移動範囲はUTF-8で13,035 bytes、SHA-256 `97abca9a0daee050ee7029f86743560facda6f2c32a0dcd10e098233a82a9ae4`。行番号だけでなくシンボル境界を確認し、`open` のdoc commentを誤って移さない。
 
 本文・signature・コメント・属性・cfg・field初期化の順序をそのまま移す。可視性調整は `from_sessions` の1件だけ。移動元の既存format差（例: `ai_selection:ai_selection::...`）を大量整形へ広げない。rustfmtが移動行の空白だけを変える場合は差分を明示し、識別子・式・処理順の変更と区別する。
 
