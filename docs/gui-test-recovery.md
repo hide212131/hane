@@ -187,6 +187,20 @@ New-Item -ItemType Directory -Path $kernelTempPath
 
 証拠はWindows側の`%USERPROFILE%\.codex\sessions\2026\10\17\rollout-2026-10-17T12-59-21-01a14803-a6bf-7d92-9102-bb5007ace138.jsonl`にある。当時の行4128に欠落パス検出、4141に復元、4162・4173にJS/アプリ列挙の再試験が記録されている。照会先の回答も同チャットの2026-10-18の履歴に残る。
 
+### 候補起動前にcanonical GUI lockを取得する（Issue #639）
+
+Windowsで隔離したHane候補を起動するときは、候補を直接起動せず次のランチャー経由にする。macOS専用の`scripts/gui_validate.py`（build・ウインドウ列挙・撮影）は使わず、画面取得と入力は従来どおりWindows上のChatGPTアプリのCUAが直接行う。ランチャーはロックの取得と候補の起動だけを担う。
+
+```text
+python scripts/windows_gui_lock_launcher.py -- <候補exe> [引数...]
+```
+
+- ロックはWindowsのアカウント情報（known folderのProfile）配下の`.cache/hane/gui-validation.lock`で、macOSと同じ相対位置。パスや環境変数による上書きはできない。
+- 非待機で排他取得し、取得できない場合は`blocked`（終了コード2）で候補を起動しない。実行ディレクトリ・fixture・stateは取得に成功してから作る。
+- 取得したOS handleだけを候補に継承する。ランチャーが先に終了しても候補が生きている間はロックが保持され、候補の終了でOSが解放する。ロックファイルの削除・置換や、所有者の推定はしない。
+- 引数はshellを介さずargvとして渡し、候補の終了コードを返す。
+- 実候補でのロック取得・保持・解放の確認（papa-win）は、このランチャーのCI通過後に別途行う。
+
 ### 入力・ダイアログ・証拠保存の失敗を分ける
 
 | 症状 | 成功した対応と再観測 |
