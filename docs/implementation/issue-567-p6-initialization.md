@@ -4,7 +4,7 @@
 
 Refs #567（RF2-A）、親 #297。P5のPR #635はmerge済み（`5676eb901d6d66bd658e0af2a4aa776d5a04d126`）。基準mainは `a50c44669d6a116dfbe13439bb258db39d9bf92b`。EditorViewを構築する一続きの処理をprivate moduleへ置き、初期化責務を見分けられる配置にする。
 
-本書だけを追加する実装準備PRであり、製品実装・test/build・GUIは未実施。実装依頼は未投稿。着手時はcurrent main、PR head、Issue、関連PRと同じ対象のrunを取り直す。運用判断はdefault branchのCommander Policy、実装入口はClaude実行手順に従う。
+以下の準備状態・調査結果は設計時点の履歴である。当時は本書だけを追加する実装準備PRで、製品実装・test/build・GUIは未実施、実装依頼は未投稿だった。現在の実装・検証状態は末尾の同期記録とPR #638を参照する。着手時はcurrent main、PR head、Issue、関連PRと同じ対象のrunを取り直す。運用判断はdefault branchのCommander Policy、実装入口はClaude実行手順に従う。
 
 調査時点のopen PRは0件。前回重なっていたproxy設定UI #633はmerge済みであり、現在の `network_settings` / `network_applier` の初期化もそのまま維持する。RF0全体を一律に待たず、#567の機械分割を先行する。Jev `jev-1.14.0` はcache/geometry共有helper、I/O意味整理、契約文書照合との比較で `initialization` を選択（probability 0.93、confidence 0.91）。
 
@@ -76,3 +76,25 @@ GUIのhead/base、OS/toolchain、候補Release hash、fixture/期待値/実結�
 実装受入時に `docs/refactor-execution-plan.md` の§9.13配下へ移動・維持理由・検証を短く追記する。P5記録が未反映ならPR #635の実結果を参照して履歴を補い、未検証を成功へ書き換えない。rollbackはP6の機械移動PRを一単位でrevertし、永続データ移行は不要とする。
 
 P6だけで#567/#297をcloseしない。次のRF Issue/フェーズを選定するのは本P6 PRがmergeされてからとする。
+
+
+## 2026-10-27 main同期記録（P6の受入前）
+
+対象はPR #638、branch `codex/issue-567-p6-initialization`。同期前headは `647c48255ed66608e0456747b9c04ad424016c1f`、旧baseは `a50c44669d6a116dfbe13439bb258db39d9bf92b`、今回取り込むmainは `497419203834f2a7aca413d1cb7758b37eb9dff6`。利用者の依頼に従い、製品修正と分離した通常mergeでmainのancestryを取り込む。merge-treeのpreviewと実mergeはいずれも競合なし。mainの運用文書、Issue #567、PR #638と実行中runを確認し、対象head一致を確認してから実行した。
+
+mainの追加差分は以下の4ファイルだけであり、Rust source、Cargo設定・依存、assets、GUI validatorの実装には変更がない。
+
+- `.github/scripts/rust_ci_path_filter.py`
+- `.github/tests/test_rust_ci_path_filter.py`
+- `.github/tests/test_windows_gui_lock_ci_wiring.py`
+- `.github/workflows/ci.yml`
+
+P6の実装は `new` / `from_sessions` のprivate moduleへの機械移動として維持する。同期前後の製品treeの一致と、旧baseに対するP6のRust差分と同期mainに対するRust差分の一致を確認する。追加変更はこの状態記録だけで、製品コード・既存testsには加えない。先行する実装・検証記録はPRの履歴として保持する。
+
+旧headのCI・reviewは同期後headの証拠として扱わない。push後の新headに対する通常CIを別途確認し、結果URLとexact headをPRへ記録する。最終reviewは新headでは未取得とする。通常CIを超える追加の重いbuild/testは行わない。
+
+macOSで既に得たfocused GUIの観測は、Rust source head `74095a005be73796428e3387ff7205b2b9bbb3d5` の通常Release候補（SHA-256 `88e938e8a4ba8e93fcf89a45b3da51d1dec72390bfe2ecf48548dfcf80386f88`）に結び付く。同期前headまでの追加変更は文書だけで、今回のmain差分もCI workflow/testだけである。製品treeが同一で、起動・IME・rename・quit/releaseの実行経路および候補生成入力に影響しないため、既存の観測範囲に限り保持する。新headでGUIを再実行したとは扱わない。
+
+macOSのG2 AI入力IMEとG4通常終了/draft復旧/Mermaid release、およびWindows G1〜G4はUnknownのまま。Windows実機はcanonical lockのownerを直接照合できておらず、専用CIの成功を実機受入の代用にしない。この同期担当はWindows desktop、canonical lock、candidate、buildへ触れない。GUI確認までDraftを維持する既存の利用者判断を守り、受入・merge・Issue close・releaseは行わない。
+
+Jev（要求 `jev-latest`、provider `typesafe`、応答 `jev-1.14.0`）は `sync_main` を選択（probability 0.86、confidence 0.72、入力873/output34 tokens）。Commanderはsame-repository/open/Draft、exact head、current mainと競合なしを確認して採用した。
