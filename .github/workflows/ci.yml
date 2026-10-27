@@ -359,7 +359,10 @@ jobs:
       needs.release_only_detector.result == 'success' &&
       needs.release_only_detector.outputs.release_only != 'true' &&
       needs.rust_ci_changes.result == 'success' &&
-      needs.rust_ci_changes.outputs.macos_gui_validator_lock_required == 'true'
+      (
+        needs.rust_ci_changes.outputs.macos_gui_validator_lock_required == 'true' ||
+        needs.rust_ci_changes.outputs.windows_gui_lock_required == 'true'
+      )
     runs-on: macos-latest
     timeout-minutes: 10
     permissions:
