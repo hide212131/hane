@@ -2909,16 +2909,21 @@ mod tests {
             // The selectors below repeat on every row and `debug_bounds`
             // returns one of them, so also record the target row's own
             // create slot (keyed by its flatten index) as a reference.
-            let slot_selector = format!(
-                "sidebar-folder-create-slot:work-folder-create:{}",
-                index - 1
+            // `debug_bounds` requires `&'static str`; the selector is used a
+            // bounded number of times in this test, so leaking is acceptable.
+            let slot_selector: &'static str = Box::leak(
+                format!(
+                    "sidebar-folder-create-slot:work-folder-create:{}",
+                    index - 1
+                )
+                .into_boxed_str(),
             );
             let snapshot = |cx: &mut gpui::VisualTestContext| {
                 (
                     cx.debug_bounds("sidebar-folder-create-folder"),
                     cx.debug_bounds("sidebar-folder-create-note"),
                     cx.debug_bounds("sidebar-pin-toggle"),
-                    cx.debug_bounds(&slot_selector),
+                    cx.debug_bounds(slot_selector),
                 )
             };
             let first = snapshot(cx);
