@@ -2609,4 +2609,176 @@ mod tests {
         assert!(badge_renders_before_remainder(DateBadgePosition::Left));
         assert!(!badge_renders_before_remainder(DateBadgePosition::Right));
     }
+
+    /// Clicks a row's hover "new folder" / "new file" button through the real
+    /// GPUI event path. `directory` is the root when `None`; otherwise the row
+    /// is found in the flattened tree, in the order the sidebar renders it.
+    fn click_create_button(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        directory: Option<&Path>,
+        note: bool,
+    ) {
+        cx.run_until_parked();
+        let row_height = px(SIDEBAR_ROW_HEIGHT);
+        let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
+        let point = match directory {
+            None => {
+                // The root row has no pin slot: its create slot is the row's
+                // right-most element, the folder button first, the note second.
+                let slot_width = sidebar_pins::PIN_SLOT_SIZE;
+                let slot_right = root_row.right() - px(SIDEBAR_ROW_HORIZONTAL_PADDING);
+                let button_center_x = if note {
+                    slot_right - px(slot_width / 2.0)
+                } else {
+                    slot_right - px(slot_width * 1.5)
+                };
+                gpui::point(button_center_x, root_row.center().y)
+            }
+            Some(directory) => {
+                let target_index = view.read_with(cx, |view, _| {
+                    let mut rows = Vec::new();
+                    flatten_work_folder_tree(
+                        view.work_folder.as_ref().unwrap().children(),
+                        1,
+                        &view.expanded_folders,
+                        &mut rows,
+                    );
+                    rows.iter()
+                        .position(|row| {
+                            matches!(row.node, WorkFolderNode::Folder(folder) if folder.path() == directory)
+                        })
+                        .expect("the folder row is visible")
+                        + 1
+                });
+                let selector = if note {
+                    "sidebar-folder-create-note"
+                } else {
+                    "sidebar-folder-create-folder"
+                };
+                // Several rows share the selector and only one is reported;
+                // locate which one it is and move to the wanted row.
+                let reported = cx.debug_bounds(selector).expect("a folder create button");
+                let reported_index =
+                    f32::from((reported.top() - root_row.top()) / row_height).round() as i32;
+                assert!(reported_index > 0, "a folder row's button is reported");
+                let offset = target_index as i32 - reported_index;
+                gpui::point(
+                    reported.center().x,
+                    reported.center().y + row_height * offset as f32,
+                )
+            }
+        };
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    // Issue #642: the real hover buttons create in their own row's folder,
+    // whatever is selected, and never reach the row's select / toggle / rename
+    // / open handlers.
+    #[gpui::test]
+    fn row_create_buttons_create_in_their_own_folder_without_triggering_the_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-row-create-buttons-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/inner")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/Existing.md"), "# Existing\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // `a` is expanded and `inner` collapsed; `b` is the selection.
+            view.expanded_folders.insert(root.join("a"));
+            view.selected_folder = Some(root.join("b"));
+            view.sidebar_focus = SidebarFocus::Folder;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let assert_row_untouched = |view: &gpui::Entity<EditorView>,
+                                    cx: &mut gpui::VisualTestContext,
+                                    inner_expanded: bool| {
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_folder, Some(root.join("b")));
+                assert!(view.expanded_folders.contains(&root.join("a")));
+                assert_eq!(
+                    view.expanded_folders.contains(&root.join("a/inner")),
+                    inner_expanded
+                );
+                assert!(view.inline_rename.is_none(), "no rename starts");
+                assert!(view.loading_paths.is_empty(), "no file opens");
+            });
+        };
+
+        // Nested parent row: two folders in a row, then a note.
+        let inner = root.join("a/inner");
+        click_create_button(&view, cx, Some(&inner), false);
+        click_create_button(&view, cx, Some(&inner), false);
+        assert!(root.join("a/inner/New Folder").is_dir());
+        assert!(root.join("a/inner/New Folder 2").is_dir());
+        assert!(!root.join("b/New Folder").exists());
+        // Only the creation itself expands `inner`; the row click would have
+        // toggled it back closed on the second press.
+        assert_row_untouched(&view, cx, true);
+
+        click_create_button(&view, cx, Some(&inner), true);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 1);
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .all(|draft| draft.target_directory == inner),
+                "the note starts in the clicked row's folder"
+            );
+        });
+
+        // The outer parent row.
+        let outer = root.join("a");
+        click_create_button(&view, cx, Some(&outer), false);
+        assert!(root.join("a/New Folder").is_dir());
+        click_create_button(&view, cx, Some(&outer), true);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 2);
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|draft| draft.target_directory == outer),
+                "the note starts in the outer row's folder"
+            );
+        });
+        assert_row_untouched(&view, cx, true);
+
+        // The root row.
+        click_create_button(&view, cx, None, false);
+        assert!(root.join("New Folder").is_dir());
+        assert!(!root.join("b/New Folder").exists());
+        click_create_button(&view, cx, None, true);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 3);
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|draft| draft.target_directory == root),
+                "the note starts in the root"
+            );
+        });
+        assert_row_untouched(&view, cx, true);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
