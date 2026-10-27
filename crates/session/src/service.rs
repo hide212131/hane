@@ -171,6 +171,15 @@ pub trait FileService: Send + Sync + 'static {
     /// directories. Creating a directory that already exists is not an
     /// error, the same as `std::fs::create_dir_all`.
     fn create_dir(&self, path: &Path) -> io::Result<()>;
+
+    /// Creates the single directory `path` without creating its parent: a
+    /// parent that no longer exists fails with `ErrorKind::NotFound` instead
+    /// of being recreated, the directory counterpart of
+    /// `save_in_existing_directory`. The default falls back to `create_dir`
+    /// for services whose parents cannot vanish (in-memory fakes).
+    fn create_dir_in_existing_parent(&self, path: &Path) -> io::Result<()> {
+        self.create_dir(path)
+    }
 }
 
 /// Runs one save job against a service, enforcing the external-change rule the
@@ -316,6 +325,13 @@ impl FileService for OsFileService {
 
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(path)
+    }
+
+    fn create_dir_in_existing_parent(&self, path: &Path) -> io::Result<()> {
+        match fs::create_dir(path) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+            result => result,
+        }
     }
 }
 

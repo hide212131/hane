@@ -3051,6 +3051,7 @@ impl EditorView {
         }
         self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
+        let parent_must_exist = explicit_directory.is_some();
         let target_directory = match explicit_directory {
             Some(directory) => {
                 let exists = self
@@ -3110,7 +3111,14 @@ impl EditorView {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let result = files.create_dir(&probe_path);
+                    // The tree's `children_at` can be stale: an explicitly
+                    // chosen parent may have been deleted externally, and
+                    // `create_dir` would silently recreate it. Refuse instead.
+                    let result = if parent_must_exist {
+                        files.create_dir_in_existing_parent(&probe_path)
+                    } else {
+                        files.create_dir(&probe_path)
+                    };
                     // Acquired here, off the main thread, so `touch` below
                     // can retain the new folder's modified time the same
                     // no-rescan way a save does, instead of leaving it
@@ -3161,15 +3169,16 @@ impl EditorView {
                     folder.touch(&path, modified, modified_seq);
                 }
                 self.touch_work_folder_ancestors(&ancestors);
-                // A folder created from a row's hover button may sit in a
-                // collapsed parent; open it so the result is visible.
-                if let Some(parent) = path.parent()
-                    && self
-                        .work_folder
-                        .as_ref()
-                        .is_some_and(|folder| parent != folder.root())
-                {
-                    self.expanded_folders.insert(parent.to_path_buf());
+                // A folder created from a row's hover button may sit in
+                // collapsed ancestors; open every one up to the work folder
+                // root so the result is visible once any filter is cleared.
+                if let Some(root) = self.work_folder.as_ref().map(|folder| folder.root().to_path_buf()) {
+                    for ancestor in path.ancestors().skip(1) {
+                        if ancestor == root || !ancestor.starts_with(&root) {
+                            break;
+                        }
+                        self.expanded_folders.insert(ancestor.to_path_buf());
+                    }
                 }
                 self.expanded_folders.insert(path);
                 self.content_search_workspace_changed(cx);
@@ -17667,7 +17676,46 @@ mod tests {
         assert!(!root.join("missing").exists());
         view.read_with(cx, |view, _| {
             assert!(view.expanded_folders.contains(&root.join("a/inner")));
+            assert!(view.expanded_folders.contains(&root.join("a")));
+            assert!(!view.expanded_folders.contains(&root));
             assert_eq!(view.selected_folder, Some(root.join("b")));
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #642 review: a row's folder deleted externally after the scan is
+    // not recreated by the hover button, and the failure is shown.
+    #[gpui::test]
+    fn new_folder_in_a_stale_deleted_parent_fails_without_recreating_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("new-folder-stale-parent");
+        std::fs::create_dir_all(root.join("gone")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        std::fs::remove_dir_all(root.join("gone")).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_folder_in(Some(root.join("gone")), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(!root.join("gone").exists());
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("New Folder failed"))
+            );
         });
 
         std::fs::remove_dir_all(&root).unwrap();

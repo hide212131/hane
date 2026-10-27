@@ -777,8 +777,7 @@ impl EditorView {
                             )
                             .debug_selector(|| "sidebar-folder".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
-                            .pl(left_padding)
-                            .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                            .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
                             .flex()
                             .flex_row()
                             .items_center()
@@ -791,6 +790,11 @@ impl EditorView {
                                 div()
                                     .h_full()
                                     .flex_1()
+                                    // The nesting indent lives inside the
+                                    // shrinkable name area so it can never
+                                    // push the create/pin slots off the right
+                                    // edge of a narrow sidebar.
+                                    .pl(px(12.0 * row.depth as f32))
                                     .min_w(px(0.0))
                                     .overflow_hidden()
                                     .flex()
