@@ -130,7 +130,7 @@ Full / Compactでは短い文言の専用更新ボタンを右側へ追加する
 
 | 試験 | 条件・確認する不変条件 | 対応 |
 |---|---|---|
-| T1 起動 | 30秒経過とReady候補復元・再検証完了の両方が揃うまでrequest 0、両条件成立時にmetadata一組。Ready復元が30秒を超える場合も復元完了前は0。通常window失敗/health child/helper/debug/非対応配置では0 | A1/A6/A10 |
+| T1 起動 | Readyが見つかった場合はrequest 0。Readyがない場合だけ、通常window表示から30秒経過かつReadyの復元・再検証完了の両方を満たすまでrequest 0とし、成立後にmetadata一組。復元完了が30秒を超える場合も、完了前は0。通常window失敗/health child/helper/debug/非対応配置では0 | A1/A6/A10 |
 | T2 日程 | check完了直前/1時間直前/期限、長時間休止からの復帰、壁時計前進/後退、window再接続/文書切替。未実行の連続dispatchなし | A2 |
 | T3 失敗 | network/timeout/403/429/署名不正、手動/自動共通の失敗数と1/2/4時間backoff、期限中の手動retryで期限を短縮できないこと、成功reset。最新版と誤表示せずZIP取得0 | A6/A8 |
 | T4 競合 | 初回restoreが30秒を超える、同時手動/自動、Available再check中のクリック、候補変更直後の古いクリック、取消後の遅延完了、Download/Ready/Discard/restart freeze | A7/A10 |
