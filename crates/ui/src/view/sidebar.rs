@@ -333,8 +333,12 @@ impl EditorView {
         let folder_view = cx.entity();
         let folder_directory = directory.clone();
         let note_view = cx.entity();
+        let slot_id = id;
         div()
-            .debug_selector(|| "sidebar-folder-create-slot".to_owned())
+            // Keyed per row so tests can tell which row's slot they measure.
+            .debug_selector(move || {
+                format!("sidebar-folder-create-slot:{}:{}", slot_id.0, slot_id.1)
+            })
             .w(px(sidebar_pins::PIN_SLOT_SIZE * 2.0))
             .h(px(sidebar_pins::PIN_SLOT_SIZE))
             .flex_none()
@@ -2859,9 +2863,12 @@ mod tests {
 
         // Hovers the target row and returns (row, new folder, new file, pin)
         // bounds, after asserting they are all reachable.
+        let measure_calls = std::cell::Cell::new(0usize);
         let measure = |view: &gpui::Entity<EditorView>,
                        cx: &mut gpui::VisualTestContext|
          -> [gpui::Bounds<gpui::Pixels>; 4] {
+            measure_calls.set(measure_calls.get() + 1);
+            let call = measure_calls.get();
             cx.run_until_parked();
             let (index, depth) = view.read_with(cx, |view, _| {
                 let mut rows = Vec::new();
@@ -2899,15 +2906,56 @@ mod tests {
             );
             cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
             cx.run_until_parked();
-            let folder_button = cx
-                .debug_bounds("sidebar-folder-create-folder")
-                .expect("the new folder button is rendered");
-            let note_button = cx
-                .debug_bounds("sidebar-folder-create-note")
-                .expect("the new file button is rendered");
-            let pin_button = cx
-                .debug_bounds("sidebar-pin-toggle")
-                .expect("the pin button is rendered");
+            // The selectors below repeat on every row and `debug_bounds`
+            // returns one of them, so also record the target row's own
+            // create slot (keyed by its flatten index) as a reference.
+            let slot_selector = format!(
+                "sidebar-folder-create-slot:work-folder-create:{}",
+                index - 1
+            );
+            let snapshot = |cx: &mut gpui::VisualTestContext| {
+                (
+                    cx.debug_bounds("sidebar-folder-create-folder"),
+                    cx.debug_bounds("sidebar-folder-create-note"),
+                    cx.debug_bounds("sidebar-pin-toggle"),
+                    cx.debug_bounds(&slot_selector),
+                )
+            };
+            let first = snapshot(cx);
+            // One more frame at the same hover point, to see whether a
+            // vertical offset is a stale frame.
+            cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+            cx.run_until_parked();
+            let second = snapshot(cx);
+            let diagnostics = format!(
+                "measure call #{call}: target={target:?} depth={depth} flatten_index={} \
+                 estimated_row={row:?} sidebar-root={root_row:?} sidebar-list={list:?} \
+                 sidebar-pin-area={:?} hover={:?}; \
+                 [first frame] folder_button={:?} note_button={:?} pin_button={:?} \
+                 target_row_slot={:?}; \
+                 [after one more frame] folder_button={:?} note_button={:?} pin_button={:?} \
+                 target_row_slot={:?}",
+                index - 1,
+                cx.debug_bounds("sidebar-pin-area"),
+                row.center(),
+                first.0,
+                first.1,
+                first.2,
+                first.3,
+                second.0,
+                second.1,
+                second.2,
+                second.3,
+            );
+            let folder_button = first
+                .0
+                .unwrap_or_else(|| panic!("the new folder button is rendered: {diagnostics}"));
+            let note_button = first
+                .1
+                .unwrap_or_else(|| panic!("the new file button is rendered: {diagnostics}"));
+            let pin_button = first
+                .2
+                .unwrap_or_else(|| panic!("the pin button is rendered: {diagnostics}"));
             let buttons = [folder_button, note_button, pin_button];
             for button in buttons {
                 assert!(
@@ -2915,14 +2963,14 @@ mod tests {
                         && button.right() <= row.right()
                         && button.top() >= row.top()
                         && button.bottom() <= row.bottom(),
-                    "{button:?} stays inside the row {row:?}"
+                    "{button:?} stays inside the row {row:?}: {diagnostics}"
                 );
                 assert!(
                     button.left() >= list.left()
                         && button.right() <= list.right()
                         && button.top() >= list.top()
                         && button.bottom() <= list.bottom(),
-                    "{button:?} stays inside the sidebar viewport {list:?}"
+                    "{button:?} stays inside the sidebar viewport {list:?}: {diagnostics}"
                 );
                 let center = button.center();
                 assert!(
@@ -2930,14 +2978,14 @@ mod tests {
                         && center.x <= list.right()
                         && center.y >= list.top()
                         && center.y <= list.bottom(),
-                    "the click point {center:?} is not clipped"
+                    "the click point {center:?} is not clipped: {diagnostics}"
                 );
             }
             for (index, first) in buttons.iter().enumerate() {
                 for second in &buttons[index + 1..] {
                     assert!(
                         first.right() <= second.left() || second.right() <= first.left(),
-                        "{first:?} and {second:?} must not overlap"
+                        "{first:?} and {second:?} must not overlap: {diagnostics}"
                     );
                 }
             }
