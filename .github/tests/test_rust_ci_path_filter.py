@@ -28,8 +28,6 @@ class Tests(unittest.TestCase):
             ".github/workflows/ci.yml",
             ".github/scripts/rust_ci_path_filter.py",
             ".github/tests/test_rust_ci_path_filter.py",
-            "scripts/windows_gui_lock_launcher.py",
-            "scripts/tests/test_windows_gui_lock_launcher.py",
         ]
         for path in paths:
             with self.subTest(path=path):
@@ -44,6 +42,8 @@ class Tests(unittest.TestCase):
             ".github/scripts/aadw_observer.py",
             ".github/tests/test_aadw_observer.py",
             ".github/workflows/aadw-notifications.yml",
+            "scripts/windows_gui_lock_launcher.py",
+            "scripts/tests/test_windows_gui_lock_launcher.py",
             "assets/app-icon.svg",
             "assets/phase4-feather.svg",
         ]
