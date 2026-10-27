@@ -2644,12 +2644,22 @@ mod tests {
             Some(directory) => {
                 let target_index = view.read_with(cx, |view, _| {
                     let mut rows = Vec::new();
-                    flatten_work_folder_tree(
-                        view.work_folder.as_ref().unwrap().children(),
-                        1,
-                        &view.expanded_folders,
-                        &mut rows,
-                    );
+                    let query = view.sidebar_filter.text().to_lowercase();
+                    if query.is_empty() {
+                        flatten_work_folder_tree(
+                            view.work_folder.as_ref().unwrap().children(),
+                            1,
+                            &view.expanded_folders,
+                            &mut rows,
+                        );
+                    } else {
+                        flatten_filtered_work_folder_tree(
+                            view.work_folder.as_ref().unwrap().children(),
+                            1,
+                            &query,
+                            &mut rows,
+                        );
+                    }
                     rows.iter()
                         .position(|row| {
                             matches!(row.node, WorkFolderNode::Folder(folder) if folder.path() == directory)
@@ -2789,5 +2799,160 @@ mod tests {
         assert_row_untouched(&view, cx, true);
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #642: a folder created from a row's hover button while the filter
+    // shows that row through closed ancestors stays hidden (it is empty) during
+    // the filter, and every ancestor plus the new folder is rendered and
+    // reachable once the filter is cleared through the real input path.
+    #[gpui::test]
+    fn folder_created_under_a_filtered_closed_ancestor_chain_is_reachable_after_clearing_the_filter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-row-create-filtered-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let level1 = root.join("a");
+        let level2 = level1.join("b");
+        let level3 = level2.join("c");
+        let target = level3.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(target.join("Needle.md"), "# Needle\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // Every ancestor of `target` is closed; another folder is selected.
+            view.selected_folder = Some(root.join("other"));
+            view.sidebar_focus = SidebarFocus::Folder;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.expanded_folders.is_empty());
+        });
+
+        // Filter through the real input path.
+        let filter_point = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter_point, gpui::Modifiers::none());
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter.text(), "needle");
+            assert!(view.expanded_folders.is_empty());
+        });
+        assert!(cx.debug_bounds("sidebar-filter-empty").is_none());
+
+        // Hover the filtered target row and click its real new-folder button.
+        click_create_button(&view, cx, Some(&target), false);
+        let created = target.join("New Folder");
+        assert!(created.is_dir(), "created inside the hovered folder");
+        assert!(!root.join("other/New Folder").exists());
+        assert!(!level3.join("New Folder").exists());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.selected_folder, Some(root.join("other")));
+            assert!(view.inline_rename.is_none(), "no rename starts");
+            assert!(view.loading_paths.is_empty(), "no file opens");
+            let mut rows = Vec::new();
+            flatten_filtered_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                "needle",
+                &mut rows,
+            );
+            let paths: Vec<&Path> = rows.iter().map(|row| row.node.path()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    level1.as_path(),
+                    level2.as_path(),
+                    level3.as_path(),
+                    target.as_path(),
+                    target.join("Needle.md").as_path(),
+                ],
+                "the empty new folder stays hidden while filtering"
+            );
+        });
+
+        // Clear the filter through the real input path.
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_filter.text().is_empty());
+        });
+        assert!(cx.debug_bounds("sidebar-filter-empty").is_none());
+
+        // Every ancestor and the new folder are rendered rows that can be
+        // hovered and reached: the real hover button is reported on each row.
+        for folder in [&level1, &level2, &level3, &target, &created] {
+            click_create_button_hover_only(&view, cx, folder);
+        }
+        // The new folder row accepts a real click on its own button.
+        click_create_button(&view, cx, Some(&created), true);
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|draft| draft.target_directory == created),
+                "the note starts in the new folder"
+            );
+            assert_eq!(view.selected_folder, Some(root.join("other")));
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Hovers the rendered row of `directory` in the unfiltered tree and
+    /// asserts that its create button is rendered on that row.
+    fn click_create_button_hover_only(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        directory: &Path,
+    ) {
+        cx.run_until_parked();
+        let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
+        let index = view.read_with(cx, |view, _| {
+            let mut rows = Vec::new();
+            flatten_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                &view.expanded_folders,
+                &mut rows,
+            );
+            rows.iter()
+                .position(|row| {
+                    matches!(row.node, WorkFolderNode::Folder(folder) if folder.path() == directory)
+                })
+                .unwrap_or_else(|| panic!("{} is a visible row", directory.display()))
+                + 1
+        });
+        let row_center = gpui::point(
+            root_row.center().x,
+            root_row.center().y + px(SIDEBAR_ROW_HEIGHT) * index as f32,
+        );
+        cx.simulate_mouse_move(row_center, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("sidebar-folder-create-folder")
+            .unwrap_or_else(|| panic!("{} renders its create button", directory.display()));
+        assert!(button.top() <= row_center.y && row_center.y <= button.bottom());
     }
 }
