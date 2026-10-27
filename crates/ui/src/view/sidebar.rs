@@ -2660,7 +2660,7 @@ mod tests {
                 // locate which one it is and move to the wanted row.
                 let reported = cx.debug_bounds(selector).expect("a folder create button");
                 let reported_index =
-                    f32::from((reported.top() - root_row.top()) / row_height).round() as i32;
+                    ((reported.top() - root_row.top()) / row_height).round() as i32;
                 assert!(reported_index > 0, "a folder row's button is reported");
                 let offset = target_index as i32 - reported_index;
                 gpui::point(
