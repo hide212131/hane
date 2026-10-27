@@ -1,10 +1,14 @@
-# Issue #639: Windows GUI lock launcher — implementation preparation
+# Issue #639: Windows GUI lock launcher — implementation record
 
-- Status: preparation only. Product/tool implementation and tests have not started.
+- Status: implementation candidate prepared; current-head Windows/macOS CI and papa-win lifecycle verification remain.
 - Issue: https://github.com/hide212131/hane/issues/639
 - Parent work to unblock: PR #638 / Issue #567 P6 Windows focused GUI.
 - Base/current main at preparation: `a50c44669d6a116dfbe13439bb258db39d9bf92b`.
-- The current PR contains this preparation document only. Do not treat it as completed support or as proof that Windows GUI was run.
+- Current implementation head: `fcdbd3ef47d0c0bf00d6395c98412d89f4099a27`.
+- The PR contains the Windows launcher, its process tests, this record, and the recovery-guide update. The current implementation is not yet proof that Windows GUI was run.
+- AADW run [40443432550](https://github.com/hide212131/hane/actions/runs/40443432550) completed prepare, Claude Sonnet 5.5 verification, finalizer, workspace regression tests, and lint successfully.
+- CI run [40443655916](https://github.com/hide212131/hane/actions/runs/40443655916) succeeded before the focused Windows/macOS Python jobs were added. After PR #641 merges, synchronize this PR with main and require those jobs on this exact implementation.
+- papa-win real-canonical-lock lifecycle verification remains outstanding. Do not launch a GUI candidate until the current-head Windows/macOS jobs pass and the shared desktop is available.
 
 ## Current source and confirmed gap
 
