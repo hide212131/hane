@@ -89,7 +89,11 @@ class WindowsGuiLockCiWiringTests(unittest.TestCase):
             "needs.rust_ci_changes.outputs.macos_gui_validator_lock_required == 'true'",
             macos_job["if"],
         )
-        self.assertNotIn("windows_gui_lock_required", macos_job["if"])
+        self.assertIn(
+            "needs.rust_ci_changes.outputs.windows_gui_lock_required == 'true'",
+            macos_job["if"],
+        )
+        self.assertIn("||", macos_job["if"])
         self.assertIn("needs.release_only_detector.outputs.release_only != 'true'", macos_job["if"])
         python_step = step(macos_job, "Install Python")
         self.assertEqual(python_step["uses"], "actions/setup-python@v6")
