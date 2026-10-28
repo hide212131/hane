@@ -7,6 +7,10 @@ license.workspace = true
 [features]
 default = []
 timing-probe = ["hane-ui/timing-probe"]
+# Isolated update validation build (Issue #510): the update check reads from a
+# loopback fixture feed instead of GitHub. Never part of the default, `debug` or
+# `release` builds of the product; see https_transport/validation_feed.rs.
+validation-feed = []
 instrument = [
     "dep:hane-document",
     "dep:hane-markdown",

@@ -25,6 +25,11 @@ use hane_update::download::{
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
+/// Loopback-only transport of the opt-in update validation build. It does not
+/// exist in a standard build.
+#[cfg(feature = "validation-feed")]
+pub(crate) mod validation_feed;
+
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_LINE_BYTES: usize = 1024;
 const HTTPS_PORT: u16 = 443;
@@ -80,6 +85,7 @@ struct SharedParts {
 
 /// Builds the TLS configuration (reading the system trust store) on the first
 /// request instead of at startup, so launching the app does no update work.
+#[cfg_attr(feature = "validation-feed", allow(dead_code))]
 pub struct LazyHttpsTransport {
     network: NetworkProvider,
     shared: Arc<std::sync::OnceLock<Result<SharedParts, String>>>,
@@ -90,6 +96,7 @@ pub struct LazyHttpsTransport {
 /// it once and keeps that snapshot for every request of the operation.
 pub type NetworkProvider = Arc<dyn Fn() -> NetworkContext + Send + Sync>;
 
+#[cfg_attr(feature = "validation-feed", allow(dead_code))]
 impl LazyHttpsTransport {
     pub fn new(network: NetworkProvider) -> Self {
         Self {

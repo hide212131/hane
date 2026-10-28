@@ -258,6 +258,17 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
         }
     };
     let updates_root = state.root().join("updates").join(install_id.as_str());
+    // The standard build always uses the fixed GitHub HTTPS transport. Only the
+    // opt-in `validation-feed` build swaps in the loopback fixture transport;
+    // signature, archive and apply checks below are unchanged.
+    #[cfg(not(feature = "validation-feed"))]
+    let transport: Arc<dyn hane_update::download::Transport> =
+        Arc::new(https_transport::LazyHttpsTransport::new(Arc::new(network_context)));
+    #[cfg(feature = "validation-feed")]
+    let transport: Arc<dyn hane_update::download::Transport> = {
+        let _ = &network_context;
+        Arc::new(https_transport::validation_feed::ValidationFeedTransport::from_environment())
+    };
     let service = Arc::new(app_update::AppUpdateService::new(
         app_update::UpdateServiceConfig {
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -270,7 +281,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             updates_root,
             receipts_dir,
         },
-        Arc::new(https_transport::LazyHttpsTransport::new(Arc::new(network_context))),
+        transport,
         Arc::new(SystemClock::new()),
     ));
     // Only a supported placement can hand a Ready update to the helper, and
