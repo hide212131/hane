@@ -302,6 +302,102 @@ impl EditorView {
         )
     }
 
+    /// The hover-only "new folder" / "new file" buttons at the right end of a
+    /// parent folder row (Issue #642). The slot always takes its space, so the
+    /// row and its name never move; the buttons show on row hover (the
+    /// `sidebar-pin-row` group). Each button creates inside `directory`, the
+    /// row's own folder, whatever is selected. Mouse-down is stopped here so
+    /// the row's expand / rename never sees the click.
+    fn folder_create_slot(
+        &self,
+        id: (&'static str, usize),
+        directory: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let create_button = |button_id: (&'static str, usize),
+                             label: &'static str,
+                             icon_path: &'static str| {
+            Button::new(button_id)
+                .ghost()
+                .w(px(sidebar_pins::PIN_SLOT_SIZE))
+                .h_full()
+                .accessibility_label(label)
+                .icon(
+                    Icon::empty()
+                        .path(icon_path)
+                        .size(px(14.0))
+                        .text_color(rgb(self.theme.sidebar_foreground)),
+                )
+        };
+        // `Button::tooltip` needs a `gpui_component::Root` as the window root,
+        // which the app does not have, so the tooltip is a `HoverCard` around
+        // the button (like the reading mode switch). The selector spells
+        // `sidebar-folder-create-tooltip:{label}` so tests can find the text.
+        let with_tooltip = |card_id: (&'static str, usize),
+                            trigger: gpui::Stateful<gpui::Div>,
+                            label: &'static str| {
+            HoverCard::new(card_id)
+                .anchor(Anchor::TopCenter)
+                .trigger(trigger)
+                .content(move |_, _, _| {
+                    div()
+                        .px_2()
+                        .py_1()
+                        .debug_selector(move || format!("sidebar-folder-create-tooltip:{label}"))
+                        .child(label)
+                })
+        };
+        let folder_view = cx.entity();
+        let folder_directory = directory.clone();
+        let note_view = cx.entity();
+        let slot_id = id;
+        div()
+            // Keyed per row so tests can tell which row's slot they measure.
+            .debug_selector(move || {
+                format!("sidebar-folder-create-slot:{}:{}", slot_id.0, slot_id.1)
+            })
+            .w(px(sidebar_pins::PIN_SLOT_SIZE * 2.0))
+            .h(px(sidebar_pins::PIN_SLOT_SIZE))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .invisible()
+            .group_hover("sidebar-pin-row", |style| style.visible())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(with_tooltip(
+                ("sidebar-folder-create-folder-tooltip", id.1),
+                div()
+                    .id(("sidebar-folder-create-folder-trigger", id.1))
+                    .debug_selector(|| "sidebar-folder-create-folder".to_owned())
+                    .child(
+                        create_button((id.0, id.1 * 2), "新規フォルダ", icons::ICON_FOLDER_NEW)
+                            .on_click(move |_, _, app| {
+                                let directory = folder_directory.clone();
+                                folder_view.update(app, |view, cx| {
+                                    view.new_work_folder_folder_in(Some(directory), cx)
+                                });
+                            }),
+                    ),
+                "新規フォルダ",
+            ))
+            .child(with_tooltip(
+                ("sidebar-folder-create-note-tooltip", id.1),
+                div()
+                    .id(("sidebar-folder-create-note-trigger", id.1))
+                    .debug_selector(|| "sidebar-folder-create-note".to_owned())
+                    .child(
+                        create_button((id.0, id.1 * 2 + 1), "新規ファイル", icons::ICON_FILE_NEW)
+                            .on_click(move |_, _, app| {
+                                let directory = directory.clone();
+                                note_view.update(app, |view, cx| {
+                                    view.new_work_folder_note_in(Some(directory), cx)
+                                });
+                            }),
+                    ),
+                "新規ファイル",
+            ))
+    }
+
     /// The folder/file tree for the sidebar, when this window was opened onto
     /// a work folder. File and folder rows reserve the same disclosure slot,
     /// so their file/folder icons line up and a folder does not shift when its
@@ -492,11 +588,20 @@ impl EditorView {
             && self.selected_folder.is_none())
             || (self.sidebar_focus == SidebarFocus::ActiveSession
                 && !self.active_session_has_sidebar_row());
+        let root_create_slot = self.folder_create_slot(
+            ("work-folder-root-create", 0),
+            work_folder.root().to_path_buf(),
+            cx,
+        );
         let root_row = div()
             .id("work-folder-root")
+            .group("sidebar-pin-row")
             .debug_selector(|| "sidebar-root".to_owned())
             .h(px(SIDEBAR_ROW_HEIGHT))
             .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+            .flex()
+            .flex_row()
+            .items_center()
             .rounded_sm()
             .cursor_pointer()
             .when(root_is_selected, |element| {
@@ -505,6 +610,9 @@ impl EditorView {
             .child(
                 div()
                     .h_full()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -516,6 +624,7 @@ impl EditorView {
                     ))
                     .child(work_folder_root_display_name(work_folder.root())),
             )
+            .child(root_create_slot)
             .on_click(cx.listener(|view, _, window, cx| {
                 window.focus(&view.focus_handle, cx);
                 view.select_work_folder_root(cx);
@@ -675,6 +784,11 @@ impl EditorView {
                             pinned,
                             cx,
                         );
+                        let create_slot = self.folder_create_slot(
+                            ("work-folder-create", index),
+                            path.clone(),
+                            cx,
+                        );
                         div()
                             .id(("work-folder-folder", index))
                             .group("sidebar-pin-row")
@@ -690,8 +804,7 @@ impl EditorView {
                             )
                             .debug_selector(|| "sidebar-folder".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
-                            .pl(left_padding)
-                            .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                            .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
                             .flex()
                             .flex_row()
                             .items_center()
@@ -708,15 +821,32 @@ impl EditorView {
                                     .overflow_hidden()
                                     .flex()
                                     .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(entry_icon(
-                                        icons::ICON_FOLDER,
-                                        Some(disclosure),
-                                        self.theme.sidebar_foreground,
-                                    ))
-                                    .child(name),
+                                    // The padding must not sit on the
+                                    // shrinkable outer area: padding is a
+                                    // minimum width, so a deep indent would
+                                    // keep it wide and push the create/pin
+                                    // slots off the right edge. The outer area
+                                    // only clips; the indent lives on the
+                                    // inner content.
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .pl(px(12.0 * row.depth as f32))
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(entry_icon(
+                                                icons::ICON_FOLDER,
+                                                Some(disclosure),
+                                                self.theme.sidebar_foreground,
+                                            ))
+                                            .child(name),
+                                    ),
                             )
+                            .child(create_slot)
                             .child(pin_slot)
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                                 window.focus(&view.focus_handle, cx);
@@ -2520,5 +2650,705 @@ mod tests {
     fn the_date_badge_renders_before_the_remainder_only_on_the_left() {
         assert!(badge_renders_before_remainder(DateBadgePosition::Left));
         assert!(!badge_renders_before_remainder(DateBadgePosition::Right));
+    }
+
+    /// Clicks a row's hover "new folder" / "new file" button through the real
+    /// GPUI event path. `directory` is the root when `None`; otherwise the row
+    /// is found in the flattened tree, in the order the sidebar renders it.
+    fn click_create_button(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        directory: Option<&Path>,
+        note: bool,
+    ) {
+        cx.run_until_parked();
+        let row_height = px(SIDEBAR_ROW_HEIGHT);
+        let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
+        let point = match directory {
+            None => {
+                cx.simulate_mouse_move(root_row.center(), None, gpui::Modifiers::none());
+                cx.run_until_parked();
+                // The root row has no pin slot: its create slot is the row's
+                // right-most element, the folder button first, the note second.
+                let slot_width = sidebar_pins::PIN_SLOT_SIZE;
+                let slot_right = root_row.right() - px(SIDEBAR_ROW_HORIZONTAL_PADDING);
+                let button_center_x = if note {
+                    slot_right - px(slot_width / 2.0)
+                } else {
+                    slot_right - px(slot_width * 1.5)
+                };
+                gpui::point(button_center_x, root_row.center().y)
+            }
+            Some(directory) => {
+                let target_index = view.read_with(cx, |view, _| {
+                    let mut rows = Vec::new();
+                    let query = view.sidebar_filter.text().to_lowercase();
+                    if query.is_empty() {
+                        flatten_work_folder_tree(
+                            view.work_folder.as_ref().unwrap().children(),
+                            1,
+                            &view.expanded_folders,
+                            &mut rows,
+                        );
+                    } else {
+                        flatten_filtered_work_folder_tree(
+                            view.work_folder.as_ref().unwrap().children(),
+                            1,
+                            &query,
+                            &mut rows,
+                        );
+                    }
+                    rows.iter()
+                        .position(|row| {
+                            matches!(row.node, WorkFolderNode::Folder(folder) if folder.path() == directory)
+                        })
+                        .expect("the folder row is visible")
+                        + 1
+                });
+                let selector = if note {
+                    "sidebar-folder-create-note"
+                } else {
+                    "sidebar-folder-create-folder"
+                };
+                // The buttons only exist while their row is hovered: move onto
+                // the wanted row first so the reported bounds are its button.
+                let row_center = gpui::point(
+                    root_row.center().x,
+                    root_row.center().y + row_height * target_index as f32,
+                );
+                cx.simulate_mouse_move(row_center, None, gpui::Modifiers::none());
+                cx.run_until_parked();
+                let button = cx.debug_bounds(selector).expect("a folder create button");
+                assert!(
+                    button.top() <= row_center.y && row_center.y <= button.bottom(),
+                    "the hovered row's button is the one reported"
+                );
+                button.center()
+            }
+        };
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    // Issue #642: the real hover buttons create in their own row's folder,
+    // whatever is selected, and never reach the row's select / toggle / rename
+    // / open handlers.
+    #[gpui::test]
+    fn row_create_buttons_create_in_their_own_folder_without_triggering_the_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-row-create-buttons-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/inner")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/Existing.md"), "# Existing\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // `a` is expanded and `inner` collapsed; `b` is the selection.
+            view.expanded_folders.insert(root.join("a"));
+            view.selected_folder = Some(root.join("b"));
+            view.sidebar_focus = SidebarFocus::Folder;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let assert_row_untouched = |view: &gpui::Entity<EditorView>,
+                                    cx: &mut gpui::VisualTestContext,
+                                    inner_expanded: bool| {
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_folder, Some(root.join("b")));
+                assert!(view.expanded_folders.contains(&root.join("a")));
+                assert_eq!(
+                    view.expanded_folders.contains(&root.join("a/inner")),
+                    inner_expanded
+                );
+                assert!(view.inline_rename.is_none(), "no rename starts");
+                assert!(view.loading_paths.is_empty(), "no file opens");
+            });
+        };
+
+        // Nested parent row: two folders in a row, then a note.
+        let inner = root.join("a/inner");
+        click_create_button(&view, cx, Some(&inner), false);
+        click_create_button(&view, cx, Some(&inner), false);
+        assert!(root.join("a/inner/New Folder").is_dir());
+        assert!(root.join("a/inner/New Folder 2").is_dir());
+        assert!(!root.join("b/New Folder").exists());
+        // Only the creation itself expands `inner`; the row click would have
+        // toggled it back closed on the second press.
+        assert_row_untouched(&view, cx, true);
+
+        click_create_button(&view, cx, Some(&inner), true);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 1);
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .all(|draft| draft.target_directory == inner),
+                "the note starts in the clicked row's folder"
+            );
+        });
+
+        // The outer parent row.
+        let outer = root.join("a");
+        click_create_button(&view, cx, Some(&outer), false);
+        assert!(root.join("a/New Folder").is_dir());
+        click_create_button(&view, cx, Some(&outer), true);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 2);
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|draft| draft.target_directory == outer),
+                "the note starts in the outer row's folder"
+            );
+        });
+        assert_row_untouched(&view, cx, true);
+
+        // The root row.
+        click_create_button(&view, cx, None, false);
+        assert!(root.join("New Folder").is_dir());
+        assert!(!root.join("b/New Folder").exists());
+        click_create_button(&view, cx, None, true);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 3);
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|draft| draft.target_directory == root),
+                "the note starts in the root"
+            );
+        });
+        assert_row_untouched(&view, cx, true);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #642: in a 13-level-deep row with a long Japanese name at
+    // `SIDEBAR_MIN_WIDTH`, the hover create / pin buttons stay inside the row
+    // and the sidebar viewport, never overlap, and the real clicks at their
+    // centres still reach their own row's handlers.
+    #[gpui::test]
+    fn deep_row_buttons_stay_reachable_at_minimum_sidebar_width(cx: &mut gpui::TestAppContext) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-row-create-deep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut target = root.clone();
+        let mut ancestors = Vec::new();
+        for level in 1..=12 {
+            target = target.join(format!("階層{level}"));
+            ancestors.push(target.clone());
+        }
+        let target = target.join("とても長い日本語のフォルダ名".repeat(3));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(900.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.begin_pin_load(cx);
+            view.sidebar_width = SIDEBAR_MIN_WIDTH;
+            for ancestor in &ancestors {
+                view.expanded_folders.insert(ancestor.clone());
+            }
+            view.selected_folder = Some(root.join("other"));
+            view.sidebar_focus = SidebarFocus::Folder;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Hovers the target row and returns (row, new folder, new file, pin)
+        // bounds, after asserting they are all reachable.
+        let measure_calls = std::cell::Cell::new(0usize);
+        let measure = |view: &gpui::Entity<EditorView>,
+                       cx: &mut gpui::VisualTestContext|
+         -> [gpui::Bounds<gpui::Pixels>; 4] {
+            measure_calls.set(measure_calls.get() + 1);
+            let call = measure_calls.get();
+            cx.run_until_parked();
+            let (index, depth) = view.read_with(cx, |view, _| {
+                let mut rows = Vec::new();
+                flatten_work_folder_tree(
+                    view.work_folder.as_ref().unwrap().children(),
+                    1,
+                    &view.expanded_folders,
+                    &mut rows,
+                );
+                let position = rows
+                    .iter()
+                    .position(|row| {
+                        matches!(row.node, WorkFolderNode::Folder(folder) if folder.path() == target)
+                    })
+                    .expect("the deep folder row is visible");
+                (position + 1, rows[position].depth)
+            });
+            assert_eq!(depth, 13, "the target is 13 levels deep");
+            let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
+            let list = cx.debug_bounds("sidebar-list").expect("the sidebar list");
+            assert!(
+                list.right() <= px(SIDEBAR_MIN_WIDTH),
+                "the sidebar is at its minimum width: {list:?}"
+            );
+            let row = gpui::Bounds::new(
+                gpui::point(
+                    root_row.left(),
+                    root_row.top() + px(SIDEBAR_ROW_HEIGHT) * index as f32,
+                ),
+                gpui::size(root_row.size.width, px(SIDEBAR_ROW_HEIGHT)),
+            );
+            assert!(
+                row.top() >= list.top() && row.bottom() <= list.bottom(),
+                "the target row is inside the viewport: {row:?} in {list:?}"
+            );
+            cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+            cx.run_until_parked();
+            // The selectors below repeat on every row and `debug_bounds`
+            // returns one of them, so also record the target row's own
+            // create slot (keyed by its flatten index) as a reference.
+            // `debug_bounds` requires `&'static str`; the selector is used a
+            // bounded number of times in this test, so leaking is acceptable.
+            let slot_selector: &'static str = Box::leak(
+                format!(
+                    "sidebar-folder-create-slot:work-folder-create:{}",
+                    index - 1
+                )
+                .into_boxed_str(),
+            );
+            // The pin button is likewise keyed by the target's own row (an
+            // ordinary tree row, never a Pinned-area row), because the shared
+            // `sidebar-pin-toggle` key is overwritten by neighbouring rows.
+            let pin_selector: &'static str = Box::leak(
+                format!(
+                    "sidebar-pin-toggle-row:work-folder-pin-toggle:{}",
+                    index - 1
+                )
+                .into_boxed_str(),
+            );
+            let snapshot = |cx: &mut gpui::VisualTestContext| {
+                (
+                    cx.debug_bounds("sidebar-folder-create-folder"),
+                    cx.debug_bounds("sidebar-folder-create-note"),
+                    cx.debug_bounds(pin_selector),
+                    cx.debug_bounds(slot_selector),
+                )
+            };
+            let first = snapshot(cx);
+            // One more frame at the same hover point, to see whether a
+            // vertical offset is a stale frame.
+            cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+            cx.run_until_parked();
+            let second = snapshot(cx);
+            let diagnostics = format!(
+                "measure call #{call}: target={target:?} depth={depth} flatten_index={} \
+                 estimated_row={row:?} sidebar-root={root_row:?} sidebar-list={list:?} \
+                 sidebar-pin-area={:?} hover={:?}; \
+                 [first frame] folder_button={:?} note_button={:?} pin_button={:?} \
+                 target_row_slot={:?}; \
+                 [after one more frame] folder_button={:?} note_button={:?} pin_button={:?} \
+                 target_row_slot={:?}",
+                index - 1,
+                cx.debug_bounds("sidebar-pin-area"),
+                row.center(),
+                first.0,
+                first.1,
+                first.2,
+                first.3,
+                second.0,
+                second.1,
+                second.2,
+                second.3,
+            );
+            let folder_button = first
+                .0
+                .unwrap_or_else(|| panic!("the new folder button is rendered: {diagnostics}"));
+            let note_button = first
+                .1
+                .unwrap_or_else(|| panic!("the new file button is rendered: {diagnostics}"));
+            let pin_button = first
+                .2
+                .unwrap_or_else(|| panic!("the pin button is rendered: {diagnostics}"));
+            let buttons = [folder_button, note_button, pin_button];
+            for button in buttons {
+                assert!(
+                    button.left() >= row.left()
+                        && button.right() <= row.right()
+                        && button.top() >= row.top()
+                        && button.bottom() <= row.bottom(),
+                    "{button:?} stays inside the row {row:?}: {diagnostics}"
+                );
+                assert!(
+                    button.left() >= list.left()
+                        && button.right() <= list.right()
+                        && button.top() >= list.top()
+                        && button.bottom() <= list.bottom(),
+                    "{button:?} stays inside the sidebar viewport {list:?}: {diagnostics}"
+                );
+                let center = button.center();
+                assert!(
+                    center.x >= list.left()
+                        && center.x <= list.right()
+                        && center.y >= list.top()
+                        && center.y <= list.bottom(),
+                    "the click point {center:?} is not clipped: {diagnostics}"
+                );
+            }
+            for (index, first) in buttons.iter().enumerate() {
+                for second in &buttons[index + 1..] {
+                    assert!(
+                        first.right() <= second.left() || second.right() <= first.left(),
+                        "{first:?} and {second:?} must not overlap: {diagnostics}"
+                    );
+                }
+            }
+            [row, folder_button, note_button, pin_button]
+        };
+        let assert_row_untouched = |view: &gpui::Entity<EditorView>,
+                                    cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_folder, Some(root.join("other")));
+                assert!(view.inline_rename.is_none(), "no rename starts");
+                assert!(view.loading_paths.is_empty(), "no file opens");
+            });
+        };
+
+        // Two folders in a row: a propagated row click would toggle the
+        // target closed again on the second press.
+        for _ in 0..2 {
+            let [_, folder_button, _, _] = measure(&view, cx);
+            cx.simulate_click(folder_button.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        }
+        assert!(target.join("New Folder").is_dir());
+        assert!(target.join("New Folder 2").is_dir());
+        assert!(!root.join("other/New Folder").exists());
+        view.read_with(cx, |view, _| {
+            assert!(view.expanded_folders.contains(&target));
+        });
+        assert_row_untouched(&view, cx);
+
+        let [_, _, note_button, _] = measure(&view, cx);
+        cx.simulate_click(note_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 1);
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .all(|draft| draft.target_directory == target),
+                "the note starts in the deep row's folder"
+            );
+        });
+        assert_row_untouched(&view, cx);
+
+        // Pin through the real click; the Pinned area shifts the rows.
+        let pinned_here = |view: &gpui::Entity<EditorView>,
+                           cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.sidebar_pins
+                    .entries
+                    .iter()
+                    .any(|entry| root.join(&entry.relative_path) == target)
+            })
+        };
+        let [_, _, _, pin_button] = measure(&view, cx);
+        cx.simulate_click(pin_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(pinned_here(&view, cx), "the deep folder is pinned");
+        assert_row_untouched(&view, cx);
+
+        // The remaining create buttons are still reachable after the shift.
+        let [_, folder_button, _, _] = measure(&view, cx);
+        cx.simulate_click(folder_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(target.join("New Folder 3").is_dir());
+        assert!(!root.join("other/New Folder 3").exists());
+        view.read_with(cx, |view, _| {
+            assert!(view.expanded_folders.contains(&target));
+        });
+        assert_row_untouched(&view, cx);
+
+        // Unpin from the same ordinary row.
+        let [_, _, _, pin_button] = measure(&view, cx);
+        cx.simulate_click(pin_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!pinned_here(&view, cx), "the deep folder is unpinned");
+        assert_row_untouched(&view, cx);
+        let [_, _, note_button, _] = measure(&view, cx);
+        cx.simulate_click(note_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.work_folder_drafts.len(), 2);
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #642: a folder created from a row's hover button while the filter
+    // shows that row through closed ancestors stays hidden (it is empty) during
+    // the filter, and every ancestor plus the new folder is rendered and
+    // reachable once the filter is cleared through the real input path.
+    #[gpui::test]
+    fn folder_created_under_a_filtered_closed_ancestor_chain_is_reachable_after_clearing_the_filter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-row-create-filtered-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let level1 = root.join("a");
+        let level2 = level1.join("b");
+        let level3 = level2.join("c");
+        let target = level3.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(target.join("Needle.md"), "# Needle\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // Every ancestor of `target` is closed; another folder is selected.
+            view.selected_folder = Some(root.join("other"));
+            view.sidebar_focus = SidebarFocus::Folder;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.expanded_folders.is_empty());
+        });
+
+        // Filter through the real input path.
+        let filter_point = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter_point, gpui::Modifiers::none());
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter.text(), "needle");
+            assert!(view.expanded_folders.is_empty());
+        });
+        assert!(cx.debug_bounds("sidebar-filter-empty").is_none());
+
+        // Hover the filtered target row and click its real new-folder button.
+        click_create_button(&view, cx, Some(&target), false);
+        let created = target.join("New Folder");
+        assert!(created.is_dir(), "created inside the hovered folder");
+        assert!(!root.join("other/New Folder").exists());
+        assert!(!level3.join("New Folder").exists());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.selected_folder, Some(root.join("other")));
+            assert!(view.inline_rename.is_none(), "no rename starts");
+            assert!(view.loading_paths.is_empty(), "no file opens");
+            let mut rows = Vec::new();
+            flatten_filtered_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                "needle",
+                &mut rows,
+            );
+            let paths: Vec<&Path> = rows.iter().map(|row| row.node.path()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    level1.as_path(),
+                    level2.as_path(),
+                    level3.as_path(),
+                    target.as_path(),
+                    target.join("Needle.md").as_path(),
+                ],
+                "the empty new folder stays hidden while filtering"
+            );
+        });
+
+        // Creating the folder blurred the filter; click the currently
+        // rendered filter again to bring input focus back.
+        let filter_point = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sidebar_filter_focused,
+                "clicking the filter restores input focus"
+            );
+            assert_eq!(view.sidebar_filter.text(), "needle");
+        });
+
+        // Clear the filter through the real input path.
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_filter.text().is_empty());
+        });
+        assert!(cx.debug_bounds("sidebar-filter-empty").is_none());
+
+        // Every ancestor and the new folder are rendered rows that can be
+        // hovered and reached: the real hover button is reported on each row.
+        for folder in [&level1, &level2, &level3, &target, &created] {
+            click_create_button_hover_only(&view, cx, folder);
+        }
+        // The new folder row accepts a real click on its own button.
+        click_create_button(&view, cx, Some(&created), true);
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|draft| draft.target_directory == created),
+                "the note starts in the new folder"
+            );
+            assert_eq!(view.selected_folder, Some(root.join("other")));
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Hovers the rendered row of `directory` in the unfiltered tree and
+    /// asserts that its create button is rendered on that row.
+    fn click_create_button_hover_only(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        directory: &Path,
+    ) {
+        cx.run_until_parked();
+        let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
+        let index = view.read_with(cx, |view, _| {
+            let mut rows = Vec::new();
+            flatten_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                &view.expanded_folders,
+                &mut rows,
+            );
+            rows.iter()
+                .position(|row| {
+                    matches!(row.node, WorkFolderNode::Folder(folder) if folder.path() == directory)
+                })
+                .unwrap_or_else(|| panic!("{} is a visible row", directory.display()))
+                + 1
+        });
+        let row_center = gpui::point(
+            root_row.center().x,
+            root_row.center().y + px(SIDEBAR_ROW_HEIGHT) * index as f32,
+        );
+        cx.simulate_mouse_move(row_center, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("sidebar-folder-create-folder")
+            .unwrap_or_else(|| panic!("{} renders its create button", directory.display()));
+        assert!(button.top() <= row_center.y && row_center.y <= button.bottom());
+    }
+
+    // Issue #642: the buttons' Japanese tooltips are painted on hover in a
+    // window without a `gpui_component::Root`, and hovering creates nothing.
+    #[gpui::test]
+    fn row_create_buttons_paint_their_tooltips_on_hover_without_creating(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-row-create-tooltips-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
+        let row_center = gpui::point(
+            root_row.center().x,
+            root_row.center().y + px(SIDEBAR_ROW_HEIGHT),
+        );
+        for (button_selector, tooltip_selector) in [
+            (
+                "sidebar-folder-create-folder",
+                "sidebar-folder-create-tooltip:新規フォルダ",
+            ),
+            (
+                "sidebar-folder-create-note",
+                "sidebar-folder-create-tooltip:新規ファイル",
+            ),
+        ] {
+            cx.simulate_mouse_move(row_center, None, gpui::Modifiers::none());
+            cx.run_until_parked();
+            let button = cx
+                .debug_bounds(button_selector)
+                .expect("the hovered row renders its create button");
+            assert!(
+                cx.debug_bounds(tooltip_selector).is_none(),
+                "no tooltip before the button is hovered"
+            );
+            cx.simulate_mouse_move(button.center(), None, gpui::Modifiers::none());
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(1500));
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds(tooltip_selector).is_some(),
+                "{tooltip_selector} is painted after hovering"
+            );
+        }
+
+        // Hovering alone creates no folder, file or draft.
+        view.read_with(cx, |view, _| {
+            assert!(view.work_folder_drafts.is_empty());
+        });
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(root.join("a")).unwrap().count(), 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
