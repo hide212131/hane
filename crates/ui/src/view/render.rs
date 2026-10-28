@@ -93,6 +93,7 @@ impl EditorView {
         {
             self.tab_close_confirm = None;
         }
+        self.prune_external_comparison();
         self.begin_mermaid_frame(window, cx);
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
@@ -608,6 +609,11 @@ impl EditorView {
         };
         let rendered = if let Some(confirm) = self.tab_close_confirm.as_ref() {
             rendered.child(self.tab_close_confirm_element(confirm, cx))
+        } else {
+            rendered
+        };
+        let rendered = if let Some(overlay) = self.external_comparison_overlay(cx) {
+            rendered.child(overlay)
         } else {
             rendered
         };

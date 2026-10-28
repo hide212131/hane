@@ -65,10 +65,21 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 - テスト: `crates/session/tests/external_change.rs` に、確認後・適用前にディスクだけが再変更される場合、消失・読込不能、編集後／旧requestの破棄、通常成功の回帰テストを追加。UI(GPUI)側の専用テストは追加していない。
 - 未実行: build・tests・Clippy（macOS / Windows）、focused GUI。上書き経路は変更していない。
 
+### 差分確認（AC4、Claude worker、未検証）
+
+このworkerはshell・test・build・lintを実行していない。コードを書いた範囲の記録であり、検証済みを意味しない。
+
+- `crates/ui/src/view/external_comparison.rs`（新規）: 読取専用の比較。左にsessionが観測済みのディスク版（`observed_document()`）、右に編集中版を、開いた時点の固定snapshot（String）として表示する。文書id・`DocumentInstance`・編集revision・外部fingerprint（`observed_fingerprint()`）に束縛。ファイル読込・hash計算はせず、メモリ上の2本文のコピーのみ。観測済み本文がない場合は空や古い内容を出さず、比較を開かず案内statusを出す。
+- 鮮度: `Current` / `Updated`（手元編集または外部版更新）/ `Gone`（文書instance切替）。`Updated` では「内容が更新されました」と「最新の内容で再比較」を表示する。再比較は現在のsessionの観測で撮り直し、既存の `start_external_check`（背景確認）を呼ぶ。`Gone`・非active文書の比較はrenderで破棄し、作業フォルダ切替でも破棄する。
+- 古い比較中は `run_resolution` の再読込・上書き・別名保存を拒否する（`external_comparison_is_stale`）。比較画面自体には再読込・上書き・保存の操作を置かない。
+- 入口: 保存状態メニューに「差分を確認」（`ResolutionAction::Compare`、再読込と同じく外部版を保持している競合時のみ）。表示は各版の先頭2,000行まで（超過は注記）。強調は共通の先頭／末尾行を除いた範囲の行単位で、上限内の行のみで計算する。
+- 変更: `view.rs`（field・mod・切替時破棄）、`view/render.rs`（prune・overlay）、`view/external_change.rs`（action・stale拒否）、`view/footer.rs`（menu項目）。
+- テスト（未実行）: `external_comparison.rs` に、開く／閉じるで本文・revision・dirty・ディスク内容が不変、手元編集・外部版更新・文書置換後のstale／Gone、再比較、観測なしで開かない、footer actionとstale時の再読込・上書き・別名保存の拒否、行範囲・行数上限の単体テスト。undo/redo・draftの直接検証、IME中の比較は追加していない。
+- 未実行: build・tests・Clippy（macOS / Windows）、focused GUI（T04）。
+
 ### 未実装・未検証（受入条件を満たしたと扱わない）
 
 - 監視寿命以外の独立root（下記の差分確認、ディスク版の整合読込・fingerprint・OS file identity、保存承認鮮度、同一実体のSave As、全域リファクタリング）。
-- 差分確認（ディスク版／編集中版の読取専用比較表示）。session側に `observed_document()` はあるが画面は未実装。
 - 別名保存で同一実体（symlink・ハードリンク等）を選んだ場合の保護。現状は字句上の同一pathだけを同一ファイルとして扱う。
 - IME中の延期と非アクティブ文書の自動再読込のGUI経路テスト、再読込時のdraft write / AI・解析結果との接続のUIテスト（sessionのgeneration更新までは実装）。
 - 保存前の内容照合は対象ファイル全体を背景で読む。大文書・複数タブでの入力応答、背景時間、メモリ、snapshot上限の前後比較（T12）は未測定。

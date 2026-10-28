@@ -294,6 +294,14 @@ fn build_menu(
             ResolutionAction::SaveAs,
         ));
         if choices.reload {
+            // A reload is offered only while the session holds the observed
+            // disk version, which is also what the comparison shows.
+            menu = menu.item(resolution_item(
+                "差分を確認",
+                "footer-resolve-compare",
+                view,
+                ResolutionAction::Compare,
+            ));
             menu = menu.item(resolution_item(
                 "ディスクの内容を読み直す（未保存の編集を破棄）",
                 "footer-resolve-reload",

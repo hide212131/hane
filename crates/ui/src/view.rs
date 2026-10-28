@@ -108,6 +108,7 @@ mod editor_context_menu;
 use editor_context_menu::EditorContextMenu;
 mod document_watch;
 mod external_change;
+mod external_comparison;
 use external_change::{ResolutionAction, ResolutionChoices};
 mod folder_watch;
 mod footer;
@@ -954,6 +955,10 @@ pub struct EditorView {
     /// raised for, so a record that outlives its document is never shown, and
     /// it is cleared only by a valid save success of that same document.
     save_problems: HashMap<SessionId, ScopedSaveProblem>,
+    /// The read-only disk / editing comparison of an external change, if open.
+    /// Fixed snapshots bound to the document instance, revision and observed
+    /// disk fingerprint; never persisted and never used to change a document.
+    external_comparison: Option<external_comparison::ExternalComparison>,
     /// The last failure to write the settings file, shown in the general
     /// settings page. Kept apart from `settings_error`, which belongs to the
     /// Windows integration.
@@ -1868,6 +1873,7 @@ impl EditorView {
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
             save_problems: HashMap::new(),
+            external_comparison: None,
             settings_store_error: None,
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
@@ -3422,6 +3428,7 @@ impl EditorView {
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
         self.save_problems.clear();
+        self.external_comparison = None;
         // Any background read still in flight for the old folder (or for
         // single-file state) is now for a session that no longer exists;
         // bumping this makes `finish_open` discard it instead of merging a

@@ -41,6 +41,8 @@ pub(super) enum ResolutionAction {
     /// Looks at the file on disk again; offered while its changes are not
     /// being watched. Changes nothing by itself.
     Recheck,
+    /// Shows the disk version and the edited version side by side, read-only.
+    Compare,
 }
 
 /// Which of the destructive choices apply to the active document right now.
@@ -264,7 +266,21 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A comparison that is out of date must not lead to a reload, an
+        // overwrite or a save-as: compare again first (or close it).
+        if matches!(
+            action,
+            ResolutionAction::SaveAs | ResolutionAction::Reload | ResolutionAction::Overwrite
+        ) && self.external_comparison_is_stale()
+        {
+            self.status = Some(
+                "比較中の内容が更新されました。再比較してから操作してください".to_owned(),
+            );
+            cx.notify();
+            return;
+        }
         match action {
+            ResolutionAction::Compare => self.open_external_comparison(cx),
             ResolutionAction::SaveAs => self.prompt_save_as(cx),
             ResolutionAction::Reload => self.confirm_discarding_reload(window, cx),
             ResolutionAction::Overwrite => self.confirm_overwrite(window, cx),
