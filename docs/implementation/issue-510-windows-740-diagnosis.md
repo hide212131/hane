@@ -2,7 +2,7 @@
 
 関連Issue: [#510](https://github.com/hide212131/hane/issues/510)
 
-状態: 原因未確定。診断専用の記録で、製品コードの変更や受入判定は含まない。
+状態: 初回診断では原因未確定だった。その後の隔離比較で、同一bytesでもbasenameにより起動可否が変わることを観測した。これを受けてWindowsのtransaction copy名を中立化する実装候補が入っている。Windows内部の原因は確定しておらず、通常CI/exact-head検証と実Windowsでの正式な更新・再起動受入は未確認。
 
 ## 観測
 
@@ -26,10 +26,22 @@ v0.32.0では、準備時にインストール済みの署名済みhelperをtran
 
 ## コード上の境界
 
-v0.32.0と現行mainの`Coordination::from_helper_exe`は、実行ファイル名ではなく親の`helper` directory、transaction/install ID、owner-only directory/ACLを検証する。したがって、実装候補はインストール済みファイルとsigned inventoryの`hane-updater.exe`を維持し、transaction用copyのbasenameだけを`hane-worker.exe`等へ変えること。実装ではhelper record、復旧、launch path、各platformの既存契約を確認し、neutral copyの経路を回帰テストする。
+v0.32.0と現行mainの`Coordination::from_helper_exe`は、実行ファイル名ではなく親の`helper` directory、transaction/install ID、owner-only directory/ACLを検証する。したがって、実装候補はインストール済みファイルとsigned inventoryの`hane-updater.exe`を維持し、transaction用copyのbasenameだけを中立名へ変えること。
+
+## 実装候補（head ec78b2a）
+
+- Windowsのtransaction用staged helper copy名を中立化した。
+- インストール済みhelper名（`hane-updater.exe`）とsigned inventoryは維持している。
+- これは隔離比較で観測したbasename依存の起動差に対する候補であり、Windows内部の判定規則を確定した上での修正ではない。UAC/AppCompat側の未確認要因も残る。
 
 参照: [v0.32.0 path validation](https://github.com/hide212131/hane/blob/v0.32.0/crates/update/src/platform/lease.rs#L161-L194)、[current main path validation](https://github.com/hide212131/hane/blob/ad4b80b155bf219a9c5686858dba3c87f14c3e77/crates/update/src/platform/lease.rs#L161-L194)。
 
 ## 次の工程
 
-同じDraft PRで、installed helper名とinventoryを維持するneutral transaction-copy名の実装を依頼する。昇格要求、UAC/AppCompat回避、設定変更は行わない。診断プローブだけではfull handshakeや適用成功を確認していない。
+## 未確認事項
+
+- 通常CIとexact-headでの検証結果は、この文書の時点では未確認。
+- 実Windowsでの正式な更新準備・適用・再起動の受入は未実施で、成功とは扱わない。
+- 診断プローブだけではfull handshakeや適用成功を確認していない。
+
+昇格要求、UAC/AppCompat回避、設定変更は行わない。次の工程（検証・レビュー・実機受入）の判断はCommanderの再観測に委ねる。
