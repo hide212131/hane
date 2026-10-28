@@ -8,6 +8,8 @@
 
 調査基準: main `4f11a6675381838a33653ba0fb0ad62b364f34c9`（2026-10-26）。実装開始時にはcurrent main、対象Issue、関連PRと実行中runを再確認する。
 
+2026-10-28の追加設計: [Issue #649](https://github.com/hide212131/hane/issues/649)の[更新通知設計](application-update-notifications.md)は、本体更新metadataだけを起動後・使用中1時間ごとに確認する。下記P10の起動時無通信にはこの確認だけを例外として追加する。自動確認も既存のnetwork snapshotを通し、AI/runtime/Skillsや設定の表示・保存を新しい通信トリガーにしない。通知機能の製品実装は未実施。
+
 ## 2. 現在の通信経路
 
 | 機能 | 現在の入口 | 現状と変更点 |
@@ -150,7 +152,7 @@ AI childは起動時環境が固定のため、既存のstop/reconfigureとgener
 | P7 | pinned runtimeのChatGPT、Custom Provider、モデル取得、本文変換、必要なWebSocket、loopbackが各方式に従う | 両OSで実runtime+proxyの接続観測。fake childのenv試験は補助のみ。認証/API経路と外部ブラウザを区別 |
 | P8 | 変更中の操作と旧AI childの応答を混ぜず、次の操作が新設定を使う | cancel/停止/遅延応答のgeneration試験、設定変更→再接続のfocused GUI |
 | P9 | 更新後も設定を使え、認証proxyの秘密を通常ファイルへ保存しない | 両OSの更新/再起動fixture、OS秘密ストアと環境復元、残骸削除・復元失敗試験 |
-| P10 | 起動/設定表示/保存だけでは通信せず、失敗を分類表示し、秘密を漏らさない | 無通信assert、診断redaction試験、GUIエラー確認、state/ticket/log/argvのfixture秘密検索 |
+| P10 | 本体更新metadataの追加設計による自動確認を除き、起動/設定表示/保存だけでは通信せず、失敗を分類表示し、秘密を漏らさない | 自動確認arm前/非対象機能/設定表示・保存の無通信assert、自動checkのnetwork snapshot試験、診断redaction試験、GUIエラー確認、state/ticket/log/argvのfixture秘密検索 |
 
 実装PRでは `cargo test --workspace --all-features`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` と通常Release buildをmacOS/Windowsで確認する。通信fixtureは実サービスや実ユーザーの秘密に依存させず、productionのTLS無効化flagは作らない。実ChatGPT連携等の認証が必要な検証は専用アカウントと秘匿した観測を使い、未実施は未検証と記録する。
 

@@ -22,6 +22,8 @@
 
 ## 1. 着手前の確認
 
+2026-10-28の追加設計: 起動後・使用中1時間ごとのmetadata確認と下部の更新入口は[Issue #649](https://github.com/hide212131/hane/issues/649)と[更新通知設計](design/application-update-notifications.md)で扱う。U0〜U5の実装・検証が完了したという記録ではない。本体の自動確認だけを追加し、本人操作による取得・再起動、Readyのローカル復元、既存の保存・署名・適用保護を維持する。
+
 current main、追跡Issue、関連PRと同対象の実行中runを読み直す。本設計PRを実装用に転用しない。設計採用後、各段階の実装Issueに目的・範囲・下表の受入条件と設計pathを記し、文書準備commitを持つ別の実装用Draft PRを作る。通常製品実装は[Claude実行手順](aadw-claude-execution.md)に従う。
 
 | 重なる作業 | 調整する責務／待つ範囲 |
