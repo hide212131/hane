@@ -8,8 +8,9 @@
 use hane_session::testing::MemoryFileService;
 use hane_session::{
     ContentFingerprint, DocumentSession, ExternalCheckOutcome, ExternalCheckStart, ExternalStatus,
-    FileService, OverwriteGuard, ReloadOutcome, ResolutionKind, SaveDecision, SaveIntent, SaveJob,
-    SaveOutcome, SessionId, run_external_check, run_save_job,
+    FileService, OverwriteGuard, ReloadOutcome, ReloadVerifyOutcome, ReloadVerifyRequest,
+    ResolutionKind, SaveDecision, SaveIntent, SaveJob, SaveOutcome, SessionId, run_external_check,
+    run_reload_verification, run_save_job,
 };
 use std::path::Path;
 
@@ -512,6 +513,145 @@ fn a_confirmed_reload_takes_the_disk_version_only_with_a_current_approval() {
     assert!(!session.is_dirty());
     assert_ne!(session.generation(), generation);
     assert_eq!(session.apply_confirmed_reload(approval), ReloadOutcome::StaleApproval);
+}
+
+/// Confirms a reload of what the session currently shows and returns the
+/// request that reads the disk again.
+fn confirm_reload(session: &mut DocumentSession) -> ReloadVerifyRequest {
+    let approval = session
+        .approve_resolution(ResolutionKind::DiscardAndReload, session.observed_fingerprint())
+        .unwrap();
+    session.begin_confirmed_reload(approval).unwrap()
+}
+
+#[test]
+fn a_reload_confirmed_for_the_version_still_on_disk_is_applied() {
+    let service = MemoryFileService::new();
+    let mut session = opened(&service, "base\n");
+    type_into(&mut session, "mine ");
+    service.write_externally(PATH, "theirs\n");
+    check(&mut session, &service);
+
+    let request = confirm_reload(&mut session);
+    let result = run_reload_verification(&service, &request);
+    assert_eq!(
+        session.finish_confirmed_reload(&request, result),
+        ReloadVerifyOutcome::Reloaded
+    );
+    assert_eq!(text(&session), "theirs\n");
+    assert!(!session.is_dirty());
+}
+
+#[test]
+fn a_disk_change_during_the_dialog_refuses_the_old_approval_and_asks_again() {
+    let service = MemoryFileService::new();
+    let mut session = opened(&service, "base\n");
+    type_into(&mut session, "mine ");
+    service.write_externally(PATH, "theirs v1\n");
+    check(&mut session, &service);
+    let kept = text(&session);
+    let shown = session.observed_fingerprint();
+
+    let request = confirm_reload(&mut session);
+    // Only the disk changes: no watcher check reaches the session.
+    service.write_externally(PATH, "theirs v2\n");
+    assert_eq!(session.observed_fingerprint(), shown);
+    let result = run_reload_verification(&service, &request);
+    assert_eq!(
+        session.finish_confirmed_reload(&request, result),
+        ReloadVerifyOutcome::DiskChanged
+    );
+
+    // The stale observation was not applied; the user's text is intact.
+    assert_eq!(text(&session), kept);
+    assert!(session.is_dirty());
+    assert_eq!(session.external_status(), ExternalStatus::Changed);
+    assert_ne!(session.observed_fingerprint(), shown);
+    assert_eq!(
+        session.observed_document().map(|d| d.full_text()).as_deref(),
+        Some("theirs v2\n")
+    );
+
+    // Re-approving the old version is refused; the new one needs a new answer.
+    assert!(
+        session
+            .approve_resolution(ResolutionKind::DiscardAndReload, shown)
+            .is_none()
+    );
+    let request = confirm_reload(&mut session);
+    let result = run_reload_verification(&service, &request);
+    assert_eq!(
+        session.finish_confirmed_reload(&request, result),
+        ReloadVerifyOutcome::Reloaded
+    );
+    assert_eq!(text(&session), "theirs v2\n");
+}
+
+#[test]
+fn a_file_that_vanishes_or_cannot_be_read_during_the_dialog_keeps_the_text() {
+    let service = MemoryFileService::new();
+    let mut session = opened(&service, "base\n");
+    type_into(&mut session, "mine ");
+    service.write_externally(PATH, "theirs\n");
+    check(&mut session, &service);
+    let kept = text(&session);
+
+    let request = confirm_reload(&mut session);
+    service.delete(PATH);
+    let result = run_reload_verification(&service, &request);
+    assert_eq!(
+        session.finish_confirmed_reload(&request, result),
+        ReloadVerifyOutcome::Missing
+    );
+    assert_eq!(text(&session), kept);
+    assert!(session.is_dirty());
+    assert_eq!(session.external_status(), ExternalStatus::Missing);
+
+    // Back on disk as bytes that are not text: unverifiable, still kept.
+    service.write_externally(PATH, "theirs again\n");
+    check(&mut session, &service);
+    let request = confirm_reload(&mut session);
+    service.write_bytes_externally(PATH, &[0xff, 0xfe, 0x00, 0xff]);
+    let result = run_reload_verification(&service, &request);
+    assert!(matches!(
+        session.finish_confirmed_reload(&request, result),
+        ReloadVerifyOutcome::Unverifiable { .. }
+    ));
+    assert_eq!(text(&session), kept);
+    assert!(session.is_dirty());
+}
+
+#[test]
+fn a_verification_for_an_edited_document_or_an_older_request_is_dropped() {
+    let service = MemoryFileService::new();
+    let mut session = opened(&service, "base\n");
+    type_into(&mut session, "mine ");
+    service.write_externally(PATH, "theirs\n");
+    check(&mut session, &service);
+
+    let request = confirm_reload(&mut session);
+    type_into(&mut session, "later ");
+    let kept = text(&session);
+    let result = run_reload_verification(&service, &request);
+    assert_eq!(
+        session.finish_confirmed_reload(&request, result),
+        ReloadVerifyOutcome::Stale
+    );
+    assert_eq!(text(&session), kept);
+
+    let older = confirm_reload(&mut session);
+    let newer = confirm_reload(&mut session);
+    let result = run_reload_verification(&service, &older);
+    assert_eq!(
+        session.finish_confirmed_reload(&older, result),
+        ReloadVerifyOutcome::Stale
+    );
+    assert_eq!(text(&session), kept);
+    let result = run_reload_verification(&service, &newer);
+    assert_eq!(
+        session.finish_confirmed_reload(&newer, result),
+        ReloadVerifyOutcome::Reloaded
+    );
 }
 
 #[test]

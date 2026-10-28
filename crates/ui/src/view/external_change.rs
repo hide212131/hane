@@ -20,7 +20,8 @@
 use super::*;
 use hane_session::{
     ContentFingerprint, ExternalCheckOutcome, ExternalCheckResult, ExternalCheckStart,
-    ExternalCheckTicket, ExternalStatus, ReloadOutcome, ResolutionKind, run_external_check,
+    ExternalCheckTicket, ExternalStatus, ReloadOutcome, ReloadVerifyOutcome, ReloadVerifyRequest,
+    ReloadVerifyResult, ResolutionKind, run_external_check, run_reload_verification,
 };
 
 /// Prefix of the save-problem text that reports an unreadable external file,
@@ -315,8 +316,6 @@ impl EditorView {
         if !confirmed || self.document_instance(id) != Some(instance) {
             return;
         }
-        let was_active = self.sessions.active_id() == id;
-        let position = self.view_position();
         let Some(session) = self.sessions.get_mut(id) else {
             return;
         };
@@ -338,21 +337,108 @@ impl EditorView {
             cx.notify();
             return;
         };
-        match session.apply_confirmed_reload(approval) {
-            ReloadOutcome::Reloaded => {
+        // The answer is not enough: the disk may have changed while the dialog
+        // was open and the watcher result may not have arrived yet. Read the
+        // file again in the background and take it only if it is still the
+        // version the user was shown.
+        let request = match session.begin_confirmed_reload(approval) {
+            Ok(request) => request,
+            Err(ReloadOutcome::Busy) => {
+                self.status = Some(
+                    "入力の変換中または保存中のため読み直していません。終わってからやり直してください"
+                        .to_owned(),
+                );
+                cx.notify();
+                return;
+            }
+            Err(_) => {
+                self.status = Some(
+                    "確認後に文書またはディスクの内容が変わったため読み直していません"
+                        .to_owned(),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let files = self.files.clone();
+        cx.spawn(async move |view, cx| {
+            let (request, result) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = run_reload_verification(files.as_ref(), &request);
+                    (request, result)
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_verified_reload(id, instance, request, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Applies the fresh read made after a reload confirmation. Anything but
+    /// the exact version the user was shown keeps the text, history and draft
+    /// and asks again.
+    fn finish_verified_reload(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        request: ReloadVerifyRequest,
+        result: ReloadVerifyResult,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document_instance(id) != Some(instance) {
+            return;
+        }
+        let was_active = self.sessions.active_id() == id;
+        let position = self.view_position();
+        let Some(session) = self.sessions.get_mut(id) else {
+            return;
+        };
+        let outcome = session.finish_confirmed_reload(&request, result);
+        let dirty = session.is_dirty();
+        let path = session.path().map(Path::to_path_buf);
+        match outcome {
+            ReloadVerifyOutcome::Reloaded => {
                 self.after_document_reloaded(id, was_active, position, cx);
                 self.status = Some("ディスクの内容を読み直しました".to_owned());
             }
-            ReloadOutcome::StaleApproval => {
+            ReloadVerifyOutcome::Stale => {
                 self.status = Some(
                     "確認後に文書またはディスクの内容が変わったため読み直していません"
                         .to_owned(),
                 );
             }
-            ReloadOutcome::Busy => {
+            ReloadVerifyOutcome::Busy => {
                 self.status = Some(
                     "入力の変換中または保存中のため読み直していません。終わってからやり直してください"
                         .to_owned(),
+                );
+            }
+            ReloadVerifyOutcome::DiskChanged => {
+                if dirty {
+                    self.record_save_problem(id, instance, path, DocumentSaveProblem::Conflict);
+                }
+                self.status = Some(
+                    "確認後にディスクの内容が更新されたため読み直していません。最新の内容を確認してください"
+                        .to_owned(),
+                );
+            }
+            ReloadVerifyOutcome::Missing => {
+                self.status = Some(
+                    "確認後にファイルが見つからなくなったため読み直していません。編集中の内容は保持しています"
+                        .to_owned(),
+                );
+            }
+            ReloadVerifyOutcome::Unverifiable { reason } => {
+                self.record_save_problem(
+                    id,
+                    instance,
+                    path,
+                    DocumentSaveProblem::Failed(format!("{UNVERIFIABLE_PREFIX}{reason}")),
+                );
+                self.status = Some(
+                    "確認後にディスクの内容を確認できなくなったため読み直していません".to_owned(),
                 );
             }
         }

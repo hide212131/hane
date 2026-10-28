@@ -282,6 +282,58 @@ pub enum ReloadOutcome {
     Busy,
 }
 
+/// A confirmed reload waiting for the disk to be read again. The read happens
+/// after the answer, so what is applied is what was read *then*, and only if it
+/// is the version the user was shown.
+pub struct ReloadVerifyRequest {
+    approval: ResolutionApproval,
+    generation: u64,
+    revision: Revision,
+    sequence: u64,
+    path: PathBuf,
+}
+
+impl ReloadVerifyRequest {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// What the I/O side found for a [`ReloadVerifyRequest`].
+pub struct ReloadVerifyResult {
+    disk: DiskVersion,
+}
+
+/// Reads the file once as a consistent version. Blocking: call from a
+/// background executor, never the UI thread.
+pub fn run_reload_verification(
+    service: &dyn FileService,
+    request: &ReloadVerifyRequest,
+) -> ReloadVerifyResult {
+    ReloadVerifyResult {
+        disk: observe_disk(service, request.path()),
+    }
+}
+
+/// Result of applying a [`ReloadVerifyResult`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReloadVerifyOutcome {
+    /// The disk still held the version the user was shown; it was taken.
+    Reloaded,
+    /// The request, document or approval no longer matches; nothing changed.
+    Stale,
+    /// An IME composition or a write is running; nothing changed.
+    Busy,
+    /// The disk now holds a different version. It is remembered as the new
+    /// external version; the text, history and draft are kept and the user
+    /// must confirm again.
+    DiskChanged,
+    /// The file is gone. The content is kept.
+    Missing,
+    /// The file could not be read consistently. The content is kept.
+    Unverifiable { reason: String },
+}
+
 /// One open document: its editor, the file it came from, and everything about
 /// persistence that is not I/O. Holds no window, no renderer, and no executor,
 /// so every rule below is testable without a UI.
@@ -317,6 +369,9 @@ pub struct DocumentSession {
     approval_serial: u64,
     /// The only approval that may still be consumed.
     live_approval: Option<u64>,
+    verify_sequence: u64,
+    /// Sequence of the one reload verification whose answer is still wanted.
+    verify_in_flight: Option<u64>,
 }
 
 impl DocumentSession {
@@ -350,6 +405,8 @@ impl DocumentSession {
             recheck_pending: false,
             approval_serial: 0,
             live_approval: None,
+            verify_sequence: 0,
+            verify_in_flight: None,
         }
     }
 
@@ -1091,6 +1148,87 @@ impl DocumentSession {
             stamp: observed.stamp,
         });
         ReloadOutcome::Reloaded
+    }
+
+    /// First half of a confirmed reload: checks the approval against the
+    /// session as it is now and returns the read to run in the background.
+    /// Nothing is discarded or consumed here; a newer request supersedes an
+    /// older one.
+    pub fn begin_confirmed_reload(
+        &mut self,
+        approval: ResolutionApproval,
+    ) -> Result<ReloadVerifyRequest, ReloadOutcome> {
+        if self.editor.ime().is_some() || self.in_flight.is_some() {
+            return Err(ReloadOutcome::Busy);
+        }
+        if !self.approval_is_current(approval, ResolutionKind::DiscardAndReload)
+            || !matches!(self.external, ExternalState::Changed(_))
+        {
+            return Err(ReloadOutcome::StaleApproval);
+        }
+        let Some(path) = self.file.path().map(Path::to_path_buf) else {
+            return Err(ReloadOutcome::StaleApproval);
+        };
+        self.verify_sequence = self.verify_sequence.wrapping_add(1);
+        self.verify_in_flight = Some(self.verify_sequence);
+        Ok(ReloadVerifyRequest {
+            approval,
+            generation: self.generation,
+            revision: self.revision(),
+            sequence: self.verify_sequence,
+            path,
+        })
+    }
+
+    /// Second half: the text is taken only if the file read after the answer
+    /// is the version the user was shown. Otherwise the text, history and
+    /// draft stay as they are, the newly read state replaces the remembered
+    /// external state (which kills the old approval), and the user is asked
+    /// again.
+    pub fn finish_confirmed_reload(
+        &mut self,
+        request: &ReloadVerifyRequest,
+        result: ReloadVerifyResult,
+    ) -> ReloadVerifyOutcome {
+        if self.verify_in_flight != Some(request.sequence)
+            || self.generation != request.generation
+            || self.file.path() != Some(request.path.as_path())
+            || self.revision() != request.revision
+        {
+            return ReloadVerifyOutcome::Stale;
+        }
+        self.verify_in_flight = None;
+        if self.editor.ime().is_some() || self.in_flight.is_some() {
+            return ReloadVerifyOutcome::Busy;
+        }
+        match result.disk {
+            DiskVersion::Present(observed)
+                if self.approval_is_current(request.approval, ResolutionKind::DiscardAndReload)
+                    && request.approval.shown == Some(observed.fingerprint) =>
+            {
+                self.replace_with_disk(*observed);
+                ReloadVerifyOutcome::Reloaded
+            }
+            DiskVersion::Present(observed) => {
+                let observed = *observed;
+                self.file.mark_present();
+                self.set_external(ExternalState::Changed(ObservedExternal {
+                    fingerprint: observed.fingerprint,
+                    stamp: observed.stamp,
+                    document: observed.document,
+                }));
+                ReloadVerifyOutcome::DiskChanged
+            }
+            DiskVersion::Missing => {
+                self.set_external(ExternalState::Missing);
+                self.file.mark_missing();
+                ReloadVerifyOutcome::Missing
+            }
+            DiskVersion::Unreadable(reason) => {
+                self.set_external(ExternalState::Unverifiable(reason.clone()));
+                ReloadVerifyOutcome::Unverifiable { reason }
+            }
+        }
     }
 
     pub fn close_decision(&self) -> CloseDecision {

@@ -58,6 +58,13 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 - テスト: `document_watch.rs` のGPUI deterministic tests（実OS threadは起動せず既存のtest batch注入を再利用）と、`watch.rs` の名前絞り込み・実FS（atomic置換）tests。いずれも未実行。
 - 既存テストへの影響の懸念（未確認）: render時に初回確認が走るため、描画を伴う既存テストで開いた直後にディスクを書き換えるものは、初回確認の結果（未編集なら自動再読込）の影響を受ける可能性がある。
 
+### 再読込承認の鮮度（T04、Claude worker、未検証）
+
+- 確認ダイアログの返答後、`apply_confirmed_reload` を直接呼ばず、`DocumentSession::begin_confirmed_reload`（現在のIME・保存・approval・path・generation・revisionを再確認し、要求sequenceを発行）→ 背景の `run_reload_verification`（既存の `observe_disk`、UI threadでは読まない）→ `finish_confirmed_reload` の順に進める。
+- 返答後に読んだ版のfingerprintが、確認画面で示した版と同一の場合だけ適用する。変わった／消えた／読めない場合は本文・undo/redo・draftを保持し、新しい観測を外部版として記録して旧approvalを失効させ、非モーダルの案内（status、dirty時はConflict表示）で再確認を求める。旧requestや編集・文書切替後の結果は `Stale` として捨てる。
+- テスト: `crates/session/tests/external_change.rs` に、確認後・適用前にディスクだけが再変更される場合、消失・読込不能、編集後／旧requestの破棄、通常成功の回帰テストを追加。UI(GPUI)側の専用テストは追加していない。
+- 未実行: build・tests・Clippy（macOS / Windows）、focused GUI。上書き経路は変更していない。
+
 ### 未実装・未検証（受入条件を満たしたと扱わない）
 
 - 監視寿命以外の独立root（下記の差分確認、ディスク版の整合読込・fingerprint・OS file identity、保存承認鮮度、同一実体のSave As、全域リファクタリング）。

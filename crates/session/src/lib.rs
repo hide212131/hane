@@ -70,9 +70,10 @@ pub use service::{
 pub use session::{
     AutosaveTicket, CloseDecision, DocumentSession, ExternalCheckOutcome, ExternalCheckRequest,
     ExternalCheckResult, ExternalCheckStart, ExternalCheckTicket, ExternalStatus, FileEvent,
-    FileEventOutcome, OpenDecision, OpenPolicy, ReloadOutcome, ResolutionApproval, ResolutionKind,
-    SaveDecision, SaveIntent, SaveJob, SaveOutcome, SaveTicket, SessionId, SessionSet,
-    SessionViewState, UnsavedChanges, run_external_check,
+    FileEventOutcome, OpenDecision, OpenPolicy, ReloadOutcome, ReloadVerifyOutcome,
+    ReloadVerifyRequest, ReloadVerifyResult, ResolutionApproval, ResolutionKind, SaveDecision,
+    SaveIntent, SaveJob, SaveOutcome, SaveTicket, SessionId, SessionSet, SessionViewState,
+    UnsavedChanges, run_external_check, run_reload_verification,
 };
 pub use store::{
     FileStateStore, InvalidNetworkConfig, MemoryStateStore, NetworkConfig, RecentFiles,
