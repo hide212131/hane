@@ -57,7 +57,6 @@ pub(super) struct ResolutionChoices {
 #[derive(Clone, Copy)]
 struct ViewPosition {
     scroll_y: f32,
-    granularity: Granularity,
     sidebar_focus: SidebarFocus,
 }
 
@@ -82,7 +81,6 @@ impl EditorView {
     fn view_position(&self) -> ViewPosition {
         ViewPosition {
             scroll_y: self.scroll_y,
-            granularity: self.granularity,
             sidebar_focus: self.sidebar_focus,
         }
     }
@@ -256,8 +254,10 @@ impl EditorView {
         }
         self.on_document_replaced();
         // `on_document_replaced` is written for navigation; a reload must not
-        // change the mode or move the sidebar focus.
-        self.granularity = position.granularity;
+        // change the mode or move the sidebar focus. The granularity stays at
+        // the Lines layout it just installed: Blocks needs the block index and
+        // heights, which the background parse publishes (and switches to) once
+        // it completes. Restoring Blocks now would draw with an empty index.
         self.sidebar_focus = position.sidebar_focus;
         self.resync_document_find_for_active_document(cx);
         self.schedule_document_parse(cx);
@@ -586,6 +586,48 @@ mod tests {
             );
             assert!(!view.active_session().is_dirty());
             assert_eq!(view.active_save_display(), SaveDisplay::Saved);
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_reload_stays_in_lines_layout_until_the_parse_publishes_blocks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = external_test_root("reload-granularity");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Note.md");
+        std::fs::write(&path, "# before\n\nbody\n").unwrap();
+        let (view, cx) = open_view(cx, &path);
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+        });
+
+        std::fs::write(&path, "# after\n\nreloaded body\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.check_open_documents_for_external_changes(cx);
+        });
+        // The read is awaited, but the 40 ms-delayed parse has not run yet.
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().document().full_text(),
+                "# after\n\nreloaded body\n"
+            );
+            assert_eq!(view.granularity, Granularity::Lines);
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+        });
+
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            assert_eq!(
+                Some(view.heights.len()),
+                view.current_index().map(|index| index.len())
+            );
         });
         let _ = std::fs::remove_dir_all(&root);
     }
