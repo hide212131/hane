@@ -3237,6 +3237,7 @@ dependencies = [
  "hane-markdown",
  "hane-network",
  "hane-presentation",
+ "icu_normalizer",
  "libc",
  "notify",
 ]

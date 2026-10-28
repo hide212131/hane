@@ -41,6 +41,7 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = 
 gpui-component = { version = "=0.6.6", default-features = false }
 gpui-kit-assets = { version = "=0.6.6" }
 libc = "=0.2.189"
+icu_normalizer = "=2.3.0"
 notify = "=7.0.0"
 async-channel = "=2.5.0"
 mach2 = "=0.5.0"

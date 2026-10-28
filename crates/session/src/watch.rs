@@ -131,7 +131,7 @@ impl WatchedNames {
     pub fn set(&self, names: impl IntoIterator<Item = impl AsRef<OsStr>>) {
         let names: Vec<String> = names
             .into_iter()
-            .map(|name| name.as_ref().to_string_lossy().to_lowercase())
+            .map(|name| comparison_key(name.as_ref()))
             .collect();
         if let Ok(mut current) = self.0.lock() {
             *current = names;
@@ -142,12 +142,22 @@ impl WatchedNames {
         let Some(name) = path.file_name() else {
             return false;
         };
-        let name = name.to_string_lossy().to_lowercase();
+        let name = comparison_key(name);
         // A poisoned set cannot say what is wanted: report everything.
         self.0
             .lock()
             .map_or(true, |names| names.contains(&name))
     }
+}
+
+/// The form file names are compared in: lowercase and canonically decomposed
+/// (NFD), so a name reported in a canonically equivalent spelling (for example
+/// NFC from the caller and NFD from the OS) is still the same target.
+fn comparison_key(name: &OsStr) -> String {
+    let lowered = name.to_string_lossy().to_lowercase();
+    icu_normalizer::DecomposingNormalizer::new_nfd()
+        .normalize(&lowered)
+        .into_owned()
 }
 
 /// Keeps one folder watched for as long as it lives. Dropping it stops the OS
@@ -593,6 +603,33 @@ mod tests {
             Some(Signal::Changed)
         ));
         assert!(classify_for(&roots, Some(&names), event(create(), "/notes/Note.md")).is_none());
+    }
+
+    #[test]
+    fn watched_names_match_canonically_equivalent_spellings() {
+        let roots = vec![PathBuf::from("/notes")];
+        let create = || EventKind::Create(CreateKind::File);
+        let nfc = "/notes/\u{00E9}.md";
+        let nfd = "/notes/e\u{0301}.md";
+
+        let names = WatchedNames::new(["\u{00E9}.md"]);
+        assert!(matches!(
+            classify_for(&roots, Some(&names), event(create(), nfd)),
+            Some(Signal::Changed)
+        ));
+        assert!(classify_for(&roots, Some(&names), event(create(), "/notes/f.md")).is_none());
+
+        let names = WatchedNames::new(["e\u{0301}.md"]);
+        assert!(matches!(
+            classify_for(&roots, Some(&names), event(create(), nfc)),
+            Some(Signal::Changed)
+        ));
+        // Case-insensitive matching still applies alongside normalization.
+        assert!(matches!(
+            classify_for(&roots, Some(&names), event(create(), "/notes/\u{00C9}.MD")),
+            Some(Signal::Changed)
+        ));
+        assert!(classify_for(&roots, Some(&names), event(create(), "/notes/f.md")).is_none());
     }
 
     #[test]
