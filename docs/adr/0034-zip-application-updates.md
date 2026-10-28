@@ -14,7 +14,7 @@ Windowsでは任意の展開先に利用者ファイルが混在でき、Explore
 
 ## 決定
 
-1. ZIP配布と現在のOS/CPU対応を維持する。初期対象は`aarch64-apple-darwin`と`x86_64-pc-windows-msvc`のstable releaseとし、利用者の明示操作で確認・取得し、別操作の「再起動して更新」で適用する。
+1. ZIP配布と現在のOS/CPU対応を維持する。初期対象は`aarch64-apple-darwin`と`x86_64-pc-windows-msvc`のstable releaseとし、利用者の明示操作で取得し、別操作の「再起動して更新」で適用する。確認の入口は当初の手動操作に加え、[Issue #649](https://github.com/hide212131/hane/issues/649)で通常起動後・使用中1時間ごとのmetadata確認と下部の更新ボタンを設計する。確認の自動化は取得・適用の自動化を許可しない。具体仕様・導入境界は[更新通知設計](../design/application-update-notifications.md)に従う（2026-10-28追記、製品は未実装）。
 2. GitHub Releasesを発見・配信に使い、アプリに埋め込んだ公開鍵による署名済みカタログとZIP全体のSHA-256で取得物を検証する。公開GitHub APIの認証情報を要求しない。APIの`digest`や同梱証明書だけを更新の信頼の根にしない。
 3. 更新用の独立したRust libraryとhelperを設ける。アプリが確認・取得・編集状態の調停を担当し、現在インストール済みの信頼できるhelperのコピーが、親の終了後にローカルの検証済み候補を適用する。helperはネットワーク取得、文書保存、権限昇格、任意コマンド実行をしない。
 4. Windowsは署名された所有ファイル一覧に限定した置換を行う。展開先フォルダ全体を入れ替えない。Explorer DLLをバージョン別のパスへ変更し、使用中の旧DLLを残して更新する。
