@@ -329,7 +329,14 @@ impl FileService for OsFileService {
 
     fn create_dir_in_existing_parent(&self, path: &Path) -> io::Result<()> {
         match fs::create_dir(path) {
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // `symlink_metadata` does not follow links, so a symlink to a
+                // directory is not mistaken for an existing directory.
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                    _ => Err(error),
+                }
+            }
             result => result,
         }
     }
@@ -636,6 +643,50 @@ mod tests {
             .save(&path, &RopeBuffer::from_text(source))
             .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creating_a_directory_in_an_existing_parent_accepts_only_real_directories() {
+        let root = temporary_directory("create-dir-existing-parent");
+        fs::create_dir_all(&root).unwrap();
+
+        let fresh = root.join("fresh");
+        OsFileService.create_dir_in_existing_parent(&fresh).unwrap();
+        assert!(fresh.is_dir());
+        OsFileService.create_dir_in_existing_parent(&fresh).unwrap();
+
+        let file = root.join("file");
+        fs::write(&file, "x").unwrap();
+        let error = OsFileService
+            .create_dir_in_existing_parent(&file)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        let missing_parent = root.join("missing").join("child");
+        let error = OsFileService
+            .create_dir_in_existing_parent(&missing_parent)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_a_directory_over_a_symlink_to_a_directory_fails() {
+        let root = temporary_directory("create-dir-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = OsFileService
+            .create_dir_in_existing_parent(&link)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
         fs::remove_dir_all(root).unwrap();
     }
 
