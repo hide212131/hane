@@ -754,6 +754,14 @@ fn atomic_write_checked_with_hook(
     if create_parent {
         fs::create_dir_all(parent).map_err(SaveFailure::Io)?;
     }
+    // A directory is never a save target: the move-aside install below would
+    // otherwise rename and replace it.
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(SaveFailure::Io(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            format!("{} is a directory", path.display()),
+        )));
+    }
     let stem = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1013,6 +1021,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "my edit\n");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_onto_an_existing_directory_fails_and_leaves_it_untouched() {
+        let root = temporary_directory("save-onto-directory");
+        let target = root.join("folder");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("inner.md"), "inner\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        let failure = atomic_write_checked(
+            &target,
+            true,
+            |writer| edited.write_to(writer),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, OverwriteGuard::Force),
+        )
+        .unwrap_err();
+
+        assert!(matches!(failure, SaveFailure::Io(_)));
+        assert!(target.is_dir());
+        assert_eq!(
+            fs::read_to_string(target.join("inner.md")).unwrap(),
+            "inner\n"
+        );
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
