@@ -213,6 +213,28 @@ pub trait FileService: Send + Sync + 'static {
         self.save(path, document)
     }
 
+    /// Saves like `save` (or `save_in_existing_directory` when
+    /// `create_parent` is false) after running `check`. Implementations that
+    /// write through a temporary file must run `check` again immediately
+    /// before the final replace, so an external write that lands while the
+    /// temporary file is being written is reported instead of replaced. The
+    /// default only checks once, before writing.
+    fn save_checked(
+        &self,
+        path: &Path,
+        document: &RopeBuffer,
+        create_parent: bool,
+        check: &dyn Fn() -> Result<(), SaveFailure>,
+    ) -> Result<SavedFile, SaveFailure> {
+        check()?;
+        let saved = if create_parent {
+            self.save(path, document)
+        } else {
+            self.save_in_existing_directory(path, document)
+        };
+        saved.map_err(SaveFailure::Io)
+    }
+
     /// Current stamp, or `None` when the file does not exist.
     fn stamp(&self, path: &Path) -> Option<FileStamp>;
 
@@ -240,8 +262,9 @@ pub fn run_save_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    check_overwrite_guard(service, path, guard)?;
-    service.save(path, document).map_err(SaveFailure::Io)
+    service.save_checked(path, document, true, &|| {
+        check_overwrite_guard(service, path, guard)
+    })
 }
 
 /// Shared `ExpectStamp` check for every job that writes to a path. `Force`
@@ -319,10 +342,9 @@ pub fn run_create_new_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    check_overwrite_guard(service, path, guard)?;
-    service
-        .save_in_existing_directory(path, document)
-        .map_err(SaveFailure::Io)
+    service.save_checked(path, document, false, &|| {
+        check_overwrite_guard(service, path, guard)
+    })
 }
 
 /// Whether a write must first prove the file has not changed underneath it.
@@ -387,6 +409,31 @@ impl FileService for OsFileService {
         document: &RopeBuffer,
     ) -> io::Result<SavedFile> {
         atomic_write(path, false, |writer| document.write_to(writer))?;
+        Ok(SavedFile {
+            identity: identity_for(path),
+            stamp: self.stamp(path),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
+        })
+    }
+
+    fn save_checked(
+        &self,
+        path: &Path,
+        document: &RopeBuffer,
+        create_parent: bool,
+        check: &dyn Fn() -> Result<(), SaveFailure>,
+    ) -> Result<SavedFile, SaveFailure> {
+        check()?;
+        // The check runs a second time right before the rename. A plain
+        // `rename` cannot compare-and-swap, so a write landing between this
+        // re-check and the rename itself remains an unavoidable, much
+        // narrower window.
+        atomic_write_checked(
+            path,
+            create_parent,
+            |writer| document.write_to(writer),
+            check,
+        )?;
         Ok(SavedFile {
             identity: identity_for(path),
             stamp: self.stamp(path),
@@ -672,12 +719,27 @@ fn atomic_write(
     create_parent: bool,
     write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
 ) -> io::Result<()> {
+    atomic_write_checked(path, create_parent, write, &|| Ok(())).map_err(|failure| match failure {
+        SaveFailure::Io(error) => error,
+        SaveFailure::ExternalChange => io::Error::other("file changed on disk"),
+    })
+}
+
+/// Like `atomic_write`, but runs `check` after the temporary file is durable
+/// and immediately before it replaces `path`. A failing check removes the
+/// temporary file and leaves the target untouched.
+fn atomic_write_checked(
+    path: &Path,
+    create_parent: bool,
+    write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
+    check: &dyn Fn() -> Result<(), SaveFailure>,
+) -> Result<(), SaveFailure> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     if create_parent {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(SaveFailure::Io)?;
     }
     let stem = path
         .file_name()
@@ -692,13 +754,15 @@ fn atomic_write(
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary)?;
+            .open(&temporary)
+            .map_err(SaveFailure::Io)?;
         let mut writer = BufWriter::new(file);
-        write(&mut writer)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+        write(&mut writer).map_err(SaveFailure::Io)?;
+        writer.flush().map_err(SaveFailure::Io)?;
+        writer.get_ref().sync_all().map_err(SaveFailure::Io)?;
         drop(writer);
-        fs::rename(&temporary, path)
+        check()?;
+        fs::rename(&temporary, path).map_err(SaveFailure::Io)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -762,6 +826,63 @@ mod tests {
 
         assert_eq!(bytes, "本文を少しずつ読む🙂\r\n".as_bytes());
         assert_eq!(before, after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_external_write_during_the_temporary_write_is_not_replaced() {
+        let root = temporary_directory("save-race");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        let saved = OsFileService
+            .save(&path, &RopeBuffer::from_text("one\n"))
+            .unwrap();
+        let guard = OverwriteGuard::ExpectContent {
+            stamp: saved.stamp,
+            baseline: saved.fingerprint,
+        };
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        // The pre-write check passes; the external save lands while the
+        // temporary file is being written.
+        check_overwrite_guard(&OsFileService, &path, guard).unwrap();
+        let result = atomic_write_checked(
+            &path,
+            true,
+            |writer| {
+                fs::write(&path, "someone else, longer\n")?;
+                edited.write_to(writer)
+            },
+            &|| check_overwrite_guard(&OsFileService, &path, guard),
+        );
+
+        assert!(matches!(result, Err(SaveFailure::ExternalChange)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "someone else, longer\n");
+        let leftovers = fs::read_dir(&root).unwrap().count();
+        assert_eq!(leftovers, 1, "the temporary file must be removed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_forced_save_still_replaces_an_external_write_during_the_temporary_write() {
+        let root = temporary_directory("save-race-force");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        fs::write(&path, "one\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        atomic_write_checked(
+            &path,
+            true,
+            |writer| {
+                fs::write(&path, "someone else\n")?;
+                edited.write_to(writer)
+            },
+            &|| check_overwrite_guard(&OsFileService, &path, OverwriteGuard::Force),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "my edit\n");
         fs::remove_dir_all(root).unwrap();
     }
 
