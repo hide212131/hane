@@ -52,7 +52,7 @@ pub use draft::{
 };
 pub use identity::{
     ContentFingerprint, ExternalChange, FileIdentity, FilePresence, FileStamp, FileState,
-    Fingerprinter,
+    Fingerprinter, lexical_canonical,
 };
 pub use naming::{
     TitleSyncAction, decide_title_sync, extract_h1_title, unique_folder_name,

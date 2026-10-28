@@ -327,7 +327,7 @@ impl FileState {
 
 /// Normalizes `.` and `..` without asking the filesystem, so two spellings of
 /// the same path compare equal even when the file does not exist yet.
-fn lexical_canonical(path: &Path) -> PathBuf {
+pub fn lexical_canonical(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {

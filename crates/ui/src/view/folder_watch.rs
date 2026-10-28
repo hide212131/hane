@@ -13,7 +13,7 @@
 use super::*;
 #[cfg(not(test))]
 use hane_session::WatchTiming;
-use hane_session::{FolderWatcher, WatchBatch};
+use hane_session::{FolderWatcher, WatchBatch, lexical_canonical};
 
 /// The watch and re-list bookkeeping for the current work folder. Replaced
 /// wholesale (dropping the old watcher) whenever a folder is opened.
@@ -84,7 +84,9 @@ impl EditorView {
                 .folder_watch
                 .watch_root
                 .as_deref()
-                .is_some_and(|root| path.starts_with(root))
+                .is_some_and(|root| {
+                    lexical_canonical(path).starts_with(lexical_canonical(root))
+                })
     }
 
     /// The warning shown for as long as the current work folder's changes are
@@ -416,6 +418,25 @@ mod tests {
             .collect();
         names.sort_unstable();
         names
+    }
+
+    #[gpui::test]
+    fn folder_watch_covers_compares_lexically_normalized_paths(cx: &mut gpui::TestAppContext) {
+        let root = watch_test_root("covers");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+        view.update(cx, |view, _| {
+            view.folder_watch.watch_root = Some(PathBuf::from("/work"));
+            assert!(view.folder_watch_covers(Path::new("/work/notes/note.md")));
+            assert!(view.folder_watch_covers(Path::new("/work/./notes/../note.md")));
+            assert!(!view.folder_watch_covers(Path::new("/work/../outside/note.md")));
+            assert!(!view.folder_watch_covers(Path::new("/workshop/note.md")));
+
+            view.folder_watch.watch_root = Some(PathBuf::from("/work/sub/.."));
+            assert!(view.folder_watch_covers(Path::new("/work/notes/note.md")));
+            assert!(!view.folder_watch_covers(Path::new("/work/../outside/note.md")));
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
