@@ -15519,12 +15519,20 @@ mod tests {
                 !view.tab_close_after_save.contains_key(&id),
                 "a refused save must drop the close request rather than let a coincidentally clean document close it"
             );
+            // Issue #653: the document had no unsaved edits when the refused
+            // write's conflict was noticed, so the external check reloads the
+            // latest disk content instead of leaving a conflict warning.
+            assert_eq!(
+                view.editor().document().full_text(),
+                "someone else's edit, longer than before",
+                "a clean document must follow the external content"
+            );
             assert_eq!(
                 view.active_save_display(),
-                footer::SaveDisplay::Conflict,
-                "the conflict must stay in the document's footer warning"
+                footer::SaveDisplay::Saved,
+                "the reloaded clean document must read as saved"
             );
-            assert_eq!(view.footer_warnings().len(), 1);
+            assert!(view.footer_warnings().is_empty());
         });
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
