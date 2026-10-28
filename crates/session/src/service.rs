@@ -214,19 +214,20 @@ pub trait FileService: Send + Sync + 'static {
     }
 
     /// Saves like `save` (or `save_in_existing_directory` when
-    /// `create_parent` is false) after running `check`. Implementations that
-    /// write through a temporary file must run `check` again immediately
-    /// before the final replace, so an external write that lands while the
-    /// temporary file is being written is reported instead of replaced. The
-    /// default only checks once, before writing.
+    /// `create_parent` is false) after running `check`. `check` is given the
+    /// path whose contents to inspect. Implementations that write through a
+    /// temporary file must check again on the exact version being replaced
+    /// (moved aside atomically first), so an external write that lands before
+    /// the replace is reported instead of overwritten. The default only
+    /// checks once, before writing.
     fn save_checked(
         &self,
         path: &Path,
         document: &RopeBuffer,
         create_parent: bool,
-        check: &dyn Fn() -> Result<(), SaveFailure>,
+        check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
     ) -> Result<SavedFile, SaveFailure> {
-        check()?;
+        check(path)?;
         let saved = if create_parent {
             self.save(path, document)
         } else {
@@ -262,8 +263,8 @@ pub fn run_save_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    service.save_checked(path, document, true, &|| {
-        check_overwrite_guard(service, path, guard)
+    service.save_checked(path, document, true, &|inspect| {
+        check_overwrite_guard(service, inspect, guard)
     })
 }
 
@@ -342,8 +343,8 @@ pub fn run_create_new_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    service.save_checked(path, document, false, &|| {
-        check_overwrite_guard(service, path, guard)
+    service.save_checked(path, document, false, &|inspect| {
+        check_overwrite_guard(service, inspect, guard)
     })
 }
 
@@ -421,13 +422,11 @@ impl FileService for OsFileService {
         path: &Path,
         document: &RopeBuffer,
         create_parent: bool,
-        check: &dyn Fn() -> Result<(), SaveFailure>,
+        check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
     ) -> Result<SavedFile, SaveFailure> {
-        check()?;
-        // The check runs a second time right before the rename. A plain
-        // `rename` cannot compare-and-swap, so a write landing between this
-        // re-check and the rename itself remains an unavoidable, much
-        // narrower window.
+        check(path)?;
+        // The version being replaced is checked again after it is atomically
+        // moved aside, so what is verified is exactly what gets replaced.
         atomic_write_checked(
             path,
             create_parent,
@@ -719,20 +718,34 @@ fn atomic_write(
     create_parent: bool,
     write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
 ) -> io::Result<()> {
-    atomic_write_checked(path, create_parent, write, &|| Ok(())).map_err(|failure| match failure {
+    atomic_write_checked(path, create_parent, write, &|_| Ok(())).map_err(|failure| match failure {
         SaveFailure::Io(error) => error,
         SaveFailure::ExternalChange => io::Error::other("file changed on disk"),
     })
 }
 
-/// Like `atomic_write`, but runs `check` after the temporary file is durable
-/// and immediately before it replaces `path`. A failing check removes the
-/// temporary file and leaves the target untouched.
+/// Like `atomic_write`, but checks the version being replaced after the
+/// temporary file is durable. `check` receives the location to inspect: the
+/// target moved aside at the moment of replacement. A failing check removes
+/// the temporary file and leaves the target in place.
 fn atomic_write_checked(
     path: &Path,
     create_parent: bool,
     write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
-    check: &dyn Fn() -> Result<(), SaveFailure>,
+    check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+) -> Result<(), SaveFailure> {
+    atomic_write_checked_with_hook(path, create_parent, write, check, &|| {})
+}
+
+/// `before_displace` runs after the temporary file is durable and right
+/// before the target is moved aside; tests use it to place an external
+/// version in exactly that window.
+fn atomic_write_checked_with_hook(
+    path: &Path,
+    create_parent: bool,
+    write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
+    check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+    before_displace: &dyn Fn(),
 ) -> Result<(), SaveFailure> {
     let parent = path
         .parent()
@@ -761,14 +774,93 @@ fn atomic_write_checked(
         writer.flush().map_err(SaveFailure::Io)?;
         writer.get_ref().sync_all().map_err(SaveFailure::Io)?;
         drop(writer);
-        check()?;
-        fs::rename(&temporary, path).map_err(SaveFailure::Io)
+        before_displace();
+        install_checked(&temporary, path, check)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
 }
+
+/// Installs `temporary` at `path` without ever replacing a version that was
+/// not checked. A plain `rename` cannot compare-and-swap, so the current
+/// target is first moved aside atomically: whatever sits at `path` at that
+/// instant is exactly what gets checked (at its new name), and a file that an
+/// external app places later is never overwritten because the final install
+/// refuses to replace. A failed check puts the displaced version back.
+fn install_checked(
+    temporary: &Path,
+    path: &Path,
+    check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+) -> Result<(), SaveFailure> {
+    // Each retry means another writer created a new file at `path` between
+    // the move-aside and the install; that file is judged on the next round.
+    for _ in 0..MAX_INSTALL_ATTEMPTS {
+        let aside = displaced_path(path);
+        match rename_file_without_replace(path, &aside) {
+            Ok(()) => {
+                if let Err(failure) = check(&aside) {
+                    return Err(restore_displaced(&aside, path, failure));
+                }
+                match rename_file_without_replace(temporary, path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&aside);
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let _ = fs::remove_file(&aside);
+                    }
+                    Err(error) => {
+                        return Err(restore_displaced(&aside, path, SaveFailure::Io(error)));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                check(path)?;
+                match rename_file_without_replace(temporary, path) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(SaveFailure::Io(error)),
+                }
+            }
+            Err(error) => return Err(SaveFailure::Io(error)),
+        }
+    }
+    Err(SaveFailure::ExternalChange)
+}
+
+/// Puts a displaced version back at `path` and returns `failure`. If another
+/// file has appeared there meanwhile the displaced version is kept at its
+/// aside name and reported, never deleted or overwritten.
+fn restore_displaced(aside: &Path, path: &Path, failure: SaveFailure) -> SaveFailure {
+    match rename_file_without_replace(aside, path) {
+        Ok(()) => failure,
+        Err(restore_error) => SaveFailure::Io(io::Error::other(format!(
+            "{failure}; restoring the original file failed ({restore_error}); \
+             the previous version remains at {}",
+            aside.display()
+        ))),
+    }
+}
+
+fn displaced_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document");
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{stem}.hane-displaced-{}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+const MAX_INSTALL_ATTEMPTS: usize = 3;
 
 #[cfg(test)]
 pub(crate) fn temporary_directory(name: &str) -> PathBuf {
@@ -853,13 +945,75 @@ mod tests {
                 fs::write(&path, "someone else, longer\n")?;
                 edited.write_to(writer)
             },
-            &|| check_overwrite_guard(&OsFileService, &path, guard),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, guard),
         );
 
         assert!(matches!(result, Err(SaveFailure::ExternalChange)));
         assert_eq!(fs::read_to_string(&path).unwrap(), "someone else, longer\n");
         let leftovers = fs::read_dir(&root).unwrap().count();
         assert_eq!(leftovers, 1, "the temporary file must be removed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_atomic_replace_after_the_last_check_is_not_overwritten() {
+        let root = temporary_directory("save-race-after-check");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        let saved = OsFileService
+            .save(&path, &RopeBuffer::from_text("one\n"))
+            .unwrap();
+        let guard = OverwriteGuard::ExpectContent {
+            stamp: saved.stamp,
+            baseline: saved.fingerprint,
+        };
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        // The pre-write check passes, then an external app atomically
+        // replaces the file after the temporary file is complete and before
+        // the save replaces the target.
+        check_overwrite_guard(&OsFileService, &path, guard).unwrap();
+        let external = root.join("external.tmp");
+        let result = atomic_write_checked_with_hook(
+            &path,
+            true,
+            |writer| edited.write_to(writer),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, guard),
+            &|| {
+                fs::write(&external, "external, atomically placed\n").unwrap();
+                fs::rename(&external, &path).unwrap();
+            },
+        );
+
+        assert!(matches!(result, Err(SaveFailure::ExternalChange)));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "external, atomically placed\n"
+        );
+        let leftovers = fs::read_dir(&root).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary or displaced file may remain");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_forced_save_replaces_a_version_placed_after_the_last_check() {
+        let root = temporary_directory("save-race-after-check-force");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        fs::write(&path, "one\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        atomic_write_checked_with_hook(
+            &path,
+            true,
+            |writer| edited.write_to(writer),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, OverwriteGuard::Force),
+            &|| fs::write(&path, "someone else\n").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "my edit\n");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -878,7 +1032,7 @@ mod tests {
                 fs::write(&path, "someone else\n")?;
                 edited.write_to(writer)
             },
-            &|| check_overwrite_guard(&OsFileService, &path, OverwriteGuard::Force),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, OverwriteGuard::Force),
         )
         .unwrap();
 
