@@ -17,8 +17,19 @@ v0.32.0では、準備時にインストール済みの署名済みhelperをtran
 
 参照: [helper起動](https://github.com/hide212131/hane/blob/v0.32.0/crates/update/src/helper.rs)、[Windows helperコピー](https://github.com/hide212131/hane/blob/v0.32.0/crates/update/src/platform/mod.rs)、[Microsoft: UAC architecture](https://learn.microsoft.com/en-us/windows/security/application-security/application-control/user-account-control/architecture)。
 
-## 未確定点と次の観測
+## 承認済みの隔離起動比較（2026-10-29）
 
-未確定なのは、どのWindows判定がhelperに昇格を要求したか。イベントログは親プロセスしか特定せず、失敗したコピーは清掃済みである。byte-identical helperを隔離した中立名のパスから同じ通常権限で起動し、ファイル名・実行条件を比較するプローブは、Windowsホストの実行審査で拒否されており、実行していない。別経路での回避はしていない。
+- ユーザー承認後、通常権限でインストール済みhelperの同一バイトコピーを一時フォルダに配置した。元ファイル、通常state、UAC設定は変更していない。
+- 4条件（`hane-updater.exe` / `hane-worker.exe` × 継承環境 / `SystemRoot`のみ）を、同一作業フォルダ、引数`--codex-740-probe`、pipe stdin/stdout/stderr、非表示で比較した。元名は両環境条件でCreateProcess失敗、中立名は両条件で起動しexit code 2。元ファイルと2コピーのSHA-256は一致し、通常権限tokenであることも確認した。
+- 比較と同時刻のUAC Operational Event ID 1が2件あり、両方とも`ERROR_ELEVATION_REQUIRED`。イベントは子実行パスを含まない。隔離コピーの正確なAppCompat `Layers`値はHKCU/HKLMとも見つからなかった。
+- この環境ではhelperのbasenameが起動可否に結びつくことを再現した。Windows内部の判定規則は未確定であり、x64の標準Installer Detectionだけでは説明しにくい。
 
-原因を確定するには、承認された同条件の隔離比較、または対象child pathを含むプロセス作成イベントの新規採取が必要。診断完了までは原因を断定せず、管理者昇格やUAC/AppCompat回避を実施しない。
+## コード上の境界
+
+v0.32.0と現行mainの`Coordination::from_helper_exe`は、実行ファイル名ではなく親の`helper` directory、transaction/install ID、owner-only directory/ACLを検証する。したがって、実装候補はインストール済みファイルとsigned inventoryの`hane-updater.exe`を維持し、transaction用copyのbasenameだけを`hane-worker.exe`等へ変えること。実装ではhelper record、復旧、launch path、各platformの既存契約を確認し、neutral copyの経路を回帰テストする。
+
+参照: [v0.32.0 path validation](https://github.com/hide212131/hane/blob/v0.32.0/crates/update/src/platform/lease.rs#L161-L194)、[current main path validation](https://github.com/hide212131/hane/blob/ad4b80b155bf219a9c5686858dba3c87f14c3e77/crates/update/src/platform/lease.rs#L161-L194)。
+
+## 次の工程
+
+同じDraft PRで、installed helper名とinventoryを維持するneutral transaction-copy名の実装を依頼する。昇格要求、UAC/AppCompat回避、設定変更は行わない。診断プローブだけではfull handshakeや適用成功を確認していない。
