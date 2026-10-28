@@ -321,7 +321,6 @@ impl EditorView {
                 .ghost()
                 .w(px(sidebar_pins::PIN_SLOT_SIZE))
                 .h_full()
-                .tooltip(label)
                 .accessibility_label(label)
                 .icon(
                     Icon::empty()
@@ -329,6 +328,24 @@ impl EditorView {
                         .size(px(14.0))
                         .text_color(rgb(self.theme.sidebar_foreground)),
                 )
+        };
+        // `Button::tooltip` needs a `gpui_component::Root` as the window root,
+        // which the app does not have, so the tooltip is a `HoverCard` around
+        // the button (like the reading mode switch). The selector spells
+        // `sidebar-folder-create-tooltip:{label}` so tests can find the text.
+        let with_tooltip = |card_id: (&'static str, usize),
+                            trigger: gpui::Stateful<gpui::Div>,
+                            label: &'static str| {
+            HoverCard::new(card_id)
+                .anchor(Anchor::TopCenter)
+                .trigger(trigger)
+                .content(move |_, _, _| {
+                    div()
+                        .px_2()
+                        .py_1()
+                        .debug_selector(move || format!("sidebar-folder-create-tooltip:{label}"))
+                        .child(label)
+                })
         };
         let folder_view = cx.entity();
         let folder_directory = directory.clone();
@@ -347,8 +364,10 @@ impl EditorView {
             .invisible()
             .group_hover("sidebar-pin-row", |style| style.visible())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
+            .child(with_tooltip(
+                ("sidebar-folder-create-folder-tooltip", id.1),
                 div()
+                    .id(("sidebar-folder-create-folder-trigger", id.1))
                     .debug_selector(|| "sidebar-folder-create-folder".to_owned())
                     .child(
                         create_button((id.0, id.1 * 2), "新規フォルダ", icons::ICON_FOLDER_NEW)
@@ -359,9 +378,12 @@ impl EditorView {
                                 });
                             }),
                     ),
-            )
-            .child(
+                "新規フォルダ",
+            ))
+            .child(with_tooltip(
+                ("sidebar-folder-create-note-tooltip", id.1),
                 div()
+                    .id(("sidebar-folder-create-note-trigger", id.1))
                     .debug_selector(|| "sidebar-folder-create-note".to_owned())
                     .child(
                         create_button((id.0, id.1 * 2 + 1), "新規ファイル", icons::ICON_FILE_NEW)
@@ -372,7 +394,8 @@ impl EditorView {
                                 });
                             }),
                     ),
-            )
+                "新規ファイル",
+            ))
     }
 
     /// The folder/file tree for the sidebar, when this window was opened onto
@@ -3253,5 +3276,79 @@ mod tests {
             .debug_bounds("sidebar-folder-create-folder")
             .unwrap_or_else(|| panic!("{} renders its create button", directory.display()));
         assert!(button.top() <= row_center.y && row_center.y <= button.bottom());
+    }
+
+    // Issue #642: the buttons' Japanese tooltips are painted on hover in a
+    // window without a `gpui_component::Root`, and hovering creates nothing.
+    #[gpui::test]
+    fn row_create_buttons_paint_their_tooltips_on_hover_without_creating(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "hane-row-create-tooltips-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let root_row = cx.debug_bounds("sidebar-root").expect("the root row");
+        let row_center = gpui::point(
+            root_row.center().x,
+            root_row.center().y + px(SIDEBAR_ROW_HEIGHT),
+        );
+        for (button_selector, tooltip_selector) in [
+            (
+                "sidebar-folder-create-folder",
+                "sidebar-folder-create-tooltip:新規フォルダ",
+            ),
+            (
+                "sidebar-folder-create-note",
+                "sidebar-folder-create-tooltip:新規ファイル",
+            ),
+        ] {
+            cx.simulate_mouse_move(row_center, None, gpui::Modifiers::none());
+            cx.run_until_parked();
+            let button = cx
+                .debug_bounds(button_selector)
+                .expect("the hovered row renders its create button");
+            assert!(
+                cx.debug_bounds(tooltip_selector).is_none(),
+                "no tooltip before the button is hovered"
+            );
+            cx.simulate_mouse_move(button.center(), None, gpui::Modifiers::none());
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(1500));
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds(tooltip_selector).is_some(),
+                "{tooltip_selector} is painted after hovering"
+            );
+        }
+
+        // Hovering alone creates no folder, file or draft.
+        view.read_with(cx, |view, _| {
+            assert!(view.work_folder_drafts.is_empty());
+        });
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(root.join("a")).unwrap().count(), 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
