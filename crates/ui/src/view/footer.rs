@@ -208,7 +208,7 @@ fn save_problem_text(label: &str, scoped: &ScopedSaveProblem) -> String {
             format!("{label}: 保存できませんでした{target}: {error}")
         }
         DocumentSaveProblem::Conflict => format!(
-            "{label}: 外部で変更されています{target}。ファイルがディスク上で変更されたため保存していません。名前を付けて保存するか、もう一度保存すると上書きします。"
+            "{label}: 外部で変更されています{target}。ファイルがディスク上で変更されたため保存していません。編集中の内容は残しています。保存状態のメニューから、名前を付けて保存・ディスクの内容の読み直し・上書きを選べます（保存を繰り返しても上書きにはなりません）。"
         ),
         DocumentSaveProblem::SaveAsDialogFailed(error) => {
             format!("{label}: 保存先を選べませんでした: {error}")
@@ -227,6 +227,9 @@ struct MenuSpec {
     show_settings: bool,
     show_ai: bool,
     ai_enabled: bool,
+    /// How the active document's external-change conflict can be resolved,
+    /// when it has one. Shown only in the save-state menu.
+    resolution: Option<ResolutionChoices>,
 }
 
 fn text_item(text: String, max_width: f32) -> PopupMenuItem {
@@ -237,6 +240,25 @@ fn text_item(text: String, max_width: f32) -> PopupMenuItem {
             .py(px(3.0))
             .whitespace_normal()
             .child(text.clone())
+    })
+}
+
+fn resolution_item(
+    label: &'static str,
+    selector: &'static str,
+    view: &gpui::Entity<EditorView>,
+    action: ResolutionAction,
+) -> PopupMenuItem {
+    let view = view.clone();
+    PopupMenuItem::element(move |_, _| {
+        div()
+            .debug_selector(move || selector.to_owned())
+            .px(px(5.0))
+            .py(px(3.0))
+            .child(label)
+    })
+    .on_click(move |_, window, app| {
+        view.update(app, |view, cx| view.run_resolution(action, window, cx));
     })
 }
 
@@ -258,6 +280,32 @@ fn build_menu(
     }
     for line in &spec.info_lines {
         menu = menu.item(text_item(line.clone(), item_width));
+    }
+    if let Some(choices) = spec.resolution {
+        // Every choice that can lose something asks first; none of them is
+        // reachable by repeating an ordinary save.
+        menu = menu.item(resolution_item(
+            "名前を付けて保存",
+            "footer-resolve-save-as",
+            view,
+            ResolutionAction::SaveAs,
+        ));
+        if choices.reload {
+            menu = menu.item(resolution_item(
+                "ディスクの内容を読み直す（未保存の編集を破棄）",
+                "footer-resolve-reload",
+                view,
+                ResolutionAction::Reload,
+            ));
+        }
+        if choices.overwrite {
+            menu = menu.item(resolution_item(
+                "この内容で上書き",
+                "footer-resolve-overwrite",
+                view,
+                ResolutionAction::Overwrite,
+            ));
+        }
     }
     if spec.show_zoom {
         for value in ZOOM_CHOICES {
@@ -459,6 +507,7 @@ impl EditorView {
         // (Issue #549), so the footer offers it again.
         let show_settings = self.work_folder.is_none() || !self.sidebar_shown();
         let zoom = self.zoom;
+        let resolution = self.active_resolution_choices();
 
         let full_count = match selected {
             Some(selected) => format!(
@@ -518,6 +567,7 @@ impl EditorView {
                 show_settings,
                 show_ai: true,
                 ai_enabled,
+                resolution,
             };
             let menu_view = view.clone();
             left.push(
@@ -545,6 +595,7 @@ impl EditorView {
                 show_settings: false,
                 show_ai: false,
                 ai_enabled,
+                resolution,
             };
             let details_view = view.clone();
             left.push(
@@ -599,6 +650,7 @@ impl EditorView {
                         show_settings: false,
                         show_ai: false,
                         ai_enabled,
+                        resolution: None,
                     };
                     let zoom_view = view.clone();
                     right.push(
@@ -661,6 +713,7 @@ impl EditorView {
                         show_settings,
                         show_ai: false,
                         ai_enabled,
+                        resolution: None,
                     };
                     let more_view = view.clone();
                     right.push(

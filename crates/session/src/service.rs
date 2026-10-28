@@ -1,4 +1,4 @@
-use crate::identity::{FileIdentity, FileStamp};
+use crate::identity::{ContentFingerprint, FileIdentity, FileStamp};
 use hane_document::RopeBuffer;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
@@ -105,6 +105,58 @@ impl StampedRead for OsStampedRead {
 pub struct SavedFile {
     pub identity: FileIdentity,
     pub stamp: Option<FileStamp>,
+    /// Fingerprint of the bytes that were written, so the session's baseline
+    /// follows what actually reached the disk.
+    pub fingerprint: Option<ContentFingerprint>,
+}
+
+/// One consistent read of a file for external-change checks: the document, the
+/// fingerprint of exactly those bytes, and the stamp of the handle they came
+/// from.
+pub struct ObservedFile {
+    pub document: RopeBuffer,
+    pub fingerprint: ContentFingerprint,
+    pub stamp: Option<FileStamp>,
+}
+
+/// What a background check found at a path. `Unreadable` is never "no change":
+/// the caller keeps its document and reports the reason.
+pub enum DiskVersion {
+    Present(Box<ObservedFile>),
+    Missing,
+    Unreadable(String),
+}
+
+/// How many times a read that raced a writer is retried before the check
+/// gives up and reports the file as unstable rather than accepting a mix.
+const OBSERVE_ATTEMPTS: usize = 3;
+
+/// Reads `path` as one consistent version. The stamp of the opened handle must
+/// still equal the path's stamp after the read, otherwise the file changed or
+/// was atomically replaced mid-read and the read is retried (bounded). Runs on
+/// a background thread; it reads and hashes the whole file.
+pub fn observe_disk(service: &dyn FileService, path: &Path) -> DiskVersion {
+    for _ in 0..OBSERVE_ATTEMPTS {
+        if service.stamp(path).is_none() {
+            return DiskVersion::Missing;
+        }
+        let loaded = match service.load(path) {
+            Ok(loaded) => loaded,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return DiskVersion::Missing,
+            Err(error) => return DiskVersion::Unreadable(error.to_string()),
+        };
+        let after = service.stamp(path);
+        if loaded.stamp.is_some() && loaded.stamp != after {
+            continue;
+        }
+        let fingerprint = ContentFingerprint::of_document(&loaded.document);
+        return DiskVersion::Present(Box::new(ObservedFile {
+            document: loaded.document,
+            fingerprint,
+            stamp: loaded.stamp,
+        }));
+    }
+    DiskVersion::Unreadable("ファイルが更新され続けているため、整合した内容を読めませんでした".to_owned())
 }
 
 /// Why a save did not happen.
@@ -193,8 +245,12 @@ fn check_overwrite_guard(
     path: &Path,
     guard: OverwriteGuard,
 ) -> Result<(), SaveFailure> {
-    let OverwriteGuard::ExpectStamp(expected) = guard else {
-        return Ok(());
+    let expected = match guard {
+        OverwriteGuard::Force => return Ok(()),
+        OverwriteGuard::ExpectContent { stamp, baseline } => {
+            return check_content_guard(service, path, stamp, baseline);
+        }
+        OverwriteGuard::ExpectStamp(expected) => expected,
     };
     let unchanged = match (expected, service.stamp(path)) {
         (Some(expected), Some(current)) => expected == current,
@@ -208,6 +264,41 @@ fn check_overwrite_guard(
         Ok(())
     } else {
         Err(SaveFailure::ExternalChange)
+    }
+}
+
+/// The content-based guard: the disk must still hold the version the session
+/// believes it is replacing. It does not depend on a watcher notification
+/// having arrived, and it does not trust the stamp alone.
+///
+/// - The file is gone: allowed only when the session never knew a stamp (a
+///   file it has not written yet). A file that existed and vanished is not
+///   silently recreated.
+/// - The file cannot be read (permission, invalid text, unstable): refused as
+///   an I/O error, never treated as unchanged.
+/// - A known baseline fingerprint must equal the fingerprint of what is on
+///   disk now; without one the stamp is the best remaining evidence.
+fn check_content_guard(
+    service: &dyn FileService,
+    path: &Path,
+    stamp: Option<FileStamp>,
+    baseline: Option<ContentFingerprint>,
+) -> Result<(), SaveFailure> {
+    match observe_disk(service, path) {
+        DiskVersion::Missing => {
+            if stamp.is_none() && baseline.is_none() {
+                Ok(())
+            } else {
+                Err(SaveFailure::ExternalChange)
+            }
+        }
+        DiskVersion::Unreadable(reason) => Err(SaveFailure::Io(io::Error::other(reason))),
+        DiskVersion::Present(file) => match (baseline, stamp) {
+            (Some(baseline), _) if file.fingerprint == baseline => Ok(()),
+            (Some(_), _) | (None, None) => Err(SaveFailure::ExternalChange),
+            (None, Some(stamp)) if file.stamp == Some(stamp) => Ok(()),
+            (None, Some(_)) => Err(SaveFailure::ExternalChange),
+        },
     }
 }
 
@@ -235,6 +326,14 @@ pub enum OverwriteGuard {
     Force,
     /// Write only if the disk still matches the stamp the session recorded.
     ExpectStamp(Option<FileStamp>),
+    /// Write only if the disk still holds the recorded content: the baseline
+    /// fingerprint when known, else the stamp. Used for every ordinary save of
+    /// a tracked file and, with the version the user was shown, for a
+    /// confirmed overwrite.
+    ExpectContent {
+        stamp: Option<FileStamp>,
+        baseline: Option<ContentFingerprint>,
+    },
 }
 
 /// `FileService` backed by the real filesystem.
@@ -269,6 +368,7 @@ impl FileService for OsFileService {
         Ok(SavedFile {
             identity: identity_for(path),
             stamp: self.stamp(path),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
         })
     }
 
@@ -281,6 +381,7 @@ impl FileService for OsFileService {
         Ok(SavedFile {
             identity: identity_for(path),
             stamp: self.stamp(path),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
         })
     }
 

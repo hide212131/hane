@@ -34,6 +34,28 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 
 変更前後の大文書・複数タブの応答、背景確認時間、保持メモリ、snapshot上限を比較する。未実行の計測・CI・GUIを成功扱いにしない。Windows GUIは接続先WindowsのChatGPTから直接操作し、Mac経由VMを使わない。
 
+## 実装記録（Claude worker、未検証）
+
+このworkerはshell・test・build・lintを実行していない。以下はコードを書いた範囲の記録であり、検証済みを意味しない。検証はCommanderが対象SHAへ紐付けて取得する。
+
+### 実装した範囲
+
+- `identity.rs`: `ContentFingerprint` / `Fingerprinter`（保存形式のbytesから作る内容fingerprint、2レーン+長さ）。`FileState` にbaselineを追加。open直後は未確立（UI threadでhashしない）で、最初の背景確認、または保存成功時に確立する。
+- `service.rs`: `observe_disk`（有界3回の整合読込。handleのstampと読込後のpath stampが一致しない読込は再試行し、収束しなければ `Unreadable`）、`DiskVersion`、`OverwriteGuard::ExpectContent`（保存直前にwatcher到達に依存せず実体とbaselineを照合。消失・読込不可・不一致は書かない）、`SavedFile.fingerprint`。
+- `session.rs`: 背景確認の `begin_external_check` / `finish_external_check`（ticketにgeneration・path・要求sequence・revisionを束縛、文書あたり1 jobと1件の追従に集約）。未編集・IMEなし・保存中でない場合だけ新generationで自動再読込し、カーソルは有効な文字境界へ丸めて復元。それ以外は本文・履歴を保持して `Changed` / `Missing` / `Unverifiable` を記録。`ResolutionApproval`（revision・外部版・操作種別に束縛した一回限りの承認）と `request_confirmed_overwrite` / `apply_confirmed_reload`、`SaveIntent::Confirmed`。通常保存・自動保存は常に `ExpectContent` で、キュー経由でもForceへ昇格しない。`apply_file_event` は通知だけでstampを進めない。
+- UI: `view/external_change.rs`（watcher batchで開いている文書だけを背景確認、結果受理時にDocumentInstanceとticketを照合、競合記録、保存状態メニューの「名前を付けて保存／ディスクの内容を読み直す／この内容で上書き」と確認ダイアログ）、`folder_watch.rs` からの接続、`session_save.rs` の競合時再確認と `ApprovalExpired`、`footer.rs` の案内文修正。
+- テスト: `crates/session/tests/external_change.rs`、`view/external_change.rs` 内のGUIイベントtests、`conflict_rules.rs` の削除後保存（黙って再作成しない契約へ更新）。
+
+### 未実装・未検証（受入条件を満たしたと扱わない）
+
+- 単独で開いたファイルの親ディレクトリ監視、アプリ復帰時の再確認、監視不能時の手動再確認の表示（現状は作業フォルダwatcher経由のみ）。
+- 差分確認（ディスク版／編集中版の読取専用比較表示）。session側に `observed_document()` はあるが画面は未実装。
+- 別名保存で同一実体（symlink・ハードリンク等）を選んだ場合の保護。現状は字句上の同一pathだけを同一ファイルとして扱う。
+- IME中の延期と非アクティブ文書の自動再読込のGUI経路テスト、再読込時のdraft write / AI・解析結果との接続のUIテスト（sessionのgeneration更新までは実装）。
+- 保存前の内容照合は対象ファイル全体を背景で読む。大文書・複数タブでの入力応答、背景時間、メモリ、snapshot上限の前後比較（T12）は未測定。
+- 外部processとの原子的compare-and-swapは保証しない。照合から置換までの間に他者が書く競合窓が残る（検出可能なのは照合時点の不一致のみ）。
+- macOS / Windowsのbuild・tests・Clippy・focused GUI（T01/T02/T03/T04/T07/T08）は未取得。
+
 ## 対象外と完了
 
 共同編集、自動マージ、排他ロック、クラウド専用同期API、全共有方式の通知保証、永続履歴、新runtime、永続形式移行、無関係なリファクタリング、保護パス・workflowの変更は対象外。

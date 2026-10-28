@@ -149,8 +149,10 @@ impl EditorView {
             return;
         }
         if self.connect_folder_watch(root, cx).is_ok() {
-            // Changes made while unwatched were never reported; list again.
+            // Changes made while unwatched were never reported; list again
+            // and look at the open files too.
             self.refresh_work_folder_listing(cx);
+            self.check_open_documents_for_external_changes(cx);
             cx.notify();
         } else {
             cx.notify();
@@ -218,6 +220,10 @@ impl EditorView {
             self.folder_watch.failure = Some(failure);
         }
         self.refresh_work_folder_listing(cx);
+        // The listing above never opens a note. The files that are open are
+        // checked separately, one background read each, because a batch only
+        // says that something changed, not which file.
+        self.check_open_documents_for_external_changes(cx);
         true
     }
 

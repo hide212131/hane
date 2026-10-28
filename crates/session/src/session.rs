@@ -1,8 +1,11 @@
-use crate::identity::{ExternalChange, FilePresence, FileStamp, FileState};
+use crate::identity::{ContentFingerprint, ExternalChange, FilePresence, FileStamp, FileState};
 use crate::resource::ResourceResolver;
-use crate::service::{LoadedFile, OverwriteGuard, SaveFailure, SavedFile};
-use hane_document::{Revision, RopeBuffer, TextBuffer};
-use hane_editor::Editor;
+use crate::service::{
+    DiskVersion, FileService, LoadedFile, ObservedFile, OverwriteGuard, SaveFailure, SavedFile,
+    observe_disk,
+};
+use hane_document::{Revision, RopeBuffer, SourceOffset, TextBuffer};
+use hane_editor::{Editor, Selection};
 use std::path::{Path, PathBuf};
 
 /// Stable identifier for one open document. Survives renames and reloads, so a
@@ -33,6 +36,11 @@ pub enum SaveIntent {
     /// automatically, so a collision means the caller's candidate was
     /// already stale and must be recomputed, not written over.
     CreateNew(PathBuf),
+    /// The user confirmed replacing the external version they were shown (or
+    /// recreating a file that is gone). Valid only while the approval still
+    /// describes the document and the external version; queued behind a
+    /// running write it is re-validated when it runs.
+    Confirmed(ResolutionApproval),
 }
 
 /// One accepted write, ready to hand to the I/O boundary.
@@ -71,6 +79,10 @@ pub enum SaveDecision {
     Queued,
     /// Untitled document: the caller must ask for a path first.
     NeedsPath,
+    /// A confirmed overwrite no longer matches the document or the external
+    /// version (an edit, a newer external change, a reload happened since).
+    /// Nothing was written; the caller asks the user again.
+    ApprovalExpired,
 }
 
 #[derive(Debug)]
@@ -134,6 +146,142 @@ pub enum CloseDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnsavedChanges;
 
+/// Binds one background check of the disk to the document it was started for.
+/// A result is applied only while every field still describes the session, so
+/// a slow read can never act on a replaced document, a renamed path, or a
+/// newer request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalCheckTicket {
+    generation: u64,
+    sequence: u64,
+    revision: Revision,
+    path: PathBuf,
+}
+
+impl ExternalCheckTicket {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// One accepted background check, ready for [`run_external_check`].
+pub struct ExternalCheckRequest {
+    pub ticket: ExternalCheckTicket,
+    /// A snapshot of the clean document, present only when the session has no
+    /// baseline fingerprint yet: the check fingerprints it in the background
+    /// so the UI thread never hashes a document.
+    local: Option<RopeBuffer>,
+}
+
+impl ExternalCheckRequest {
+    pub fn path(&self) -> &Path {
+        self.ticket.path()
+    }
+}
+
+/// What the I/O side found. Applied with [`DocumentSession::finish_external_check`].
+pub struct ExternalCheckResult {
+    disk: DiskVersion,
+    local: Option<ContentFingerprint>,
+}
+
+/// Reads the file once as a consistent version (bounded retries) and
+/// fingerprints it. Blocking: call from a background executor.
+pub fn run_external_check(
+    service: &dyn FileService,
+    request: &ExternalCheckRequest,
+) -> ExternalCheckResult {
+    ExternalCheckResult {
+        disk: observe_disk(service, request.path()),
+        local: request.local.as_ref().map(ContentFingerprint::of_document),
+    }
+}
+
+/// Whether a check was started, or folded into the one already running.
+pub enum ExternalCheckStart {
+    Run(ExternalCheckRequest),
+    /// A check is running; one more follows it so a burst of notifications
+    /// costs one job plus one follow-up, never a queue.
+    Coalesced,
+    /// Untitled documents are not watched.
+    NotTracked,
+}
+
+/// Result of applying a background check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalCheckOutcome {
+    /// The ticket no longer describes this session; nothing changed.
+    Stale,
+    /// The disk holds the version this session already has.
+    Unchanged,
+    /// The document had nothing to lose and was replaced with the disk
+    /// version in a new document generation.
+    Reloaded,
+    /// The disk differs and the document was kept. `dirty` is a conflict with
+    /// unsaved edits; otherwise the reload is deferred because input, an IME
+    /// composition or a write was in progress.
+    Changed { dirty: bool },
+    /// The file is gone or moved. The content is kept.
+    Missing { dirty: bool },
+    /// The file could not be read as text or kept changing. Not "no change".
+    Unverifiable { reason: String },
+}
+
+/// What this session currently knows about the file on disk, apart from
+/// being dirty or saving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalStatus {
+    InSync,
+    Changed,
+    Missing,
+    Unverifiable,
+}
+
+/// The external version a session has seen but not accepted.
+struct ObservedExternal {
+    fingerprint: ContentFingerprint,
+    stamp: Option<FileStamp>,
+    document: RopeBuffer,
+}
+
+enum ExternalState {
+    InSync,
+    Changed(ObservedExternal),
+    Missing,
+    Unverifiable(String),
+}
+
+/// Which destructive resolution the user confirmed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionKind {
+    /// Replace the disk version with this document.
+    Overwrite,
+    /// Discard unsaved edits and take the disk version.
+    DiscardAndReload,
+}
+
+/// A one-time confirmation bound to the document revision and the external
+/// version the user was shown. It is consumed by the operation it approves
+/// and dies with any edit, reload, or newer external version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolutionApproval {
+    kind: ResolutionKind,
+    generation: u64,
+    revision: Revision,
+    shown: Option<ContentFingerprint>,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReloadOutcome {
+    Reloaded,
+    /// The approval no longer matches the document or the external version;
+    /// the caller must ask again. Nothing was discarded.
+    StaleApproval,
+    /// An IME composition or a write is running; try again afterwards.
+    Busy,
+}
+
 /// One open document: its editor, the file it came from, and everything about
 /// persistence that is not I/O. Holds no window, no renderer, and no executor,
 /// so every rule below is testable without a UI.
@@ -159,6 +307,16 @@ pub struct DocumentSession {
     /// file opened from disk, or one where the filename has drifted away
     /// from what auto-naming last set it to.
     auto_title: Option<String>,
+    /// What the last accepted background check said about the disk.
+    external: ExternalState,
+    check_sequence: u64,
+    /// Sequence of the one check allowed to run at a time.
+    check_in_flight: Option<u64>,
+    /// A check was requested while one ran; one follow-up is owed.
+    recheck_pending: bool,
+    approval_serial: u64,
+    /// The only approval that may still be consumed.
+    live_approval: Option<u64>,
 }
 
 impl DocumentSession {
@@ -186,6 +344,12 @@ impl DocumentSession {
             pending_save: None,
             view: SessionViewState::default(),
             auto_title: None,
+            external: ExternalState::InSync,
+            check_sequence: 0,
+            check_in_flight: None,
+            recheck_pending: false,
+            approval_serial: 0,
+            live_approval: None,
         }
     }
 
@@ -260,6 +424,16 @@ impl DocumentSession {
         self.pending_save = None;
         self.view = SessionViewState::default();
         self.auto_title = None;
+        self.reset_external_tracking();
+    }
+
+    /// Forgets everything learned about the previous document's disk file, so
+    /// no check, notice or approval of the old document can reach the new one.
+    fn reset_external_tracking(&mut self) {
+        self.external = ExternalState::InSync;
+        self.check_in_flight = None;
+        self.recheck_pending = false;
+        self.live_approval = None;
     }
 
     /// The title this session's current filename was derived from, if the
@@ -335,6 +509,16 @@ impl DocumentSession {
     /// time; a request that arrives during a write replaces the queued target,
     /// so a burst of autosaves collapses to one follow-up write.
     pub fn request_save(&mut self, intent: SaveIntent) -> SaveDecision {
+        if let SaveIntent::Confirmed(approval) = intent {
+            if self.in_flight.is_some() {
+                self.pending_save = Some(SaveIntent::Confirmed(approval));
+                return SaveDecision::Queued;
+            }
+            return match self.request_confirmed_overwrite(approval) {
+                Some(job) => SaveDecision::Write(job),
+                None => SaveDecision::ApprovalExpired,
+            };
+        }
         let (path, guard) = match &intent {
             SaveIntent::Current | SaveIntent::Overwrite => {
                 let Some(path) = self.file.path().map(Path::to_path_buf) else {
@@ -343,7 +527,7 @@ impl DocumentSession {
                 let guard = if matches!(intent, SaveIntent::Overwrite) {
                     OverwriteGuard::Force
                 } else {
-                    OverwriteGuard::ExpectStamp(self.file.stamp())
+                    self.content_guard()
                 };
                 (path, guard)
             }
@@ -353,7 +537,7 @@ impl DocumentSession {
                     .identity()
                     .is_some_and(|identity| identity.matches_path(path));
                 let guard = if same_file {
-                    OverwriteGuard::ExpectStamp(self.file.stamp())
+                    self.content_guard()
                 } else {
                     // The user named this target in a dialog that already asked
                     // about replacing it.
@@ -362,11 +546,17 @@ impl DocumentSession {
                 (path.clone(), guard)
             }
             SaveIntent::CreateNew(path) => (path.clone(), OverwriteGuard::ExpectStamp(None)),
+            SaveIntent::Confirmed(_) => unreachable!("handled before the match"),
         };
         if self.in_flight.is_some() {
             self.pending_save = Some(intent);
             return SaveDecision::Queued;
         }
+        SaveDecision::Write(self.start_write(path, guard))
+    }
+
+    /// Takes the save slot and snapshots the document for one write.
+    fn start_write(&mut self, path: PathBuf, guard: OverwriteGuard) -> SaveJob {
         self.save_sequence = self.save_sequence.wrapping_add(1);
         let ticket = SaveTicket {
             generation: self.generation,
@@ -375,12 +565,22 @@ impl DocumentSession {
         };
         self.in_flight = Some(ticket);
         self.in_flight_target = Some(path.clone());
-        SaveDecision::Write(SaveJob {
+        SaveJob {
             path,
             document: self.editor.document().clone(),
             guard,
             ticket,
-        })
+        }
+    }
+
+    /// The guard of every ordinary write to this session's own file: the disk
+    /// must still hold the baseline content. A pending or repeated ordinary
+    /// save is never promoted to a forced write.
+    fn content_guard(&self) -> OverwriteGuard {
+        OverwriteGuard::ExpectContent {
+            stamp: self.file.stamp(),
+            baseline: self.file.baseline(),
+        }
     }
 
     /// Applies the outcome of a write. A result whose ticket is not the one this
@@ -398,6 +598,13 @@ impl DocumentSession {
         match result {
             Ok(saved) => {
                 self.file.set_identity(saved.identity, saved.stamp);
+                // The baseline follows the bytes that reached the disk, and
+                // only now: a refused or failed write never moves it.
+                self.file.set_baseline(saved.fingerprint);
+                if self.external_status() != ExternalStatus::InSync {
+                    self.external = ExternalState::InSync;
+                    self.live_approval = None;
+                }
                 if self.revision() == ticket.revision {
                     self.saved_revision = ticket.revision;
                     SaveOutcome::Saved
@@ -490,7 +697,10 @@ impl DocumentSession {
                     if self.is_dirty() {
                         FileEventOutcome::Conflict
                     } else {
-                        self.file.set_stamp(*stamp);
+                        // The recorded stamp is deliberately left alone: a
+                        // notification only says "look again". The stamp and
+                        // baseline move when a background check has read and
+                        // accepted the new version (`finish_external_check`).
                         FileEventOutcome::ExternalEdit
                     }
                 }
@@ -520,7 +730,9 @@ impl DocumentSession {
         // the path after the folder is gone, so its destination counts too.
         match self.pending_save.as_ref() {
             Some(SaveIntent::To(path) | SaveIntent::CreateNew(path)) => path.starts_with(folder),
-            Some(SaveIntent::Current | SaveIntent::Overwrite) => self.is_under_folder(folder),
+            Some(SaveIntent::Current | SaveIntent::Overwrite | SaveIntent::Confirmed(_)) => {
+                self.is_under_folder(folder)
+            }
             None => false,
         }
     }
@@ -564,6 +776,321 @@ impl DocumentSession {
 
     pub fn presence(&self) -> FilePresence {
         self.file.presence()
+    }
+
+    /// What the last accepted check (or deletion event) says about the disk.
+    pub fn external_status(&self) -> ExternalStatus {
+        match &self.external {
+            ExternalState::Changed(_) => ExternalStatus::Changed,
+            ExternalState::Missing => ExternalStatus::Missing,
+            ExternalState::Unverifiable(_) => ExternalStatus::Unverifiable,
+            ExternalState::InSync => {
+                if self.file.presence() == FilePresence::Missing {
+                    ExternalStatus::Missing
+                } else {
+                    ExternalStatus::InSync
+                }
+            }
+        }
+    }
+
+    /// Why the disk version could not be verified, for the notice text.
+    pub fn external_failure(&self) -> Option<&str> {
+        match &self.external {
+            ExternalState::Unverifiable(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The disk version seen but not accepted, as a read-only document for a
+    /// side-by-side comparison. Never the editing buffer.
+    pub fn observed_document(&self) -> Option<&RopeBuffer> {
+        match &self.external {
+            ExternalState::Changed(observed) => Some(&observed.document),
+            _ => None,
+        }
+    }
+
+    /// Identifies the observed external version, so a comparison view can tell
+    /// when it is showing something older than the session now knows.
+    pub fn observed_fingerprint(&self) -> Option<ContentFingerprint> {
+        match &self.external {
+            ExternalState::Changed(observed) => Some(observed.fingerprint),
+            _ => None,
+        }
+    }
+
+    /// An unedited document whose reload was held back (input, IME or a write
+    /// was in progress) and should be checked again once that is over.
+    pub fn needs_external_recheck(&self) -> bool {
+        matches!(self.external, ExternalState::Changed(_)) && !self.is_dirty()
+    }
+
+    /// Whether another check was requested while one ran. Taking it clears it.
+    pub fn take_recheck_request(&mut self) -> bool {
+        std::mem::take(&mut self.recheck_pending)
+    }
+
+    /// Starts a background check of the disk for this document. At most one
+    /// runs per document; further requests collapse into one follow-up.
+    pub fn begin_external_check(&mut self) -> ExternalCheckStart {
+        let Some(path) = self.file.path().map(Path::to_path_buf) else {
+            return ExternalCheckStart::NotTracked;
+        };
+        if self.check_in_flight.is_some() {
+            self.recheck_pending = true;
+            return ExternalCheckStart::Coalesced;
+        }
+        self.check_sequence = self.check_sequence.wrapping_add(1);
+        self.check_in_flight = Some(self.check_sequence);
+        // Without a baseline the clean document itself stands for it.
+        let local = (self.file.baseline().is_none() && !self.is_dirty())
+            .then(|| self.editor.document().clone());
+        ExternalCheckStart::Run(ExternalCheckRequest {
+            ticket: ExternalCheckTicket {
+                generation: self.generation,
+                sequence: self.check_sequence,
+                revision: self.revision(),
+                path,
+            },
+            local,
+        })
+    }
+
+    /// Releases a check that will never report (its job was dropped), so the
+    /// next request can start one.
+    pub fn abandon_external_check(&mut self, ticket: &ExternalCheckTicket) {
+        if self.check_in_flight == Some(ticket.sequence) && self.generation == ticket.generation {
+            self.check_in_flight = None;
+        }
+    }
+
+    /// Applies the result of a background check. Nothing is changed unless the
+    /// ticket still describes this exact document, path and request. A disk
+    /// version is accepted (baseline and stamp advance, the document is
+    /// replaced) only when the document has nothing to lose *now*; otherwise
+    /// the version is only remembered.
+    pub fn finish_external_check(
+        &mut self,
+        ticket: &ExternalCheckTicket,
+        result: ExternalCheckResult,
+    ) -> ExternalCheckOutcome {
+        if self.check_in_flight != Some(ticket.sequence) {
+            return ExternalCheckOutcome::Stale;
+        }
+        // The slot is released even when the result is dropped below, or a
+        // renamed or replaced document would never be checked again.
+        self.check_in_flight = None;
+        if self.generation != ticket.generation || self.file.path() != Some(ticket.path.as_path())
+        {
+            return ExternalCheckOutcome::Stale;
+        }
+        match result.disk {
+            DiskVersion::Missing => {
+                self.set_external(ExternalState::Missing);
+                self.file.mark_missing();
+                ExternalCheckOutcome::Missing {
+                    dirty: self.is_dirty(),
+                }
+            }
+            DiskVersion::Unreadable(reason) => {
+                self.set_external(ExternalState::Unverifiable(reason.clone()));
+                ExternalCheckOutcome::Unverifiable { reason }
+            }
+            DiskVersion::Present(observed) => self.apply_observed(ticket, *observed, result.local),
+        }
+    }
+
+    fn apply_observed(
+        &mut self,
+        ticket: &ExternalCheckTicket,
+        observed: ObservedFile,
+        local: Option<ContentFingerprint>,
+    ) -> ExternalCheckOutcome {
+        if self.file.baseline().is_none() {
+            // The clean document the check started from is the baseline, but
+            // only if no write has advanced it since (a write sets it).
+            if let Some(local) = local {
+                self.file.set_baseline(Some(local));
+            }
+        }
+        let same = match self.file.baseline() {
+            Some(baseline) => baseline == observed.fingerprint,
+            // Still unknown (edited before the first check): the stamp is the
+            // only evidence there is.
+            None => observed.stamp.is_some() && observed.stamp == self.file.stamp(),
+        };
+        if same {
+            self.file.set_stamp(observed.stamp);
+            self.file.set_baseline(Some(observed.fingerprint));
+            self.set_external(ExternalState::InSync);
+            return ExternalCheckOutcome::Unchanged;
+        }
+        let dirty = self.is_dirty();
+        let can_replace = !dirty
+            && self.revision() == ticket.revision
+            && self.editor.ime().is_none()
+            && self.in_flight.is_none();
+        if can_replace {
+            self.replace_with_disk(observed);
+            return ExternalCheckOutcome::Reloaded;
+        }
+        self.file.mark_present();
+        self.set_external(ExternalState::Changed(ObservedExternal {
+            fingerprint: observed.fingerprint,
+            stamp: observed.stamp,
+            document: observed.document,
+        }));
+        ExternalCheckOutcome::Changed { dirty }
+    }
+
+    /// Stores a new external state. An approval given for an earlier external
+    /// version dies when the version changes.
+    fn set_external(&mut self, state: ExternalState) {
+        let same_version = match (&self.external, &state) {
+            (ExternalState::Changed(old), ExternalState::Changed(new)) => {
+                old.fingerprint == new.fingerprint
+            }
+            (ExternalState::Missing, ExternalState::Missing)
+            | (ExternalState::InSync, ExternalState::InSync) => true,
+            _ => false,
+        };
+        if !same_version {
+            self.live_approval = None;
+        }
+        self.external = state;
+    }
+
+    /// Replaces the document with an accepted disk version. Starts a new
+    /// document generation: history, parse/layout caches and background
+    /// results of the old text are invalidated by the bump, and the old
+    /// undo/redo is not replayed on the new text. The selection is carried
+    /// over by offset, rounded to a valid character boundary.
+    fn replace_with_disk(&mut self, observed: ObservedFile) {
+        let before = self.editor.selection();
+        self.editor = Editor::from_document(observed.document);
+        let anchor = self.nearest_valid_offset(before.anchor);
+        let active = self.nearest_valid_offset(before.active);
+        // Offsets were just validated, so this cannot fail; a failure would
+        // only leave the caret at the start, never invalidate the document.
+        let _ = self.editor.set_selection(Selection { anchor, active });
+        self.file.set_stamp(observed.stamp);
+        self.file.set_baseline(Some(observed.fingerprint));
+        self.saved_revision = self.editor.document().revision();
+        self.generation = self.generation.wrapping_add(1);
+        self.autosave_generation = self.autosave_generation.wrapping_add(1);
+        self.pending_save = None;
+        self.live_approval = None;
+        self.external = ExternalState::InSync;
+    }
+
+    /// The closest offset at or before `offset` that is inside the document
+    /// and on a character boundary.
+    fn nearest_valid_offset(&self, offset: SourceOffset) -> SourceOffset {
+        let document = self.editor.document();
+        let mut candidate = offset.0.min(document.len_bytes().0);
+        while candidate > 0 && document.validate_offset(SourceOffset(candidate)).is_err() {
+            candidate -= 1;
+        }
+        SourceOffset(candidate)
+    }
+
+    /// Records that the user confirmed `kind` while looking at `shown` (the
+    /// fingerprint of the external version on screen, `None` for "the file is
+    /// gone"). `None` back means that is not what the session knows any more:
+    /// ask again. The approval is bound to the current revision and document.
+    pub fn approve_resolution(
+        &mut self,
+        kind: ResolutionKind,
+        shown: Option<ContentFingerprint>,
+    ) -> Option<ResolutionApproval> {
+        if self.current_external_fingerprint()? != shown {
+            return None;
+        }
+        self.approval_serial = self.approval_serial.wrapping_add(1);
+        self.live_approval = Some(self.approval_serial);
+        Some(ResolutionApproval {
+            kind,
+            generation: self.generation,
+            revision: self.revision(),
+            shown,
+            serial: self.approval_serial,
+        })
+    }
+
+    /// `Some(Some(fp))` for an observed external version, `Some(None)` for a
+    /// missing file, `None` when there is nothing to resolve.
+    fn current_external_fingerprint(&self) -> Option<Option<ContentFingerprint>> {
+        match &self.external {
+            ExternalState::Changed(observed) => Some(Some(observed.fingerprint)),
+            ExternalState::Missing => Some(None),
+            ExternalState::InSync => (self.file.presence() == FilePresence::Missing).then_some(None),
+            ExternalState::Unverifiable(_) => None,
+        }
+    }
+
+    fn approval_is_current(&self, approval: ResolutionApproval, kind: ResolutionKind) -> bool {
+        approval.kind == kind
+            && self.live_approval == Some(approval.serial)
+            && approval.generation == self.generation
+            && approval.revision == self.revision()
+            && self.current_external_fingerprint() == Some(approval.shown)
+    }
+
+    /// Starts the confirmed overwrite of the external version the user saw.
+    /// The write is guarded by that exact version, so a newer external change
+    /// that lands before the bytes are replaced is refused again instead of
+    /// overwritten. `None`: the approval is stale or the save slot is busy;
+    /// nothing was consumed in the busy case.
+    pub fn request_confirmed_overwrite(&mut self, approval: ResolutionApproval) -> Option<SaveJob> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        if !self.approval_is_current(approval, ResolutionKind::Overwrite) {
+            return None;
+        }
+        let path = self.file.path().map(Path::to_path_buf)?;
+        let guard = match &self.external {
+            ExternalState::Changed(observed) => OverwriteGuard::ExpectContent {
+                stamp: observed.stamp,
+                baseline: Some(observed.fingerprint),
+            },
+            // Recreating is allowed only while the file is still gone.
+            _ => OverwriteGuard::ExpectContent {
+                stamp: None,
+                baseline: None,
+            },
+        };
+        // One use: a second attempt needs a new confirmation.
+        self.live_approval = None;
+        Some(self.start_write(path, guard))
+    }
+
+    /// Discards unsaved edits and takes the external version the user saw.
+    /// The text comes from the already-read version, so a failed or cancelled
+    /// step never leaves the document emptied.
+    pub fn apply_confirmed_reload(&mut self, approval: ResolutionApproval) -> ReloadOutcome {
+        if self.editor.ime().is_some() || self.in_flight.is_some() {
+            return ReloadOutcome::Busy;
+        }
+        if !self.approval_is_current(approval, ResolutionKind::DiscardAndReload) {
+            return ReloadOutcome::StaleApproval;
+        }
+        // Missing / unreadable: there is no disk text to take.
+        if !matches!(self.external, ExternalState::Changed(_)) {
+            return ReloadOutcome::StaleApproval;
+        }
+        let ExternalState::Changed(observed) =
+            std::mem::replace(&mut self.external, ExternalState::InSync)
+        else {
+            return ReloadOutcome::StaleApproval;
+        };
+        self.replace_with_disk(ObservedFile {
+            document: observed.document,
+            fingerprint: observed.fingerprint,
+            stamp: observed.stamp,
+        });
+        ReloadOutcome::Reloaded
     }
 
     pub fn close_decision(&self) -> CloseDecision {

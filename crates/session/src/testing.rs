@@ -1,6 +1,6 @@
 //! In-memory doubles so the session rules can be tested without a filesystem.
 
-use crate::identity::{FileIdentity, FileStamp};
+use crate::identity::{ContentFingerprint, FileIdentity, FileStamp};
 use crate::service::{FileService, LoadedFile, ReadFile, SavedFile, StampedRead};
 use crate::workfolder::{WorkFolder, WorkFolderScanner};
 use hane_document::RopeBuffer;
@@ -254,6 +254,7 @@ impl FileService for MemoryFileService {
         Ok(SavedFile {
             identity: FileIdentity::lexical(path),
             stamp: Some(stamp),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
         })
     }
 

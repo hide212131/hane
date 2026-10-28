@@ -50,7 +50,10 @@ pub use draft::{
     DraftId, DraftStore, OsDraftStore, RecoveredDraft, RecoveredDrafts,
     next_draft_snapshot_sequence,
 };
-pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
+pub use identity::{
+    ContentFingerprint, ExternalChange, FileIdentity, FilePresence, FileStamp, FileState,
+    Fingerprinter,
+};
 pub use naming::{
     TitleSyncAction, decide_title_sync, extract_h1_title, unique_folder_name,
     unique_markdown_filename,
@@ -61,13 +64,15 @@ pub use pins::{
 };
 pub use resource::ResourceResolver;
 pub use service::{
-    FileService, LoadedFile, OsFileService, OverwriteGuard, ReadFile, SaveFailure, SavedFile,
-    run_create_new_job, run_save_job,
+    DiskVersion, FileService, LoadedFile, ObservedFile, OsFileService, OverwriteGuard, ReadFile,
+    SaveFailure, SavedFile, observe_disk, run_create_new_job, run_save_job,
 };
 pub use session::{
-    AutosaveTicket, CloseDecision, DocumentSession, FileEvent, FileEventOutcome, OpenDecision,
-    OpenPolicy, SaveDecision, SaveIntent, SaveJob, SaveOutcome, SaveTicket, SessionId, SessionSet,
-    SessionViewState, UnsavedChanges,
+    AutosaveTicket, CloseDecision, DocumentSession, ExternalCheckOutcome, ExternalCheckRequest,
+    ExternalCheckResult, ExternalCheckStart, ExternalCheckTicket, ExternalStatus, FileEvent,
+    FileEventOutcome, OpenDecision, OpenPolicy, ReloadOutcome, ResolutionApproval, ResolutionKind,
+    SaveDecision, SaveIntent, SaveJob, SaveOutcome, SaveTicket, SessionId, SessionSet,
+    SessionViewState, UnsavedChanges, run_external_check,
 };
 pub use store::{
     FileStateStore, InvalidNetworkConfig, MemoryStateStore, NetworkConfig, RecentFiles,

@@ -106,6 +106,8 @@ mod content_search;
 mod document_find;
 mod editor_context_menu;
 use editor_context_menu::EditorContextMenu;
+mod external_change;
+use external_change::{ResolutionAction, ResolutionChoices};
 mod folder_watch;
 mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};

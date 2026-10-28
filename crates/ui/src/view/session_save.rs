@@ -794,6 +794,15 @@ impl EditorView {
             // `save_in_flight()`, so queued and started writes need no
             // message of their own.
             SaveDecision::Queued => {}
+            SaveDecision::ApprovalExpired => {
+                // The confirmation was for an older document or an older
+                // external version; nothing was written and the choice has
+                // to be made again against what is there now.
+                self.status = Some(
+                    "確認後に文書または外部のファイルが変更されました。もう一度、操作を選んでください"
+                        .to_owned(),
+                );
+            }
             SaveDecision::Write(job) => {
                 // A started write replaces any older transient message, the
                 // way the former "Saving…" text did; the save problem of the
@@ -972,6 +981,9 @@ impl EditorView {
                 // The candidate name this was for was raced away; drop it
                 // rather than let a later, unrelated write consume it.
                 self.title_sync_pending.remove(&id);
+                // Read what is on disk now, so the comparison and the
+                // resolution choices describe the version that refused us.
+                self.start_external_check(id, cx);
             }
             SaveOutcome::Failed(error) => {
                 self.status = None;
