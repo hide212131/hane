@@ -295,7 +295,10 @@ fn a_check_read_before_a_save_completes_never_overwrites_the_saved_text() {
         panic!("expected a check to start");
     };
     let stale = run_external_check(&service, &request);
-    assert_eq!(complete_job(&mut session, &service, job), SaveOutcome::Saved);
+    assert!(matches!(
+        complete_job(&mut session, &service, job),
+        SaveOutcome::Saved
+    ));
 
     assert_eq!(
         session.finish_external_check(&request.ticket, stale),
