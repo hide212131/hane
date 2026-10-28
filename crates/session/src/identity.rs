@@ -70,6 +70,37 @@ impl FileIdentity {
         self.path == path || self.canonical == lexical_canonical(path)
     }
 
+    /// Same-file test for a Save As target. Beyond the lexical match this asks
+    /// the filesystem, so a symlink (both ends resolved) or, on Unix, a hard link
+    /// to the session's own file is recognised as the same file and keeps the
+    /// ordinary external-change protection. A target that does not exist yet or
+    /// cannot be inspected is a different file. Windows hard links are not
+    /// detected: `std` exposes no stable file index there.
+    pub fn is_same_file_on_disk(&self, path: impl AsRef<Path>) -> bool {
+        let path = path.as_ref();
+        if self.matches_path(path) {
+            return true;
+        }
+        if let (Ok(own), Ok(target)) = (
+            std::fs::canonicalize(&self.path),
+            std::fs::canonicalize(path),
+        ) && own == target
+        {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(own), Ok(target)) = (
+                std::fs::metadata(&self.path),
+                std::fs::metadata(path),
+            ) {
+                return own.dev() == target.dev() && own.ino() == target.ino();
+            }
+        }
+        false
+    }
+
     /// Follow a rename or move. The document is untouched: only where it is
     /// written changes.
     #[must_use]
@@ -366,6 +397,59 @@ mod tests {
         let two = FileIdentity::lexical("/notes/b.md");
         assert!(!one.is_same_file(&two));
         assert!(!one.matches_path("/notes/b.md"));
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hane-identity-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_as_target_on_disk_matches_only_the_same_file() {
+        let dir = scratch_dir("plain");
+        let own = dir.join("a.md");
+        let other = dir.join("b.md");
+        std::fs::write(&own, "a").unwrap();
+        std::fs::write(&other, "b").unwrap();
+        let identity = FileIdentity::new(&own, std::fs::canonicalize(&own).unwrap());
+        assert!(identity.is_same_file_on_disk(&own));
+        assert!(!identity.is_same_file_on_disk(&other));
+        assert!(!identity.is_same_file_on_disk(dir.join("missing.md")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_target_through_a_symlink_is_the_same_file() {
+        let dir = scratch_dir("symlink");
+        let own = dir.join("a.md");
+        let link = dir.join("link.md");
+        std::fs::write(&own, "a").unwrap();
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        let identity = FileIdentity::new(&own, std::fs::canonicalize(&own).unwrap());
+        assert!(!identity.matches_path(&link));
+        assert!(identity.is_same_file_on_disk(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_target_through_a_hard_link_is_the_same_file() {
+        let dir = scratch_dir("hardlink");
+        let own = dir.join("a.md");
+        let hard = dir.join("hard.md");
+        std::fs::write(&own, "a").unwrap();
+        std::fs::hard_link(&own, &hard).unwrap();
+        let identity = FileIdentity::new(&own, std::fs::canonicalize(&own).unwrap());
+        assert!(!identity.matches_path(&hard));
+        assert!(identity.is_same_file_on_disk(&hard));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

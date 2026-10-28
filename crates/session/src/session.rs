@@ -598,7 +598,7 @@ impl DocumentSession {
                 let same_file = self
                     .file
                     .identity()
-                    .is_some_and(|identity| identity.matches_path(path));
+                    .is_some_and(|identity| identity.is_same_file_on_disk(path));
                 let guard = if same_file {
                     self.content_guard()
                 } else {
