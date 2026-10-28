@@ -193,7 +193,6 @@ impl Transport for ValidationFeedTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hane_update::download::BodyReader;
     use std::net::TcpListener;
 
     fn request(url: &str) -> Request {

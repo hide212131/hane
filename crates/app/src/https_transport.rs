@@ -10,6 +10,12 @@
 //! interrupt; it runs on a single helper thread that the request stops waiting
 //! for at the deadline, and no second lookup starts while it is still running.
 
+// The opt-in `validation-feed` build replaces this transport with the loopback
+// fixture (see `main.rs`), so the standard implementation below is unused
+// there. It is still compiled, and covered by the unit tests, in every build;
+// the allowance is limited to this module and to that one feature.
+#![cfg_attr(all(feature = "validation-feed", not(test)), allow(dead_code))]
+
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,7 +91,6 @@ struct SharedParts {
 
 /// Builds the TLS configuration (reading the system trust store) on the first
 /// request instead of at startup, so launching the app does no update work.
-#[cfg_attr(feature = "validation-feed", allow(dead_code))]
 pub struct LazyHttpsTransport {
     network: NetworkProvider,
     shared: Arc<std::sync::OnceLock<Result<SharedParts, String>>>,
@@ -96,7 +101,6 @@ pub struct LazyHttpsTransport {
 /// it once and keeps that snapshot for every request of the operation.
 pub type NetworkProvider = Arc<dyn Fn() -> NetworkContext + Send + Sync>;
 
-#[cfg_attr(feature = "validation-feed", allow(dead_code))]
 impl LazyHttpsTransport {
     pub fn new(network: NetworkProvider) -> Self {
         Self {
