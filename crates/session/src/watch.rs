@@ -146,7 +146,7 @@ impl WatchedNames {
         // A poisoned set cannot say what is wanted: report everything.
         self.0
             .lock()
-            .map_or(true, |names| names.iter().any(|wanted| *wanted == name))
+            .map_or(true, |names| names.contains(&name))
     }
 }
 
