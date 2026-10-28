@@ -155,6 +155,9 @@ pub struct ExternalCheckTicket {
     generation: u64,
     sequence: u64,
     revision: Revision,
+    /// Count of successful writes when the check started: a write that lands
+    /// while the disk is being read makes the read stale.
+    saves: u64,
     path: PathBuf,
 }
 
@@ -362,6 +365,8 @@ pub struct DocumentSession {
     /// What the last accepted background check said about the disk.
     external: ExternalState,
     check_sequence: u64,
+    /// Successful writes so far; see [`ExternalCheckTicket`].
+    saves_completed: u64,
     /// Sequence of the one check allowed to run at a time.
     check_in_flight: Option<u64>,
     /// A check was requested while one ran; one follow-up is owed.
@@ -401,6 +406,7 @@ impl DocumentSession {
             auto_title: None,
             external: ExternalState::InSync,
             check_sequence: 0,
+            saves_completed: 0,
             check_in_flight: None,
             recheck_pending: false,
             approval_serial: 0,
@@ -658,6 +664,7 @@ impl DocumentSession {
                 // The baseline follows the bytes that reached the disk, and
                 // only now: a refused or failed write never moves it.
                 self.file.set_baseline(saved.fingerprint);
+                self.saves_completed = self.saves_completed.wrapping_add(1);
                 if self.external_status() != ExternalStatus::InSync {
                     self.external = ExternalState::InSync;
                     self.live_approval = None;
@@ -908,6 +915,7 @@ impl DocumentSession {
                 generation: self.generation,
                 sequence: self.check_sequence,
                 revision: self.revision(),
+                saves: self.saves_completed,
                 path,
             },
             local,
@@ -940,6 +948,12 @@ impl DocumentSession {
         self.check_in_flight = None;
         if self.generation != ticket.generation || self.file.path() != Some(ticket.path.as_path())
         {
+            return ExternalCheckOutcome::Stale;
+        }
+        if self.saves_completed != ticket.saves {
+            // A write landed while the disk was read, so the read may predate
+            // it. Drop it and owe a fresh check against the saved baseline.
+            self.recheck_pending = true;
             return ExternalCheckOutcome::Stale;
         }
         match result.disk {

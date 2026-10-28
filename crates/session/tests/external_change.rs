@@ -279,6 +279,39 @@ fn results_for_a_replaced_document_or_path_are_rejected() {
 }
 
 #[test]
+fn a_check_read_before_a_save_completes_never_overwrites_the_saved_text() {
+    let service = MemoryFileService::new();
+    let mut session = opened(&service, "base\n");
+    assert_eq!(check(&mut session, &service), ExternalCheckOutcome::Unchanged);
+    type_into(&mut session, "mine ");
+    let mine = text(&session);
+    assert_eq!(mine, "mine base\n");
+
+    let SaveDecision::Write(job) = session.request_save(SaveIntent::Current) else {
+        panic!("expected an accepted write");
+    };
+    // The check reads the old disk content while the save is still running.
+    let ExternalCheckStart::Run(request) = session.begin_external_check() else {
+        panic!("expected a check to start");
+    };
+    let stale = run_external_check(&service, &request);
+    assert_eq!(complete_job(&mut session, &service, job), SaveOutcome::Saved);
+
+    assert_eq!(
+        session.finish_external_check(&request.ticket, stale),
+        ExternalCheckOutcome::Stale
+    );
+    assert_eq!(text(&session), mine);
+    assert!(!session.is_dirty());
+    assert_eq!(session.external_status(), ExternalStatus::InSync);
+    assert!(session.take_recheck_request(), "a follow-up check is owed");
+
+    // The follow-up reads the saved disk content and finds nothing to do.
+    assert_eq!(check(&mut session, &service), ExternalCheckOutcome::Unchanged);
+    assert_eq!(text(&session), mine);
+}
+
+#[test]
 fn notifications_during_a_check_collapse_into_one_follow_up() {
     let service = MemoryFileService::new();
     let mut session = opened(&service, "base\n");
