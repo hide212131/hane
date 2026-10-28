@@ -1049,6 +1049,7 @@ mod tests {
                     document: RopeBuffer::from_text("replacement\n"),
                     identity: FileIdentity::lexical(PathBuf::from("replacement.md")),
                     stamp: None,
+                    fingerprint: None,
                 });
             assert!(view.footer_warnings().is_empty());
             assert_ne!(view.active_save_display(), SaveDisplay::Conflict);

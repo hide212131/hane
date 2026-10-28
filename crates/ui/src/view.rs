@@ -13947,6 +13947,7 @@ mod tests {
                 document: RopeBuffer::from_text("active\n"),
                 identity: hane_session::FileIdentity::lexical(active_path),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -13954,6 +13955,7 @@ mod tests {
                     document: RopeBuffer::from_text("clicked\n"),
                     identity: hane_session::FileIdentity::lexical(clicked_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -14028,6 +14030,7 @@ mod tests {
                 document: RopeBuffer::from_text("first\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -14035,6 +14038,7 @@ mod tests {
                     document: RopeBuffer::from_text("second\n"),
                     identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -14221,6 +14225,7 @@ mod tests {
                 document: RopeBuffer::from_text("body\n"),
                 identity: hane_session::FileIdentity::lexical(path),
                 stamp: None,
+                fingerprint: None,
             });
             EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
         });
@@ -14264,6 +14269,7 @@ mod tests {
                 document: RopeBuffer::from_text("active\n"),
                 identity: hane_session::FileIdentity::lexical(active_path),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -14271,6 +14277,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -14428,6 +14435,7 @@ mod tests {
                     document: RopeBuffer::from_text("active\n"),
                     identity: hane_session::FileIdentity::lexical(active_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14441,6 +14449,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(view.sessions.activate(SessionId(0)));
@@ -14475,6 +14484,7 @@ mod tests {
                     document: RopeBuffer::from_text("first\n"),
                     identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14489,6 +14499,7 @@ mod tests {
                     document: RopeBuffer::from_text("second\n"),
                     identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             (first, second)
@@ -14793,6 +14804,7 @@ mod tests {
                     document: RopeBuffer::from_text("first\n"),
                     identity: hane_session::FileIdentity::lexical(first_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14807,6 +14819,7 @@ mod tests {
                     document: RopeBuffer::from_text("second\n"),
                     identity: hane_session::FileIdentity::lexical(second_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             let third = view.sessions.apply_open(
@@ -14815,6 +14828,7 @@ mod tests {
                     document: RopeBuffer::from_text("third\n"),
                     identity: hane_session::FileIdentity::lexical(third_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(view.sessions.activate(third));
@@ -14913,6 +14927,7 @@ mod tests {
                     document: RopeBuffer::from_text("body\n"),
                     identity: hane_session::FileIdentity::lexical(long_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14926,6 +14941,7 @@ mod tests {
                     document: RopeBuffer::from_text("body\n"),
                     identity: hane_session::FileIdentity::lexical(other_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(view.sessions.activate(SessionId(0)));
@@ -14965,6 +14981,7 @@ mod tests {
                 document: RopeBuffer::from_text("active\n"),
                 identity: hane_session::FileIdentity::lexical(active_path),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -14972,6 +14989,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path.clone()),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -15018,6 +15036,7 @@ mod tests {
                     document: RopeBuffer::from_text("before"),
                     identity: hane_session::FileIdentity::lexical(path.clone()),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -15140,6 +15159,7 @@ mod tests {
                 document: RopeBuffer::from_text("before"),
                 identity: hane_session::FileIdentity::lexical(path.clone()),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -15147,6 +15167,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path.clone()),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -15271,6 +15292,7 @@ mod tests {
                     document: RopeBuffer::from_text("before"),
                     identity: hane_session::FileIdentity::lexical(missing_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -15779,6 +15801,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             assert_ne!(
                 view.sessions.active().generation(),
@@ -16097,6 +16120,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             (id, confirm)
         });
@@ -16178,6 +16202,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.editor_mut().insert_text("draft").unwrap();
             view.after_input(cx);
@@ -16251,6 +16276,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.editor_mut().insert_text("draft").unwrap();
             view.after_input(cx);
@@ -16317,6 +16343,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             DocumentInstance {
                 generation: view.sessions.active().generation(),
@@ -16406,6 +16433,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             // Bookkeeping belonging entirely to the replacement document —
             // a close-and-save request of its own, armed after the dialog
@@ -16481,6 +16509,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.status = Some("current document status".to_owned());
             (id, stale_instance)
@@ -16699,6 +16728,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.status = Some("current document status".to_owned());
             (id, stale_instance)
@@ -16756,6 +16786,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.status = Some("current document status".to_owned());
             (id, stale_instance)

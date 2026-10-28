@@ -13,6 +13,11 @@ pub struct LoadedFile {
     pub document: RopeBuffer,
     pub identity: FileIdentity,
     pub stamp: Option<FileStamp>,
+    /// Fingerprint of the disk content that `document` was read from,
+    /// computed on the loading (background) path. It becomes the session's
+    /// baseline so a same-stamp external rewrite is still detected before the
+    /// first background check. `None` when the service cannot provide one.
+    pub fingerprint: Option<ContentFingerprint>,
 }
 
 /// A read-only file handle used by streaming features such as content search.
@@ -149,7 +154,9 @@ pub fn observe_disk(service: &dyn FileService, path: &Path) -> DiskVersion {
         if loaded.stamp.is_some() && loaded.stamp != after {
             continue;
         }
-        let fingerprint = ContentFingerprint::of_document(&loaded.document);
+        let fingerprint = loaded
+            .fingerprint
+            .unwrap_or_else(|| ContentFingerprint::of_document(&loaded.document));
         return DiskVersion::Present(Box::new(ObservedFile {
             document: loaded.document,
             fingerprint,
@@ -356,10 +363,12 @@ impl FileService for OsFileService {
         let file = fs::File::open(path)?;
         let stamp = stamp_from_metadata(file.metadata().ok());
         let document = RopeBuffer::from_reader(io::BufReader::new(file))?;
+        let fingerprint = Some(ContentFingerprint::of_document(&document));
         Ok(LoadedFile {
             document,
             identity: identity_for(path),
             stamp,
+            fingerprint,
         })
     }
 

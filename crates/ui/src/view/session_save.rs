@@ -1361,6 +1361,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             assert!(session.begin_rename().is_some());
             assert!(matches!(

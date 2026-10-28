@@ -385,7 +385,8 @@ impl DocumentSession {
     }
 
     pub fn from_loaded(id: SessionId, loaded: LoadedFile) -> Self {
-        let file = FileState::tracked(loaded.identity, loaded.stamp);
+        let mut file = FileState::tracked(loaded.identity, loaded.stamp);
+        file.set_baseline(loaded.fingerprint);
         Self::from_parts(id, Editor::from_document(loaded.document), file)
     }
 
@@ -479,6 +480,7 @@ impl DocumentSession {
     pub fn adopt(&mut self, loaded: LoadedFile) {
         self.editor = Editor::from_document(loaded.document);
         self.file = FileState::tracked(loaded.identity, loaded.stamp);
+        self.file.set_baseline(loaded.fingerprint);
         self.saved_revision = self.editor.document().revision();
         self.generation = self.generation.wrapping_add(1);
         self.autosave_generation = 0;

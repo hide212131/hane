@@ -72,6 +72,72 @@ fn fingerprints_tell_same_length_contents_apart() {
     );
 }
 
+/// Loads "base\n", then lets someone else rewrite the file with same-length
+/// content and hands back a load whose stamp already equals the rewritten
+/// file's: only the content fingerprint can tell the versions apart.
+fn load_with_same_stamp_rewrite(service: &MemoryFileService) -> hane_session::LoadedFile {
+    service.write_externally(PATH, "base\n");
+    let mut loaded = service.load(Path::new(PATH)).unwrap();
+    assert!(loaded.fingerprint.is_some());
+    service.write_externally(PATH, "them\n");
+    loaded.stamp = service.stamp(Path::new(PATH));
+    loaded
+}
+
+fn assert_refuses_to_overwrite_same_stamp_rewrite(
+    mut session: DocumentSession,
+    service: &MemoryFileService,
+) {
+    assert_eq!(
+        session.file().baseline(),
+        Some(ContentFingerprint::of_bytes(b"base\n"))
+    );
+    type_into(&mut session, "mine ");
+    let mine = text(&session);
+
+    let decision = session.request_save(SaveIntent::Current);
+    assert!(matches!(
+        complete(&mut session, service, decision),
+        SaveOutcome::Conflict
+    ));
+    assert_eq!(service.contents(PATH).as_deref(), Some("them\n"));
+    assert_eq!(text(&session), mine);
+    assert!(session.is_dirty());
+}
+
+#[test]
+fn from_loaded_keeps_the_disk_fingerprint_as_baseline() {
+    let service = MemoryFileService::new();
+    let loaded = load_with_same_stamp_rewrite(&service);
+    let session = DocumentSession::from_loaded(SessionId(0), loaded);
+    assert_refuses_to_overwrite_same_stamp_rewrite(session, &service);
+}
+
+#[test]
+fn adopt_keeps_the_disk_fingerprint_as_baseline() {
+    let service = MemoryFileService::new();
+    let loaded = load_with_same_stamp_rewrite(&service);
+    let mut session = DocumentSession::untitled(SessionId(0), "", "untitled");
+    session.adopt(loaded);
+    assert_refuses_to_overwrite_same_stamp_rewrite(session, &service);
+}
+
+#[test]
+fn the_first_check_sees_a_same_stamp_rewrite_made_after_an_edit() {
+    let service = MemoryFileService::new();
+    let loaded = load_with_same_stamp_rewrite(&service);
+    let mut session = DocumentSession::from_loaded(SessionId(0), loaded);
+    type_into(&mut session, "mine ");
+    let mine = text(&session);
+
+    assert_eq!(
+        check(&mut session, &service),
+        ExternalCheckOutcome::Changed { dirty: true }
+    );
+    assert_eq!(text(&session), mine);
+    assert_eq!(service.contents(PATH).as_deref(), Some("them\n"));
+}
+
 #[test]
 fn a_clean_document_follows_an_external_save() {
     let service = MemoryFileService::new();
