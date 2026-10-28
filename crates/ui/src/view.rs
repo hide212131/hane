@@ -106,6 +106,7 @@ mod content_search;
 mod document_find;
 mod editor_context_menu;
 use editor_context_menu::EditorContextMenu;
+mod document_watch;
 mod external_change;
 use external_change::{ResolutionAction, ResolutionChoices};
 mod folder_watch;
@@ -1096,6 +1097,10 @@ pub struct EditorView {
     /// dropped (releasing the watch) when the folder is replaced or the
     /// window closes.
     folder_watch: folder_watch::FolderWatchState,
+    /// The directory watches of open files outside the watched work folder,
+    /// the first-check bookkeeping, and the window-return observer; see
+    /// `document_watch`.
+    document_watch: document_watch::DocumentWatchState,
     /// Start order of every work folder listing scan; see
     /// `folder_watch::ListingRequests`.
     listing_requests: folder_watch::ListingRequests,
@@ -1897,6 +1902,7 @@ impl EditorView {
             external_folder_open_token: 0,
             external_file_open_after_folder_scan: None,
             folder_watch: folder_watch::FolderWatchState::default(),
+            document_watch: document_watch::DocumentWatchState::default(),
             listing_requests: folder_watch::ListingRequests::default(),
             focus_handle: cx.focus_handle(),
             heights,

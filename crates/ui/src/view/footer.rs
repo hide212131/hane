@@ -230,6 +230,9 @@ struct MenuSpec {
     /// How the active document's external-change conflict can be resolved,
     /// when it has one. Shown only in the save-state menu.
     resolution: Option<ResolutionChoices>,
+    /// The active document's file is not being watched, so the menu offers a
+    /// manual check of the disk. Shown only in the save-state menu.
+    recheck: bool,
 }
 
 fn text_item(text: String, max_width: f32) -> PopupMenuItem {
@@ -306,6 +309,14 @@ fn build_menu(
                 ResolutionAction::Overwrite,
             ));
         }
+    }
+    if spec.recheck {
+        menu = menu.item(resolution_item(
+            "ディスクの内容を再確認",
+            "footer-recheck-disk",
+            view,
+            ResolutionAction::Recheck,
+        ));
     }
     if spec.show_zoom {
         for value in ZOOM_CHOICES {
@@ -436,6 +447,7 @@ impl EditorView {
         if let Some(warning) = self.folder_watch_warning() {
             warnings.push(warning);
         }
+        warnings.extend(self.document_watch_warnings());
         warnings
     }
 
@@ -508,6 +520,7 @@ impl EditorView {
         let show_settings = self.work_folder.is_none() || !self.sidebar_shown();
         let zoom = self.zoom;
         let resolution = self.active_resolution_choices();
+        let recheck = self.active_document_watch_problem();
 
         let full_count = match selected {
             Some(selected) => format!(
@@ -568,6 +581,7 @@ impl EditorView {
                 show_ai: true,
                 ai_enabled,
                 resolution,
+                recheck,
             };
             let menu_view = view.clone();
             left.push(
@@ -596,6 +610,7 @@ impl EditorView {
                 show_ai: false,
                 ai_enabled,
                 resolution,
+                recheck,
             };
             let details_view = view.clone();
             left.push(
@@ -651,6 +666,7 @@ impl EditorView {
                         show_ai: false,
                         ai_enabled,
                         resolution: None,
+                        recheck: false,
                     };
                     let zoom_view = view.clone();
                     right.push(
@@ -714,6 +730,7 @@ impl EditorView {
                         show_ai: false,
                         ai_enabled,
                         resolution: None,
+                        recheck: false,
                     };
                     let more_view = view.clone();
                     right.push(

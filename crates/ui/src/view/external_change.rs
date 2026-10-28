@@ -37,6 +37,9 @@ pub(super) enum ResolutionAction {
     SaveAs,
     Reload,
     Overwrite,
+    /// Looks at the file on disk again; offered while its changes are not
+    /// being watched. Changes nothing by itself.
+    Recheck,
 }
 
 /// Which of the destructive choices apply to the active document right now.
@@ -264,6 +267,7 @@ impl EditorView {
             ResolutionAction::SaveAs => self.prompt_save_as(cx),
             ResolutionAction::Reload => self.confirm_discarding_reload(window, cx),
             ResolutionAction::Overwrite => self.confirm_overwrite(window, cx),
+            ResolutionAction::Recheck => self.recheck_active_document(cx),
         }
     }
 

@@ -78,7 +78,9 @@ pub use store::{
     FileStateStore, InvalidNetworkConfig, MemoryStateStore, NetworkConfig, RecentFiles,
     RecentFilesRepository, Settings, SettingsRepository, StateStores, ThemePreference, pin_state_root,
 };
-pub use watch::{DEFAULT_MAX_WAIT, DEFAULT_QUIET_PERIOD, FolderWatcher, WatchBatch, WatchTiming};
+pub use watch::{
+    DEFAULT_MAX_WAIT, DEFAULT_QUIET_PERIOD, FolderWatcher, WatchBatch, WatchTiming, WatchedNames,
+};
 pub use workfolder::{
     OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderFolder, WorkFolderNode,
     WorkFolderScanner, WorkFolderSortOrder, next_modified_sequence, stamp_with_sequence,

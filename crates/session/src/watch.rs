@@ -15,9 +15,11 @@
 
 use notify::event::ModifyKind;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -110,6 +112,44 @@ impl DebounceWindow {
     }
 }
 
+/// The file names a directory watch reports on. A directory shared by several
+/// open files, or by files that are not open, would otherwise wake the
+/// receiver for every unrelated write next to them. The set can be replaced
+/// while the watch runs, so the same watch follows the files opened and closed
+/// in that directory. Names compare case-insensitively: over-matching only
+/// costs one extra check, under-matching would lose a change.
+#[derive(Clone, Default)]
+pub struct WatchedNames(Arc<Mutex<Vec<String>>>);
+
+impl WatchedNames {
+    pub fn new(names: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Self {
+        let set = Self::default();
+        set.set(names);
+        set
+    }
+
+    pub fn set(&self, names: impl IntoIterator<Item = impl AsRef<OsStr>>) {
+        let names: Vec<String> = names
+            .into_iter()
+            .map(|name| name.as_ref().to_string_lossy().to_lowercase())
+            .collect();
+        if let Ok(mut current) = self.0.lock() {
+            *current = names;
+        }
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name() else {
+            return false;
+        };
+        let name = name.to_string_lossy().to_lowercase();
+        // A poisoned set cannot say what is wanted: report everything.
+        self.0
+            .lock()
+            .map_or(true, |names| names.iter().any(|wanted| *wanted == name))
+    }
+}
+
 /// Keeps one folder watched for as long as it lives. Dropping it stops the OS
 /// watch and the debounce thread; no batch is delivered afterward.
 pub struct FolderWatcher {
@@ -130,6 +170,37 @@ impl FolderWatcher {
         timing: WatchTiming,
         on_batch: impl FnMut(WatchBatch) -> bool + Send + 'static,
     ) -> io::Result<Self> {
+        Self::start_with(root, RecursiveMode::Recursive, None, timing, on_batch)
+    }
+
+    /// Starts watching only the entries directly inside `directory`, and only
+    /// reports those named in `names` (plus loss of the directory itself and
+    /// notification trouble). This is how a file opened outside the work
+    /// folder is followed: watching the parent, not the file, is what sees an
+    /// editor that saves by replacing the file. Subdirectories are not
+    /// watched. The same delivery and release rules as `start` apply.
+    pub fn start_directory(
+        directory: &Path,
+        names: WatchedNames,
+        timing: WatchTiming,
+        on_batch: impl FnMut(WatchBatch) -> bool + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::start_with(
+            directory,
+            RecursiveMode::NonRecursive,
+            Some(names),
+            timing,
+            on_batch,
+        )
+    }
+
+    fn start_with(
+        root: &Path,
+        mode: RecursiveMode,
+        names: Option<WatchedNames>,
+        timing: WatchTiming,
+        on_batch: impl FnMut(WatchBatch) -> bool + Send + 'static,
+    ) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let mut roots = vec![root.to_path_buf()];
         if let Ok(canonical) = root.canonicalize()
@@ -140,16 +211,14 @@ impl FolderWatcher {
         let handler_sender = sender.clone();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
-                if let Some(signal) = classify(&roots, result) {
+                if let Some(signal) = classify_for(&roots, names.as_ref(), result) {
                     let _ = handler_sender.send(signal);
                 }
             },
             Config::default(),
         )
         .map_err(io::Error::other)?;
-        watcher
-            .watch(root, RecursiveMode::Recursive)
-            .map_err(io::Error::other)?;
+        watcher.watch(root, mode).map_err(io::Error::other)?;
         thread::Builder::new()
             .name("hane-folder-watch".to_owned())
             .spawn(move || run_debouncer(&receiver, timing, on_batch))?;
@@ -193,6 +262,26 @@ fn run_debouncer(
             return;
         }
     }
+}
+
+/// `classify`, narrowed to the watched file names when a directory watch has
+/// them. Trouble reports and anything about the directory itself always pass.
+fn classify_for(
+    roots: &[PathBuf],
+    names: Option<&WatchedNames>,
+    result: notify::Result<Event>,
+) -> Option<Signal> {
+    if let (Some(names), Ok(event)) = (names, &result)
+        && !event.need_rescan()
+        && !event.paths.is_empty()
+        && !event
+            .paths
+            .iter()
+            .any(|path| roots.contains(path) || names.matches(path))
+    {
+        return None;
+    }
+    classify(roots, result)
 }
 
 /// Maps one notification to what the debouncer should do about it, or `None`
@@ -452,6 +541,90 @@ mod tests {
             receiver.recv_timeout(Duration::from_millis(800)).is_err(),
             "a released watch must not report later changes"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_directory_watch_reports_only_the_watched_names_and_trouble() {
+        let roots = vec![PathBuf::from("/notes")];
+        let names = WatchedNames::new(["Note.md"]);
+        let create = || EventKind::Create(CreateKind::File);
+        assert!(matches!(
+            classify_for(&roots, Some(&names), event(create(), "/notes/note.MD")),
+            Some(Signal::Changed)
+        ));
+        assert!(classify_for(&roots, Some(&names), event(create(), "/notes/Other.md")).is_none());
+        // An atomic replacement names the temporary file and the target.
+        let replace = Ok(Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(PathBuf::from("/notes/.tmp123"))
+            .add_path(PathBuf::from("/notes/Note.md")));
+        assert!(matches!(
+            classify_for(&roots, Some(&names), replace),
+            Some(Signal::Changed)
+        ));
+        // Loss of the directory and notification trouble are never filtered.
+        assert!(matches!(
+            classify_for(
+                &roots,
+                Some(&names),
+                event(EventKind::Remove(RemoveKind::Folder), "/notes")
+            ),
+            Some(Signal::Failed(_))
+        ));
+        assert!(matches!(
+            classify_for(
+                &roots,
+                Some(&names),
+                Err(notify::Error::generic("watch failed"))
+            ),
+            Some(Signal::Failed(_))
+        ));
+        let overflow = Ok(Event::new(EventKind::Other)
+            .add_path(PathBuf::from("/elsewhere"))
+            .set_flag(Flag::Rescan));
+        assert!(matches!(
+            classify_for(&roots, Some(&names), overflow),
+            Some(Signal::Failed(_))
+        ));
+        // The set follows the files opened and closed meanwhile.
+        names.set(["Other.md"]);
+        assert!(matches!(
+            classify_for(&roots, Some(&names), event(create(), "/notes/Other.md")),
+            Some(Signal::Changed)
+        ));
+        assert!(classify_for(&roots, Some(&names), event(create(), "/notes/Note.md")).is_none());
+    }
+
+    #[test]
+    fn a_directory_watch_sees_an_atomic_replacement_of_a_watched_file_only() {
+        let root = temporary_directory("watch-directory");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Note.md"), "# Note\n").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let watcher = FolderWatcher::start_directory(
+            &root,
+            WatchedNames::new(["Note.md"]),
+            timing(50, 200),
+            move |batch| sender.send(batch).is_ok(),
+        )
+        .unwrap();
+        // Setting the folder up can itself be reported late by the OS.
+        while receiver.recv_timeout(Duration::from_millis(500)).is_ok() {}
+
+        fs::write(root.join("Unrelated.md"), "# Unrelated\n").unwrap();
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(800)).is_err(),
+            "a file that is not watched must not wake the receiver"
+        );
+
+        fs::write(root.join(".replacement"), "# Replaced\n").unwrap();
+        fs::rename(root.join(".replacement"), root.join("Note.md")).unwrap();
+        let batch = receiver
+            .recv_timeout(NOTIFICATION_WAIT_LIMIT)
+            .expect("replacing the watched file is reported within the wait limit");
+        assert_eq!(batch.failure, None);
+
+        drop(watcher);
         fs::remove_dir_all(root).unwrap();
     }
 

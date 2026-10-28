@@ -66,7 +66,27 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Test-only: makes the next folder watch attaches fail with `message` (or
+/// stop failing). Lets other view modules exercise a folder watch that is down.
+#[cfg(test)]
+pub(super) fn inject_folder_attach_error(message: Option<&str>) {
+    INJECTED_ATTACH_ERROR.with(|slot| *slot.borrow_mut() = message.map(str::to_owned));
+}
+
 impl EditorView {
+    /// Whether the work folder watch is attached and reports changes under
+    /// `path`. A file it covers needs no watch of its own; while the folder
+    /// watch is down, nothing is covered and each file falls back to watching
+    /// its parent directory (`document_watch`).
+    pub(super) fn folder_watch_covers(&self, path: &Path) -> bool {
+        self.folder_watch.unwatched.is_none()
+            && self
+                .folder_watch
+                .watch_root
+                .as_deref()
+                .is_some_and(|root| path.starts_with(root))
+    }
+
     /// The warning shown for as long as the current work folder's changes are
     /// not being watched.
     pub(super) fn folder_watch_warning(&self) -> Option<String> {

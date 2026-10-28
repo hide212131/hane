@@ -46,9 +46,21 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 - UI: `view/external_change.rs`（watcher batchで開いている文書だけを背景確認、結果受理時にDocumentInstanceとticketを照合、競合記録、保存状態メニューの「名前を付けて保存／ディスクの内容を読み直す／この内容で上書き」と確認ダイアログ）、`folder_watch.rs` からの接続、`session_save.rs` の競合時再確認と `ApprovalExpired`、`footer.rs` の案内文修正。
 - テスト: `crates/session/tests/external_change.rs`、`view/external_change.rs` 内のGUIイベントtests、`conflict_rules.rs` の削除後保存（黙って再作成しない契約へ更新）。
 
+### 監視寿命（watch lifecycle）の追加実装（Claude worker、未検証）
+
+このworkerはshell・test・build・lintを実行していない。コードを書いた範囲の記録であり、検証済みを意味しない。
+
+- `crates/session/src/watch.rs`: `FolderWatcher::start_directory`（非再帰の親ディレクトリ監視）と `WatchedNames`（開いているファイル名だけを通す、実行中に差し替え可能な集合）を追加。既存の `start` / debounce / failure batch / Drop は同じ経路を共有し、通知集中は既存のquiet / max-waitに集約される。ディレクトリ自体の消失・overflow・通知errorは名前で絞らず常に通す。
+- `crates/ui/src/view/document_watch.rs`（新規）: 開いている保存済み文書と登録済み監視の差分を、renderごとのpath集合比較（I/Oなし）で同期する。作業フォルダwatcherが正常に接続され、そのrootに含まれる文書は親監視を作らない（二重登録なし）。それ以外は親ディレクトリごとに1監視を共有し、最後のownerが消えると監視と受信taskを解放する。untitledは対象外。work folder generationが変わると全登録を破棄し、旧tokenの遅延batchは棄却される。
+- 監視登録後に文書ごとの初回確認を開始する（新open・同path再open・保存先変更・rename・フォルダ切替）。作業フォルダ内の文書も、既存watcherが正常に接続された後に同じ経路で初回確認する。本文確認は既存の `start_external_check`（文書ごとに1 job + 1 pending、結果はDocumentInstance / ticketで照合）を使い、未openファイルは読まない。
+- 失敗（開始失敗・overflow・通知error・監視root消失）は成功扱いにしない。通知由来の失敗は再登録して開いている文書を再確認する。再登録できない場合は文書に紐付けた警告をフッターに残し（tab切替・status更新で消えない）、タイマー1本で再試行する。再試行自体は本文を読まず、復旧時だけ確認する。保存状態メニューに「ディスクの内容を再確認」を追加（`ResolutionAction::Recheck`）。
+- アプリ復帰: 初回renderで一度だけ `observe_window_activation` を登録し、アクティブ化時に失敗中の監視を再登録して開いている文書を再確認する。IME中・編集中の保護は既存のsession判定と結果受理時のticket照合に任せる。
+- テスト: `document_watch.rs` のGPUI deterministic tests（実OS threadは起動せず既存のtest batch注入を再利用）と、`watch.rs` の名前絞り込み・実FS（atomic置換）tests。いずれも未実行。
+- 既存テストへの影響の懸念（未確認）: render時に初回確認が走るため、描画を伴う既存テストで開いた直後にディスクを書き換えるものは、初回確認の結果（未編集なら自動再読込）の影響を受ける可能性がある。
+
 ### 未実装・未検証（受入条件を満たしたと扱わない）
 
-- 単独で開いたファイルの親ディレクトリ監視、アプリ復帰時の再確認、監視不能時の手動再確認の表示（現状は作業フォルダwatcher経由のみ）。
+- 監視寿命以外の独立root（下記の差分確認、ディスク版の整合読込・fingerprint・OS file identity、保存承認鮮度、同一実体のSave As、全域リファクタリング）。
 - 差分確認（ディスク版／編集中版の読取専用比較表示）。session側に `observed_document()` はあるが画面は未実装。
 - 別名保存で同一実体（symlink・ハードリンク等）を選んだ場合の保護。現状は字句上の同一pathだけを同一ファイルとして扱う。
 - IME中の延期と非アクティブ文書の自動再読込のGUI経路テスト、再読込時のdraft write / AI・解析結果との接続のUIテスト（sessionのgeneration更新までは実装）。

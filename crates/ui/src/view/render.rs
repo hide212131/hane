@@ -3,6 +3,10 @@ use super::*;
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_external_open_guard();
+        // Registered once; then only a path-set comparison per frame, never
+        // file I/O (the checks themselves run on the background executor).
+        self.observe_window_return(window, cx);
+        self.sync_document_watches(cx);
         // Erase the opaque type so the element no longer borrows `self`.
         let element = self.render_frame(window, cx).into_any_element();
         // `editor_mut` raises the external-open guard even for access that does
