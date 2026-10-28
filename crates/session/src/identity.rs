@@ -74,8 +74,8 @@ impl FileIdentity {
     /// the filesystem, so a symlink (both ends resolved) or, on Unix, a hard link
     /// to the session's own file is recognised as the same file and keeps the
     /// ordinary external-change protection. A target that does not exist yet or
-    /// cannot be inspected is a different file. Windows hard links are not
-    /// detected: `std` exposes no stable file index there.
+    /// cannot be inspected is a different file. On Windows the volume serial
+    /// number and file index of the opened file identify hard links.
     pub fn is_same_file_on_disk(&self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
         if self.matches_path(path) {
@@ -98,6 +98,15 @@ impl FileIdentity {
                 return own.dev() == target.dev() && own.ino() == target.ino();
             }
         }
+        #[cfg(windows)]
+        {
+            if let (Some(own), Some(target)) = (
+                windows_file_id(&self.path),
+                windows_file_id(path),
+            ) {
+                return own == target;
+            }
+        }
         false
     }
 
@@ -107,6 +116,57 @@ impl FileIdentity {
     pub fn moved_to(&self, path: impl AsRef<Path>) -> Self {
         Self::lexical(path)
     }
+}
+
+/// Mirrors `BY_HANDLE_FILE_INFORMATION` from `<fileapi.h>`; it is passed by
+/// pointer straight to `kernel32.dll`, so the layout must match exactly.
+#[cfg(windows)]
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_file_information_by_handle(
+        handle: *mut std::ffi::c_void,
+        info: *mut ByHandleFileInformation,
+    ) -> i32;
+}
+
+/// Volume serial number and file index of the file at `path`, which are the
+/// same for every hard link to one physical file. `None` when the file cannot
+/// be opened or queried.
+#[cfg(windows)]
+fn windows_file_id(path: &Path) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: `file` owns a valid handle for the duration of the call, and
+    // `info` is a plain-old-data struct matching `BY_HANDLE_FILE_INFORMATION`
+    // that the API fully initializes when it returns non-zero.
+    let info = unsafe {
+        let mut info: ByHandleFileInformation = std::mem::zeroed();
+        if get_file_information_by_handle(file.as_raw_handle().cast(), &mut info) == 0 {
+            return None;
+        }
+        info
+    };
+    Some((
+        info.volume_serial_number,
+        (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+    ))
 }
 
 /// Cheap fingerprint of a file on disk, captured when it is read or written, so
@@ -438,7 +498,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn save_as_target_through_a_hard_link_is_the_same_file() {
         let dir = scratch_dir("hardlink");
