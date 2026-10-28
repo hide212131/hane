@@ -177,7 +177,11 @@ impl EditorView {
                 // progress: look again shortly instead of replacing it now.
                 self.schedule_external_recheck(id, cx);
             }
-            ExternalCheckOutcome::Missing { .. } => {}
+            ExternalCheckOutcome::Missing { .. } => {
+                // The file is gone: an earlier external conflict / unverifiable
+                // notice no longer describes it. A genuine save failure stays.
+                self.clear_external_problem(id);
+            }
             ExternalCheckOutcome::Unverifiable { reason } => {
                 self.record_save_problem(
                     id,
@@ -696,5 +700,82 @@ mod tests {
             assert_eq!(view.active_session().path(), Some(other.as_path()));
         });
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Opens a note, records `problem` for it, deletes the file and runs one
+    /// check. Returns what the window still holds for that note.
+    fn problem_left_after_the_file_goes_missing(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        problem: DocumentSaveProblem,
+    ) -> Option<DocumentSaveProblem> {
+        let root = external_test_root(label);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Note.md");
+        std::fs::write(&path, "before\n").unwrap();
+        let (view, cx) = open_view(cx, &path);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("typed ").unwrap();
+            view.after_input(cx);
+            let id = view.sessions.active_id();
+            let instance = view.document_instance(id).unwrap();
+            view.record_save_problem(id, instance, Some(path.clone()), problem);
+        });
+        std::fs::remove_file(&path).unwrap();
+        view.update(cx, |view, cx| {
+            view.check_open_documents_for_external_changes(cx);
+        });
+        cx.run_until_parked();
+
+        let left = view.read_with(cx, |view, _| {
+            // The missing state, the text and the recovery choice stay.
+            assert_eq!(
+                view.active_session().external_status(),
+                ExternalStatus::Missing
+            );
+            assert!(view.editor().document().full_text().starts_with("typed "));
+            assert!(view.active_resolution_choices().is_some());
+            let id = view.sessions.active_id();
+            view.save_problems
+                .get(&id)
+                .map(|scoped| scoped.problem.clone())
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        left
+    }
+
+    #[gpui::test]
+    fn a_missing_file_clears_an_earlier_external_conflict(cx: &mut gpui::TestAppContext) {
+        let left = problem_left_after_the_file_goes_missing(
+            cx,
+            "missing-conflict",
+            DocumentSaveProblem::Conflict,
+        );
+        assert!(left.is_none(), "stale conflict notice left: {left:?}");
+    }
+
+    #[gpui::test]
+    fn a_missing_file_clears_an_earlier_unverifiable_notice(cx: &mut gpui::TestAppContext) {
+        let left = problem_left_after_the_file_goes_missing(
+            cx,
+            "missing-unverifiable",
+            DocumentSaveProblem::Failed(format!("{UNVERIFIABLE_PREFIX}denied")),
+        );
+        assert!(left.is_none(), "stale unverifiable notice left: {left:?}");
+    }
+
+    #[gpui::test]
+    fn a_missing_file_keeps_a_genuine_save_failure(cx: &mut gpui::TestAppContext) {
+        let left = problem_left_after_the_file_goes_missing(
+            cx,
+            "missing-save-failure",
+            DocumentSaveProblem::Failed("disk full".to_owned()),
+        );
+        assert!(matches!(
+            left,
+            Some(DocumentSaveProblem::Failed(text)) if text == "disk full"
+        ));
     }
 }
