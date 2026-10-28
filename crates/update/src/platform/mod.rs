@@ -35,6 +35,17 @@ pub const HELPER_FILE_NAME: &str = "hane-updater.exe";
 #[cfg(not(windows))]
 pub const HELPER_FILE_NAME: &str = "hane-updater";
 
+/// The basename of the transaction-private helper copy. On Windows the copy
+/// is launched under a neutral name: a byte-identical helper named
+/// `hane-updater.exe` failed to start with `ERROR_ELEVATION_REQUIRED` (740) on
+/// an affected machine while the same bytes started as `hane-worker.exe`. The
+/// installed file and the signed inventory keep `HELPER_FILE_NAME`; the copy's
+/// location is validated by its directory chain, never by this name.
+#[cfg(windows)]
+pub const STAGED_HELPER_FILE_NAME: &str = "hane-worker.exe";
+#[cfg(not(windows))]
+pub const STAGED_HELPER_FILE_NAME: &str = HELPER_FILE_NAME;
+
 /// A supported, verified installation of the running application.
 #[derive(Debug, Clone)]
 pub struct Placement {
@@ -304,7 +315,7 @@ pub fn stage_helper_copy(
         ));
     }
     let dir = coordination.ensure_helper_dir(transaction)?;
-    let dest = dir.join(HELPER_FILE_NAME);
+    let dest = dir.join(STAGED_HELPER_FILE_NAME);
     durable_write(&dest, &bytes)?;
     // The copy must be owned by this principal and writable by nobody else
     // before it is hashed and run; the private subtree keeps it that way.
@@ -404,7 +415,7 @@ pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -
     let staged = coordination
         .transaction_dir(transaction)
         .join(lease::HELPER_DIR)
-        .join(HELPER_FILE_NAME);
+        .join(STAGED_HELPER_FILE_NAME);
     let present = hash_regular_file(&staged)?
         .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"))?;
     if (FileIdentity { size: present.0, sha256: present.1 }) != identity {
@@ -448,6 +459,10 @@ mod tests {
         };
         let copy = stage_helper_copy(&coord, &txn, &good).unwrap();
         assert_eq!(fs::read(&copy).unwrap(), b"helper-bytes");
+        assert_eq!(copy.file_name().unwrap(), STAGED_HELPER_FILE_NAME);
+        assert_eq!(staged_helper(&coord, &txn).unwrap(), copy);
+        #[cfg(windows)]
+        assert_ne!(copy.file_name().unwrap(), HELPER_FILE_NAME);
         assert!(
             Coordination::from_helper_exe(&copy).is_ok(),
             "the copy lives where the helper derives its identity from"
@@ -460,7 +475,7 @@ mod tests {
         let other_txn = TransactionId::generate().unwrap();
         let err = stage_helper_copy(&coord, &other_txn, &bad).unwrap_err();
         assert_eq!(err.code, ErrorCode::HashMismatch);
-        assert!(!coord.transaction_dir(&other_txn).join("helper").join(HELPER_FILE_NAME).exists());
+        assert!(!coord.transaction_dir(&other_txn).join("helper").join(STAGED_HELPER_FILE_NAME).exists());
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
