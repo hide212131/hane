@@ -1025,6 +1025,11 @@ mod tests {
             Phase::Prepared => &[],
             Phase::ExitAuthorized => &[Phase::ExitAuthorized],
             Phase::Applying => &[Phase::ExitAuthorized, Phase::Applying],
+            Phase::AwaitingHealth => &[
+                Phase::ExitAuthorized,
+                Phase::Applying,
+                Phase::AwaitingHealth,
+            ],
             Phase::RolledBack => &[Phase::RolledBack],
             Phase::Committed => &[
                 Phase::ExitAuthorized,
