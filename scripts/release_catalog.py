@@ -65,6 +65,9 @@ WINDOWS_LAYOUT = 2
 # other. The release only ever produces layout 2.
 MACOS_LAYOUT = 2
 MACOS_BUNDLE_ID = "io.github.hide212131.hane"
+# Fixed identity of the isolated `validation-feed` build (Issue #510); only
+# verify_validation_macos_zip accepts it.
+VALIDATION_MACOS_BUNDLE_ID = "io.github.hide212131.hane.validation"
 RELEASE_ASSETS = (WINDOWS_ASSET, MACOS_ASSET, CATALOG_NAME, SIGNATURE_NAME)
 
 MAX_CATALOG_BYTES = 256 << 10
@@ -739,6 +742,19 @@ def verify_archive_inventory(archive: Archive, *, prefix: str, inventory_path: s
 
 
 def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust) -> dict:
+    """Release verifier: accepts the product bundle identifier only."""
+    return _verify_macos_zip(path, version=version, source_sha=source_sha, trust=trust,
+                             bundle_id=MACOS_BUNDLE_ID)
+
+
+def verify_validation_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust) -> dict:
+    """Verifier of the isolated `validation-feed` package (Issue #510): the fixed
+    validation bundle identifier only. Never used by the Release path."""
+    return _verify_macos_zip(path, version=version, source_sha=source_sha, trust=trust,
+                             bundle_id=VALIDATION_MACOS_BUNDLE_ID)
+
+
+def _verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust, bundle_id: str) -> dict:
     inventory_path, signature_path = macos_sidecar_paths(version, source_sha)
     sidecar_dir = macos_sidecar_dir(version, source_sha)
     with Archive(path) as archive:
@@ -765,7 +781,7 @@ def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust)
         except Exception as err:  # plistlib raises several types
             raise fail(f"Info.plist is not a valid property list: {err}") from err
         expected = {
-            "CFBundleIdentifier": MACOS_BUNDLE_ID,
+            "CFBundleIdentifier": bundle_id,
             "CFBundleExecutable": "hane",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": version,

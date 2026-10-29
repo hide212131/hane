@@ -522,6 +522,19 @@ class MacosZipTests(TempCase):
         self.assertIn(rc.MACOS_CODE_RESOURCES_REL, [f["path"] for f in document["files"]])
         self.assertEqual(document["layout_revision"], 2)
 
+    def test_the_validation_identity_is_accepted_only_by_the_validation_verifier(self):
+        validation = self.fx.macos_zip(self.tmp / "validation.zip", bundle_id=rc.VALIDATION_MACOS_BUNDLE_ID)
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            self.verify(validation)
+        facts = rc.verify_validation_macos_zip(validation, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        self.assertEqual(facts["bundle_id"], rc.VALIDATION_MACOS_BUNDLE_ID)
+        product = self.fx.macos_zip(self.tmp / "product.zip")
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            rc.verify_validation_macos_zip(product, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        other = self.fx.macos_zip(self.tmp / "other-id.zip", bundle_id="com.example.fake")
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            rc.verify_validation_macos_zip(other, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+
     def test_an_unsealed_bundle_is_rejected(self):
         with self.assertRaisesRegex(ReleaseError, "CodeResources"):
             self.verify(self.fx.macos_zip(self.tmp / "unsealed.zip", code_resources=False))

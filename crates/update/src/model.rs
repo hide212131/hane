@@ -20,7 +20,19 @@ pub const SIGNATURE_ASSET_NAME: &str = "hane-update.json.sig";
 pub const CATALOG_DOMAIN: &[u8] = b"hane-update-catalog-v1\0";
 pub const INVENTORY_DOMAIN: &[u8] = b"hane-install-v1\0";
 
-pub const MACOS_BUNDLE_ID: &str = "io.github.hide212131.hane";
+/// The product's pinned macOS bundle identifier.
+pub const PRODUCT_MACOS_BUNDLE_ID: &str = "io.github.hide212131.hane";
+/// The fixed bundle identifier of the isolated `validation-feed` build
+/// (Issue #510). It is recognised only when that feature is enabled; there is no
+/// way to configure another identifier.
+pub const VALIDATION_MACOS_BUNDLE_ID: &str = "io.github.hide212131.hane.validation";
+
+/// The only bundle identifier this build accepts for the app, the helper and
+/// candidate bundles. Standard builds accept the product identifier alone.
+#[cfg(not(feature = "validation-feed"))]
+pub const MACOS_BUNDLE_ID: &str = PRODUCT_MACOS_BUNDLE_ID;
+#[cfg(feature = "validation-feed")]
+pub const MACOS_BUNDLE_ID: &str = VALIDATION_MACOS_BUNDLE_ID;
 
 pub const INVENTORY_FILE_NAME: &str = "hane-install.json";
 pub const INVENTORY_SIGNATURE_FILE_NAME: &str = "hane-install.json.sig";
@@ -176,4 +188,30 @@ pub struct SignatureFile {
 pub struct SignatureEntry {
     pub key_id: String,
     pub signature_base64: String,
+}
+
+#[cfg(test)]
+mod bundle_id_tests {
+    use super::*;
+
+    #[test]
+    fn the_validation_identity_is_distinct_and_fixed() {
+        assert_ne!(PRODUCT_MACOS_BUNDLE_ID, VALIDATION_MACOS_BUNDLE_ID);
+        assert_eq!(PRODUCT_MACOS_BUNDLE_ID, "io.github.hide212131.hane");
+        assert_eq!(VALIDATION_MACOS_BUNDLE_ID, "io.github.hide212131.hane.validation");
+    }
+
+    #[cfg(not(feature = "validation-feed"))]
+    #[test]
+    fn a_standard_build_pins_the_product_identity_and_rejects_validation() {
+        assert_eq!(MACOS_BUNDLE_ID, PRODUCT_MACOS_BUNDLE_ID);
+        assert_ne!(MACOS_BUNDLE_ID, VALIDATION_MACOS_BUNDLE_ID);
+    }
+
+    #[cfg(feature = "validation-feed")]
+    #[test]
+    fn a_validation_build_pins_only_the_validation_identity() {
+        assert_eq!(MACOS_BUNDLE_ID, VALIDATION_MACOS_BUNDLE_ID);
+        assert_ne!(MACOS_BUNDLE_ID, PRODUCT_MACOS_BUNDLE_ID);
+    }
 }

@@ -344,7 +344,8 @@ class HelperAndBundleTests(unittest.TestCase):
 
         self.assertIn(f'CATALOG_DOMAIN: &[u8] = b"{rc.CATALOG_DOMAIN.decode().replace(chr(0), chr(92) + "0")}"', model)
         self.assertIn(f'INVENTORY_DOMAIN: &[u8] = b"{rc.INVENTORY_DOMAIN.decode().replace(chr(0), chr(92) + "0")}"', model)
-        self.assertIn(f'MACOS_BUNDLE_ID: &str = "{rc.MACOS_BUNDLE_ID}"', model)
+        self.assertIn(f'PRODUCT_MACOS_BUNDLE_ID: &str = "{rc.MACOS_BUNDLE_ID}"', model)
+        self.assertIn(f'VALIDATION_MACOS_BUNDLE_ID: &str = "{rc.VALIDATION_MACOS_BUNDLE_ID}"', model)
         self.assertIn(f'REPOSITORY: &str = "{rc.REPOSITORY}"', model)
         self.assertIn(f'"{rc.WINDOWS_TARGET}"', model)
         self.assertIn(f'"{rc.MACOS_TARGET}"', model)
