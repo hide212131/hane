@@ -811,9 +811,15 @@ def _verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust
 # ------------------------------------------------------------ catalog
 
 
+def macos_verifier(validation_feed: bool = False):
+    """The macOS ZIP verifier: production identity unless the isolated
+    `validation-feed` (Issue #510) is explicitly requested."""
+    return verify_validation_macos_zip if validation_feed else verify_macos_zip
+
+
 def build_catalog(release_dir: Path, *, tag: str, source_sha: str, sequence: int,
                   trust: Trust, published: dt.datetime | None = None,
-                  validity: dt.timedelta = DEFAULT_VALIDITY) -> bytes:
+                  validity: dt.timedelta = DEFAULT_VALIDITY, validation_feed: bool = False) -> bytes:
     version = version_of(tag)
     if not SHA1_RE.match(source_sha):
         raise fail("source SHA must be 40 lowercase hex digits")
@@ -821,7 +827,8 @@ def build_catalog(release_dir: Path, *, tag: str, source_sha: str, sequence: int
         raise fail("catalog_sequence must be an integer from 1 to 2^64-1")
     release_dir = Path(release_dir)
     windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust)
-    macos = verify_macos_zip(release_dir / MACOS_ASSET, version=version, source_sha=source_sha, trust=trust)
+    macos = macos_verifier(validation_feed)(release_dir / MACOS_ASSET, version=version, source_sha=source_sha,
+                                            trust=trust)
     w_size, w_sha = file_sha256(release_dir / WINDOWS_ASSET)
     m_size, m_sha = file_sha256(release_dir / MACOS_ASSET)
     published = (published or now_utc()).replace(microsecond=0)
@@ -902,7 +909,8 @@ def verify_catalog_bytes(raw: bytes, signature_file: bytes, trust: Trust) -> dic
 
 
 def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, trust: Trust,
-                       now: dt.datetime | None = None, sequence: int | None = None) -> dict:
+                       now: dt.datetime | None = None, sequence: int | None = None,
+                       validation_feed: bool = False) -> dict:
     """The single verifier: signature, catalog fields and both real ZIPs."""
     release_dir = Path(release_dir)
     version = version_of(tag)
@@ -935,7 +943,8 @@ def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, trust: T
         raise fail("catalog must contain exactly the Windows x64 and macOS arm64 targets")
 
     windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust)
-    macos = verify_macos_zip(release_dir / MACOS_ASSET, version=version, source_sha=source_sha, trust=trust)
+    macos = macos_verifier(validation_feed)(release_dir / MACOS_ASSET, version=version, source_sha=source_sha,
+                                            trust=trust)
     expected = {
         WINDOWS_TARGET: (WINDOWS_ASSET, WINDOWS_LAYOUT, WINDOWS_ENTRY_FIELDS, windows),
         MACOS_TARGET: (MACOS_ASSET, MACOS_LAYOUT, MACOS_ENTRY_FIELDS, macos),
@@ -1168,11 +1177,13 @@ def main(argv: list[str] | None = None) -> int:
     add("make-zip", "root", "output")
     add("extract-zip", "zip", "dest")
     add("verify-windows-zip", "zip", "version", "source-sha")
-    add("verify-macos-zip", "zip", "version", "source-sha")
+    add("verify-macos-zip", "zip", "version", "source-sha").add_argument("--validation-feed", action="store_true")
     bc = add("build-catalog", "dir", "tag", "source-sha", "output")
     bc.add_argument("--sequence", type=int, required=True)
+    bc.add_argument("--validation-feed", action="store_true")
     vr = add("verify-release", "dir", "tag", "source-sha")
     vr.add_argument("--sequence", type=int)
+    vr.add_argument("--validation-feed", action="store_true")
     pl = add("plan", "repo", "tag")
     pl.add_argument("--tag-push", action="store_true")
     pl.add_argument("--initial", action="store_true")
@@ -1230,17 +1241,20 @@ def _dispatch(args: argparse.Namespace) -> int:
     elif cmd == "verify-windows-zip":
         verify_windows_zip(Path(args.zip), version=args.version, source_sha=args.source_sha, trust=Trust.from_env())
     elif cmd == "verify-macos-zip":
-        verify_macos_zip(Path(args.zip), version=args.version, source_sha=args.source_sha, trust=Trust.from_env())
+        macos_verifier(args.validation_feed)(Path(args.zip), version=args.version, source_sha=args.source_sha,
+                                             trust=Trust.from_env())
     elif cmd == "build-catalog":
         trust = Trust.from_env()
         out = Path(args.output)
         if out.exists():
             raise fail(f"{out} already exists; refusing to overwrite")
         out.write_bytes(build_catalog(Path(args.dir), tag=args.tag, source_sha=args.source_sha,
-                                      sequence=args.sequence, trust=trust))
+                                      sequence=args.sequence, trust=trust,
+                                      validation_feed=args.validation_feed))
     elif cmd == "verify-release":
         verify_release_dir(Path(args.dir), tag=args.tag, source_sha=args.source_sha,
-                           trust=Trust.from_env(), sequence=args.sequence)
+                           trust=Trust.from_env(), sequence=args.sequence,
+                           validation_feed=args.validation_feed)
     elif cmd == "plan":
         plan = plan_release(Gh(), args.repo, args.tag, tag_push=args.tag_push, initial=args.initial,
                             trust=Trust.from_env())
