@@ -290,6 +290,20 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertIn("codesign --verify --deep --strict",
                       step_text(jobs(RELEASE)["build-macos"], "Verify macOS app bundle"))
 
+    def test_validation_package_is_an_explicit_opt_in_separate_from_the_product_path(self):
+        # Standard path: product build and product identifier, unchanged.
+        self.assertIn('bundle_id="io.github.hide212131.hane"\n', BUNDLE)
+        self.assertIn("  cargo build --release --locked -p hane -p hane-updater\nfi", BUNDLE)
+        # Opt-in path: only the explicit flag selects validation identity and both binaries' feature.
+        self.assertIn("1:--validation-feed)", BUNDLE)
+        self.assertIn('bundle_id="io.github.hide212131.hane.validation"', BUNDLE)
+        self.assertEqual(BUNDLE.count("--validation-feed"), 2)  # case label + usage
+        self.assertIn("--features hane/validation-feed,hane-updater/validation-feed", BUNDLE)
+        self.assertIn('Set :CFBundleIdentifier $bundle_id', BUNDLE)
+        self.assertIn('"CFBundleIdentifier:$bundle_id"', BUNDLE)
+        self.assertNotIn('"CFBundleIdentifier:io.github.hide212131.hane"', BUNDLE)
+        self.assertEqual(BUNDLE.count('bundle_id="io.github.hide212131.hane'), 2)
+
     def test_bundle_is_sealed_ad_hoc_from_the_inside_out_before_the_inventory_exists(self):
         code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
         # Helper first, then the main executable, then the bundle; local ad-hoc identity only.
