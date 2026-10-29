@@ -617,24 +617,31 @@ impl EditorView {
         let Some(relative) = relative else {
             return slot;
         };
-        slot.child(
-            Button::new(id)
-                .ghost()
-                .w_full()
-                .h_full()
-                .tooltip(label)
-                .accessibility_label(label)
-                .icon(
-                    Icon::empty()
-                        .path(icon_path)
-                        .size(px(PIN_ICON_SIZE))
-                        .text_color(rgb(self.theme.sidebar_foreground)),
-                )
-                .on_click(move |_, _, app| {
-                    let relative = relative.clone();
-                    view.update(app, |view, cx| view.toggle_pin(relative, kind, cx));
-                }),
-        )
+        let button = Button::new(id)
+            .ghost()
+            .w_full()
+            .h_full()
+            .tooltip(label)
+            .accessibility_label(label)
+            .icon(
+                Icon::empty()
+                    .path(icon_path)
+                    .size(px(PIN_ICON_SIZE))
+                    .text_color(rgb(self.theme.sidebar_foreground)),
+            )
+            .on_click(move |_, _, app| {
+                let relative = relative.clone();
+                view.update(app, |view, cx| view.toggle_pin(relative, kind, cx));
+            });
+        // Test-only: the shared `sidebar-pin-toggle` selector repeats on every
+        // row and `debug_bounds` keeps the last one registered, so key the
+        // button per row (element id prefix + flatten index) as well.
+        #[cfg(test)]
+        let button = div()
+            .debug_selector(move || format!("sidebar-pin-toggle-row:{}:{}", id.0, id.1))
+            .size_full()
+            .child(button);
+        slot.child(button)
     }
 
     /// The heading and one row per pin, for the separate area or, when the
