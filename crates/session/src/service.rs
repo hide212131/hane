@@ -171,6 +171,15 @@ pub trait FileService: Send + Sync + 'static {
     /// directories. Creating a directory that already exists is not an
     /// error, the same as `std::fs::create_dir_all`.
     fn create_dir(&self, path: &Path) -> io::Result<()>;
+
+    /// Creates the single directory `path` without creating its parent: a
+    /// parent that no longer exists fails with `ErrorKind::NotFound` instead
+    /// of being recreated, the directory counterpart of
+    /// `save_in_existing_directory`. The default falls back to `create_dir`
+    /// for services whose parents cannot vanish (in-memory fakes).
+    fn create_dir_in_existing_parent(&self, path: &Path) -> io::Result<()> {
+        self.create_dir(path)
+    }
 }
 
 /// Runs one save job against a service, enforcing the external-change rule the
@@ -316,6 +325,132 @@ impl FileService for OsFileService {
 
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(path)
+    }
+
+    fn create_dir_in_existing_parent(&self, path: &Path) -> io::Result<()> {
+        create_dir_under_parent_handle(path, || {})
+    }
+}
+
+/// Splits `path` into the parent directory to open and the single child name.
+fn split_parent_and_name(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no folder name"))?;
+    Ok((parent, name))
+}
+
+/// Creates the single directory `path` relative to a handle on its parent that
+/// is opened first and refuses symlinks / reparse points. `before_create` runs
+/// between opening the parent and creating the child; it exists so tests can
+/// replace the parent at exactly that point without timing.
+///
+/// On Unix the child is made with `mkdirat` on the opened parent descriptor, so
+/// a later swap of the parent path cannot redirect the creation. On Windows the
+/// parent handle is held without `FILE_SHARE_DELETE`, so the parent (and its
+/// ancestors) cannot be renamed, deleted or replaced while the child is made.
+fn create_dir_under_parent_handle(path: &Path, before_create: impl FnOnce()) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let (parent, name) = split_parent_and_name(path)?;
+        let parent = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "parent contains NUL"))?;
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL"))?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+        // SAFETY: `parent` is a valid NUL-terminated string; the returned
+        // descriptor is checked and then owned exclusively by `OwnedFd`.
+        let raw = unsafe { libc::open(parent.as_ptr(), flags) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let parent_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        before_create();
+
+        // SAFETY: `parent_fd` is a live directory descriptor and `name` is a
+        // valid NUL-terminated single path component.
+        if unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o777) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            // `O_NOFOLLOW` keeps a symlink to a directory from being mistaken
+            // for an existing directory.
+            // SAFETY: same invariants as above.
+            let existing = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), flags) };
+            if existing >= 0 {
+                drop(unsafe { OwnedFd::from_raw_fd(existing) });
+                return Ok(());
+            }
+        }
+        Err(error)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        let (parent, _) = split_parent_and_name(path)?;
+        // Held until the end of this function: without FILE_SHARE_DELETE the
+        // parent cannot be renamed, deleted or swapped for a reparse point.
+        let parent_handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(parent)?;
+        let attributes = parent_handle.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "parent is not a plain directory",
+            ));
+        }
+
+        before_create();
+
+        let result = create_dir_rejecting_links(path);
+        drop(parent_handle);
+        result
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        before_create();
+        create_dir_rejecting_links(path)
+    }
+}
+
+#[cfg(not(unix))]
+fn create_dir_rejecting_links(path: &Path) -> io::Result<()> {
+    match fs::create_dir(path) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // `symlink_metadata` does not follow links, so a symlink to a
+            // directory is not mistaken for an existing directory.
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                _ => Err(error),
+            }
+        }
+        result => result,
     }
 }
 
@@ -620,6 +755,134 @@ mod tests {
             .save(&path, &RopeBuffer::from_text(source))
             .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creating_a_directory_in_an_existing_parent_accepts_only_real_directories() {
+        let root = temporary_directory("create-dir-existing-parent");
+        fs::create_dir_all(&root).unwrap();
+
+        let fresh = root.join("fresh");
+        OsFileService.create_dir_in_existing_parent(&fresh).unwrap();
+        assert!(fresh.is_dir());
+        OsFileService.create_dir_in_existing_parent(&fresh).unwrap();
+
+        let file = root.join("file");
+        fs::write(&file, "x").unwrap();
+        let error = OsFileService
+            .create_dir_in_existing_parent(&file)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        let missing_parent = root.join("missing").join("child");
+        let error = OsFileService
+            .create_dir_in_existing_parent(&missing_parent)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_a_directory_over_a_symlink_to_a_directory_fails() {
+        let root = temporary_directory("create-dir-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = OsFileService
+            .create_dir_in_existing_parent(&link)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_swapped_for_a_symlink_after_the_check_does_not_redirect_creation() {
+        let root = temporary_directory("create-dir-parent-swap");
+        let work = root.join("work");
+        let parent = work.join("parent");
+        let moved = work.join("moved");
+        let outside = root.join("outside");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // The parent is replaced exactly between opening it and creating the
+        // child, so the result does not depend on timing.
+        create_dir_under_parent_handle(&parent.join("child"), || {
+            fs::rename(&parent, &moved).unwrap();
+            std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        })
+        .unwrap();
+
+        assert!(moved.join("child").is_dir());
+        assert!(!outside.join("child").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_that_is_already_a_symlink_fails_without_creating_a_child() {
+        let root = temporary_directory("create-dir-symlink-parent");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        assert!(
+            OsFileService
+                .create_dir_in_existing_parent(&link.join("child"))
+                .is_err()
+        );
+        assert!(!outside.join("child").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_held_parent_cannot_be_replaced_while_the_child_is_created() {
+        let root = temporary_directory("create-dir-parent-hold");
+        let parent = root.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+
+        create_dir_under_parent_handle(&parent.join("child"), || {
+            // The open parent handle must block rename/replace of the parent.
+            assert!(fs::rename(&parent, root.join("moved")).is_err());
+        })
+        .unwrap();
+
+        assert!(parent.join("child").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_reparse_point_parent_fails_without_creating_a_child() {
+        let root = temporary_directory("create-dir-reparse-parent");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = root.join("link");
+        // Creating a symlink needs a privilege that is not always granted.
+        if std::os::windows::fs::symlink_dir(&outside, &link).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        assert!(
+            OsFileService
+                .create_dir_in_existing_parent(&link.join("child"))
+                .is_err()
+        );
+        assert!(!outside.join("child").exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 
