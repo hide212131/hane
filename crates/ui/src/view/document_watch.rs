@@ -47,7 +47,16 @@ thread_local! {
     /// message instead of being registered.
     static INJECTED_DOCUMENT_WATCH_ERROR: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// Test-only: registrations wait in `HELD_DOCUMENT_WATCH_REGISTRATIONS`
+    /// instead of finishing, standing in for a slow directory.
+    static HOLD_DOCUMENT_WATCH_REGISTRATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static HELD_DOCUMENT_WATCH_REGISTRATIONS: std::cell::RefCell<Vec<HeldRegistration>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
+
+#[cfg(test)]
+type HeldRegistration = (PathBuf, u64, Result<Option<FolderWatcher>, String>);
 
 /// One registered (or failed) watch on the parent directory of open files.
 struct ParentWatch {
@@ -64,6 +73,13 @@ struct ParentWatch {
     test_batches: Option<async_channel::Sender<WatchBatch>>,
     /// Why the directory is not being watched; `None` when it is.
     failure: Option<String>,
+    /// The OS watcher is still being created off the UI thread. Such a watch
+    /// is neither healthy nor failed.
+    pending: bool,
+    /// Look at the directory's documents once the registration succeeds.
+    check_on_ready: bool,
+    /// Look at them even if the registration fails.
+    check_when_failed: bool,
 }
 
 /// What the watch lifecycle knows about one open saved document.
@@ -210,23 +226,22 @@ impl EditorView {
         self.document_watch
             .parents
             .retain(|parent, _| wanted.contains_key(parent));
-        let mut failed = false;
         for (parent, names) in &wanted {
             if let Some(existing) = self.document_watch.parents.get(parent) {
                 existing.names.set(names);
                 continue;
             }
             let set = WatchedNames::new(names);
-            let watch = self.attach_document_watch(parent, &set, cx);
-            failed |= watch.failure.is_some();
-            self.document_watch.parents.insert(parent.clone(), watch);
+            self.attach_document_watch(parent, &set, false, false, cx);
         }
-        if failed {
-            self.schedule_document_watch_retry(cx);
-        }
+        self.start_initial_document_checks(cx);
+    }
 
-        // The first check comes after the watch is registered, so a change
-        // between the two arrives as a notification instead of being lost.
+    /// Starts the first check of every document whose watch is registered. It
+    /// comes after the registration, so a change between the two arrives as a
+    /// notification instead of being lost. A registration that is still
+    /// pending (it runs off the UI thread) or failed does not count.
+    fn start_initial_document_checks(&mut self, cx: &mut Context<Self>) {
         let pending: Vec<(SessionId, PathBuf)> = self
             .document_watch
             .tracked
@@ -238,7 +253,7 @@ impl EditorView {
             let watched = self.folder_watch_covers(&path)
                 || watch_parent(&path)
                     .and_then(|parent| self.document_watch.parents.get(&parent))
-                    .is_some_and(|watch| watch.failure.is_none());
+                    .is_some_and(|watch| !watch.pending && watch.failure.is_none());
             if !watched {
                 continue;
             }
@@ -249,74 +264,162 @@ impl EditorView {
         }
     }
 
-    /// Registers a watch on `parent` and starts the task that delivers its
-    /// notifications. A failure is returned inside the value, not raised: the
-    /// caller records it so it is shown and retried.
+    /// Records a new registration for `parent` right away (as pending) and
+    /// starts the task that delivers its notifications. Creating the OS
+    /// watcher can wait on a slow or network directory, so it never runs on
+    /// the UI thread: `complete_document_watch` applies the outcome later.
+    /// `check_on_ready` looks at the directory's documents once the watch is
+    /// registered; `check_when_failed` also does so when it could not be.
     fn attach_document_watch(
         &mut self,
         parent: &Path,
         names: &WatchedNames,
+        check_on_ready: bool,
+        check_when_failed: bool,
         cx: &mut Context<Self>,
-    ) -> ParentWatch {
+    ) {
         self.document_watch.next_token = self.document_watch.next_token.wrapping_add(1);
         let token = self.document_watch.next_token;
-        let mut watch = ParentWatch {
-            token,
-            names: names.clone(),
-            _watcher: None,
-            #[cfg(test)]
-            test_batches: None,
-            failure: None,
-        };
-        #[cfg(test)]
-        {
-            if let Some(message) = INJECTED_DOCUMENT_WATCH_ERROR.with(|slot| slot.borrow().clone())
-            {
-                watch.failure = Some(message);
-                return watch;
-            }
-        }
         let (sender, receiver) = async_channel::unbounded();
         // GPUI's deterministic test scheduler must not be woken by a real OS
         // thread, so unit tests do not start the OS watcher. They feed batches
         // through `test_batches`; the OS watcher itself is covered by the
         // `hane_session` tests.
+        #[cfg(test)]
+        let watch_sender = sender.clone();
+        let watch = ParentWatch {
+            token,
+            names: names.clone(),
+            _watcher: None,
+            #[cfg(test)]
+            test_batches: Some(watch_sender),
+            failure: None,
+            pending: true,
+            check_on_ready,
+            check_when_failed,
+        };
+        self.document_watch
+            .parents
+            .insert(parent.to_path_buf(), watch);
+
+        let parent = parent.to_path_buf();
+        {
+            let parent = parent.clone();
+            cx.spawn(async move |view, cx| {
+                // Ends when the watch is released (the channel closes), the
+                // view is gone, or this registration was replaced.
+                while let Ok(batch) = receiver.recv().await {
+                    let keep_going = view
+                        .update(cx, |view, cx| {
+                            view.document_watch_batch_arrived(&parent, token, batch, cx)
+                        })
+                        .unwrap_or(false);
+                    if !keep_going {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+
         #[cfg(not(test))]
         {
-            match FolderWatcher::start_directory(
-                parent,
-                names.clone(),
-                WatchTiming::default(),
-                move |batch| sender.send_blocking(batch).is_ok(),
-            ) {
-                Ok(watcher) => watch._watcher = Some(watcher),
-                Err(error) => {
-                    watch.failure = Some(error.to_string());
-                    return watch;
-                }
-            }
+            let names = names.clone();
+            cx.spawn(async move |view, cx| {
+                let directory = parent.clone();
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        FolderWatcher::start_directory(
+                            &directory,
+                            names,
+                            WatchTiming::default(),
+                            move |batch| sender.send_blocking(batch).is_ok(),
+                        )
+                        .map(Some)
+                        .map_err(|error| error.to_string())
+                    })
+                    .await;
+                let _ = view.update(cx, |view, cx| {
+                    view.complete_document_watch(&parent, token, outcome, cx);
+                });
+            })
+            .detach();
         }
         #[cfg(test)]
         {
-            watch.test_batches = Some(sender);
-        }
-        let parent = parent.to_path_buf();
-        cx.spawn(async move |view, cx| {
-            // Ends when the watch is released (the channel closes), the view
-            // is gone, or this registration was replaced.
-            while let Ok(batch) = receiver.recv().await {
-                let keep_going = view
-                    .update(cx, |view, cx| {
-                        view.document_watch_batch_arrived(&parent, token, batch, cx)
-                    })
-                    .unwrap_or(false);
-                if !keep_going {
-                    break;
-                }
+            drop(sender);
+            let outcome = match INJECTED_DOCUMENT_WATCH_ERROR.with(|slot| slot.borrow().clone()) {
+                Some(message) => Err(message),
+                None => Ok(None),
+            };
+            if HOLD_DOCUMENT_WATCH_REGISTRATION.with(std::cell::Cell::get) {
+                HELD_DOCUMENT_WATCH_REGISTRATIONS
+                    .with(|held| held.borrow_mut().push((parent, token, outcome)));
+            } else {
+                self.complete_document_watch(&parent, token, outcome, cx);
             }
-        })
-        .detach();
-        watch
+        }
+    }
+
+    /// Applies the outcome of a registration that ran off the UI thread. It is
+    /// accepted only while the registration is still the current one for a
+    /// directory some open document needs in this work folder generation;
+    /// otherwise the watcher is dropped (released) and nothing is checked.
+    fn complete_document_watch(
+        &mut self,
+        parent: &Path,
+        token: u64,
+        outcome: Result<Option<FolderWatcher>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_current = self
+            .document_watch
+            .parents
+            .get(parent)
+            .is_some_and(|watch| watch.token == token && watch.pending);
+        if !is_current {
+            return;
+        }
+        let still_needed = self.document_watch.epoch == self.work_folder_generation
+            && self
+                .sessions
+                .sessions()
+                .any(|session| session.path().and_then(watch_parent).as_deref() == Some(parent));
+        if !still_needed {
+            // The document closed, moved or the work folder changed while the
+            // registration ran. Forget the entry so a later sync registers
+            // afresh; the dropped outcome releases the watcher.
+            self.document_watch.parents.remove(parent);
+            return;
+        }
+        let Some(watch) = self.document_watch.parents.get_mut(parent) else {
+            return;
+        };
+        watch.pending = false;
+        let (check_on_ready, check_when_failed) = (watch.check_on_ready, watch.check_when_failed);
+        let failed = match outcome {
+            Ok(watcher) => {
+                watch._watcher = watcher;
+                false
+            }
+            Err(message) => {
+                watch.failure = Some(message);
+                #[cfg(test)]
+                {
+                    watch.test_batches = None;
+                }
+                true
+            }
+        };
+        if failed {
+            self.schedule_document_watch_retry(cx);
+        }
+        if (!failed && check_on_ready) || (failed && check_when_failed) {
+            self.check_documents_in(parent, cx);
+        }
+        self.start_initial_document_checks(cx);
+        cx.notify();
     }
 
     /// Returns whether the registration this batch came from is still current.
@@ -362,15 +465,9 @@ impl EditorView {
         // Released first so the old task ends instead of two registrations
         // reporting the same directory.
         drop(old);
-        let fresh = self.attach_document_watch(parent, &names, cx);
-        let failed = fresh.failure.is_some();
-        self.document_watch.parents.insert(parent.to_path_buf(), fresh);
-        if failed {
-            self.schedule_document_watch_retry(cx);
-        }
-        if !failed || check_when_failed {
-            self.check_documents_in(parent, cx);
-        }
+        // The documents are checked once the new registration finishes (or
+        // fails, when `check_when_failed`), not before the watch exists.
+        self.attach_document_watch(parent, &names, true, check_when_failed, cx);
         cx.notify();
     }
 
@@ -912,6 +1009,170 @@ mod tests {
             assert!(session.editor().document().full_text().starts_with("typed "));
             assert!(view.active_resolution_choices().is_some());
         });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finishes every registration held back by
+    /// `HOLD_DOCUMENT_WATCH_REGISTRATION`, as the background thread would.
+    fn release_held_registrations(view: &gpui::Entity<EditorView>, cx: &mut gpui::TestAppContext) {
+        let held: Vec<HeldRegistration> =
+            HELD_DOCUMENT_WATCH_REGISTRATIONS.with(|held| std::mem::take(&mut *held.borrow_mut()));
+        for (parent, token, outcome) in held {
+            view.update(cx, |view, cx| {
+                view.complete_document_watch(&parent, token, outcome, cx);
+            });
+        }
+        cx.run_until_parked();
+    }
+
+    fn hold_registrations(hold: bool) {
+        HOLD_DOCUMENT_WATCH_REGISTRATION.with(|slot| slot.set(hold));
+        if !hold {
+            HELD_DOCUMENT_WATCH_REGISTRATIONS.with(|held| held.borrow_mut().clear());
+        }
+    }
+
+    fn held_count() -> usize {
+        HELD_DOCUMENT_WATCH_REGISTRATIONS.with(|held| held.borrow().len())
+    }
+
+    #[gpui::test]
+    fn a_slow_registration_does_not_block_the_view_and_the_first_check_waits_for_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        inject_watch_error(None);
+        hold_registrations(true);
+        let root = watch_test_root("slow");
+        let a = root.join("A.md");
+        write(&a, "a\n");
+        let view = view_with_files(cx, &[&a]);
+        let id = ids(&view, cx)[0];
+        write(&a, "a changed\n");
+
+        // Several renders while the registration is outstanding: sync returns
+        // at once, registers once, and checks nothing yet.
+        view.update(cx, |view, cx| {
+            view.sync_document_watches(cx);
+            view.sync_document_watches(cx);
+            view.sync_document_watches(cx);
+            assert_eq!(view.document_watch.parents.len(), 1);
+            assert!(view.document_watch.parents.values().all(|watch| watch.pending));
+            assert!(!view.active_document_watch_problem());
+            // The editor keeps working meanwhile.
+            view.editor_mut().insert_text("typed ").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(held_count(), 1, "one registration, not one per render");
+        view.read_with(cx, |view, _| {
+            assert!(view.document_watch.tracked[&id].initial_pending);
+            let session = view.sessions.get(id).unwrap();
+            assert!(session.editor().document().full_text().starts_with("typed "));
+        });
+
+        release_held_registrations(&view, cx);
+        hold_registrations(false);
+        view.read_with(cx, |view, _| {
+            assert!(view.document_watch.parents.values().all(|watch| !watch.pending));
+            assert!(!view.document_watch.tracked[&id].initial_pending);
+            assert!(view.footer_warnings().is_empty());
+        });
+        only_batch_sender(&view, cx);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_registration_finished_after_close_move_or_folder_switch_is_discarded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        inject_watch_error(None);
+        hold_registrations(true);
+        let root = watch_test_root("late");
+        let (a, moved) = (root.join("one/A.md"), root.join("two/Moved.md"));
+        write(&a, "a\n");
+        write(&moved, "moved\n");
+        let view = view_with_files(cx, &[&a]);
+        let id = ids(&view, cx)[0];
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        assert_eq!(held_count(), 1);
+
+        // The document moves to another directory before the registration of
+        // the old one finishes.
+        let loaded = OsFileService.load(&moved).unwrap();
+        view.update(cx, |view, cx| {
+            view.sessions.get_mut(id).unwrap().adopt(loaded);
+            view.sync_document_watches(cx);
+        });
+        assert_eq!(held_count(), 2);
+        write(&a, "late external write\n");
+        write(&moved, "moved changed\n");
+        release_held_registrations(&view, cx);
+        view.read_with(cx, |view, _| {
+            let parent = watch_parent(&moved).unwrap();
+            assert_eq!(view.document_watch.parents.len(), 1);
+            assert!(!view.document_watch.parents[&parent].pending);
+        });
+        // Only the current registration checked the current document.
+        assert_eq!(text_of(&view, cx, id), "moved changed\n");
+
+        // Closing the document before the registration finishes: nothing is
+        // kept, and a later sync registers afresh.
+        view.update(cx, |view, cx| {
+            let _ = view.sessions.close(id, "Untitled");
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            view.sync_document_watches(cx);
+        });
+        let reopened = OsFileService.load(&a).unwrap();
+        view.update(cx, |view, cx| {
+            view.sessions.apply_open(None, reopened);
+            view.sync_document_watches(cx);
+        });
+        let first_token = only_token(&view, cx);
+        view.update(cx, |view, cx| {
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            view.sync_document_watches(cx);
+        });
+        assert_ne!(only_token(&view, cx), first_token);
+        release_held_registrations(&view, cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.document_watch.parents.values().all(|watch| !watch.pending));
+        });
+        hold_registrations(false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_registration_that_fails_late_is_shown_and_recovers(cx: &mut gpui::TestAppContext) {
+        inject_watch_error(Some("slow and denied"));
+        hold_registrations(true);
+        let root = watch_test_root("late-fail");
+        let a = root.join("A.md");
+        write(&a, "a\n");
+        let view = view_with_files(cx, &[&a]);
+        let id = ids(&view, cx)[0];
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        view.read_with(cx, |view, _| {
+            // Still pending: neither healthy nor reported as failed.
+            assert!(view.footer_warnings().is_empty());
+            assert!(!view.document_watch.retry_scheduled);
+        });
+
+        release_held_registrations(&view, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.footer_warnings().len(), 1);
+            assert!(view.footer_warnings()[0].contains("slow and denied"));
+            assert!(view.document_watch.retry_scheduled);
+        });
+        assert_eq!(text_of(&view, cx, id), "a\n", "a failed watch checks nothing");
+
+        inject_watch_error(None);
+        write(&a, "a changed\n");
+        cx.executor().advance_clock(DOCUMENT_WATCH_RETRY_DELAY);
+        cx.run_until_parked();
+        release_held_registrations(&view, cx);
+        hold_registrations(false);
+        view.read_with(cx, |view, _| assert!(view.footer_warnings().is_empty()));
+        assert_eq!(text_of(&view, cx, id), "a changed\n");
         let _ = std::fs::remove_dir_all(&root);
     }
 
