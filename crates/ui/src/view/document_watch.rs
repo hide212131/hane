@@ -1075,7 +1075,13 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(view.document_watch.parents.values().all(|watch| !watch.pending));
             assert!(!view.document_watch.tracked[&id].initial_pending);
-            assert!(view.footer_warnings().is_empty());
+            assert!(!view.active_document_watch_problem());
+            // The first check ran after the registration: the external change
+            // is not written over the unsaved text, and the conflict is kept.
+            let session = view.sessions.get(id).unwrap();
+            assert!(session.is_dirty());
+            assert!(session.editor().document().full_text().starts_with("typed "));
+            assert!(view.active_resolution_choices().is_some());
         });
         only_batch_sender(&view, cx);
         let _ = std::fs::remove_dir_all(&root);
