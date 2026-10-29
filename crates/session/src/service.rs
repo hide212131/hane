@@ -813,7 +813,7 @@ fn rename_path_without_replace(from: &Path, to: &Path) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
 
         #[link(name = "kernel32")]
-        extern "system" {
+        unsafe extern "system" {
             fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         }
 
