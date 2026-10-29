@@ -809,6 +809,68 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_comparison_blocks_body_input_until_it_is_closed(cx: &mut gpui::TestAppContext) {
+        let root = external_test_root("comparison-modal");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Note.md");
+        std::fs::write(&path, "before\n").unwrap();
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = open_view(cx, &path);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("typed ").unwrap();
+            view.after_input(cx);
+        });
+        std::fs::write(&path, "changed elsewhere\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.check_open_documents_for_external_changes(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                window.focus(&view.focus_handle, cx);
+                view.open_external_comparison(cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let state = |view: &EditorView| {
+            (
+                view.editor().document().full_text(),
+                view.active_session().is_dirty(),
+            )
+        };
+        let (text, dirty) = view.read_with(cx, |view, _| {
+            assert!(view.external_comparison_blocks_body());
+            assert!(!view.body_input_capture_enabled());
+            state(view)
+        });
+        assert!(dirty);
+
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("backspace enter tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(state(view), (text.clone(), dirty)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "changed elsewhere\n"
+        );
+
+        view.update(cx, |view, cx| view.close_external_comparison(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.external_comparison_blocks_body());
+            assert!(view.body_input_capture_enabled());
+        });
+        cx.simulate_input("x");
+        view.read_with(cx, |view, _| {
+            assert_ne!(view.editor().document().full_text(), text);
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
     fn a_missing_file_keeps_a_genuine_save_failure(cx: &mut gpui::TestAppContext) {
         let left = problem_left_after_the_file_goes_missing(
             cx,

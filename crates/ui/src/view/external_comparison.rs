@@ -108,6 +108,12 @@ impl EditorView {
         cx.notify();
     }
 
+    /// While the comparison is shown the body is read-only: keyboard actions
+    /// and OS text input must not reach the document behind it.
+    pub(crate) fn external_comparison_blocks_body(&self) -> bool {
+        self.external_comparison.is_some()
+    }
+
     pub(super) fn close_external_comparison(&mut self, cx: &mut Context<Self>) {
         if self.external_comparison.take().is_some() {
             cx.notify();
