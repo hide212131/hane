@@ -3,7 +3,17 @@
 Refs #653
 
 基準main: `ad4b80b155bf219a9c5686858dba3c87f14c3e77`。
-本commitはClaude実装待ちの文書準備のみ。製品機能・テスト・GUI・受入条件は未実装・未検証。
+【準備commit時点の履歴】準備commitはClaude実装待ちの文書準備のみで、その時点では製品機能・テスト・GUI・受入条件は未実装・未検証だった。この記述はcurrent headの状態ではない。current headの実装・検証状況は下記「current headの状態」と「実装記録」を参照する。
+
+## current headの状態
+
+観測対象のheadは `89eb9dfe9139cb08058aac354a0b55570fdab258`（base `cc2c19979726195a111a32913d145846c8b651af`、観測時のcurrent main `29ed353d1548db7d2df61ffa85085dc4457c98cc`）。
+
+- 実装: 以降の「実装記録」の範囲がcurrent headに含まれる。受入条件を満たしたことを意味しない。
+- exact-head verifier（[run 40923553155](https://github.com/hide212131/hane/actions/runs/40923553155)）: workspace regression testsとlintはsuccessで完了した。
+- 通常PR CI（[run 40923856998](https://github.com/hide212131/hane/actions/runs/40923856998)）: `action_required` / jobs 0のままで、成功ではない。未完了。
+- current headのMac / Windows GUI確認: 未完了。
+- 上記は観測時点の値であり、headが変わった場合は旧headの証拠として使わない。
 
 ## 正本
 
@@ -36,7 +46,7 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 
 ## 実装記録（Claude worker、未検証）
 
-このworkerはshell・test・build・lintを実行していない。以下はコードを書いた範囲の記録であり、検証済みを意味しない。検証はCommanderが対象SHAへ紐付けて取得する。
+このworkerはshell・test・build・lintを実行していない（worker自身の未実行という履歴）。以下はコードを書いた範囲の記録であり、worker側では検証済みを意味しない。current headで別途取得された検証結果は上記「current headの状態」に記し、worker自身の実行とは区別する。検証はCommanderが対象SHAへ紐付けて取得する。
 
 ### 実装した範囲
 
@@ -84,7 +94,7 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 - IME中の延期と非アクティブ文書の自動再読込のGUI経路テスト、再読込時のdraft write / AI・解析結果との接続のUIテスト（sessionのgeneration更新までは実装）。
 - 保存前の内容照合は対象ファイル全体を背景で読む。大文書・複数タブでの入力応答、背景時間、メモリ、snapshot上限の前後比較（T12）は未測定。
 - 外部processとの原子的compare-and-swapは保証しない。照合から置換までの間に他者が書く競合窓が残る（検出可能なのは照合時点の不一致のみ）。
-- macOS / Windowsのbuild・tests・Clippy・focused GUI（T01/T02/T03/T04/T07/T08）は未取得。
+- 両OSの通常PR CI（run 40923856998は `action_required` / jobs 0）とfocused GUI（T01/T02/T03/T04/T07/T08）は、current headで未完了。exact-head verifierのworkspace regression testsとlintがsuccessであることは上記「current headの状態」のとおりで、これで通常CIやGUIを代替しない。
 
 ## 対象外と完了
 
