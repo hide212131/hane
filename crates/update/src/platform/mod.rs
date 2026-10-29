@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(copy.file_name().unwrap(), STAGED_HELPER_FILE_NAME);
         assert_eq!(staged_helper(&coord, &txn).unwrap(), copy);
         #[cfg(windows)]
-        assert_ne!(copy.file_name().unwrap(), HELPER_FILE_NAME);
+        assert_eq!(copy.file_name().unwrap(), "hane-worker.exe");
         assert!(
             Coordination::from_helper_exe(&copy).is_ok(),
             "the copy lives where the helper derives its identity from"
