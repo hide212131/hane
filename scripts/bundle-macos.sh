@@ -321,7 +321,10 @@ fi
 # copy (a byte-identical copy of the installed helper) keeps.
 for binary in "$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"; do
   /usr/bin/codesign --verify --strict "$binary"
-  if ! /usr/bin/codesign -dvvv "$binary" 2>&1 | grep -q '^CDHash='; then
+  # Read the whole output before matching: `grep -q` closing the pipe early
+  # makes codesign die with SIGPIPE, which pipefail reports as a failure.
+  signature_details="$(/usr/bin/codesign -dvvv "$binary" 2>&1)"
+  if ! grep -q '^CDHash=' <<<"$signature_details"; then
     echo "$binary must carry a code directory hash for the Keychain access list" >&2
     exit 1
   fi

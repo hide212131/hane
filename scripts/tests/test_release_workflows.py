@@ -304,6 +304,17 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertNotIn('"CFBundleIdentifier:io.github.hide212131.hane"', BUNDLE)
         self.assertEqual(BUNDLE.count('bundle_id="io.github.hide212131.hane'), 2)
 
+    def test_cdhash_check_does_not_close_the_codesign_pipe_early_under_pipefail(self):
+        code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn("set -euo pipefail", code)
+        # `codesign -dvvv ... | grep -q` makes codesign die with SIGPIPE once grep exits on
+        # the first match, so a valid signature fails under pipefail.
+        self.assertNotRegex(code, r"codesign\s+-dvvv[^\n]*\|\s*grep\s+-q")
+        # The output is captured completely first, and the CDHash is still required.
+        self.assertIn('signature_details="$(/usr/bin/codesign -dvvv "$binary" 2>&1)"', code)
+        self.assertIn("grep -q '^CDHash=' <<<\"$signature_details\"", code)
+        self.assertIn('/usr/bin/codesign --verify --strict "$binary"', code)
+
     def test_bundle_is_sealed_ad_hoc_from_the_inside_out_before_the_inventory_exists(self):
         code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
         # Helper first, then the main executable, then the bundle; local ad-hoc identity only.
