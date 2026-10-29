@@ -445,6 +445,9 @@ impl EditorView {
                 );
             }
             ReloadVerifyOutcome::Missing => {
+                // The file is gone: an earlier external conflict / unverifiable
+                // notice no longer describes it. A genuine save failure stays.
+                self.clear_external_problem(id);
                 self.status = Some(
                     "確認後にファイルが見つからなくなったため読み直していません。編集中の内容は保持しています"
                         .to_owned(),
@@ -868,6 +871,93 @@ mod tests {
             assert_ne!(view.editor().document().full_text(), text);
         });
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Records `problem`, confirms a reload, deletes the file before the
+    /// verification read and applies its result. Returns what is left.
+    fn problem_left_after_the_file_vanishes_during_reload_verification(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        problem: DocumentSaveProblem,
+    ) -> Option<DocumentSaveProblem> {
+        let root = external_test_root(label);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Note.md");
+        std::fs::write(&path, "before\n").unwrap();
+        let (view, cx) = open_view(cx, &path);
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("typed ").unwrap();
+            view.after_input(cx);
+        });
+        std::fs::write(&path, "changed elsewhere\n").unwrap();
+        view.update(cx, |view, cx| {
+            view.check_open_documents_for_external_changes(cx);
+        });
+        cx.run_until_parked();
+
+        let (id, instance, request) = view.update(cx, |view, _| {
+            let id = view.sessions.active_id();
+            let instance = view.document_instance(id).unwrap();
+            let session = view.sessions.active_mut();
+            let approval = session
+                .approve_resolution(
+                    ResolutionKind::DiscardAndReload,
+                    session.observed_fingerprint(),
+                )
+                .unwrap();
+            (id, instance, session.begin_confirmed_reload(approval).unwrap())
+        });
+        view.update(cx, |view, _| {
+            view.record_save_problem(id, instance, Some(path.clone()), problem);
+        });
+        std::fs::remove_file(&path).unwrap();
+        let result = run_reload_verification(&OsFileService, &request);
+        view.update(cx, |view, cx| {
+            view.finish_verified_reload(id, instance, request, result, cx);
+        });
+
+        let left = view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.active_session().external_status(),
+                ExternalStatus::Missing
+            );
+            assert!(view.active_session().is_dirty());
+            assert!(view.editor().document().full_text().starts_with("typed "));
+            view.save_problems
+                .get(&id)
+                .map(|scoped| scoped.problem.clone())
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        left
+    }
+
+    #[gpui::test]
+    fn a_file_missing_at_reload_verification_clears_an_earlier_conflict(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let left = problem_left_after_the_file_vanishes_during_reload_verification(
+            cx,
+            "reload-missing-conflict",
+            DocumentSaveProblem::Conflict,
+        );
+        assert!(left.is_none(), "stale conflict notice left: {left:?}");
+    }
+
+    #[gpui::test]
+    fn a_file_missing_at_reload_verification_keeps_a_genuine_save_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let left = problem_left_after_the_file_vanishes_during_reload_verification(
+            cx,
+            "reload-missing-save-failure",
+            DocumentSaveProblem::Failed("disk full".to_owned()),
+        );
+        assert!(matches!(
+            left,
+            Some(DocumentSaveProblem::Failed(text)) if text == "disk full"
+        ));
     }
 
     #[gpui::test]
