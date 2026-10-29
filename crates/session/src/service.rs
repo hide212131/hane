@@ -810,17 +810,35 @@ fn rename_path_without_replace(from: &Path, to: &Path) -> io::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows' MoveFileEx implementation, which backs std::fs::rename,
-        // refuses an existing destination unless the replace flag is passed.
-        // Keep the explicit existence check for a useful, deterministic error
-        // and retain the no-replace call at the OS boundary.
-        if to.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "rename target already exists",
-            ));
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         }
-        fs::rename(from, to)
+
+        fn wide(path: &Path) -> io::Result<Vec<u16>> {
+            let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if units.contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path contains NUL",
+                ));
+            }
+            units.push(0);
+            Ok(units)
+        }
+
+        // std::fs::rename passes MOVEFILE_REPLACE_EXISTING, so an existence
+        // check followed by it could replace a destination created in between.
+        // Calling MoveFileExW with no flags makes the OS itself refuse an
+        // existing destination (ERROR_ALREADY_EXISTS) atomically.
+        let from = wide(from)?;
+        let to = wide(to)?;
+        let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+        (result != 0)
+            .then_some(())
+            .ok_or_else(io::Error::last_os_error)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -1029,6 +1047,46 @@ mod tests {
             .save(&path, &RopeBuffer::from_text(source))
             .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_without_replace_keeps_an_existing_file_target() {
+        let root = temporary_directory("rename-no-replace-file");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("from.md");
+        let to = root.join("to.md");
+        fs::write(&from, "source").unwrap();
+        fs::write(&to, "external").unwrap();
+
+        let error = rename_path_without_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&to).unwrap(), "external");
+        assert_eq!(fs::read_to_string(&from).unwrap(), "source");
+
+        let free = root.join("free.md");
+        rename_path_without_replace(&from, &free).unwrap();
+        assert_eq!(fs::read_to_string(&free).unwrap(), "source");
+        assert!(!from.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_without_replace_keeps_an_existing_directory_target() {
+        let root = temporary_directory("rename-no-replace-dir");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(to.join("keep.md"), "external").unwrap();
+
+        let error = rename_path_without_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(to.join("keep.md")).unwrap(), "external");
+        assert!(from.is_dir());
+
         fs::remove_dir_all(root).unwrap();
     }
 
