@@ -172,16 +172,17 @@ fn is_private_alias(path: &Path, resolved: &Path) -> bool {
 }
 
 /// Whether `resolved` is only another spelling of `path`: the macOS
-/// `/private` alias, or on Windows a different letter case or an 8.3 short
-/// name (`RUNNER~1`) that `canonicalize` expanded. The resolved path comes
-/// from the recorded identity, so no filesystem access is possible here.
+/// `/private` alias, or on Windows a different letter case. The resolved path
+/// comes from the recorded identity, so no filesystem access is possible here.
 fn is_same_spelling(path: &Path, resolved: &Path) -> bool {
     is_private_alias(path, resolved)
         || (cfg!(windows) && is_windows_spelling_alias(path, resolved))
 }
 
-/// Component-wise comparison ignoring case, where a component holding an 8.3
-/// `NAME~N` marker matches a longer name starting with `NAME`.
+/// Component-wise comparison ignoring case. An 8.3 short name is never
+/// guessed from its spelling: without a filesystem lookup it cannot be shown
+/// to name the same directory, so distinct paths stay distinct and the
+/// resolved path is watched as well (a redundant watch, never a missed one).
 fn is_windows_spelling_alias(path: &Path, resolved: &Path) -> bool {
     let (path, resolved) = (path.to_string_lossy(), resolved.to_string_lossy());
     let split = |text: &'_ str| -> Vec<String> {
@@ -190,22 +191,7 @@ fn is_windows_spelling_alias(path: &Path, resolved: &Path) -> bool {
             .map(str::to_lowercase)
             .collect()
     };
-    let (own, other) = (split(&path), split(&resolved));
-    own.len() == other.len()
-        && own.iter().zip(&other).all(|(a, b)| {
-            a == b || short_name_matches(a, b) || short_name_matches(b, a)
-        })
-}
-
-fn short_name_matches(short: &str, long: &str) -> bool {
-    short
-        .split_once('~')
-        .is_some_and(|(stem, number)| {
-            !stem.is_empty()
-                && !number.is_empty()
-                && number.chars().all(|c| c.is_ascii_digit())
-                && long.replace(' ', "").starts_with(stem)
-        })
+    split(&path) == split(&resolved)
 }
 
 /// Whether `parent` is the directory of any watch target of `session`.
@@ -686,10 +672,14 @@ mod tests {
     }
 
     #[test]
-    fn windows_case_and_short_name_spellings_are_one_path() {
-        assert!(is_windows_spelling_alias(
-            Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\a.md"),
-            Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\a.md"),
+    fn windows_case_spellings_are_one_path_but_short_names_are_not_guessed() {
+        assert!(!is_windows_spelling_alias(
+            Path::new(r"C:\Users\FOO~1\a.md"),
+            Path::new(r"C:\Users\FOOBAR\a.md"),
+        ));
+        assert!(!is_windows_spelling_alias(
+            Path::new(r"C:\Users\FOOBAR\a.md"),
+            Path::new(r"C:\Users\FOO~1\a.md"),
         ));
         assert!(is_windows_spelling_alias(
             Path::new(r"C:\Work\Notes\A.md"),
