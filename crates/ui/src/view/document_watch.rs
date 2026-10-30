@@ -120,8 +120,9 @@ fn watch_parent(path: &Path) -> Option<PathBuf> {
 
 /// The paths to watch for `session`: the path it was opened with, plus the
 /// path it resolves to when that is somewhere else (a symlink). The resolved
-/// path comes from the identity recorded when the file was opened, so no
-/// filesystem access happens here. A change to the link target is reported in
+/// path comes from the identity recorded when the file was opened. Only when
+/// the two spellings of its directory differ is the filesystem asked whether
+/// they are the same directory. A change to the link target is reported in
 /// the target's directory, which the link's own directory never sees.
 fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
     let Some(identity) = session.file().identity() else {
@@ -143,11 +144,39 @@ fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
             {
                 Some(own.join(name))
             }
+            // The spellings differ (for example a Windows 8.3 short name
+            // against its long name); only the filesystem can say whether the
+            // two directories are the same one.
+            (Some(own), Some(resolved_parent), Some(name))
+                if is_same_directory_on_disk(own, resolved_parent) =>
+            {
+                Some(own.join(name))
+            }
             _ => None,
         };
         targets.push(in_same_directory.unwrap_or_else(|| resolved.to_path_buf()));
     }
     targets
+}
+
+/// Whether both directories resolve to the same real directory. A failed
+/// lookup counts as different, which only costs a redundant watch. Distinct
+/// directories such as `FOO~1` and `FOOBAR` resolve differently and stay apart.
+fn is_same_directory_on_disk(a: &Path, b: &Path) -> bool {
+    let resolve = |dir: &Path| {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::canonicalize(dir)
+            .ok()
+            .map(|resolved| strip_verbatim_prefix(&resolved))
+    };
+    match (resolve(a), resolve(b)) {
+        (Some(a), Some(b)) => a == b || (cfg!(windows) && is_windows_spelling_alias(&a, &b)),
+        _ => false,
+    }
 }
 
 /// `path` without the Windows extended-length prefix (`\\?\C:\x` becomes
@@ -693,6 +722,26 @@ mod tests {
             Path::new(r"C:\work\a.md"),
             Path::new(r"C:\work\sub\a.md"),
         ));
+    }
+
+    #[test]
+    fn same_directory_is_confirmed_on_disk_and_distinct_ones_stay_apart() {
+        let root = watch_test_root("same-directory");
+        let real = root.join("real");
+        let other = root.join("other");
+        write(&real.join("a.md"), "a");
+        write(&other.join("a.md"), "a");
+        // A spelling that differs from the canonical one but names the same
+        // directory (a `..` detour) is one directory on disk.
+        let detour = other.join("..").join("real");
+        assert!(is_same_directory_on_disk(&real, &detour));
+        assert!(is_same_directory_on_disk(
+            &real,
+            &std::fs::canonicalize(&real).unwrap()
+        ));
+        assert!(!is_same_directory_on_disk(&real, &other));
+        assert!(!is_same_directory_on_disk(&real, &root.join("missing")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn write(path: &Path, text: &str) {
