@@ -131,7 +131,18 @@ fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
     let mut targets = vec![path.to_path_buf()];
     let resolved = identity.canonical_path();
     if resolved != path && !is_private_alias(path, resolved) {
-        targets.push(resolved.to_path_buf());
+        // A target in the link's own directory is reached through the same
+        // directory spelling, so both names share one watch even when the
+        // resolved path spells that directory as `/private/...`.
+        let in_same_directory = match (path.parent(), resolved.parent(), resolved.file_name()) {
+            (Some(own), Some(resolved_parent), Some(name))
+                if own == resolved_parent || is_private_alias(own, resolved_parent) =>
+            {
+                Some(own.join(name))
+            }
+            _ => None,
+        };
+        targets.push(in_same_directory.unwrap_or_else(|| resolved.to_path_buf()));
     }
     targets
 }
@@ -800,12 +811,107 @@ mod tests {
         let id = ids(&view, cx)[0];
         view.update(cx, |view, cx| view.sync_document_watches(cx));
         cx.run_until_parked();
+        // One directory watch serves both names, however the platform spells
+        // the directory (macOS: `/var` vs `/private/var`).
         let sender = only_batch_sender(&view, cx);
 
         write(&target, "target changed\n");
         sender.send_blocking(WatchBatch::default()).unwrap();
         cx.run_until_parked();
         assert_eq!(text_of(&view, cx, id), "target changed\n");
+
+        view.update(cx, |view, cx| {
+            let _ = view.sessions.close(id, "Untitled");
+            view.sync_document_watches(cx);
+            assert!(view.document_watch.parents.is_empty());
+        });
+        let _ = sender.send_blocking(WatchBatch::default());
+        cx.run_until_parked();
+        assert!(sender.is_closed());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_relinked_symlink_follows_the_new_target_and_releases_the_old_watch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        inject_watch_error(None);
+        let (view, root, old_target) = symlinked_view(cx, "link-retarget", "real", "Old.md");
+        let link = root.join("links/Note.md");
+        let new_target = root.join("moved/New.md");
+        write(&new_target, "new target\n");
+        let id = ids(&view, cx)[0];
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        cx.run_until_parked();
+        let old_parent = std::fs::canonicalize(&old_target)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let new_parent = std::fs::canonicalize(&new_target)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let (link_sender, old_sender) = view.read_with(cx, |view, _| {
+            assert_eq!(view.document_watch.parents.len(), 2);
+            let link_parent = view
+                .document_watch
+                .parents
+                .keys()
+                .find(|parent| **parent != old_parent)
+                .expect("the link's own directory is watched")
+                .clone();
+            (
+                view.document_watch.parents[&link_parent]
+                    .test_batches
+                    .clone()
+                    .unwrap(),
+                view.document_watch.parents[&old_parent]
+                    .test_batches
+                    .clone()
+                    .expect("the old target's directory is watched"),
+            )
+        });
+
+        // The link is pointed at another file; the link's directory reports it.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&new_target, &link).unwrap();
+        link_sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "new target\n");
+        view.read_with(cx, |view, _| {
+            // The displayed path stays the link and nothing became dirty.
+            let session = view.sessions.get(id).unwrap();
+            assert!(session.path().unwrap().ends_with("links/Note.md"));
+            assert!(!session.is_dirty());
+        });
+
+        // The next sync watches the new target's directory and drops the old.
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        cx.run_until_parked();
+        let new_sender = view.read_with(cx, |view, _| {
+            assert_eq!(view.document_watch.parents.len(), 2);
+            assert!(!view.document_watch.parents.contains_key(&old_parent));
+            view.document_watch.parents[&new_parent]
+                .test_batches
+                .clone()
+                .expect("the new target's directory is watched")
+        });
+
+        // A late notification from the old target changes nothing.
+        write(&old_target, "stale old target\n");
+        let _ = old_sender.send_blocking(WatchBatch::default());
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "new target\n");
+        assert!(old_sender.is_closed());
+
+        // A change to the new target is followed.
+        write(&new_target, "new target changed\n");
+        new_sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "new target changed\n");
         let _ = std::fs::remove_dir_all(&root);
     }
 

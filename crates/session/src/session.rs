@@ -980,6 +980,11 @@ impl DocumentSession {
         observed: ObservedFile,
         local: Option<ContentFingerprint>,
     ) -> ExternalCheckOutcome {
+        // A link may now point somewhere else; the watch follows the file the
+        // path resolves to. The displayed path never changes.
+        if let Some(canonical) = &observed.canonical {
+            self.file.refresh_canonical(canonical);
+        }
         if self.file.baseline().is_none() {
             // The clean document the check started from is the baseline, but
             // only if no write has advanced it since (a write sets it).
@@ -1162,6 +1167,7 @@ impl DocumentSession {
             document: observed.document,
             fingerprint: observed.fingerprint,
             stamp: observed.stamp,
+            canonical: None,
         });
         ReloadOutcome::Reloaded
     }

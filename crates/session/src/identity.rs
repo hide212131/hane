@@ -418,6 +418,16 @@ impl FileState {
         self.presence = FilePresence::Present;
     }
 
+    /// Follows a symlink that now resolves elsewhere. The path as opened (what
+    /// the UI shows and saves to) is kept.
+    pub(crate) fn refresh_canonical(&mut self, canonical: &Path) {
+        if let Some(identity) = &mut self.identity
+            && identity.canonical != canonical
+        {
+            identity.canonical = canonical.to_path_buf();
+        }
+    }
+
     pub(crate) fn set_stamp(&mut self, stamp: Option<FileStamp>) {
         self.stamp = stamp;
         self.presence = FilePresence::Present;

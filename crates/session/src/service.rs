@@ -122,6 +122,9 @@ pub struct ObservedFile {
     pub document: RopeBuffer,
     pub fingerprint: ContentFingerprint,
     pub stamp: Option<FileStamp>,
+    /// The path the file was resolved to when it was read (a symlink may have
+    /// been pointed elsewhere since the document was opened).
+    pub canonical: Option<PathBuf>,
 }
 
 /// What a background check found at a path. `Unreadable` is never "no change":
@@ -161,6 +164,7 @@ pub fn observe_disk(service: &dyn FileService, path: &Path) -> DiskVersion {
             document: loaded.document,
             fingerprint,
             stamp: loaded.stamp,
+            canonical: Some(loaded.identity.canonical_path().to_path_buf()),
         }));
     }
     DiskVersion::Unreadable("ファイルが更新され続けているため、整合した内容を読めませんでした".to_owned())
