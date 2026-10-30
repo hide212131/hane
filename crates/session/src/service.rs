@@ -375,6 +375,37 @@ pub enum OverwriteGuard {
     },
 }
 
+/// How many times a load whose path was replaced during the read is retried
+/// before it fails instead of returning a body from a file the path no longer
+/// names.
+const LOAD_ATTEMPTS: usize = 3;
+
+/// Reads `path` through one handle and accepts the result only if the path
+/// still names that same file afterwards. `after_read` runs between the read
+/// and the check so tests can replace the path at exactly that point.
+fn load_verified(path: &Path, after_read: &dyn Fn(usize)) -> io::Result<LoadedFile> {
+    for attempt in 0..LOAD_ATTEMPTS {
+        let file = fs::File::open(path)?;
+        let stamp = stamp_from_metadata(file.metadata().ok());
+        let mut reader = io::BufReader::new(file);
+        let document = RopeBuffer::from_reader(&mut reader)?;
+        after_read(attempt);
+        if !crate::identity::handle_is_path(reader.get_ref(), path)? {
+            continue;
+        }
+        let fingerprint = Some(ContentFingerprint::of_document(&document));
+        return Ok(LoadedFile {
+            document,
+            identity: identity_for(path),
+            stamp,
+            fingerprint,
+        });
+    }
+    Err(io::Error::other(
+        "ファイルが読込中に置き換えられ続けているため、整合した内容を読めませんでした",
+    ))
+}
+
 /// `FileService` backed by the real filesystem.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OsFileService;
@@ -392,16 +423,7 @@ impl FileService for OsFileService {
     }
 
     fn load(&self, path: &Path) -> io::Result<LoadedFile> {
-        let file = fs::File::open(path)?;
-        let stamp = stamp_from_metadata(file.metadata().ok());
-        let document = RopeBuffer::from_reader(io::BufReader::new(file))?;
-        let fingerprint = Some(ContentFingerprint::of_document(&document));
-        Ok(LoadedFile {
-            document,
-            identity: identity_for(path),
-            stamp,
-            fingerprint,
-        })
+        load_verified(path, &|_| {})
     }
 
     fn save(&self, path: &Path, document: &RopeBuffer) -> io::Result<SavedFile> {
@@ -1036,6 +1058,74 @@ pub(crate) fn temporary_directory(name: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::testing::MemoryFileService;
+
+    /// Atomically replaces `path` with `text`, giving it the same mtime as the
+    /// file it replaces, so size and mtime alone cannot tell the two apart.
+    #[cfg(unix)]
+    fn replace_with_same_stamp(path: &Path, text: &str) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let staging = path.with_extension("replacement");
+        fs::write(&staging, text).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(&staging, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_a_body_read_from_a_file_replaced_with_the_same_stamp() {
+        let root = temporary_directory("load-replaced-same-stamp");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "old body").unwrap();
+
+        let loaded = load_verified(&path, &|attempt| {
+            if attempt == 0 {
+                replace_with_same_stamp(&path, "new body");
+            }
+        })
+        .unwrap();
+
+        assert_eq!(loaded.document.full_text(), "new body");
+        assert_eq!(
+            loaded.fingerprint,
+            Some(ContentFingerprint::of_bytes(b"new body"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_fails_instead_of_returning_a_stale_body_when_replacement_never_settles() {
+        let root = temporary_directory("load-replaced-always");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "body-0").unwrap();
+
+        let result = load_verified(&path, &|attempt| {
+            replace_with_same_stamp(&path, &format!("body-{}", attempt + 1));
+        });
+
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_of_an_unchanged_file_succeeds() {
+        let root = temporary_directory("load-unchanged");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "stable").unwrap();
+
+        let loaded = OsFileService.load(&path).unwrap();
+
+        assert_eq!(loaded.document.full_text(), "stable");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn atomic_document_save_preserves_markdown_bytes() {

@@ -150,9 +150,15 @@ unsafe extern "system" {
 /// be opened or queried.
 #[cfg(windows)]
 fn windows_file_id(path: &Path) -> Option<(u32, u64)> {
+    let file = std::fs::File::open(path).ok()?;
+    windows_handle_id(&file)
+}
+
+/// Same as `windows_file_id`, for a handle that is already open.
+#[cfg(windows)]
+fn windows_handle_id(file: &std::fs::File) -> Option<(u32, u64)> {
     use std::os::windows::io::AsRawHandle;
 
-    let file = std::fs::File::open(path).ok()?;
     // SAFETY: `file` owns a valid handle for the duration of the call, and
     // `info` is a plain-old-data struct matching `BY_HANDLE_FILE_INFORMATION`
     // that the API fully initializes when it returns non-zero.
@@ -167,6 +173,35 @@ fn windows_file_id(path: &Path) -> Option<(u32, u64)> {
         info.volume_serial_number,
         (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
     ))
+}
+
+/// Whether `path` still names the very file `file` has open. A path that is
+/// gone or now names another file (an atomic replacement) is `false`, so a
+/// body read through the old handle is never attributed to the new entry. On
+/// platforms without an OS file id the caller's stamp comparison is the only
+/// evidence, so this reports `true`.
+#[cfg(unix)]
+pub(crate) fn handle_is_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let own = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(target) => Ok(own.dev() == target.dev() && own.ino() == target.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn handle_is_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    Ok(match (windows_handle_id(file), windows_file_id(path)) {
+        (Some(own), Some(target)) => own == target,
+        _ => false,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn handle_is_path(_file: &std::fs::File, _path: &Path) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 /// Cheap fingerprint of a file on disk, captured when it is read or written, so
