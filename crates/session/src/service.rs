@@ -382,8 +382,17 @@ const LOAD_ATTEMPTS: usize = 3;
 
 /// Reads `path` through one handle and accepts the result only if the path
 /// still names that same file afterwards. `after_read` runs between the read
-/// and the check so tests can replace the path at exactly that point.
-fn load_verified(path: &Path, after_read: &dyn Fn(usize)) -> io::Result<LoadedFile> {
+/// and the check, and `after_identity` runs between resolving the path identity
+/// and the final check, so tests can replace the path at exactly those points.
+///
+/// The path identity is resolved before the last handle/path comparison, so a
+/// replacement at any earlier point is caught and the identity returned always
+/// belongs to the file the body was read from.
+fn load_verified(
+    path: &Path,
+    after_read: &dyn Fn(usize),
+    after_identity: &dyn Fn(usize),
+) -> io::Result<LoadedFile> {
     for attempt in 0..LOAD_ATTEMPTS {
         let file = fs::File::open(path)?;
         let stamp = stamp_from_metadata(file.metadata().ok());
@@ -393,10 +402,15 @@ fn load_verified(path: &Path, after_read: &dyn Fn(usize)) -> io::Result<LoadedFi
         if !crate::identity::handle_is_path(reader.get_ref(), path)? {
             continue;
         }
+        let identity = identity_for(path);
+        after_identity(attempt);
+        if !crate::identity::handle_is_path(reader.get_ref(), path)? {
+            continue;
+        }
         let fingerprint = Some(ContentFingerprint::of_document(&document));
         return Ok(LoadedFile {
             document,
-            identity: identity_for(path),
+            identity,
             stamp,
             fingerprint,
         });
@@ -423,7 +437,7 @@ impl FileService for OsFileService {
     }
 
     fn load(&self, path: &Path) -> io::Result<LoadedFile> {
-        load_verified(path, &|_| {})
+        load_verified(path, &|_| {}, &|_| {})
     }
 
     fn save(&self, path: &Path, document: &RopeBuffer) -> io::Result<SavedFile> {
@@ -1083,7 +1097,34 @@ mod tests {
         let path = root.join("document.md");
         fs::write(&path, "old body").unwrap();
 
-        let loaded = load_verified(&path, &|attempt| {
+        let loaded = load_verified(
+            &path,
+            &|attempt| {
+                if attempt == 0 {
+                    replace_with_same_stamp(&path, "new body");
+                }
+            },
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(loaded.document.full_text(), "new body");
+        assert_eq!(
+            loaded.fingerprint,
+            Some(ContentFingerprint::of_bytes(b"new body"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_a_body_when_the_file_is_replaced_after_the_identity_is_resolved() {
+        let root = temporary_directory("load-replaced-after-identity");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "old body").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|attempt| {
             if attempt == 0 {
                 replace_with_same_stamp(&path, "new body");
             }
@@ -1100,15 +1141,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn load_fails_when_replacement_after_the_identity_never_settles() {
+        let root = temporary_directory("load-replaced-after-identity-always");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "body-0").unwrap();
+
+        let result = load_verified(&path, &|_| {}, &|attempt| {
+            replace_with_same_stamp(&path, &format!("body-{}", attempt + 1));
+        });
+
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_with_both_checks_succeeds_for_an_unchanged_file_on_windows() {
+        let root = temporary_directory("load-unchanged-windows");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "stable").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|_| {}).unwrap();
+
+        assert_eq!(loaded.document.full_text(), "stable");
+        assert!(loaded.identity.matches_path(&path));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn load_fails_instead_of_returning_a_stale_body_when_replacement_never_settles() {
         let root = temporary_directory("load-replaced-always");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("document.md");
         fs::write(&path, "body-0").unwrap();
 
-        let result = load_verified(&path, &|attempt| {
-            replace_with_same_stamp(&path, &format!("body-{}", attempt + 1));
-        });
+        let result = load_verified(
+            &path,
+            &|attempt| {
+                replace_with_same_stamp(&path, &format!("body-{}", attempt + 1));
+            },
+            &|_| {},
+        );
 
         assert!(result.is_err());
         fs::remove_dir_all(root).unwrap();
