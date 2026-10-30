@@ -1058,8 +1058,10 @@ impl DocumentSession {
         self.generation = self.generation.wrapping_add(1);
         self.autosave_generation = self.autosave_generation.wrapping_add(1);
         self.pending_save = None;
-        self.live_approval = None;
-        self.external = ExternalState::InSync;
+        // A check started before the reload describes the old generation and
+        // its result is dropped before it can release the slot, so free it
+        // here. Its sequence no longer matches any later check.
+        self.reset_external_tracking();
     }
 
     /// The closest offset at or before `offset` that is inside the document

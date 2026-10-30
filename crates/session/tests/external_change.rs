@@ -617,6 +617,53 @@ fn a_confirmed_reload_takes_the_disk_version_only_with_a_current_approval() {
     assert_eq!(session.apply_confirmed_reload(approval), ReloadOutcome::StaleApproval);
 }
 
+#[test]
+fn a_reload_frees_the_check_slot_and_a_late_old_result_cannot_break_the_next_check() {
+    let service = MemoryFileService::new();
+    let mut session = opened(&service, "base\n");
+    type_into(&mut session, "mine ");
+    service.write_externally(PATH, "theirs\n");
+    check(&mut session, &service);
+
+    // A normal check is running when the confirmed reload completes.
+    let ExternalCheckStart::Run(old) = session.begin_external_check() else {
+        panic!("a check");
+    };
+    let late = run_external_check(&service, &old);
+    let approval = session
+        .approve_resolution(ResolutionKind::DiscardAndReload, session.observed_fingerprint())
+        .unwrap();
+    assert_eq!(session.apply_confirmed_reload(approval), ReloadOutcome::Reloaded);
+    assert_eq!(text(&session), "theirs\n");
+
+    // The reload invalidated the old check, so a new one can start.
+    let ExternalCheckStart::Run(fresh) = session.begin_external_check() else {
+        panic!("a new check must start after the reload");
+    };
+    // The old result arriving late is stale and leaves the new slot alone.
+    assert_eq!(
+        session.finish_external_check(&old.ticket, late),
+        ExternalCheckOutcome::Stale
+    );
+    service.write_externally(PATH, "again\n");
+    let result = run_external_check(&service, &fresh);
+    assert_eq!(
+        session.finish_external_check(&fresh.ticket, result),
+        ExternalCheckOutcome::Reloaded
+    );
+    assert_eq!(text(&session), "again\n");
+
+    // The next external change is still detected, and edits stay protected.
+    type_into(&mut session, "mine ");
+    let typed = text(&session);
+    service.write_externally(PATH, "third\n");
+    assert_eq!(
+        check(&mut session, &service),
+        ExternalCheckOutcome::Changed { dirty: true }
+    );
+    assert_eq!(text(&session), typed);
+}
+
 /// Confirms a reload of what the session currently shows and returns the
 /// request that reads the disk again.
 fn confirm_reload(session: &mut DocumentSession) -> ReloadVerifyRequest {
