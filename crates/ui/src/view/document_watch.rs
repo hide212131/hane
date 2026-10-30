@@ -53,6 +53,12 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static HELD_DOCUMENT_WATCH_REGISTRATIONS: std::cell::RefCell<Vec<HeldRegistration>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Test-only: directory alias lookups wait in `HELD_DIRECTORY_ALIAS_LOOKUPS`
+    /// until a test answers them.
+    static HOLD_DIRECTORY_ALIAS_LOOKUPS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static HELD_DIRECTORY_ALIAS_LOOKUPS: std::cell::RefCell<Vec<((PathBuf, PathBuf), u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -399,6 +405,14 @@ impl EditorView {
             return;
         }
         let generation = self.work_folder_generation;
+        // Tests can hold the lookup and answer it themselves, so the state
+        // before and after the answer is observed without depending on the
+        // spelling of the platform's temp directory or on task order.
+        #[cfg(test)]
+        if HOLD_DIRECTORY_ALIAS_LOOKUPS.with(std::cell::Cell::get) {
+            HELD_DIRECTORY_ALIAS_LOOKUPS.with(|held| held.borrow_mut().push((pair, generation)));
+            return;
+        }
         cx.spawn(async move |view, cx| {
             let (own, other) = pair.clone();
             let same = cx
@@ -406,15 +420,27 @@ impl EditorView {
                 .spawn(async move { is_same_directory_on_disk(&own, &other) })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                if view.work_folder_generation != generation {
-                    return;
-                }
-                view.document_watch.alias_lookups.remove(&pair);
-                view.document_watch.directory_aliases.insert(pair, same);
-                view.sync_document_watches(cx);
+                view.complete_directory_alias(pair, generation, same, cx);
             });
         })
         .detach();
+    }
+
+    /// Records the answer of a directory lookup and syncs again with it. An
+    /// answer for an older work folder generation is dropped.
+    fn complete_directory_alias(
+        &mut self,
+        pair: (PathBuf, PathBuf),
+        generation: u64,
+        same: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.work_folder_generation != generation {
+            return;
+        }
+        self.document_watch.alias_lookups.remove(&pair);
+        self.document_watch.directory_aliases.insert(pair, same);
+        self.sync_document_watches(cx);
     }
 
     /// Starts the first check of every document whose watch is registered. It
@@ -837,6 +863,54 @@ mod tests {
         view
     }
 
+    /// Answers, on the calling thread and before any watch is registered, the
+    /// "are these the same directory" question of every open document. The
+    /// temp directory may be spelled differently from its canonical form (a
+    /// Windows 8.3 name, `/private/var`), which leaves the pair unresolved and
+    /// temporarily watches both spellings; tests about the watch lifecycle
+    /// start from the resolved state instead of racing the background lookup.
+    fn resolve_aliases_up_front(view: &gpui::Entity<EditorView>, cx: &mut gpui::TestAppContext) {
+        view.update(cx, |view, _| {
+            let pairs: Vec<(PathBuf, PathBuf)> = view
+                .sessions
+                .sessions()
+                .filter_map(|session| {
+                    watch_plan(session, &view.document_watch.directory_aliases).1
+                })
+                .collect();
+            for pair in pairs {
+                let same = is_same_directory_on_disk(&pair.0, &pair.1);
+                view.document_watch.directory_aliases.insert(pair, same);
+            }
+        });
+    }
+
+    fn hold_alias_lookups(hold: bool) {
+        HOLD_DIRECTORY_ALIAS_LOOKUPS.with(|slot| slot.set(hold));
+        if !hold {
+            HELD_DIRECTORY_ALIAS_LOOKUPS.with(|held| held.borrow_mut().clear());
+        }
+    }
+
+    fn held_alias_lookups() -> Vec<((PathBuf, PathBuf), u64)> {
+        HELD_DIRECTORY_ALIAS_LOOKUPS.with(|held| held.borrow().clone())
+    }
+
+    /// Answers every held directory lookup with `same`.
+    fn answer_held_alias_lookups(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::TestAppContext,
+        same: bool,
+    ) {
+        let held = HELD_DIRECTORY_ALIAS_LOOKUPS.with(|held| std::mem::take(&mut *held.borrow_mut()));
+        for (pair, generation) in held {
+            view.update(cx, |view, cx| {
+                view.complete_directory_alias(pair, generation, same, cx);
+            });
+        }
+        cx.run_until_parked();
+    }
+
     fn inject_watch_error(message: Option<&str>) {
         INJECTED_DOCUMENT_WATCH_ERROR.with(|slot| *slot.borrow_mut() = message.map(str::to_owned));
     }
@@ -896,6 +970,7 @@ mod tests {
         // Both files change after they were opened and before any watch exists.
         write(&a, "a changed\n");
         write(&b, "b changed\n");
+        resolve_aliases_up_front(&view, cx);
         view.update(cx, |view, cx| {
             // An untitled tab has no file: it is not tracked or watched.
             view.sessions.open_untitled("draft", "Untitled");
@@ -987,6 +1062,105 @@ mod tests {
         link_sender.send_blocking(WatchBatch::default()).unwrap();
         cx.run_until_parked();
         assert_eq!(text_of(&view, cx, id), "target changed again\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The resolved directory is watched too until the lookup answers, and one
+    /// watch serves both spellings once it says they are one directory.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn an_unresolved_directory_spelling_is_watched_twice_then_merged_when_it_is_the_same(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        inject_watch_error(None);
+        hold_alias_lookups(true);
+        let root = watch_test_root("alias-same");
+        let real = root.join("real");
+        let linked = root.join("linked");
+        write(&real.join("A.md"), "a\n");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let file = linked.join("A.md");
+        let view = view_with_files(cx, &[&file]);
+        let id = ids(&view, cx)[0];
+        let canonical_parent = view.read_with(cx, |view, _| {
+            let identity = view.sessions.get(id).unwrap().file().identity().unwrap();
+            strip_verbatim_prefix(identity.canonical_path())
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        });
+        let own_parent = watch_parent(&file).unwrap();
+        assert_ne!(own_parent, canonical_parent);
+
+        view.update(cx, |view, cx| {
+            view.sync_document_watches(cx);
+            view.sync_document_watches(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(held_alias_lookups().len(), 1, "one lookup, not one per sync");
+        view.read_with(cx, |view, _| {
+            // Nothing is missed while the answer is outstanding.
+            assert_eq!(view.document_watch.parents.len(), 2);
+            assert!(view.document_watch.parents.contains_key(&own_parent));
+            assert!(view.document_watch.parents.contains_key(&canonical_parent));
+        });
+
+        answer_held_alias_lookups(&view, cx, true);
+        let sender = view.read_with(cx, |view, _| {
+            assert_eq!(view.document_watch.parents.len(), 1);
+            view.document_watch.parents[&own_parent]
+                .test_batches
+                .clone()
+                .expect("the merged directory is watched")
+        });
+        assert!(held_alias_lookups().is_empty());
+
+        write(&real.join("A.md"), "a changed\n");
+        sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "a changed\n");
+        hold_alias_lookups(false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A different directory keeps its own watch after the lookup answers.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn an_unresolved_directory_spelling_keeps_both_watches_when_it_is_another_directory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        inject_watch_error(None);
+        hold_alias_lookups(true);
+        let (view, root, target) = symlinked_view(cx, "alias-different", "real", "Real.md");
+        let id = ids(&view, cx)[0];
+        let target_parent = strip_verbatim_prefix(&std::fs::canonicalize(&target).unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        cx.run_until_parked();
+        assert_eq!(held_alias_lookups().len(), 1);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_watch.parents.len(), 2);
+            assert!(view.document_watch.parents.contains_key(&target_parent));
+        });
+
+        answer_held_alias_lookups(&view, cx, false);
+        let sender = view.read_with(cx, |view, _| {
+            assert_eq!(view.document_watch.parents.len(), 2);
+            view.document_watch.parents[&target_parent]
+                .test_batches
+                .clone()
+                .expect("the target's directory stays watched")
+        });
+        assert!(held_alias_lookups().is_empty(), "the answer is remembered");
+
+        write(&target, "target changed\n");
+        sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "target changed\n");
+        hold_alias_lookups(false);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1149,6 +1323,7 @@ mod tests {
         write(&b, "b\n");
         let view = view_with_files(cx, &[&a, &b]);
         let ids = ids(&view, cx);
+        resolve_aliases_up_front(&view, cx);
         view.update(cx, |view, cx| {
             view.sync_document_watches(cx);
             assert_eq!(view.document_watch.parents.len(), 2);
@@ -1223,6 +1398,7 @@ mod tests {
         let view = view_with_files(cx, &[&inside, &outside]);
         let ids = ids(&view, cx);
         write(&inside, "in changed\n");
+        resolve_aliases_up_front(&view, cx);
         view.update(cx, |view, cx| {
             view.start_folder_watch(&work, cx);
             view.sync_document_watches(cx);
@@ -1248,6 +1424,7 @@ mod tests {
         let view = view_with_files(cx, &[&inside]);
         inject_watch_error(None);
         inject_folder_attach_error(Some("folder denied"));
+        resolve_aliases_up_front(&view, cx);
         view.update(cx, |view, cx| {
             view.start_folder_watch(&root, cx);
             view.sync_document_watches(cx);
@@ -1519,6 +1696,7 @@ mod tests {
         let view = view_with_files(cx, &[&a]);
         let id = ids(&view, cx)[0];
         write(&a, "a changed\n");
+        resolve_aliases_up_front(&view, cx);
 
         // Several renders while the registration is outstanding: sync returns
         // at once, registers once, and checks nothing yet.
@@ -1570,6 +1748,7 @@ mod tests {
         write(&moved, "moved\n");
         let view = view_with_files(cx, &[&a]);
         let id = ids(&view, cx)[0];
+        resolve_aliases_up_front(&view, cx);
         view.update(cx, |view, cx| view.sync_document_watches(cx));
         assert_eq!(held_count(), 1);
 
@@ -1578,8 +1757,9 @@ mod tests {
         let loaded = OsFileService.load(&moved).unwrap();
         view.update(cx, |view, cx| {
             view.sessions.get_mut(id).unwrap().adopt(loaded);
-            view.sync_document_watches(cx);
         });
+        resolve_aliases_up_front(&view, cx);
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
         assert_eq!(held_count(), 2);
         write(&a, "late external write\n");
         write(&moved, "moved changed\n");
@@ -1602,8 +1782,9 @@ mod tests {
         let reopened = OsFileService.load(&a).unwrap();
         view.update(cx, |view, cx| {
             view.sessions.apply_open(None, reopened);
-            view.sync_document_watches(cx);
         });
+        resolve_aliases_up_front(&view, cx);
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
         let first_token = only_token(&view, cx);
         view.update(cx, |view, cx| {
             view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
