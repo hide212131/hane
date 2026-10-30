@@ -129,7 +129,10 @@ fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
     };
     let path = identity.path();
     let mut targets = vec![path.to_path_buf()];
-    let resolved = identity.canonical_path();
+    // Windows `canonicalize` returns the extended-length `\\?\` spelling of
+    // the same path; that is not a link, so compare without the prefix.
+    let resolved_plain = strip_verbatim_prefix(identity.canonical_path());
+    let resolved = resolved_plain.as_path();
     if resolved != path && !is_private_alias(path, resolved) {
         // A target in the link's own directory is reached through the same
         // directory spelling, so both names share one watch even when the
@@ -145,6 +148,19 @@ fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
         targets.push(in_same_directory.unwrap_or_else(|| resolved.to_path_buf()));
     }
     targets
+}
+
+/// `path` without the Windows extended-length prefix (`\\?\C:\x` becomes
+/// `C:\x`, `\\?\UNC\srv\x` becomes `\\srv\x`); other paths are unchanged.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// macOS resolves `/var` to `/private/var`; that is the same file under the
@@ -614,6 +630,22 @@ mod tests {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn extended_length_prefix_is_not_a_separate_watch_target() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\work\a.md")),
+            PathBuf::from(r"C:\work\a.md")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\srv\share\a.md")),
+            PathBuf::from(r"\\srv\share\a.md")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new("/tmp/a.md")),
+            PathBuf::from("/tmp/a.md")
+        );
     }
 
     fn write(path: &Path, text: &str) {
