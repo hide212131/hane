@@ -1155,6 +1155,63 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Windows counterpart of `replace_with_same_stamp`. `fs::File` opens with
+    /// read/write/delete sharing, so renaming a staged file over a path whose
+    /// old file is still open by the loader is allowed; the open handle keeps
+    /// naming the old file while the path names the new one.
+    #[cfg(windows)]
+    fn replace_with_same_stamp_on_windows(path: &Path, text: &str) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let staging = path.with_extension("replacement");
+        fs::write(&staging, text).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(&staging, path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_rejects_a_body_when_the_file_is_replaced_after_the_identity_is_resolved_on_windows() {
+        let root = temporary_directory("load-replaced-after-identity-windows");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "old body").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|attempt| {
+            if attempt == 0 {
+                replace_with_same_stamp_on_windows(&path, "new body");
+            }
+        })
+        .unwrap();
+
+        assert_eq!(loaded.document.full_text(), "new body");
+        assert_eq!(
+            loaded.fingerprint,
+            Some(ContentFingerprint::of_bytes(b"new body"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_fails_when_replacement_after_the_identity_never_settles_on_windows() {
+        let root = temporary_directory("load-replaced-after-identity-always-windows");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "body-0").unwrap();
+
+        let result = load_verified(&path, &|_| {}, &|attempt| {
+            replace_with_same_stamp_on_windows(&path, &format!("body-{}", attempt + 1));
+        });
+
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn load_with_both_checks_succeeds_for_an_unchanged_file_on_windows() {
