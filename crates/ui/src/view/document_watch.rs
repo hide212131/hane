@@ -106,6 +106,11 @@ pub(super) struct DocumentWatchState {
     retry_scheduled: bool,
     /// Registered once, the first time the window is available.
     activation: Option<Subscription>,
+    /// Background answers to "is this the same directory". The render path
+    /// reads them and never touches the filesystem itself.
+    directory_aliases: DirectoryAliases,
+    /// Directory pairs whose lookup is running, so each is asked only once.
+    alias_lookups: HashSet<(PathBuf, PathBuf)>,
 }
 
 /// The directory whose watch reports on `path`.
@@ -124,12 +129,27 @@ fn watch_parent(path: &Path) -> Option<PathBuf> {
 /// the two spellings of its directory differ is the filesystem asked whether
 /// they are the same directory. A change to the link target is reported in
 /// the target's directory, which the link's own directory never sees.
-fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
+fn watch_targets(session: &DocumentSession, aliases: &DirectoryAliases) -> Vec<PathBuf> {
+    watch_plan(session, aliases).0
+}
+
+/// Answers of earlier background lookups of "are these two spellings the same
+/// directory". The render path only reads this; it never asks the filesystem.
+type DirectoryAliases = HashMap<(PathBuf, PathBuf), bool>;
+
+/// `watch_targets` plus the directory pair whose answer is not known yet. Until
+/// the background lookup reports, the pair counts as different, which costs a
+/// redundant watch and never a missed one.
+fn watch_plan(
+    session: &DocumentSession,
+    aliases: &DirectoryAliases,
+) -> (Vec<PathBuf>, Option<(PathBuf, PathBuf)>) {
     let Some(identity) = session.file().identity() else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let path = identity.path();
     let mut targets = vec![path.to_path_buf()];
+    let mut unresolved = None;
     // Windows `canonicalize` returns the extended-length `\\?\` spelling of
     // the same path; that is not a link, so compare without the prefix.
     let resolved_plain = strip_verbatim_prefix(identity.canonical_path());
@@ -146,17 +166,24 @@ fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
             }
             // The spellings differ (for example a Windows 8.3 short name
             // against its long name); only the filesystem can say whether the
-            // two directories are the same one.
-            (Some(own), Some(resolved_parent), Some(name))
-                if is_same_directory_on_disk(own, resolved_parent) =>
-            {
-                Some(own.join(name))
+            // two directories are the same one. That is looked up in the
+            // background and remembered in `aliases`.
+            (Some(own), Some(resolved_parent), Some(name)) => {
+                let key = (own.to_path_buf(), resolved_parent.to_path_buf());
+                match aliases.get(&key) {
+                    Some(true) => Some(own.join(name)),
+                    Some(false) => None,
+                    None => {
+                        unresolved = Some(key);
+                        None
+                    }
+                }
             }
             _ => None,
         };
         targets.push(in_same_directory.unwrap_or_else(|| resolved.to_path_buf()));
     }
-    targets
+    (targets, unresolved)
 }
 
 /// Whether both directories resolve to the same real directory. A failed
@@ -224,8 +251,8 @@ fn is_windows_spelling_alias(path: &Path, resolved: &Path) -> bool {
 }
 
 /// Whether `parent` is the directory of any watch target of `session`.
-fn uses_parent(session: &DocumentSession, parent: &Path) -> bool {
-    watch_targets(session)
+fn uses_parent(session: &DocumentSession, aliases: &DirectoryAliases, parent: &Path) -> bool {
+    watch_targets(session, aliases)
         .iter()
         .any(|target| watch_parent(target).as_deref() == Some(parent))
 }
@@ -235,7 +262,7 @@ impl EditorView {
     /// when it has no file). A document inside a healthy work folder is
     /// covered by the folder watch.
     pub(super) fn document_watch_problem(&self, id: SessionId) -> Option<String> {
-        watch_targets(self.sessions.get(id)?)
+        watch_targets(self.sessions.get(id)?, &self.document_watch.directory_aliases)
             .iter()
             .filter(|target| !self.folder_watch_covers(target))
             .filter_map(|target| watch_parent(target))
@@ -299,14 +326,25 @@ impl EditorView {
             // Another workspace: nothing registered for the old one applies.
             self.document_watch.parents.clear();
             self.document_watch.tracked.clear();
+            self.document_watch.directory_aliases.clear();
+            self.document_watch.alias_lookups.clear();
             self.document_watch.epoch = self.work_folder_generation;
         }
+        let mut unresolved: Vec<(PathBuf, PathBuf)> = Vec::new();
         let documents: Vec<(SessionId, Vec<PathBuf>)> = self
             .sessions
             .sessions()
-            .map(|session| (session.id(), watch_targets(session)))
+            .map(|session| {
+                let (targets, pending) =
+                    watch_plan(session, &self.document_watch.directory_aliases);
+                unresolved.extend(pending);
+                (session.id(), targets)
+            })
             .filter(|(_, targets)| !targets.is_empty())
             .collect();
+        for pair in unresolved {
+            self.resolve_directory_alias(pair, cx);
+        }
         self.document_watch
             .tracked
             .retain(|id, _| documents.iter().any(|(open, _)| open == id));
@@ -351,6 +389,32 @@ impl EditorView {
             self.attach_document_watch(parent, &set, false, false, cx);
         }
         self.start_initial_document_checks(cx);
+    }
+
+    /// Asks the filesystem, off the UI thread, whether the two directory
+    /// spellings are one directory, then syncs again with the answer. A failed
+    /// lookup is remembered as "different".
+    fn resolve_directory_alias(&mut self, pair: (PathBuf, PathBuf), cx: &mut Context<Self>) {
+        if !self.document_watch.alias_lookups.insert(pair.clone()) {
+            return;
+        }
+        let generation = self.work_folder_generation;
+        cx.spawn(async move |view, cx| {
+            let (own, other) = pair.clone();
+            let same = cx
+                .background_executor()
+                .spawn(async move { is_same_directory_on_disk(&own, &other) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.work_folder_generation != generation {
+                    return;
+                }
+                view.document_watch.alias_lookups.remove(&pair);
+                view.document_watch.directory_aliases.insert(pair, same);
+                view.sync_document_watches(cx);
+            });
+        })
+        .detach();
     }
 
     /// Starts the first check of every document whose watch is registered. It
@@ -503,7 +567,7 @@ impl EditorView {
             && self
                 .sessions
                 .sessions()
-                .any(|session| uses_parent(session, parent));
+                .any(|session| uses_parent(session, &self.document_watch.directory_aliases, parent));
         if !still_needed {
             // The document closed, moved or the work folder changed while the
             // registration ran. Forget the entry so a later sync registers
@@ -595,7 +659,7 @@ impl EditorView {
         let ids: Vec<SessionId> = self
             .sessions
             .sessions()
-            .filter(|session| uses_parent(session, parent))
+            .filter(|session| uses_parent(session, &self.document_watch.directory_aliases, parent))
             .map(DocumentSession::id)
             .collect();
         for id in ids {
@@ -650,7 +714,7 @@ impl EditorView {
             return;
         }
         let down = self.sessions.get(id).and_then(|session| {
-            watch_targets(session)
+            watch_targets(session, &self.document_watch.directory_aliases)
                 .iter()
                 .filter_map(|target| watch_parent(target))
                 .find(|parent| {
