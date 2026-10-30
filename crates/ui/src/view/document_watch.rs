@@ -1755,7 +1755,7 @@ mod tests {
         // The document moves to another directory before the registration of
         // the old one finishes.
         let loaded = OsFileService.load(&moved).unwrap();
-        view.update(cx, |view, cx| {
+        view.update(cx, |view, _cx| {
             view.sessions.get_mut(id).unwrap().adopt(loaded);
         });
         resolve_aliases_up_front(&view, cx);
@@ -1780,7 +1780,7 @@ mod tests {
             view.sync_document_watches(cx);
         });
         let reopened = OsFileService.load(&a).unwrap();
-        view.update(cx, |view, cx| {
+        view.update(cx, |view, _cx| {
             view.sessions.apply_open(None, reopened);
         });
         resolve_aliases_up_front(&view, cx);
