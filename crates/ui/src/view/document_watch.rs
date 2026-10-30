@@ -885,6 +885,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     fn hold_alias_lookups(hold: bool) {
         HOLD_DIRECTORY_ALIAS_LOOKUPS.with(|slot| slot.set(hold));
         if !hold {
@@ -892,11 +893,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn held_alias_lookups() -> Vec<((PathBuf, PathBuf), u64)> {
         HELD_DIRECTORY_ALIAS_LOOKUPS.with(|held| held.borrow().clone())
     }
 
     /// Answers every held directory lookup with `same`.
+    #[cfg(unix)]
     fn answer_held_alias_lookups(
         view: &gpui::Entity<EditorView>,
         cx: &mut gpui::TestAppContext,
