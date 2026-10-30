@@ -397,6 +397,7 @@ fn load_verified(
     after_read: &dyn Fn(usize),
     after_identity: &dyn Fn(usize),
 ) -> io::Result<LoadedFile> {
+    recover_displaced_file(path);
     for attempt in 0..LOAD_ATTEMPTS {
         let file = fs::File::open(path)?;
         let stamp = stamp_from_metadata(file.metadata().ok());
@@ -947,6 +948,7 @@ fn atomic_write_checked_with_hook(
     if create_parent {
         fs::create_dir_all(parent).map_err(SaveFailure::Io)?;
     }
+    recover_displaced_file(path);
     // A directory is never a save target: the move-aside install below would
     // otherwise rename and replace it.
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
@@ -1061,6 +1063,59 @@ fn displaced_path(path: &Path) -> PathBuf {
     ))
 }
 
+/// Restores the previous version of `path` after a process died between moving
+/// it aside and installing the new one. Only the unambiguous case is acted on:
+/// `path` does not exist and exactly one well-formed displaced file from
+/// another process sits next to it. A file at `path`, several candidates, or
+/// unrecognized names are left untouched so no content is overwritten or
+/// guessed at. Returns whether a file was restored.
+fn recover_displaced_file(path: &Path) -> bool {
+    if fs::symlink_metadata(path).is_ok() {
+        return false;
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(stem) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = format!(".{stem}.hane-displaced-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    let own_pid = std::process::id().to_string();
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|name| name.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let Some((pid, sequence)) = rest.split_once('-') else {
+            continue;
+        };
+        let is_number = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        if !is_number(pid) || !is_number(sequence) {
+            continue;
+        }
+        // A displaced file of this process belongs to a save in progress.
+        if pid == own_pid {
+            return false;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            candidates.push(entry.path());
+        }
+    }
+    match candidates.as_slice() {
+        [only] => rename_file_without_replace(only, path).is_ok(),
+        _ => false,
+    }
+}
+
 const MAX_INSTALL_ATTEMPTS: usize = 3;
 
 #[cfg(test)]
@@ -1076,6 +1131,102 @@ pub(crate) fn temporary_directory(name: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::testing::MemoryFileService;
+
+    const STALE_PID: u32 = u32::MAX;
+
+    fn stale_displaced(root: &Path, name: &str, pid: u32, sequence: u32) -> PathBuf {
+        root.join(format!(".{name}.hane-displaced-{pid}-{sequence}.tmp"))
+    }
+
+    #[test]
+    fn interrupted_save_restores_the_displaced_file_when_the_target_is_missing() {
+        let root = temporary_directory("recover-displaced-missing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", STALE_PID, 0);
+        fs::write(&aside, "old body").unwrap();
+
+        atomic_write_bytes(&path, b"new body").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new body");
+        // The old version was restored first, then replaced by the save.
+        assert!(!aside.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_restores_the_displaced_file_when_the_target_is_missing() {
+        let root = temporary_directory("recover-displaced-load");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", STALE_PID, 0);
+        fs::write(&aside, "old body").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|_| {}).unwrap();
+
+        assert_eq!(loaded.document.full_text(), "old body");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old body");
+        assert!(!aside.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_never_overwrites_a_file_placed_at_the_target() {
+        let root = temporary_directory("recover-displaced-external");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", STALE_PID, 0);
+        fs::write(&aside, "old body").unwrap();
+        fs::write(&path, "external body").unwrap();
+
+        assert!(!recover_displaced_file(&path));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external body");
+        assert_eq!(fs::read_to_string(&aside).unwrap(), "old body");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_leaves_ambiguous_and_unrecognized_files_untouched() {
+        let root = temporary_directory("recover-displaced-ambiguous");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let first = stale_displaced(&root, "document.md", STALE_PID, 0);
+        let second = stale_displaced(&root, "document.md", STALE_PID - 1, 7);
+        let unrecognized = root.join(".document.md.hane-displaced-abc.tmp");
+        let other_document = stale_displaced(&root, "other.md", STALE_PID, 0);
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        fs::write(&unrecognized, "unknown").unwrap();
+        fs::write(&other_document, "other").unwrap();
+
+        assert!(!recover_displaced_file(&path));
+        assert!(!path.exists());
+
+        fs::remove_file(&first).unwrap();
+        fs::remove_file(&second).unwrap();
+        // Only an unrecognized name remains: nothing is guessed.
+        assert!(!recover_displaced_file(&path));
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&unrecognized).unwrap(), "unknown");
+        assert_eq!(fs::read_to_string(&other_document).unwrap(), "other");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_ignores_the_displaced_file_of_a_save_in_this_process() {
+        let root = temporary_directory("recover-displaced-own-pid");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", std::process::id(), 0);
+        fs::write(&aside, "in flight").unwrap();
+
+        assert!(!recover_displaced_file(&path));
+
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&aside).unwrap(), "in flight");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Atomically replaces `path` with `text`, giving it the same mtime as the
     /// file it replaces, so size and mtime alone cannot tell the two apart.
