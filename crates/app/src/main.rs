@@ -300,6 +300,20 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     Some(service)
 }
 
+const AI_CREDENTIAL_SERVICE: &str = "com.hide212131.hane.ai";
+const VALIDATION_AI_CREDENTIAL_SERVICE: &str = "com.hide212131.hane.ai.validation";
+
+/// The OS credential-store service name for AI credentials. The isolated
+/// update-validation build uses its own namespace so it never reads, writes or
+/// deletes the user's regular credentials.
+const fn ai_credential_service(validation_feed: bool) -> &'static str {
+    if validation_feed {
+        VALIDATION_AI_CREDENTIAL_SERVICE
+    } else {
+        AI_CREDENTIAL_SERVICE
+    }
+}
+
 fn start_ai_service() -> Option<AiService> {
     let state = FileStateStore::from_environment().ok()?;
     let explicit_override = std::env::var_os(EXPLICIT_OVERRIDE_ENV_VAR);
@@ -322,7 +336,9 @@ fn start_ai_service() -> Option<AiService> {
             app_data_root: state.root().to_path_buf(),
             binary_path,
             binary_resolution_error,
-            credential_store: Arc::new(OsCredentialStore::new("com.hide212131.hane.ai")),
+            credential_store: Arc::new(OsCredentialStore::new(ai_credential_service(cfg!(
+                feature = "validation-feed"
+            )))),
             browser_opener: Arc::new(SystemBrowserOpener),
             shell_env_format: ShellEnvironmentPolicyFormat::Filters,
         },
@@ -1006,6 +1022,38 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod ai_credential_service_tests {
+    use super::ai_credential_service;
+
+    #[test]
+    fn the_regular_build_keeps_the_existing_service_name() {
+        assert_eq!(ai_credential_service(false), "com.hide212131.hane.ai");
+    }
+
+    #[test]
+    fn the_validation_build_uses_a_separate_service_name() {
+        assert_eq!(
+            ai_credential_service(true),
+            "com.hide212131.hane.ai.validation"
+        );
+        assert_ne!(ai_credential_service(true), ai_credential_service(false));
+    }
+
+    #[test]
+    fn the_build_configuration_selects_the_matching_service() {
+        let expected = if cfg!(feature = "validation-feed") {
+            "com.hide212131.hane.ai.validation"
+        } else {
+            "com.hide212131.hane.ai"
+        };
+        assert_eq!(
+            ai_credential_service(cfg!(feature = "validation-feed")),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]
