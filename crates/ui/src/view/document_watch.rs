@@ -133,13 +133,13 @@ fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
     // the same path; that is not a link, so compare without the prefix.
     let resolved_plain = strip_verbatim_prefix(identity.canonical_path());
     let resolved = resolved_plain.as_path();
-    if resolved != path && !is_private_alias(path, resolved) {
+    if resolved != path && !is_same_spelling(path, resolved) {
         // A target in the link's own directory is reached through the same
         // directory spelling, so both names share one watch even when the
         // resolved path spells that directory as `/private/...`.
         let in_same_directory = match (path.parent(), resolved.parent(), resolved.file_name()) {
             (Some(own), Some(resolved_parent), Some(name))
-                if own == resolved_parent || is_private_alias(own, resolved_parent) =>
+                if own == resolved_parent || is_same_spelling(own, resolved_parent) =>
             {
                 Some(own.join(name))
             }
@@ -169,6 +169,43 @@ fn is_private_alias(path: &Path, resolved: &Path) -> bool {
     resolved
         .strip_prefix("/private")
         .is_ok_and(|rest| path.strip_prefix("/").is_ok_and(|plain| plain == rest))
+}
+
+/// Whether `resolved` is only another spelling of `path`: the macOS
+/// `/private` alias, or on Windows a different letter case or an 8.3 short
+/// name (`RUNNER~1`) that `canonicalize` expanded. The resolved path comes
+/// from the recorded identity, so no filesystem access is possible here.
+fn is_same_spelling(path: &Path, resolved: &Path) -> bool {
+    is_private_alias(path, resolved)
+        || (cfg!(windows) && is_windows_spelling_alias(path, resolved))
+}
+
+/// Component-wise comparison ignoring case, where a component holding an 8.3
+/// `NAME~N` marker matches a longer name starting with `NAME`.
+fn is_windows_spelling_alias(path: &Path, resolved: &Path) -> bool {
+    let (path, resolved) = (path.to_string_lossy(), resolved.to_string_lossy());
+    let split = |text: &'_ str| -> Vec<String> {
+        text.split(['/', '\\'])
+            .filter(|part| !part.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let (own, other) = (split(&path), split(&resolved));
+    own.len() == other.len()
+        && own.iter().zip(&other).all(|(a, b)| {
+            a == b || short_name_matches(a, b) || short_name_matches(b, a)
+        })
+}
+
+fn short_name_matches(short: &str, long: &str) -> bool {
+    short
+        .split_once('~')
+        .is_some_and(|(stem, number)| {
+            !stem.is_empty()
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+                && long.replace(' ', "").starts_with(stem)
+        })
 }
 
 /// Whether `parent` is the directory of any watch target of `session`.
@@ -646,6 +683,26 @@ mod tests {
             strip_verbatim_prefix(Path::new("/tmp/a.md")),
             PathBuf::from("/tmp/a.md")
         );
+    }
+
+    #[test]
+    fn windows_case_and_short_name_spellings_are_one_path() {
+        assert!(is_windows_spelling_alias(
+            Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\a.md"),
+            Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\a.md"),
+        ));
+        assert!(is_windows_spelling_alias(
+            Path::new(r"C:\Work\Notes\A.md"),
+            Path::new(r"c:\work\notes\a.MD"),
+        ));
+        assert!(!is_windows_spelling_alias(
+            Path::new(r"C:\links\Note.md"),
+            Path::new(r"C:\real\Note.md"),
+        ));
+        assert!(!is_windows_spelling_alias(
+            Path::new(r"C:\work\a.md"),
+            Path::new(r"C:\work\sub\a.md"),
+        ));
     }
 
     fn write(path: &Path, text: &str) {
