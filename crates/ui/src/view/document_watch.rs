@@ -84,7 +84,9 @@ struct ParentWatch {
 
 /// What the watch lifecycle knows about one open saved document.
 struct TrackedDocument {
-    path: PathBuf,
+    /// The paths whose directories report on this document: the path as
+    /// opened and, for a symlink, the path it resolves to.
+    targets: Vec<PathBuf>,
     /// The first check after this path was opened (or renamed) has not been
     /// started yet because nothing watches the file so far.
     initial_pending: bool,
@@ -116,17 +118,49 @@ fn watch_parent(path: &Path) -> Option<PathBuf> {
     })
 }
 
+/// The paths to watch for `session`: the path it was opened with, plus the
+/// path it resolves to when that is somewhere else (a symlink). The resolved
+/// path comes from the identity recorded when the file was opened, so no
+/// filesystem access happens here. A change to the link target is reported in
+/// the target's directory, which the link's own directory never sees.
+fn watch_targets(session: &DocumentSession) -> Vec<PathBuf> {
+    let Some(identity) = session.file().identity() else {
+        return Vec::new();
+    };
+    let path = identity.path();
+    let mut targets = vec![path.to_path_buf()];
+    let resolved = identity.canonical_path();
+    if resolved != path && !is_private_alias(path, resolved) {
+        targets.push(resolved.to_path_buf());
+    }
+    targets
+}
+
+/// macOS resolves `/var` to `/private/var`; that is the same file under the
+/// same directory watch, not a link to follow separately.
+fn is_private_alias(path: &Path, resolved: &Path) -> bool {
+    resolved
+        .strip_prefix("/private")
+        .is_ok_and(|rest| path.strip_prefix("/").is_ok_and(|plain| plain == rest))
+}
+
+/// Whether `parent` is the directory of any watch target of `session`.
+fn uses_parent(session: &DocumentSession, parent: &Path) -> bool {
+    watch_targets(session)
+        .iter()
+        .any(|target| watch_parent(target).as_deref() == Some(parent))
+}
+
 impl EditorView {
     /// Why the file of `id` is not being followed, or `None` when it is (or
     /// when it has no file). A document inside a healthy work folder is
     /// covered by the folder watch.
     pub(super) fn document_watch_problem(&self, id: SessionId) -> Option<String> {
-        let path = self.sessions.get(id)?.path()?;
-        if self.folder_watch_covers(path) {
-            return None;
-        }
-        let parent = watch_parent(path)?;
-        self.document_watch.parents.get(&parent)?.failure.clone()
+        watch_targets(self.sessions.get(id)?)
+            .iter()
+            .filter(|target| !self.folder_watch_covers(target))
+            .filter_map(|target| watch_parent(target))
+            .find_map(|parent| self.document_watch.parents.get(&parent)?.failure.clone())
     }
 
     /// Whether the active document's changes are currently not followed.
@@ -188,25 +222,26 @@ impl EditorView {
             self.document_watch.tracked.clear();
             self.document_watch.epoch = self.work_folder_generation;
         }
-        let documents: Vec<(SessionId, PathBuf)> = self
+        let documents: Vec<(SessionId, Vec<PathBuf>)> = self
             .sessions
             .sessions()
-            .filter_map(|session| Some((session.id(), session.path()?.to_path_buf())))
+            .map(|session| (session.id(), watch_targets(session)))
+            .filter(|(_, targets)| !targets.is_empty())
             .collect();
         self.document_watch
             .tracked
             .retain(|id, _| documents.iter().any(|(open, _)| open == id));
-        for (id, path) in &documents {
+        for (id, targets) in &documents {
             let current = self
                 .document_watch
                 .tracked
                 .get(id)
-                .is_some_and(|tracked| tracked.path == *path);
+                .is_some_and(|tracked| tracked.targets == *targets);
             if !current {
                 self.document_watch.tracked.insert(
                     *id,
                     TrackedDocument {
-                        path: path.clone(),
+                        targets: targets.clone(),
                         initial_pending: true,
                     },
                 );
@@ -214,14 +249,16 @@ impl EditorView {
         }
 
         let mut wanted: HashMap<PathBuf, Vec<OsString>> = HashMap::new();
-        for (_, path) in &documents {
-            if self.folder_watch_covers(path) {
-                continue;
+        for (_, targets) in &documents {
+            for path in targets {
+                if self.folder_watch_covers(path) {
+                    continue;
+                }
+                let (Some(parent), Some(name)) = (watch_parent(path), path.file_name()) else {
+                    continue;
+                };
+                wanted.entry(parent).or_default().push(name.to_os_string());
             }
-            let (Some(parent), Some(name)) = (watch_parent(path), path.file_name()) else {
-                continue;
-            };
-            wanted.entry(parent).or_default().push(name.to_os_string());
         }
         self.document_watch
             .parents
@@ -242,18 +279,20 @@ impl EditorView {
     /// notification instead of being lost. A registration that is still
     /// pending (it runs off the UI thread) or failed does not count.
     fn start_initial_document_checks(&mut self, cx: &mut Context<Self>) {
-        let pending: Vec<(SessionId, PathBuf)> = self
+        let pending: Vec<(SessionId, Vec<PathBuf>)> = self
             .document_watch
             .tracked
             .iter()
             .filter(|(_, tracked)| tracked.initial_pending)
-            .map(|(id, tracked)| (*id, tracked.path.clone()))
+            .map(|(id, tracked)| (*id, tracked.targets.clone()))
             .collect();
-        for (id, path) in pending {
-            let watched = self.folder_watch_covers(&path)
-                || watch_parent(&path)
-                    .and_then(|parent| self.document_watch.parents.get(&parent))
-                    .is_some_and(|watch| !watch.pending && watch.failure.is_none());
+        for (id, targets) in pending {
+            let watched = targets.iter().all(|path| {
+                self.folder_watch_covers(path)
+                    || watch_parent(path)
+                        .and_then(|parent| self.document_watch.parents.get(&parent))
+                        .is_some_and(|watch| !watch.pending && watch.failure.is_none())
+            });
             if !watched {
                 continue;
             }
@@ -385,7 +424,7 @@ impl EditorView {
             && self
                 .sessions
                 .sessions()
-                .any(|session| session.path().and_then(watch_parent).as_deref() == Some(parent));
+                .any(|session| uses_parent(session, parent));
         if !still_needed {
             // The document closed, moved or the work folder changed while the
             // registration ran. Forget the entry so a later sync registers
@@ -477,9 +516,7 @@ impl EditorView {
         let ids: Vec<SessionId> = self
             .sessions
             .sessions()
-            .filter(|session| {
-                session.path().and_then(watch_parent).as_deref() == Some(parent)
-            })
+            .filter(|session| uses_parent(session, parent))
             .map(DocumentSession::id)
             .collect();
         for id in ids {
@@ -530,14 +567,19 @@ impl EditorView {
     /// reads the active document's file now.
     pub(super) fn recheck_active_document(&mut self, cx: &mut Context<Self>) {
         let id = self.sessions.active_id();
-        let Some(path) = self.sessions.active().path().map(Path::to_path_buf) else {
+        if self.sessions.active().path().is_none() {
             return;
-        };
-        let down = watch_parent(&path).filter(|parent| {
-            self.document_watch
-                .parents
-                .get(parent)
-                .is_some_and(|watch| watch.failure.is_some())
+        }
+        let down = self.sessions.get(id).and_then(|session| {
+            watch_targets(session)
+                .iter()
+                .filter_map(|target| watch_parent(target))
+                .find(|parent| {
+                    self.document_watch
+                        .parents
+                        .get(parent)
+                        .is_some_and(|watch| watch.failure.is_some())
+                })
         });
         self.status = Some("ディスクの内容を再確認しています".to_owned());
         match down {
@@ -664,6 +706,137 @@ mod tests {
         assert_eq!(text_of(&view, cx, ids[0]), "a changed\n");
         assert_eq!(text_of(&view, cx, ids[1]), "b changed\n");
         only_batch_sender(&view, cx);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Not run on Windows: creating a symlink there needs a privilege the
+    /// environment may not grant, so this coverage is Unix-only.
+    #[cfg(unix)]
+    fn symlinked_view(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        target_dir: &str,
+        target_name: &str,
+    ) -> (gpui::Entity<EditorView>, PathBuf, PathBuf) {
+        let root = watch_test_root(label);
+        let target = root.join(target_dir).join(target_name);
+        let link = root.join("links/Note.md");
+        write(&target, "target\n");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let view = view_with_files(cx, &[&link]);
+        (view, root, target)
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_symlink_target_in_another_directory_is_watched_and_checked(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        inject_watch_error(None);
+        let (view, root, target) = symlinked_view(cx, "link-other-dir", "real", "Real.md");
+        let id = ids(&view, cx)[0];
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        cx.run_until_parked();
+        let target_parent = std::fs::canonicalize(&target)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let (link_sender, target_sender) = view.read_with(cx, |view, _| {
+            assert_eq!(view.document_watch.parents.len(), 2);
+            let link_parent = view
+                .document_watch
+                .parents
+                .keys()
+                .find(|parent| **parent != target_parent)
+                .expect("the link's own directory is watched")
+                .clone();
+            (
+                view.document_watch.parents[&link_parent]
+                    .test_batches
+                    .clone()
+                    .unwrap(),
+                view.document_watch.parents[&target_parent]
+                    .test_batches
+                    .clone()
+                    .expect("the resolved target's directory is watched"),
+            )
+        });
+        // The display path stays the link; only the watch follows the target.
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions
+                    .get(id)
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .ends_with("links/Note.md")
+            );
+        });
+
+        write(&target, "target changed\n");
+        target_sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "target changed\n");
+
+        write(&target, "target changed again\n");
+        link_sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "target changed again\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_symlink_target_in_the_same_directory_is_watched_by_name(cx: &mut gpui::TestAppContext) {
+        inject_watch_error(None);
+        let root = watch_test_root("link-same-dir");
+        let target = root.join("Real.md");
+        let link = root.join("Note.md");
+        write(&target, "target\n");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let view = view_with_files(cx, &[&link]);
+        let id = ids(&view, cx)[0];
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        cx.run_until_parked();
+        let sender = only_batch_sender(&view, cx);
+
+        write(&target, "target changed\n");
+        sender.send_blocking(WatchBatch::default()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx, id), "target changed\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn the_resolved_target_watch_is_released_with_the_document(cx: &mut gpui::TestAppContext) {
+        inject_watch_error(None);
+        let (view, root, _target) = symlinked_view(cx, "link-release", "real", "Real.md");
+        let id = ids(&view, cx)[0];
+        view.update(cx, |view, cx| view.sync_document_watches(cx));
+        cx.run_until_parked();
+        let senders: Vec<_> = view.read_with(cx, |view, _| {
+            view.document_watch
+                .parents
+                .values()
+                .map(|watch| watch.test_batches.clone().unwrap())
+                .collect()
+        });
+        assert_eq!(senders.len(), 2);
+
+        view.update(cx, |view, cx| {
+            let _ = view.sessions.close(id, "Untitled");
+            view.sync_document_watches(cx);
+            assert!(view.document_watch.parents.is_empty());
+            assert!(view.document_watch.tracked.is_empty());
+        });
+        for sender in &senders {
+            let _ = sender.send_blocking(WatchBatch::default());
+        }
+        cx.run_until_parked();
+        assert!(senders.iter().all(async_channel::Sender::is_closed));
         let _ = std::fs::remove_dir_all(&root);
     }
 
