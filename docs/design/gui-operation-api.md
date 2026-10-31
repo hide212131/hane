@@ -97,6 +97,9 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 | `ui.wait` | `id`・`ref`・`generation`で指定した対象が、指定した状態になるまで期限付きで待機。検索完了を待つ場合は、`ui.text`が返した`query_generation`も必須 |
 | `ui.batch` | 複数操作を順番に実行 |
 | `ui.capture` | 必要なときに画面を撮影 |
+| `ui.request_status` | 同一セッション内の`request_id`から実行状況を読み取り専用で照会（元の操作は再実行しない。§8.1） |
+
+`ui.click`、`ui.key`、`ui.text`、`ui.batch`は、呼び出し側が事前に生成した`request_id`を要求に必須とする（§8.1）。
 
 `ui.key`と`ui.text`には、期待する入力先を必須指定する。実際のフォーカスと一致しなければ入力せず失敗する。
 
@@ -292,7 +295,7 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 
 エラーは少なくとも次を区別する。
 
-`target_not_found`、`target_ambiguous`、`target_stale`、`target_disabled`、`target_occluded`、`focus_mismatch`、`composition_active`、`query_generation_mismatch`、`query_generation_stale`、`timeout`。
+`target_not_found`、`target_ambiguous`、`target_stale`、`target_disabled`、`target_occluded`、`focus_mismatch`、`composition_active`、`query_generation_mismatch`、`query_generation_stale`、`request_id_required`、`request_id_duplicate`、`timeout`。
 
 `target_stale`は、`ui.inspect`、`ui.click`、`ui.wait`の要求の`ref`・`generation`が登録要素と一致しない、失効済み、または再描画で置換された場合に返す。同じIDの現行要素へ再解決せず、画面入力も待機成功も発生させない。
 
@@ -302,9 +305,126 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 
 一括実行は最初の失敗で停止し、完了した手順と失敗した手順を返す。過去の編集は巻き戻さない。初期版の`stop_on_error`は`true`だけを受理する。
 
-通信切断やタイムアウトでは、操作が実行済みの場合がある。編集・削除・保存を自動再送せず、同一セッションの要求IDから実行状況を照会できるようにする。要求記録はセッション内の有界な一時情報とし、永続的なworkflow stateを作らない。照会で確定できない結果は不明として返す。
+通信切断やタイムアウトでは、操作が実行済みの場合がある。編集・削除・保存を自動再送せず、同一セッションの要求IDから実行状況を照会できるようにする。要求記録はセッション内の有界な一時情報とし、永続的なworkflow stateを作らない。照会で確定できない結果は`unknown`として返す。
 
 APIが入力の成否を確認できなかった場合も、成功と推測しない。
+
+### 8.1 要求IDと実行状況の照会
+
+#### 要求IDの結び付け
+
+副作用を持つ`ui.click`、`ui.key`、`ui.text`、`ui.batch`は、要求の最上位に呼び出し側が生成した`request_id`を必須とする。`request_id`が無い要求は何も実行せず`request_id_required`で失敗する。
+
+- 呼び出し側は、最初の副作用要求を送る前に`request_id`を生成して保持する。応答を受け取れず切断しても、保持したIDで照会できるようにするためである。サーバーがIDを払い出す方式は、応答を失うと呼び出し側がIDを得られないため採用しない。
+- `request_id`はセッション内で一意な不透明文字列（最大64文字）とする。同じ操作の再試行ではなく、新しい操作ごとに新しい値を使う。
+- サーバーは、最初の手順を配送する前に`request_id`の記録を作る。記録を作れない場合は何も実行せず失敗する。
+- 既に記録がある`request_id`を持つ要求は実行しない。`request_id_duplicate`で失敗し、現在の状態を応答に含める。これにより、再送が誤って届いても操作は二重に実行されない。
+- `ui.batch`の`request_id`は一括実行全体を指す。各手順の`id`（例: `enter-query`）は同じ一括実行内の相関用であり、`request_id`の代わりにはならない。
+- 読み取り専用の`ui.query`、`ui.inspect`、`ui.wait`、`ui.capture`、`session.info`と、下記の`ui.request_status`は`request_id`を要求しない。
+
+要求の例（§5の一括実行に`request_id`を付けたもの）：
+
+```json
+{
+  "method": "ui.batch",
+  "request_id": "req-20",
+  "params": {
+    "window": "main",
+    "stop_on_error": true,
+    "steps": [
+      {
+        "id": "enter-query",
+        "method": "ui.text",
+        "params": { "expected_focus": "document-find-query", "text": "見出し" }
+      }
+    ]
+  }
+}
+```
+
+要求を受け付けて完了まで応答できた場合、応答は同じ`request_id`と各手順の状態を含む。
+
+```json
+{
+  "request_id": "req-20",
+  "result": {
+    "status": "succeeded",
+    "steps": [
+      { "id": "enter-query", "status": "succeeded", "query_generation": "q-31" }
+    ]
+  }
+}
+```
+
+#### 状態の定義
+
+`request_id`全体と各手順の状態は次のいずれかとする。
+
+| 状態 | 意味 |
+|---|---|
+| `not_started` | 記録は存在し、その要求または手順の配送を開始していないことを記録で確認できる |
+| `running` | 配送を開始し、完了または失敗を記録していない |
+| `succeeded` | 入力の配送が完了した（§7のとおり、期待した結果になったことの証明ではない） |
+| `failed` | 失敗を記録した。エラーコードを含む。一括実行が停止した後の未配送の手順は`not_started` |
+| `unknown` | 実行済みか判断できない |
+
+要求全体の状態は、いずれかの手順が`running`なら`running`、失敗した手順があれば`failed`、全手順が`succeeded`なら`succeeded`、全手順が`not_started`なら`not_started`とする。配送の途中でAPIが成否を確認できなかった手順は`unknown`とする。`unknown`は`not_started`や未実行の証明として扱わず、成功とも推測しない。
+
+#### 状態照会`ui.request_status`
+
+`ui.request_status`は、同一セッション内で`request_id`から状態を読む読み取り専用のメソッドである。照会は元の操作を再実行せず、入力の配送・文書・UI状態の変更も行わない。UIスレッドの操作列に並ばず、実行中の`ui.batch`があっても応答できる（`ui.wait`と同様にUIスレッドを占有しない）。
+
+```json
+{
+  "method": "ui.request_status",
+  "params": { "request_id": "req-20" }
+}
+```
+
+```json
+{
+  "result": {
+    "request_id": "req-20",
+    "status": "running",
+    "steps": [
+      { "id": "enter-query", "status": "running" }
+    ]
+  }
+}
+```
+
+次の場合は、同じ形式で`status`を`unknown`とし、理由を`reason`に含める。
+
+- 記録が存在しない（そのセッションに送られていない、または受け付ける前に切断した）。
+- 保持上限または期限により記録が破棄された。
+- 配送の成否をAPIが確認できなかった。
+
+```json
+{
+  "result": {
+    "request_id": "req-20",
+    "status": "unknown",
+    "reason": "record_unavailable"
+  }
+}
+```
+
+記録が無い`unknown`は、操作が実行されていないことを意味しない。呼び出し側は、`ui.inspect`などの読み取り専用メソッドで現在の状態を確認してから、新しい`request_id`で操作を再発行するかを判断する。
+
+#### 記録の保持
+
+- 記録は同一セッション内のメモリ上だけに保持する。ファイル・設定・成果物には書かず、永続的なworkflow stateを作らない。セッション終了時に破棄し、別のセッションからは照会できない。
+- 記録するのは`request_id`、手順の`id`・メソッド名・状態・エラーコード・`query_generation`だけとする。入力文字列、本文、秘密入力欄の内容は含めない（§9）。
+- 保持上限は直近256件、完了後の保持期限は10分とする（初期値。実装時に設定可能にしてよいが、上限なしにはしない）。上限を超えた場合は完了済みの古い記録から破棄する。`running`の記録は破棄しない。
+- 期限切れ・破棄後の照会は`unknown`（`reason: "record_unavailable"`）とし、`not_started`や未実行の証明として扱わない。
+
+#### 切断・タイムアウト時の契約
+
+切断または`timeout`で応答を受け取れなかった場合、呼び出し側は同じ要求を自動再送しない。まず保持した`request_id`で`ui.request_status`を呼ぶ。`running`なら照会を繰り返して完了を待ち、`succeeded`・`failed`は結果として扱う。`unknown`は結果として提示し、再発行するかは現在の状態を確認した上での明示的な判断とする。同じ`request_id`での再送は§8.1のとおり実行されない。
+
+#### 既存の相関値との区別
+
+`request_id`は操作要求の実行状況を照会するための値であり、`ref`・`generation`（要素の同一性）や`query_generation`（検索クエリの世代）の代わりにならず、逆も同様である。`ui.request_status`の結果は、`target_stale`・`composition_active`・`query_generation_mismatch`・`query_generation_stale`の判定を変更しない。IME composition guard、`ui.wait`のUIスレッド外実行、§9のOS別アクセス制御と接続トークンは`ui.request_status`にも同様に適用し、トークンを提示しない接続は照会もできない。
 
 ## 9. 接続と有効化
 
@@ -399,7 +519,7 @@ API経由のテスト結果には入力経路を記録する。画面の正し�
 - [ ] 入力がUndo履歴や保存処理へ通常どおり反映される。
 - [ ] 検索欄への`ui.text`が、開始した検索の`query_generation`を返し、検索完了を待つ`ui.wait`が同値を必須指定する。先行検索の`pending: false`や古い結果では成功せず、不一致は`query_generation_mismatch`、失効は`query_generation_stale`を返す。
 - [ ] 保存の完了を対象文書・リビジョンに結び付け、過去の結果を利用しない。
-- [ ] 一括実行が途中で止まり、通信切断・タイムアウトで編集を重複実行しない。
+- [ ] 一括実行が途中で止まり、通信切断・タイムアウトで編集を重複実行しない。切断後は自動再送せず`ui.request_status`で状態を照会でき、記録が無い・期限切れ・成否不明の場合は`unknown`を返して`not_started`と扱わない。`request_id`の無い副作用要求は`request_id_required`、記録済みIDの再送は`request_id_duplicate`で、いずれも実行しない。
 - [ ] macOS／Windowsの実アプリで代表シナリオが成立する。
 - [ ] 通常配布ビルドではAPIが有効にならない。
 - [ ] 秘密入力が状態取得・通常ログへ出ず、隔離stateで検証できる。
