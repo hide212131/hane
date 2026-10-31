@@ -15,11 +15,13 @@
 - restart ticketのscroll/caret保存は初回公開の必須条件から外し、位置の完全復元は後続候補とする。保存済み文書・active path・work folderの復元と、設定・AIデータの保護は維持する。
 - 署名・hash・版・対象OS・配置・所有権の検査、未保存データ保護、限定health、durable commit、rollback/RecoveryRequired、Windows ExplorerとmacOS配布の制約は変更しない。
 
+2026-10-31の追加設計: Windowsの必要時UAC昇格は[Windows UAC設計](implementation/issue-510-windows-uac.md)に従う。以下の一般権限・同一owner・stdio/child直接起動の記述に対するWindows専用の変更点を同文書に集約する。製品未実装・未検証。macOSの契約は維持する。
+
 ## 1. 要求と到達点
 
 設定の「一般」に、現在のバージョンと「最新に更新する」を表示する。利用者が押すとstable releaseを確認し、新版があれば対象OSのZIPを取得・検証する。準備後に「再起動して更新」を押すと、保存状態を確認して終了し、helperがアプリ一式を置換して新版を起動する。
 
-確認・取得だけでは再起動しない。当初v1では起動時の自動通信・定期確認を対象外としたが、本体更新metadataについてはIssue #649の追加設計に置き換える。設定表示による自動通信、強制更新、差分更新、prerelease channel、OS再起動、管理者権限による配置変更、全プラットフォーム追加は引き続き範囲外。手動ZIP配布も残す。
+確認・取得だけでは再起動しない。当初v1では起動時の自動通信・定期確認を対象外としたが、本体更新metadataについてはIssue #649の追加設計に置き換える。設定表示による自動通信、強制更新、差分更新、prerelease channel、OS再起動、任意のインストール先変更、全プラットフォーム追加は引き続き範囲外。手動ZIP配布も残す。
 
 完成条件は、対応するWindows/macOSの実配布物で、既存の文書・設定・AI接続・Explorer登録の状態を保ち、旧版→新版の更新と適用前の失敗からの復旧を実証すること。ダウンロード成功や新版プロセスの生成だけを更新成功にしない。
 
@@ -134,7 +136,7 @@ JSONはUTF-8、256 KiB以下、重複キーを拒否する。署名は**取得�
 
 最大sequenceは配置単位のprivate receiptsへ保存し、`HANE_STATE_DIR`変更で既知のsequenceを巻き戻せないようにする。保存失敗時はcandidateをReadyにしない。Readyを適用するときもcatalogの期限・sequenceと全取得物を再検証する。期限切れの古いReleaseは、同じZIP/hashのままsequenceを増やしてmetadataを再署名できる。これは配布基盤の明示操作とし、毎日起動する新しいautomationは作らない。
 
-この信頼境界は、通信途中・Release配信データの改ざんや破損を検出するためのもの。署名秘密鍵の侵害、同じOSユーザー権限で既に任意コードを実行できる攻撃者、OS管理者による改変まで防ぐものではない。helperへの入力とjournalはこの前提でもpath/identityを検査し、任意file操作へ拡張しない。
+この信頼境界は、通信途中・Release配信データの改ざんや破損を検出するためのもの。署名秘密鍵の侵害、同じOSユーザー権限で既に任意コードを実行できる攻撃者、OS管理者による改変まで防ぐものではない。ただしWindows昇格境界ではこの旧前提を権限逸脱の許可に使わず、UAC設計に従い低権限側の入力・file差替え・IPCを独立検証する。helperへの入力とjournalはこの前提でもpath/identityを検査し、任意file操作へ拡張しない。
 
 ### 5.3 通信と展開
 
@@ -154,11 +156,11 @@ API JSON上限1 MiB、署名catalog上限は前節、ZIP上限256 MiB、展開�
 
 インストール先は`current_exe`と検証済み配置から決める。API/catalog/CLI引数が書込先を指定できない。Windowsはexeの親、macOSは構造・Bundle ID検査を通した`.app`が対象。別名exe、開発用cargo出力、app外の裸macOS binary、network/share/removable配置は自動適用しない。v1はWindows NTFS、macOS APFSのローカルvolumeに限定し、対応外なら手動案内する。
 
-通常の実行ユーザーの権限で、対象と親に必要なcreate/replace/deleteが可能なことを実際の一時ファイル操作で確認する。管理者としてhelperを再起動しない。インストールのownerと実行ユーザーが異なる場合は自動更新不可。macOSのApp Translocation/read-only volumeではアプリを移動して再起動するよう案内し、隔離属性を消したり別名の実体を推測して書き換えたりしない。
+通常の実行ユーザーの権限で、対象と親に必要なcreate/replace/deleteが可能なことを実際の一時ファイル操作で確認する。Windowsでは必要時に限り検証済みhelperをrunasで起動する。install所有主体、通常利用者、昇格先のSIDを検証し、所有関係が不明なら拒否する。macOSは管理者helperを追加せず、ownerと実行ユーザーが異なる場合は自動更新不可。macOSのApp Translocation/read-only volumeではアプリを移動して再起動するよう案内し、隔離属性を消したり別名の実体を推測して書き換えたりしない。
 
 `InstallId`はOS、volume identity、正規化した配置path、owner identityから決める。operationは配置の旧file IDも保持し、途中でmove/replaceされれば拒否する。別の配置のHaneを更新しない。`HANE_STATE_DIR`変更で同じ配置のleaseが分裂しないよう、起動排他の正本は配置の親にある`.hane-update-<InstallId>/`に置く。lock directory/fileは他ユーザーの通常起動でもleaseを取得できる読取権限を持たせ、所有者以外の書込を禁止する。privateなstage、journal、ticketは所有者だけが読書きできるsubdirectoryに置く。既存の別owner/link/不明内容の同名directoryは採用しない。
 
-配置親にcoordination directoryを作れない場合は本体更新不可とし通常編集を許す。ただし既にpending mutationが記録された配置では起動調停を迂回せず、復旧を先に行う。設定データ保存先が不明・memory fallbackしか使えない場合も更新不可。
+Windowsの既知の保護配置ではUAC設計の限定された初期化・ACLを使う。それ以外で配置親にcoordination directoryを作れない場合は本体更新不可とし通常編集を許す。ただし既にpending mutationが記録された配置では起動調停を迂回せず、復旧を先に行う。設定データ保存先が不明・memory fallbackしか使えない場合も更新不可。
 
 ```text
 <Hane state root>/updates/<InstallId>/
@@ -238,7 +240,7 @@ LICENSE
 
 Windowsの通常起動入口は、app資源・state・AIを開く前にpending transactionを検出し、検証済みrecovery helperへ渡す。新helperと旧helperはprotocol 1を理解できなければ候補不可。電源断等で一部fileだけ新版になっても、journalのwrite-intentと実hashを照合して旧一覧に戻す。
 
-rootの使用中exeやAntivirus等による共有違反は短い再試行（最大3秒）の後にrollbackする。`MOVEFILE_DELAY_UNTIL_REBOOT`、Explorer kill、証明書自動信頼、管理者権限は使わない。バックアップ復元も同じhash/identity検査を行い、第三者の変更を上書きしない。
+rootの使用中exeやAntivirus等による共有違反は短い再試行（最大3秒）の後にrollbackする。`MOVEFILE_DELAY_UNTIL_REBOOT`、Explorer kill、証明書自動信頼は使わない。管理者権限はWindows UAC設計のhelper内の検証済み更新・復旧に限定する。バックアップ復元も同じhash/identity検査を行い、第三者の変更を上書きしない。
 
 ### 9.3 Explorer DLLを上書きしない
 
