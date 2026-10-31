@@ -93,14 +93,18 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 | `ui.inspect` | `id`・`ref`・`generation`で指定した対象の状態を取得 |
 | `ui.click` | `id`・`ref`・`generation`で指定してクリック |
 | `ui.key` | 現在の入力先へキー操作 |
-| `ui.text` | 現在の入力先へ確定文字列を入力（入力先がIME composition中なら`composition_active`で失敗） |
-| `ui.wait` | `id`・`ref`・`generation`で指定した対象が、指定した状態になるまで期限付きで待機 |
+| `ui.text` | 現在の入力先へ確定文字列を入力（入力先がIME composition中なら`composition_active`で失敗）。検索欄への入力が検索を開始した場合は、その検索のクエリ世代`query_generation`を結果に返す |
+| `ui.wait` | `id`・`ref`・`generation`で指定した対象が、指定した状態になるまで期限付きで待機。検索完了を待つ場合は、`ui.text`が返した`query_generation`も必須 |
 | `ui.batch` | 複数操作を順番に実行 |
 | `ui.capture` | 必要なときに画面を撮影 |
 
 `ui.key`と`ui.text`には、期待する入力先を必須指定する。実際のフォーカスと一致しなければ入力せず失敗する。
 
 `ui.text`は、`expected_focus`の確認に加えて、対象の入力先がIME composition中かを確認する。composition中（`composition_active`）なら、文字入力イベントを配送せず、compositionのcommit・cancel・置換も行わない。本文・入力欄・Undo履歴・composition stateは変更せず、`composition_active`を返す。compositionがactiveでない場合は、従来どおり確定文字列を通常の入力ハンドラーへ渡す。
+
+検索欄への`ui.text`が成功し、その入力で検索が開始された場合、結果に`query_generation`を含める。これは検索クエリの世代を表す不透明な値で、入力ごとに新しい値が割り当てられ、同じ検索欄で先行した検索の値とは異なる。要素の`ref`・`generation`（要素の登録・置換を表す値）とは別の概念であり、相互に代用しない。入力が検索を開始しなかった場合（例: 失敗、または検索を起動しない入力先）は`query_generation`を返さない。
+
+検索完了を待つ`ui.wait`は、`query_generation`を必須指定する。`ui.wait`は、要求した`query_generation`と同じ検索が完了した（その世代について`pending: false`かつ結果が確定した）場合だけ成功を返す。先行検索の`pending: false`や古い結果では成功しない。要素の`ref`・`generation`の照合は従来どおり別に行い、両方が一致しなければ成功しない。相関値の不一致・失効時の結果は§8に定める。
 
 例えば、検索欄へ入力する場合は次の順序になる。
 
@@ -167,6 +171,7 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
         }
       },
       {
+        "id": "enter-query",
         "method": "ui.text",
         "params": {
           "expected_focus": "document-find-query",
@@ -179,6 +184,7 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
           "id": "document-find-results",
           "ref": "el-23",
           "generation": 2,
+          "query_generation": { "from_step": "enter-query" },
           "state": { "pending": false },
           "timeout_ms": 3000
         }
@@ -189,6 +195,58 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 ```
 
 `document-find-results`の`ref`（`el-23`）と`generation`も、同様に`ui.query`で取得済みの値である。`ref`・`generation`が現在の登録要素と一致しない手順は、同じIDの現行要素へ再解決せず`target_stale`で失敗し、一括実行はそこで停止する。
+
+`query_generation`の`{ "from_step": "enter-query" }`は、同じ一括実行内で`id`が`enter-query`の手順の結果に含まれる`query_generation`を指す。その手順が成功しなかった場合や`query_generation`を返さなかった場合、この`ui.wait`は待機せず`query_generation_mismatch`で失敗する。一括実行を使わない場合は、`ui.text`の応答の値を`ui.wait`へ明示的に渡す。
+
+`ui.text`の成功結果の例は次のとおりである（値は新設案の例）。
+
+```json
+{
+  "result": {
+    "delivered": "text",
+    "query_generation": "q-31"
+  }
+}
+```
+
+同じ検索を待つ単独の`ui.wait`要求の例は次のとおりである。
+
+```json
+{
+  "method": "ui.wait",
+  "params": {
+    "id": "document-find-results",
+    "ref": "el-23",
+    "generation": 2,
+    "query_generation": "q-31",
+    "state": { "pending": false },
+    "timeout_ms": 3000
+  }
+}
+```
+
+成功時の応答には、完了を確認した`query_generation`（`q-31`）を含める。
+
+```json
+{
+  "result": {
+    "query_generation": "q-31",
+    "state": { "pending": false }
+  }
+}
+```
+
+`q-31`の検索が完了する前に、別の入力で新しい検索（例: `q-32`）が開始された場合、`q-31`は失効する。この`ui.wait`は`q-32`の完了や`q-30`以前の結果では成功せず、次のように失敗する。
+
+```json
+{
+  "error": {
+    "code": "query_generation_stale",
+    "requested": "q-31",
+    "current": "q-32"
+  }
+}
+```
 
 例の`ui.text`は、検索欄がIME composition中でない場合に確定文字列を入力する。composition中なら入力せず`composition_active`で失敗し、一括実行はそこで停止する。
 
@@ -222,11 +280,11 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 |---|---|
 | フォーカス移動 | 現在の入力先 |
 | ボタン切替 | 選択・チェック状態 |
-| 検索完了 | 対象クエリの世代と処理状態 |
+| 検索完了 | `ui.text`が返した`query_generation`と、その世代の処理状態 |
 | 保存完了 | 対象文書・リビジョンに対応する保存結果 |
 | ダイアログ表示 | 指定要素の出現 |
 
-「アプリ全体が落ち着くまで待つ」という曖昧な条件は設けない。次の描画フレームが完了しただけで、保存や検索の完了とは扱わない。呼び出し例の`pending: false`も、直前の入力に対応するクエリ世代について確認し、以前の結果で成立させない。
+「アプリ全体が落ち着くまで待つ」という曖昧な条件は設けない。次の描画フレームが完了しただけで、保存や検索の完了とは扱わない。呼び出し例の`pending: false`も、直前の`ui.text`が返した`query_generation`の検索についてだけ確認し、以前の検索の`pending: false`や結果で成立させない。要素の`ref`・`generation`は要素の同一性を確認する値であり、検索クエリの世代の代わりにはしない。
 
 ## 8. 状態取得と失敗時の扱い
 
@@ -234,11 +292,13 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 
 エラーは少なくとも次を区別する。
 
-`target_not_found`、`target_ambiguous`、`target_stale`、`target_disabled`、`target_occluded`、`focus_mismatch`、`composition_active`、`timeout`。
+`target_not_found`、`target_ambiguous`、`target_stale`、`target_disabled`、`target_occluded`、`focus_mismatch`、`composition_active`、`query_generation_mismatch`、`query_generation_stale`、`timeout`。
 
 `target_stale`は、`ui.inspect`、`ui.click`、`ui.wait`の要求の`ref`・`generation`が登録要素と一致しない、失効済み、または再描画で置換された場合に返す。同じIDの現行要素へ再解決せず、画面入力も待機成功も発生させない。
 
 `composition_active`は、`ui.text`の入力先がIME composition中の場合に返す。文字入力イベントの配送、compositionのcommit・cancel・置換、本文・入力欄・Undo履歴・composition stateの変更はいずれも発生させない。
+
+`query_generation_mismatch`は、検索完了を待つ`ui.wait`で`query_generation`が未指定、対象の検索欄が発行していない値、または参照先の手順が値を返していない場合に返す。`query_generation_stale`は、指定した`query_generation`が、より新しい入力による検索で置き換えられた、または検索の取り消し・対象文書の切替などで失効した場合に返す。いずれも待機成功を発生させず、他の世代の`pending: false`や結果で代用しない。`query_generation_stale`の応答には、要求した値と現在の値を含める。呼び出し側は、新しい`ui.text`の結果から取得し直して再試行する。これらは要素の`ref`・`generation`による`target_stale`とは独立に判定する。
 
 一括実行は最初の失敗で停止し、完了した手順と失敗した手順を返す。過去の編集は巻き戻さない。初期版の`stop_on_error`は`true`だけを受理する。
 
@@ -337,7 +397,8 @@ API経由のテスト結果には入力経路を記録する。画面の正し�
 - [ ] ダイアログの背後や失効した要素を操作しない。
 - [ ] 古い`ref`・`generation`を指定した`ui.inspect`・`ui.click`・`ui.wait`は、同IDの現行要素へ再解決せず、画面入力も待機成功も発生させずに`target_stale`を返す。
 - [ ] 入力がUndo履歴や保存処理へ通常どおり反映される。
-- [ ] 検索・保存の完了を対象世代・リビジョンに結び付け、過去の結果を利用しない。
+- [ ] 検索欄への`ui.text`が、開始した検索の`query_generation`を返し、検索完了を待つ`ui.wait`が同値を必須指定する。先行検索の`pending: false`や古い結果では成功せず、不一致は`query_generation_mismatch`、失効は`query_generation_stale`を返す。
+- [ ] 保存の完了を対象文書・リビジョンに結び付け、過去の結果を利用しない。
 - [ ] 一括実行が途中で止まり、通信切断・タイムアウトで編集を重複実行しない。
 - [ ] macOS／Windowsの実アプリで代表シナリオが成立する。
 - [ ] 通常配布ビルドではAPIが有効にならない。
