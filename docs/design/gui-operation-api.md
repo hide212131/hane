@@ -479,6 +479,33 @@ APIが入力の成否を確認できなかった場合も、成功と推測し�
 }
 ```
 
+#### 手順状態の遷移と`unknown`の意味
+
+手順状態の有効な遷移は次のものだけとする。
+
+| 遷移前 | 遷移後 | 条件 |
+|---|---|---|
+| `not_started` | `running` | その手順の配送を開始した |
+| `running` | `succeeded` | 入力の配送完了を確認した |
+| `running` | `failed` | 失敗とエラーコードを記録した |
+| `running` | `unknown` | 配送中に結果を確認できなかった |
+
+- `succeeded`・`failed`・`unknown`は終端状態であり、他の状態へ戻さず、後から書き換えない。`not_started`へ戻る遷移、`running`を経ない`succeeded`・`unknown`への遷移もない。
+- `unknown`は、手順が`running`（配送中）で、その結果を確認できなかった場合に限って記録する。配送を開始していない手順（`not_started`）、または結果を確認できた手順を`unknown`にしてはならない。一括実行が停止した後の未配送の手順は`not_started`のままとする。
+- 手順の`unknown`は上記の遷移で得られる状態であり、記録そのものが無い場合の要求全体の`unknown`（`reason: "record_unavailable"`）とは別である。後者は`steps`を持たない。どちらの`unknown`も未実行の証明ではなく、切断後に同じ`request_id`を再送しない契約（§8.1「切断・タイムアウト時の契約」）は変わらない。
+- 手順は一括実行の順に配送され、同時に`running`になる手順は高々一つとする。
+
+#### 状態とstepsの同一時点の整合性
+
+`ui.request_status`が返す要求全体の`status`と各`steps`の状態は、一つの要求記録から、一つのsnapshot（linearization point）で読み取った手順状態だけから作る。
+
+- 応答の`steps`は、そのsnapshot時点の各手順状態の写しとする。要求全体の`status`は、同じ写しに上記の優先順位表を適用して導出する。`status`を別の集計値や別の時点の読み取りから作らず、`steps`の読み取りと`status`の導出の間に実行中の`ui.batch`が手順状態を更新した結果を混ぜない。
+- 実行側の手順状態の更新（遷移と、その結果・エラーコードの記録）は、各手順について一つの不可分な更新としてsnapshotから見える。snapshotは更新の前か後のどちらか一方だけを観測し、`running`のまま結果だけ、または結果だけ更新されて状態が古い、といった途中の組み合わせを返さない。
+- そのため、実行中の`ui.batch`と並行して照会しても、`status`が`running`なのに全手順が`succeeded`または全手順が`not_started`である、`status`が`succeeded`なのに`steps`に`succeeded`以外がある、といった集計値と個別手順が矛盾する応答は返さない。優先順位表のとおり、`succeeded`と`not_started`だけが混在する配送進行中のsnapshotは`running`になる。
+- 同じ`request_id`への連続した照会は、手順ごとに遷移の方向だけを観測する。先に`succeeded`・`failed`・`unknown`として観測した手順が、後の照会で別の状態や`running`・`not_started`として返ることはない。
+- snapshotを一貫して作れない場合は、一部だけを返さず、成功や`not_started`の推測もしない。呼び出し側は、同じ`request_id`で`ui.request_status`を再照会する（元の操作は再送しない）。
+- 呼び出し側は、切断後の確認でこの応答の`status`と`steps`を同じ時点の事実として扱う。古い応答や、複数回の応答の`status`と`steps`を組み合わせた結果を根拠に、副作用入力を新しい`request_id`で再発行しない。
+
 要求記録は現在の保持上限（未完了16件など）の範囲内の有界な一時情報であり、上記の集約のために記録や手順情報を追加で保持しない。
 
 #### 状態照会`ui.request_status`
