@@ -1290,6 +1290,17 @@ pub fn spawn_suspended_standard(exe: &Path, environment: &[(String, String)]) ->
     Ok(suspended)
 }
 
+/// The system-protected roots an install can be placed under: the Program Files
+/// folders and the Windows directory.
+fn protected_roots() -> Vec<std::path::PathBuf> {
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name))
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect()
+}
+
 /// The Windows seam of the elevated route.
 #[derive(Default)]
 pub struct WindowsElevation {
@@ -1307,6 +1318,16 @@ impl ElevationOs for WindowsElevation {
                 .and_then(|token| token_is_elevated(token.0))
                 .is_ok_and(|elevated| !elevated)
             && standard_token_available().is_ok()
+    }
+
+    fn placement_access(&self, install_root: &Path) -> crate::elevation::PlacementAccess {
+        let protected = match self.current_principals(install_root) {
+            Ok((user, owner)) => {
+                crate::elevation::is_protected_placement(&user, &owner, install_root, &protected_roots())
+            }
+            Err(_) => false,
+        };
+        crate::elevation::PlacementAccess { protected, write: super::probe_write_access(install_root) }
     }
 
     fn current_principals(&self, install_root: &Path) -> Result<(String, String)> {

@@ -168,8 +168,70 @@ pub struct PrincipalDecision {
     pub rederive_install_id: bool,
 }
 
+// The OS adapters report a SID as `sid:` and the hex of its binary form.
+const BINARY_SID_ADMINISTRATORS: &str = "sid:01020000000000052000000020020000";
+const BINARY_SID_SYSTEM: &str = "sid:010100000000000512000000";
+const BINARY_SID_TRUSTED_INSTALLER_PREFIX: &str = "sid:010600000000000550000000";
+
 fn is_protected_owner(sid: &str) -> bool {
-    sid == SID_ADMINISTRATORS || sid == SID_SYSTEM || sid.starts_with(SID_TRUSTED_INSTALLER_PREFIX)
+    sid == SID_ADMINISTRATORS
+        || sid == SID_SYSTEM
+        || sid.starts_with(SID_TRUSTED_INSTALLER_PREFIX)
+        || sid == BINARY_SID_ADMINISTRATORS
+        || sid == BINARY_SID_SYSTEM
+        || sid.starts_with(BINARY_SID_TRUSTED_INSTALLER_PREFIX)
+}
+
+/// The OS facts of an install placement that decide the route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementAccess {
+    /// The owner is the user or a protected owner and the directory lies under
+    /// a system-protected root (for example `Program Files`).
+    pub protected: bool,
+    /// Whether the current (ordinary) token verifiably writes the install.
+    pub write: WriteAccess,
+}
+
+/// Whether `install_root` is a known protected placement. An owner that is
+/// neither the requesting user nor a protected owner, or a directory outside
+/// every protected root, is never assumed to be one.
+pub fn is_protected_placement(
+    user_sid: &str,
+    install_owner_sid: &str,
+    install_root: &Path,
+    protected_roots: &[std::path::PathBuf],
+) -> bool {
+    let owner_known = !user_sid.is_empty()
+        && !install_owner_sid.is_empty()
+        && (install_owner_sid == user_sid || is_protected_owner(install_owner_sid));
+    let normalize = |path: &Path| {
+        let text = path.display().to_string();
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text).replace('/', "\\");
+        text.trim_end_matches('\\').to_ascii_lowercase()
+    };
+    let root = normalize(install_root);
+    owner_known
+        && protected_roots.iter().any(|protected| {
+            let protected = normalize(protected);
+            !protected.is_empty()
+                && root.len() > protected.len()
+                && root.starts_with(&protected)
+                && root.as_bytes()[protected.len()] == b'\\'
+        })
+}
+
+/// The refusal of the update before any change when the route cannot be chosen.
+pub fn route_refused_error(reason: &str) -> UpdateError {
+    UpdateError::new(ErrorCode::Io, format!("the update route was refused: {reason}"))
+}
+
+/// A known protected placement that needs the consent prompt, in a build that
+/// cannot finish an elevated apply.
+pub fn protected_placement_error() -> UpdateError {
+    UpdateError::new(
+        ErrorCode::Io,
+        format!("{ELEVATION_REQUIRED_MARKER}: the install is a protected placement without write access"),
+    )
 }
 
 /// Accepts the relation only when the install owner is the requesting user or a
@@ -403,6 +465,9 @@ pub trait ElevatedListener: Send {
 pub trait ElevationOs {
     /// See [`STANDARD_RESTART_AVAILABLE`].
     fn standard_restart_available(&self) -> bool;
+    /// The classification and the verified write access of the install, which
+    /// alone decide whether the helper needs the consent prompt.
+    fn placement_access(&self, install_root: &Path) -> PlacementAccess;
     /// `(requesting user's SID, owner SID of the install root)` as the OS
     /// reports them.
     fn current_principals(&self, install_root: &Path) -> Result<(String, String)>;
@@ -420,6 +485,12 @@ pub struct UnavailableElevation;
 impl ElevationOs for UnavailableElevation {
     fn standard_restart_available(&self) -> bool {
         false
+    }
+
+    /// Without an elevated route nothing is ever prompted for: the helper is
+    /// started normally and a placement it cannot write fails at the apply.
+    fn placement_access(&self, _install_root: &Path) -> PlacementAccess {
+        PlacementAccess { protected: false, write: WriteAccess::Writable }
     }
 
     fn current_principals(&self, _install_root: &Path) -> Result<(String, String)> {
@@ -522,25 +593,20 @@ pub const ELEVATION_REQUIRED_MARKER: &str = "elevation_required";
 /// apply is not available in this build. Nothing was changed.
 pub const ELEVATION_UNAVAILABLE_MESSAGE: &str = "この配置では更新の適用にWindowsの管理者確認が必要ですが、このバージョンでは対応していません。現在のHaneと作業内容はそのままです。書き込み可能な場所へ配置するか、手動で更新してください。";
 
-/// The failure of starting the verified helper normally. A 740 is kept apart
-/// from every other OS error (access denied included) so that only it can lead
-/// to the consent route; the number, stage, API and path are kept for the
-/// record (no secrets).
+/// The failure of starting the verified helper normally. No OS error number,
+/// 740 included, is evidence that the install needs elevation (it can come from
+/// the helper's file name alone): the number, stage, API and path are kept for
+/// the record (no secrets) and the route is never changed by them.
 pub fn normal_start_error(os_error: Option<u32>, path: &std::path::Path) -> UpdateError {
     let facts = format!(
         "stage=normal-launch, api=CreateProcessW, os_error={}, path={}",
         os_error.map_or_else(|| "none".to_owned(), |e| e.to_string()),
         path.display()
     );
-    match classify_launch_error(os_error) {
-        LaunchClass::ElevationRequired => {
-            UpdateError::new(ErrorCode::Io, format!("{ELEVATION_REQUIRED_MARKER}: {facts}"))
-        }
-        _ => UpdateError::new(ErrorCode::Io, format!("the helper could not be started ({facts})")),
-    }
+    UpdateError::new(ErrorCode::Io, format!("the helper could not be started ({facts})"))
 }
 
-/// Whether `err` is a normal helper start that needs elevation.
+/// Whether `err` is a protected placement that needs elevation.
 pub fn is_elevation_required(err: &UpdateError) -> bool {
     err.code == ErrorCode::Io && err.detail.starts_with(ELEVATION_REQUIRED_MARKER)
 }
@@ -616,6 +682,24 @@ mod tests {
             choose_route(false, WriteAccess::Writable, StandardAttempt::Failed { os_error: Some(1223) }),
             Route::Refused(_)
         ));
+    }
+
+    #[test]
+    fn only_a_known_owner_under_a_protected_root_is_a_protected_placement() {
+        let roots = [std::path::PathBuf::from(r"C:\Program Files")];
+        let under = Path::new(r"C:\Program Files\Hane");
+        let user = "sid:0102";
+        assert!(is_protected_placement(user, user, under, &roots));
+        assert!(is_protected_placement(user, BINARY_SID_ADMINISTRATORS, under, &roots));
+        assert!(is_protected_placement(user, SID_SYSTEM, Path::new(r"\\?\c:\program files\Hane"), &roots));
+        // Another owner, an unknown directory, the root itself and a sibling
+        // that only shares the prefix are never assumed to be protected.
+        assert!(!is_protected_placement(user, "sid:0999", under, &roots));
+        assert!(!is_protected_placement(user, "", under, &roots));
+        assert!(!is_protected_placement(user, user, Path::new(r"C:\Users\me\Hane"), &roots));
+        assert!(!is_protected_placement(user, user, Path::new(r"C:\Program Files"), &roots));
+        assert!(!is_protected_placement(user, user, Path::new(r"C:\Program Files Extra\Hane"), &roots));
+        assert!(!is_protected_placement(user, user, under, &[]));
     }
 
     fn principals(user: &str, owner: &str, elevated: &str) -> Principals {
@@ -785,14 +869,16 @@ mod tests {
     }
 
     #[test]
-    fn only_740_on_the_normal_start_is_an_elevation_request() {
+    fn a_740_on_the_normal_start_is_kept_as_a_fact_and_is_not_an_elevation_request() {
         let path = Path::new("C:\\h\\hane-updater.exe");
         let required = normal_start_error(Some(740), path);
-        assert!(is_elevation_required(&required));
-        assert_eq!(elevation_message(&required), Some(ELEVATION_UNAVAILABLE_MESSAGE));
+        assert!(!is_elevation_required(&required));
+        assert_eq!(elevation_message(&required), None);
         for fact in ["os_error=740", "stage=normal-launch", "hane-updater.exe"] {
             assert!(required.detail.contains(fact), "{fact} in {}", required.detail);
         }
+        assert!(is_elevation_required(&protected_placement_error()));
+        assert_eq!(elevation_message(&protected_placement_error()), Some(ELEVATION_UNAVAILABLE_MESSAGE));
         for other in [Some(5), Some(1223), None] {
             let err = normal_start_error(other, path);
             assert!(!is_elevation_required(&err));
@@ -887,6 +973,10 @@ mod tests {
     impl ElevationOs for ScriptedOs {
         fn standard_restart_available(&self) -> bool {
             self.script.lock().unwrap().available
+        }
+
+        fn placement_access(&self, _install_root: &Path) -> PlacementAccess {
+            PlacementAccess { protected: false, write: WriteAccess::Unknown }
         }
 
         fn current_principals(&self, _install_root: &Path) -> Result<(String, String)> {

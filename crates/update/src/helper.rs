@@ -1090,10 +1090,15 @@ impl RunningHelper {
 /// How long the application waits for the elevated helper's `Prepared`.
 const ELEVATED_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Starts the helper normally, and only if the OS answers the normal start with
-/// `ERROR_ELEVATION_REQUIRED` (740) goes through one consent prompt. Every other
-/// failure, access denied included, is returned as it is. Returns the failure
-/// together with whether the helper is certain not to be running.
+/// Chooses the route from the install's classification and the current token's
+/// verified write access (see [`crate::elevation::choose_route`]), before the
+/// helper is started and before anything is applied. A writable install starts
+/// the helper normally and never prompts, whatever the OS says about the helper's
+/// name (`ERROR_ELEVATION_REQUIRED` included: the failure is returned as it is).
+/// Only a known protected placement without write access goes through one
+/// consent prompt; an unknown placement or an undetermined access is refused.
+/// Returns the failure together with whether the helper is certain not to be
+/// running.
 fn start_running_helper(
     copy: &Path,
     request: &HelloRequest,
@@ -1103,13 +1108,21 @@ fn start_running_helper(
     prepare_timeout: Duration,
     normal: impl FnOnce() -> std::result::Result<SpawnedHelper, (UpdateError, bool)>,
 ) -> std::result::Result<RunningHelper, (UpdateError, bool)> {
-    match normal() {
-        Ok(spawned) => Ok(RunningHelper::Standard(spawned)),
-        Err((err, true)) if crate::elevation::is_elevation_required(&err) => {
-            start_elevated_helper(copy, request, coordination, install_root, os, prepare_timeout, err)
-                .map(RunningHelper::Elevated)
-        }
-        Err(other) => Err(other),
+    use crate::elevation::{Route, StandardAttempt, choose_route};
+    let access = os.placement_access(install_root);
+    match choose_route(access.protected, access.write, StandardAttempt::NotTried) {
+        Route::Standard => normal().map(RunningHelper::Standard),
+        Route::Elevated(_) => start_elevated_helper(
+            copy,
+            request,
+            coordination,
+            install_root,
+            os,
+            prepare_timeout,
+            crate::elevation::protected_placement_error(),
+        )
+        .map(RunningHelper::Elevated),
+        Route::Refused(reason) => Err((crate::elevation::route_refused_error(&reason), true)),
     }
 }
 
@@ -1311,10 +1324,11 @@ impl Drop for PreparedRestart {
 /// bound to this transaction before the helper exists, and later reaches the
 /// limited child only through the private health capability.
 ///
-/// The helper is started normally and without any prompt. Only when the OS
-/// answers that start with `ERROR_ELEVATION_REQUIRED` (740) does the explicit
-/// "restart and update" operation go through one Windows consent prompt (see
-/// [`crate::elevation`]); the application is never closed by this function.
+/// The helper is started normally and without any prompt when the install is
+/// writable. Only a known protected placement that the current user cannot write
+/// makes the explicit "restart and update" operation go through one Windows
+/// consent prompt (see [`crate::elevation`]); the application is never closed by
+/// this function.
 pub fn prepare_restart(
     placement: &crate::platform::Placement,
     policy: &crate::trust::TrustPolicy,
@@ -2356,6 +2370,8 @@ mod tests {
         peer: Mutex<PeerFacts>,
         consent: AtomicBool,
         available: bool,
+        /// The classification and write access the route is chosen from.
+        access: crate::elevation::PlacementAccess,
         /// A helper that does not hold the published secret.
         helper_nonce: Option<Nonce>,
         pending: Mutex<Option<(PipeReader, PipeWriter)>>,
@@ -2382,6 +2398,10 @@ mod tests {
                 peer: Mutex::new(genuine_peer()),
                 consent: AtomicBool::new(true),
                 available: true,
+                access: crate::elevation::PlacementAccess {
+                    protected: true,
+                    write: crate::elevation::WriteAccess::Denied,
+                },
                 helper_nonce: None,
                 pending: Mutex::new(None),
                 closer: Mutex::new(None),
@@ -2456,6 +2476,10 @@ mod tests {
     impl ElevationOs for ConsentOs {
         fn standard_restart_available(&self) -> bool {
             self.available
+        }
+
+        fn placement_access(&self, _install_root: &Path) -> crate::elevation::PlacementAccess {
+            self.access
         }
 
         fn current_principals(&self, _install_root: &Path) -> Result<(String, String)> {
@@ -2578,27 +2602,117 @@ mod tests {
         }
     }
 
+    /// Runs the production route selection of `start_running_helper` and reports
+    /// how often the normal start was attempted.
+    fn route_with(
+        fx: &Fixture,
+        os: &dyn ElevationOs,
+        normal: (UpdateError, bool),
+    ) -> (Started, usize) {
+        fx.coord.ensure_helper_dir(&fx.txn).unwrap();
+        let hello = HelloRequest {
+            mode: Mode::Prepare,
+            install_id: fx.install.clone(),
+            transaction_id: fx.txn.clone(),
+            candidate_id: Some("cand".to_owned()),
+        };
+        let normal_starts = std::cell::Cell::new(0_usize);
+        let result = start_running_helper(
+            Path::new("C:\\h\\hane-worker.exe"),
+            &hello,
+            &fx.coord,
+            Path::new("C:\\hane"),
+            os,
+            ELEVATED_TEST_TIMEOUT,
+            || {
+                normal_starts.set(normal_starts.get() + 1);
+                Err(normal)
+            },
+        );
+        (result, normal_starts.get())
+    }
+
+    fn access(protected: bool, write: crate::elevation::WriteAccess) -> crate::elevation::PlacementAccess {
+        crate::elevation::PlacementAccess { protected, write }
+    }
+
     #[test]
-    fn only_a_740_start_ever_asks_for_consent() {
+    fn a_writable_install_never_prompts_whatever_the_start_error_says() {
+        use crate::elevation::WriteAccess;
         let fx = fixture();
-        let path = Path::new("C:\\h\\hane-updater.exe");
-        let other_failures = [
-            // ERROR_ACCESS_DENIED, an unknown error and a refused prompt are not 740.
+        let path = Path::new("C:\\h\\hane-worker.exe");
+        let failures = [
+            // A name-derived 740, access denied, an unknown error, a refused prompt.
+            (normal_start_error(Some(740), path), true),
             (normal_start_error(Some(5), path), true),
             (normal_start_error(None, path), true),
             (normal_start_error(Some(1223), path), true),
             (UpdateError::new(ErrorCode::Io, "the helper pipes are unavailable"), true),
-            // A 740 whose helper may still be running is never retried elevated.
             (normal_start_error(Some(740), path), false),
         ];
-        for (error, stopped) in other_failures {
-            let os = ConsentOs::new(&fx);
-            let (returned, returned_stopped) =
-                start_with(&fx, &os, (error.clone(), stopped)).err().unwrap();
-            assert_eq!(returned, error);
-            assert_eq!(returned_stopped, stopped);
-            assert!(os.events().is_empty(), "no endpoint and no prompt: {:?}", os.events());
+        for protected in [false, true] {
+            for (error, stopped) in &failures {
+                let mut os = ConsentOs::new(&fx);
+                os.access = access(protected, WriteAccess::Writable);
+                let (result, normal_starts) = route_with(&fx, &os, (error.clone(), *stopped));
+                let (returned, returned_stopped) = result.err().unwrap();
+                assert_eq!(&returned, error);
+                assert_eq!(returned_stopped, *stopped);
+                assert_eq!(normal_starts, 1);
+                assert!(os.events().is_empty(), "no endpoint and no prompt: {:?}", os.events());
+            }
         }
+    }
+
+    #[test]
+    fn an_unknown_or_nonprotected_placement_is_refused_without_a_prompt_or_a_start() {
+        use crate::elevation::WriteAccess;
+        let fx = fixture();
+        for facts in [
+            access(false, WriteAccess::Denied),
+            access(false, WriteAccess::Unknown),
+            access(true, WriteAccess::Unknown),
+        ] {
+            let mut os = ConsentOs::new(&fx);
+            os.access = facts;
+            let (result, normal_starts) = route_with(&fx, &os, elevation_required());
+            let (error, stopped) = result.err().unwrap();
+            assert!(error.detail.starts_with("the update route was refused"), "{error:?}");
+            assert!(!crate::elevation::is_elevation_required(&error));
+            assert!(stopped, "no helper was started");
+            assert_eq!(normal_starts, 0);
+            assert!(os.events().is_empty(), "{:?}", os.events());
+        }
+    }
+
+    #[test]
+    fn a_protected_placement_without_write_access_goes_to_the_consent_prompt_first() {
+        let fx = fixture();
+        let os = ConsentOs::new(&fx);
+        let started = Instant::now();
+        let (result, normal_starts) = loop {
+            let (result, normal_starts) = route_with(&fx, &os, (UpdateError::new(ErrorCode::Io, "unused"), true));
+            let transient = matches!(
+                &result,
+                Err((err, _)) if err.code == ErrorCode::NotApplicable
+                    && err.detail.starts_with("the helper refused: stale_journal:")
+            );
+            if !transient || started.elapsed() >= Duration::from_secs(10) {
+                break (result, normal_starts);
+            }
+            let _ = os.helper_result();
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let running = result.expect("an elevated helper");
+        assert_eq!(normal_starts, 0, "the update is not tried unelevated first");
+        assert!(matches!(running, RunningHelper::Elevated(_)));
+        assert_eq!(os.events(), ["listen", "launch"]);
+        drop(PreparedRestart {
+            spawned: Some(running),
+            coordination: fx.coord.clone(),
+            transaction: fx.txn.clone(),
+        });
+        assert_eq!(os.helper_result().unwrap(), SessionEnd::Aborted);
     }
 
     #[test]
