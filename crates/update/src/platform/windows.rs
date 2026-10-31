@@ -478,9 +478,32 @@ fn token_user_sid(token: HANDLE) -> Result<String> {
 }
 
 fn token_is_elevated(token: HANDLE) -> Result<bool> {
-    let buffer = token_information(token, TOKEN_ELEVATION_CLASS)?;
-    // SAFETY: a `TOKEN_ELEVATION` is one `u32` at the start of the buffer.
-    Ok(unsafe { *buffer.as_ptr().cast::<u32>() } != 0)
+    // `TOKEN_ELEVATION` is a fixed-size structure of one `u32`, so it is read
+    // directly rather than through the size probe of `token_information`,
+    // which does not report a size for this class on every Windows version.
+    // Any failure stays an error: it is never read as "not elevated".
+    let mut elevation = 0_u32;
+    let mut returned = 0_u32;
+    // SAFETY: the buffer is exactly one `u32` and `returned` is a live out-pointer.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_ELEVATION_CLASS,
+            std::ptr::addr_of_mut!(elevation).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        )
+    };
+    if ok == 0 {
+        return Err(os_failure("the token elevation could not be queried"));
+    }
+    if returned != std::mem::size_of::<u32>() as u32 {
+        return Err(UpdateError::new(
+            ErrorCode::Io,
+            "the token elevation had an unexpected size",
+        ));
+    }
+    Ok(elevation != 0)
 }
 
 fn own_token() -> Result<Handle> {
