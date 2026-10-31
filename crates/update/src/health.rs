@@ -802,7 +802,7 @@ impl Capability {
             Some(candidate),
             Some(version),
             Some(root),
-            Some(launch),
+            launch,
             None,
         ) = (
             lines.next(),
@@ -818,7 +818,15 @@ impl Capability {
         else {
             return Err(bad());
         };
-        let launch = Launch::parse(launch).ok_or_else(bad)?;
+        // The 7-line form written by the previous release's helper has no
+        // launch line and was always admitted by the OS parent check, which is
+        // exactly `Launch::Parent`. The current 8-line form states its launch
+        // explicitly, so a bound (standard-token) identity is still enforced
+        // and an unparsable launch line is still refused.
+        let launch = match launch {
+            None => Launch::Parent,
+            Some(text) => Launch::parse(text).ok_or_else(bad)?,
+        };
         if !valid_candidate_id(candidate) || version.is_empty() || version.len() > MAX_VERSION_BYTES {
             return Err(bad());
         }
@@ -1675,10 +1683,74 @@ mod tests {
             with(6, ""),
             with(6, "relative/state"),
             lines[..6].join("\n") + "\n",
+            lines[..5].join("\n") + "\n",
+            with(7, ""),
+            with(7, "child"),
             format!("{text}extra\n"),
         ] {
             assert!(Capability::parse(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_previous_seven_line_capability_means_a_parent_launch() {
+        let fx = fixture();
+        let cap = capability(&fx, 4242);
+        let text = cap.encode();
+        let legacy: Vec<&str> = text.lines().take(7).collect();
+        let legacy = legacy.join("\n") + "\n";
+        assert_eq!(Capability::parse(&legacy).unwrap(), cap);
+        // Extra lines after the legacy form are still refused.
+        assert!(Capability::parse(&format!("{legacy}parent\nextra\n")).is_err());
+        // A legacy capability never carries a bound identity.
+        let mut bound = cap.clone();
+        bound.launch = Launch::Bound { pid: 900, created: 77 };
+        let legacy_of_bound: Vec<String> = bound.encode().lines().take(7).map(str::to_owned).collect();
+        let parsed = Capability::parse(&(legacy_of_bound.join("\n") + "\n")).unwrap();
+        assert_eq!(parsed.launch, Launch::Parent);
+    }
+
+    #[test]
+    fn a_legacy_helper_capability_admits_only_its_real_child() {
+        let fx = fixture();
+        let _helper = hold_transaction(&fx);
+        let text = capability(&fx, 4242).encode();
+        let legacy: Vec<&str> = text.lines().take(7).collect();
+        let legacy = legacy.join("\n") + "\n";
+        let path = capability_path(&fx.coordination, &fx.transaction);
+        let write = || {
+            discard_capability(&fx.coordination, &fx.transaction);
+            std::fs::write(&path, &legacy).unwrap();
+            acl::secure_new_user_owned(&path, false, 0o600).unwrap();
+        };
+
+        write();
+        for parent in [None, Some(1), Some(4243)] {
+            assert!(matches!(
+                detect_in(&fx.coordination, "0.26.0", parent),
+                ChildEntry::NotChild
+            ));
+        }
+        // A matching pid with another parent is not the helper's child.
+        let impostor = OwnProcess { parent: Some(1), pid: 4242, created: Some(5) };
+        assert!(matches!(detect_with(&fx.coordination, "0.26.0", &impostor), ChildEntry::NotChild));
+        // Another version is refused, the capability is kept.
+        assert!(matches!(
+            detect_in(&fx.coordination, "0.25.0", Some(4242)),
+            ChildEntry::Refused(_)
+        ));
+        assert!(path.exists());
+
+        let ChildEntry::Child(session) = detect_in(&fx.coordination, "0.26.0", Some(4242)) else {
+            panic!("the legacy helper's child must be admitted");
+        };
+        assert_eq!(session.transaction(), &fx.transaction);
+        // Single use.
+        assert!(!path.exists());
+        assert!(matches!(
+            detect_in(&fx.coordination, "0.26.0", Some(4242)),
+            ChildEntry::NotChild
+        ));
     }
 
     fn hold_transaction(fx: &Fixture) -> Lease {
