@@ -2,7 +2,7 @@
 
 ## 目的と状態
 
-Issue [#664](https://github.com/hide212131/hane/issues/664)に基づき、2026-10-31のmacOS GUI復旧観測を`docs/gui-test-recovery.md`へ追加するための文書作業用Draft PR。これは準備文書であり、復旧ガイドへの変更は未実施。
+Issue [#664](https://github.com/hide212131/hane/issues/664)に基づき、2026-10-31のmacOS GUI復旧観測を`docs/gui-test-recovery.md`へ追加するための文書作業用Draft PR。この文書は準備時点の記録であり、準備commitを作った時点では復旧ガイドへの変更は未実施だった。その後、同じPRのhead `352dedfe698a2c215430c28974cb8c0217750fa2`で`docs/gui-test-recovery.md`への追記は実装済みである（この状態表記を修正する前のheadとして記録する）。以下の「Claudeに依頼する範囲」以降は準備時点の依頼内容であり、現在の実装状態や実装完了の証拠を示すものではない。この追記は新たなGUI成功、原因特定、PR #638のG4合格を意味せず、G4は`unknown`のままである。
 
 対象時点のmain: `09deafcc3085d0b73675c32b74aee624a1c12579`
 関連するGUI検証: PR #638、head `c44d4f79464e1be729b8a5f5c8c94b43f87fc6c6`
