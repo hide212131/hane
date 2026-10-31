@@ -80,19 +80,21 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 
 台帳には操作対象と観測用の情報だけを登録する。画面の全構造や業務状態を別管理しない。
 
-APIの対象取得は、IDに加えて、その時点の要素を指す一時的な参照を返す。ファイル名変更欄などが閉じて開き直された場合、古い参照は失効させる。
+`ui.query`などの対象取得は、IDに加えて、その時点の要素を指す一時的な参照（`ref`）と要素の世代（`generation`）を返す。ファイル名変更欄などが閉じて開き直された場合、古い参照は失効させる。
+
+対象を操作・観測する`ui.inspect`、`ui.click`、`ui.wait`は、IDに加えて、取得した`ref`と`generation`を要求に必ず含める。dispatcherは、要求の`ref`・`generation`が台帳に登録された要素の現在の値と一致する場合だけ、その要素を対象にする。一致しない場合、失効済みの場合、再描画で別の要素に置換された場合は、同じIDの現行要素へ再解決しない。画面入力の配送も待機の成功も行わず、`target_stale`を返す。呼び出し側は`ui.query`で対象を取得し直してから再試行する。
 
 ## 4. 最小API
 
 | API | 内容 |
 |---|---|
 | `session.info` | 対象プロセス、ビルド、ウィンドウ、対応機能を取得 |
-| `ui.query` | ID・役割・親領域で対象を検索 |
-| `ui.inspect` | 指定対象の状態を取得 |
-| `ui.click` | ID指定でクリック |
+| `ui.query` | ID・役割・親領域で対象を検索し、`ref`と`generation`を返す |
+| `ui.inspect` | `id`・`ref`・`generation`で指定した対象の状態を取得 |
+| `ui.click` | `id`・`ref`・`generation`で指定してクリック |
 | `ui.key` | 現在の入力先へキー操作 |
 | `ui.text` | 現在の入力先へ確定文字列を入力 |
-| `ui.wait` | 指定した状態になるまで期限付きで待機 |
+| `ui.wait` | `id`・`ref`・`generation`で指定した対象が、指定した状態になるまで期限付きで待機 |
 | `ui.batch` | 複数操作を順番に実行 |
 | `ui.capture` | 必要なときに画面を撮影 |
 
@@ -113,7 +115,26 @@ APIの対象取得は、IDに加えて、その時点の要素を指す一時的
 
 ## 5. 呼び出し例
 
-以下の検索欄IDと結果状態名は新設案である。検索欄を開いた後に実行する。
+以下の検索欄ID、結果状態名、`ref`、`generation`の値は新設案の例である。検索欄を開いた後に実行する。
+
+まず`ui.query`で対象を取得する。応答の`ref`と`generation`を、以降の要求へ明示的に渡す。
+
+```json
+{
+  "method": "ui.query",
+  "params": { "window": "main", "id": "document-find-query" }
+}
+```
+
+```json
+{
+  "result": {
+    "targets": [
+      { "id": "document-find-query", "ref": "el-17", "generation": 4 }
+    ]
+  }
+}
+```
 
 ```json
 {
@@ -124,12 +145,14 @@ APIの対象取得は、IDに加えて、その時点の要素を指す一時的
     "steps": [
       {
         "method": "ui.click",
-        "params": { "id": "document-find-query" }
+        "params": { "id": "document-find-query", "ref": "el-17", "generation": 4 }
       },
       {
         "method": "ui.wait",
         "params": {
           "id": "document-find-query",
+          "ref": "el-17",
+          "generation": 4,
           "state": { "focused": true },
           "timeout_ms": 1000
         }
@@ -152,6 +175,8 @@ APIの対象取得は、IDに加えて、その時点の要素を指す一時的
         "method": "ui.wait",
         "params": {
           "id": "document-find-results",
+          "ref": "el-23",
+          "generation": 2,
           "state": { "pending": false },
           "timeout_ms": 3000
         }
@@ -160,6 +185,8 @@ APIの対象取得は、IDに加えて、その時点の要素を指す一時的
   }
 }
 ```
+
+`document-find-results`の`ref`（`el-23`）と`generation`も、同様に`ui.query`で取得済みの値である。`ref`・`generation`が現在の登録要素と一致しない手順は、同じIDの現行要素へ再解決せず`target_stale`で失敗し、一括実行はそこで停止する。
 
 `primary`はmacOSではCommand、WindowsではCtrlとする。実際に配送したキーは結果に記録する。
 
@@ -173,7 +200,7 @@ APIの対象取得は、IDに加えて、その時点の要素を指す一時的
 - 表示領域内に操作可能な位置があること。
 - 無効化されていないこと。
 - 別のダイアログやメニューに遮られていないこと。
-- 要素の世代が一致すること。
+- 要求の`ref`・`generation`が、台帳に登録された要素の現在の値と一致すること。
 
 画面外の対象を探すためのスクロールは、明示的な別操作とする。クリックの裏で設定画面を開いたり、フォルダを展開したりしない。
 
@@ -204,6 +231,8 @@ APIの対象取得は、IDに加えて、その時点の要素を指す一時的
 エラーは少なくとも次を区別する。
 
 `target_not_found`、`target_ambiguous`、`target_stale`、`target_disabled`、`target_occluded`、`focus_mismatch`、`composition_active`、`timeout`。
+
+`target_stale`は、`ui.inspect`、`ui.click`、`ui.wait`の要求の`ref`・`generation`が登録要素と一致しない、失効済み、または再描画で置換された場合に返す。同じIDの現行要素へ再解決せず、画面入力も待機成功も発生させない。
 
 一括実行は最初の失敗で停止し、完了した手順と失敗した手順を返す。過去の編集は巻き戻さない。初期版の`stop_on_error`は`true`だけを受理する。
 
@@ -299,6 +328,7 @@ API経由のテスト結果には入力経路を記録する。画面の正し�
 - [ ] クリック処理を無効にした場合、期待状態の確認が失敗する。
 - [ ] フォーカスが別の欄にある場合、文字を入力しない。
 - [ ] ダイアログの背後や失効した要素を操作しない。
+- [ ] 古い`ref`・`generation`を指定した`ui.inspect`・`ui.click`・`ui.wait`は、同IDの現行要素へ再解決せず、画面入力も待機成功も発生させずに`target_stale`を返す。
 - [ ] 入力がUndo履歴や保存処理へ通常どおり反映される。
 - [ ] 検索・保存の完了を対象世代・リビジョンに結び付け、過去の結果を利用しない。
 - [ ] 一括実行が途中で止まり、通信切断・タイムアウトで編集を重複実行しない。
