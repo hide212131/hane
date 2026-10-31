@@ -25,8 +25,17 @@
 - 接続済み（`prepare_restart` → `start_running_helper`）: 通常起動が740を返し、かつhelperが確実に未起動のときだけ `start_elevated_helper` へ進む。アクセス拒否・その他のOSエラー・停止未確認の740は昇格しない。`ElevationOs` seam（`elevation.rs`）で同意起動・待受・OS由来のpeer事実を注入でき、CIは実UACを開かない。
 - 昇格helperとの通信（`platform/windows.rs`）: 方向ごとの2本のnamed pipe（同期I/Oの相互ブロックを避ける）。`FIRST_PIPE_INSTANCE`・`REJECT_REMOTE_CLIENTS`・明示DACL（昇格した管理者のみ）で作成し、接続後に (1) 2本のclient PIDの一致、(2) `ImpersonateNamedPipeClient`（identificationレベル）で得たtokenのSID・昇格状態、(3) session、(4) 起動したprocess handleのPIDを `verify_peer` で照合する。helper側も昇格tokenであること、pipe所有processが同一SID・同一sessionであることを確認してから、一回限りのnonce（既存の秘密ファイル）を消費する。
 - 取消: `ERROR_CANCELLED` は日本語の取消として返り、nonceを破棄し、旧版・未保存の作業・candidateを触らず再試行できる。helperの `Prepared` を受け取るまで `PreparedRestart` は作られず、本体の終了は始まらない。
-- 意図的に閉じている経路: `STANDARD_RESTART_AVAILABLE = false`。昇格helperが起動するlimited-health childは現状の `Command` では管理者tokenを継承し、さらに子の親PID検証（`detect_child`）は `CreateProcessWithTokenW` 等で一般権限tokenから起動した子の親（seclogon）と一致しない。一般権限での再起動と、その子の実PID/token照合の設計・実装が済むまで、同意画面を出さず従来どおり740の案内で更新を中止し、昇格helper側もapplyを拒否する（`ElevatedBackend`）。
-- 未実装（後続）: 一般権限tokenでの新版起動とその照合、保護配置（書込不可の既知配置）での昇格coordination初期化と管理者保護stage（現状は740経路のみ）、`asInvoker` manifest埋込み、同意画面のowner HWND、UIの事前案内。実機のUAC・GUI検証は未実施。
+- 第3段階時点では `STANDARD_RESTART_AVAILABLE = false` で経路を閉じていた（昇格helperの `Command` 起動は管理者tokenを継承し、`CreateProcessWithTokenW` の子の親はseclogonになり `detect_child` の親PID検証と一致しないため）。第4段階で解消する。
+- 未実装（後続）: 保護配置（書込不可の既知配置）での昇格coordination初期化と管理者保護stage（現状は740経路のみ）、`asInvoker` manifest埋込み、同意画面のowner HWND、UIの事前案内。実機のUAC・GUI検証は未実施。
+
+## 実装の進捗（第4段階: 一般権限での新版起動）
+
+- 方式: 昇格helperは新版（limited-health child）を `Command` で起動せず、同一session・同一SIDのデスクトップシェルの一般権限tokenを複製し、`CreateProcessWithTokenW` で `CREATE_SUSPENDED` 起動する（`platform/windows.rs` の `spawn_suspended_standard`）。昇格helperのtokenも、そのlinked tokenも使わない。stdin/stdoutは匿名pipe（子側のみ継承可能）で、環境は従来と同じallowlistのみ。
+- 一般権限の立証: 作成直後（resume前）に、OSが報告する実PID・session・tokenのSID・elevation・実行imageを `elevation::verify_standard_child` で期待値（要求したPID、要求側session・SID、検証済みの `hane.exe`）と照合する。管理者tokenの混入、別account/session/process/imageは拒否し、そのprocessを終了して適用をロールバックする。
+- 親PID検証の置換: この子の親はseclogonでありhelperではないため、capabilityに `parent` / `bound:<pid>:<作成時刻>` の起動種別を追加した。`bound` では、resume前にhelperが記録した子のOS PIDと作成時刻に一致するprocessだけが `detect_child` で健康状態に入れる。従来の `parent` 起動の検証は変更しない。transaction lease保持・capability一回消費・nonce・Healthy内の `child_pid` 照合も従来どおり。
+- UAC前のfail-closed: アプリ側の `standard_restart_available` は、アプリ自身が非昇格で、かつ一般権限tokenをシェルから取得できる場合だけtrue。昇格helperも、アプリに接続する前に同じ取得を確認し、できなければ何も変更せず終了する（exit 7）。
+- 取消・失敗・timeout: 子の作成/検証/resume/Healthy待ちの失敗はすべて既存の `failed` → ロールバック経路に入り、旧版を保つ。UAC取消は第3段階のまま作業を保ち再試行できる。
+- 実機未検証: シェルtokenでの `CreateProcessWithTokenW`（標準handleの引き渡しを含む）の実動作、新版が一般権限で起動し編集・保存できること。CIは実UACを出さず、判断は注入可能なpure関数（`verify_standard_child` / `Launch`）で回帰testしている。
 
 ## 目的と利用者に見える動作
 

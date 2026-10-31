@@ -461,6 +461,9 @@ pub struct PlatformBackend {
     clock: Arc<dyn Clock>,
     /// The OS seam of the macOS bundle exchange; `None` where there is none.
     bundle_host: Option<Box<dyn BundleHost>>,
+    /// Start the limited-health child with the user's unelevated token (the
+    /// elevated helper), never with the token of this process.
+    standard_token_children: bool,
 }
 
 /// The real macOS host on macOS builds; nothing anywhere else, so a macOS
@@ -481,7 +484,15 @@ impl PlatformBackend {
             policy,
             clock,
             bundle_host: system_bundle_host(),
+            standard_token_children: false,
         }
+    }
+
+    /// For the elevated helper: the new version must not inherit its
+    /// administrator token.
+    pub fn with_standard_token_children(mut self) -> Self {
+        self.standard_token_children = true;
+        self
     }
 
     /// Replaces the OS seam of the bundle exchange (deterministic tests).
@@ -512,6 +523,7 @@ impl HelperBackend for PlatformBackend {
                 let mut launcher = ProcessLauncher {
                     runtime: &mut ctx.leases.runtime,
                     timing: StopTiming::default(),
+                    standard_token: self.standard_token_children,
                 };
                 apply_and_settle(
                     &ApplyInputs {
@@ -537,6 +549,7 @@ impl HelperBackend for PlatformBackend {
                 let mut launcher = ProcessLauncher {
                     runtime: &mut ctx.leases.runtime,
                     timing: StopTiming::default(),
+                    standard_token: false,
                 };
                 macos_apply::apply_and_settle(
                     &BundleApplyInputs {
@@ -741,6 +754,12 @@ fn elevated_main() -> i32 {
     let Ok((coordination, transaction)) = Coordination::from_helper_exe(&exe) else {
         return 3;
     };
+    // The new version must be startable with the user's unelevated token. This
+    // is established before the application is contacted, so a helper that
+    // could only start it as an administrator ends before any change.
+    if crate::platform::windows::standard_token_available().is_err() {
+        return 7;
+    }
     // The application's endpoint must exist and must be the requesting
     // account's process in this session before anything is read or consumed.
     let Ok(mut pipes) = crate::platform::windows::connect_helper_pipes(&transaction) else {
@@ -760,7 +779,7 @@ fn elevated_main() -> i32 {
         authorize_window: AUTHORIZE_WINDOW,
     };
     let mut backend = ElevatedBackend {
-        inner: PlatformBackend::production(),
+        inner: PlatformBackend::production().with_standard_token_children(),
         standard_restart: crate::elevation::STANDARD_RESTART_AVAILABLE,
     };
     match run_session(&mut pipes.reader, &mut pipes.writer, &env, &nonce, &mut backend) {

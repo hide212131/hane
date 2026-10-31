@@ -35,11 +35,15 @@ use crate::protocol::Nonce;
 pub const ELEVATED_ARGUMENT: &str = "--elevated";
 
 /// Whether this build can restart the new version with the ordinary (not the
-/// elevated) token after an elevated apply. The elevated helper starts the
-/// limited-health child itself, and that child would inherit the administrator
-/// token; until a launch with the requesting user's token exists the elevated
-/// route is closed before any consent prompt, and the helper refuses to apply.
-pub const STANDARD_RESTART_AVAILABLE: bool = false;
+/// elevated) token after an elevated apply. The elevated helper never lets the
+/// limited-health child inherit its administrator token: on Windows it creates
+/// the child suspended with the requesting user's unelevated shell token, checks
+/// the OS-reported token, session and image of the created process
+/// ([`verify_standard_child`]) and binds the capability to its process id and
+/// creation time. Where that cannot be done the route stays closed before any
+/// consent prompt (see [`ElevationOs::standard_restart_available`]), and the
+/// helper refuses to apply.
+pub const STANDARD_RESTART_AVAILABLE: bool = cfg!(windows);
 
 /// `CreateProcess` result when the image needs elevation.
 pub const ERROR_ELEVATION_REQUIRED: u32 = 740;
@@ -222,6 +226,64 @@ pub fn verify_peer(os: &PeerFacts, expected: &ExpectedPeer) -> Result<()> {
     }
     if !os.token_elevated {
         return refuse("the connected process is not elevated");
+    }
+    Ok(())
+}
+
+/// Accepts a token as the requesting user's ordinary token: it is the expected
+/// account and it is not elevated.
+pub fn require_standard_token(token_sid: &str, token_elevated: bool, expected_sid: &str) -> Result<()> {
+    let refuse = |why: &str| Err(UpdateError::new(ErrorCode::IdentityMismatch, why.to_owned()));
+    if expected_sid.is_empty() || token_sid != expected_sid {
+        return refuse("the token is not the requesting user's account");
+    }
+    if token_elevated {
+        return refuse("the token is elevated");
+    }
+    Ok(())
+}
+
+/// What the OS says about the process the elevated helper created for the new
+/// version. Never self-reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandardChildFacts {
+    pub pid: u32,
+    pub session_id: u32,
+    pub token_sid: String,
+    pub token_elevated: bool,
+    pub image_path: String,
+}
+
+/// What the helper expects of that process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedStandardChild {
+    pub pid: u32,
+    pub session_id: u32,
+    pub token_sid: String,
+    pub image_path: String,
+}
+
+fn same_image(a: &str, b: &str) -> bool {
+    let plain = |path: &'_ str| path.strip_prefix(r"\\?\").unwrap_or(path).replace('/', "\\");
+    !a.is_empty() && plain(a).eq_ignore_ascii_case(&plain(b))
+}
+
+/// The created new version is proven to be the process that was asked for, in
+/// the requesting session, running as the requesting account with an
+/// unelevated token, from the verified executable. An administrator token that
+/// leaked into the child, another account, session, process or image is
+/// refused.
+pub fn verify_standard_child(os: &StandardChildFacts, expected: &ExpectedStandardChild) -> Result<()> {
+    let refuse = |why: &str| Err(UpdateError::new(ErrorCode::IdentityMismatch, why.to_owned()));
+    if os.pid != expected.pid {
+        return refuse("the created process is not the requested one");
+    }
+    if os.session_id != expected.session_id {
+        return refuse("the created process runs in another session");
+    }
+    require_standard_token(&os.token_sid, os.token_elevated, &expected.token_sid)?;
+    if !same_image(&os.image_path, &expected.image_path) {
+        return refuse("the created process runs another executable");
     }
     Ok(())
 }
@@ -612,6 +674,62 @@ mod tests {
         not_elevated.token_elevated = false;
         for forged in [wrong_pid, wrong_session, wrong_sid, not_elevated] {
             assert_eq!(verify_peer(&forged, &expected()).unwrap_err().code, ErrorCode::IdentityMismatch);
+        }
+    }
+
+    fn child_facts() -> StandardChildFacts {
+        StandardChildFacts {
+            pid: 500,
+            session_id: 1,
+            token_sid: "S-1-5-21-1".to_owned(),
+            token_elevated: false,
+            image_path: r"C:\Hane\hane.exe".to_owned(),
+        }
+    }
+
+    fn expected_child() -> ExpectedStandardChild {
+        ExpectedStandardChild {
+            pid: 500,
+            session_id: 1,
+            token_sid: "S-1-5-21-1".to_owned(),
+            image_path: r"\\?\c:\hane\HANE.exe".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_new_version_is_accepted_only_with_an_unelevated_token_of_the_user() {
+        verify_standard_child(&child_facts(), &expected_child()).unwrap();
+
+        let mut inherited_admin = child_facts();
+        inherited_admin.token_elevated = true;
+        let mut other_process = child_facts();
+        other_process.pid = 501;
+        let mut other_session = child_facts();
+        other_session.session_id = 2;
+        let mut other_account = child_facts();
+        other_account.token_sid = "S-1-5-21-2".to_owned();
+        let mut other_image = child_facts();
+        other_image.image_path = r"C:\Hane\evil.exe".to_owned();
+        let mut unknown_image = child_facts();
+        unknown_image.image_path = String::new();
+        for forged in [inherited_admin, other_process, other_session, other_account, other_image, unknown_image] {
+            assert_eq!(
+                verify_standard_child(&forged, &expected_child()).unwrap_err().code,
+                ErrorCode::IdentityMismatch,
+                "{forged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_standard_token_must_be_the_users_and_unelevated() {
+        require_standard_token("S-1-5-21-1", false, "S-1-5-21-1").unwrap();
+        for (sid, elevated, expected) in [
+            ("S-1-5-21-1", true, "S-1-5-21-1"),
+            ("S-1-5-21-2", false, "S-1-5-21-1"),
+            ("", false, ""),
+        ] {
+            assert!(require_standard_token(sid, elevated, expected).is_err());
         }
     }
 

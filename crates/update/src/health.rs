@@ -438,6 +438,46 @@ pub struct LaunchFailure<'a> {
 pub struct ProcessLauncher<'a> {
     pub runtime: &'a mut Option<Lease>,
     pub timing: StopTiming,
+    /// Start the child with the requesting user's unelevated token instead of
+    /// inheriting this process's token. The elevated helper sets it so that the
+    /// new version never runs as an administrator.
+    pub standard_token: bool,
+}
+
+impl ProcessLauncher<'_> {
+    #[cfg(windows)]
+    fn launch_standard(
+        &mut self,
+        request: &LaunchRequest<'_>,
+        failure: &LaunchFailure<'_>,
+    ) -> Box<dyn LimitedChild> {
+        match spawn_standard(request) {
+            Ok((process, link, pid)) => Box::new(ProcessChild::new(
+                process,
+                link,
+                identity_for(failure, request.version, pid),
+                request.coordination.clone(),
+                self.timing,
+            )),
+            Err(err) => {
+                discard_capability(request.coordination, request.transaction);
+                self.failed(err, failure)
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn launch_standard(
+        &mut self,
+        request: &LaunchRequest<'_>,
+        failure: &LaunchFailure<'_>,
+    ) -> Box<dyn LimitedChild> {
+        discard_capability(request.coordination, request.transaction);
+        self.failed(
+            UpdateError::new(ErrorCode::NotApplicable, "this OS has no standard-token restart"),
+            failure,
+        )
+    }
 }
 
 /// The limited child's command. The environment starts empty; only `profile`
@@ -454,23 +494,35 @@ fn child_command(exe: &Path, profile: &[(String, String)]) -> Command {
     if let Some(dir) = exe.parent() {
         command.current_dir(dir);
     }
-    for (name, value) in profile {
-        if state_root::env_name_allowed(name) {
-            command.env(name, value);
-        }
+    for (name, value) in child_environment(profile) {
+        command.env(name, value);
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        if !profile.iter().any(|(name, _)| name == "SystemRoot")
-            && let Some(root) = std::env::var_os("SystemRoot")
-        {
-            command.env("SystemRoot", root);
-        }
         // CREATE_NO_WINDOW
         command.creation_flags(0x0800_0000);
     }
     command
+}
+
+/// The whole environment of the limited child: the allowlisted `profile`
+/// variables, plus `SystemRoot` on Windows when the profile has none. Shared
+/// by the inherited-token and the standard-token start.
+fn child_environment(profile: &[(String, String)]) -> Vec<(String, String)> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut variables: Vec<(String, String)> = profile
+        .iter()
+        .filter(|(name, _)| state_root::env_name_allowed(name))
+        .cloned()
+        .collect();
+    #[cfg(windows)]
+    if !profile.iter().any(|(name, _)| name == "SystemRoot")
+        && let Some(root) = std::env::var_os("SystemRoot").and_then(|root| root.into_string().ok())
+    {
+        variables.push(("SystemRoot".to_owned(), root));
+    }
+    variables
 }
 
 fn identity_for(request: &LaunchFailure<'_>, version: &str, pid: u32) -> ChildIdentity {
@@ -495,6 +547,9 @@ impl HealthLauncher for ProcessLauncher<'_> {
         // failed child is stopped.
         if let Some(lease) = self.runtime.take() {
             lease.release();
+        }
+        if self.standard_token {
+            return self.launch_standard(request, &failure);
         }
         match spawn_limited(request) {
             Ok((process, link, pid)) => Box::new(ProcessChild::new(
@@ -537,7 +592,50 @@ fn capability_for(request: &LaunchRequest<'_>, nonce: &Nonce) -> Result<Capabili
         candidate_id: request.candidate_id.to_owned(),
         version: request.version.to_owned(),
         state_root,
+        launch: Launch::Parent,
     })
+}
+
+/// The standard-token start. The child is created suspended with the
+/// unelevated shell token of the requesting user, so its parent is not this
+/// helper. Its OS process id and creation time are therefore recorded in the
+/// capability *before* it runs a single instruction, and only that exact
+/// process can enter health mode. The OS-reported token, session and image of
+/// the created process are verified by the Windows adapter beforehand.
+#[cfg(windows)]
+fn spawn_standard(
+    request: &LaunchRequest<'_>,
+) -> Result<(platform::windows::StandardTokenChild, ChildLink, u32)> {
+    let nonce = Nonce::generate()?;
+    let mut capability = capability_for(request, &nonce)?;
+    let profile = state_root::read_environment_with_secrets(
+        request.coordination,
+        request.transaction,
+        &crate::secret_store::OsSecretStore::proxy(),
+    )?;
+    let suspended = platform::windows::spawn_suspended_standard(request.exe, &child_environment(&profile))?;
+    capability.launch = Launch::Bound {
+        pid: suspended.pid(),
+        created: suspended.created(),
+    };
+    // A failure here drops `suspended`, which ends the not yet running child.
+    publish_capability(request.coordination, request.transaction, &capability)?;
+    let (mut process, stdin, stdout) = match suspended.resume() {
+        Ok(started) => started,
+        Err(err) => {
+            discard_capability(request.coordination, request.transaction);
+            return Err(err);
+        }
+    };
+    let pid = process.id();
+    match ChildLink::new(stdout, Box::new(stdin), nonce) {
+        Ok(link) => Ok((process, link, pid)),
+        Err(err) => {
+            let _ = process.kill();
+            let _ = process.wait();
+            Err(err)
+        }
+    }
 }
 
 fn spawn_limited(request: &LaunchRequest<'_>) -> Result<(Child, ChildLink, u32)> {
@@ -634,19 +732,62 @@ struct Capability {
     version: String,
     /// The verified state root of the application that started the update.
     state_root: PathBuf,
+    launch: Launch,
+}
+
+/// How the process admitted to health mode is recognised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// Its OS parent is the helper (`Command` start).
+    Parent,
+    /// It is the very process the helper created with the user's standard
+    /// token: the OS process id and creation time recorded before it ran.
+    Bound { pid: u32, created: u64 },
+}
+
+impl Launch {
+    fn encode(self) -> String {
+        match self {
+            Self::Parent => "parent".to_owned(),
+            Self::Bound { pid, created } => format!("bound:{pid}:{created}"),
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        if text == "parent" {
+            return Some(Self::Parent);
+        }
+        let mut parts = text.strip_prefix("bound:")?.split(':');
+        let (Some(pid), Some(created), None) = (parts.next(), parts.next(), parts.next()) else {
+            return None;
+        };
+        Some(Self::Bound {
+            pid: pid.parse().ok()?,
+            created: created.parse().ok()?,
+        })
+    }
+
+    /// Whether `process` is the one this launch describes.
+    fn matches(self, helper_pid: u32, process: &OwnProcess) -> bool {
+        match self {
+            Self::Parent => process.parent == Some(helper_pid),
+            Self::Bound { pid, created } => process.pid == pid && process.created == Some(created),
+        }
+    }
 }
 
 impl Capability {
     fn encode(&self) -> String {
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             self.nonce.as_str(),
             self.helper_pid,
             self.install_id.as_str(),
             self.transaction.as_str(),
             self.candidate_id,
             self.version,
-            self.state_root.display()
+            self.state_root.display(),
+            self.launch.encode()
         )
     }
 
@@ -661,8 +802,10 @@ impl Capability {
             Some(candidate),
             Some(version),
             Some(root),
+            Some(launch),
             None,
         ) = (
+            lines.next(),
             lines.next(),
             lines.next(),
             lines.next(),
@@ -675,6 +818,7 @@ impl Capability {
         else {
             return Err(bad());
         };
+        let launch = Launch::parse(launch).ok_or_else(bad)?;
         if !valid_candidate_id(candidate) || version.is_empty() || version.len() > MAX_VERSION_BYTES {
             return Err(bad());
         }
@@ -692,6 +836,7 @@ impl Capability {
             transaction: TransactionId::parse(txn)?,
             candidate_id: candidate.to_owned(),
             version: version.to_owned(),
+            launch,
         })
     }
 }
@@ -751,10 +896,38 @@ pub fn detect_child(exe: &Path, own_version: &str) -> ChildEntry {
     let Ok(Some(coordination)) = placement.existing_coordination() else {
         return ChildEntry::NotChild;
     };
-    detect_in(&coordination, own_version, crate::helper::os_parent_id())
+    detect_with(&coordination, own_version, &OwnProcess::current())
 }
 
+/// What the OS says about this process.
+struct OwnProcess {
+    parent: Option<u32>,
+    pid: u32,
+    /// Creation time of this process; `None` when it cannot be read.
+    created: Option<u64>,
+}
+
+impl OwnProcess {
+    fn current() -> Self {
+        #[cfg(windows)]
+        let created = platform::windows::own_process_creation_time();
+        #[cfg(not(windows))]
+        let created = None;
+        Self {
+            parent: crate::helper::os_parent_id(),
+            pid: std::process::id(),
+            created,
+        }
+    }
+}
+
+/// A parent-launched child only; a standard-token child never matches here.
+#[cfg(test)]
 fn detect_in(coordination: &Coordination, own_version: &str, parent: Option<u32>) -> ChildEntry {
+    detect_with(coordination, own_version, &OwnProcess { parent, pid: 0, created: None })
+}
+
+fn detect_with(coordination: &Coordination, own_version: &str, process: &OwnProcess) -> ChildEntry {
     let private = coordination.dir().join(PRIVATE_DIR);
     let Ok(entries) = fs::read_dir(&private) else {
         return ChildEntry::NotChild;
@@ -783,7 +956,7 @@ fn detect_in(coordination: &Coordination, own_version: &str, parent: Option<u32>
     };
     if capability.transaction != transaction
         || &capability.install_id != coordination.install_id()
-        || parent != Some(capability.helper_pid)
+        || !capability.launch.matches(capability.helper_pid, process)
     {
         return ChildEntry::NotChild;
     }
@@ -1445,6 +1618,7 @@ mod tests {
             candidate_id: candidate(),
             version: "0.26.0".to_owned(),
             state_root: fx._dir.path().join("state"),
+            launch: Launch::Parent,
         }
     }
 
@@ -1562,6 +1736,56 @@ mod tests {
             ChildEntry::NotChild
         ));
         assert!(!capability_path(&fx.coordination, &fx.transaction).exists());
+    }
+
+    #[test]
+    fn the_standard_token_launch_round_trips_and_rejects_malformed_text() {
+        let fx = fixture();
+        let mut cap = capability(&fx, 4242);
+        cap.launch = Launch::Bound { pid: 900, created: 133_000_000_000_000_000 };
+        assert_eq!(Capability::parse(&cap.encode()).unwrap(), cap);
+        for bad in ["", "child", "bound:", "bound:1", "bound:x:2", "bound:1:y", "bound:1:2:3"] {
+            let text = cap.encode().replace("bound:900:133000000000000000", bad);
+            assert!(Capability::parse(&text).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_exact_standard_token_process_the_helper_created_is_admitted() {
+        let fx = fixture();
+        let _helper = hold_transaction(&fx);
+        let mut cap = capability(&fx, 4242);
+        cap.launch = Launch::Bound { pid: 900, created: 77 };
+        publish_capability(&fx.coordination, &fx.transaction, &cap).unwrap();
+
+        // The helper is not the parent of this child, and a matching parent
+        // alone proves nothing; another pid, a reused pid with another creation
+        // time and an unreadable creation time are all ordinary launches.
+        for process in [
+            OwnProcess { parent: Some(4242), pid: 0, created: None },
+            OwnProcess { parent: Some(4242), pid: 900, created: Some(78) },
+            OwnProcess { parent: Some(4242), pid: 900, created: None },
+            OwnProcess { parent: Some(4242), pid: 901, created: Some(77) },
+        ] {
+            assert!(matches!(detect_with(&fx.coordination, "0.26.0", &process), ChildEntry::NotChild));
+            assert!(capability_path(&fx.coordination, &fx.transaction).exists());
+        }
+
+        let genuine = OwnProcess { parent: None, pid: 900, created: Some(77) };
+        let ChildEntry::Child(session) = detect_with(&fx.coordination, "0.26.0", &genuine) else {
+            panic!("the helper's standard-token child must be admitted");
+        };
+        assert_eq!(session.transaction(), &fx.transaction);
+        assert!(!capability_path(&fx.coordination, &fx.transaction).exists());
+    }
+
+    #[test]
+    fn a_parent_capability_is_not_satisfied_by_a_matching_pid() {
+        let fx = fixture();
+        let _helper = hold_transaction(&fx);
+        publish_capability(&fx.coordination, &fx.transaction, &capability(&fx, 4242)).unwrap();
+        let impostor = OwnProcess { parent: Some(1), pid: 4242, created: Some(5) };
+        assert!(matches!(detect_with(&fx.coordination, "0.26.0", &impostor), ChildEntry::NotChild));
     }
 
     #[test]
