@@ -135,6 +135,24 @@ Locked useの認可プラグインも別に調べた。利用者による設定�
 
 [追加の切り分けと復旧記録](https://github.com/hide212131/hane/pull/520#issuecomment-6246544052)、[元のMac受入シナリオの最終結果](https://github.com/hide212131/hane/pull/507#issuecomment-6246590428)を参照。ローカル証拠は`<一時検証ルート>/hane-cua-locked-use-20261018/`の`service-restart-before.json`・`after-manual-toggle.json`、`hane-pr507-final-1518ae34/`の入力ログ・fixture前後記録・PID終了記録、および同チャットのCUA画像・AX・プロセス比較にある。認証情報や通常stateをPRへアップロードしない。
 
+### 追加観測（2026-10-31）: 再起動では戻らず、Finder通常Open後に軽量クリックが成功
+
+2026-10-31にPR #638（head `c44d4f79464e1be729b8a5f5c8c94b43f87fc6c6`）のmacOS G4検証中、Calculatorの座標クリックが`noWindowsAvailable`となった（Issue [#664](https://github.com/hide212131/hane/issues/664)）。比較した対処と結果は次のとおりで、それぞれ別の観測として扱う。
+
+| 対処 | Calculator座標クリックの結果 |
+| --- | --- |
+| ChatGPTアプリの再起動 | `noWindowsAvailable`のまま |
+| 実行パスを照合した`SkyComputerUseService`の再起動とCUA再接続 | `noWindowsAvailable`のまま |
+| FinderからCalculator.appを通常の「開く」で起動し直し | 成功 |
+
+- **再起動は、この観測では復旧手順として機能しなかった。** ChatGPTアプリの再起動も、サービス再起動だけも、座標クリックを戻さなかった。2026-10-18の「操作サービス再起動で回復」は異なる時点の観測であり、撤回せず、一般的な処方にもしない。
+- 成功したのは、Finder通常Openで対象アプリを起動し直した後の、Calculatorに対する軽量な座標クリックである。これは2026-10-18のPR #507の記録と同じ方向の観測だが、毎回の成功を保証しない。
+- 続けて、Finderから隔離したPR #638候補を通常の「開く」で起動し直した後、Hane本文への無害な座標クリックが1回成功した。
+- **Hane候補では、その後の終了操作と再取得がタイムアウトした。** 軽量クリックの成功をGUI全体の復旧や、元の受入シナリオの完了とは扱わない。
+- 専用Haneプロセスは実行パスを照合して終了し、共有ロックの解放と専用state・fixtureの復元を確認した。
+
+**PR #638のG4は`unknown`/未完了のままである。** 軽量クリックの成功は受入passではなく、current PRの必須GUI evidenceも免除しない。CUA内部の原因は未確定で、ChatGPTやhelperの再起動、Finder通常Openを一般的な修復手順として固定しない。ローカルの一次記録は一時ディレクトリにあり、PR上で共有可能な証拠が追加されるまで公開済みの証拠リンクとして扱わない。
+
 ### 検証アプリの残骸: 終了確認を削除・移動より先に行う
 
 同日の調査では旧検証Haneが8件生存していた。ゾンビではなく実行中のプロセスであり、PPIDが1という事実だけでは異常・所有者不明と判定しない。同じbundle IDで別実行パスのアプリもあり、名前やbundle IDだけの選択は対象を曖昧にする。今回のリソース量だけを`noWindowsAvailable`の原因とはしない。
