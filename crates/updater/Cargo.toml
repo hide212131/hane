@@ -12,5 +12,10 @@ rust-version.workspace = true
 name = "hane-updater"
 path = "src/main.rs"
 
+[features]
+# Isolated update validation build (Issue #510): uses the fixed validation
+# bundle identifier, matching the app built with the same feature.
+validation-feed = ["hane-update/validation-feed"]
+
 [dependencies]
 hane-update.workspace = true

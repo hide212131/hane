@@ -9,6 +9,9 @@ rust-version.workspace = true
 # Test signing key, fake transport/clock/filesystem and ZIP fixture builders.
 # Never enabled for product builds; the unit tests always compile them in.
 test-support = []
+# Isolated update validation build (Issue #510): pins the fixed validation macOS
+# bundle identifier instead of the product one. Never part of product builds.
+validation-feed = []
 
 # Dependencies are limited to crates already resolved in Cargo.lock for other
 # workspace members (ring via rustls, flate2 via png). GPUI, document body and

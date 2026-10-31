@@ -544,9 +544,11 @@ mod tests {
 
     #[test]
     fn the_bundle_identifier_is_read_from_an_xml_plist_only() {
-        let plist = "<dict><key>CFBundleIdentifier</key>\n<string>io.github.hide212131.hane</string></dict>";
+        let plist = format!(
+            "<dict><key>CFBundleIdentifier</key>\n<string>{MACOS_BUNDLE_ID}</string></dict>"
+        );
         assert_eq!(
-            plist_string(plist, "CFBundleIdentifier").as_deref(),
+            plist_string(&plist, "CFBundleIdentifier").as_deref(),
             Some(MACOS_BUNDLE_ID)
         );
         assert_eq!(plist_string("bplist00\u{1}", "CFBundleIdentifier"), None);

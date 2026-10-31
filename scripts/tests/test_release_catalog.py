@@ -522,6 +522,54 @@ class MacosZipTests(TempCase):
         self.assertIn(rc.MACOS_CODE_RESOURCES_REL, [f["path"] for f in document["files"]])
         self.assertEqual(document["layout_revision"], 2)
 
+    def test_the_validation_identity_is_accepted_only_by_the_validation_verifier(self):
+        validation = self.fx.macos_zip(self.tmp / "validation.zip", bundle_id=rc.VALIDATION_MACOS_BUNDLE_ID)
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            self.verify(validation)
+        facts = rc.verify_validation_macos_zip(validation, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        self.assertEqual(facts["bundle_id"], rc.VALIDATION_MACOS_BUNDLE_ID)
+        product = self.fx.macos_zip(self.tmp / "product.zip")
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            rc.verify_validation_macos_zip(product, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        other = self.fx.macos_zip(self.tmp / "other-id.zip", bundle_id="com.example.fake")
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            rc.verify_validation_macos_zip(other, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+
+    def test_catalog_build_and_release_verify_share_the_explicit_validation_selection(self):
+        validation = self.fx.macos_zip(self.tmp / "validation.zip", bundle_id=rc.VALIDATION_MACOS_BUNDLE_ID)
+        product = self.fx.macos_zip(self.tmp / "product.zip")
+        windows = self.fx.windows_zip(self.tmp / "w.zip")
+
+        def assets(name: str, macos: Path) -> Path:
+            directory = self.tmp / name
+            directory.mkdir()
+            (directory / rc.WINDOWS_ASSET).write_bytes(windows.read_bytes())
+            (directory / rc.MACOS_ASSET).write_bytes(macos.read_bytes())
+            return directory
+
+        def seal(directory: Path, **kwargs) -> None:
+            raw = rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=1, trust=self.fx.trust,
+                                   published=NOW, **kwargs)
+            (directory / rc.CATALOG_NAME).write_bytes(raw)
+            (directory / rc.SIGNATURE_NAME).write_bytes(self.fx.sign(rc.CATALOG_DOMAIN, raw))
+
+        # The standard path accepts production and refuses the validation identity.
+        production_dir = assets("production", product)
+        seal(production_dir)
+        self.fx.verify(production_dir)
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            self.fx.verify(production_dir, validation_feed=True)
+        validation_dir = assets("validation", validation)
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            seal(validation_dir)
+
+        # The explicit validation path accepts it in both build and verify, and only there.
+        seal(validation_dir, validation_feed=True)
+        catalog = self.fx.verify(validation_dir, validation_feed=True)
+        self.assertEqual(catalog["targets"][rc.MACOS_TARGET]["bundle_id"], rc.VALIDATION_MACOS_BUNDLE_ID)
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            self.fx.verify(validation_dir)
+
     def test_an_unsealed_bundle_is_rejected(self):
         with self.assertRaisesRegex(ReleaseError, "CodeResources"):
             self.verify(self.fx.macos_zip(self.tmp / "unsealed.zip", code_resources=False))

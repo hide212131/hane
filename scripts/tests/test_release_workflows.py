@@ -290,6 +290,31 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertIn("codesign --verify --deep --strict",
                       step_text(jobs(RELEASE)["build-macos"], "Verify macOS app bundle"))
 
+    def test_validation_package_is_an_explicit_opt_in_separate_from_the_product_path(self):
+        # Standard path: product build and product identifier, unchanged.
+        self.assertIn('bundle_id="io.github.hide212131.hane"\n', BUNDLE)
+        self.assertIn("  cargo build --release --locked -p hane -p hane-updater\nfi", BUNDLE)
+        # Opt-in path: only the explicit flag selects validation identity and both binaries' feature.
+        self.assertIn("1:--validation-feed)", BUNDLE)
+        self.assertIn('bundle_id="io.github.hide212131.hane.validation"', BUNDLE)
+        self.assertEqual(BUNDLE.count("--validation-feed"), 2)  # case label + usage
+        self.assertIn("--features hane/validation-feed,hane-updater/validation-feed", BUNDLE)
+        self.assertIn('Set :CFBundleIdentifier $bundle_id', BUNDLE)
+        self.assertIn('"CFBundleIdentifier:$bundle_id"', BUNDLE)
+        self.assertNotIn('"CFBundleIdentifier:io.github.hide212131.hane"', BUNDLE)
+        self.assertEqual(BUNDLE.count('bundle_id="io.github.hide212131.hane'), 2)
+
+    def test_cdhash_check_does_not_close_the_codesign_pipe_early_under_pipefail(self):
+        code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn("set -euo pipefail", code)
+        # `codesign -dvvv ... | grep -q` makes codesign die with SIGPIPE once grep exits on
+        # the first match, so a valid signature fails under pipefail.
+        self.assertNotRegex(code, r"codesign\s+-dvvv[^\n]*\|\s*grep\s+-q")
+        # The output is captured completely first, and the CDHash is still required.
+        self.assertIn('signature_details="$(/usr/bin/codesign -dvvv "$binary" 2>&1)"', code)
+        self.assertIn("grep -q '^CDHash=' <<<\"$signature_details\"", code)
+        self.assertIn('/usr/bin/codesign --verify --strict "$binary"', code)
+
     def test_bundle_is_sealed_ad_hoc_from_the_inside_out_before_the_inventory_exists(self):
         code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
         # Helper first, then the main executable, then the bundle; local ad-hoc identity only.
@@ -344,7 +369,8 @@ class HelperAndBundleTests(unittest.TestCase):
 
         self.assertIn(f'CATALOG_DOMAIN: &[u8] = b"{rc.CATALOG_DOMAIN.decode().replace(chr(0), chr(92) + "0")}"', model)
         self.assertIn(f'INVENTORY_DOMAIN: &[u8] = b"{rc.INVENTORY_DOMAIN.decode().replace(chr(0), chr(92) + "0")}"', model)
-        self.assertIn(f'MACOS_BUNDLE_ID: &str = "{rc.MACOS_BUNDLE_ID}"', model)
+        self.assertIn(f'PRODUCT_MACOS_BUNDLE_ID: &str = "{rc.MACOS_BUNDLE_ID}"', model)
+        self.assertIn(f'VALIDATION_MACOS_BUNDLE_ID: &str = "{rc.VALIDATION_MACOS_BUNDLE_ID}"', model)
         self.assertIn(f'REPOSITORY: &str = "{rc.REPOSITORY}"', model)
         self.assertIn(f'"{rc.WINDOWS_TARGET}"', model)
         self.assertIn(f'"{rc.MACOS_TARGET}"', model)
