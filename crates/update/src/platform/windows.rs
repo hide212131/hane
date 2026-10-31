@@ -1295,7 +1295,7 @@ pub fn spawn_suspended_standard(exe: &Path, environment: &[(String, String)]) ->
 fn protected_roots() -> Vec<std::path::PathBuf> {
     ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"]
         .iter()
-        .filter_map(|name| std::env::var_os(name))
+        .filter_map(std::env::var_os)
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_absolute())
         .collect()
