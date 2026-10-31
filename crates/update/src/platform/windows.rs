@@ -10,7 +10,8 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, Prefix};
 
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows_sys::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
 };
@@ -18,8 +19,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, GetProcessTimes,
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
 };
 
 use super::{HELPER_FILE_NAME, HelperSource, Placement, owner_name, unsupported};
@@ -223,6 +224,98 @@ pub fn parent_process_id() -> Option<u32> {
     // SAFETY: `handle` is owned by this function.
     unsafe { CloseHandle(handle) };
     (parent_created? <= own_created).then_some(parent)
+}
+
+/// The real consent launch: `ShellExecuteExW` with the `runas` verb, an absolute
+/// executable path, no arguments and no shell string. The real process handle is
+/// kept (`SEE_MASK_NOCLOSEPROCESS`) so the application observes the very process
+/// it started.
+pub struct RunasLauncher {
+    /// Owner window of the consent prompt; `0` for none.
+    pub owner_hwnd: usize,
+}
+
+/// The elevated process, closed when dropped.
+pub struct ShellProcess {
+    handle: HANDLE,
+    pid: u32,
+}
+
+impl Drop for ShellProcess {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by `ShellExecuteExW` with
+        // `SEE_MASK_NOCLOSEPROCESS` and is owned by this value.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+impl crate::elevation::ElevatedProcess for ShellProcess {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn wait_exit(&mut self, timeout: std::time::Duration) -> Option<u32> {
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: `handle` is a live process handle owned by this value.
+        let waited = unsafe { WaitForSingleObject(self.handle, millis) };
+        if waited != 0 {
+            return None;
+        }
+        let mut code = 0_u32;
+        // SAFETY: `handle` is live and `code` is a live local.
+        let ok = unsafe { GetExitCodeProcess(self.handle, &mut code) };
+        (ok != 0).then_some(code)
+    }
+}
+
+impl crate::elevation::ElevatedLauncher for RunasLauncher {
+    type Process = ShellProcess;
+
+    fn launch(&mut self, helper: &Path) -> std::result::Result<ShellProcess, crate::elevation::LaunchFailure> {
+        use crate::elevation::LaunchFailure;
+        // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+        const MASK: u32 = 0x0000_0040 | 0x0000_0100;
+        const SW_HIDE: i32 = 0;
+        let failure = |stage: &'static str, os_error: Option<u32>| LaunchFailure {
+            stage,
+            api: "ShellExecuteExW",
+            os_error,
+            path: helper.display().to_string(),
+        };
+        if !helper.is_absolute() {
+            return Err(failure("validate-path", None));
+        }
+        let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
+        let file = wide_path(helper);
+        let directory = helper.parent().map(wide_path);
+        // SAFETY: SHELLEXECUTEINFOW is plain data for which all-zero is valid.
+        let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = MASK;
+        info.hwnd = self.owner_hwnd as HWND;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = std::ptr::null();
+        info.lpDirectory = directory.as_ref().map_or(std::ptr::null(), |dir| dir.as_ptr());
+        info.nShow = SW_HIDE;
+        // SAFETY: `info` is initialised as documented and every pointer it holds
+        // refers to a NUL-terminated buffer that outlives the call.
+        let ok = unsafe { ShellExecuteExW(&mut info) };
+        if ok == 0 {
+            let code = std::io::Error::last_os_error().raw_os_error().map(|raw| raw as u32);
+            return Err(failure("consent-launch", code));
+        }
+        if info.hProcess.is_null() {
+            return Err(failure("no-process-handle", None));
+        }
+        // SAFETY: `hProcess` is the live handle just returned.
+        let pid = unsafe { GetProcessId(info.hProcess) };
+        let process = ShellProcess { handle: info.hProcess, pid };
+        if pid == 0 {
+            return Err(failure("process-id", None));
+        }
+        Ok(process)
+    }
 }
 
 fn is_regular_file(path: &Path) -> bool {

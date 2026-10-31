@@ -6,6 +6,11 @@
 要求の正本: [Issue #510](https://github.com/hide212131/hane/issues/510)
 判断の正本: [ADR-0034](../adr/0034-zip-application-updates.md)
 
+## 実装の進捗（第1段階）
+
+- 追加済み: `crates/update/src/elevation.rs`（通常/UAC経路の判定、740とアクセス拒否の区別、通常利用者・install所有者・昇格先SIDの検査、OS由来peer照合、nonceの一回限り消費、取消の日本語表示）と、`platform/windows.rs` の `ShellExecuteExW` / `runas` ラッパー（実processハンドル保持）。いずれも注入可能なseam経由でテストする。
+- 未接続（後続）: helper起動経路（`prepare_restart` / `spawn_helper_checked`）への組み込み、昇格helper向けのDACL付きローカルIPC、昇格後の独立再検証と管理者保護stage、一般権限の待機側からの新版起動、`asInvoker` manifest埋込み、UI案内。実機のUAC・GUI検証は未実施。
+
 ## 目的と利用者に見える動作
 
 本人のWindows x64の既知のローカルNTFS配置で、通常のHaneを一般権限で使い、手動更新の適用時だけ必要なhelperを正規UACで昇格する。取得・署名検証だけでは昇格しない。「再起動して更新」で保存状態を確認し、必要ならWindows確認画面が開くことを日本語で案内する。同意後に適用・一般権限再起動を行う。拒否・資格情報入力取消ではいまの文書と旧版を使い続け、後から再試行できる。書込可能かつ通常起動可能な配置ではUACを出さない。
