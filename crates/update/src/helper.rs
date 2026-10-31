@@ -936,7 +936,12 @@ fn spawn_helper_checked(
     // anything the first frame says.
     let nonce = Nonce::generate().map_err(|err| (err, true))?;
     publish_session_nonce(&coordination, &transaction, &nonce).map_err(|err| (err, true))?;
-    let mut child = match helper_command(exe).and_then(|mut command| Ok(command.spawn()?)) {
+    let spawned = helper_command(exe).and_then(|mut command| {
+        command.spawn().map_err(|err| {
+            crate::elevation::normal_start_error(err.raw_os_error().map(|raw| raw as u32), exe)
+        })
+    });
+    let mut child = match spawned {
         Ok(child) => child,
         Err(err) => {
             discard_session_nonce(&coordination, &transaction);

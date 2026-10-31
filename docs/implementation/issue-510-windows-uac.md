@@ -11,6 +11,15 @@
 - 追加済み: `crates/update/src/elevation.rs`（通常/UAC経路の判定、740とアクセス拒否の区別、通常利用者・install所有者・昇格先SIDの検査、OS由来peer照合、nonceの一回限り消費、取消の日本語表示）と、`platform/windows.rs` の `ShellExecuteExW` / `runas` ラッパー（実processハンドル保持）。いずれも注入可能なseam経由でテストする。
 - 未接続（後続）: helper起動経路（`prepare_restart` / `spawn_helper_checked`）への組み込み、昇格helper向けのDACL付きローカルIPC、昇格後の独立再検証と管理者保護stage、一般権限の待機側からの新版起動、`asInvoker` manifest埋込み、UI案内。実機のUAC・GUI検証は未実施。
 
+## 実装の進捗（第2段階）
+
+- 接続済み: `spawn_helper_checked` の通常起動失敗を `elevation::normal_start_error` で分類し、740だけを `elevation_required` として区別して、OSエラー番号・stage・API・実パスを記録する。他のエラー（アクセス拒否を含む）は昇格要求にしない。アプリ側は740を日本語で案内し、旧Haneと作業内容を保ったまま更新を中止する。昇格はまだ実行しない。
+- 未実装（安全条件を満たせないため意図的に止めている）:
+  - `runas` 後のDACL付きnamed pipe、peer PID/token/session照合、nonce接続（昇格helperの引数契約と親PID検証の変更を伴う）。
+  - 昇格helperが起動する新版・limited-health childは、現状 `Command` で起動するため管理者tokenを継承する。一般権限での再起動（非昇格token起動）が実装できるまで、昇格helperにapplyさせてはならない。
+  - 保護配置の確認済み権限不足の判定、保護されたcoordination初期化と既存owner-only検査の役割分離。
+- 上記は実機のUAC・GUI検証を含め未実施であり、完了扱いにしない。
+
 ## 目的と利用者に見える動作
 
 本人のWindows x64の既知のローカルNTFS配置で、通常のHaneを一般権限で使い、手動更新の適用時だけ必要なhelperを正規UACで昇格する。取得・署名検証だけでは昇格しない。「再起動して更新」で保存状態を確認し、必要ならWindows確認画面が開くことを日本語で案内する。同意後に適用・一般権限再起動を行う。拒否・資格情報入力取消ではいまの文書と旧版を使い続け、後から再試行できる。書込可能かつ通常起動可能な配置ではUACを出さない。

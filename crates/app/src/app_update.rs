@@ -1185,7 +1185,10 @@ impl Inner {
     fn prepare_failure(&self, error: &UpdateError, version: Option<&str>) -> String {
         self.diag
             .record("prepare", error.code.as_str(), &error.detail, version);
-        error.to_string()
+        match hane_update::elevation::elevation_message(error) {
+            Some(message) => message.to_owned(),
+            None => error.to_string(),
+        }
     }
 
     /// Starts the helper for the Ready candidate. The lock is not held while

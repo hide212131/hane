@@ -289,6 +289,48 @@ pub fn launch_elevated<L: ElevatedLauncher>(
     })
 }
 
+/// Marker in [`UpdateError::detail`] of a normal helper start that the OS
+/// refused with `ERROR_ELEVATION_REQUIRED` (740).
+pub const ELEVATION_REQUIRED_MARKER: &str = "elevation_required";
+
+/// Shown when the helper needs the Windows consent prompt but the elevated
+/// apply is not available in this build. Nothing was changed.
+pub const ELEVATION_UNAVAILABLE_MESSAGE: &str = "この配置では更新の適用にWindowsの管理者確認が必要ですが、このバージョンでは対応していません。現在のHaneと作業内容はそのままです。書き込み可能な場所へ配置するか、手動で更新してください。";
+
+/// The failure of starting the verified helper normally. A 740 is kept apart
+/// from every other OS error (access denied included) so that only it can lead
+/// to the consent route; the number, stage, API and path are kept for the
+/// record (no secrets).
+pub fn normal_start_error(os_error: Option<u32>, path: &std::path::Path) -> UpdateError {
+    let facts = format!(
+        "stage=normal-launch, api=CreateProcessW, os_error={}, path={}",
+        os_error.map_or_else(|| "none".to_owned(), |e| e.to_string()),
+        path.display()
+    );
+    match classify_launch_error(os_error) {
+        LaunchClass::ElevationRequired => {
+            UpdateError::new(ErrorCode::Io, format!("{ELEVATION_REQUIRED_MARKER}: {facts}"))
+        }
+        _ => UpdateError::new(ErrorCode::Io, format!("the helper could not be started ({facts})")),
+    }
+}
+
+/// Whether `err` is a normal helper start that needs elevation.
+pub fn is_elevation_required(err: &UpdateError) -> bool {
+    err.code == ErrorCode::Io && err.detail.starts_with(ELEVATION_REQUIRED_MARKER)
+}
+
+/// The Japanese text for the elevation related failures, if `err` is one.
+pub fn elevation_message(err: &UpdateError) -> Option<&'static str> {
+    if is_declined(err) {
+        Some(CANCELLED_MESSAGE)
+    } else if is_elevation_required(err) {
+        Some(ELEVATION_UNAVAILABLE_MESSAGE)
+    } else {
+        None
+    }
+}
+
 /// Whether `err` is the user's refusal of the consent prompt.
 pub fn is_declined(err: &UpdateError) -> bool {
     err.code == ErrorCode::Cancelled && err.detail.starts_with(DECLINED_MARKER)
@@ -458,6 +500,23 @@ mod tests {
         // The seam is reusable: a later attempt is not blocked by the refusal.
         let mut again = FakeLauncher(Ok(()));
         assert_eq!(launch_elevated(&mut again, Path::new("h")).ok().unwrap().pid(), 77);
+    }
+
+    #[test]
+    #[test]
+    fn only_740_on_the_normal_start_is_an_elevation_request() {
+        let path = Path::new("C:\\h\\hane-updater.exe");
+        let required = normal_start_error(Some(740), path);
+        assert!(is_elevation_required(&required));
+        assert_eq!(elevation_message(&required), Some(ELEVATION_UNAVAILABLE_MESSAGE));
+        for fact in ["os_error=740", "stage=normal-launch", "hane-updater.exe"] {
+            assert!(required.detail.contains(fact), "{fact} in {}", required.detail);
+        }
+        for other in [Some(5), Some(1223), None] {
+            let err = normal_start_error(other, path);
+            assert!(!is_elevation_required(&err));
+            assert_eq!(elevation_message(&err), None);
+        }
     }
 
     #[test]
