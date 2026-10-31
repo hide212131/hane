@@ -82,7 +82,7 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 
 `ui.query`などの対象取得は、IDに加えて、その時点の要素を指す一時的な参照（`ref`）と要素の世代（`generation`）を返す。ファイル名変更欄などが閉じて開き直された場合、古い参照は失効させる。
 
-対象を操作・観測する`ui.inspect`、`ui.click`、`ui.wait`は、IDに加えて、取得した`ref`と`generation`を要求に必ず含める。dispatcherは、要求の`ref`・`generation`が台帳に登録された要素の現在の値と一致する場合だけ、その要素を対象にする。一致しない場合、失効済みの場合、再描画で別の要素に置換された場合は、同じIDの現行要素へ再解決しない。画面入力の配送も待機の成功も行わず、`target_stale`を返す。呼び出し側は`ui.query`で対象を取得し直してから再試行する。
+対象を操作・観測する`ui.inspect`、`ui.click`、`ui.wait`は、IDに加えて、取得した`ref`と`generation`を要求に必ず含める。dispatcherは、要求の`ref`・`generation`が台帳に登録された要素の現在の値と一致する場合だけ、その要素を対象にする。一致しない場合、失効済みの場合、再描画で別の要素に置換された場合は、同じIDの現行要素へ再解決しない。画面入力の配送も待機の成功も行わず、`target_stale`を返す。呼び出し側は`ui.query`で対象を取得し直してから再試行する。待機開始時点で存在しない対象の出現待ちだけは、対象自身の`ref`・`generation`の代わりに、安定した親対象の`ref`・`generation`を要求する（§4.1）。
 
 ## 4. 最小API
 
@@ -94,7 +94,7 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 | `ui.click` | `id`・`ref`・`generation`で指定してクリック |
 | `ui.key` | 現在の入力先へキー操作 |
 | `ui.text` | 現在の入力先へ確定文字列を入力（入力先がIME composition中なら`composition_active`で失敗）。検索欄への入力が検索を開始した場合は、その検索のクエリ世代`query_generation`を結果に返す |
-| `ui.wait` | `id`・`ref`・`generation`で指定した対象が、指定した状態になるまで期限付きで待機。検索完了を待つ場合は、`ui.text`が返した`query_generation`も必須 |
+| `ui.wait` | 既存の対象は`id`・`ref`・`generation`で指定し、指定した状態になるまで期限付きで待機。検索完了を待つ場合は、`ui.text`が返した`query_generation`も必須。待機開始時点で存在しない対象の出現は、安定した親対象とquery条件を指定する出現待ち（`appear`、§4.1）で待つ |
 | `ui.batch` | 複数操作を順番に実行 |
 | `ui.capture` | 必要なときに画面を撮影 |
 | `ui.request_status` | 同一セッション内の`request_id`から実行状況を読み取り専用で照会（元の操作は再実行しない。§8.1） |
@@ -108,6 +108,73 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 検索欄への`ui.text`が成功し、その入力で検索が開始された場合、結果に`query_generation`を含める。これは検索クエリの世代を表す不透明な値で、入力ごとに新しい値が割り当てられ、同じ検索欄で先行した検索の値とは異なる。要素の`ref`・`generation`（要素の登録・置換を表す値）とは別の概念であり、相互に代用しない。入力が検索を開始しなかった場合（例: 失敗、または検索を起動しない入力先）は`query_generation`を返さない。
 
 検索完了を待つ`ui.wait`は、`query_generation`を必須指定する。`ui.wait`は、要求した`query_generation`と同じ検索が完了した（その世代について`pending: false`かつ結果が確定した）場合だけ成功を返す。先行検索の`pending: false`や古い結果では成功しない。要素の`ref`・`generation`の照合は従来どおり別に行い、両方が一致しなければ成功しない。相関値の不一致・失効時の結果は§8に定める。
+
+### 4.1 まだ存在しない対象の出現待ち
+
+ダイアログなど、`ui.wait`の開始時点で存在しない対象は`ref`・`generation`を持てない。この場合だけ、`id`・`ref`・`generation`の代わりに`appear`を指定する。`appear`と、既存対象を指す`id`・`ref`・`generation`は同時に指定できない。
+
+- `parent`: 出現を待つ範囲を限定する、すでに存在する安定した親対象（例: ウィンドウ直下のダイアログ配置領域）。`ui.query`で取得した`id`・`ref`・`generation`を必須とする。
+- `match`: 親の配下で探す対象のquery条件。`id`を必須とし、必要なら`role`を加える。表示文言、座標、表示順は使わない。
+- `state`と`timeout_ms`: 出現した対象に求める状態と期限。既存の`ui.wait`と同じ意味とする。
+
+待機anchorは、dispatcherが待機開始時に台帳から記録する`parent`の`ref`・`generation`と描画フレーム番号（`anchor_frame`）である。これは呼び出し側が指定する値ではなく、`query_generation`・`request_id`とは別の概念である。
+
+- anchorより後（`anchor_frame`より大きいフレーム）に台帳へ登録された、`parent`配下で`match`に合う要素だけを候補にする。待機開始時にすでに存在した要素は候補にしない。開始時点で存在する対象は、`ui.query`で`ref`・`generation`を取得して従来の形式で待つ。
+- 候補が最初に一つ見つかった時点で、その要素の`ref`・`generation`へ待機を結び付ける（束縛）。以降は`id`で現行要素を再解決しない。束縛後に`state`が満たされる前にその要素が閉じる・置換されると、別要素の同じ`id`で成功せず`target_stale`を返す。
+- 同時に候補が複数見つかった場合は、どれも選ばず`target_ambiguous`を返す。
+- 待機中に`parent`の`ref`・`generation`が登録要素と一致しなくなった場合は、親が閉じた・置換された場合も含め、`target_stale`を返す。
+- 期限までに候補が現れない、または束縛した対象が`state`を満たさない場合は`timeout`を返す。応答に、`reason`（`no_match`または`state_unmet`）と`anchor_frame`を含める。他の要素や過去の状態で代用しない。
+
+要求の例（値は新設案の例）。
+
+```json
+{
+  "method": "ui.wait",
+  "params": {
+    "appear": {
+      "parent": { "id": "dialog-host", "ref": "el-3", "generation": 1 },
+      "match": { "id": "settings-dialog", "role": "dialog" }
+    },
+    "state": { "visible": true },
+    "timeout_ms": 3000
+  }
+}
+```
+
+成功時は、束縛した要素の`ref`・`generation`を返す。以降の`ui.inspect`・`ui.click`・`ui.wait`には、この値を明示的に渡す。
+
+```json
+{
+  "result": {
+    "target": { "id": "settings-dialog", "ref": "el-41", "generation": 1 },
+    "anchor_frame": 1208,
+    "state": { "visible": true }
+  }
+}
+```
+
+期限までに対象が現れなかった場合の失敗応答の例。
+
+```json
+{
+  "error": {
+    "code": "timeout",
+    "reason": "no_match",
+    "anchor_frame": 1208
+  }
+}
+```
+
+出現後に対象が置換された場合の失敗応答の例。置換後の同じ`id`の要素では成功しない。
+
+```json
+{
+  "error": {
+    "code": "target_stale",
+    "requested": { "id": "settings-dialog", "ref": "el-41", "generation": 1 }
+  }
+}
+```
 
 例えば、検索欄へ入力する場合は次の順序になる。
 
@@ -285,7 +352,7 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 | ボタン切替 | 選択・チェック状態 |
 | 検索完了 | `ui.text`が返した`query_generation`と、その世代の処理状態 |
 | 保存完了 | 対象文書・リビジョンに対応する保存結果 |
-| ダイアログ表示 | 指定要素の出現 |
+| ダイアログ表示 | 開始時に存在しない対象は、`appear`（§4.1）で指定した親対象の配下に、待機anchor以降に登録された要素の出現。出現後の要素の`ref`・`generation`へ束縛して状態を確認する |
 
 「アプリ全体が落ち着くまで待つ」という曖昧な条件は設けない。次の描画フレームが完了しただけで、保存や検索の完了とは扱わない。呼び出し例の`pending: false`も、直前の`ui.text`が返した`query_generation`の検索についてだけ確認し、以前の検索の`pending: false`や結果で成立させない。要素の`ref`・`generation`は要素の同一性を確認する値であり、検索クエリの世代の代わりにはしない。
 
@@ -297,7 +364,9 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 
 `target_not_found`、`target_ambiguous`、`target_stale`、`target_disabled`、`target_occluded`、`focus_mismatch`、`composition_active`、`query_generation_mismatch`、`query_generation_stale`、`request_id_required`、`request_id_duplicate`、`request_limit_exceeded`、`timeout`。
 
-`target_stale`は、`ui.inspect`、`ui.click`、`ui.wait`の要求の`ref`・`generation`が登録要素と一致しない、失効済み、または再描画で置換された場合に返す。同じIDの現行要素へ再解決せず、画面入力も待機成功も発生させない。
+`target_stale`は、`ui.inspect`、`ui.click`、`ui.wait`の要求の`ref`・`generation`が登録要素と一致しない、失効済み、または再描画で置換された場合に返す。同じIDの現行要素へ再解決せず、画面入力も待機成功も発生させない。出現待ち（§4.1）では、`parent`の不一致・失効、および出現後に束縛した要素の置換・失効でも返す。
+
+出現待ちの`target_ambiguous`は、待機anchor以降に`match`へ合う候補が同時に複数登録された場合に返す。`timeout`は、`reason`が`no_match`（候補が現れない）または`state_unmet`（束縛した対象が期限までに`state`を満たさない）のいずれかを示し、`anchor_frame`を含める。`anchor_frame`は台帳の描画フレーム番号であり、`query_generation`・`request_id`・要素の`generation`の代わりにならない。
 
 `composition_active`は、`ui.text`の入力先がIME composition中の場合に返す。文字入力イベントの配送、compositionのcommit・cancel・置換、本文・入力欄・Undo履歴・composition stateの変更はいずれも発生させない。
 
@@ -526,6 +595,7 @@ API経由のテスト結果には入力経路を記録する。画面の正し�
 - [ ] ダイアログの背後や失効した要素を操作しない。
 - [ ] 古い`ref`・`generation`を指定した`ui.inspect`・`ui.click`・`ui.wait`は、同IDの現行要素へ再解決せず、画面入力も待機成功も発生させずに`target_stale`を返す。
 - [ ] 入力がUndo履歴や保存処理へ通常どおり反映される。
+- [ ] 開始時に存在しない対象を待つ`ui.wait`は、`appear`で親対象の`ref`・`generation`と`match`条件を受け取り、待機anchor以降に登録された候補だけを束縛する。出現後の置換は`target_stale`、複数候補は`target_ambiguous`、不出現・状態不一致は`reason`付きの`timeout`を返し、同じ`id`の別要素では成功しない。
 - [ ] 検索欄への`ui.text`が、開始した検索の`query_generation`を返し、検索完了を待つ`ui.wait`が同値を必須指定する。先行検索の`pending: false`や古い結果では成功せず、不一致は`query_generation_mismatch`、失効は`query_generation_stale`を返す。
 - [ ] 保存の完了を対象文書・リビジョンに結び付け、過去の結果を利用しない。
 - [ ] 一括実行が途中で止まり、通信切断・タイムアウトで編集を重複実行しない。切断後は自動再送せず`ui.request_status`で状態を照会でき、記録が無い・期限切れ・成否不明の場合は`unknown`を返して`not_started`と扱わない。`request_id`の無い副作用要求は`request_id_required`、記録済みIDの再送は`request_id_duplicate`、未完了要求が上限に達している場合は`request_limit_exceeded`で、いずれも実行しない。切断後も同じセッションなら同じ接続トークンでの再接続で照会でき、新しいアプリ起動や新しいトークンからは過去の記録を照会できない。
