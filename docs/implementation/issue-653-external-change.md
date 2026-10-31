@@ -7,13 +7,25 @@ Refs #653
 
 ## current headの状態
 
-観測対象のheadは `89eb9dfe9139cb08058aac354a0b55570fdab258`（base `cc2c19979726195a111a32913d145846c8b651af`、観測時のcurrent main `29ed353d1548db7d2df61ffa85085dc4457c98cc`）。
+対象headは `6cd241f85fba86a166dee5d14448b4a79a57fef9`（base / current main `29ed353d1548db7d2df61ffa85085dc4457c98cc`）。
 
 - 実装: 以降の「実装記録」の範囲がcurrent headに含まれる。受入条件を満たしたことを意味しない。
+- exact-head verifier（[run 41098937044](https://github.com/hide212131/hane/actions/runs/41098937044)）: success。
+- current-head CI（[run 41099201210](https://github.com/hide212131/hane/actions/runs/41099201210)）: success。両OSのworkspace testsとClippyはpass。
+- Windows GUI matrix: 14 PASS / 3 UNKNOWN / 0 FAIL。次の3件はUnknownのままで、passとして扱わない。
+  - 通常Saveとautosaveの競合
+  - アプリ生成draftの再起動後end-to-end復旧
+  - watcher失敗警告の可視性
+- Mac GUI: PR本文にある部分確認のみ。上記Unknownを含め、その範囲を越えて主張しない。
+- Issue #653のGUI条件は未完了のため、PRはDraftを維持する。この文書の更新は製品受入やIssue完了を意味しない。
+- 上記は観測時点の値であり、headが変わった場合は旧headの証拠として使わない。次headのCI・review・GUIは取得するまで成功扱いにしない。
+
+### 検証履歴（旧head、current headではない）
+
+- head `89eb9dfe9139cb08058aac354a0b55570fdab258`（base `cc2c19979726195a111a32913d145846c8b651af`、観測時のcurrent main `29ed353d1548db7d2df61ffa85085dc4457c98cc`）。
 - exact-head verifier（[run 40923553155](https://github.com/hide212131/hane/actions/runs/40923553155)）: workspace regression testsとlintはsuccessで完了した。
-- 通常PR CI（[run 40923856998](https://github.com/hide212131/hane/actions/runs/40923856998)）: `action_required` / jobs 0のままで、成功ではない。未完了。
-- current headのMac / Windows GUI確認: 未完了。
-- 上記は観測時点の値であり、headが変わった場合は旧headの証拠として使わない。
+- 通常PR CI（[run 40923856998](https://github.com/hide212131/hane/actions/runs/40923856998)）: `action_required` / jobs 0のままで、成功ではなかった。
+- 当時のMac / Windows GUI確認: 未完了。
 
 ## 正本
 
