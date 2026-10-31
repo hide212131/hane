@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use crate::apply::{self, FsFileOps, RecoveryOutcome};
 use crate::clock::{Clock, SystemClock};
+use crate::elevation::{ElevatedProcess, ElevationOs};
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::health::{ProcessLauncher, StopTiming};
 use crate::identity::{InstallId, TransactionId};
@@ -690,12 +691,91 @@ impl apply::FileOps for GuardedOps {
     }
 }
 
-/// Entry point of the `hane-updater` binary. Takes no arguments; the process
-/// exit code is 0 only for a session that ended cleanly.
+/// Entry point of the `hane-updater` binary. It takes no argument, or exactly
+/// [`crate::elevation::ELEVATED_ARGUMENT`] when the application started it
+/// through the Windows consent prompt; the process exit code is 0 only for a
+/// session that ended cleanly.
 pub fn helper_main() -> i32 {
-    if std::env::args_os().count() > 1 {
-        return 2;
+    let mut arguments = std::env::args_os().skip(1);
+    match (arguments.next(), arguments.next()) {
+        (None, _) => standard_main(),
+        (Some(argument), None) if argument == crate::elevation::ELEVATED_ARGUMENT => elevated_main(),
+        _ => 2,
     }
+}
+
+/// Refuses every apply while the build cannot restart the new version with the
+/// requesting user's token (see [`crate::elevation::STANDARD_RESTART_AVAILABLE`]):
+/// the elevated helper would otherwise start the limited-health child with the
+/// administrator token. Recovery is not an apply and is passed through.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows elevated entry point builds it")
+)]
+struct ElevatedBackend<B: HelperBackend> {
+    inner: B,
+    standard_restart: bool,
+}
+
+impl<B: HelperBackend> HelperBackend for ElevatedBackend<B> {
+    fn apply(&mut self, ctx: &mut ApplyContext<'_>) -> Result<()> {
+        if !self.standard_restart {
+            return Err(UpdateError::new(
+                ErrorCode::NotApplicable,
+                "the elevated helper cannot restart the new version with the user's token",
+            ));
+        }
+        self.inner.apply(ctx)
+    }
+
+    fn recover(&mut self, ctx: &RecoverContext<'_>) -> Result<RecoveryReport> {
+        self.inner.recover(ctx)
+    }
+}
+
+#[cfg(windows)]
+fn elevated_main() -> i32 {
+    let Ok(exe) = std::env::current_exe() else {
+        return 3;
+    };
+    let Ok((coordination, transaction)) = Coordination::from_helper_exe(&exe) else {
+        return 3;
+    };
+    // The application's endpoint must exist and must be the requesting
+    // account's process in this session before anything is read or consumed.
+    let Ok(mut pipes) = crate::platform::windows::connect_helper_pipes(&transaction) else {
+        return 6;
+    };
+    let Ok(nonce) = take_session_nonce(&coordination, &transaction) else {
+        return 5;
+    };
+    let env = HelperEnv {
+        coordination,
+        transaction,
+        // The OS-reported owner of the pipe, never a value from the wire.
+        parent_pid: pipes.server_pid,
+        own_pid: std::process::id(),
+        gate_timeout: STARTUP_GATE_TIMEOUT,
+        parent_exit_timeout: PARENT_EXIT_TIMEOUT,
+        authorize_window: AUTHORIZE_WINDOW,
+    };
+    let mut backend = ElevatedBackend {
+        inner: PlatformBackend::production(),
+        standard_restart: crate::elevation::STANDARD_RESTART_AVAILABLE,
+    };
+    match run_session(&mut pipes.reader, &mut pipes.writer, &env, &nonce, &mut backend) {
+        Ok(SessionEnd::Applied | SessionEnd::Recovered(_) | SessionEnd::Aborted) => 0,
+        Ok(SessionEnd::ParentStillRunning) => 4,
+        Err(_) => 1,
+    }
+}
+
+#[cfg(not(windows))]
+fn elevated_main() -> i32 {
+    2
+}
+
+fn standard_main() -> i32 {
     let Ok(env) = HelperEnv::from_current_process() else {
         return 3;
     };
@@ -965,11 +1045,104 @@ fn spawn_helper_checked(
     }
 }
 
+/// A helper started through the Windows consent prompt, with the process
+/// handle the application got at launch and its verified local channel.
+struct ElevatedHelper {
+    link: HelperLink<Box<dyn Write + Send>>,
+    process: Box<dyn ElevatedProcess>,
+}
+
+/// The helper of a prepared restart: a normally started child, or an elevated
+/// process behind the consent prompt.
+enum RunningHelper {
+    Standard(SpawnedHelper),
+    Elevated(ElevatedHelper),
+}
+
+impl RunningHelper {
+    fn link_pid(&self) -> u32 {
+        match self {
+            Self::Standard(spawned) => spawned.link.helper_pid(),
+            Self::Elevated(elevated) => elevated.link.helper_pid(),
+        }
+    }
+}
+
+/// How long the application waits for the elevated helper's `Prepared`.
+const ELEVATED_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Starts the helper normally, and only if the OS answers the normal start with
+/// `ERROR_ELEVATION_REQUIRED` (740) goes through one consent prompt. Every other
+/// failure, access denied included, is returned as it is. Returns the failure
+/// together with whether the helper is certain not to be running.
+fn start_running_helper(
+    copy: &Path,
+    request: &HelloRequest,
+    coordination: &Coordination,
+    install_root: &Path,
+    os: &dyn ElevationOs,
+    prepare_timeout: Duration,
+    normal: impl FnOnce() -> std::result::Result<SpawnedHelper, (UpdateError, bool)>,
+) -> std::result::Result<RunningHelper, (UpdateError, bool)> {
+    match normal() {
+        Ok(spawned) => Ok(RunningHelper::Standard(spawned)),
+        Err((err, true)) if crate::elevation::is_elevation_required(&err) => {
+            start_elevated_helper(copy, request, coordination, install_root, os, prepare_timeout, err)
+                .map(RunningHelper::Elevated)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// The consent route: publishes the one-shot secret, asks for consent once,
+/// requires the connected process to be the launched, elevated helper of the
+/// requesting account, and completes the same `Hello`/`Prepared` handshake as
+/// the normal start over the verified channel.
+fn start_elevated_helper(
+    copy: &Path,
+    request: &HelloRequest,
+    coordination: &Coordination,
+    install_root: &Path,
+    os: &dyn ElevationOs,
+    prepare_timeout: Duration,
+    cause: UpdateError,
+) -> std::result::Result<ElevatedHelper, (UpdateError, bool)> {
+    // A build that cannot finish an elevated apply must not show a prompt.
+    if !os.standard_restart_available() {
+        return Err((cause, true));
+    }
+    let transaction = &request.transaction_id;
+    let nonce = Nonce::generate().map_err(|err| (err, true))?;
+    publish_session_nonce(coordination, transaction, &nonce).map_err(|err| (err, true))?;
+    let connection = match crate::elevation::connect_elevated(
+        os,
+        install_root,
+        copy,
+        transaction,
+        crate::elevation::CONNECT_TIMEOUT,
+    ) {
+        Ok(connection) => connection,
+        Err(failure) => {
+            discard_session_nonce(coordination, transaction);
+            return Err((failure.error, failure.helper_stopped));
+        }
+    };
+    let crate::elevation::ElevatedConnection { process, reader, writer } = connection;
+    match HelperLink::handshake(reader, writer, request, nonce, Some(process.pid()), prepare_timeout) {
+        Ok(link) => Ok(ElevatedHelper { link, process }),
+        Err(err) => {
+            let failure = crate::elevation::stop_helper(process, err);
+            discard_session_nonce(coordination, transaction);
+            Err((failure.error, failure.helper_stopped))
+        }
+    }
+}
+
 /// A helper that answered `Prepared` for a restart. The application may quit
 /// only while it holds one, and only after its own shutdown work is done.
 /// Dropping it without [`PreparedRestart::authorize_exit`] aborts the helper.
 pub struct PreparedRestart {
-    spawned: Option<SpawnedHelper>,
+    spawned: Option<RunningHelper>,
     coordination: Coordination,
     transaction: TransactionId,
 }
@@ -1013,13 +1186,19 @@ impl PreparedRestart {
     }
 
     pub fn helper_pid(&self) -> Option<u32> {
-        self.spawned.as_ref().map(|spawned| spawned.link.helper_pid())
+        self.spawned.as_ref().map(RunningHelper::link_pid)
+    }
+
+    /// Whether the helper runs elevated, behind the Windows consent prompt.
+    pub fn is_elevated(&self) -> bool {
+        matches!(self.spawned, Some(RunningHelper::Elevated(_)))
     }
 
     /// Lets the helper proceed once this process has exited.
     pub fn authorize_exit(mut self) -> Result<()> {
         match self.spawned.as_mut() {
-            Some(spawned) => spawned.link.authorize_exit(),
+            Some(RunningHelper::Standard(spawned)) => spawned.link.authorize_exit(),
+            Some(RunningHelper::Elevated(elevated)) => elevated.link.authorize_exit(),
             None => Err(unexpected("authorization of a finished handoff")),
         }
         .inspect(|()| {
@@ -1034,17 +1213,36 @@ impl PreparedRestart {
     }
 
     fn abort_in_place(&mut self) {
-        if let Some(mut spawned) = self.spawned.take() {
-            spawned.link.abort();
+        if let Some(running) = self.spawned.take() {
             // Only a confirmed exit allows the cleanup; a helper that may
             // still be running keeps its transaction directory (and journal)
             // for recovery. The wait is bounded because this runs on the UI
             // thread and a hung helper must not freeze the application.
-            if confirm_child_exit(&mut spawned.child, ABORT_EXIT_GRACE, ABORT_KILL_WAIT) {
+            let exited = match running {
+                RunningHelper::Standard(mut spawned) => {
+                    spawned.link.abort();
+                    confirm_child_exit(&mut spawned.child, ABORT_EXIT_GRACE, ABORT_KILL_WAIT)
+                }
+                RunningHelper::Elevated(mut elevated) => {
+                    elevated.link.abort();
+                    confirm_elevated_exit(elevated.process.as_mut(), ABORT_EXIT_GRACE, ABORT_KILL_WAIT)
+                }
+            };
+            if exited {
                 discard_unstarted_transaction(&self.coordination, &self.transaction);
             }
         }
     }
+}
+
+/// [`confirm_child_exit`] for an elevated process: it gets `grace` to end by
+/// itself after `Abort`, then a best-effort termination and `kill_wait` more.
+fn confirm_elevated_exit(process: &mut dyn ElevatedProcess, grace: Duration, kill_wait: Duration) -> bool {
+    if process.wait_exit(grace).is_some() {
+        return true;
+    }
+    process.terminate();
+    process.wait_exit(kill_wait).is_some()
 }
 
 /// How long an aborted helper may take to exit by itself.
@@ -1093,12 +1291,36 @@ impl Drop for PreparedRestart {
 /// `FileStateStore` resolved, default or `HANE_STATE_DIR`). It is validated and
 /// bound to this transaction before the helper exists, and later reaches the
 /// limited child only through the private health capability.
+///
+/// The helper is started normally and without any prompt. Only when the OS
+/// answers that start with `ERROR_ELEVATION_REQUIRED` (740) does the explicit
+/// "restart and update" operation go through one Windows consent prompt (see
+/// [`crate::elevation`]); the application is never closed by this function.
 pub fn prepare_restart(
     placement: &crate::platform::Placement,
     policy: &crate::trust::TrustPolicy,
     candidate_id: &str,
     candidate: &CandidateSource<'_>,
     state_root: &Path,
+) -> Result<PreparedRestart> {
+    prepare_restart_with(
+        placement,
+        policy,
+        candidate_id,
+        candidate,
+        state_root,
+        crate::platform::system_elevation().as_ref(),
+    )
+}
+
+/// [`prepare_restart`] with the elevation OS seam injected.
+pub fn prepare_restart_with(
+    placement: &crate::platform::Placement,
+    policy: &crate::trust::TrustPolicy,
+    candidate_id: &str,
+    candidate: &CandidateSource<'_>,
+    state_root: &Path,
+    os: &dyn ElevationOs,
 ) -> Result<PreparedRestart> {
     if !valid_candidate_id(candidate_id) {
         return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed candidate id"));
@@ -1120,15 +1342,20 @@ pub fn prepare_restart(
     // The limited child's environment is published later, by the handoff that
     // owns the real OS secret store, before the application can quit
     // (`state_root::publish_environment_with_secrets`).
-    let spawned = match spawn_helper_checked(
+    let request = HelloRequest {
+        mode: Mode::Prepare,
+        install_id: placement.install_id.clone(),
+        transaction_id: transaction.clone(),
+        candidate_id: Some(candidate_id.to_owned()),
+    };
+    let spawned = match start_running_helper(
         &copy,
-        &HelloRequest {
-            mode: Mode::Prepare,
-            install_id: placement.install_id.clone(),
-            transaction_id: transaction.clone(),
-            candidate_id: Some(candidate_id.to_owned()),
-        },
-        PREPARE_TIMEOUT,
+        &request,
+        &coordination,
+        &placement.install_root,
+        os,
+        ELEVATED_PREPARE_TIMEOUT,
+        || spawn_helper_checked(&copy, &request, PREPARE_TIMEOUT),
     ) {
         Ok(spawned) => spawned,
         Err((err, stopped)) => {
@@ -2087,5 +2314,405 @@ mod tests {
             guard.armed = false;
         }
         assert!(marker.exists());
+    }
+
+    // ------------------------------------------------ the elevated start
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::elevation::{
+        AcceptedPeer, ElevatedListener, LaunchFailure, PeerFacts, normal_start_error,
+    };
+
+    const ELEVATED_TEST_TIMEOUT: Duration = Duration::from_millis(400);
+    const HELPER_PID: u32 = 4242;
+    const USER_SID: &str = "S-1-5-21-1";
+
+    /// Plays the consent prompt and the elevated helper: `launch` starts the
+    /// real `run_session` on a thread with the secret the application published,
+    /// over in-memory pipes, so only the OS facts are scripted.
+    struct ConsentOs {
+        coord: Coordination,
+        txn: TransactionId,
+        peer: Mutex<PeerFacts>,
+        consent: AtomicBool,
+        available: bool,
+        /// A helper that does not hold the published secret.
+        helper_nonce: Option<Nonce>,
+        pending: Mutex<Option<(PipeReader, PipeWriter)>>,
+        closer: Mutex<Option<PipeWriter>>,
+        thread: Mutex<Option<std::thread::JoinHandle<Result<SessionEnd>>>>,
+        exited: Arc<AtomicBool>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    fn genuine_peer() -> PeerFacts {
+        PeerFacts {
+            pid: HELPER_PID,
+            session_id: 1,
+            token_sid: USER_SID.to_owned(),
+            token_elevated: true,
+        }
+    }
+
+    impl ConsentOs {
+        fn new(fx: &Fixture) -> Self {
+            Self {
+                coord: fx.coord.clone(),
+                txn: fx.txn.clone(),
+                peer: Mutex::new(genuine_peer()),
+                consent: AtomicBool::new(true),
+                available: true,
+                helper_nonce: None,
+                pending: Mutex::new(None),
+                closer: Mutex::new(None),
+                thread: Mutex::new(None),
+                exited: Arc::new(AtomicBool::new(false)),
+                log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn helper_result(&self) -> Result<SessionEnd> {
+            let handle = self.thread.lock().unwrap().take().expect("a helper was launched");
+            handle.join().expect("the helper thread did not panic")
+        }
+    }
+
+    struct ConsentListener {
+        peer: PeerFacts,
+        ends: Option<(PipeReader, PipeWriter)>,
+    }
+
+    impl ElevatedListener for ConsentListener {
+        fn accept(
+            &mut self,
+            _timeout: Duration,
+            _helper_alive: &mut dyn FnMut() -> bool,
+        ) -> Result<AcceptedPeer> {
+            let (reader, writer) = self.ends.take().ok_or_else(|| {
+                UpdateError::new(ErrorCode::TransitionInvalid, "the endpoint accepts one connection")
+            })?;
+            Ok(AcceptedPeer {
+                facts: self.peer.clone(),
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+            })
+        }
+    }
+
+    struct ConsentProcess {
+        exited: Arc<AtomicBool>,
+        closer: PipeWriter,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ElevatedProcess for ConsentProcess {
+        fn pid(&self) -> u32 {
+            HELPER_PID
+        }
+
+        fn wait_exit(&mut self, timeout: Duration) -> Option<u32> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if self.exited.load(Ordering::SeqCst) {
+                    return Some(0);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn terminate(&mut self) {
+            self.log.lock().unwrap().push("terminate");
+            self.closer.close();
+        }
+    }
+
+    impl ElevationOs for ConsentOs {
+        fn standard_restart_available(&self) -> bool {
+            self.available
+        }
+
+        fn current_principals(&self, _install_root: &Path) -> Result<(String, String)> {
+            Ok((USER_SID.to_owned(), USER_SID.to_owned()))
+        }
+
+        fn session_id(&self) -> Result<u32> {
+            Ok(1)
+        }
+
+        fn listen(&self, _transaction: &TransactionId) -> Result<Box<dyn ElevatedListener>> {
+            self.log.lock().unwrap().push("listen");
+            let (helper_in, app_to_helper) = pipe();
+            let (app_from_helper, helper_out) = pipe();
+            *self.pending.lock().unwrap() = Some((helper_in, helper_out));
+            *self.closer.lock().unwrap() = Some(app_to_helper.clone());
+            Ok(Box::new(ConsentListener {
+                peer: self.peer.lock().unwrap().clone(),
+                ends: Some((app_from_helper, app_to_helper)),
+            }))
+        }
+
+        fn launch(&self, _helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+            self.log.lock().unwrap().push("launch");
+            if !self.consent.load(Ordering::SeqCst) {
+                return Err(LaunchFailure {
+                    stage: "consent-launch",
+                    api: "ShellExecuteExW",
+                    os_error: Some(crate::elevation::ERROR_CANCELLED),
+                    path: "C:\\h\\hane-updater.exe".to_owned(),
+                });
+            }
+            let (mut helper_in, mut helper_out) = self
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the endpoint was created before the launch");
+            let closer = self.closer.lock().unwrap().clone().expect("the endpoint exists");
+            let env = HelperEnv {
+                coordination: self.coord.clone(),
+                transaction: self.txn.clone(),
+                parent_pid: std::process::id(),
+                own_pid: HELPER_PID,
+                gate_timeout: Duration::from_millis(100),
+                parent_exit_timeout: Duration::from_millis(150),
+                authorize_window: Duration::from_secs(60),
+            };
+            let exited = Arc::clone(&self.exited);
+            exited.store(false, Ordering::SeqCst);
+            let override_nonce = self.helper_nonce.clone();
+            let end = helper_out.clone();
+            let thread = std::thread::spawn(move || {
+                let nonce = match override_nonce {
+                    Some(nonce) => Ok(nonce),
+                    None => take_session_nonce(&env.coordination, &env.transaction),
+                };
+                let result = nonce.and_then(|nonce| {
+                    run_session(&mut helper_in, &mut helper_out, &env, &nonce, &mut Spy::default())
+                });
+                end.close();
+                exited.store(true, Ordering::SeqCst);
+                result
+            });
+            *self.thread.lock().unwrap() = Some(thread);
+            Ok(Box::new(ConsentProcess {
+                exited: Arc::clone(&self.exited),
+                closer,
+                log: Arc::clone(&self.log),
+            }))
+        }
+    }
+
+    type Started = std::result::Result<RunningHelper, (UpdateError, bool)>;
+
+    fn start_with(
+        fx: &Fixture,
+        os: &dyn ElevationOs,
+        normal: (UpdateError, bool),
+    ) -> Started {
+        fx.coord.ensure_helper_dir(&fx.txn).unwrap();
+        let hello = HelloRequest {
+            mode: Mode::Prepare,
+            install_id: fx.install.clone(),
+            transaction_id: fx.txn.clone(),
+            candidate_id: Some("cand".to_owned()),
+        };
+        start_running_helper(
+            Path::new("C:\\h\\hane-updater.exe"),
+            &hello,
+            &fx.coord,
+            Path::new("C:\\hane"),
+            os,
+            ELEVATED_TEST_TIMEOUT,
+            || Err(normal),
+        )
+    }
+
+    fn elevation_required() -> (UpdateError, bool) {
+        (normal_start_error(Some(740), Path::new("C:\\h\\hane-updater.exe")), true)
+    }
+
+    /// Like `start_with` for a 740 start, retrying only while the transaction
+    /// lease is transiently held by a duplicate descriptor of another test's
+    /// child process (see `the_application_requires_prepared_from_the_expected_helper`).
+    fn start_elevated_settled(fx: &Fixture, os: &ConsentOs) -> Started {
+        let started = Instant::now();
+        loop {
+            let result = start_with(fx, os, elevation_required());
+            let transient = matches!(
+                &result,
+                Err((err, _)) if err.code == ErrorCode::NotApplicable
+                    && err.detail.starts_with("the helper refused: stale_journal:")
+            );
+            if !transient || started.elapsed() >= Duration::from_secs(10) {
+                return result;
+            }
+            let _ = os.helper_result();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn only_a_740_start_ever_asks_for_consent() {
+        let fx = fixture();
+        let path = Path::new("C:\\h\\hane-updater.exe");
+        let other_failures = [
+            // ERROR_ACCESS_DENIED, an unknown error and a refused prompt are not 740.
+            (normal_start_error(Some(5), path), true),
+            (normal_start_error(None, path), true),
+            (normal_start_error(Some(1223), path), true),
+            (UpdateError::new(ErrorCode::Io, "the helper pipes are unavailable"), true),
+            // A 740 whose helper may still be running is never retried elevated.
+            (normal_start_error(Some(740), path), false),
+        ];
+        for (error, stopped) in other_failures {
+            let os = ConsentOs::new(&fx);
+            let (returned, returned_stopped) =
+                start_with(&fx, &os, (error.clone(), stopped)).err().unwrap();
+            assert_eq!(returned, error);
+            assert_eq!(returned_stopped, stopped);
+            assert!(os.events().is_empty(), "no endpoint and no prompt: {:?}", os.events());
+        }
+    }
+
+    #[test]
+    fn a_build_without_the_standard_restart_keeps_the_original_error_and_shows_no_prompt() {
+        let fx = fixture();
+        let mut os = ConsentOs::new(&fx);
+        os.available = false;
+        let (error, stopped) = start_with(&fx, &os, elevation_required()).err().unwrap();
+        assert!(crate::elevation::is_elevation_required(&error));
+        assert!(stopped);
+        assert!(os.events().is_empty(), "{:?}", os.events());
+    }
+
+    #[test]
+    fn a_740_start_prepares_the_elevated_helper_and_nothing_applies_before_the_exit_is_authorized() {
+        let fx = fixture();
+        let os = ConsentOs::new(&fx);
+        let running = start_elevated_settled(&fx, &os).expect("an elevated helper");
+        assert!(matches!(running, RunningHelper::Elevated(_)));
+        assert_eq!(running.link_pid(), HELPER_PID);
+        assert_eq!(os.events(), ["listen", "launch"]);
+        let prepared = PreparedRestart {
+            spawned: Some(running),
+            coordination: fx.coord.clone(),
+            transaction: fx.txn.clone(),
+        };
+        assert!(prepared.is_elevated());
+        assert_eq!(prepared.helper_pid(), Some(HELPER_PID));
+        // Prepared was answered, yet the helper has neither applied nor ended:
+        // it waits for the application's own authorization.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!os.exited.load(Ordering::SeqCst));
+        prepared.authorize_exit().unwrap();
+        assert_eq!(os.helper_result().unwrap(), SessionEnd::Applied);
+    }
+
+    #[test]
+    fn a_dropped_elevated_handoff_aborts_the_helper_without_applying() {
+        let fx = fixture();
+        let os = ConsentOs::new(&fx);
+        let running = start_elevated_settled(&fx, &os).expect("an elevated helper");
+        drop(PreparedRestart {
+            spawned: Some(running),
+            coordination: fx.coord.clone(),
+            transaction: fx.txn.clone(),
+        });
+        assert_eq!(os.helper_result().unwrap(), SessionEnd::Aborted);
+    }
+
+    #[test]
+    fn a_declined_prompt_leaves_everything_in_place_and_a_retry_succeeds() {
+        let fx = fixture();
+        let os = ConsentOs::new(&fx);
+        os.consent.store(false, Ordering::SeqCst);
+        let (error, stopped) = start_with(&fx, &os, elevation_required()).err().unwrap();
+        assert!(crate::elevation::is_declined(&error));
+        assert!(stopped, "no helper exists after a refused prompt");
+        assert_eq!(os.events(), ["listen", "launch"]);
+        // The one-shot secret of the refused attempt is gone.
+        assert!(take_session_nonce(&fx.coord, &fx.txn).is_err());
+
+        os.consent.store(true, Ordering::SeqCst);
+        let running = start_elevated_settled(&fx, &os).expect("the retry prepares");
+        drop(PreparedRestart {
+            spawned: Some(running),
+            coordination: fx.coord.clone(),
+            transaction: fx.txn.clone(),
+        });
+        assert_eq!(os.helper_result().unwrap(), SessionEnd::Aborted);
+    }
+
+    #[test]
+    fn a_peer_that_is_not_the_launched_elevated_helper_never_prepares() {
+        let fx = fixture();
+        let mut other_process = genuine_peer();
+        other_process.pid = HELPER_PID + 1;
+        let mut other_session = genuine_peer();
+        other_session.session_id = 2;
+        let mut other_account = genuine_peer();
+        other_account.token_sid = "S-1-5-21-2".to_owned();
+        let mut not_elevated = genuine_peer();
+        not_elevated.token_elevated = false;
+        for forged in [other_process, other_session, other_account, not_elevated] {
+            let os = ConsentOs::new(&fx);
+            *os.peer.lock().unwrap() = forged;
+            let (error, stopped) = start_with(&fx, &os, elevation_required()).err().unwrap();
+            assert_eq!(error.code, ErrorCode::IdentityMismatch);
+            assert!(stopped, "the launched process was stopped and its exit confirmed");
+            assert_eq!(os.events().last(), Some(&"terminate"));
+            // The helper never saw `Hello`, let alone an authorization.
+            assert!(os.helper_result().is_err());
+        }
+    }
+
+    #[test]
+    fn a_helper_without_the_published_secret_never_prepares() {
+        let fx = fixture();
+        let mut os = ConsentOs::new(&fx);
+        os.helper_nonce = Some(Nonce::generate().unwrap());
+        let (error, stopped) = start_with(&fx, &os, elevation_required()).err().unwrap();
+        // The helper drops the session without a reply: the application sees a
+        // silent or closed link, never `Prepared`.
+        assert!(matches!(error.code, ErrorCode::Timeout | ErrorCode::Truncated), "{error:?}");
+        assert!(stopped);
+        assert_eq!(os.events().last(), Some(&"terminate"));
+        assert_eq!(os.helper_result().unwrap_err().code, ErrorCode::IdentityMismatch);
+        // The unused secret of the failed attempt was withdrawn.
+        assert!(take_session_nonce(&fx.coord, &fx.txn).is_err());
+    }
+
+    #[test]
+    fn the_elevated_helper_refuses_to_apply_without_the_standard_restart() {
+        let fx = fixture();
+        let transaction = fx.coord.try_acquire(LeaseKind::Transaction, &[]).unwrap().unwrap();
+        let startup = fx
+            .coord
+            .try_acquire(LeaseKind::Startup, &[&transaction])
+            .unwrap()
+            .unwrap();
+        let mut leases = HeldLeases { transaction, startup, runtime: None };
+        let env = fx.env();
+        let mut backend = ElevatedBackend { inner: Spy::default(), standard_restart: false };
+        let err = backend
+            .apply(&mut ApplyContext { env: &env, candidate_id: Some("cand"), leases: &mut leases })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotApplicable);
+        assert_eq!(backend.inner.applied, 0);
+
+        backend.standard_restart = true;
+        leases.runtime = Some(parent_runtime(&fx));
+        backend
+            .apply(&mut ApplyContext { env: &env, candidate_id: Some("cand"), leases: &mut leases })
+            .unwrap();
+        assert_eq!(backend.inner.applied, 1);
     }
 }

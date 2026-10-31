@@ -15,12 +15,31 @@
 //! - [`launch_elevated`]: one consent request through an [`ElevatedLauncher`];
 //!   the user's refusal is a cancellation that leaves the running application
 //!   and its work untouched and can be retried.
+//! - [`connect_elevated`]: the whole application side up to a verified peer:
+//!   principals, one consent request, and the local channel of the process that
+//!   was really launched. Only a peer whose OS-reported process id, session,
+//!   token account and elevation all match is handed back; anything else stops
+//!   the launched process and reports whether it is certainly gone.
 
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{ErrorCode, Result, UpdateError};
+use crate::identity::TransactionId;
 use crate::protocol::Nonce;
+
+/// The single fixed argument of an elevated helper start. The helper takes no
+/// other argument, path or secret on its command line.
+pub const ELEVATED_ARGUMENT: &str = "--elevated";
+
+/// Whether this build can restart the new version with the ordinary (not the
+/// elevated) token after an elevated apply. The elevated helper starts the
+/// limited-health child itself, and that child would inherit the administrator
+/// token; until a launch with the requesting user's token exists the elevated
+/// route is closed before any consent prompt, and the helper refuses to apply.
+pub const STANDARD_RESTART_AVAILABLE: bool = false;
 
 /// `CreateProcess` result when the image needs elevation.
 pub const ERROR_ELEVATION_REQUIRED: u32 = 740;
@@ -250,10 +269,14 @@ pub struct LaunchFailure {
 }
 
 /// A launched elevated process whose real handle the application keeps.
-pub trait ElevatedProcess {
+pub trait ElevatedProcess: Send {
     fn pid(&self) -> u32;
     /// `Some(code)` once the process has exited within `timeout`.
     fn wait_exit(&mut self, timeout: Duration) -> Option<u32>;
+    /// Best-effort stop of a helper that never became ready. The caller
+    /// confirms the exit with [`ElevatedProcess::wait_exit`]; an exit that
+    /// cannot be confirmed keeps the transaction for a later cleanup.
+    fn terminate(&mut self);
 }
 
 /// The OS seam of `ShellExecuteExW` with the `runas` verb.
@@ -269,24 +292,164 @@ pub fn launch_elevated<L: ElevatedLauncher>(
     launcher: &mut L,
     helper: &std::path::Path,
 ) -> Result<L::Process> {
-    launcher.launch(helper).map_err(|failure| {
-        if classify_launch_error(failure.os_error) == LaunchClass::UserCancelled {
-            UpdateError::new(ErrorCode::Cancelled, format!("{DECLINED_MARKER}: {CANCELLED_MESSAGE}"))
-        } else {
-            UpdateError::new(
-                ErrorCode::Io,
-                format!(
-                    "the elevated helper could not be started (stage={}, api={}, os_error={}, path={})",
-                    failure.stage,
-                    failure.api,
-                    failure
-                        .os_error
-                        .map_or_else(|| "none".to_owned(), |e| e.to_string()),
-                    failure.path
-                ),
-            )
-        }
+    launcher.launch(helper).map_err(launch_failure_error)
+}
+
+/// The error of a failed consent launch (see [`launch_elevated`]).
+pub fn launch_failure_error(failure: LaunchFailure) -> UpdateError {
+    if classify_launch_error(failure.os_error) == LaunchClass::UserCancelled {
+        UpdateError::new(ErrorCode::Cancelled, format!("{DECLINED_MARKER}: {CANCELLED_MESSAGE}"))
+    } else {
+        UpdateError::new(
+            ErrorCode::Io,
+            format!(
+                "the elevated helper could not be started (stage={}, api={}, os_error={}, path={})",
+                failure.stage,
+                failure.api,
+                failure
+                    .os_error
+                    .map_or_else(|| "none".to_owned(), |e| e.to_string()),
+                failure.path
+            ),
+        )
+    }
+}
+
+// --------------------------------------------------------------- connection
+
+/// A connection accepted by the application's local endpoint, with the facts
+/// the OS reports about the process on the other end.
+pub struct AcceptedPeer {
+    pub facts: PeerFacts,
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+}
+
+/// The application's local endpoint for one elevated helper. It exists before
+/// the helper is launched and accepts exactly one connection.
+pub trait ElevatedListener: Send {
+    /// Waits for the helper. `helper_alive` is asked while waiting so that a
+    /// helper that already ended is not waited for until the timeout.
+    fn accept(
+        &mut self,
+        timeout: Duration,
+        helper_alive: &mut dyn FnMut() -> bool,
+    ) -> Result<AcceptedPeer>;
+}
+
+/// The operating system under the elevated route, as one injectable seam.
+pub trait ElevationOs {
+    /// See [`STANDARD_RESTART_AVAILABLE`].
+    fn standard_restart_available(&self) -> bool;
+    /// `(requesting user's SID, owner SID of the install root)` as the OS
+    /// reports them.
+    fn current_principals(&self, install_root: &Path) -> Result<(String, String)>;
+    /// The session of this (the requesting) process.
+    fn session_id(&self) -> Result<u32>;
+    /// Creates the local endpoint of `transaction` before any launch.
+    fn listen(&self, transaction: &TransactionId) -> Result<Box<dyn ElevatedListener>>;
+    /// One consent request that starts `helper` elevated.
+    fn launch(&self, helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure>;
+}
+
+/// The seam of an OS without the elevated route (everything but Windows).
+pub struct UnavailableElevation;
+
+impl ElevationOs for UnavailableElevation {
+    fn standard_restart_available(&self) -> bool {
+        false
+    }
+
+    fn current_principals(&self, _install_root: &Path) -> Result<(String, String)> {
+        Err(UpdateError::new(ErrorCode::NotApplicable, "this OS has no elevated update route"))
+    }
+
+    fn session_id(&self) -> Result<u32> {
+        Err(UpdateError::new(ErrorCode::NotApplicable, "this OS has no elevated update route"))
+    }
+
+    fn listen(&self, _transaction: &TransactionId) -> Result<Box<dyn ElevatedListener>> {
+        Err(UpdateError::new(ErrorCode::NotApplicable, "this OS has no elevated update route"))
+    }
+
+    fn launch(&self, helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+        Err(LaunchFailure {
+            stage: "unavailable",
+            api: "none",
+            os_error: None,
+            path: helper.display().to_string(),
+        })
+    }
+}
+
+/// A verified elevated helper and the application's ends of its channel.
+pub struct ElevatedConnection {
+    pub process: Box<dyn ElevatedProcess>,
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+}
+
+/// Why the elevated helper could not be connected, and whether it is certain
+/// not to be running (it never started, or its exit was confirmed).
+pub struct ConnectFailure {
+    pub error: UpdateError,
+    pub helper_stopped: bool,
+}
+
+/// How long the application waits for the elevated helper to connect once the
+/// consent was given.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a stopped helper gets to be confirmed gone.
+pub const STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// Stops `process` (best effort) and reports `error` together with whether its
+/// exit was confirmed.
+pub fn stop_helper(mut process: Box<dyn ElevatedProcess>, error: UpdateError) -> ConnectFailure {
+    process.terminate();
+    let helper_stopped = process.wait_exit(STOP_WAIT).is_some();
+    ConnectFailure { error, helper_stopped }
+}
+
+/// Starts `helper` through one consent request and returns its channel once the
+/// connected process is proven to be that very process, elevated, in this
+/// session and running as the requesting account. Nothing is prompted for when
+/// the route is unavailable or the principals cannot be verified, and a refused
+/// prompt changes nothing.
+pub fn connect_elevated(
+    os: &dyn ElevationOs,
+    install_root: &Path,
+    helper: &Path,
+    transaction: &TransactionId,
+    timeout: Duration,
+) -> std::result::Result<ElevatedConnection, ConnectFailure> {
+    let unstarted = |error: UpdateError| ConnectFailure { error, helper_stopped: true };
+    if !os.standard_restart_available() {
+        return Err(unstarted(UpdateError::new(
+            ErrorCode::Io,
+            format!("{ELEVATION_REQUIRED_MARKER}: the elevated apply is not available in this build"),
+        )));
+    }
+    let (user_sid, install_owner_sid) = os.current_principals(install_root).map_err(unstarted)?;
+    // The elevated token must be the requesting account: an unverifiable
+    // owner relation is refused here, and another account is refused when the
+    // peer is verified below.
+    check_principals(&Principals {
+        user_sid: user_sid.clone(),
+        install_owner_sid,
+        elevated_sid: user_sid.clone(),
     })
+    .map_err(unstarted)?;
+    let session_id = os.session_id().map_err(unstarted)?;
+    let mut listener = os.listen(transaction).map_err(unstarted)?;
+    let mut process = os
+        .launch(helper)
+        .map_err(|failure| unstarted(launch_failure_error(failure)))?;
+    let expected = ExpectedPeer { pid: process.pid(), session_id, token_sid: user_sid };
+    let accepted = listener.accept(timeout, &mut || process.wait_exit(Duration::ZERO).is_none());
+    match accepted.and_then(|peer| verify_peer(&peer.facts, &expected).map(|()| peer)) {
+        Ok(peer) => Ok(ElevatedConnection { process, reader: peer.reader, writer: peer.writer }),
+        Err(error) => Err(stop_helper(process, error)),
+    }
 }
 
 /// Marker in [`UpdateError::detail`] of a normal helper start that the OS
@@ -339,7 +502,6 @@ pub fn is_declined(err: &UpdateError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn a_writable_placement_never_prompts() {
@@ -475,6 +637,8 @@ mod tests {
         fn wait_exit(&mut self, _timeout: Duration) -> Option<u32> {
             None
         }
+
+        fn terminate(&mut self) {}
     }
 
     struct FakeLauncher(std::result::Result<(), LaunchFailure>);
@@ -503,7 +667,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn only_740_on_the_normal_start_is_an_elevation_request() {
         let path = Path::new("C:\\h\\hane-updater.exe");
         let required = normal_start_error(Some(740), path);
@@ -527,5 +690,199 @@ mod tests {
         for fact in ["stage=launch", "api=ShellExecuteExW", "os_error=5", "hane-updater.exe"] {
             assert!(err.detail.contains(fact), "{fact} in {}", err.detail);
         }
+    }
+
+    // ------------------------------------------------------ connect_elevated
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const HELPER_PID: u32 = 77;
+    const SESSION: u32 = 1;
+    const USER: &str = "S-1-5-21-1";
+
+    type Events = Arc<Mutex<Vec<&'static str>>>;
+
+    struct Script {
+        available: bool,
+        owner: String,
+        launch: std::result::Result<(), LaunchFailure>,
+        /// `None`: nobody connects.
+        peer: Option<PeerFacts>,
+    }
+
+    fn genuine() -> PeerFacts {
+        PeerFacts { pid: HELPER_PID, session_id: SESSION, token_sid: USER.to_owned(), token_elevated: true }
+    }
+
+    fn script() -> Script {
+        Script { available: true, owner: USER.to_owned(), launch: Ok(()), peer: Some(genuine()) }
+    }
+
+    struct ScriptedProcess {
+        events: Events,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl ElevatedProcess for ScriptedProcess {
+        fn pid(&self) -> u32 {
+            HELPER_PID
+        }
+
+        fn wait_exit(&mut self, _timeout: Duration) -> Option<u32> {
+            self.stopped.load(Ordering::SeqCst).then_some(0)
+        }
+
+        fn terminate(&mut self) {
+            self.events.lock().unwrap().push("terminate");
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct ScriptedListener {
+        peer: Option<PeerFacts>,
+    }
+
+    impl ElevatedListener for ScriptedListener {
+        fn accept(
+            &mut self,
+            _timeout: Duration,
+            _helper_alive: &mut dyn FnMut() -> bool,
+        ) -> Result<AcceptedPeer> {
+            match self.peer.take() {
+                Some(facts) => Ok(AcceptedPeer {
+                    facts,
+                    reader: Box::new(std::io::empty()),
+                    writer: Box::new(std::io::sink()),
+                }),
+                None => Err(UpdateError::new(ErrorCode::Timeout, "the elevated helper did not connect")),
+            }
+        }
+    }
+
+    struct ScriptedOs {
+        script: Mutex<Script>,
+        events: Events,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl ElevationOs for ScriptedOs {
+        fn standard_restart_available(&self) -> bool {
+            self.script.lock().unwrap().available
+        }
+
+        fn current_principals(&self, _install_root: &Path) -> Result<(String, String)> {
+            Ok((USER.to_owned(), self.script.lock().unwrap().owner.clone()))
+        }
+
+        fn session_id(&self) -> Result<u32> {
+            Ok(SESSION)
+        }
+
+        fn listen(&self, _transaction: &TransactionId) -> Result<Box<dyn ElevatedListener>> {
+            self.events.lock().unwrap().push("listen");
+            Ok(Box::new(ScriptedListener { peer: self.script.lock().unwrap().peer.clone() }))
+        }
+
+        fn launch(&self, _helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+            self.events.lock().unwrap().push("launch");
+            self.script.lock().unwrap().launch.clone().map(|()| {
+                Box::new(ScriptedProcess {
+                    events: Arc::clone(&self.events),
+                    stopped: Arc::clone(&self.stopped),
+                }) as Box<dyn ElevatedProcess>
+            })
+        }
+    }
+
+    fn connect(script: Script) -> (std::result::Result<ElevatedConnection, ConnectFailure>, Vec<&'static str>) {
+        let events: Events = Arc::new(Mutex::new(Vec::new()));
+        let os = ScriptedOs {
+            script: Mutex::new(script),
+            events: Arc::clone(&events),
+            stopped: Arc::new(AtomicBool::new(false)),
+        };
+        let transaction = TransactionId::generate().unwrap();
+        let result = connect_elevated(
+            &os,
+            Path::new("C:\\hane"),
+            Path::new("C:\\h\\hane-updater.exe"),
+            &transaction,
+            Duration::from_secs(1),
+        );
+        let seen = events.lock().unwrap().clone();
+        (result, seen)
+    }
+
+    #[test]
+    fn the_route_is_closed_before_any_prompt_while_the_standard_restart_is_missing() {
+        let (result, events) = connect(Script { available: false, ..script() });
+        let failure = result.err().unwrap();
+        assert!(is_elevation_required(&failure.error));
+        assert!(failure.helper_stopped);
+        assert!(events.is_empty(), "no endpoint and no prompt: {events:?}");
+    }
+
+    #[test]
+    fn an_unverifiable_install_owner_is_refused_before_any_prompt() {
+        let (result, events) = connect(Script { owner: "S-1-5-21-9".to_owned(), ..script() });
+        let failure = result.err().unwrap();
+        assert_eq!(failure.error.code, ErrorCode::IdentityMismatch);
+        assert!(failure.helper_stopped);
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_declined_prompt_stops_before_any_helper_exists_and_can_be_retried() {
+        let (result, events) = connect(Script { launch: Err(failure(Some(ERROR_CANCELLED))), ..script() });
+        let refused = result.err().unwrap();
+        assert!(is_declined(&refused.error));
+        assert!(refused.helper_stopped);
+        assert_eq!(events, ["listen", "launch"]);
+
+        let (again, events) = connect(script());
+        assert!(again.is_ok());
+        assert_eq!(events, ["listen", "launch"]);
+    }
+
+    #[test]
+    fn only_the_launched_elevated_process_of_the_requesting_account_is_accepted() {
+        let (result, events) = connect(script());
+        let connection = result.ok().unwrap();
+        assert_eq!(connection.process.pid(), HELPER_PID);
+        assert!(!events.contains(&"terminate"));
+
+        let mut other_process = genuine();
+        other_process.pid = HELPER_PID + 1;
+        let mut other_session = genuine();
+        other_session.session_id = SESSION + 1;
+        let mut other_account = genuine();
+        other_account.token_sid = "S-1-5-21-2".to_owned();
+        let mut not_elevated = genuine();
+        not_elevated.token_elevated = false;
+        for forged in [other_process, other_session, other_account, not_elevated] {
+            let (result, events) = connect(Script { peer: Some(forged), ..script() });
+            let refused = result.err().unwrap();
+            assert_eq!(refused.error.code, ErrorCode::IdentityMismatch);
+            assert!(refused.helper_stopped, "the launched process was stopped and confirmed");
+            assert_eq!(events.last(), Some(&"terminate"));
+        }
+    }
+
+    #[test]
+    fn a_helper_that_never_connects_is_stopped() {
+        let (result, events) = connect(Script { peer: None, ..script() });
+        let refused = result.err().unwrap();
+        assert_eq!(refused.error.code, ErrorCode::Timeout);
+        assert!(refused.helper_stopped);
+        assert_eq!(events.last(), Some(&"terminate"));
+    }
+
+    #[test]
+    fn the_unavailable_os_never_launches_anything() {
+        let os = UnavailableElevation;
+        assert!(!os.standard_restart_available());
+        assert!(os.listen(&TransactionId::generate().unwrap()).is_err());
+        assert!(os.launch(Path::new("h")).is_err());
     }
 }

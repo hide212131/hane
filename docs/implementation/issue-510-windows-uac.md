@@ -20,6 +20,14 @@
   - 保護配置の確認済み権限不足の判定、保護されたcoordination初期化と既存owner-only検査の役割分離。
 - 上記は実機のUAC・GUI検証を含め未実施であり、完了扱いにしない。
 
+## 実装の進捗（第3段階）
+
+- 接続済み（`prepare_restart` → `start_running_helper`）: 通常起動が740を返し、かつhelperが確実に未起動のときだけ `start_elevated_helper` へ進む。アクセス拒否・その他のOSエラー・停止未確認の740は昇格しない。`ElevationOs` seam（`elevation.rs`）で同意起動・待受・OS由来のpeer事実を注入でき、CIは実UACを開かない。
+- 昇格helperとの通信（`platform/windows.rs`）: 方向ごとの2本のnamed pipe（同期I/Oの相互ブロックを避ける）。`FIRST_PIPE_INSTANCE`・`REJECT_REMOTE_CLIENTS`・明示DACL（昇格した管理者のみ）で作成し、接続後に (1) 2本のclient PIDの一致、(2) `ImpersonateNamedPipeClient`（identificationレベル）で得たtokenのSID・昇格状態、(3) session、(4) 起動したprocess handleのPIDを `verify_peer` で照合する。helper側も昇格tokenであること、pipe所有processが同一SID・同一sessionであることを確認してから、一回限りのnonce（既存の秘密ファイル）を消費する。
+- 取消: `ERROR_CANCELLED` は日本語の取消として返り、nonceを破棄し、旧版・未保存の作業・candidateを触らず再試行できる。helperの `Prepared` を受け取るまで `PreparedRestart` は作られず、本体の終了は始まらない。
+- 意図的に閉じている経路: `STANDARD_RESTART_AVAILABLE = false`。昇格helperが起動するlimited-health childは現状の `Command` では管理者tokenを継承し、さらに子の親PID検証（`detect_child`）は `CreateProcessWithTokenW` 等で一般権限tokenから起動した子の親（seclogon）と一致しない。一般権限での再起動と、その子の実PID/token照合の設計・実装が済むまで、同意画面を出さず従来どおり740の案内で更新を中止し、昇格helper側もapplyを拒否する（`ElevatedBackend`）。
+- 未実装（後続）: 一般権限tokenでの新版起動とその照合、保護配置（書込不可の既知配置）での昇格coordination初期化と管理者保護stage（現状は740経路のみ）、`asInvoker` manifest埋込み、同意画面のowner HWND、UIの事前案内。実機のUAC・GUI検証は未実施。
+
 ## 目的と利用者に見える動作
 
 本人のWindows x64の既知のローカルNTFS配置で、通常のHaneを一般権限で使い、手動更新の適用時だけ必要なhelperを正規UACで昇格する。取得・署名検証だけでは昇格しない。「再起動して更新」で保存状態を確認し、必要ならWindows確認画面が開くことを日本語で案内する。同意後に適用・一般権限再起動を行う。拒否・資格情報入力取消ではいまの文書と旧版を使い続け、後から再試行できる。書込可能かつ通常起動可能な配置ではUACを出さない。

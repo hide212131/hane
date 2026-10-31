@@ -75,6 +75,19 @@ impl Placement {
     }
 }
 
+/// The OS seam of the elevated update route: the Windows consent prompt and its
+/// local channel, or nothing on an OS without one.
+pub fn system_elevation() -> Box<dyn crate::elevation::ElevationOs> {
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(windows::WindowsElevation::default())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Box::new(crate::elevation::UnavailableElevation)
+    }
+}
+
 pub(crate) fn unsupported(detail: impl Into<String>) -> UpdateError {
     UpdateError::new(ErrorCode::UnsupportedInstall, detail)
 }
