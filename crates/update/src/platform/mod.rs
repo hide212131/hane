@@ -35,6 +35,14 @@ pub const HELPER_FILE_NAME: &str = "hane-updater.exe";
 #[cfg(not(windows))]
 pub const HELPER_FILE_NAME: &str = "hane-updater";
 
+/// The name of the staged helper copy. A neutral name: Windows starts an image
+/// whose name looks like an installer or updater with `ERROR_ELEVATION_REQUIRED`
+/// (740), which says nothing about the install's placement.
+#[cfg(windows)]
+pub const STAGED_HELPER_FILE_NAME: &str = "hane-worker.exe";
+#[cfg(not(windows))]
+pub const STAGED_HELPER_FILE_NAME: &str = "hane-worker";
+
 /// A supported, verified installation of the running application.
 #[derive(Debug, Clone)]
 pub struct Placement {
@@ -72,6 +80,50 @@ impl Placement {
             Target::MacosArm64 => Box::new(crate::macos_apply::BundleView::new(&self.install_root)),
             Target::WindowsX64 => Box::new(FsDiskView::new(&self.install_root)),
         }
+    }
+}
+
+/// The OS seam of the elevated update route: the Windows consent prompt and its
+/// local channel, or nothing on an OS without one.
+pub fn system_elevation() -> Box<dyn crate::elevation::ElevationOs> {
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(windows::WindowsElevation::default())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Box::new(crate::elevation::UnavailableElevation)
+    }
+}
+
+/// Whether the current token can create files in `root`, proven by creating
+/// one: a permission error is `Denied`, every other failure `Unknown`. The probe
+/// is removed on close (Windows) or right away, and never touches a managed file.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn probe_write_access(root: &Path) -> crate::elevation::WriteAccess {
+    use crate::elevation::WriteAccess;
+    use std::io::ErrorKind;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let probe = root.join(format!(".hane-write-probe-{}-{nanos}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+    match options.open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            WriteAccess::Writable
+        }
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => WriteAccess::Denied,
+        Err(_) => WriteAccess::Unknown,
     }
 }
 
@@ -304,7 +356,7 @@ pub fn stage_helper_copy(
         ));
     }
     let dir = coordination.ensure_helper_dir(transaction)?;
-    let dest = dir.join(HELPER_FILE_NAME);
+    let dest = dir.join(STAGED_HELPER_FILE_NAME);
     durable_write(&dest, &bytes)?;
     // The copy must be owned by this principal and writable by nobody else
     // before it is hashed and run; the private subtree keeps it that way.
@@ -382,6 +434,15 @@ fn write_helper_record(
 /// recovery may run: the live install may be half replaced after a power loss.
 /// A missing, altered or foreign copy or record is an error, never a fallback.
 pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -> Result<PathBuf> {
+    staged_helper_verified(coordination, transaction).map(|(staged, _)| staged)
+}
+
+/// [`staged_helper`] together with the identity it was verified against.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn staged_helper_verified(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+) -> Result<(PathBuf, FileIdentity)> {
     let refuse = |detail: &str| UpdateError::new(ErrorCode::IdentityMismatch, detail.to_owned());
     let record = helper_record_path(coordination, transaction);
     let raw = read_limited(&record, HELPER_RECORD_LIMIT)?
@@ -401,11 +462,20 @@ pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -
         size: size.parse().map_err(|_| refuse("the staged helper record is malformed"))?,
         sha256: sha256.to_owned(),
     };
-    let staged = coordination
-        .transaction_dir(transaction)
-        .join(lease::HELPER_DIR)
-        .join(HELPER_FILE_NAME);
-    let present = hash_regular_file(&staged)?
+    let helper_dir = coordination.transaction_dir(transaction).join(lease::HELPER_DIR);
+    // A transaction journaled by an earlier build staged the copy under the
+    // installed name. It is recovered through the same identity record.
+    let (staged, present) = [STAGED_HELPER_FILE_NAME, HELPER_FILE_NAME]
+        .iter()
+        .find_map(|name| {
+            let path = helper_dir.join(name);
+            match hash_regular_file(&path) {
+                Ok(Some(hashed)) => Some(Ok((path, hashed))),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .transpose()?
         .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"))?;
     if (FileIdentity { size: present.0, sha256: present.1 }) != identity {
         return Err(UpdateError::new(
@@ -414,7 +484,7 @@ pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -
         ));
     }
     acl::verify(&staged, false)?;
-    Ok(staged)
+    Ok((staged, identity))
 }
 
 #[cfg(test)]
@@ -460,7 +530,39 @@ mod tests {
         let other_txn = TransactionId::generate().unwrap();
         let err = stage_helper_copy(&coord, &other_txn, &bad).unwrap_err();
         assert_eq!(err.code, ErrorCode::HashMismatch);
-        assert!(!coord.transaction_dir(&other_txn).join("helper").join(HELPER_FILE_NAME).exists());
+        assert!(!coord.transaction_dir(&other_txn).join("helper").join(STAGED_HELPER_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn the_write_probe_reports_what_the_token_can_do_and_leaves_nothing() {
+        use crate::elevation::WriteAccess;
+        let dir = TempDir::new("write-probe");
+        assert_eq!(probe_write_access(dir.path()), WriteAccess::Writable);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(probe_write_access(&dir.path().join("absent")), WriteAccess::Unknown);
+    }
+
+    #[test]
+    fn the_copy_is_staged_under_the_neutral_name_and_a_legacy_copy_is_still_recovered() {
+        let dir = TempDir::new("helper-names");
+        let coord = coordination(&dir);
+        let txn = TransactionId::generate().unwrap();
+        let source = dir.path().join("hane-updater-source");
+        fs::write(&source, b"helper-bytes").unwrap();
+        let verified = HelperSource { path: source, identity: FileIdentity::of(b"helper-bytes") };
+        let copy = stage_helper_copy(&coord, &txn, &verified).unwrap();
+        assert_eq!(copy.file_name().and_then(|n| n.to_str()), Some(STAGED_HELPER_FILE_NAME));
+        assert_eq!(staged_helper(&coord, &txn).unwrap(), copy);
+
+        // An earlier build's transaction holds the copy under the installed name.
+        let legacy = copy.with_file_name(HELPER_FILE_NAME);
+        fs::rename(&copy, &legacy).unwrap();
+        assert_eq!(staged_helper(&coord, &txn).unwrap(), legacy);
+
+        // A legacy copy that differs from its record is never accepted.
+        fs::remove_file(&legacy).unwrap();
+        fs::write(&legacy, b"tampered").unwrap();
+        assert!(staged_helper(&coord, &txn).is_err());
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

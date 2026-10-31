@@ -34,6 +34,40 @@ pub(crate) fn verify(path: &Path, is_dir: bool) -> Result<()> {
     imp::verify(path, is_dir)
 }
 
+/// Which owners `verify` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerRule {
+    /// The principal itself or, on Windows, the token's default owner (the
+    /// Administrators group for an elevated token).
+    UserOrDefaultOwner,
+    /// Only the principal (the token's user SID). Used for the health
+    /// capability, whose owner is explicitly set to that principal by the
+    /// process that writes it, so an elevated writer and a standard reader of
+    /// the same account agree on one owner and no default owner is trusted.
+    UserOnly,
+}
+
+fn owner_allowed(rule: OwnerRule, is_user: bool, is_default_owner: bool) -> bool {
+    match rule {
+        OwnerRule::UserOrDefaultOwner => is_user || is_default_owner,
+        OwnerRule::UserOnly => is_user,
+    }
+}
+
+/// Like [`secure_new`], and additionally makes the token's user SID the owner
+/// (Windows). An elevated token's default owner is the Administrators group;
+/// a file created by it is re-owned by the user so the same account's standard
+/// process can pass [`verify_user_owned`].
+pub(crate) fn secure_new_user_owned(path: &Path, is_dir: bool, mode: u32) -> Result<()> {
+    imp::secure_new_user_owned(path, is_dir, mode)
+}
+
+/// Like [`verify`], but the owner must be the current principal itself. The
+/// token's default owner is not accepted.
+pub(crate) fn verify_user_owned(path: &Path, is_dir: bool) -> Result<()> {
+    imp::verify_with(path, is_dir, OwnerRule::UserOnly)
+}
+
 /// A stable text form of the current OS principal (effective UID, or the
 /// process token's user SID). It cannot be changed by the launching
 /// environment and is the same principal `verify` compares ownership with.
@@ -231,7 +265,7 @@ mod imp {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
-    use super::refuse;
+    use super::{OwnerRule, owner_allowed, refuse};
     use crate::error::Result;
 
     /// Sets the mode and removes any extended ACL through one no-follow
@@ -291,7 +325,16 @@ mod imp {
         secure_entry(path, mode)
     }
 
+    pub fn secure_new_user_owned(path: &Path, is_dir: bool, mode: u32) -> Result<()> {
+        // A new file is already owned by the effective user.
+        secure_new(path, is_dir, mode)
+    }
+
     pub fn verify(path: &Path, is_dir: bool) -> Result<()> {
+        verify_with(path, is_dir, OwnerRule::UserOrDefaultOwner)
+    }
+
+    pub fn verify_with(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<()> {
         let meta = fs::symlink_metadata(path)?;
         let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
         if meta.file_type().is_symlink() || !kind_ok {
@@ -299,7 +342,7 @@ mod imp {
         }
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        if meta.uid() != euid {
+        if !owner_allowed(rule, meta.uid() == euid, false) {
             return Err(refuse(format!(
                 "{} is not owned by the current user",
                 path.display()
@@ -336,7 +379,7 @@ mod imp {
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    use super::refuse;
+    use super::{OwnerRule, owner_allowed, refuse};
     use crate::error::{Result, UpdateError};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -500,6 +543,16 @@ mod imp {
     }
 
     pub fn secure_new(path: &Path, is_dir: bool, _mode: u32) -> Result<()> {
+        secure(path, is_dir, false)
+    }
+
+    /// Also sets the token's user SID as the owner, replacing the default
+    /// owner the creating token gave the file.
+    pub fn secure_new_user_owned(path: &Path, is_dir: bool, _mode: u32) -> Result<()> {
+        secure(path, is_dir, true)
+    }
+
+    fn secure(path: &Path, is_dir: bool, set_owner: bool) -> Result<()> {
         let user = token_sid(TOKEN_USER_CLASS)?;
         let mut acl = vec![0_u32; 128];
         let flags = if is_dir { INHERIT_CONTAINER_AND_OBJECT } else { 0 };
@@ -519,14 +572,20 @@ mod imp {
             return Err(failure("an owner-only access list"));
         }
         let name = wide(path);
-        // SAFETY: `name` is NUL-terminated; `acl` is an initialized ACL. The
-        // protected flag stops parent ACEs from being inherited.
+        let (info, owner) = if set_owner {
+            (OWNER_SECURITY_INFORMATION, sid_ptr(&user))
+        } else {
+            (0, std::ptr::null_mut())
+        };
+        // SAFETY: `name` is NUL-terminated; `acl` is an initialized ACL and
+        // `owner` is null or the valid user SID copy above. The protected
+        // flag stops parent ACEs from being inherited.
         let rc = unsafe {
             SetNamedSecurityInfoW(
                 name.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
+                info | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
                 std::ptr::null_mut(),
                 acl.as_ptr().cast::<ACL>(),
                 std::ptr::null(),
@@ -542,6 +601,10 @@ mod imp {
     }
 
     pub fn verify(path: &Path, is_dir: bool) -> Result<()> {
+        verify_with(path, is_dir, OwnerRule::UserOrDefaultOwner)
+    }
+
+    pub fn verify_with(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<()> {
         let meta = fs::symlink_metadata(path)?;
         let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
         if meta.file_type().is_symlink()
@@ -577,7 +640,7 @@ mod imp {
         if owner.is_null() || dacl.is_null() {
             return Err(refuse(format!("{} has no owner-only access list", path.display())));
         }
-        if !same_sid(owner, &user) && !same_sid(owner, &default_owner) {
+        if !owner_allowed(rule, same_sid(owner, &user), same_sid(owner, &default_owner)) {
             return Err(refuse(format!(
                 "{} is not owned by the current user",
                 path.display()
@@ -625,8 +688,16 @@ mod imp {
 mod imp {
     use std::path::Path;
 
-    use super::refuse;
+    use super::{OwnerRule, refuse};
     use crate::error::Result;
+
+    pub fn secure_new_user_owned(_path: &Path, _is_dir: bool, _mode: u32) -> Result<()> {
+        Err(refuse("ownership cannot be checked on this OS"))
+    }
+
+    pub fn verify_with(_path: &Path, _is_dir: bool, _rule: OwnerRule) -> Result<()> {
+        Err(refuse("ownership cannot be checked on this OS"))
+    }
 
     pub fn principal_id() -> Result<String> {
         Err(refuse("the OS principal is unavailable on this OS"))
@@ -694,6 +765,35 @@ mod tests {
 
     fn is_refusal<T>(result: Result<T>) -> bool {
         matches!(result, Err(UpdateError { .. }))
+    }
+
+    #[test]
+    fn the_capability_owner_rule_accepts_only_the_user_never_a_default_owner() {
+        use super::{OwnerRule, owner_allowed};
+        // An elevated writer's default owner (Administrators) is not the user:
+        // the file must be re-owned by the user to be accepted.
+        assert!(!owner_allowed(OwnerRule::UserOnly, false, true));
+        assert!(!owner_allowed(OwnerRule::UserOnly, false, false));
+        assert!(owner_allowed(OwnerRule::UserOnly, true, false));
+        // The general rule keeps accepting the default owner.
+        assert!(owner_allowed(OwnerRule::UserOrDefaultOwner, false, true));
+        assert!(owner_allowed(OwnerRule::UserOrDefaultOwner, true, false));
+        assert!(!owner_allowed(OwnerRule::UserOrDefaultOwner, false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_owned_file_round_trips_and_a_loose_mode_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hane-acl-owned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("capability");
+        std::fs::write(&file, b"x").unwrap();
+        super::secure_new_user_owned(&file, false, 0o600).unwrap();
+        super::verify_user_owned(&file, false).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(is_refusal(super::verify_user_owned(&file, false)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub mod archive;
 pub mod catalog;
 pub mod clock;
 pub mod download;
+pub mod elevation;
 pub mod error;
 pub mod fsutil;
 pub mod health;

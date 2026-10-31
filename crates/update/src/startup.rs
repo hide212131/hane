@@ -1991,7 +1991,7 @@ mod tests {
         coord
             .transaction_dir(transaction)
             .join(crate::platform::lease::HELPER_DIR)
-            .join(crate::platform::HELPER_FILE_NAME)
+            .join(crate::platform::STAGED_HELPER_FILE_NAME)
     }
 
     #[test]
