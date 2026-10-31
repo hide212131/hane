@@ -43,7 +43,7 @@
 | クリック | 現在の描画位置へマウス移動・押下・解放イベントを送る |
 | ダブルクリック・右クリック | 対応するボタン・クリック回数のマウスイベントを送る |
 | キー操作 | GPUIのキー割当・イベント伝播を通す |
-| 文字入力 | 現在フォーカスされている通常の入力ハンドラーへ確定文字列を渡す |
+| 文字入力 | 現在フォーカスされている通常の入力ハンドラーへ確定文字列を渡す（IME composition中は配送しない） |
 | スクロール | 指定した位置へ通常のスクロールイベントを送る |
 | ホバー・ドラッグ | マウス移動と押下・解放の系列を送る |
 
@@ -93,12 +93,14 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 | `ui.inspect` | `id`・`ref`・`generation`で指定した対象の状態を取得 |
 | `ui.click` | `id`・`ref`・`generation`で指定してクリック |
 | `ui.key` | 現在の入力先へキー操作 |
-| `ui.text` | 現在の入力先へ確定文字列を入力 |
+| `ui.text` | 現在の入力先へ確定文字列を入力（入力先がIME composition中なら`composition_active`で失敗） |
 | `ui.wait` | `id`・`ref`・`generation`で指定した対象が、指定した状態になるまで期限付きで待機 |
 | `ui.batch` | 複数操作を順番に実行 |
 | `ui.capture` | 必要なときに画面を撮影 |
 
 `ui.key`と`ui.text`には、期待する入力先を必須指定する。実際のフォーカスと一致しなければ入力せず失敗する。
+
+`ui.text`は、`expected_focus`の確認に加えて、対象の入力先がIME composition中かを確認する。composition中（`composition_active`）なら、文字入力イベントを配送せず、compositionのcommit・cancel・置換も行わない。本文・入力欄・Undo履歴・composition stateは変更せず、`composition_active`を返す。compositionがactiveでない場合は、従来どおり確定文字列を通常の入力ハンドラーへ渡す。
 
 例えば、検索欄へ入力する場合は次の順序になる。
 
@@ -188,6 +190,8 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 
 `document-find-results`の`ref`（`el-23`）と`generation`も、同様に`ui.query`で取得済みの値である。`ref`・`generation`が現在の登録要素と一致しない手順は、同じIDの現行要素へ再解決せず`target_stale`で失敗し、一括実行はそこで停止する。
 
+例の`ui.text`は、検索欄がIME composition中でない場合に確定文字列を入力する。composition中なら入力せず`composition_active`で失敗し、一括実行はそこで停止する。
+
 `primary`はmacOSではCommand、WindowsではCtrlとする。実際に配送したキーは結果に記録する。
 
 一回の呼び出しで操作列を実行し、通常時は短い結果だけ返す。画像や詳細な状態は要求時・失敗時に取得する。
@@ -233,6 +237,8 @@ IDはウィンドウ内で一意とする。タブ・ファイル行・検索結
 `target_not_found`、`target_ambiguous`、`target_stale`、`target_disabled`、`target_occluded`、`focus_mismatch`、`composition_active`、`timeout`。
 
 `target_stale`は、`ui.inspect`、`ui.click`、`ui.wait`の要求の`ref`・`generation`が登録要素と一致しない、失効済み、または再描画で置換された場合に返す。同じIDの現行要素へ再解決せず、画面入力も待機成功も発生させない。
+
+`composition_active`は、`ui.text`の入力先がIME composition中の場合に返す。文字入力イベントの配送、compositionのcommit・cancel・置換、本文・入力欄・Undo履歴・composition stateの変更はいずれも発生させない。
 
 一括実行は最初の失敗で停止し、完了した手順と失敗した手順を返す。過去の編集は巻き戻さない。初期版の`stop_on_error`は`true`だけを受理する。
 
@@ -327,6 +333,7 @@ API経由のテスト結果には入力経路を記録する。画面の正し�
 
 - [ ] クリック処理を無効にした場合、期待状態の確認が失敗する。
 - [ ] フォーカスが別の欄にある場合、文字を入力しない。
+- [ ] 入力先がIME composition中の場合、`ui.text`は文字入力イベントを配送せず、compositionをcommit・cancel・置換せず、本文・入力欄・Undo履歴・composition stateを変更しないで`composition_active`を返す。compositionがactiveでない場合の通常の確定文字列入力は維持する。
 - [ ] ダイアログの背後や失効した要素を操作しない。
 - [ ] 古い`ref`・`generation`を指定した`ui.inspect`・`ui.click`・`ui.wait`は、同IDの現行要素へ再解決せず、画面入力も待機成功も発生させずに`target_stale`を返す。
 - [ ] 入力がUndo履歴や保存処理へ通常どおり反映される。
