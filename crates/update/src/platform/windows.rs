@@ -319,6 +319,22 @@ impl crate::elevation::ElevatedLauncher for RunasLauncher {
         if !helper.is_absolute() {
             return Err(failure("validate-path", None));
         }
+        // Everything verified below stays pinned until the process exists, so
+        // the image the loader maps is the one that was hashed. A path that
+        // cannot be pinned is refused before any consent prompt.
+        let pinned = PinnedHelper::acquire(helper)
+            .map_err(|err| failure("pin-helper", err.raw_os_error().map(|raw| raw as u32)))?;
+        let (coordination, transaction) = super::Coordination::from_helper_exe(helper)
+            .map_err(|_| failure("verify-helper", None))?;
+        let (staged, identity) = super::staged_helper_verified(&coordination, &transaction)
+            .map_err(|_| failure("verify-helper", None))?;
+        if staged != helper {
+            return Err(failure("verify-helper", None));
+        }
+        match pinned.identity() {
+            Ok(held) if held == identity => {}
+            _ => return Err(failure("verify-pinned-helper", None)),
+        }
         let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
         let file = wide_path(helper);
         let parameters: Vec<u16> = crate::elevation::ELEVATED_ARGUMENT
@@ -352,7 +368,87 @@ impl crate::elevation::ElevatedLauncher for RunasLauncher {
         if pid == 0 {
             return Err(failure("process-id", None));
         }
+        // The process exists, so its image is already acquired.
+        drop(pinned);
         Ok(process)
+    }
+}
+
+/// `FILE_SHARE_READ`: while a handle opened with only this share mode is alive,
+/// nobody can open the object for write or delete, or rename it.
+const SHARE_READ_ONLY: u32 = 0x1;
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// The helper file and every directory above it, held open without write or
+/// delete sharing. While it lives, the file cannot be replaced, rewritten,
+/// deleted or renamed, and no ancestor can be renamed, deleted or swapped for a
+/// link, so the path the loader resolves is the object that was verified.
+pub(crate) struct PinnedHelper {
+    file: File,
+    _ancestors: Vec<File>,
+}
+
+fn open_pinned(path: &Path, directory: bool) -> std::io::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
+    if directory {
+        flags |= FILE_FLAG_BACKUP_SEMANTICS;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_ONLY)
+        .custom_flags(flags)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || meta.is_dir() != directory {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the helper path is not made of plain directories and a plain file",
+        ));
+    }
+    Ok(file)
+}
+
+impl PinnedHelper {
+    /// Pins the ancestors from the root down, then the file. Every object is
+    /// checked through its own handle to be a plain directory or file (no link),
+    /// so a link swapped in before the pin is refused. Fails closed when any
+    /// object cannot be held.
+    pub(crate) fn acquire(path: &Path) -> std::io::Result<Self> {
+        if path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the helper path is not normalised",
+            ));
+        }
+        let mut dirs: Vec<&Path> = path
+            .ancestors()
+            .skip(1)
+            .filter(|dir| dir.file_name().is_some())
+            .collect();
+        dirs.reverse();
+        let mut ancestors = Vec::with_capacity(dirs.len());
+        for dir in dirs {
+            ancestors.push(open_pinned(dir, true)?);
+        }
+        let file = open_pinned(path, false)?;
+        Ok(Self { file, _ancestors: ancestors })
+    }
+
+    /// The size and SHA-256 of the pinned file, read through the pinned handle.
+    pub(crate) fn identity(&self) -> std::io::Result<FileIdentity> {
+        use std::io::{Seek, SeekFrom};
+        let mut handle = &self.file;
+        handle.seek(SeekFrom::Start(0))?;
+        let limit = crate::limits::MAX_ENTRY_BYTES;
+        let mut bytes = Vec::new();
+        handle.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the helper is too large"));
+        }
+        Ok(FileIdentity::of(&bytes))
     }
 }
 
@@ -1339,6 +1435,60 @@ pub fn installed_helper(placement: &Placement, policy: &TrustPolicy) -> Result<H
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pinned_helper_cannot_be_replaced_or_moved_before_the_loader_has_it() {
+        let dir = crate::testing::TempDir::new("pinned-helper");
+        let parent = dir.path().join("helper");
+        fs::create_dir(&parent).unwrap();
+        let helper = parent.join("hane-updater.exe");
+        fs::write(&helper, b"verified").unwrap();
+
+        let pin = PinnedHelper::acquire(&helper).unwrap();
+        assert_eq!(pin.identity().unwrap(), FileIdentity::of(b"verified"));
+
+        // The substitutions of the race: rewrite, delete, replace by rename,
+        // and move the parent away.
+        assert!(fs::write(&helper, b"swapped").is_err());
+        assert!(fs::remove_file(&helper).is_err());
+        let other = parent.join("other.exe");
+        fs::write(&other, b"attacker").unwrap();
+        assert!(fs::rename(&other, &helper).is_err());
+        assert!(fs::rename(&parent, dir.path().join("moved")).is_err());
+        assert!(fs::remove_dir_all(&parent).is_err() || helper.exists());
+        assert_eq!(pin.identity().unwrap(), FileIdentity::of(b"verified"));
+
+        drop(pin);
+        assert_eq!(fs::read(&helper).unwrap(), b"verified");
+        fs::rename(&parent, dir.path().join("moved")).unwrap();
+    }
+
+    #[test]
+    fn a_helper_path_that_cannot_be_pinned_is_refused() {
+        let dir = crate::testing::TempDir::new("pinned-helper-refused");
+        assert!(PinnedHelper::acquire(&dir.path().join("missing.exe")).is_err());
+        // A directory is not a helper image.
+        assert!(PinnedHelper::acquire(dir.path()).is_err());
+        let held = dir.path().join("held.exe");
+        fs::write(&held, b"x").unwrap();
+        // An existing writer makes the pin impossible, so the launch is refused
+        // before the consent prompt instead of racing it.
+        let writer = fs::OpenOptions::new().write(true).open(&held).unwrap();
+        assert!(PinnedHelper::acquire(&held).is_err());
+        drop(writer);
+        assert!(PinnedHelper::acquire(&held).is_ok());
+    }
+
+    #[test]
+    fn a_launch_of_an_unstaged_helper_is_refused_before_any_prompt() {
+        use crate::elevation::ElevatedLauncher;
+        let dir = crate::testing::TempDir::new("pinned-helper-launch");
+        let helper = dir.path().join("hane-updater.exe");
+        fs::write(&helper, b"not staged").unwrap();
+        let mut launcher = RunasLauncher { owner_hwnd: 0 };
+        let failure = launcher.launch(&helper).err().expect("an unstaged helper must not launch");
+        assert_eq!(failure.stage, "verify-helper");
+    }
 
     fn volume(guid: &str, serial: u32, file_system: &str, fixed: bool) -> Volume {
         Volume {

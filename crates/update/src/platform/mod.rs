@@ -395,6 +395,15 @@ fn write_helper_record(
 /// recovery may run: the live install may be half replaced after a power loss.
 /// A missing, altered or foreign copy or record is an error, never a fallback.
 pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -> Result<PathBuf> {
+    staged_helper_verified(coordination, transaction).map(|(staged, _)| staged)
+}
+
+/// [`staged_helper`] together with the identity it was verified against.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn staged_helper_verified(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+) -> Result<(PathBuf, FileIdentity)> {
     let refuse = |detail: &str| UpdateError::new(ErrorCode::IdentityMismatch, detail.to_owned());
     let record = helper_record_path(coordination, transaction);
     let raw = read_limited(&record, HELPER_RECORD_LIMIT)?
@@ -427,7 +436,7 @@ pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -
         ));
     }
     acl::verify(&staged, false)?;
-    Ok(staged)
+    Ok((staged, identity))
 }
 
 #[cfg(test)]
