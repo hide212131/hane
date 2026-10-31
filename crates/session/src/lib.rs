@@ -50,7 +50,10 @@ pub use draft::{
     DraftId, DraftStore, OsDraftStore, RecoveredDraft, RecoveredDrafts,
     next_draft_snapshot_sequence,
 };
-pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
+pub use identity::{
+    ContentFingerprint, ExternalChange, FileIdentity, FilePresence, FileStamp, FileState,
+    Fingerprinter, lexical_canonical,
+};
 pub use naming::{
     TitleSyncAction, decide_title_sync, extract_h1_title, unique_folder_name,
     unique_markdown_filename,
@@ -61,19 +64,24 @@ pub use pins::{
 };
 pub use resource::ResourceResolver;
 pub use service::{
-    FileService, LoadedFile, OsFileService, OverwriteGuard, ReadFile, SaveFailure, SavedFile,
-    run_create_new_job, run_save_job,
+    DiskVersion, FileService, LoadedFile, ObservedFile, OsFileService, OverwriteGuard, ReadFile,
+    SaveFailure, SavedFile, observe_disk, run_create_new_job, run_save_job,
 };
 pub use session::{
-    AutosaveTicket, CloseDecision, DocumentSession, FileEvent, FileEventOutcome, OpenDecision,
-    OpenPolicy, SaveDecision, SaveIntent, SaveJob, SaveOutcome, SaveTicket, SessionId, SessionSet,
-    SessionViewState, UnsavedChanges,
+    AutosaveTicket, CloseDecision, DocumentSession, ExternalCheckOutcome, ExternalCheckRequest,
+    ExternalCheckResult, ExternalCheckStart, ExternalCheckTicket, ExternalStatus, FileEvent,
+    FileEventOutcome, OpenDecision, OpenPolicy, ReloadOutcome, ReloadVerifyOutcome,
+    ReloadVerifyRequest, ReloadVerifyResult, ResolutionApproval, ResolutionKind, SaveDecision,
+    SaveIntent, SaveJob, SaveOutcome, SaveTicket, SessionId, SessionSet, SessionViewState,
+    UnsavedChanges, run_external_check, run_reload_verification,
 };
 pub use store::{
     FileStateStore, InvalidNetworkConfig, MemoryStateStore, NetworkConfig, RecentFiles,
     RecentFilesRepository, Settings, SettingsRepository, StateStores, ThemePreference, pin_state_root,
 };
-pub use watch::{DEFAULT_MAX_WAIT, DEFAULT_QUIET_PERIOD, FolderWatcher, WatchBatch, WatchTiming};
+pub use watch::{
+    DEFAULT_MAX_WAIT, DEFAULT_QUIET_PERIOD, FolderWatcher, WatchBatch, WatchTiming, WatchedNames,
+};
 pub use workfolder::{
     OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderFolder, WorkFolderNode,
     WorkFolderScanner, WorkFolderSortOrder, next_modified_sequence, stamp_with_sequence,

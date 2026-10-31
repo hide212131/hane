@@ -1,4 +1,4 @@
-use crate::identity::{FileIdentity, FileStamp};
+use crate::identity::{ContentFingerprint, FileIdentity, FileStamp};
 use hane_document::RopeBuffer;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
@@ -13,6 +13,11 @@ pub struct LoadedFile {
     pub document: RopeBuffer,
     pub identity: FileIdentity,
     pub stamp: Option<FileStamp>,
+    /// Fingerprint of the disk content that `document` was read from,
+    /// computed on the loading (background) path. It becomes the session's
+    /// baseline so a same-stamp external rewrite is still detected before the
+    /// first background check. `None` when the service cannot provide one.
+    pub fingerprint: Option<ContentFingerprint>,
 }
 
 /// A read-only file handle used by streaming features such as content search.
@@ -105,6 +110,64 @@ impl StampedRead for OsStampedRead {
 pub struct SavedFile {
     pub identity: FileIdentity,
     pub stamp: Option<FileStamp>,
+    /// Fingerprint of the bytes that were written, so the session's baseline
+    /// follows what actually reached the disk.
+    pub fingerprint: Option<ContentFingerprint>,
+}
+
+/// One consistent read of a file for external-change checks: the document, the
+/// fingerprint of exactly those bytes, and the stamp of the handle they came
+/// from.
+pub struct ObservedFile {
+    pub document: RopeBuffer,
+    pub fingerprint: ContentFingerprint,
+    pub stamp: Option<FileStamp>,
+    /// The path the file was resolved to when it was read (a symlink may have
+    /// been pointed elsewhere since the document was opened).
+    pub canonical: Option<PathBuf>,
+}
+
+/// What a background check found at a path. `Unreadable` is never "no change":
+/// the caller keeps its document and reports the reason.
+pub enum DiskVersion {
+    Present(Box<ObservedFile>),
+    Missing,
+    Unreadable(String),
+}
+
+/// How many times a read that raced a writer is retried before the check
+/// gives up and reports the file as unstable rather than accepting a mix.
+const OBSERVE_ATTEMPTS: usize = 3;
+
+/// Reads `path` as one consistent version. The stamp of the opened handle must
+/// still equal the path's stamp after the read, otherwise the file changed or
+/// was atomically replaced mid-read and the read is retried (bounded). Runs on
+/// a background thread; it reads and hashes the whole file.
+pub fn observe_disk(service: &dyn FileService, path: &Path) -> DiskVersion {
+    for _ in 0..OBSERVE_ATTEMPTS {
+        if service.stamp(path).is_none() {
+            return DiskVersion::Missing;
+        }
+        let loaded = match service.load(path) {
+            Ok(loaded) => loaded,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return DiskVersion::Missing,
+            Err(error) => return DiskVersion::Unreadable(error.to_string()),
+        };
+        let after = service.stamp(path);
+        if loaded.stamp.is_some() && loaded.stamp != after {
+            continue;
+        }
+        let fingerprint = loaded
+            .fingerprint
+            .unwrap_or_else(|| ContentFingerprint::of_document(&loaded.document));
+        return DiskVersion::Present(Box::new(ObservedFile {
+            document: loaded.document,
+            fingerprint,
+            stamp: loaded.stamp,
+            canonical: Some(loaded.identity.canonical_path().to_path_buf()),
+        }));
+    }
+    DiskVersion::Unreadable("ファイルが更新され続けているため、整合した内容を読めませんでした".to_owned())
 }
 
 /// Why a save did not happen.
@@ -154,6 +217,29 @@ pub trait FileService: Send + Sync + 'static {
         self.save(path, document)
     }
 
+    /// Saves like `save` (or `save_in_existing_directory` when
+    /// `create_parent` is false) after running `check`. `check` is given the
+    /// path whose contents to inspect. Implementations that write through a
+    /// temporary file must check again on the exact version being replaced
+    /// (moved aside atomically first), so an external write that lands before
+    /// the replace is reported instead of overwritten. The default only
+    /// checks once, before writing.
+    fn save_checked(
+        &self,
+        path: &Path,
+        document: &RopeBuffer,
+        create_parent: bool,
+        check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+    ) -> Result<SavedFile, SaveFailure> {
+        check(path)?;
+        let saved = if create_parent {
+            self.save(path, document)
+        } else {
+            self.save_in_existing_directory(path, document)
+        };
+        saved.map_err(SaveFailure::Io)
+    }
+
     /// Current stamp, or `None` when the file does not exist.
     fn stamp(&self, path: &Path) -> Option<FileStamp>;
 
@@ -190,8 +276,9 @@ pub fn run_save_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    check_overwrite_guard(service, path, guard)?;
-    service.save(path, document).map_err(SaveFailure::Io)
+    service.save_checked(path, document, true, &|inspect| {
+        check_overwrite_guard(service, inspect, guard)
+    })
 }
 
 /// Shared `ExpectStamp` check for every job that writes to a path. `Force`
@@ -202,8 +289,12 @@ fn check_overwrite_guard(
     path: &Path,
     guard: OverwriteGuard,
 ) -> Result<(), SaveFailure> {
-    let OverwriteGuard::ExpectStamp(expected) = guard else {
-        return Ok(());
+    let expected = match guard {
+        OverwriteGuard::Force => return Ok(()),
+        OverwriteGuard::ExpectContent { stamp, baseline } => {
+            return check_content_guard(service, path, stamp, baseline);
+        }
+        OverwriteGuard::ExpectStamp(expected) => expected,
     };
     let unchanged = match (expected, service.stamp(path)) {
         (Some(expected), Some(current)) => expected == current,
@@ -220,6 +311,41 @@ fn check_overwrite_guard(
     }
 }
 
+/// The content-based guard: the disk must still hold the version the session
+/// believes it is replacing. It does not depend on a watcher notification
+/// having arrived, and it does not trust the stamp alone.
+///
+/// - The file is gone: allowed only when the session never knew a stamp (a
+///   file it has not written yet). A file that existed and vanished is not
+///   silently recreated.
+/// - The file cannot be read (permission, invalid text, unstable): refused as
+///   an I/O error, never treated as unchanged.
+/// - A known baseline fingerprint must equal the fingerprint of what is on
+///   disk now; without one the stamp is the best remaining evidence.
+fn check_content_guard(
+    service: &dyn FileService,
+    path: &Path,
+    stamp: Option<FileStamp>,
+    baseline: Option<ContentFingerprint>,
+) -> Result<(), SaveFailure> {
+    match observe_disk(service, path) {
+        DiskVersion::Missing => {
+            if stamp.is_none() && baseline.is_none() {
+                Ok(())
+            } else {
+                Err(SaveFailure::ExternalChange)
+            }
+        }
+        DiskVersion::Unreadable(reason) => Err(SaveFailure::Io(io::Error::other(reason))),
+        DiskVersion::Present(file) => match (baseline, stamp) {
+            (Some(baseline), _) if file.fingerprint == baseline => Ok(()),
+            (Some(_), _) | (None, None) => Err(SaveFailure::ExternalChange),
+            (None, Some(stamp)) if file.stamp == Some(stamp) => Ok(()),
+            (None, Some(_)) => Err(SaveFailure::ExternalChange),
+        },
+    }
+}
+
 /// Runs the first write of a `SaveIntent::CreateNew` job: the same
 /// stamp-based collision guard as `run_save_job`, but the destination
 /// directory must already exist. A directory deleted after the target name
@@ -230,10 +356,9 @@ pub fn run_create_new_job(
     document: &RopeBuffer,
     guard: OverwriteGuard,
 ) -> Result<SavedFile, SaveFailure> {
-    check_overwrite_guard(service, path, guard)?;
-    service
-        .save_in_existing_directory(path, document)
-        .map_err(SaveFailure::Io)
+    service.save_checked(path, document, false, &|inspect| {
+        check_overwrite_guard(service, inspect, guard)
+    })
 }
 
 /// Whether a write must first prove the file has not changed underneath it.
@@ -244,6 +369,60 @@ pub enum OverwriteGuard {
     Force,
     /// Write only if the disk still matches the stamp the session recorded.
     ExpectStamp(Option<FileStamp>),
+    /// Write only if the disk still holds the recorded content: the baseline
+    /// fingerprint when known, else the stamp. Used for every ordinary save of
+    /// a tracked file and, with the version the user was shown, for a
+    /// confirmed overwrite.
+    ExpectContent {
+        stamp: Option<FileStamp>,
+        baseline: Option<ContentFingerprint>,
+    },
+}
+
+/// How many times a load whose path was replaced during the read is retried
+/// before it fails instead of returning a body from a file the path no longer
+/// names.
+const LOAD_ATTEMPTS: usize = 3;
+
+/// Reads `path` through one handle and accepts the result only if the path
+/// still names that same file afterwards. `after_read` runs between the read
+/// and the check, and `after_identity` runs between resolving the path identity
+/// and the final check, so tests can replace the path at exactly those points.
+///
+/// The path identity is resolved before the last handle/path comparison, so a
+/// replacement at any earlier point is caught and the identity returned always
+/// belongs to the file the body was read from.
+fn load_verified(
+    path: &Path,
+    after_read: &dyn Fn(usize),
+    after_identity: &dyn Fn(usize),
+) -> io::Result<LoadedFile> {
+    recover_displaced_file(path);
+    for attempt in 0..LOAD_ATTEMPTS {
+        let file = fs::File::open(path)?;
+        let stamp = stamp_from_metadata(file.metadata().ok());
+        let mut reader = io::BufReader::new(file);
+        let document = RopeBuffer::from_reader(&mut reader)?;
+        after_read(attempt);
+        if !crate::identity::handle_is_path(reader.get_ref(), path)? {
+            continue;
+        }
+        let identity = identity_for(path);
+        after_identity(attempt);
+        if !crate::identity::handle_is_path(reader.get_ref(), path)? {
+            continue;
+        }
+        let fingerprint = Some(ContentFingerprint::of_document(&document));
+        return Ok(LoadedFile {
+            document,
+            identity,
+            stamp,
+            fingerprint,
+        });
+    }
+    Err(io::Error::other(
+        "ファイルが読込中に置き換えられ続けているため、整合した内容を読めませんでした",
+    ))
 }
 
 /// `FileService` backed by the real filesystem.
@@ -263,14 +442,7 @@ impl FileService for OsFileService {
     }
 
     fn load(&self, path: &Path) -> io::Result<LoadedFile> {
-        let file = fs::File::open(path)?;
-        let stamp = stamp_from_metadata(file.metadata().ok());
-        let document = RopeBuffer::from_reader(io::BufReader::new(file))?;
-        Ok(LoadedFile {
-            document,
-            identity: identity_for(path),
-            stamp,
-        })
+        load_verified(path, &|_| {}, &|_| {})
     }
 
     fn save(&self, path: &Path, document: &RopeBuffer) -> io::Result<SavedFile> {
@@ -278,6 +450,7 @@ impl FileService for OsFileService {
         Ok(SavedFile {
             identity: identity_for(path),
             stamp: self.stamp(path),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
         })
     }
 
@@ -290,6 +463,30 @@ impl FileService for OsFileService {
         Ok(SavedFile {
             identity: identity_for(path),
             stamp: self.stamp(path),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
+        })
+    }
+
+    fn save_checked(
+        &self,
+        path: &Path,
+        document: &RopeBuffer,
+        create_parent: bool,
+        check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+    ) -> Result<SavedFile, SaveFailure> {
+        check(path)?;
+        // The version being replaced is checked again after it is atomically
+        // moved aside, so what is verified is exactly what gets replaced.
+        atomic_write_checked(
+            path,
+            create_parent,
+            |writer| document.write_to(writer),
+            check,
+        )?;
+        Ok(SavedFile {
+            identity: identity_for(path),
+            stamp: self.stamp(path),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
         })
     }
 
@@ -654,17 +851,35 @@ fn rename_path_without_replace(from: &Path, to: &Path) -> io::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows' MoveFileEx implementation, which backs std::fs::rename,
-        // refuses an existing destination unless the replace flag is passed.
-        // Keep the explicit existence check for a useful, deterministic error
-        // and retain the no-replace call at the OS boundary.
-        if to.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "rename target already exists",
-            ));
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         }
-        fs::rename(from, to)
+
+        fn wide(path: &Path) -> io::Result<Vec<u16>> {
+            let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if units.contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path contains NUL",
+                ));
+            }
+            units.push(0);
+            Ok(units)
+        }
+
+        // std::fs::rename passes MOVEFILE_REPLACE_EXISTING, so an existence
+        // check followed by it could replace a destination created in between.
+        // Calling MoveFileExW with no flags makes the OS itself refuse an
+        // existing destination (ERROR_ALREADY_EXISTS) atomically.
+        let from = wide(from)?;
+        let to = wide(to)?;
+        let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+        (result != 0)
+            .then_some(())
+            .ok_or_else(io::Error::last_os_error)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -697,12 +912,50 @@ fn atomic_write(
     create_parent: bool,
     write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
 ) -> io::Result<()> {
+    atomic_write_checked(path, create_parent, write, &|_| Ok(())).map_err(|failure| match failure {
+        SaveFailure::Io(error) => error,
+        SaveFailure::ExternalChange => io::Error::other("file changed on disk"),
+    })
+}
+
+/// Like `atomic_write`, but checks the version being replaced after the
+/// temporary file is durable. `check` receives the location to inspect: the
+/// target moved aside at the moment of replacement. A failing check removes
+/// the temporary file and leaves the target in place.
+fn atomic_write_checked(
+    path: &Path,
+    create_parent: bool,
+    write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
+    check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+) -> Result<(), SaveFailure> {
+    atomic_write_checked_with_hook(path, create_parent, write, check, &|| {})
+}
+
+/// `before_displace` runs after the temporary file is durable and right
+/// before the target is moved aside; tests use it to place an external
+/// version in exactly that window.
+fn atomic_write_checked_with_hook(
+    path: &Path,
+    create_parent: bool,
+    write: impl FnOnce(&mut BufWriter<fs::File>) -> io::Result<()>,
+    check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+    before_displace: &dyn Fn(),
+) -> Result<(), SaveFailure> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     if create_parent {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(SaveFailure::Io)?;
+    }
+    recover_displaced_file(path);
+    // A directory is never a save target: the move-aside install below would
+    // otherwise rename and replace it.
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(SaveFailure::Io(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            format!("{} is a directory", path.display()),
+        )));
     }
     let stem = path
         .file_name()
@@ -717,19 +970,153 @@ fn atomic_write(
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary)?;
+            .open(&temporary)
+            .map_err(SaveFailure::Io)?;
         let mut writer = BufWriter::new(file);
-        write(&mut writer)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+        write(&mut writer).map_err(SaveFailure::Io)?;
+        writer.flush().map_err(SaveFailure::Io)?;
+        writer.get_ref().sync_all().map_err(SaveFailure::Io)?;
         drop(writer);
-        fs::rename(&temporary, path)
+        before_displace();
+        install_checked(&temporary, path, check)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
 }
+
+/// Installs `temporary` at `path` without ever replacing a version that was
+/// not checked. A plain `rename` cannot compare-and-swap, so the current
+/// target is first moved aside atomically: whatever sits at `path` at that
+/// instant is exactly what gets checked (at its new name), and a file that an
+/// external app places later is never overwritten because the final install
+/// refuses to replace. A failed check puts the displaced version back.
+fn install_checked(
+    temporary: &Path,
+    path: &Path,
+    check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+) -> Result<(), SaveFailure> {
+    // Each retry means another writer created a new file at `path` between
+    // the move-aside and the install; that file is judged on the next round.
+    for _ in 0..MAX_INSTALL_ATTEMPTS {
+        let aside = displaced_path(path);
+        match rename_file_without_replace(path, &aside) {
+            Ok(()) => {
+                if let Err(failure) = check(&aside) {
+                    return Err(restore_displaced(&aside, path, failure));
+                }
+                match rename_file_without_replace(temporary, path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&aside);
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let _ = fs::remove_file(&aside);
+                    }
+                    Err(error) => {
+                        return Err(restore_displaced(&aside, path, SaveFailure::Io(error)));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                check(path)?;
+                match rename_file_without_replace(temporary, path) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(SaveFailure::Io(error)),
+                }
+            }
+            Err(error) => return Err(SaveFailure::Io(error)),
+        }
+    }
+    Err(SaveFailure::ExternalChange)
+}
+
+/// Puts a displaced version back at `path` and returns `failure`. If another
+/// file has appeared there meanwhile the displaced version is kept at its
+/// aside name and reported, never deleted or overwritten.
+fn restore_displaced(aside: &Path, path: &Path, failure: SaveFailure) -> SaveFailure {
+    match rename_file_without_replace(aside, path) {
+        Ok(()) => failure,
+        Err(restore_error) => SaveFailure::Io(io::Error::other(format!(
+            "{failure}; restoring the original file failed ({restore_error}); \
+             the previous version remains at {}",
+            aside.display()
+        ))),
+    }
+}
+
+fn displaced_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document");
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{stem}.hane-displaced-{}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+/// Restores the previous version of `path` after a process died between moving
+/// it aside and installing the new one. Only the unambiguous case is acted on:
+/// `path` does not exist and exactly one well-formed displaced file from
+/// another process sits next to it. A file at `path`, several candidates, or
+/// unrecognized names are left untouched so no content is overwritten or
+/// guessed at. Returns whether a file was restored.
+fn recover_displaced_file(path: &Path) -> bool {
+    if fs::symlink_metadata(path).is_ok() {
+        return false;
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(stem) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = format!(".{stem}.hane-displaced-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    let own_pid = std::process::id().to_string();
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|name| name.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let Some((pid, sequence)) = rest.split_once('-') else {
+            continue;
+        };
+        let is_number = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        if !is_number(pid) || !is_number(sequence) {
+            continue;
+        }
+        // A displaced file of this process belongs to a save in progress.
+        if pid == own_pid {
+            return false;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            candidates.push(entry.path());
+        }
+    }
+    match candidates.as_slice() {
+        [only] => rename_file_without_replace(only, path).is_ok(),
+        _ => false,
+    }
+}
+
+const MAX_INSTALL_ATTEMPTS: usize = 3;
 
 #[cfg(test)]
 pub(crate) fn temporary_directory(name: &str) -> PathBuf {
@@ -745,6 +1132,289 @@ mod tests {
     use super::*;
     use crate::testing::MemoryFileService;
 
+    const STALE_PID: u32 = u32::MAX;
+
+    fn stale_displaced(root: &Path, name: &str, pid: u32, sequence: u32) -> PathBuf {
+        root.join(format!(".{name}.hane-displaced-{pid}-{sequence}.tmp"))
+    }
+
+    #[test]
+    fn interrupted_save_restores_the_displaced_file_when_the_target_is_missing() {
+        let root = temporary_directory("recover-displaced-missing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", STALE_PID, 0);
+        fs::write(&aside, "old body").unwrap();
+
+        atomic_write_bytes(&path, b"new body").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new body");
+        // The old version was restored first, then replaced by the save.
+        assert!(!aside.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_restores_the_displaced_file_when_the_target_is_missing() {
+        let root = temporary_directory("recover-displaced-load");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", STALE_PID, 0);
+        fs::write(&aside, "old body").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|_| {}).unwrap();
+
+        assert_eq!(loaded.document.full_text(), "old body");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old body");
+        assert!(!aside.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_never_overwrites_a_file_placed_at_the_target() {
+        let root = temporary_directory("recover-displaced-external");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", STALE_PID, 0);
+        fs::write(&aside, "old body").unwrap();
+        fs::write(&path, "external body").unwrap();
+
+        assert!(!recover_displaced_file(&path));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external body");
+        assert_eq!(fs::read_to_string(&aside).unwrap(), "old body");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_leaves_ambiguous_and_unrecognized_files_untouched() {
+        let root = temporary_directory("recover-displaced-ambiguous");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let first = stale_displaced(&root, "document.md", STALE_PID, 0);
+        let second = stale_displaced(&root, "document.md", STALE_PID - 1, 7);
+        let unrecognized = root.join(".document.md.hane-displaced-abc.tmp");
+        let other_document = stale_displaced(&root, "other.md", STALE_PID, 0);
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        fs::write(&unrecognized, "unknown").unwrap();
+        fs::write(&other_document, "other").unwrap();
+
+        assert!(!recover_displaced_file(&path));
+        assert!(!path.exists());
+
+        fs::remove_file(&first).unwrap();
+        fs::remove_file(&second).unwrap();
+        // Only an unrecognized name remains: nothing is guessed.
+        assert!(!recover_displaced_file(&path));
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&unrecognized).unwrap(), "unknown");
+        assert_eq!(fs::read_to_string(&other_document).unwrap(), "other");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_ignores_the_displaced_file_of_a_save_in_this_process() {
+        let root = temporary_directory("recover-displaced-own-pid");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        let aside = stale_displaced(&root, "document.md", std::process::id(), 0);
+        fs::write(&aside, "in flight").unwrap();
+
+        assert!(!recover_displaced_file(&path));
+
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&aside).unwrap(), "in flight");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Atomically replaces `path` with `text`, giving it the same mtime as the
+    /// file it replaces, so size and mtime alone cannot tell the two apart.
+    #[cfg(unix)]
+    fn replace_with_same_stamp(path: &Path, text: &str) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let staging = path.with_extension("replacement");
+        fs::write(&staging, text).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(&staging, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_a_body_read_from_a_file_replaced_with_the_same_stamp() {
+        let root = temporary_directory("load-replaced-same-stamp");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "old body").unwrap();
+
+        let loaded = load_verified(
+            &path,
+            &|attempt| {
+                if attempt == 0 {
+                    replace_with_same_stamp(&path, "new body");
+                }
+            },
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(loaded.document.full_text(), "new body");
+        assert_eq!(
+            loaded.fingerprint,
+            Some(ContentFingerprint::of_bytes(b"new body"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_a_body_when_the_file_is_replaced_after_the_identity_is_resolved() {
+        let root = temporary_directory("load-replaced-after-identity");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "old body").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|attempt| {
+            if attempt == 0 {
+                replace_with_same_stamp(&path, "new body");
+            }
+        })
+        .unwrap();
+
+        assert_eq!(loaded.document.full_text(), "new body");
+        assert_eq!(
+            loaded.fingerprint,
+            Some(ContentFingerprint::of_bytes(b"new body"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_fails_when_replacement_after_the_identity_never_settles() {
+        let root = temporary_directory("load-replaced-after-identity-always");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "body-0").unwrap();
+
+        let result = load_verified(&path, &|_| {}, &|attempt| {
+            replace_with_same_stamp(&path, &format!("body-{}", attempt + 1));
+        });
+
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Windows counterpart of `replace_with_same_stamp`. `fs::File` opens with
+    /// read/write/delete sharing, so renaming a staged file over a path whose
+    /// old file is still open by the loader is allowed; the open handle keeps
+    /// naming the old file while the path names the new one.
+    #[cfg(windows)]
+    fn replace_with_same_stamp_on_windows(path: &Path, text: &str) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let staging = path.with_extension("replacement");
+        fs::write(&staging, text).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(&staging, path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_rejects_a_body_when_the_file_is_replaced_after_the_identity_is_resolved_on_windows() {
+        let root = temporary_directory("load-replaced-after-identity-windows");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "old body").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|attempt| {
+            if attempt == 0 {
+                replace_with_same_stamp_on_windows(&path, "new body");
+            }
+        })
+        .unwrap();
+
+        assert_eq!(loaded.document.full_text(), "new body");
+        assert_eq!(
+            loaded.fingerprint,
+            Some(ContentFingerprint::of_bytes(b"new body"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_fails_when_replacement_after_the_identity_never_settles_on_windows() {
+        let root = temporary_directory("load-replaced-after-identity-always-windows");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "body-0").unwrap();
+
+        let result = load_verified(&path, &|_| {}, &|attempt| {
+            replace_with_same_stamp_on_windows(&path, &format!("body-{}", attempt + 1));
+        });
+
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_with_both_checks_succeeds_for_an_unchanged_file_on_windows() {
+        let root = temporary_directory("load-unchanged-windows");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "stable").unwrap();
+
+        let loaded = load_verified(&path, &|_| {}, &|_| {}).unwrap();
+
+        assert_eq!(loaded.document.full_text(), "stable");
+        assert!(loaded.identity.matches_path(&path));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_fails_instead_of_returning_a_stale_body_when_replacement_never_settles() {
+        let root = temporary_directory("load-replaced-always");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "body-0").unwrap();
+
+        let result = load_verified(
+            &path,
+            &|attempt| {
+                replace_with_same_stamp(&path, &format!("body-{}", attempt + 1));
+            },
+            &|_| {},
+        );
+
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_of_an_unchanged_file_succeeds() {
+        let root = temporary_directory("load-unchanged");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("document.md");
+        fs::write(&path, "stable").unwrap();
+
+        let loaded = OsFileService.load(&path).unwrap();
+
+        assert_eq!(loaded.document.full_text(), "stable");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn atomic_document_save_preserves_markdown_bytes() {
         let root = temporary_directory("save");
@@ -755,6 +1425,46 @@ mod tests {
             .save(&path, &RopeBuffer::from_text(source))
             .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_without_replace_keeps_an_existing_file_target() {
+        let root = temporary_directory("rename-no-replace-file");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("from.md");
+        let to = root.join("to.md");
+        fs::write(&from, "source").unwrap();
+        fs::write(&to, "external").unwrap();
+
+        let error = rename_path_without_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&to).unwrap(), "external");
+        assert_eq!(fs::read_to_string(&from).unwrap(), "source");
+
+        let free = root.join("free.md");
+        rename_path_without_replace(&from, &free).unwrap();
+        assert_eq!(fs::read_to_string(&free).unwrap(), "source");
+        assert!(!from.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_without_replace_keeps_an_existing_directory_target() {
+        let root = temporary_directory("rename-no-replace-dir");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(to.join("keep.md"), "external").unwrap();
+
+        let error = rename_path_without_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(to.join("keep.md")).unwrap(), "external");
+        assert!(from.is_dir());
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -915,6 +1625,151 @@ mod tests {
 
         assert_eq!(bytes, "本文を少しずつ読む🙂\r\n".as_bytes());
         assert_eq!(before, after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_external_write_during_the_temporary_write_is_not_replaced() {
+        let root = temporary_directory("save-race");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        let saved = OsFileService
+            .save(&path, &RopeBuffer::from_text("one\n"))
+            .unwrap();
+        let guard = OverwriteGuard::ExpectContent {
+            stamp: saved.stamp,
+            baseline: saved.fingerprint,
+        };
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        // The pre-write check passes; the external save lands while the
+        // temporary file is being written.
+        check_overwrite_guard(&OsFileService, &path, guard).unwrap();
+        let result = atomic_write_checked(
+            &path,
+            true,
+            |writer| {
+                fs::write(&path, "someone else, longer\n")?;
+                edited.write_to(writer)
+            },
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, guard),
+        );
+
+        assert!(matches!(result, Err(SaveFailure::ExternalChange)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "someone else, longer\n");
+        let leftovers = fs::read_dir(&root).unwrap().count();
+        assert_eq!(leftovers, 1, "the temporary file must be removed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_atomic_replace_after_the_last_check_is_not_overwritten() {
+        let root = temporary_directory("save-race-after-check");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        let saved = OsFileService
+            .save(&path, &RopeBuffer::from_text("one\n"))
+            .unwrap();
+        let guard = OverwriteGuard::ExpectContent {
+            stamp: saved.stamp,
+            baseline: saved.fingerprint,
+        };
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        // The pre-write check passes, then an external app atomically
+        // replaces the file after the temporary file is complete and before
+        // the save replaces the target.
+        check_overwrite_guard(&OsFileService, &path, guard).unwrap();
+        let external = root.join("external.tmp");
+        let result = atomic_write_checked_with_hook(
+            &path,
+            true,
+            |writer| edited.write_to(writer),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, guard),
+            &|| {
+                fs::write(&external, "external, atomically placed\n").unwrap();
+                fs::rename(&external, &path).unwrap();
+            },
+        );
+
+        assert!(matches!(result, Err(SaveFailure::ExternalChange)));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "external, atomically placed\n"
+        );
+        let leftovers = fs::read_dir(&root).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary or displaced file may remain");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_forced_save_replaces_a_version_placed_after_the_last_check() {
+        let root = temporary_directory("save-race-after-check-force");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        fs::write(&path, "one\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        atomic_write_checked_with_hook(
+            &path,
+            true,
+            |writer| edited.write_to(writer),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, OverwriteGuard::Force),
+            &|| fs::write(&path, "someone else\n").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "my edit\n");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_onto_an_existing_directory_fails_and_leaves_it_untouched() {
+        let root = temporary_directory("save-onto-directory");
+        let target = root.join("folder");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("inner.md"), "inner\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        let failure = atomic_write_checked(
+            &target,
+            true,
+            |writer| edited.write_to(writer),
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, OverwriteGuard::Force),
+        )
+        .unwrap_err();
+
+        assert!(matches!(failure, SaveFailure::Io(_)));
+        assert!(target.is_dir());
+        assert_eq!(
+            fs::read_to_string(target.join("inner.md")).unwrap(),
+            "inner\n"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_forced_save_still_replaces_an_external_write_during_the_temporary_write() {
+        let root = temporary_directory("save-race-force");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        fs::write(&path, "one\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+
+        atomic_write_checked(
+            &path,
+            true,
+            |writer| {
+                fs::write(&path, "someone else\n")?;
+                edited.write_to(writer)
+            },
+            &|inspect| check_overwrite_guard(&OsFileService, inspect, OverwriteGuard::Force),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "my edit\n");
         fs::remove_dir_all(root).unwrap();
     }
 

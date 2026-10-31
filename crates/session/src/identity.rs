@@ -1,3 +1,4 @@
+use hane_document::RopeBuffer;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -69,12 +70,138 @@ impl FileIdentity {
         self.path == path || self.canonical == lexical_canonical(path)
     }
 
+    /// Same-file test for a Save As target. Beyond the lexical match this asks
+    /// the filesystem, so a symlink (both ends resolved) or, on Unix, a hard link
+    /// to the session's own file is recognised as the same file and keeps the
+    /// ordinary external-change protection. A target that does not exist yet or
+    /// cannot be inspected is a different file. On Windows the volume serial
+    /// number and file index of the opened file identify hard links.
+    pub fn is_same_file_on_disk(&self, path: impl AsRef<Path>) -> bool {
+        let path = path.as_ref();
+        if self.matches_path(path) {
+            return true;
+        }
+        if let (Ok(own), Ok(target)) = (
+            std::fs::canonicalize(&self.path),
+            std::fs::canonicalize(path),
+        ) && own == target
+        {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(own), Ok(target)) = (
+                std::fs::metadata(&self.path),
+                std::fs::metadata(path),
+            ) {
+                return own.dev() == target.dev() && own.ino() == target.ino();
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let (Some(own), Some(target)) = (
+                windows_file_id(&self.path),
+                windows_file_id(path),
+            ) {
+                return own == target;
+            }
+        }
+        false
+    }
+
     /// Follow a rename or move. The document is untouched: only where it is
     /// written changes.
     #[must_use]
     pub fn moved_to(&self, path: impl AsRef<Path>) -> Self {
         Self::lexical(path)
     }
+}
+
+/// Mirrors `BY_HANDLE_FILE_INFORMATION` from `<fileapi.h>`; it is passed by
+/// pointer straight to `kernel32.dll`, so the layout must match exactly.
+#[cfg(windows)]
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_file_information_by_handle(
+        handle: *mut std::ffi::c_void,
+        info: *mut ByHandleFileInformation,
+    ) -> i32;
+}
+
+/// Volume serial number and file index of the file at `path`, which are the
+/// same for every hard link to one physical file. `None` when the file cannot
+/// be opened or queried.
+#[cfg(windows)]
+fn windows_file_id(path: &Path) -> Option<(u32, u64)> {
+    let file = std::fs::File::open(path).ok()?;
+    windows_handle_id(&file)
+}
+
+/// Same as `windows_file_id`, for a handle that is already open.
+#[cfg(windows)]
+fn windows_handle_id(file: &std::fs::File) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    // SAFETY: `file` owns a valid handle for the duration of the call, and
+    // `info` is a plain-old-data struct matching `BY_HANDLE_FILE_INFORMATION`
+    // that the API fully initializes when it returns non-zero.
+    let info = unsafe {
+        let mut info: ByHandleFileInformation = std::mem::zeroed();
+        if get_file_information_by_handle(file.as_raw_handle().cast(), &mut info) == 0 {
+            return None;
+        }
+        info
+    };
+    Some((
+        info.volume_serial_number,
+        (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+    ))
+}
+
+/// Whether `path` still names the very file `file` has open. A path that is
+/// gone or now names another file (an atomic replacement) is `false`, so a
+/// body read through the old handle is never attributed to the new entry. On
+/// platforms without an OS file id the caller's stamp comparison is the only
+/// evidence, so this reports `true`.
+#[cfg(unix)]
+pub(crate) fn handle_is_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let own = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(target) => Ok(own.dev() == target.dev() && own.ino() == target.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn handle_is_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    Ok(match (windows_handle_id(file), windows_file_id(path)) {
+        (Some(own), Some(target)) => own == target,
+        _ => false,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn handle_is_path(_file: &std::fs::File, _path: &Path) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 /// Cheap fingerprint of a file on disk, captured when it is read or written, so
@@ -89,6 +216,100 @@ pub struct FileStamp {
 impl FileStamp {
     pub fn new(len: u64, modified: Option<SystemTime>) -> Self {
         Self { len, modified }
+    }
+}
+
+/// Fingerprint of the exact bytes a document is written as. The stamp alone
+/// cannot tell a same-size, same-mtime rewrite or an atomic replacement apart
+/// from the file the session last read, so every comparison that decides
+/// "is this still my version?" also uses this. It is computed from the bytes
+/// the save format emits (`RopeBuffer::write_to`), which is what a later read
+/// of the same file yields, so BOM / newline handling stays the document's.
+///
+/// Two independent 64-bit lanes plus the length guard against accidental
+/// collisions; it is a change detector, not a security primitive.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ContentFingerprint {
+    len: u64,
+    lane_a: u64,
+    lane_b: u64,
+}
+
+impl ContentFingerprint {
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        let mut fingerprinter = Fingerprinter::default();
+        fingerprinter.update(bytes);
+        fingerprinter.finish()
+    }
+
+    /// Fingerprint of the bytes `document` is saved as. Walks the rope chunks
+    /// without materializing one contiguous string.
+    pub fn of_document(document: &RopeBuffer) -> Self {
+        let mut fingerprinter = Fingerprinter::default();
+        // Writing into the fingerprinter cannot fail.
+        let _ = document.write_to(&mut fingerprinter);
+        fingerprinter.finish()
+    }
+
+    /// Byte length of the fingerprinted content.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Incremental builder for [`ContentFingerprint`]; also an `io::Write` sink so
+/// a save or read path can fingerprint exactly what it streams.
+#[derive(Clone, Copy, Debug)]
+pub struct Fingerprinter {
+    len: u64,
+    lane_a: u64,
+    lane_b: u64,
+}
+
+impl Default for Fingerprinter {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            lane_a: 0xcbf2_9ce4_8422_2325,
+            lane_b: 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+}
+
+impl Fingerprinter {
+    pub fn update(&mut self, bytes: &[u8]) {
+        let (mut lane_a, mut lane_b) = (self.lane_a, self.lane_b);
+        for &byte in bytes {
+            lane_a ^= u64::from(byte);
+            lane_a = lane_a.wrapping_mul(0x0000_0100_0000_01b3);
+            lane_b = (lane_b.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+        self.lane_a = lane_a;
+        self.lane_b = lane_b;
+        self.len = self.len.wrapping_add(bytes.len() as u64);
+    }
+
+    pub fn finish(&self) -> ContentFingerprint {
+        ContentFingerprint {
+            len: self.len,
+            lane_a: self.lane_a,
+            lane_b: self.lane_b,
+        }
+    }
+}
+
+impl std::io::Write for Fingerprinter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -122,6 +343,10 @@ pub struct FileState {
     identity: Option<FileIdentity>,
     untitled_label: String,
     stamp: Option<FileStamp>,
+    /// Content of the last version this session read or wrote. `None` means
+    /// not established yet (a freshly opened file is fingerprinted by the
+    /// first background check, never on the UI thread).
+    baseline: Option<ContentFingerprint>,
     presence: FilePresence,
 }
 
@@ -131,6 +356,7 @@ impl FileState {
             identity: None,
             untitled_label: label.into(),
             stamp: None,
+            baseline: None,
             presence: FilePresence::Present,
         }
     }
@@ -140,8 +366,17 @@ impl FileState {
             identity: Some(identity),
             untitled_label: String::new(),
             stamp,
+            baseline: None,
             presence: FilePresence::Present,
         }
+    }
+
+    pub fn baseline(&self) -> Option<ContentFingerprint> {
+        self.baseline
+    }
+
+    pub(crate) fn set_baseline(&mut self, baseline: Option<ContentFingerprint>) {
+        self.baseline = baseline;
     }
 
     pub fn identity(&self) -> Option<&FileIdentity> {
@@ -183,8 +418,24 @@ impl FileState {
         self.presence = FilePresence::Present;
     }
 
+    /// Follows a symlink that now resolves elsewhere. The path as opened (what
+    /// the UI shows and saves to) is kept.
+    pub(crate) fn refresh_canonical(&mut self, canonical: &Path) {
+        if let Some(identity) = &mut self.identity
+            && identity.canonical != canonical
+        {
+            identity.canonical = canonical.to_path_buf();
+        }
+    }
+
     pub(crate) fn set_stamp(&mut self, stamp: Option<FileStamp>) {
         self.stamp = stamp;
+        self.presence = FilePresence::Present;
+    }
+
+    /// The file exists again (a different version than the recorded one, so
+    /// the stamp is left alone).
+    pub(crate) fn mark_present(&mut self) {
         self.presence = FilePresence::Present;
     }
 
@@ -212,7 +463,7 @@ impl FileState {
 
 /// Normalizes `.` and `..` without asking the filesystem, so two spellings of
 /// the same path compare equal even when the file does not exist yet.
-fn lexical_canonical(path: &Path) -> PathBuf {
+pub fn lexical_canonical(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -251,6 +502,59 @@ mod tests {
         let two = FileIdentity::lexical("/notes/b.md");
         assert!(!one.is_same_file(&two));
         assert!(!one.matches_path("/notes/b.md"));
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hane-identity-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_as_target_on_disk_matches_only_the_same_file() {
+        let dir = scratch_dir("plain");
+        let own = dir.join("a.md");
+        let other = dir.join("b.md");
+        std::fs::write(&own, "a").unwrap();
+        std::fs::write(&other, "b").unwrap();
+        let identity = FileIdentity::new(&own, std::fs::canonicalize(&own).unwrap());
+        assert!(identity.is_same_file_on_disk(&own));
+        assert!(!identity.is_same_file_on_disk(&other));
+        assert!(!identity.is_same_file_on_disk(dir.join("missing.md")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_target_through_a_symlink_is_the_same_file() {
+        let dir = scratch_dir("symlink");
+        let own = dir.join("a.md");
+        let link = dir.join("link.md");
+        std::fs::write(&own, "a").unwrap();
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        let identity = FileIdentity::new(&own, std::fs::canonicalize(&own).unwrap());
+        assert!(!identity.matches_path(&link));
+        assert!(identity.is_same_file_on_disk(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn save_as_target_through_a_hard_link_is_the_same_file() {
+        let dir = scratch_dir("hardlink");
+        let own = dir.join("a.md");
+        let hard = dir.join("hard.md");
+        std::fs::write(&own, "a").unwrap();
+        std::fs::hard_link(&own, &hard).unwrap();
+        let identity = FileIdentity::new(&own, std::fs::canonicalize(&own).unwrap());
+        assert!(!identity.matches_path(&hard));
+        assert!(identity.is_same_file_on_disk(&hard));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

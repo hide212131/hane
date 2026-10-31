@@ -13,7 +13,7 @@
 use super::*;
 #[cfg(not(test))]
 use hane_session::WatchTiming;
-use hane_session::{FolderWatcher, WatchBatch};
+use hane_session::{FolderWatcher, WatchBatch, lexical_canonical};
 
 /// The watch and re-list bookkeeping for the current work folder. Replaced
 /// wholesale (dropping the old watcher) whenever a folder is opened.
@@ -66,7 +66,29 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Test-only: makes the next folder watch attaches fail with `message` (or
+/// stop failing). Lets other view modules exercise a folder watch that is down.
+#[cfg(test)]
+pub(super) fn inject_folder_attach_error(message: Option<&str>) {
+    INJECTED_ATTACH_ERROR.with(|slot| *slot.borrow_mut() = message.map(str::to_owned));
+}
+
 impl EditorView {
+    /// Whether the work folder watch is attached and reports changes under
+    /// `path`. A file it covers needs no watch of its own; while the folder
+    /// watch is down, nothing is covered and each file falls back to watching
+    /// its parent directory (`document_watch`).
+    pub(super) fn folder_watch_covers(&self, path: &Path) -> bool {
+        self.folder_watch.unwatched.is_none()
+            && self
+                .folder_watch
+                .watch_root
+                .as_deref()
+                .is_some_and(|root| {
+                    lexical_canonical(path).starts_with(lexical_canonical(root))
+                })
+    }
+
     /// The warning shown for as long as the current work folder's changes are
     /// not being watched.
     pub(super) fn folder_watch_warning(&self) -> Option<String> {
@@ -149,8 +171,10 @@ impl EditorView {
             return;
         }
         if self.connect_folder_watch(root, cx).is_ok() {
-            // Changes made while unwatched were never reported; list again.
+            // Changes made while unwatched were never reported; list again
+            // and look at the open files too.
             self.refresh_work_folder_listing(cx);
+            self.check_open_documents_for_external_changes(cx);
             cx.notify();
         } else {
             cx.notify();
@@ -218,6 +242,10 @@ impl EditorView {
             self.folder_watch.failure = Some(failure);
         }
         self.refresh_work_folder_listing(cx);
+        // The listing above never opens a note. The files that are open are
+        // checked separately, one background read each, because a batch only
+        // says that something changed, not which file.
+        self.check_open_documents_for_external_changes(cx);
         true
     }
 
@@ -390,6 +418,25 @@ mod tests {
             .collect();
         names.sort_unstable();
         names
+    }
+
+    #[gpui::test]
+    fn folder_watch_covers_compares_lexically_normalized_paths(cx: &mut gpui::TestAppContext) {
+        let root = watch_test_root("covers");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = view_with_folder(cx, &root);
+        view.update(cx, |view, _| {
+            view.folder_watch.watch_root = Some(PathBuf::from("/work"));
+            assert!(view.folder_watch_covers(Path::new("/work/notes/note.md")));
+            assert!(view.folder_watch_covers(Path::new("/work/./notes/../note.md")));
+            assert!(!view.folder_watch_covers(Path::new("/work/../outside/note.md")));
+            assert!(!view.folder_watch_covers(Path::new("/workshop/note.md")));
+
+            view.folder_watch.watch_root = Some(PathBuf::from("/work/sub/.."));
+            assert!(view.folder_watch_covers(Path::new("/work/notes/note.md")));
+            assert!(!view.folder_watch_covers(Path::new("/work/../outside/note.md")));
+        });
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]

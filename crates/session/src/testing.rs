@@ -1,6 +1,6 @@
 //! In-memory doubles so the session rules can be tested without a filesystem.
 
-use crate::identity::{FileIdentity, FileStamp};
+use crate::identity::{ContentFingerprint, FileIdentity, FileStamp};
 use crate::service::{FileService, LoadedFile, ReadFile, SavedFile, StampedRead};
 use crate::workfolder::{WorkFolder, WorkFolderScanner};
 use hane_document::RopeBuffer;
@@ -226,11 +226,14 @@ impl FileService for MemoryFileService {
         let (contents, version) = files
             .get(&canonical(path))
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
+        let document = RopeBuffer::from_text(
+            std::str::from_utf8(contents)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        );
+        let fingerprint = Some(ContentFingerprint::of_document(&document));
         Ok(LoadedFile {
-            document: RopeBuffer::from_text(
-                std::str::from_utf8(contents)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-            ),
+            document,
+            fingerprint,
             identity: FileIdentity::lexical(path),
             stamp: Some(FileStamp::new(contents.len() as u64, None)).map(|stamp| FileStamp {
                 len: stamp.len ^ (*version << 32),
@@ -254,6 +257,7 @@ impl FileService for MemoryFileService {
         Ok(SavedFile {
             identity: FileIdentity::lexical(path),
             stamp: Some(stamp),
+            fingerprint: Some(ContentFingerprint::of_document(document)),
         })
     }
 
