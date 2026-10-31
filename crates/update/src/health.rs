@@ -853,7 +853,12 @@ fn publish_capability(
     discard_capability(coordination, transaction);
     let path = capability_path(coordination, transaction);
     durable_write(&path, capability.encode().as_bytes())?;
-    if let Err(err) = acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false)) {
+    // The owner is the token's user SID, not the default owner: an elevated
+    // helper's files default to Administrators, which the standard child of
+    // the same user must not have to trust. The reader requires the same owner.
+    if let Err(err) =
+        acl::secure_new_user_owned(&path, false, 0o600).and_then(|()| acl::verify_user_owned(&path, false))
+    {
         let _ = fs::remove_file(&path);
         return Err(err);
     }
@@ -991,7 +996,7 @@ fn detect_with(coordination: &Coordination, own_version: &str, process: &OwnProc
 }
 
 fn read_capability(path: &Path) -> Result<String> {
-    acl::verify(path, false)?;
+    acl::verify_user_owned(path, false)?;
     let raw = read_limited(path, CAPABILITY_LIMIT)?
         .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the health capability vanished"))?;
     String::from_utf8(raw)
