@@ -446,7 +446,40 @@ APIが入力の成否を確認できなかった場合も、成功と推測し�
 | `failed` | 失敗を記録した。エラーコードを含む。一括実行が停止した後の未配送の手順は`not_started` |
 | `unknown` | 実行済みか判断できない |
 
-要求全体の状態は、いずれかの手順が`running`なら`running`、失敗した手順があれば`failed`、全手順が`succeeded`なら`succeeded`、全手順が`not_started`なら`not_started`とする。配送の途中でAPIが成否を確認できなかった手順は`unknown`とする。`unknown`は`not_started`や未実行の証明として扱わず、成功とも推測しない。
+配送の途中でAPIが成否を確認できなかった手順は`unknown`とする。`unknown`は`not_started`や未実行の証明として扱わず、成功とも推測しない。
+
+要求全体の状態は、手順状態の組み合わせから次の優先順位の最初に該当する行で一意に決める。
+
+| 優先 | 手順状態の組み合わせ | 要求の状態 |
+|---|---|---|
+| 1 | いずれかの手順が`running` | `running` |
+| 2 | `running`が無く、いずれかの手順が`unknown` | `unknown` |
+| 3 | `running`・`unknown`が無く、失敗した手順がある | `failed` |
+| 4 | 全手順が`succeeded` | `succeeded` |
+| 5 | 全手順が`not_started` | `not_started` |
+| 6 | `succeeded`と`not_started`だけが混在（失敗・成否不明なしで配送が進行中） | `running` |
+
+- `unknown`は`failed`より優先する。成否不明の手順は実行済みの可能性があり、要求全体を`failed`（実行されなかったことの確定）や`succeeded`と見せてはならない。`unknown`を含む要求は、`not_started`・`succeeded`・再送可の証明として扱わない。
+- 要求全体が`unknown`でも、`steps`には各手順の状態を残す。既に`succeeded`として配送が完了した手順、`failed`の手順とそのエラーコード、`unknown`の手順をそれぞれ消さず、呼び出し側が配送済みの手順を把握できるようにする。
+- 要求全体が`unknown`の場合、同じ`request_id`は再送せず、新しい`request_id`での再発行は`ui.inspect`などで現在の状態を確認した上での明示的な判断とする（§8.1「切断・タイムアウト時の契約」）。
+- 例：手順が`[succeeded, unknown, not_started]`なら要求は`unknown`、`[succeeded, failed, not_started]`なら`failed`、`[succeeded, unknown, failed]`は`unknown`、`[running, unknown]`は`running`（完了後に再評価して`unknown`となる）。
+
+```json
+{
+  "result": {
+    "request_id": "req-21",
+    "status": "unknown",
+    "reason": "delivery_unconfirmed",
+    "steps": [
+      { "id": "focus-editor", "status": "succeeded" },
+      { "id": "enter-query", "status": "unknown" },
+      { "id": "confirm", "status": "not_started" }
+    ]
+  }
+}
+```
+
+要求記録は現在の保持上限（未完了16件など）の範囲内の有界な一時情報であり、上記の集約のために記録や手順情報を追加で保持しない。
 
 #### 状態照会`ui.request_status`
 
