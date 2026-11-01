@@ -67,7 +67,8 @@ pub fn write(
     {
         durable_write(&path, text.as_bytes())?;
         if let Err(err) =
-            acl::secure_new(&path, false, 0o600).and_then(|()| acl::verify(&path, false))
+            acl::secure_new_user_owned(&path, false, 0o600)
+                .and_then(|()| acl::verify_user_owned(&path, false))
         {
             let _ = fs::remove_file(&path);
             return Err(err);
@@ -104,8 +105,10 @@ fn publish_record(
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
         file.write_all(bytes)?;
         drop(file);
-        acl::secure_new(&temp, false, 0o600)?;
-        acl::verify(&temp, false)?;
+        // The requesting user owns the record, not an elevated token's default
+        // owner, so the next standard-privilege start of the same user verifies it.
+        acl::secure_new_user_owned(&temp, false, 0o600)?;
+        acl::verify_user_owned(&temp, false)?;
         // Flush after the ACL is in place so the flush covers it.
         crate::fsutil::sync_renamed_file(&temp)?;
         Ok(())
@@ -130,7 +133,7 @@ pub fn read(install_root: &Path) -> Result<Option<RelocationRecord>> {
     let Some(raw) = read_limited(&path, RECORD_LIMIT)? else {
         return Ok(None);
     };
-    acl::verify(&path, false)?;
+    acl::verify_user_owned(&path, false)?;
     let text = String::from_utf8(raw).map_err(|_| malformed())?;
     let mut lines = text.lines();
     let (Some(magic), Some(install), Some(txn), Some(parent), None) =
@@ -233,7 +236,7 @@ mod tests {
                 // verified owner-only ACL, and the record is not yet replaced.
                 assert_eq!(from, temp);
                 assert_eq!(fs::read(from).unwrap(), round);
-                acl::verify(from, false).unwrap();
+                acl::verify_user_owned(from, false).unwrap();
                 assert_ne!(fs::read(to).ok().as_deref(), Some(round));
                 published.set(true);
                 fs::rename(from, to)
@@ -262,6 +265,25 @@ mod tests {
         fs::create_dir_all(fresh.parent().unwrap()).unwrap();
         assert!(publish_record(&fresh, b"x\n", &|_, _| Err(std::io::Error::other("no"))).is_err());
         assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn a_published_record_passes_the_user_only_owner_check_and_loose_modes_are_refused() {
+        let dir = TempDir::new("relocation-user-owned");
+        let root = dir.path().join("Hane");
+        fs::create_dir_all(&root).unwrap();
+        let coordination = Coordination::create(dir.path(), &install_id()).unwrap();
+        write(&root, &coordination, &TransactionId::generate().unwrap()).unwrap();
+        let path = root.join(RELOCATION_FILE);
+        acl::verify_user_owned(&path, false).unwrap();
+        assert!(read(&root).unwrap().is_some());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(read(&root).is_err());
+        }
     }
 
     #[test]
