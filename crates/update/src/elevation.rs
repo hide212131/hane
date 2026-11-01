@@ -671,6 +671,18 @@ fn connect_with(
     let mut process = launch(os).map_err(|failure| unstarted(launch_failure_error(failure)))?;
     let expected = ExpectedPeer { pid: process.pid(), session_id, token_sid: user_sid };
     let accepted = listener.accept(timeout, &mut || process.wait_exit(Duration::ZERO).is_none());
+    let accepted = match accepted {
+        Err(error) if ended_before_connect(&error) => {
+            // The helper is gone: its exit code tells why, and only code 7
+            // (the standard token could not be confirmed) is named.
+            let error = match process.wait_exit(Duration::ZERO) {
+                Some(STANDARD_TOKEN_UNAVAILABLE_EXIT_CODE) => standard_token_unavailable_error(),
+                _ => error,
+            };
+            return Err(stop_helper(process, error));
+        }
+        other => other,
+    };
     match accepted.and_then(|peer| verify_peer(&peer.facts, &expected).map(|()| peer)) {
         Ok(peer) => Ok(ElevatedConnection { process, reader: peer.reader, writer: peer.writer }),
         Err(error) => Err(stop_helper(process, error)),
@@ -684,6 +696,36 @@ pub const ELEVATION_REQUIRED_MARKER: &str = "elevation_required";
 /// Shown when the helper needs the Windows consent prompt but the elevated
 /// apply is not available in this build. Nothing was changed.
 pub const ELEVATION_UNAVAILABLE_MESSAGE: &str = "この配置では更新の適用にWindowsの管理者確認が必要ですが、このバージョンでは対応していません。現在のHaneと作業内容はそのままです。書き込み可能な場所へ配置するか、手動で更新してください。";
+
+/// The exit code of the elevated helper that could not confirm a standard
+/// (non-elevated) token before connecting. It does not prove another account.
+pub const STANDARD_TOKEN_UNAVAILABLE_EXIT_CODE: u32 = 7;
+
+/// Marker in [`UpdateError::detail`] of a helper that ended before it connected
+/// with [`STANDARD_TOKEN_UNAVAILABLE_EXIT_CODE`].
+pub const STANDARD_TOKEN_UNAVAILABLE_MARKER: &str = "standard_token_unavailable";
+
+/// Shown when the helper ended before connecting because the standard token
+/// could not be confirmed. Nothing was changed.
+pub const STANDARD_TOKEN_UNAVAILABLE_MESSAGE: &str = "更新後に通常権限でHaneを起動できることを確認できないため、更新を進めませんでした。現在のHaneと作業内容はそのままです。手動で更新するか、同じユーザーでもう一度お試しください。";
+
+fn ended_before_connect(err: &UpdateError) -> bool {
+    err.code == ErrorCode::Truncated && err.detail.contains("ended before it connected")
+}
+
+fn standard_token_unavailable_error() -> UpdateError {
+    UpdateError::new(
+        ErrorCode::Io,
+        format!(
+            "{STANDARD_TOKEN_UNAVAILABLE_MARKER}: the elevated helper ended before it connected (exit code {STANDARD_TOKEN_UNAVAILABLE_EXIT_CODE})"
+        ),
+    )
+}
+
+/// Whether `err` is the helper's early exit for an unconfirmed standard token.
+pub fn is_standard_token_unavailable(err: &UpdateError) -> bool {
+    err.code == ErrorCode::Io && err.detail.starts_with(STANDARD_TOKEN_UNAVAILABLE_MARKER)
+}
 
 /// The failure of starting the verified helper normally. No OS error number,
 /// 740 included, is evidence that the install needs elevation (it can come from
@@ -709,6 +751,8 @@ pub fn elevation_message(err: &UpdateError) -> Option<&'static str> {
         Some(CANCELLED_MESSAGE)
     } else if is_elevation_required(err) {
         Some(ELEVATION_UNAVAILABLE_MESSAGE)
+    } else if is_standard_token_unavailable(err) {
+        Some(STANDARD_TOKEN_UNAVAILABLE_MESSAGE)
     } else {
         None
     }
@@ -1047,6 +1091,8 @@ mod tests {
         launch: std::result::Result<(), LaunchFailure>,
         /// `None`: nobody connects.
         peer: Option<PeerFacts>,
+        /// `Some(code)`: the helper exits with `code` before it connects.
+        early_exit: Option<u32>,
     }
 
     fn genuine() -> PeerFacts {
@@ -1054,12 +1100,13 @@ mod tests {
     }
 
     fn script() -> Script {
-        Script { available: true, owner: USER.to_owned(), launch: Ok(()), peer: Some(genuine()) }
+        Script { available: true, owner: USER.to_owned(), launch: Ok(()), peer: Some(genuine()), early_exit: None }
     }
 
     struct ScriptedProcess {
         events: Events,
         stopped: Arc<AtomicBool>,
+        early_exit: Option<u32>,
     }
 
     impl ElevatedProcess for ScriptedProcess {
@@ -1068,7 +1115,7 @@ mod tests {
         }
 
         fn wait_exit(&mut self, _timeout: Duration) -> Option<u32> {
-            self.stopped.load(Ordering::SeqCst).then_some(0)
+            self.early_exit.or_else(|| self.stopped.load(Ordering::SeqCst).then_some(0))
         }
 
         fn terminate(&mut self) {
@@ -1079,6 +1126,7 @@ mod tests {
 
     struct ScriptedListener {
         peer: Option<PeerFacts>,
+        early_exit: bool,
     }
 
     impl ElevatedListener for ScriptedListener {
@@ -1087,6 +1135,9 @@ mod tests {
             _timeout: Duration,
             _helper_alive: &mut dyn FnMut() -> bool,
         ) -> Result<AcceptedPeer> {
+            if self.early_exit {
+                return Err(UpdateError::new(ErrorCode::Truncated, "the elevated helper ended before it connected"));
+            }
             match self.peer.take() {
                 Some(facts) => Ok(AcceptedPeer {
                     facts,
@@ -1123,7 +1174,8 @@ mod tests {
 
         fn listen(&self, _transaction: &TransactionId) -> Result<Box<dyn ElevatedListener>> {
             self.events.lock().unwrap().push("listen");
-            Ok(Box::new(ScriptedListener { peer: self.script.lock().unwrap().peer.clone() }))
+            let script = self.script.lock().unwrap();
+            Ok(Box::new(ScriptedListener { peer: script.peer.clone(), early_exit: script.early_exit.is_some() }))
         }
 
         fn launch(
@@ -1132,10 +1184,15 @@ mod tests {
             _trusted: &crate::identity::FileIdentity,
         ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
             self.events.lock().unwrap().push("launch");
-            self.script.lock().unwrap().launch.clone().map(|()| {
+            let (launch, early_exit) = {
+                let script = self.script.lock().unwrap();
+                (script.launch.clone(), script.early_exit)
+            };
+            launch.map(|()| {
                 Box::new(ScriptedProcess {
                     events: Arc::clone(&self.events),
                     stopped: Arc::clone(&self.stopped),
+                    early_exit,
                 }) as Box<dyn ElevatedProcess>
             })
         }
@@ -1223,6 +1280,34 @@ mod tests {
         assert_eq!(refused.error.code, ErrorCode::Timeout);
         assert!(refused.helper_stopped);
         assert_eq!(events.last(), Some(&"terminate"));
+    }
+
+    #[test]
+    fn an_exit_with_code_7_before_connecting_is_an_unconfirmed_standard_token() {
+        let (result, _) = connect(Script { early_exit: Some(7), ..script() });
+        let failure = result.err().unwrap();
+        assert!(is_standard_token_unavailable(&failure.error));
+        assert!(failure.helper_stopped);
+        let message = elevation_message(&failure.error).unwrap();
+        assert_eq!(message, STANDARD_TOKEN_UNAVAILABLE_MESSAGE);
+        assert!(message.contains("現在のHaneと作業内容はそのまま"));
+        assert!(message.contains("手動で更新"));
+        assert!(!message.contains("別のユーザー") && !message.contains("別SID"));
+    }
+
+    #[test]
+    fn other_early_exits_and_failures_are_not_an_unconfirmed_standard_token() {
+        for code in [0, 1, 6, 8] {
+            let (result, _) = connect(Script { early_exit: Some(code), ..script() });
+            let failure = result.err().unwrap();
+            assert_eq!(failure.error.code, ErrorCode::Truncated);
+            assert!(!is_standard_token_unavailable(&failure.error));
+            assert_eq!(elevation_message(&failure.error), None);
+        }
+        let (timeout, _) = connect(Script { peer: None, ..script() });
+        assert_eq!(elevation_message(&timeout.err().unwrap().error), None);
+        let (declined, _) = connect(Script { launch: Err(failure(Some(ERROR_CANCELLED))), ..script() });
+        assert_eq!(elevation_message(&declined.err().unwrap().error), Some(CANCELLED_MESSAGE));
     }
 
     #[test]
