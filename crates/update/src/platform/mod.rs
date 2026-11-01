@@ -41,7 +41,7 @@ pub const HELPER_FILE_NAME: &str = "hane-updater";
 #[cfg(windows)]
 pub const STAGED_HELPER_FILE_NAME: &str = "hane-worker.exe";
 #[cfg(not(windows))]
-pub const STAGED_HELPER_FILE_NAME: &str = "hane-worker";
+pub const STAGED_HELPER_FILE_NAME: &str = HELPER_FILE_NAME;
 
 /// A supported, verified installation of the running application.
 #[derive(Debug, Clone)]
@@ -472,7 +472,10 @@ pub(crate) fn staged_helper_verified(
             == Some(&identity))
     };
     let neutral_present = hash_regular_file(&staged)?.is_some();
-    let legacy_present = hash_regular_file(&legacy)?.is_some();
+    // Where the neutral and the installed names are the same, there is one
+    // path, not two copies.
+    let two_names = staged != legacy;
+    let legacy_present = two_names && hash_regular_file(&legacy)?.is_some();
     match (neutral_present, legacy_present) {
         (true, true) => {
             // Never pick whichever copy happens to look right.
@@ -567,6 +570,28 @@ mod tests {
         assert_eq!(probe_write_access(&dir.path().join("absent")), WriteAccess::Unknown);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_keeps_the_installed_helper_name_and_a_single_path() {
+        assert_eq!(STAGED_HELPER_FILE_NAME, HELPER_FILE_NAME);
+        let dir = TempDir::new("helper-single-name");
+        let coord = coordination(&dir);
+        let txn = TransactionId::generate().unwrap();
+        let source = dir.path().join("hane-updater-source");
+        fs::write(&source, b"helper-bytes").unwrap();
+        let verified = HelperSource { path: source, identity: FileIdentity::of(b"helper-bytes") };
+        let copy = stage_helper_copy(&coord, &txn, &verified).unwrap();
+        assert_eq!(copy.file_name().and_then(|n| n.to_str()), Some(HELPER_FILE_NAME));
+        let (path, identity) = staged_helper_verified(&coord, &txn).unwrap();
+        assert_eq!(path, copy, "the one copy is not mistaken for two");
+        assert!(identity == FileIdentity::of(b"helper-bytes"));
+
+        // The record still binds the bytes.
+        fs::write(&copy, b"tampered").unwrap();
+        assert!(staged_helper(&coord, &txn).is_err());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn the_copy_is_staged_under_the_neutral_name_and_a_legacy_copy_is_still_recovered() {
         let dir = TempDir::new("helper-names");
@@ -601,6 +626,7 @@ mod tests {
         assert!(legacy.exists() && !copy.exists());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_legacy_copy_with_another_transactions_record_is_not_migrated() {
         let dir = TempDir::new("helper-foreign");
