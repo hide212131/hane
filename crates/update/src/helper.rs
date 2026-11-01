@@ -1359,20 +1359,22 @@ pub fn prepare_restart_with(
     if !valid_candidate_id(candidate_id) {
         return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed candidate id"));
     }
-    // The route is decided before any state is created or published: a known
-    // protected placement the user cannot write must reach its limited consent
-    // route (or `protected_placement_error`) rather than fail on the I/O of a
-    // coordination directory, and a refused route leaves nothing behind.
+    // The route is decided before any state is created or published, and a
+    // route that is not the plain one never writes to the install's parent. A
+    // known protected placement the user cannot write would need the
+    // coordination, helper copy, binding and secret to be created by the
+    // elevated side after consent; the pinned-bootstrap protocol that does that
+    // does not exist yet, and creating them here first would write a protected
+    // parent before the prompt (or with an ordinary token that is refused). The
+    // request therefore stops with the reason, before any consent prompt and
+    // before anything is staged, and the running application and its work are
+    // untouched. A refused route leaves nothing behind either.
     {
         use crate::elevation::{Route, StandardAttempt, choose_route};
         let access = os.placement_access(&placement.install_root);
         match choose_route(access.protected, access.write, StandardAttempt::NotTried) {
             Route::Standard => {}
-            Route::Elevated(_) => {
-                if !os.standard_restart_available() {
-                    return Err(crate::elevation::protected_placement_error());
-                }
-            }
+            Route::Elevated(_) => return Err(crate::elevation::protected_bootstrap_unavailable_error()),
             Route::Refused(reason) => return Err(crate::elevation::route_refused_error(&reason)),
         }
     }
@@ -2813,6 +2815,55 @@ mod tests {
         os.available = false;
         let err = prepare_unwritable(&fx, &os);
         assert!(crate::elevation::is_elevation_required(&err), "{err:?}");
+        assert!(os.events().is_empty(), "{:?}", os.events());
+    }
+
+    #[test]
+    fn a_protected_placement_is_refused_before_the_prompt_and_before_the_parent_is_written() {
+        let fx = fixture();
+        // Restart support is available and consent would be given: the request
+        // still stops first, with no endpoint, no prompt and no state.
+        let os = ConsentOs::new(&fx);
+        let err = prepare_unwritable(&fx, &os);
+        assert!(crate::elevation::is_elevation_required(&err), "{err:?}");
+        assert!(os.events().is_empty(), "{:?}", os.events());
+
+        // A parent that exists is left exactly as it was: no coordination
+        // directory, transaction, helper copy, binding or secret appears in it.
+        let parent = fx._dir.path().join("protected-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let placement = crate::platform::Placement {
+            target: Target::WindowsX64,
+            install_root: parent.join("hane"),
+            coordination_parent: parent.clone(),
+            install_id: fx.install.clone(),
+        };
+        let candidate = fx._dir.path().join("candidate");
+        let source = CandidateSource { catalog: &candidate, signature: &candidate, archive: &candidate };
+        let err = prepare_restart_with(
+            &placement,
+            &crate::testing::test_policy(),
+            &"a".repeat(64),
+            &source,
+            fx._dir.path(),
+            &os,
+        )
+        .err()
+        .expect("the restart is not prepared");
+        assert!(crate::elevation::is_elevation_required(&err), "{err:?}");
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+        assert!(os.events().is_empty(), "{:?}", os.events());
+    }
+
+    #[test]
+    fn a_protected_placement_is_refused_again_on_retry_with_the_old_state_kept() {
+        let fx = fixture();
+        let os = ConsentOs::new(&fx);
+        os.consent.store(false, Ordering::SeqCst);
+        let first = prepare_unwritable(&fx, &os);
+        os.consent.store(true, Ordering::SeqCst);
+        let second = prepare_unwritable(&fx, &os);
+        assert_eq!(first, second);
         assert!(os.events().is_empty(), "{:?}", os.events());
     }
 

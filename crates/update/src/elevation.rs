@@ -234,6 +234,21 @@ pub fn protected_placement_error() -> UpdateError {
     )
 }
 
+/// A known protected placement the requesting user cannot write. The elevated
+/// side would have to create the coordination, helper copy, binding and secret
+/// after consent; until that bootstrap exists nothing is created in the
+/// protected parent and no prompt is shown, so another administrator account
+/// is refused before any change as well. Nothing was changed.
+pub fn protected_bootstrap_unavailable_error() -> UpdateError {
+    UpdateError::new(
+        ErrorCode::Io,
+        format!(
+            "{ELEVATION_REQUIRED_MARKER}: the protected placement cannot be prepared before consent \
+             without writing the protected install parent, so the update was refused before any change"
+        ),
+    )
+}
+
 /// Accepts the relation only when the install owner is the requesting user or a
 /// protected owner, and every SID is present. Anything else is refused as a
 /// whole, never recorded as handled.
