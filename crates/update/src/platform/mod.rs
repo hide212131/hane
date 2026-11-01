@@ -443,6 +443,28 @@ pub(crate) fn staged_helper_verified(
     coordination: &Coordination,
     transaction: &TransactionId,
 ) -> Result<(PathBuf, FileIdentity)> {
+    staged_helper_named(
+        coordination,
+        transaction,
+        STAGED_HELPER_FILE_NAME,
+        LEGACY_STAGED_HELPER_FILE_NAME,
+    )
+}
+
+/// A pending transaction may have been written by a version that used the
+/// installed helper name. Verify and migrate that copy before running it under
+/// the neutral staged name. The name itself does not establish trust.
+#[cfg(windows)]
+const LEGACY_STAGED_HELPER_FILE_NAME: &str = HELPER_FILE_NAME;
+#[cfg(not(windows))]
+const LEGACY_STAGED_HELPER_FILE_NAME: &str = STAGED_HELPER_FILE_NAME;
+
+fn staged_helper_named(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    staged_name: &str,
+    legacy_name: &str,
+) -> Result<(PathBuf, FileIdentity)> {
     let refuse = |detail: &str| UpdateError::new(ErrorCode::IdentityMismatch, detail.to_owned());
     let record = helper_record_path(coordination, transaction);
     let raw = read_limited(&record, HELPER_RECORD_LIMIT)?
@@ -463,22 +485,22 @@ pub(crate) fn staged_helper_verified(
         sha256: sha256.to_owned(),
     };
     let helper_dir = coordination.transaction_dir(transaction).join(lease::HELPER_DIR);
-    let staged = helper_dir.join(STAGED_HELPER_FILE_NAME);
-    let legacy = helper_dir.join(HELPER_FILE_NAME);
-    let matches_record = |path: &Path| -> Result<bool> {
-        Ok(hash_regular_file(path)?
-            .map(|(size, sha256)| FileIdentity { size, sha256 })
-            .as_ref()
-            == Some(&identity))
+    let staged = helper_dir.join(staged_name);
+    let legacy = helper_dir.join(legacy_name);
+    let entry_exists = |path: &Path| -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     };
-    let neutral_present = hash_regular_file(&staged)?.is_some();
-    // Where the neutral and the installed names are the same, there is one
-    // path, not two copies.
-    let two_names = staged != legacy;
-    let legacy_present = two_names && hash_regular_file(&legacy)?.is_some();
-    match (neutral_present, legacy_present) {
+    let staged_exists = entry_exists(&staged)?;
+    // Where both names are the same, there is only one path.
+    let legacy_exists = staged != legacy && entry_exists(&legacy)?;
+    match (staged_exists, legacy_exists) {
         (true, true) => {
-            // Never pick whichever copy happens to look right.
+            // Any entry kind under both names is ambiguous. Never pick the one
+            // that happens to look valid.
             return Err(refuse("both the neutral and the legacy staged helper exist"));
         }
         (false, false) => {
@@ -487,13 +509,15 @@ pub(crate) fn staged_helper_verified(
         (true, false) => {}
         (false, true) => {
             // A transaction journaled by an earlier build staged the copy under
-            // the installed name. It is verified against the record and ACL
-            // first, then renamed, so the one file that is pinned and launched
-            // is the neutral-named one.
-            if !matches_record(&legacy)? {
+            // the installed name. Verify the regular file, identity, and ACL
+            // before renaming it; never execute it under its legacy name.
+            let found = hash_regular_file(&legacy)?
+                .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the legacy staged helper is missing"))?;
+            let found = FileIdentity { size: found.0, sha256: found.1 };
+            if found != identity {
                 return Err(UpdateError::new(
                     ErrorCode::HashMismatch,
-                    "the staged helper differs from its recorded identity",
+                    "the legacy staged helper differs from its recorded identity",
                 ));
             }
             acl::verify(&legacy, false)?;
@@ -505,7 +529,9 @@ pub(crate) fn staged_helper_verified(
             })?;
         }
     }
-    if !matches_record(&staged)? {
+    let present = hash_regular_file(&staged)?
+        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"))?;
+    if (FileIdentity { size: present.0, sha256: present.1 }) != identity {
         return Err(UpdateError::new(
             ErrorCode::HashMismatch,
             "the staged helper differs from its recorded identity",
@@ -559,6 +585,85 @@ mod tests {
         let err = stage_helper_copy(&coord, &other_txn, &bad).unwrap_err();
         assert_eq!(err.code, ErrorCode::HashMismatch);
         assert!(!coord.transaction_dir(&other_txn).join("helper").join(STAGED_HELPER_FILE_NAME).exists());
+    }
+
+    const NEUTRAL: &str = "hane-worker.exe";
+    const LEGACY: &str = "hane-updater.exe";
+
+    /// A staged copy and record as an older version left them, under the legacy name.
+    fn legacy_staged(dir: &TempDir) -> (Coordination, TransactionId, PathBuf) {
+        let coord = coordination(dir);
+        let txn = TransactionId::generate().unwrap();
+        let source = dir.path().join("legacy-source");
+        fs::write(&source, b"helper-bytes").unwrap();
+        let src = HelperSource { path: source, identity: FileIdentity::of(b"helper-bytes") };
+        let copy = stage_helper_copy(&coord, &txn, &src).unwrap();
+        let helper_dir = copy.parent().unwrap().to_path_buf();
+        let legacy = helper_dir.join(LEGACY);
+        if copy != legacy {
+            fs::rename(&copy, &legacy).unwrap();
+        }
+        (coord, txn, helper_dir)
+    }
+
+    #[test]
+    fn a_legacy_named_staged_helper_is_recovered_under_the_neutral_name() {
+        let dir = TempDir::new("legacy-helper");
+        let (coord, txn, helper_dir) = legacy_staged(&dir);
+        let (staged, identity) = staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap();
+        assert_eq!(staged, helper_dir.join(NEUTRAL));
+        assert_eq!(fs::read(&staged).unwrap(), b"helper-bytes");
+        assert_eq!(identity, FileIdentity::of(b"helper-bytes"));
+        assert!(fs::symlink_metadata(helper_dir.join(LEGACY)).is_err(), "the old name is gone");
+        assert_eq!(staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap().0, staged);
+    }
+
+    #[test]
+    fn an_altered_legacy_staged_helper_is_refused_and_left_in_place() {
+        let dir = TempDir::new("legacy-helper-altered");
+        let (coord, txn, helper_dir) = legacy_staged(&dir);
+        fs::write(helper_dir.join(LEGACY), b"tampered-bytes").unwrap();
+        let err = staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap_err();
+        assert_eq!(err.code, ErrorCode::HashMismatch);
+        assert!(fs::symlink_metadata(helper_dir.join(NEUTRAL)).is_err());
+        assert!(fs::symlink_metadata(helper_dir.join(LEGACY)).is_ok());
+    }
+
+    #[test]
+    fn a_legacy_staged_helper_of_another_transaction_is_not_accepted() {
+        let dir = TempDir::new("legacy-helper-foreign");
+        let (coord, txn, helper_dir) = legacy_staged(&dir);
+        let other = TransactionId::generate().unwrap();
+        let other_dir = coord.ensure_helper_dir(&other).unwrap();
+        fs::copy(helper_dir.join(LEGACY), other_dir.join(LEGACY)).unwrap();
+        assert!(staged_helper_named(&coord, &other, NEUTRAL, LEGACY).is_err());
+        assert!(fs::symlink_metadata(other_dir.join(NEUTRAL)).is_err());
+        assert!(staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).is_ok());
+    }
+
+    #[test]
+    fn current_and_legacy_helpers_together_are_ambiguous() {
+        let dir = TempDir::new("legacy-helper-both");
+        let (coord, txn, helper_dir) = legacy_staged(&dir);
+        fs::copy(helper_dir.join(LEGACY), helper_dir.join(NEUTRAL)).unwrap();
+        let err = staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert!(fs::symlink_metadata(helper_dir.join(LEGACY)).is_ok());
+
+        // An invalid neutral entry next to a valid legacy one is equally ambiguous.
+        fs::write(helper_dir.join(NEUTRAL), b"junk").unwrap();
+        let err = staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+    }
+
+    #[test]
+    fn a_legacy_entry_that_is_not_a_regular_file_is_refused() {
+        let dir = TempDir::new("legacy-helper-dir");
+        let (coord, txn, helper_dir) = legacy_staged(&dir);
+        fs::remove_file(helper_dir.join(LEGACY)).unwrap();
+        fs::create_dir(helper_dir.join(LEGACY)).unwrap();
+        assert!(staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).is_err());
+        assert!(fs::symlink_metadata(helper_dir.join(NEUTRAL)).is_err());
     }
 
     #[test]

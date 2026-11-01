@@ -1659,9 +1659,12 @@ mod tests {
 
     #[test]
     fn a_spoofed_nonce_or_replayed_hello_never_applies() {
-        let fx = fixture();
+        // Each independent handshake gets its own fixture and transaction so
+        // state left by one case cannot leak into the next.
         let nonce = Nonce::generate().unwrap();
         let attacker = Nonce::generate().unwrap();
+
+        let fx = fixture();
         let mut spy = Spy::default();
         let (result, _) = run(
             &fx,
@@ -1669,20 +1672,26 @@ mod tests {
             &mut spy,
         );
         assert_eq!(result.unwrap_err().code, ErrorCode::IdentityMismatch);
+        assert_eq!(spy.applied, 0);
 
+        let fx = fixture();
+        let mut spy = Spy::default();
         let (result, _) = run(
             &fx,
             &[fx.hello(&nonce, Mode::Prepare), fx.hello(&nonce, Mode::Prepare)],
             &mut spy,
         );
         assert_eq!(result.unwrap_err().code, ErrorCode::TransitionInvalid);
+        assert_eq!(spy.applied, 0);
 
+        let fx = fixture();
+        let mut spy = Spy::default();
         let mut stale = fx.authorized(&nonce);
         stale.body = Body::ExitAuthorized {
             transaction_id: TransactionId::generate().unwrap().as_str().to_owned(),
         };
         let (result, _) = run(&fx, &[fx.hello(&nonce, Mode::Prepare), stale], &mut spy);
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ErrorCode::TransitionInvalid);
         assert_eq!(spy.applied, 0);
     }
 
