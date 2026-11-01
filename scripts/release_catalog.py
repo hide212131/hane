@@ -123,8 +123,11 @@ MACOS_EXECUTABLE_PREFIXES = (f"{MACOS_APP}/Contents/MacOS/", f"{MACOS_APP}/Conte
 
 IDENTITY_RE = re.compile(
     rb"hane-updater-identity-v1;version=([0-9A-Za-z.+-]+);target=([A-Za-z0-9_.-]+);"
-    rb"source=([0-9a-f]{40}|unknown);protocol=([0-9]+);end"
+    rb"source=([0-9a-f]{40}|unknown);protocol=([0-9]+)(?:;profile=([a-z-]+))?;end"
 )
+# Build profile the helper reports; a standard build reports none.
+PROFILE_STANDARD = ""
+PROFILE_VALIDATION_FEED = "validation-feed"
 TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -311,25 +314,35 @@ def signing_seed(env: dict[str, str] | None = None) -> bytes:
 # ------------------------------------------------------------ binary identity
 
 
-def read_identity(data: bytes) -> tuple[str, str, str, int]:
-    """Reads the record `crates/updater` embeds and consults at startup."""
+def read_identity_record(data: bytes) -> tuple[str, str, str, int, str]:
+    """Reads the record `crates/updater` embeds and consults at startup,
+    including the build profile ("" for a standard build)."""
     matches = set(IDENTITY_RE.findall(data))
     if not matches:
         raise fail("the helper binary carries no updater identity record")
     if len(matches) != 1:
         raise fail("the helper binary carries conflicting updater identity records")
-    version, target, source, protocol = next(iter(matches))
-    return version.decode(), target.decode(), source.decode(), int(protocol)
+    version, target, source, protocol, profile = next(iter(matches))
+    return version.decode(), target.decode(), source.decode(), int(protocol), profile.decode()
 
 
-def check_identity(data: bytes, *, version: str, target: str, source_sha: str, what: str) -> None:
-    found_version, found_target, found_source, protocol = read_identity(data)
+def read_identity(data: bytes) -> tuple[str, str, str, int]:
+    return read_identity_record(data)[:4]
+
+
+def check_identity(data: bytes, *, version: str, target: str, source_sha: str, what: str,
+                   profile: str | None = None) -> None:
+    """`profile=None` leaves the build profile unchecked; Windows packages pass
+    the exact profile they require."""
+    found_version, found_target, found_source, protocol, found_profile = read_identity_record(data)
     if (found_version, found_target, found_source, protocol) != (version, target, source_sha, UPDATER_PROTOCOL):
         raise fail(
             f"{what} identity is version={found_version} target={found_target} "
             f"source={found_source} protocol={protocol}, expected version={version} "
             f"target={target} source={source_sha} protocol={UPDATER_PROTOCOL}"
         )
+    if profile is not None and found_profile != profile:
+        raise fail(f"{what} build profile is {found_profile or 'standard'!r}, expected {profile or 'standard'!r}")
 
 
 LC_CODE_SIGNATURE = 0x1D
@@ -653,7 +666,12 @@ def msix_check(data: bytes, version: str) -> None:
         raise fail("MSIX application executable must stay hane.exe")
 
 
-def verify_windows_zip(path: Path, *, version: str, source_sha: str, trust: Trust) -> dict:
+def verify_windows_zip(path: Path, *, version: str, source_sha: str, trust: Trust,
+                       validation_feed: bool = False) -> dict:
+    """Release verifier by default (standard helper only). The isolated
+    `validation-feed` package (Issue #510) is accepted only when explicitly
+    requested, and then only if the helper reports that profile."""
+    profile = PROFILE_VALIDATION_FEED if validation_feed else PROFILE_STANDARD
     with Archive(path) as archive:
         dll = f"shell-integration/{version}/hane_shell_extension.dll"
         allowed_dirs = {"shell-integration", f"shell-integration/{version}"}
@@ -670,7 +688,7 @@ def verify_windows_zip(path: Path, *, version: str, source_sha: str, trust: Trus
             if not archive.read(exe)[:2] == b"MZ":
                 raise fail(f"{exe} is not a Windows executable image")
         check_identity(archive.read("hane-updater.exe"), version=version, target=WINDOWS_TARGET,
-                       source_sha=source_sha, what="hane-updater.exe")
+                       source_sha=source_sha, what="hane-updater.exe", profile=profile)
         msix_check(archive.read("Hane.ShellIntegration.msix"), version)
 
         inventory_sha256 = verify_archive_inventory(
@@ -826,7 +844,8 @@ def build_catalog(release_dir: Path, *, tag: str, source_sha: str, sequence: int
     if not is_uint(sequence, 1):
         raise fail("catalog_sequence must be an integer from 1 to 2^64-1")
     release_dir = Path(release_dir)
-    windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust)
+    windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust,
+                                 validation_feed=validation_feed)
     macos = macos_verifier(validation_feed)(release_dir / MACOS_ASSET, version=version, source_sha=source_sha,
                                             trust=trust)
     w_size, w_sha = file_sha256(release_dir / WINDOWS_ASSET)
@@ -942,7 +961,8 @@ def verify_release_dir(release_dir: Path, *, tag: str, source_sha: str, trust: T
     if not isinstance(targets, dict) or set(targets) != {WINDOWS_TARGET, MACOS_TARGET}:
         raise fail("catalog must contain exactly the Windows x64 and macOS arm64 targets")
 
-    windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust)
+    windows = verify_windows_zip(release_dir / WINDOWS_ASSET, version=version, source_sha=source_sha, trust=trust,
+                                 validation_feed=validation_feed)
     macos = macos_verifier(validation_feed)(release_dir / MACOS_ASSET, version=version, source_sha=source_sha,
                                             trust=trust)
     expected = {
@@ -1166,7 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
         return p
 
     add("require-env").add_argument("names", nargs="+")
-    add("binary-identity", "binary", "version", "target", "source-sha")
+    add("binary-identity", "binary", "version", "target", "source-sha").add_argument(
+        "--validation-feed", action="store_true")
     add("macho-signed", "binary")
     add("verify-macos-codesign", "app")
     add("macos-sidecar-dir", "version", "source-sha")
@@ -1176,7 +1197,7 @@ def main(argv: list[str] | None = None) -> int:
     sign.add_argument("--domain", choices=("catalog", "inventory"), required=True)
     add("make-zip", "root", "output")
     add("extract-zip", "zip", "dest")
-    add("verify-windows-zip", "zip", "version", "source-sha")
+    add("verify-windows-zip", "zip", "version", "source-sha").add_argument("--validation-feed", action="store_true")
     add("verify-macos-zip", "zip", "version", "source-sha").add_argument("--validation-feed", action="store_true")
     bc = add("build-catalog", "dir", "tag", "source-sha", "output")
     bc.add_argument("--sequence", type=int, required=True)
@@ -1205,8 +1226,11 @@ def _dispatch(args: argparse.Namespace) -> int:
     if cmd == "require-env":
         _require_env(args.names)
     elif cmd == "binary-identity":
+        # The standard release step passes no flag and leaves the profile unchecked;
+        # the validation build script requires the validation profile explicitly.
         check_identity(Path(args.binary).read_bytes(), version=args.version, target=args.target,
-                       source_sha=args.source_sha, what=args.binary)
+                       source_sha=args.source_sha, what=args.binary,
+                       profile=PROFILE_VALIDATION_FEED if args.validation_feed else None)
     elif cmd == "macho-signed":
         check_macho_signed(Path(args.binary).read_bytes(), args.binary)
     elif cmd == "verify-macos-codesign":
@@ -1239,7 +1263,8 @@ def _dispatch(args: argparse.Namespace) -> int:
     elif cmd == "extract-zip":
         extract_zip(Path(args.zip), Path(args.dest))
     elif cmd == "verify-windows-zip":
-        verify_windows_zip(Path(args.zip), version=args.version, source_sha=args.source_sha, trust=Trust.from_env())
+        verify_windows_zip(Path(args.zip), version=args.version, source_sha=args.source_sha, trust=Trust.from_env(),
+                           validation_feed=args.validation_feed)
     elif cmd == "verify-macos-zip":
         macos_verifier(args.validation_feed)(Path(args.zip), version=args.version, source_sha=args.source_sha,
                                              trust=Trust.from_env())

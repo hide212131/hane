@@ -304,6 +304,18 @@ class HelperAndBundleTests(unittest.TestCase):
         self.assertNotIn('"CFBundleIdentifier:io.github.hide212131.hane"', BUNDLE)
         self.assertEqual(BUNDLE.count('bundle_id="io.github.hide212131.hane'), 2)
 
+    def test_windows_validation_build_is_an_explicit_opt_in_with_both_features(self):
+        script = read("scripts/build-windows-validation.ps1")
+        self.assertIn("--features hane/validation-feed,hane-updater/validation-feed", script)
+        self.assertIn("--validation-feed", script)
+        # The product Release path never selects the validation profile.
+        self.assertNotIn("validation-feed", RELEASE)
+        self.assertIn("cargo build --release --locked -p hane -p hane-updater\n", RELEASE)
+        # The helper build script derives its profile from the Cargo feature.
+        build_rs = read("crates/updater/build.rs")
+        self.assertIn("CARGO_FEATURE_VALIDATION_FEED", build_rs)
+        self.assertIn("HANE_UPDATER_PROFILE_FIELD", read("crates/updater/src/main.rs"))
+
     def test_cdhash_check_does_not_close_the_codesign_pipe_early_under_pipefail(self):
         code = "\n".join(line for line in BUNDLE.splitlines() if not line.lstrip().startswith("#"))
         self.assertIn("set -euo pipefail", code)
