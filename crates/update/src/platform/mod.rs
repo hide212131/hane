@@ -277,6 +277,17 @@ fn candidate_exe(dir: &Path) -> PathBuf {
     }
 }
 
+/// The placement the installed helper `helper` belongs to, derived from where it
+/// lives (the application sits beside it) and verified exactly as the running
+/// application verifies its own placement, with this process's own principal.
+/// Nothing the requesting side says is consulted.
+pub fn placement_of_installed_helper(helper: &Path) -> Result<Placement> {
+    let dir = helper
+        .parent()
+        .ok_or_else(|| unsupported("the helper has no directory"))?;
+    locate(&candidate_exe(dir))
+}
+
 /// Finds the installation a coordination directory belongs to without being
 /// told any path: only a sibling whose own verified `InstallId` equals the
 /// coordination directory's is accepted.
@@ -346,6 +357,36 @@ pub fn stage_helper_copy(
     transaction: &TransactionId,
     source: &HelperSource,
 ) -> Result<PathBuf> {
+    stage_helper_copy_as(coordination, transaction, source, false)
+}
+
+/// [`stage_helper_copy`] for the elevated helper of a protected placement: every
+/// directory and file it creates is owned by the requesting user, because the
+/// standard process of that account has to use and later recover it.
+pub fn stage_helper_copy_user_owned(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    source: &HelperSource,
+) -> Result<PathBuf> {
+    stage_helper_copy_as(coordination, transaction, source, true)
+}
+
+/// Restricts a file just created to this principal (and, when `user_owned`,
+/// makes the user SID its owner), then proves it.
+fn secure_file(path: &Path, mode: u32, user_owned: bool) -> Result<()> {
+    if user_owned {
+        acl::secure_new_user_owned(path, false, mode).and_then(|()| acl::verify_user_owned(path, false))
+    } else {
+        acl::secure_new(path, false, mode).and_then(|()| acl::verify(path, false))
+    }
+}
+
+fn stage_helper_copy_as(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    source: &HelperSource,
+    user_owned: bool,
+) -> Result<PathBuf> {
     let bytes = read_limited(&source.path, MAX_ENTRY_BYTES)?.ok_or_else(|| {
         UpdateError::new(ErrorCode::NotFound, "the installed helper is missing")
     })?;
@@ -355,12 +396,16 @@ pub fn stage_helper_copy(
             "the installed helper differs from the signed identity",
         ));
     }
-    let dir = coordination.ensure_helper_dir(transaction)?;
+    let dir = if user_owned {
+        coordination.ensure_helper_dir_user_owned(transaction)?
+    } else {
+        coordination.ensure_helper_dir(transaction)?
+    };
     let dest = dir.join(STAGED_HELPER_FILE_NAME);
     durable_write(&dest, &bytes)?;
     // The copy must be owned by this principal and writable by nobody else
     // before it is hashed and run; the private subtree keeps it that way.
-    if let Err(err) = acl::secure_new(&dest, false, 0o700).and_then(|()| acl::verify(&dest, false)) {
+    if let Err(err) = secure_file(&dest, 0o700, user_owned) {
         let _ = fs::remove_file(&dest);
         return Err(err);
     }
@@ -368,7 +413,9 @@ pub fn stage_helper_copy(
     if copied.as_ref() == Some(&source.identity) {
         // Recovery after a crash must not trust the live install, which may be
         // half replaced. It runs this copy, bound to the identity recorded here.
-        if let Err(err) = write_helper_record(coordination, transaction, &source.identity, &dest) {
+        if let Err(err) =
+            write_helper_record(coordination, transaction, &source.identity, &dest, user_owned)
+        {
             let _ = fs::remove_file(&dest);
             return Err(err);
         }
@@ -410,6 +457,7 @@ fn write_helper_record(
     transaction: &TransactionId,
     identity: &FileIdentity,
     staged: &Path,
+    user_owned: bool,
 ) -> Result<()> {
     let record = helper_record_path(coordination, transaction);
     // The copy must still be exactly what was verified before it is vouched for.
@@ -422,7 +470,7 @@ fn write_helper_record(
         ));
     }
     durable_write(&record, record_text(coordination, transaction, identity).as_bytes())?;
-    if let Err(err) = acl::secure_new(&record, false, 0o600).and_then(|()| acl::verify(&record, false)) {
+    if let Err(err) = secure_file(&record, 0o600, user_owned) {
         let _ = fs::remove_file(&record);
         return Err(err);
     }

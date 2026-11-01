@@ -20,6 +20,10 @@
 //!   was really launched. Only a peer whose OS-reported process id, session,
 //!   token account and elevation all match is handed back; anything else stops
 //!   the launched process and reports whether it is certainly gone.
+//! - [`connect_bootstrap`]: the same for a known protected placement, but the
+//!   endpoint is named by the install and the process is the installed helper
+//!   pinned to its signed identity. Nothing is created in the protected parent
+//!   before the peer is verified; the elevated helper creates it afterwards.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -27,7 +31,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::identity::TransactionId;
+use crate::identity::{InstallId, TransactionId};
 use crate::protocol::Nonce;
 
 /// The single fixed argument of an elevated helper start. The helper takes no
@@ -231,21 +235,6 @@ pub fn protected_placement_error() -> UpdateError {
     UpdateError::new(
         ErrorCode::Io,
         format!("{ELEVATION_REQUIRED_MARKER}: the install is a protected placement without write access"),
-    )
-}
-
-/// A known protected placement the requesting user cannot write. The elevated
-/// side would have to create the coordination, helper copy, binding and secret
-/// after consent; until that bootstrap exists nothing is created in the
-/// protected parent and no prompt is shown, so another administrator account
-/// is refused before any change as well. Nothing was changed.
-pub fn protected_bootstrap_unavailable_error() -> UpdateError {
-    UpdateError::new(
-        ErrorCode::Io,
-        format!(
-            "{ELEVATION_REQUIRED_MARKER}: the protected placement cannot be prepared before consent \
-             without writing the protected install parent, so the update was refused before any change"
-        ),
     )
 }
 
@@ -504,6 +493,28 @@ pub trait ElevationOs {
         helper: &Path,
         trusted: &crate::identity::FileIdentity,
     ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure>;
+    /// Creates the local endpoint of a protected placement's bootstrap before
+    /// any launch. It is named by the install, because the elevated helper
+    /// knows no transaction before the consent and creates nothing before it
+    /// has verified the peer behind this endpoint.
+    fn listen_bootstrap(&self, _install_id: &InstallId) -> Result<Box<dyn ElevatedListener>> {
+        Err(UpdateError::new(ErrorCode::NotApplicable, "this OS has no elevated update route"))
+    }
+    /// One consent request that starts the *installed* helper elevated, only if
+    /// its pinned image is exactly the signed-inventory identity `trusted`.
+    /// Nothing is read from or written to the protected parent for it.
+    fn launch_installed(
+        &self,
+        helper: &Path,
+        _trusted: &crate::identity::FileIdentity,
+    ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+        Err(LaunchFailure {
+            stage: "unavailable",
+            api: "none",
+            os_error: None,
+            path: helper.display().to_string(),
+        })
+    }
 }
 
 /// The seam of an OS without the elevated route (everything but Windows).
@@ -587,6 +598,45 @@ pub fn connect_elevated(
     transaction: &TransactionId,
     timeout: Duration,
 ) -> std::result::Result<ElevatedConnection, ConnectFailure> {
+    connect_with(
+        os,
+        install_root,
+        timeout,
+        |os| os.listen(transaction),
+        |os| os.launch(helper, trusted),
+    )
+}
+
+/// [`connect_elevated`] for a protected placement: the endpoint is named by the
+/// install and the process started is the *installed* helper, pinned and
+/// compared with the signed-inventory identity `trusted`. No staged copy,
+/// coordination directory, lease, binding or secret exists yet, and none is
+/// created by this side: the elevated helper creates them after the peer was
+/// verified here.
+pub fn connect_bootstrap(
+    os: &dyn ElevationOs,
+    install_root: &Path,
+    helper: &Path,
+    trusted: &crate::identity::FileIdentity,
+    install_id: &InstallId,
+    timeout: Duration,
+) -> std::result::Result<ElevatedConnection, ConnectFailure> {
+    connect_with(
+        os,
+        install_root,
+        timeout,
+        |os| os.listen_bootstrap(install_id),
+        |os| os.launch_installed(helper, trusted),
+    )
+}
+
+fn connect_with(
+    os: &dyn ElevationOs,
+    install_root: &Path,
+    timeout: Duration,
+    listen: impl FnOnce(&dyn ElevationOs) -> Result<Box<dyn ElevatedListener>>,
+    launch: impl FnOnce(&dyn ElevationOs) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure>,
+) -> std::result::Result<ElevatedConnection, ConnectFailure> {
     let unstarted = |error: UpdateError| ConnectFailure { error, helper_stopped: true };
     if !os.standard_restart_available() {
         return Err(unstarted(UpdateError::new(
@@ -605,10 +655,8 @@ pub fn connect_elevated(
     })
     .map_err(unstarted)?;
     let session_id = os.session_id().map_err(unstarted)?;
-    let mut listener = os.listen(transaction).map_err(unstarted)?;
-    let mut process = os
-        .launch(helper, trusted)
-        .map_err(|failure| unstarted(launch_failure_error(failure)))?;
+    let mut listener = listen(os).map_err(unstarted)?;
+    let mut process = launch(os).map_err(|failure| unstarted(launch_failure_error(failure)))?;
     let expected = ExpectedPeer { pid: process.pid(), session_id, token_sid: user_sid };
     let accepted = listener.accept(timeout, &mut || process.wait_exit(Duration::ZERO).is_none());
     match accepted.and_then(|peer| verify_peer(&peer.facts, &expected).map(|()| peer)) {

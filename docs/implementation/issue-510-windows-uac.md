@@ -26,7 +26,7 @@
 - 昇格helperとの通信（`platform/windows.rs`）: 方向ごとの2本のnamed pipe（同期I/Oの相互ブロックを避ける）。`FIRST_PIPE_INSTANCE`・`REJECT_REMOTE_CLIENTS`・明示DACL（昇格した管理者のみ）で作成し、接続後に (1) 2本のclient PIDの一致、(2) `ImpersonateNamedPipeClient`（identificationレベル）で得たtokenのSID・昇格状態、(3) session、(4) 起動したprocess handleのPIDを `verify_peer` で照合する。helper側も昇格tokenであること、pipe所有processが同一SID・同一sessionであることを確認してから、一回限りのnonce（既存の秘密ファイル）を消費する。
 - 取消: `ERROR_CANCELLED` は日本語の取消として返り、nonceを破棄し、旧版・未保存の作業・candidateを触らず再試行できる。helperの `Prepared` を受け取るまで `PreparedRestart` は作られず、本体の終了は始まらない。
 - 第3段階時点では `STANDARD_RESTART_AVAILABLE = false` で経路を閉じていた（昇格helperの `Command` 起動は管理者tokenを継承し、`CreateProcessWithTokenW` の子の親はseclogonになり `detect_child` の親PID検証と一致しないため）。第4段階で解消する。
-- 未実装（後続）: 保護配置（書込不可の既知配置）での昇格coordination初期化と管理者保護stage（現状は740経路のみ）、`asInvoker` manifest埋込み、同意画面のowner HWND、UIの事前案内。実機のUAC・GUI検証は未実施。
+- 未実装（後続）: `asInvoker` manifest埋込み、同意画面のowner HWND、UIの事前案内。保護配置の昇格coordination初期化は第5段階で接続した。実機のUAC・GUI検証は未実施。
 
 ## 実装の進捗（第4段階: 一般権限での新版起動）
 
@@ -36,6 +36,18 @@
 - UAC前のfail-closed: アプリ側の `standard_restart_available` は、アプリ自身が非昇格で、かつ一般権限tokenをシェルから取得できる場合だけtrue。昇格helperも、アプリに接続する前に同じ取得を確認し、できなければ何も変更せず終了する（exit 7）。
 - 取消・失敗・timeout: 子の作成/検証/resume/Healthy待ちの失敗はすべて既存の `failed` → ロールバック経路に入り、旧版を保つ。UAC取消は第3段階のまま作業を保ち再試行できる。
 - 実機未検証: シェルtokenでの `CreateProcessWithTokenW`（標準handleの引き渡しを含む）の実動作、新版が一般権限で起動し編集・保存できること。CIは実UACを出さず、判断は注入可能なpure関数（`verify_standard_child` / `Launch`）で回帰testしている。
+
+## 実装の進捗（第5段階: 保護配置のpinned bootstrap）
+
+同一SIDの既知の保護配置（書込不可）で、同意後に昇格helperが保護親のcoordinationを作る経路を接続した。第3段階の「保護配置は未実装」を置き換える。
+
+- 経路判定（`prepare_restart_with`）: 書込可能なら従来の一般権限経路でUACを出さない。既知の保護配置で書込不可のときだけ `prepare_protected_with` へ進む。未知owner・書込可否不明・別SID・network/reparse等は、同意画面もstagingも行う前に理由付きで拒否する（`choose_route` / `check_principals` / `locate`）。
+- 同意前の書込禁止: 通常Hane側は保護install親へcoordination・lease・helper copy・binding・nonceを一切書かない。ユーザー領域の要求とlocal named pipeだけを持ち、署名済みinventoryのhash・file identityで固定した**installed helper**を、固定引数 `--elevated` のみで `ShellExecuteExW(runas)` 起動する（`RunasLauncher::launch_installed`、`PinnedHelper` で祖先dirごと固定しidentity一致を確認してから同意画面）。secret/nonceは引数にも環境にもログにも出さない。
+- 認証: pipeは従来どおり `FIRST_PIPE_INSTANCE`・`REJECT_REMOTE_CLIENTS`・昇格管理者のみのDACLで、名前だけinstall（`InstallId`）由来（`bootstrap_pipe_names`）。昇格helperはtransactionをまだ知らないため。接続後、OS由来のpeer PID・token SID・elevation・sessionを、起動したprocess handleの期待値と `verify_peer` で照合する。helper側も自身が昇格済みであること、pipe所有processが同一SID・同一sessionであることを確認してから進む。
+- 同意・peer認証後のbootstrap: アプリは一回限りnonceとtransaction idを含む1行（上限512 byte、`HANE-BOOTSTRAP-1`）を検証済みpipeで送る。昇格helperは自分の位置から `placement_of_installed_helper`（`locate`）と `installed_helper`（署名inventory）を独立に導出し、要求のInstallIdが一致すること、実行中imageがそのinstalled helperであること、transactionが未使用であることを確認してから、**user SID所有**のcoordination・`private`・transaction・helper dirとstaged helper copyを作る（`serve_bootstrap`）。作成後に1 byteのackを返す。失敗時はそのtransactionを取り除く。要求側入力は任意のroot・fileを指定できない。
+- 所有者: 昇格tokenの既定ownerはAdministratorsなので、`secure_new_user_owned` で所有者を要求ユーザーSIDにする（`Coordination::create_user_owned` / `ensure_helper_dir_user_owned` / `stage_helper_copy_user_owned`）。これにより同じアカウントの一般権限Haneが、既存のowner-only検査を緩めずにcandidate・state bindingをstageし、後続の復旧でも読める。
+- `Prepared` 前の終了拒否: ack後に一般権限側がcandidateとbindingをstageし、既存の `Hello`/`Prepared` handshake（OS報告のhelper PID一致）が成功して初めて `PreparedRestart` を作る。それ以前の失敗・取消・timeoutでは通常Haneを終了せず、helperを停止して確認できたときだけ当該transactionを削除する。確認できなければ残して後続cleanupに任せる。更新後の本体は従来どおり昇格helperが一般権限tokenで起動する（`spawn_suspended_standard` / `verify_standard_child`）。
+- 実機未検証: 実UAC・secure desktop、保護領域でのACL/所有者設定、`ShellExecuteExW` 起動したinstalled helperの実動作、標準tokenでのcoordination継続利用はWindows実機で未検証。CIは注入seam（`BootstrapOs`）と純関数で回帰testする。別管理者資格情報（別SID）の成功は対象外で、peer照合とhelper側の `locate` の所有者検査で変更前に拒否する。
 
 ## 目的と利用者に見える動作
 

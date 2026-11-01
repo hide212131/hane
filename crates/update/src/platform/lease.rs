@@ -115,11 +115,23 @@ fn create_dir(path: &Path, _mode: u32) -> io::Result<()> {
 }
 
 fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
+    ensure_dir_as(path, mode, false)
+}
+
+/// [`ensure_dir`]. With `user_owned` the new directory is explicitly owned by
+/// the token's user SID, so a standard process of the same account that did not
+/// create it still passes the ownership check (an elevated creator would
+/// otherwise leave the Administrators group as owner).
+fn ensure_dir_as(path: &Path, mode: u32, user_owned: bool) -> Result<()> {
     match create_dir(path, mode) {
         Ok(()) => {
             // Restrict first, then confirm; a directory that cannot be made
             // private is removed so it is not left for a later adoption.
-            let secured = acl::secure_new(path, true, mode).and_then(|()| acl::verify(path, true));
+            let secured = if user_owned {
+                acl::secure_new_user_owned(path, true, mode).and_then(|()| acl::verify_user_owned(path, true))
+            } else {
+                acl::secure_new(path, true, mode).and_then(|()| acl::verify(path, true))
+            };
             if secured.is_err() {
                 let _ = fs::remove_dir(path);
             }
@@ -136,6 +148,20 @@ impl Coordination {
         let dir = parent.join(install_id.coordination_dir_name());
         // Readable by other users' launches; only the owner can write.
         ensure_dir(&dir, 0o755)?;
+        Ok(Self {
+            dir,
+            install_id: install_id.clone(),
+        })
+    }
+
+    /// [`Coordination::create`] for the elevated helper of a protected
+    /// placement. It runs only after consent and peer verification; the
+    /// directory is owned by the requesting user (not by the elevated token's
+    /// default owner) and closed to everybody else, so the same account's
+    /// standard application can continue to stage into it.
+    pub fn create_user_owned(parent: &Path, install_id: &InstallId) -> Result<Self> {
+        let dir = parent.join(install_id.coordination_dir_name());
+        ensure_dir_as(&dir, 0o755, true)?;
         Ok(Self {
             dir,
             install_id: install_id.clone(),
@@ -238,9 +264,13 @@ impl Coordination {
 
     /// `private/` exists with owner-only permission; created on first use.
     pub fn private_dir(&self) -> Result<PathBuf> {
+        self.private_dir_as(false)
+    }
+
+    fn private_dir_as(&self, user_owned: bool) -> Result<PathBuf> {
         require_plain_dir(&self.dir)?;
         let private = self.dir.join(PRIVATE_DIR);
-        ensure_dir(&private, 0o700)?;
+        ensure_dir_as(&private, 0o700, user_owned)?;
         Ok(private)
     }
 
@@ -250,11 +280,21 @@ impl Coordination {
 
     /// `private/<TransactionId>/helper/`, owner-only, created on demand.
     pub fn ensure_helper_dir(&self, transaction: &TransactionId) -> Result<PathBuf> {
-        self.private_dir()?;
+        self.ensure_helper_dir_as(transaction, false)
+    }
+
+    /// [`Coordination::ensure_helper_dir`] with every new directory owned by
+    /// the requesting user (see [`Coordination::create_user_owned`]).
+    pub fn ensure_helper_dir_user_owned(&self, transaction: &TransactionId) -> Result<PathBuf> {
+        self.ensure_helper_dir_as(transaction, true)
+    }
+
+    fn ensure_helper_dir_as(&self, transaction: &TransactionId, user_owned: bool) -> Result<PathBuf> {
+        self.private_dir_as(user_owned)?;
         let txn_dir = self.transaction_dir(transaction);
-        ensure_dir(&txn_dir, 0o700)?;
+        ensure_dir_as(&txn_dir, 0o700, user_owned)?;
         let helper = txn_dir.join(HELPER_DIR);
-        ensure_dir(&helper, 0o700)?;
+        ensure_dir_as(&helper, 0o700, user_owned)?;
         Ok(helper)
     }
 

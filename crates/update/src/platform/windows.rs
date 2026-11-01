@@ -311,9 +311,6 @@ impl crate::elevation::ElevatedLauncher for RunasLauncher {
         trusted: &FileIdentity,
     ) -> std::result::Result<ShellProcess, crate::elevation::LaunchFailure> {
         use crate::elevation::LaunchFailure;
-        // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
-        const MASK: u32 = 0x0000_0040 | 0x0000_0100;
-        const SW_HIDE: i32 = 0;
         let failure = |stage: &'static str, os_error: Option<u32>| LaunchFailure {
             stage,
             api: "ShellExecuteExW",
@@ -342,6 +339,56 @@ impl crate::elevation::ElevatedLauncher for RunasLauncher {
             Ok(held) if &held == trusted => {}
             _ => return Err(failure("verify-pinned-helper", None)),
         }
+        self.runas(helper, pinned)
+    }
+}
+
+impl RunasLauncher {
+    /// The consent launch of the *installed* helper of a protected placement.
+    /// It reads nothing from the protected parent: the image is pinned through
+    /// its directories and compared with `trusted`, the identity the signed
+    /// inventory vouched for, before the prompt is shown.
+    pub fn launch_installed(
+        &mut self,
+        helper: &Path,
+        trusted: &FileIdentity,
+    ) -> std::result::Result<ShellProcess, crate::elevation::LaunchFailure> {
+        use crate::elevation::LaunchFailure;
+        let failure = |stage: &'static str, os_error: Option<u32>| LaunchFailure {
+            stage,
+            api: "ShellExecuteExW",
+            os_error,
+            path: helper.display().to_string(),
+        };
+        if !helper.is_absolute() {
+            return Err(failure("validate-path", None));
+        }
+        let pinned = PinnedHelper::acquire(helper)
+            .map_err(|err| failure("pin-helper", err.raw_os_error().map(|raw| raw as u32)))?;
+        match pinned.identity() {
+            Ok(held) if &held == trusted => {}
+            _ => return Err(failure("verify-pinned-helper", None)),
+        }
+        self.runas(helper, pinned)
+    }
+
+    /// `ShellExecuteExW` with the `runas` verb for a helper that is already
+    /// verified and still pinned.
+    fn runas(
+        &self,
+        helper: &Path,
+        pinned: PinnedHelper,
+    ) -> std::result::Result<ShellProcess, crate::elevation::LaunchFailure> {
+        use crate::elevation::LaunchFailure;
+        // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+        const MASK: u32 = 0x0000_0040 | 0x0000_0100;
+        const SW_HIDE: i32 = 0;
+        let failure = |stage: &'static str, os_error: Option<u32>| LaunchFailure {
+            stage,
+            api: "ShellExecuteExW",
+            os_error,
+            path: helper.display().to_string(),
+        };
         let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
         let file = wide_path(helper);
         let parameters: Vec<u16> = crate::elevation::ELEVATED_ARGUMENT
@@ -514,6 +561,15 @@ fn io_failure(what: &str, code: Option<i32>) -> UpdateError {
 /// read on a duplex handle would block the writes of the other thread.
 fn pipe_names(transaction: &TransactionId) -> (String, String) {
     let base = format!(r"\\.\pipe\hane-update-{}", transaction.as_str());
+    (format!("{base}-a2h"), format!("{base}-h2a"))
+}
+
+/// The two pipes of a protected placement's bootstrap, named by the install:
+/// the elevated helper knows no transaction before the consent. Only one
+/// update of an install runs at a time, and `FILE_FLAG_FIRST_PIPE_INSTANCE`
+/// turns a name that is already taken into a failure instead of a hijack.
+fn bootstrap_pipe_names(install_id: &InstallId) -> (String, String) {
+    let base = format!(r"\\.\pipe\hane-update-bootstrap-{}", install_id.as_str());
     (format!("{base}-a2h"), format!("{base}-h2a"))
 }
 
@@ -775,7 +831,16 @@ pub struct PipeListener {
 
 impl PipeListener {
     pub fn create(transaction: &TransactionId) -> Result<Self> {
-        let (to_helper, from_helper) = pipe_names(transaction);
+        Self::create_named(pipe_names(transaction))
+    }
+
+    /// The endpoint of a protected placement's bootstrap (see
+    /// [`bootstrap_pipe_names`]).
+    pub fn create_bootstrap(install_id: &InstallId) -> Result<Self> {
+        Self::create_named(bootstrap_pipe_names(install_id))
+    }
+
+    fn create_named((to_helper, from_helper): (String, String)) -> Result<Self> {
         Ok(Self {
             to_helper: Some(create_server_pipe(&to_helper, false)?),
             from_helper: Some(create_server_pipe(&from_helper, true)?),
@@ -908,6 +973,16 @@ fn open_client_pipe(name: &str, read: bool) -> Result<File> {
 /// the application's pipes and requires their owner to be a process of the same
 /// account in the same session. Then it announces itself with the ready marker.
 pub fn connect_helper_pipes(transaction: &TransactionId) -> Result<HelperPipes> {
+    connect_pipes(pipe_names(transaction))
+}
+
+/// [`connect_helper_pipes`] for the helper started from the install itself, which
+/// finds its endpoint by the install it belongs to.
+pub fn connect_bootstrap_pipes(install_id: &InstallId) -> Result<HelperPipes> {
+    connect_pipes(bootstrap_pipe_names(install_id))
+}
+
+fn connect_pipes((to_helper, from_helper): (String, String)) -> Result<HelperPipes> {
     let own = own_token()?;
     if !token_is_elevated(own.0)? {
         return Err(UpdateError::new(
@@ -916,7 +991,6 @@ pub fn connect_helper_pipes(transaction: &TransactionId) -> Result<HelperPipes> 
         ));
     }
     let own_sid = token_user_sid(own.0)?;
-    let (to_helper, from_helper) = pipe_names(transaction);
     let reader = open_client_pipe(&to_helper, true)?;
     let mut writer = open_client_pipe(&from_helper, false)?;
     let server_pid = pipe_server_pid(&reader)?;
@@ -1357,6 +1431,21 @@ impl ElevationOs for WindowsElevation {
     ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
         let mut launcher = RunasLauncher { owner_hwnd: self.owner_hwnd };
         crate::elevation::ElevatedLauncher::launch(&mut launcher, helper, trusted)
+            .map(|process| Box::new(process) as Box<dyn ElevatedProcess>)
+    }
+
+    fn listen_bootstrap(&self, install_id: &InstallId) -> Result<Box<dyn ElevatedListener>> {
+        Ok(Box::new(PipeListener::create_bootstrap(install_id)?))
+    }
+
+    fn launch_installed(
+        &self,
+        helper: &Path,
+        trusted: &FileIdentity,
+    ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+        let mut launcher = RunasLauncher { owner_hwnd: self.owner_hwnd };
+        launcher
+            .launch_installed(helper, trusted)
             .map(|process| Box::new(process) as Box<dyn ElevatedProcess>)
     }
 }

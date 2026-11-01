@@ -124,6 +124,310 @@ pub fn take_session_nonce(coord: &Coordination, transaction: &TransactionId) -> 
     outcome
 }
 
+// ------------------------------------------- protected-placement bootstrap
+
+/// Opens the bootstrap request line. It is sent over the verified local channel,
+/// never on a command line, and it is not logged.
+const BOOTSTRAP_MAGIC: &str = "HANE-BOOTSTRAP-1";
+const BOOTSTRAP_LINE_LIMIT: usize = 512;
+/// The single byte with which the elevated helper reports that its coordination
+/// directory and helper copy exist.
+const BOOTSTRAP_ACK: u8 = 0xA5;
+/// How long the application waits for the elevated helper's bootstrap.
+pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the application asks the elevated, installed helper to create after the
+/// consent. The helper checks every part against what it derives itself; the
+/// one-time `nonce` becomes the secret of the framed session that follows.
+#[derive(Debug)]
+pub struct BootstrapRequest {
+    pub install_id: InstallId,
+    pub transaction: TransactionId,
+    pub nonce: Nonce,
+}
+
+fn write_bootstrap_request<W: Write>(
+    writer: &mut W,
+    install_id: &InstallId,
+    transaction: &TransactionId,
+    nonce: &Nonce,
+) -> Result<()> {
+    let line = format!(
+        "{BOOTSTRAP_MAGIC} {} {} {}\n",
+        install_id.as_str(),
+        transaction.as_str(),
+        nonce.as_str()
+    );
+    writer.write_all(line.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Reads one bounded request line. A malformed or over-long line is refused with
+/// a fixed message that never repeats what was received.
+fn read_bootstrap_request<R: Read>(reader: &mut R) -> Result<BootstrapRequest> {
+    let refuse = |why: &str| UpdateError::new(ErrorCode::IdentityMismatch, why.to_owned());
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(UpdateError::new(
+                    ErrorCode::Truncated,
+                    "the application closed the channel before the bootstrap request",
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= BOOTSTRAP_LINE_LIMIT {
+            return Err(refuse("the bootstrap request is too long"));
+        }
+        line.push(byte[0]);
+    }
+    let text = String::from_utf8(line).map_err(|_| refuse("the bootstrap request is malformed"))?;
+    let mut parts = text.split(' ');
+    let (Some(magic), Some(install), Some(transaction), Some(nonce), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(refuse("the bootstrap request is malformed"));
+    };
+    if magic != BOOTSTRAP_MAGIC {
+        return Err(refuse("the bootstrap request is malformed"));
+    }
+    Ok(BootstrapRequest {
+        install_id: InstallId::parse(install)?,
+        transaction: TransactionId::parse(transaction)?,
+        nonce: Nonce::parse(nonce)?,
+    })
+}
+
+/// What the elevated helper holds once its bootstrap succeeded.
+pub struct Bootstrapped {
+    pub coordination: Coordination,
+    pub transaction: TransactionId,
+    pub nonce: Nonce,
+}
+
+fn same_helper_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Helper side of the protected-placement bootstrap. It runs only after the
+/// application has proven, through the OS, to be the requesting account's
+/// process of the same session behind the pipes. `placement` and `source` are
+/// derived and verified by the helper itself (its own location, the signed
+/// inventory); the request only names the transaction and carries the secret.
+///
+/// Nothing is created before the request is checked against them: the install
+/// must be this one, the running image must be the installed helper and the
+/// transaction must be new. Then, and only then, the coordination directory, the
+/// transaction directory and the staged helper copy are created, owned by the
+/// requesting user so that the same account's standard application can stage the
+/// candidate and the state binding into them. On a failure after the first
+/// directory exists the transaction is removed again.
+pub fn serve_bootstrap<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    placement: &crate::platform::Placement,
+    source: &crate::platform::HelperSource,
+    own_exe: &Path,
+) -> Result<Bootstrapped> {
+    let request = read_bootstrap_request(reader)?;
+    let mismatch = |why: &str| UpdateError::new(ErrorCode::IdentityMismatch, why.to_owned());
+    if request.install_id != placement.install_id {
+        return Err(mismatch("the request is not for this installation"));
+    }
+    if !same_helper_path(&source.path, own_exe) {
+        return Err(mismatch("the running helper is not the installed helper of this installation"));
+    }
+    let BootstrapRequest { transaction, nonce, .. } = request;
+    let coordination_dir = placement
+        .coordination_parent
+        .join(placement.install_id.coordination_dir_name());
+    if std::fs::symlink_metadata(coordination_dir.join(crate::platform::lease::PRIVATE_DIR).join(transaction.as_str()))
+        .is_ok()
+    {
+        return Err(mismatch("the transaction already exists"));
+    }
+    let coordination = Coordination::create_user_owned(&placement.coordination_parent, &placement.install_id)?;
+    if let Err(err) = crate::platform::stage_helper_copy_user_owned(&coordination, &transaction, source) {
+        let _ = coordination.remove_unjournaled_transaction(&transaction);
+        return Err(err);
+    }
+    if let Err(err) = writer.write_all(&[BOOTSTRAP_ACK]).and_then(|()| writer.flush()) {
+        let _ = coordination.remove_unjournaled_transaction(&transaction);
+        return Err(err.into());
+    }
+    Ok(Bootstrapped { coordination, transaction, nonce })
+}
+
+/// Application side: waits for the helper's acknowledgement of its bootstrap.
+/// The wait is bounded; on a timeout the caller stops the helper, which closes
+/// the channel and ends the blocked read.
+fn await_bootstrap_ack(
+    mut reader: Box<dyn Read + Send>,
+    timeout: Duration,
+) -> Result<Box<dyn Read + Send>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("hane-bootstrap-ack".to_owned())
+        .spawn(move || {
+            let mut byte = [0_u8; 1];
+            let outcome: Result<Box<dyn Read + Send>> = match reader.read(&mut byte) {
+                Ok(1) if byte[0] == BOOTSTRAP_ACK => Ok(reader),
+                Ok(0) => Err(UpdateError::new(
+                    ErrorCode::Truncated,
+                    "the elevated helper closed the channel during its bootstrap",
+                )),
+                Ok(_) => Err(UpdateError::new(
+                    ErrorCode::IdentityMismatch,
+                    "the elevated helper did not acknowledge its bootstrap",
+                )),
+                Err(err) => Err(err.into()),
+            };
+            let _ = sender.send(outcome);
+        })?;
+    match receiver.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Timeout) => Err(UpdateError::new(
+            ErrorCode::Timeout,
+            "the elevated helper did not finish its bootstrap in time",
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(UpdateError::new(
+            ErrorCode::Truncated,
+            "the bootstrap acknowledgement ended",
+        )),
+    }
+}
+
+/// Removes the transaction a failed bootstrap left in the coordination
+/// directory, once the helper is certainly stopped. Best effort: what cannot be
+/// verified stays for the next cleanup.
+fn discard_failed_bootstrap(
+    placement: &crate::platform::Placement,
+    transaction: &TransactionId,
+    helper_stopped: bool,
+) {
+    if !helper_stopped {
+        return;
+    }
+    if let Ok(Some(coordination)) = placement.existing_coordination() {
+        let _ = coordination.remove_unjournaled_transaction(transaction);
+    }
+}
+
+/// The consent route of a known protected placement. Nothing is written to the
+/// protected install parent before the consent, and nothing by this
+/// (unelevated) side at all: the ordinary application keeps its requests in its
+/// own process, listens on a local channel that only an elevated token of the
+/// same account can open, and starts the *installed* helper, pinned by the
+/// signed inventory's identity, through one consent request. Only after the OS
+/// reports the connected process to be that very launched process, elevated, in
+/// this session and running as the requesting account does the elevated helper
+/// create the coordination directory and the staged helper copy; the
+/// application then stages the candidate and the state binding into the
+/// directories the helper made for the requesting user and completes the
+/// ordinary `Hello`/`Prepared` handshake. The application is never closed here.
+fn prepare_protected_with(
+    placement: &crate::platform::Placement,
+    source: impl FnOnce() -> Result<crate::platform::HelperSource>,
+    candidate_id: &str,
+    candidate: &CandidateSource<'_>,
+    state_root: &Path,
+    os: &dyn ElevationOs,
+) -> Result<PreparedRestart> {
+    use crate::elevation as el;
+    // A build that cannot finish an elevated apply must not show a prompt.
+    if !os.standard_restart_available() {
+        return Err(el::protected_placement_error());
+    }
+    let source = source()?;
+    // Inputs of the user side that the elevated helper will use are checked
+    // before the prompt, so a request that cannot succeed never asks for consent.
+    crate::state_root::validate_root(state_root)?;
+    let transaction = TransactionId::generate()?;
+    let nonce = Nonce::generate()?;
+    let connection = el::connect_bootstrap(
+        os,
+        &placement.install_root,
+        &source.path,
+        &source.identity,
+        &placement.install_id,
+        el::CONNECT_TIMEOUT,
+    )
+    .map_err(|failure| failure.error)?;
+    let el::ElevatedConnection { process, reader, mut writer } = connection;
+
+    let acknowledged = write_bootstrap_request(&mut writer, &placement.install_id, &transaction, &nonce)
+        .and_then(|()| await_bootstrap_ack(reader, BOOTSTRAP_TIMEOUT));
+    let reader = match acknowledged {
+        Ok(reader) => reader,
+        Err(err) => {
+            let failure = el::stop_helper(process, err);
+            discard_failed_bootstrap(placement, &transaction, failure.helper_stopped);
+            return Err(failure.error);
+        }
+    };
+    let coordination = match placement.existing_coordination() {
+        Ok(Some(coordination)) => coordination,
+        other => {
+            let err = match other {
+                Err(err) => err,
+                _ => UpdateError::new(ErrorCode::NotFound, "the elevated helper did not create the coordination directory"),
+            };
+            let failure = el::stop_helper(process, err);
+            return Err(failure.error);
+        }
+    };
+    // From the first file this side stages until `PreparedRestart` owns the
+    // transaction, any early return cleans this transaction (and only this one)
+    // up, once the helper is certainly stopped.
+    let mut cleanup = PreparingTransaction {
+        coordination: &coordination,
+        transaction: &transaction,
+        helper_stopped: false,
+        armed: true,
+    };
+    let staged = stage_candidate(&coordination, &transaction, candidate)
+        .map(|_| ())
+        .and_then(|()| crate::state_root::publish_binding(&coordination, &transaction, state_root));
+    if let Err(err) = staged {
+        let failure = el::stop_helper(process, err);
+        cleanup.helper_stopped = failure.helper_stopped;
+        return Err(failure.error);
+    }
+    let request = HelloRequest {
+        mode: Mode::Prepare,
+        install_id: placement.install_id.clone(),
+        transaction_id: transaction.clone(),
+        candidate_id: Some(candidate_id.to_owned()),
+    };
+    match HelperLink::handshake(reader, writer, &request, nonce, Some(process.pid()), ELEVATED_PREPARE_TIMEOUT) {
+        Ok(link) => {
+            cleanup.armed = false;
+            drop(cleanup);
+            Ok(PreparedRestart {
+                spawned: Some(RunningHelper::Elevated(ElevatedHelper { link, process })),
+                coordination,
+                transaction,
+            })
+        }
+        Err(err) => {
+            let failure = el::stop_helper(process, err);
+            cleanup.helper_stopped = failure.helper_stopped;
+            Err(failure.error)
+        }
+    }
+}
+
 // ------------------------------------------------------------ helper side
 
 /// What the helper is allowed to be asked, derived from its own location.
@@ -751,9 +1055,17 @@ fn elevated_main() -> i32 {
     let Ok(exe) = std::env::current_exe() else {
         return 3;
     };
-    let Ok((coordination, transaction)) = Coordination::from_helper_exe(&exe) else {
-        return 3;
-    };
+    // A helper that runs from a transaction directory is a staged copy; one that
+    // runs from the install itself is the installed helper behind the
+    // protected-placement bootstrap, which has no transaction yet.
+    match Coordination::from_helper_exe(&exe) {
+        Ok((coordination, transaction)) => elevated_copy_main(coordination, transaction),
+        Err(_) => elevated_installed_main(&exe),
+    }
+}
+
+#[cfg(windows)]
+fn elevated_copy_main(coordination: Coordination, transaction: TransactionId) -> i32 {
     // The new version must be startable with the user's unelevated token. This
     // is established before the application is contacted, so a helper that
     // could only start it as an administrator ends before any change.
@@ -762,7 +1074,7 @@ fn elevated_main() -> i32 {
     }
     // The application's endpoint must exist and must be the requesting
     // account's process in this session before anything is read or consumed.
-    let Ok(mut pipes) = crate::platform::windows::connect_helper_pipes(&transaction) else {
+    let Ok(pipes) = crate::platform::windows::connect_helper_pipes(&transaction) else {
         return 6;
     };
     let Ok(nonce) = take_session_nonce(&coordination, &transaction) else {
@@ -778,11 +1090,55 @@ fn elevated_main() -> i32 {
         parent_exit_timeout: PARENT_EXIT_TIMEOUT,
         authorize_window: AUTHORIZE_WINDOW,
     };
+    run_elevated_session(pipes, &env, &nonce)
+}
+
+/// The installed helper started through the consent prompt of a protected
+/// placement. It derives the placement and its own signed identity itself,
+/// requires the application's endpoint to be the requesting account's process in
+/// this session, and only then creates the coordination directory and the staged
+/// copy the application asks for (see [`serve_bootstrap`]).
+#[cfg(windows)]
+fn elevated_installed_main(exe: &Path) -> i32 {
+    if crate::platform::windows::standard_token_available().is_err() {
+        return 7;
+    }
+    let Ok(placement) = crate::platform::placement_of_installed_helper(exe) else {
+        return 3;
+    };
+    let Ok(source) = crate::platform::installed_helper(&placement, &TrustPolicy::production()) else {
+        return 3;
+    };
+    let Ok(mut pipes) = crate::platform::windows::connect_bootstrap_pipes(&placement.install_id) else {
+        return 6;
+    };
+    let Ok(bootstrapped) = serve_bootstrap(&mut pipes.reader, &mut pipes.writer, &placement, &source, exe)
+    else {
+        return 5;
+    };
+    let env = HelperEnv {
+        coordination: bootstrapped.coordination,
+        transaction: bootstrapped.transaction,
+        parent_pid: pipes.server_pid,
+        own_pid: std::process::id(),
+        gate_timeout: STARTUP_GATE_TIMEOUT,
+        parent_exit_timeout: PARENT_EXIT_TIMEOUT,
+        authorize_window: AUTHORIZE_WINDOW,
+    };
+    run_elevated_session(pipes, &env, &bootstrapped.nonce)
+}
+
+#[cfg(windows)]
+fn run_elevated_session(
+    mut pipes: crate::platform::windows::HelperPipes,
+    env: &HelperEnv,
+    nonce: &Nonce,
+) -> i32 {
     let mut backend = ElevatedBackend {
         inner: PlatformBackend::production().with_standard_token_children(),
         standard_restart: crate::elevation::STANDARD_RESTART_AVAILABLE,
     };
-    match run_session(&mut pipes.reader, &mut pipes.writer, &env, &nonce, &mut backend) {
+    match run_session(&mut pipes.reader, &mut pipes.writer, env, nonce, &mut backend) {
         Ok(SessionEnd::Applied | SessionEnd::Recovered(_) | SessionEnd::Aborted) => 0,
         Ok(SessionEnd::ParentStillRunning) => 4,
         Err(_) => 1,
@@ -1360,21 +1716,30 @@ pub fn prepare_restart_with(
         return Err(UpdateError::new(ErrorCode::IdentityMismatch, "malformed candidate id"));
     }
     // The route is decided before any state is created or published, and a
-    // route that is not the plain one never writes to the install's parent. A
-    // known protected placement the user cannot write would need the
-    // coordination, helper copy, binding and secret to be created by the
-    // elevated side after consent; the pinned-bootstrap protocol that does that
-    // does not exist yet, and creating them here first would write a protected
-    // parent before the prompt (or with an ordinary token that is refused). The
-    // request therefore stops with the reason, before any consent prompt and
-    // before anything is staged, and the running application and its work are
-    // untouched. A refused route leaves nothing behind either.
+    // route that is not the plain one never writes to the install's parent from
+    // here. A writable install keeps the ordinary path and never prompts. A
+    // known protected placement the user cannot write goes to the pinned
+    // bootstrap: one consent prompt for the installed helper, and only after the
+    // peer is verified does the elevated side create the coordination directory
+    // and the staged helper copy (see `prepare_protected_with`). An unknown
+    // placement or an undetermined access is refused with the reason before any
+    // prompt and before anything is staged; a refused route leaves nothing
+    // behind.
     {
         use crate::elevation::{Route, StandardAttempt, choose_route};
         let access = os.placement_access(&placement.install_root);
         match choose_route(access.protected, access.write, StandardAttempt::NotTried) {
             Route::Standard => {}
-            Route::Elevated(_) => return Err(crate::elevation::protected_bootstrap_unavailable_error()),
+            Route::Elevated(_) => {
+                return prepare_protected_with(
+                    placement,
+                    || crate::platform::installed_helper(placement, policy),
+                    candidate_id,
+                    candidate,
+                    state_root,
+                    os,
+                );
+            }
             Route::Refused(reason) => return Err(crate::elevation::route_refused_error(&reason)),
         }
     }
@@ -2819,51 +3184,14 @@ mod tests {
     }
 
     #[test]
-    fn a_protected_placement_is_refused_before_the_prompt_and_before_the_parent_is_written() {
+    fn a_protected_placement_whose_installed_helper_cannot_be_verified_is_refused_before_the_prompt() {
         let fx = fixture();
-        // Restart support is available and consent would be given: the request
-        // still stops first, with no endpoint, no prompt and no state.
+        // Restart support is available and consent would be given, but the
+        // installed helper cannot be verified here (no supported placement):
+        // the request stops with no endpoint, no prompt and no state.
         let os = ConsentOs::new(&fx);
         let err = prepare_unwritable(&fx, &os);
-        assert!(crate::elevation::is_elevation_required(&err), "{err:?}");
-        assert!(os.events().is_empty(), "{:?}", os.events());
-
-        // A parent that exists is left exactly as it was: no coordination
-        // directory, transaction, helper copy, binding or secret appears in it.
-        let parent = fx._dir.path().join("protected-parent");
-        std::fs::create_dir(&parent).unwrap();
-        let placement = crate::platform::Placement {
-            target: Target::WindowsX64,
-            install_root: parent.join("hane"),
-            coordination_parent: parent.clone(),
-            install_id: fx.install.clone(),
-        };
-        let candidate = fx._dir.path().join("candidate");
-        let source = CandidateSource { catalog: &candidate, signature: &candidate, archive: &candidate };
-        let err = prepare_restart_with(
-            &placement,
-            &crate::testing::test_policy(),
-            &"a".repeat(64),
-            &source,
-            fx._dir.path(),
-            &os,
-        )
-        .err()
-        .expect("the restart is not prepared");
-        assert!(crate::elevation::is_elevation_required(&err), "{err:?}");
-        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
-        assert!(os.events().is_empty(), "{:?}", os.events());
-    }
-
-    #[test]
-    fn a_protected_placement_is_refused_again_on_retry_with_the_old_state_kept() {
-        let fx = fixture();
-        let os = ConsentOs::new(&fx);
-        os.consent.store(false, Ordering::SeqCst);
-        let first = prepare_unwritable(&fx, &os);
-        os.consent.store(true, Ordering::SeqCst);
-        let second = prepare_unwritable(&fx, &os);
-        assert_eq!(first, second);
+        assert!(!crate::elevation::is_declined(&err), "{err:?}");
         assert!(os.events().is_empty(), "{:?}", os.events());
     }
 
@@ -3018,5 +3346,504 @@ mod tests {
             .apply(&mut ApplyContext { env: &env, candidate_id: Some("cand"), leases: &mut leases })
             .unwrap();
         assert_eq!(backend.inner.applied, 1);
+    }
+
+    // ---------------------------------- the protected-placement bootstrap
+
+    use crate::identity::FileIdentity;
+    use crate::platform::{HelperSource, Placement};
+
+    const INSTALLED_HELPER: &[u8] = b"installed helper";
+
+    /// A protected install: the installed helper, a coordination parent that is
+    /// empty, a Ready candidate and the application's state root.
+    struct Protected {
+        dir: TempDir,
+        placement: Placement,
+        source: HelperSource,
+        parent: std::path::PathBuf,
+        candidate: std::path::PathBuf,
+        state_root: std::path::PathBuf,
+    }
+
+    fn protected() -> Protected {
+        let dir = TempDir::new("protected-bootstrap");
+        let install_root = dir.path().join("hane");
+        std::fs::create_dir(&install_root).unwrap();
+        let helper = install_root.join("hane-updater");
+        std::fs::write(&helper, INSTALLED_HELPER).unwrap();
+        let parent = dir.path().join("protected-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let candidate = dir.path().join("candidate");
+        std::fs::create_dir(&candidate).unwrap();
+        for name in ["catalog.json", "catalog.sig", "archive.zip"] {
+            std::fs::write(candidate.join(name), name.as_bytes()).unwrap();
+        }
+        let state_root = dir.path().join("state");
+        std::fs::create_dir(&state_root).unwrap();
+        crate::platform::acl::secure_new(&state_root, true, 0o700).unwrap();
+        let placement = Placement {
+            target: Target::WindowsX64,
+            install_root,
+            coordination_parent: parent.clone(),
+            install_id: unique_install_id(),
+        };
+        let source = HelperSource { path: helper, identity: FileIdentity::of(INSTALLED_HELPER) };
+        Protected { dir, placement, source, parent, candidate, state_root }
+    }
+
+    impl Protected {
+        fn parent_entries(&self) -> usize {
+            std::fs::read_dir(&self.parent).unwrap().count()
+        }
+
+        fn coordination(&self) -> Coordination {
+            self.placement.existing_coordination().unwrap().expect("the helper created it")
+        }
+
+        fn prepare(&self, os: &dyn ElevationOs) -> Result<PreparedRestart> {
+            let (catalog, signature, archive) = (
+                self.candidate.join("catalog.json"),
+                self.candidate.join("catalog.sig"),
+                self.candidate.join("archive.zip"),
+            );
+            let candidate = CandidateSource { catalog: &catalog, signature: &signature, archive: &archive };
+            prepare_protected_with(
+                &self.placement,
+                || Ok(self.source.clone()),
+                &"a".repeat(64),
+                &candidate,
+                &self.state_root,
+                os,
+            )
+        }
+    }
+
+    /// Plays the consent prompt and the elevated, installed helper: `launch_installed`
+    /// runs the real `serve_bootstrap` and `run_session` on a thread over in-memory
+    /// pipes. The helper derives its placement and image itself, so tests can make
+    /// it disagree with the request.
+    struct BootstrapOs {
+        helper_placement: Placement,
+        helper_source: HelperSource,
+        helper_exe: std::path::PathBuf,
+        parent: std::path::PathBuf,
+        peer: Mutex<PeerFacts>,
+        consent: AtomicBool,
+        available: bool,
+        /// Whether the coordination parent was still untouched when the prompt was shown.
+        parent_clean_at_prompt: AtomicBool,
+        pending: Mutex<Option<(PipeReader, PipeWriter)>>,
+        closer: Mutex<Option<PipeWriter>>,
+        thread: Mutex<Option<std::thread::JoinHandle<Result<SessionEnd>>>>,
+        exited: Arc<AtomicBool>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl BootstrapOs {
+        fn new(fx: &Protected) -> Self {
+            Self {
+                helper_placement: fx.placement.clone(),
+                helper_source: fx.source.clone(),
+                helper_exe: fx.source.path.clone(),
+                parent: fx.parent.clone(),
+                peer: Mutex::new(genuine_peer()),
+                consent: AtomicBool::new(true),
+                available: true,
+                parent_clean_at_prompt: AtomicBool::new(false),
+                pending: Mutex::new(None),
+                closer: Mutex::new(None),
+                thread: Mutex::new(None),
+                exited: Arc::new(AtomicBool::new(false)),
+                log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn helper_result(&self) -> Result<SessionEnd> {
+            let handle = self.thread.lock().unwrap().take().expect("a helper was launched");
+            handle.join().expect("the helper thread did not panic")
+        }
+    }
+
+    impl ElevationOs for BootstrapOs {
+        fn standard_restart_available(&self) -> bool {
+            self.available
+        }
+
+        fn placement_access(&self, _install_root: &Path) -> crate::elevation::PlacementAccess {
+            crate::elevation::PlacementAccess {
+                protected: true,
+                write: crate::elevation::WriteAccess::Denied,
+            }
+        }
+
+        fn current_principals(&self, _install_root: &Path) -> Result<(String, String)> {
+            Ok((USER_SID.to_owned(), USER_SID.to_owned()))
+        }
+
+        fn session_id(&self) -> Result<u32> {
+            Ok(1)
+        }
+
+        fn listen(&self, _transaction: &TransactionId) -> Result<Box<dyn ElevatedListener>> {
+            panic!("the bootstrap never uses a transaction-named endpoint");
+        }
+
+        fn launch(
+            &self,
+            _helper: &Path,
+            _trusted: &FileIdentity,
+        ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+            panic!("the bootstrap never starts a staged copy");
+        }
+
+        fn listen_bootstrap(&self, _install_id: &InstallId) -> Result<Box<dyn ElevatedListener>> {
+            self.log.lock().unwrap().push("listen_bootstrap");
+            let (helper_in, app_to_helper) = pipe();
+            let (app_from_helper, helper_out) = pipe();
+            *self.pending.lock().unwrap() = Some((helper_in, helper_out));
+            *self.closer.lock().unwrap() = Some(app_to_helper.clone());
+            Ok(Box::new(ConsentListener {
+                peer: self.peer.lock().unwrap().clone(),
+                ends: Some((app_from_helper, app_to_helper)),
+            }))
+        }
+
+        fn launch_installed(
+            &self,
+            _helper: &Path,
+            _trusted: &FileIdentity,
+        ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+            self.log.lock().unwrap().push("launch_installed");
+            self.parent_clean_at_prompt.store(
+                std::fs::read_dir(&self.parent).unwrap().count() == 0,
+                Ordering::SeqCst,
+            );
+            if !self.consent.load(Ordering::SeqCst) {
+                return Err(LaunchFailure {
+                    stage: "consent-launch",
+                    api: "ShellExecuteExW",
+                    os_error: Some(crate::elevation::ERROR_CANCELLED),
+                    path: "C:\\hane\\hane-updater.exe".to_owned(),
+                });
+            }
+            let (mut helper_in, mut helper_out) = self
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the endpoint was created before the launch");
+            let closer = self.closer.lock().unwrap().clone().expect("the endpoint exists");
+            let placement = self.helper_placement.clone();
+            let source = self.helper_source.clone();
+            let exe = self.helper_exe.clone();
+            let exited = Arc::clone(&self.exited);
+            exited.store(false, Ordering::SeqCst);
+            let end = helper_out.clone();
+            let thread = std::thread::spawn(move || {
+                let result = serve_bootstrap(&mut helper_in, &mut helper_out, &placement, &source, &exe)
+                    .and_then(|bootstrapped| {
+                        let env = HelperEnv {
+                            coordination: bootstrapped.coordination,
+                            transaction: bootstrapped.transaction,
+                            parent_pid: std::process::id(),
+                            own_pid: HELPER_PID,
+                            gate_timeout: Duration::from_millis(100),
+                            parent_exit_timeout: Duration::from_millis(150),
+                            authorize_window: Duration::from_secs(60),
+                        };
+                        run_session(
+                            &mut helper_in,
+                            &mut helper_out,
+                            &env,
+                            &bootstrapped.nonce,
+                            &mut Spy::default(),
+                        )
+                    });
+                end.close();
+                exited.store(true, Ordering::SeqCst);
+                result
+            });
+            *self.thread.lock().unwrap() = Some(thread);
+            Ok(Box::new(ConsentProcess {
+                exited: Arc::clone(&self.exited),
+                closer,
+                log: Arc::clone(&self.log),
+            }))
+        }
+    }
+
+    #[test]
+    fn a_protected_placement_prompts_once_and_the_parent_is_written_only_by_the_verified_helper() {
+        let fx = protected();
+        let os = BootstrapOs::new(&fx);
+        assert_eq!(fx.parent_entries(), 0);
+        let prepared = fx.prepare(&os).expect("the bootstrap prepares the restart");
+        assert_eq!(os.events(), ["listen_bootstrap", "launch_installed"]);
+        assert!(
+            os.parent_clean_at_prompt.load(Ordering::SeqCst),
+            "nothing was written to the protected parent before the consent"
+        );
+        assert!(prepared.is_elevated());
+        assert_eq!(prepared.helper_pid(), Some(HELPER_PID));
+
+        // The elevated helper made the coordination directory and the staged
+        // copy; this side staged the candidate and the state binding into it.
+        let coordination = fx.coordination();
+        let transaction = prepared.transaction().clone();
+        let txn_dir = coordination.transaction_dir(&transaction);
+        let staged = txn_dir.join("helper").join(crate::platform::STAGED_HELPER_FILE_NAME);
+        assert_eq!(std::fs::read(&staged).unwrap(), INSTALLED_HELPER);
+        assert!(txn_dir.join("candidate").join("archive.zip").is_file());
+        assert_eq!(
+            crate::state_root::read_binding(&coordination, &transaction).unwrap(),
+            fx.state_root
+        );
+        crate::platform::acl::verify_user_owned(coordination.dir(), true).unwrap();
+        crate::platform::acl::verify_user_owned(&txn_dir, true).unwrap();
+        crate::platform::acl::verify_user_owned(&staged, false).unwrap();
+        // The application is not asked to quit by the preparation.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!os.exited.load(Ordering::SeqCst));
+
+        // Dropping the handoff before any authorization aborts the helper and
+        // removes the transaction; the old version was never touched.
+        drop(prepared);
+        assert_eq!(os.helper_result().unwrap(), SessionEnd::Aborted);
+        assert!(!txn_dir.exists());
+    }
+
+    #[test]
+    fn a_declined_prompt_creates_nothing_in_the_protected_parent_and_a_retry_succeeds() {
+        let fx = protected();
+        let os = BootstrapOs::new(&fx);
+        os.consent.store(false, Ordering::SeqCst);
+        let err = fx.prepare(&os).err().expect("the prompt was declined");
+        assert!(crate::elevation::is_declined(&err), "{err:?}");
+        assert_eq!(os.events(), ["listen_bootstrap", "launch_installed"]);
+        assert!(os.parent_clean_at_prompt.load(Ordering::SeqCst));
+        assert_eq!(fx.parent_entries(), 0, "a refused consent leaves the parent untouched");
+
+        os.consent.store(true, Ordering::SeqCst);
+        let prepared = fx.prepare(&os).expect("the retry prepares");
+        drop(prepared);
+        assert_eq!(os.helper_result().unwrap(), SessionEnd::Aborted);
+    }
+
+    #[test]
+    fn a_build_without_the_standard_restart_shows_no_prompt_and_writes_nothing() {
+        let fx = protected();
+        let mut os = BootstrapOs::new(&fx);
+        os.available = false;
+        let err = fx.prepare(&os).err().expect("no prompt without the standard restart");
+        assert!(crate::elevation::is_elevation_required(&err), "{err:?}");
+        assert!(os.events().is_empty(), "{:?}", os.events());
+        assert_eq!(fx.parent_entries(), 0);
+    }
+
+    #[test]
+    fn a_peer_that_is_not_the_launched_elevated_helper_never_makes_the_helper_write_anything() {
+        let mut other_process = genuine_peer();
+        other_process.pid = HELPER_PID + 1;
+        let mut other_session = genuine_peer();
+        other_session.session_id = 2;
+        let mut other_account = genuine_peer();
+        other_account.token_sid = "S-1-5-21-2".to_owned();
+        let mut not_elevated = genuine_peer();
+        not_elevated.token_elevated = false;
+        for forged in [other_process, other_session, other_account, not_elevated] {
+            let fx = protected();
+            let os = BootstrapOs::new(&fx);
+            *os.peer.lock().unwrap() = forged;
+            let err = fx.prepare(&os).err().expect("a forged peer is refused");
+            assert_eq!(err.code, ErrorCode::IdentityMismatch);
+            assert_eq!(os.events().last(), Some(&"terminate"));
+            // The request was never sent, so the helper created nothing.
+            assert_eq!(fx.parent_entries(), 0);
+            assert!(os.helper_result().is_err());
+        }
+    }
+
+    #[test]
+    fn a_helper_that_derives_another_install_or_image_refuses_before_creating_anything() {
+        // Another install than the one the application asked for.
+        let fx = protected();
+        let mut os = BootstrapOs::new(&fx);
+        os.helper_placement.install_id = unique_install_id();
+        let err = fx.prepare(&os).err().expect("the helper refused");
+        assert_eq!(err.code, ErrorCode::Truncated, "{err:?}");
+        assert_eq!(fx.parent_entries(), 0);
+        assert_eq!(os.helper_result().unwrap_err().code, ErrorCode::IdentityMismatch);
+
+        // A running image that is not the installed helper of the install.
+        let fx = protected();
+        let mut os = BootstrapOs::new(&fx);
+        let other = fx.dir.path().join("other-helper");
+        std::fs::write(&other, INSTALLED_HELPER).unwrap();
+        os.helper_exe = other;
+        let err = fx.prepare(&os).err().expect("the helper refused");
+        assert_eq!(err.code, ErrorCode::Truncated, "{err:?}");
+        assert_eq!(fx.parent_entries(), 0);
+        assert_eq!(os.helper_result().unwrap_err().code, ErrorCode::IdentityMismatch);
+    }
+
+    #[test]
+    fn a_staging_failure_after_the_bootstrap_stops_the_helper_and_removes_the_transaction() {
+        let fx = protected();
+        std::fs::remove_file(fx.candidate.join("archive.zip")).unwrap();
+        let os = BootstrapOs::new(&fx);
+        let err = fx.prepare(&os).err().expect("the candidate cannot be staged");
+        assert!(!crate::elevation::is_declined(&err), "{err:?}");
+        assert_eq!(os.events().last(), Some(&"terminate"));
+        assert!(os.helper_result().is_err(), "the helper never got a Hello");
+        let private = fx.coordination().dir().join(crate::platform::lease::PRIVATE_DIR);
+        assert_eq!(
+            std::fs::read_dir(&private).unwrap().count(),
+            0,
+            "the failed transaction was removed and the install is untouched"
+        );
+    }
+
+    #[test]
+    fn a_state_root_that_cannot_be_bound_is_refused_before_the_prompt() {
+        let mut fx = protected();
+        fx.state_root = fx.dir.path().join("missing-state");
+        let os = BootstrapOs::new(&fx);
+        let err = fx.prepare(&os).err().expect("an unusable state root is refused");
+        assert!(!crate::elevation::is_declined(&err), "{err:?}");
+        assert!(os.events().is_empty(), "{:?}", os.events());
+        assert_eq!(fx.parent_entries(), 0);
+    }
+
+    fn request_bytes(install: &InstallId, transaction: &TransactionId, nonce: &Nonce) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_bootstrap_request(&mut bytes, install, transaction, nonce).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn the_bootstrap_request_round_trips_and_malformed_ones_are_refused_without_echoing_them() {
+        let install = unique_install_id();
+        let transaction = TransactionId::generate().unwrap();
+        let nonce = Nonce::generate().unwrap();
+        let bytes = request_bytes(&install, &transaction, &nonce);
+        let read = read_bootstrap_request(&mut Cursor::new(bytes.clone())).unwrap();
+        assert_eq!(read.install_id, install);
+        assert_eq!(read.transaction, transaction);
+        assert_eq!(read.nonce.as_str(), nonce.as_str());
+
+        let secret = nonce.as_str().to_owned();
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"HANE-BOOTSTRAP-1 only-one-field\n".to_vec(),
+            format!("OTHER-MAGIC {} {} {secret}\n", install.as_str(), transaction.as_str()).into_bytes(),
+            format!("HANE-BOOTSTRAP-1 {} {} {secret} extra\n", install.as_str(), transaction.as_str())
+                .into_bytes(),
+            format!("HANE-BOOTSTRAP-1 {} {} not-a-nonce\n", install.as_str(), transaction.as_str()).into_bytes(),
+            vec![b'a'; BOOTSTRAP_LINE_LIMIT + 8],
+            // No terminating newline: the channel closed mid-request.
+            bytes[..bytes.len() - 1].to_vec(),
+        ];
+        cases.push(b"\xff\xfe\n".to_vec());
+        for case in cases {
+            let err = read_bootstrap_request(&mut Cursor::new(case)).unwrap_err();
+            assert!(!err.to_string().contains(&secret), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn serve_bootstrap_creates_user_owned_state_only_after_checking_the_request() {
+        let fx = protected();
+        let transaction = TransactionId::generate().unwrap();
+        let nonce = Nonce::generate().unwrap();
+
+        // Another install: refused with nothing created.
+        let other = request_bytes(&unique_install_id(), &transaction, &nonce);
+        let mut ack = Vec::new();
+        let err = serve_bootstrap(
+            &mut Cursor::new(other),
+            &mut ack,
+            &fx.placement,
+            &fx.source,
+            &fx.source.path,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert!(ack.is_empty());
+        assert_eq!(fx.parent_entries(), 0);
+
+        // The right request creates the directories and the copy, owned by the
+        // user, and acknowledges with the single byte.
+        let request = request_bytes(&fx.placement.install_id, &transaction, &nonce);
+        let mut ack = Vec::new();
+        let boot = serve_bootstrap(
+            &mut Cursor::new(request.clone()),
+            &mut ack,
+            &fx.placement,
+            &fx.source,
+            &fx.source.path,
+        )
+        .unwrap();
+        assert_eq!(ack, [BOOTSTRAP_ACK]);
+        assert_eq!(boot.transaction, transaction);
+        assert_eq!(boot.nonce.as_str(), nonce.as_str());
+        let staged = boot
+            .coordination
+            .transaction_dir(&transaction)
+            .join("helper")
+            .join(crate::platform::STAGED_HELPER_FILE_NAME);
+        assert_eq!(std::fs::read(&staged).unwrap(), INSTALLED_HELPER);
+        crate::platform::acl::verify_user_owned(boot.coordination.dir(), true).unwrap();
+        crate::platform::acl::verify_user_owned(&staged, false).unwrap();
+        crate::platform::staged_helper(&boot.coordination, &transaction).unwrap();
+
+        // The same transaction cannot be bootstrapped twice.
+        let mut again = Vec::new();
+        let err = serve_bootstrap(
+            &mut Cursor::new(request),
+            &mut again,
+            &fx.placement,
+            &fx.source,
+            &fx.source.path,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert!(again.is_empty());
+        assert!(staged.is_file(), "the first transaction is untouched");
+    }
+
+    #[test]
+    fn serve_bootstrap_rolls_back_when_the_acknowledgement_cannot_be_sent() {
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let fx = protected();
+        let transaction = TransactionId::generate().unwrap();
+        let request = request_bytes(&fx.placement.install_id, &transaction, &Nonce::generate().unwrap());
+        let err = serve_bootstrap(
+            &mut Cursor::new(request),
+            &mut BrokenWriter,
+            &fx.placement,
+            &fx.source,
+            &fx.source.path,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.code, ErrorCode::Io);
+        let coordination = fx.coordination();
+        assert!(!coordination.transaction_dir(&transaction).exists());
     }
 }
