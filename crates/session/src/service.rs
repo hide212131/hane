@@ -1825,13 +1825,18 @@ mod tests {
     #[test]
     fn a_replacement_after_the_pin_is_detected_by_the_real_identity() {
         let (root, path, temporary) = install_race_fixture("install-identity-real");
+        let replaced = std::cell::Cell::new(false);
 
         let result = install_checked_with(
             &temporary,
             &path,
             &|_| Ok(()),
             PINNED_IDENTITY,
-            &|| replace_externally(&root, &path),
+            &|| {
+                if !replaced.replace(true) {
+                    replace_externally(&root, &path);
+                }
+            },
         );
 
         // Only the first round sees the replacement; the next round pins and
