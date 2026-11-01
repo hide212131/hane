@@ -42,6 +42,8 @@ PR の evidence は current head に結び付くものだけを使う。target b
 
 macOS / WindowsのローカルGUI検証には`agent-desktop`も使える。[導入・操作・証拠の手順](docs/agent-desktop-gui-testing.md)に従い、初回は`agent-desktop skills get desktop`と`agent-desktop skills get platform`を読んでから操作する。Windowsは引き続きWindows側で直接実行する。
 
+GUI確認では、Issueの受入条件を満たす最も軽いビルド種別を選ぶ。通常の機能・表示・入力シナリオは対象headのDebug / development buildを優先し、Release buildは最適化・配布物・インストール後の挙動が受入条件に含まれる場合に限る。単に配布版に近いという理由でRelease buildを作らない。タイミングや性能に依存する確認ではビルド種別の影響を考慮し、必要なprofileを明示して使う。記録にはbuild種別・対象SHA・実行バイナリの由来を含め、異なるprofileの結果を相互に代用しない。
+
 画面取得・ウインドウ列挙・入力の失敗やGUI占有だけで「できませんでした」とセッションを終えない。[GUIテストの診断・復旧手順](docs/gui-test-recovery.md)を読み、失敗した層を切り分け、自分の検証アプリ・操作helperの安全な再起動と再接続、利用可能な正規経路での再実行を進める。復旧後は軽量な操作確認に続けて元の受入シナリオを再実行する。 検証アプリは起動時に実PID・実行パス・隔離stateを記録し、終了を確認してからbundleや作業領域を片付ける。
 
 **Windows GUIは、ChatGPTアプリ（旧Codexアプリ）の「接続」でリモート設定したWindows環境上のChatGPTアプリから直接操作する。Mac経由でVMを操作する経路はNGとし、通常経路にも復旧・代替経路にも使わない。** 必要な照会・依頼は利用者が許可した既存Windowsチャットへ送る。
