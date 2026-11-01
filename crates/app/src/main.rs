@@ -536,6 +536,11 @@ fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
 }
 
 fn main() {
+    // The isolated validation build never falls back to the per-user default
+    // state: from here on every state-root resolution requires a pinned or
+    // explicit absolute `HANE_STATE_DIR`.
+    #[cfg(feature = "validation-feed")]
+    hane_session::require_explicit_state_root();
     // First of all, before the AI service, state stores, any window or open
     // request: settle a pending update transaction or stop. The guard is the
     // shared runtime lease and lives until the process ends.
@@ -572,6 +577,14 @@ fn main() {
         }
         update_gate::Entry::Stop(code) => std::process::exit(code),
     };
+
+    // Fail closed before any store, service or window when the isolated root
+    // is missing or invalid.
+    #[cfg(feature = "validation-feed")]
+    if FileStateStore::from_environment().is_err() {
+        eprintln!("Hane validation build requires an absolute HANE_STATE_DIR.");
+        std::process::exit(78);
+    }
 
     #[cfg(target_os = "windows")]
     if let Some(flag) = std::env::args_os().nth(1)
