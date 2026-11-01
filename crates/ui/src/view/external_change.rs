@@ -244,6 +244,9 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.clear_external_problem(id);
+        // The reload replaced the text, so content-search results computed
+        // from the old text are stale for active and inactive documents alike.
+        self.invalidate_content_search_session(id, cx);
         if !was_active {
             return;
         }
