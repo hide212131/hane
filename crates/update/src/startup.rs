@@ -1025,6 +1025,11 @@ mod tests {
             Phase::Prepared => &[],
             Phase::ExitAuthorized => &[Phase::ExitAuthorized],
             Phase::Applying => &[Phase::ExitAuthorized, Phase::Applying],
+            Phase::AwaitingHealth => &[
+                Phase::ExitAuthorized,
+                Phase::Applying,
+                Phase::AwaitingHealth,
+            ],
             Phase::RolledBack => &[Phase::RolledBack],
             Phase::Committed => &[
                 Phase::ExitAuthorized,
@@ -1991,7 +1996,7 @@ mod tests {
         coord
             .transaction_dir(transaction)
             .join(crate::platform::lease::HELPER_DIR)
-            .join(crate::platform::HELPER_FILE_NAME)
+            .join(crate::platform::STAGED_HELPER_FILE_NAME)
     }
 
     #[test]
@@ -2009,6 +2014,30 @@ mod tests {
                 Some(&b"old-helper"[..]),
                 "{phase:?}: the verified pre-mutation copy ran, not the live file"
             );
+            drop(outcome);
+            drop(coord);
+        }
+    }
+
+    /// A pending transaction journaled by a version that kept the private copy
+    /// as `hane-updater.exe` is recovered through the neutral name; the old name
+    /// is never run.
+    #[cfg(windows)]
+    #[test]
+    fn a_legacy_named_staged_helper_is_recovered_under_the_neutral_name() {
+        for phase in [Phase::Applying, Phase::AwaitingHealth] {
+            let dir = TempDir::new("gate-staged-legacy");
+            let (placement, coord, transaction) = interrupted(&dir, phase);
+            let neutral = staged_path(&coord, &transaction);
+            let legacy = neutral.with_file_name(crate::platform::HELPER_FILE_NAME);
+            fs::rename(&neutral, &legacy).unwrap();
+            let runner = StagedRunner {
+                ran_with: RefCell::new(None),
+            };
+            let outcome = startup_gate(&placement, &runner, Duration::from_millis(50));
+            assert!(matches!(outcome, GateOutcome::Proceed(_)), "{phase:?}: {outcome:?}");
+            assert_eq!(runner.ran_with.borrow().as_deref(), Some(&b"old-helper"[..]));
+            assert!(!legacy.exists(), "{phase:?}: the legacy name is not left to run");
             drop(outcome);
             drop(coord);
         }
