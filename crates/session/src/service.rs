@@ -997,6 +997,27 @@ fn install_checked(
     path: &Path,
     check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
 ) -> Result<(), SaveFailure> {
+    install_checked_with(temporary, path, check, PINNED_IDENTITY, &|| {})
+}
+
+/// Compares two names for the same file object. `None` means the platform
+/// cannot prove identity, so the hard-link pin is not used at all.
+type FileIdentity = Option<fn(&Path, &Path) -> bool>;
+
+#[cfg(unix)]
+const PINNED_IDENTITY: FileIdentity = Some(same_file_object);
+#[cfg(not(unix))]
+const PINNED_IDENTITY: FileIdentity = None;
+
+/// `after_pin` runs right after the current version is pinned; tests use it
+/// to replace the target inside the identity-change window.
+fn install_checked_with(
+    temporary: &Path,
+    path: &Path,
+    check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
+    identity: FileIdentity,
+    after_pin: &dyn Fn(),
+) -> Result<(), SaveFailure> {
     // Each retry means another writer created a new file at `path` between
     // the move-aside and the install; that file is judged on the next round.
     for _ in 0..MAX_INSTALL_ATTEMPTS {
@@ -1007,13 +1028,22 @@ fn install_checked(
         // swaps the new file in atomically, so a reader sees the old or the new
         // version in full, and an interrupted save leaves the old file at
         // `path`.
-        match fs::hard_link(path, &aside) {
+        // Without a way to prove that `path` is still the pinned object the
+        // pin would not guard the replace, so such platforms use the
+        // move-aside fallback below.
+        let pinned = match identity {
+            Some(_) => fs::hard_link(path, &aside),
+            None => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        };
+        match pinned {
             Ok(()) => {
+                let same_file = identity.expect("a pin is only taken with an identity check");
+                after_pin();
                 if let Err(failure) = check(&aside) {
                     let _ = fs::remove_file(&aside);
                     return Err(failure);
                 }
-                if !same_file_object(path, &aside) {
+                if !same_file(path, &aside) {
                     // Another writer replaced the file after it was pinned;
                     // judge the new version on the next round.
                     let _ = fs::remove_file(&aside);
@@ -1068,9 +1098,9 @@ fn install_checked(
     Err(SaveFailure::ExternalChange)
 }
 
-/// Whether both names refer to the same file object. Platforms without a
-/// stable file identity in the standard library report `true`; the pinned
-/// version has been checked and the replace follows immediately.
+/// Whether both names refer to the same file object. Only platforms with a
+/// stable file identity in the standard library provide it; others never
+/// take the pin path (see `PINNED_IDENTITY`).
 #[cfg(unix)]
 fn same_file_object(first: &Path, second: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -1079,11 +1109,6 @@ fn same_file_object(first: &Path, second: &Path) -> bool {
         (Ok(first), Ok(second)) => first.dev() == second.dev() && first.ino() == second.ino(),
         _ => false,
     }
-}
-
-#[cfg(not(unix))]
-fn same_file_object(_first: &Path, _second: &Path) -> bool {
-    true
 }
 
 /// Puts a displaced version back at `path` and returns `failure`. If another
@@ -1752,6 +1777,95 @@ mod tests {
         );
         let leftovers = fs::read_dir(&root).unwrap().count();
         assert_eq!(leftovers, 1, "no temporary or displaced file may remain");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn install_race_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = temporary_directory(name);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("race.md");
+        fs::write(&path, "one\n").unwrap();
+        let temporary = root.join("new.tmp");
+        fs::write(&temporary, "my edit\n").unwrap();
+        (root, path, temporary)
+    }
+
+    fn replace_externally(root: &Path, path: &Path) {
+        let external = root.join("external.tmp");
+        fs::write(&external, "external, atomically placed\n").unwrap();
+        fs::rename(&external, path).unwrap();
+    }
+
+    #[test]
+    fn a_replacement_after_the_pin_is_not_overwritten_when_identity_differs() {
+        let (root, path, temporary) = install_race_fixture("install-identity-injected");
+
+        // Platform-independent: the injected comparison reports that the
+        // target is no longer the pinned object, as the real one does after
+        // an external replacement.
+        let result = install_checked_with(
+            &temporary,
+            &path,
+            &|_| Ok(()),
+            Some(|_, _| false),
+            &|| replace_externally(&root, &path),
+        );
+
+        assert!(matches!(result, Err(SaveFailure::ExternalChange)));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "external, atomically placed\n"
+        );
+        assert!(temporary.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_after_the_pin_is_detected_by_the_real_identity() {
+        let (root, path, temporary) = install_race_fixture("install-identity-real");
+
+        let result = install_checked_with(
+            &temporary,
+            &path,
+            &|_| Ok(()),
+            PINNED_IDENTITY,
+            &|| replace_externally(&root, &path),
+        );
+
+        // Only the first round sees the replacement; the next round pins and
+        // checks the external version, which this permissive check accepts.
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "my edit\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn without_an_identity_check_the_move_aside_path_guards_the_replace() {
+        let (root, path, temporary) = install_race_fixture("install-no-identity");
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        // The external version sits at the target when the install starts;
+        // with no identity proof it must be the one that is checked.
+        replace_externally(&root, &path);
+        let result = install_checked_with(
+            &temporary,
+            &path,
+            &|inspect| {
+                seen.borrow_mut().push(fs::read_to_string(inspect).unwrap());
+                Err(SaveFailure::ExternalChange)
+            },
+            None,
+            &|| panic!("no pin may be taken without an identity check"),
+        );
+
+        assert!(matches!(result, Err(SaveFailure::ExternalChange)));
+        assert_eq!(*seen.borrow(), vec!["external, atomically placed\n"]);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "external, atomically placed\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
