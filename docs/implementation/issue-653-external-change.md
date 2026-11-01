@@ -7,16 +7,17 @@ Refs #653
 
 ## current headの状態
 
-対象headは `6cd241f85fba86a166dee5d14448b4a79a57fef9`（base / current main `29ed353d1548db7d2df61ffa85085dc4457c98cc`）。
+対象headは `5e9036ac0e582b07264170227c1850951dc8bc3c`（PR base `4623b85edc89b249cdd0bfd2e081ab8c843e4140`、current main `03132cf33bd8ebc8f7b1cb670931c125652627dd`）。
 
-- 実装: 以降の「実装記録」の範囲がcurrent headに含まれる。受入条件を満たしたことを意味しない。
-- exact-head verifier（[run 41098937044](https://github.com/hide212131/hane/actions/runs/41098937044)）: success。
-- current-head CI（[run 41099201210](https://github.com/hide212131/hane/actions/runs/41099201210)）: success。両OSのworkspace testsとClippyはpass。
-- Windows GUI matrix: 14 PASS / 3 UNKNOWN / 0 FAIL。次の3件はUnknownのままで、passとして扱わない。
-  - 通常Saveとautosaveの競合
-  - アプリ生成draftの再起動後end-to-end復旧
-  - watcher失敗警告の可視性
-- Mac GUI: PR本文にある部分確認のみ。上記Unknownを含め、その範囲を越えて主張しない。
+- 実装: 以降の「実装記録」の範囲がcurrent headに含まれる。実装済みであることは受入済みを意味しない。
+- exact-head verifier（[run 41326473783](https://github.com/hide212131/hane/actions/runs/41326473783)）: success。
+- current-head CI（[run 41326573585](https://github.com/hide212131/hane/actions/runs/41326573585)）: success。
+- GUI（current head）:
+  - Mac T07: pass。
+  - Mac T03: unknown。
+  - Windows T01: unknown。
+  - T03 / T07のうち上記以外（Windows T03 / T07など）: current headでは未確認。
+  - unknownと未確認はpassとして扱わない。詳細はPR本文の「現在の状況」を参照する。
 - Issue #653のGUI条件は未完了のため、PRはDraftを維持する。この文書の更新は製品受入やIssue完了を意味しない。
 - 上記は観測時点の値であり、headが変わった場合は旧headの証拠として使わない。次headのCI・review・GUIは取得するまで成功扱いにしない。
 
@@ -99,14 +100,16 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 - テスト（未実行）: `external_comparison.rs` に、開く／閉じるで本文・revision・dirty・ディスク内容が不変、手元編集・外部版更新・文書置換後のstale／Gone、再比較、観測なしで開かない、footer actionとstale時の再読込・上書き・別名保存の拒否、行範囲・行数上限の単体テスト。undo/redo・draftの直接検証、IME中の比較は追加していない。
 - 未実行: build・tests・Clippy（macOS / Windows）、focused GUI（T04）。
 
-### 未実装・未検証（受入条件を満たしたと扱わない）
+### 実装済みと、受入に未確認・未測定の残条件
 
-- 監視寿命以外の独立root（下記の差分確認、ディスク版の整合読込・fingerprint・OS file identity、保存承認鮮度、同一実体のSave As、全域リファクタリング）。
-- 別名保存で同一実体（symlink・ハードリンク等）を選んだ場合の保護。現状は字句上の同一pathだけを同一ファイルとして扱う。
+実装済みであることは受入済みを意味しない。
+
+- 実装・回帰検証済み（current source。受入条件の充足ではない）: ディスク版の整合読込、内容fingerprint、OS file identity、保存承認鮮度、同一実体（symlink・ハードリンク等）を選んだSave Asの保護、差分確認。上記の旧記述（字句上の同一pathだけを同一ファイルとして扱う等）はcurrent headでは当てはまらない。
+- 受入に未確認・未測定・未実装の残条件は次のとおり。
 - IME中の延期と非アクティブ文書の自動再読込のGUI経路テスト、再読込時のdraft write / AI・解析結果との接続のUIテスト（sessionのgeneration更新までは実装）。
 - 保存前の内容照合は対象ファイル全体を背景で読む。大文書・複数タブでの入力応答、背景時間、メモリ、snapshot上限の前後比較（T12）は未測定。
 - 外部processとの原子的compare-and-swapは保証しない。照合から置換までの間に他者が書く競合窓が残る（検出可能なのは照合時点の不一致のみ）。
-- 両OSの通常PR CI（run 40923856998は `action_required` / jobs 0）とfocused GUI（T01/T02/T03/T04/T07/T08）は、current headで未完了。exact-head verifierのworkspace regression testsとlintがsuccessであることは上記「current headの状態」のとおりで、これで通常CIやGUIを代替しない。
+- focused GUI（T01/T02/T03/T04/T07/T08）は、current headでMac T07がpassのほかは未完了（Mac T03・Windows T01はunknown、他は未確認）。current-head CIとexact-head verifierのsuccessは上記「current headの状態」のとおりで、これでGUIを代替しない。
 
 ## 対象外と完了
 
