@@ -406,7 +406,13 @@ pub trait ElevatedProcess: Send {
 /// The OS seam of `ShellExecuteExW` with the `runas` verb.
 pub trait ElevatedLauncher {
     type Process: ElevatedProcess;
-    fn launch(&mut self, helper: &std::path::Path) -> std::result::Result<Self::Process, LaunchFailure>;
+    /// `trusted` is the identity vouched for by the signed inventory. The
+    /// launcher refuses, before any prompt, an image that is not exactly it.
+    fn launch(
+        &mut self,
+        helper: &std::path::Path,
+        trusted: &crate::identity::FileIdentity,
+    ) -> std::result::Result<Self::Process, LaunchFailure>;
 }
 
 /// Asks for consent once and starts `helper`. A declined prompt is
@@ -415,8 +421,9 @@ pub trait ElevatedLauncher {
 pub fn launch_elevated<L: ElevatedLauncher>(
     launcher: &mut L,
     helper: &std::path::Path,
+    trusted: &crate::identity::FileIdentity,
 ) -> Result<L::Process> {
-    launcher.launch(helper).map_err(launch_failure_error)
+    launcher.launch(helper, trusted).map_err(launch_failure_error)
 }
 
 /// The error of a failed consent launch (see [`launch_elevated`]).
@@ -475,8 +482,13 @@ pub trait ElevationOs {
     fn session_id(&self) -> Result<u32>;
     /// Creates the local endpoint of `transaction` before any launch.
     fn listen(&self, transaction: &TransactionId) -> Result<Box<dyn ElevatedListener>>;
-    /// One consent request that starts `helper` elevated.
-    fn launch(&self, helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure>;
+    /// One consent request that starts `helper` elevated, only if its pinned
+    /// image is exactly the signed-inventory identity `trusted`.
+    fn launch(
+        &self,
+        helper: &Path,
+        trusted: &crate::identity::FileIdentity,
+    ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure>;
 }
 
 /// The seam of an OS without the elevated route (everything but Windows).
@@ -505,7 +517,11 @@ impl ElevationOs for UnavailableElevation {
         Err(UpdateError::new(ErrorCode::NotApplicable, "this OS has no elevated update route"))
     }
 
-    fn launch(&self, helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+    fn launch(
+        &self,
+        helper: &Path,
+        _trusted: &crate::identity::FileIdentity,
+    ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
         Err(LaunchFailure {
             stage: "unavailable",
             api: "none",
@@ -552,6 +568,7 @@ pub fn connect_elevated(
     os: &dyn ElevationOs,
     install_root: &Path,
     helper: &Path,
+    trusted: &crate::identity::FileIdentity,
     transaction: &TransactionId,
     timeout: Duration,
 ) -> std::result::Result<ElevatedConnection, ConnectFailure> {
@@ -575,7 +592,7 @@ pub fn connect_elevated(
     let session_id = os.session_id().map_err(unstarted)?;
     let mut listener = os.listen(transaction).map_err(unstarted)?;
     let mut process = os
-        .launch(helper)
+        .launch(helper, trusted)
         .map_err(|failure| unstarted(launch_failure_error(failure)))?;
     let expected = ExpectedPeer { pid: process.pid(), session_id, token_sid: user_sid };
     let accepted = listener.accept(timeout, &mut || process.wait_exit(Duration::ZERO).is_none());
@@ -848,7 +865,11 @@ mod tests {
     impl ElevatedLauncher for FakeLauncher {
         type Process = FakeProcess;
 
-        fn launch(&mut self, _helper: &Path) -> std::result::Result<FakeProcess, LaunchFailure> {
+        fn launch(
+            &mut self,
+            _helper: &Path,
+            _trusted: &crate::identity::FileIdentity,
+        ) -> std::result::Result<FakeProcess, LaunchFailure> {
             self.0.clone().map(|()| FakeProcess)
         }
     }
@@ -860,12 +881,13 @@ mod tests {
     #[test]
     fn a_declined_prompt_is_a_japanese_cancellation_and_retryable() {
         let mut launcher = FakeLauncher(Err(failure(Some(ERROR_CANCELLED))));
-        let err = launch_elevated(&mut launcher, Path::new("h")).err().unwrap();
+        let trusted = crate::identity::FileIdentity::of(b"helper");
+        let err = launch_elevated(&mut launcher, Path::new("h"), &trusted).err().unwrap();
         assert!(is_declined(&err));
         assert!(err.detail.contains("現在のHane"));
         // The seam is reusable: a later attempt is not blocked by the refusal.
         let mut again = FakeLauncher(Ok(()));
-        assert_eq!(launch_elevated(&mut again, Path::new("h")).ok().unwrap().pid(), 77);
+        assert_eq!(launch_elevated(&mut again, Path::new("h"), &trusted).ok().unwrap().pid(), 77);
     }
 
     #[test]
@@ -889,7 +911,8 @@ mod tests {
     #[test]
     fn other_launch_failures_keep_their_facts_and_are_not_a_cancellation() {
         let mut launcher = FakeLauncher(Err(failure(Some(5))));
-        let err = launch_elevated(&mut launcher, Path::new("h")).err().unwrap();
+        let trusted = crate::identity::FileIdentity::of(b"helper");
+        let err = launch_elevated(&mut launcher, Path::new("h"), &trusted).err().unwrap();
         assert!(!is_declined(&err));
         for fact in ["stage=launch", "api=ShellExecuteExW", "os_error=5", "hane-updater.exe"] {
             assert!(err.detail.contains(fact), "{fact} in {}", err.detail);
@@ -992,7 +1015,11 @@ mod tests {
             Ok(Box::new(ScriptedListener { peer: self.script.lock().unwrap().peer.clone() }))
         }
 
-        fn launch(&self, _helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+        fn launch(
+            &self,
+            _helper: &Path,
+            _trusted: &crate::identity::FileIdentity,
+        ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
             self.events.lock().unwrap().push("launch");
             self.script.lock().unwrap().launch.clone().map(|()| {
                 Box::new(ScriptedProcess {
@@ -1015,6 +1042,7 @@ mod tests {
             &os,
             Path::new("C:\\hane"),
             Path::new("C:\\h\\hane-updater.exe"),
+            &crate::identity::FileIdentity::of(b"helper"),
             &transaction,
             Duration::from_secs(1),
         );
@@ -1091,6 +1119,6 @@ mod tests {
         let os = UnavailableElevation;
         assert!(!os.standard_restart_available());
         assert!(os.listen(&TransactionId::generate().unwrap()).is_err());
-        assert!(os.launch(Path::new("h")).is_err());
+        assert!(os.launch(Path::new("h"), &crate::identity::FileIdentity::of(b"helper")).is_err());
     }
 }

@@ -305,7 +305,11 @@ impl crate::elevation::ElevatedProcess for ShellProcess {
 impl crate::elevation::ElevatedLauncher for RunasLauncher {
     type Process = ShellProcess;
 
-    fn launch(&mut self, helper: &Path) -> std::result::Result<ShellProcess, crate::elevation::LaunchFailure> {
+    fn launch(
+        &mut self,
+        helper: &Path,
+        trusted: &FileIdentity,
+    ) -> std::result::Result<ShellProcess, crate::elevation::LaunchFailure> {
         use crate::elevation::LaunchFailure;
         // SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
         const MASK: u32 = 0x0000_0040 | 0x0000_0100;
@@ -326,13 +330,16 @@ impl crate::elevation::ElevatedLauncher for RunasLauncher {
             .map_err(|err| failure("pin-helper", err.raw_os_error().map(|raw| raw as u32)))?;
         let (coordination, transaction) = super::Coordination::from_helper_exe(helper)
             .map_err(|_| failure("verify-helper", None))?;
-        let (staged, identity) = super::staged_helper_verified(&coordination, &transaction)
+        // The staged record is user-writable, so it only locates the staged
+        // copy. What may be elevated is decided by `trusted`, the identity the
+        // signed inventory vouched for, compared with the pinned image itself.
+        let (staged, _record) = super::staged_helper_verified(&coordination, &transaction)
             .map_err(|_| failure("verify-helper", None))?;
         if staged != helper {
             return Err(failure("verify-helper", None));
         }
         match pinned.identity() {
-            Ok(held) if held == identity => {}
+            Ok(held) if &held == trusted => {}
             _ => return Err(failure("verify-pinned-helper", None)),
         }
         let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
@@ -1343,9 +1350,13 @@ impl ElevationOs for WindowsElevation {
         Ok(Box::new(PipeListener::create(transaction)?))
     }
 
-    fn launch(&self, helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+    fn launch(
+        &self,
+        helper: &Path,
+        trusted: &FileIdentity,
+    ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
         let mut launcher = RunasLauncher { owner_hwnd: self.owner_hwnd };
-        crate::elevation::ElevatedLauncher::launch(&mut launcher, helper)
+        crate::elevation::ElevatedLauncher::launch(&mut launcher, helper, trusted)
             .map(|process| Box::new(process) as Box<dyn ElevatedProcess>)
     }
 }
@@ -1507,8 +1518,49 @@ mod tests {
         let helper = dir.path().join("hane-updater.exe");
         fs::write(&helper, b"not staged").unwrap();
         let mut launcher = RunasLauncher { owner_hwnd: 0 };
-        let failure = launcher.launch(&helper).err().expect("an unstaged helper must not launch");
+        let failure = launcher
+            .launch(&helper, &FileIdentity::of(b"not staged"))
+            .err()
+            .expect("an unstaged helper must not launch");
         assert_eq!(failure.stage, "verify-helper");
+    }
+
+    #[test]
+    fn a_staged_helper_and_record_rewritten_together_are_refused_before_the_prompt() {
+        use crate::elevation::ElevatedLauncher;
+        use crate::platform::Coordination;
+        let dir = crate::testing::TempDir::new("pinned-helper-forged");
+        let id = InstallId::derive(&InstallFacts {
+            os: "test",
+            volume_id: "v",
+            install_path: "/x",
+            owner: "u",
+        })
+        .unwrap();
+        let coordination = Coordination::create(dir.path(), &id).unwrap();
+        let transaction = TransactionId::generate().unwrap();
+        let source_path = dir.path().join("signed-helper.exe");
+        fs::write(&source_path, b"signed helper").unwrap();
+        let source = HelperSource { path: source_path, identity: FileIdentity::of(b"signed helper") };
+        let staged = super::super::stage_helper_copy(&coordination, &transaction, &source).unwrap();
+
+        // Before the pin is taken, a same-user process rewrites the exe and the
+        // identity record to agree with each other.
+        let record = coordination.transaction_dir(&transaction).join("helper.identity");
+        let forged = FileIdentity::of(b"forged helper");
+        fs::write(&staged, b"forged helper").unwrap();
+        fs::write(
+            &record,
+            format!("{}\n{}\n{}\n{}\n", id.as_str(), transaction.as_str(), forged.size, forged.sha256),
+        )
+        .unwrap();
+
+        let mut launcher = RunasLauncher { owner_hwnd: 0 };
+        let failure = launcher
+            .launch(&staged, &source.identity)
+            .err()
+            .expect("a forged helper must not reach the prompt");
+        assert_eq!(failure.stage, "verify-pinned-helper");
     }
 
     fn volume(guid: &str, serial: u32, file_system: &str, fixed: bool) -> Volume {

@@ -1101,6 +1101,7 @@ const ELEVATED_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 /// running.
 fn start_running_helper(
     copy: &Path,
+    trusted: &crate::identity::FileIdentity,
     request: &HelloRequest,
     coordination: &Coordination,
     install_root: &Path,
@@ -1114,6 +1115,7 @@ fn start_running_helper(
         Route::Standard => normal().map(RunningHelper::Standard),
         Route::Elevated(_) => start_elevated_helper(
             copy,
+            trusted,
             request,
             coordination,
             install_root,
@@ -1132,6 +1134,7 @@ fn start_running_helper(
 /// the normal start over the verified channel.
 fn start_elevated_helper(
     copy: &Path,
+    trusted: &crate::identity::FileIdentity,
     request: &HelloRequest,
     coordination: &Coordination,
     install_root: &Path,
@@ -1150,6 +1153,7 @@ fn start_elevated_helper(
         os,
         install_root,
         copy,
+        trusted,
         transaction,
         crate::elevation::CONNECT_TIMEOUT,
     ) {
@@ -1383,6 +1387,7 @@ pub fn prepare_restart_with(
     };
     let spawned = match start_running_helper(
         &copy,
+        &source.identity,
         &request,
         &coordination,
         &placement.install_root,
@@ -2511,7 +2516,11 @@ mod tests {
             }))
         }
 
-        fn launch(&self, _helper: &Path) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
+        fn launch(
+            &self,
+            _helper: &Path,
+            _trusted: &crate::identity::FileIdentity,
+        ) -> std::result::Result<Box<dyn ElevatedProcess>, LaunchFailure> {
             self.log.lock().unwrap().push("launch");
             if !self.consent.load(Ordering::SeqCst) {
                 return Err(LaunchFailure {
@@ -2578,6 +2587,7 @@ mod tests {
         };
         start_running_helper(
             Path::new("C:\\h\\hane-updater.exe"),
+            &crate::identity::FileIdentity::of(b"helper"),
             &hello,
             &fx.coord,
             Path::new("C:\\hane"),
@@ -2628,6 +2638,7 @@ mod tests {
         let normal_starts = std::cell::Cell::new(0_usize);
         let result = start_running_helper(
             Path::new("C:\\h\\hane-worker.exe"),
+            &crate::identity::FileIdentity::of(b"helper"),
             &hello,
             &fx.coord,
             Path::new("C:\\hane"),
