@@ -601,6 +601,27 @@ mod tests {
         assert!(legacy.exists() && !copy.exists());
     }
 
+    #[test]
+    fn a_legacy_copy_with_another_transactions_record_is_not_migrated() {
+        let dir = TempDir::new("helper-foreign");
+        let coord = coordination(&dir);
+        let txn = TransactionId::generate().unwrap();
+        let other = TransactionId::generate().unwrap();
+        let source = dir.path().join("hane-updater-source");
+        fs::write(&source, b"helper-bytes").unwrap();
+        let verified = HelperSource { path: source, identity: FileIdentity::of(b"helper-bytes") };
+        let copy = stage_helper_copy(&coord, &txn, &verified).unwrap();
+        let legacy = copy.with_file_name(HELPER_FILE_NAME);
+        fs::rename(&copy, &legacy).unwrap();
+
+        // The record names another transaction: the copy is refused untouched.
+        let record = helper_record_path(&coord, &txn);
+        let foreign = record_text(&coord, &other, &FileIdentity::of(b"helper-bytes"));
+        fs::write(&record, foreign.as_bytes()).unwrap();
+        assert!(staged_helper_verified(&coord, &txn).is_err());
+        assert!(legacy.exists() && !copy.exists());
+    }
+
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn unsupported_placements_fail_closed() {
