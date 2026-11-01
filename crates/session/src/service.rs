@@ -1002,12 +1002,12 @@ fn install_checked(
 
 /// Compares two names for the same file object. `None` means the platform
 /// cannot prove identity, so the hard-link pin is not used at all.
-type FileIdentity = Option<fn(&Path, &Path) -> bool>;
+type PinnedIdentityCheck = Option<fn(&Path, &Path) -> bool>;
 
 #[cfg(unix)]
-const PINNED_IDENTITY: FileIdentity = Some(same_file_object);
+const PINNED_IDENTITY: PinnedIdentityCheck = Some(same_file_object);
 #[cfg(not(unix))]
-const PINNED_IDENTITY: FileIdentity = None;
+const PINNED_IDENTITY: PinnedIdentityCheck = None;
 
 /// `after_pin` runs right after the current version is pinned; tests use it
 /// to replace the target inside the identity-change window.
@@ -1015,7 +1015,7 @@ fn install_checked_with(
     temporary: &Path,
     path: &Path,
     check: &dyn Fn(&Path) -> Result<(), SaveFailure>,
-    identity: FileIdentity,
+    identity: PinnedIdentityCheck,
     after_pin: &dyn Fn(),
 ) -> Result<(), SaveFailure> {
     // Each retry means another writer created a new file at `path` between
