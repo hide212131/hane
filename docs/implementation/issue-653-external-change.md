@@ -62,7 +62,7 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 
 ### 実装した範囲
 
-- `identity.rs`: `ContentFingerprint` / `Fingerprinter`（保存形式のbytesから作る内容fingerprint、2レーン+長さ）。`FileState` にbaselineを追加。open直後は未確立（UI threadでhashしない）で、最初の背景確認、または保存成功時に確立する。
+- `identity.rs`: `ContentFingerprint` / `Fingerprinter`（保存形式のbytesから作る内容fingerprint、2レーン+長さ）。`FileState` にbaselineを追加。読込経路では `OsFileService::load` が `LoadedFile.fingerprint` として読込bytesのfingerprintを返し、`Session::from_loaded` がopen時にbaselineへ設定する。サービスがfingerprintを提供しない場合は、最初の背景確認がclean documentを基準にする。保存成功時にもbaselineを更新する。いずれもUI threadではhashしない。
 - `service.rs`: `observe_disk`（有界3回の整合読込。handleのstampと読込後のpath stampが一致しない読込は再試行し、収束しなければ `Unreadable`）、`DiskVersion`、`OverwriteGuard::ExpectContent`（保存直前にwatcher到達に依存せず実体とbaselineを照合。消失・読込不可・不一致は書かない）、`SavedFile.fingerprint`。
 - `session.rs`: 背景確認の `begin_external_check` / `finish_external_check`（ticketにgeneration・path・要求sequence・revisionを束縛、文書あたり1 jobと1件の追従に集約）。未編集・IMEなし・保存中でない場合だけ新generationで自動再読込し、カーソルは有効な文字境界へ丸めて復元。それ以外は本文・履歴を保持して `Changed` / `Missing` / `Unverifiable` を記録。`ResolutionApproval`（revision・外部版・操作種別に束縛した一回限りの承認）と `request_confirmed_overwrite` / `apply_confirmed_reload`、`SaveIntent::Confirmed`。通常保存・自動保存は常に `ExpectContent` で、キュー経由でもForceへ昇格しない。`apply_file_event` は通知だけでstampを進めない。
 - UI: `view/external_change.rs`（watcher batchで開いている文書だけを背景確認、結果受理時にDocumentInstanceとticketを照合、競合記録、保存状態メニューの「名前を付けて保存／ディスクの内容を読み直す／この内容で上書き」と確認ダイアログ）、`folder_watch.rs` からの接続、`session_save.rs` の競合時再確認と `ApprovalExpired`、`footer.rs` の案内文修正。
