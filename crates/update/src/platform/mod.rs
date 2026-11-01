@@ -463,21 +463,46 @@ pub(crate) fn staged_helper_verified(
         sha256: sha256.to_owned(),
     };
     let helper_dir = coordination.transaction_dir(transaction).join(lease::HELPER_DIR);
-    // A transaction journaled by an earlier build staged the copy under the
-    // installed name. It is recovered through the same identity record.
-    let (staged, present) = [STAGED_HELPER_FILE_NAME, HELPER_FILE_NAME]
-        .iter()
-        .find_map(|name| {
-            let path = helper_dir.join(name);
-            match hash_regular_file(&path) {
-                Ok(Some(hashed)) => Some(Ok((path, hashed))),
-                Ok(None) => None,
-                Err(err) => Some(Err(err)),
+    let staged = helper_dir.join(STAGED_HELPER_FILE_NAME);
+    let legacy = helper_dir.join(HELPER_FILE_NAME);
+    let matches_record = |path: &Path| -> Result<bool> {
+        Ok(hash_regular_file(path)?
+            .map(|(size, sha256)| FileIdentity { size, sha256 })
+            .as_ref()
+            == Some(&identity))
+    };
+    let neutral_present = hash_regular_file(&staged)?.is_some();
+    let legacy_present = hash_regular_file(&legacy)?.is_some();
+    match (neutral_present, legacy_present) {
+        (true, true) => {
+            // Never pick whichever copy happens to look right.
+            return Err(refuse("both the neutral and the legacy staged helper exist"));
+        }
+        (false, false) => {
+            return Err(UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"));
+        }
+        (true, false) => {}
+        (false, true) => {
+            // A transaction journaled by an earlier build staged the copy under
+            // the installed name. It is verified against the record and ACL
+            // first, then renamed, so the one file that is pinned and launched
+            // is the neutral-named one.
+            if !matches_record(&legacy)? {
+                return Err(UpdateError::new(
+                    ErrorCode::HashMismatch,
+                    "the staged helper differs from its recorded identity",
+                ));
             }
-        })
-        .transpose()?
-        .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"))?;
-    if (FileIdentity { size: present.0, sha256: present.1 }) != identity {
+            acl::verify(&legacy, false)?;
+            fs::rename(&legacy, &staged).map_err(|err| {
+                UpdateError::new(
+                    ErrorCode::IdentityMismatch,
+                    format!("the legacy staged helper could not be renamed: {err}"),
+                )
+            })?;
+        }
+    }
+    if !matches_record(&staged)? {
         return Err(UpdateError::new(
             ErrorCode::HashMismatch,
             "the staged helper differs from its recorded identity",
@@ -557,12 +582,23 @@ mod tests {
         // An earlier build's transaction holds the copy under the installed name.
         let legacy = copy.with_file_name(HELPER_FILE_NAME);
         fs::rename(&copy, &legacy).unwrap();
-        assert_eq!(staged_helper(&coord, &txn).unwrap(), legacy);
+        let (path, identity) = staged_helper_verified(&coord, &txn).unwrap();
+        assert_eq!(path, copy, "the legacy copy is renamed to the neutral name");
+        assert!(identity == FileIdentity::of(b"helper-bytes"));
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(&copy).unwrap(), b"helper-bytes");
 
-        // A legacy copy that differs from its record is never accepted.
+        // Both names present is ambiguous and refused, whichever is valid.
+        fs::write(&legacy, b"helper-bytes").unwrap();
+        assert!(staged_helper(&coord, &txn).is_err());
+        assert!(copy.exists() && legacy.exists());
+
+        // A legacy copy that differs from its record is never accepted or renamed.
+        fs::remove_file(&copy).unwrap();
         fs::remove_file(&legacy).unwrap();
         fs::write(&legacy, b"tampered").unwrap();
         assert!(staged_helper(&coord, &txn).is_err());
+        assert!(legacy.exists() && !copy.exists());
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
