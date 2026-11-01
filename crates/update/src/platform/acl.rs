@@ -796,6 +796,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_user_owned_shared_state_is_owned_by_the_user_and_passes_both_checks() {
+        let dir = std::env::temp_dir().join(format!("hane-acl-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sub = dir.join("ledger");
+        std::fs::create_dir(&sub).unwrap();
+        super::secure_new_user_owned(&sub, true, 0o700).unwrap();
+        // An elevated creator and a standard verifier agree on the user SID.
+        assert_eq!(super::directory_owner_id(&sub).unwrap(), super::principal_id().unwrap());
+        super::verify_user_owned(&sub, true).unwrap();
+        super::verify(&sub, true).unwrap();
+        let file = dir.join("lock");
+        std::fs::write(&file, b"").unwrap();
+        super::secure_new_user_owned(&file, false, 0o644).unwrap();
+        super::verify_user_owned(&file, false).unwrap();
+        super::verify(&file, false).unwrap();
+        // A link or a missing entry is still refused.
+        assert!(super::verify_user_owned(&dir.join("missing"), false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn inherited_acl_is_removed_from_new_entry() {
         let fake = Fake::new(true);

@@ -178,7 +178,10 @@ fn record_path(coordination: &Coordination, transaction: &TransactionId) -> Path
 fn ensure_ledger_dir(dir: &Path) -> Result<()> {
     match fs::create_dir(dir) {
         Ok(()) => {
-            let secured = acl::secure_new(dir, true, 0o700).and_then(|()| acl::verify(dir, true));
+            // Created by the elevated helper, later verified by the standard
+            // process of the same user: own it by the user SID.
+            let secured = acl::secure_new_user_owned(dir, true, 0o700)
+                .and_then(|()| acl::verify_user_owned(dir, true));
             if secured.is_err() {
                 let _ = fs::remove_dir(dir);
             }
@@ -202,7 +205,7 @@ fn write_record(path: &Path, record: &Record) -> Result<()> {
     let bytes = serde_json::to_vec(record)
         .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
     durable_write(path, &bytes)?;
-    acl::secure_new(path, false, 0o600).and_then(|()| acl::verify(path, false))
+    acl::secure_new_user_owned(path, false, 0o600).and_then(|()| acl::verify_user_owned(path, false))
 }
 
 /// The cleanup-pending record of one transaction, held by the file operations

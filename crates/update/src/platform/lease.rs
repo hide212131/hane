@@ -329,7 +329,11 @@ impl Coordination {
         }
         match options.open(&path) {
             Ok(file) => {
-                match acl::secure_new(&path, false, 0o644).and_then(|()| acl::verify(&path, false)) {
+                // The elevated helper and the standard process share this lock,
+                // so the owner is the user SID, not the elevated default owner.
+                match acl::secure_new_user_owned(&path, false, 0o644)
+                    .and_then(|()| acl::verify_user_owned(&path, false))
+                {
                     Ok(()) => Ok(file),
                     Err(err) => {
                         drop(file);
