@@ -128,6 +128,7 @@ IDENTITY_RE = re.compile(
 # Build profile the helper reports; a standard build reports none.
 PROFILE_STANDARD = ""
 PROFILE_VALIDATION_FEED = "validation-feed"
+APP_PROFILE_RE = re.compile(rb"hane-app-profile-v1;version=([0-9A-Za-z.+-]+);profile=([a-z-]+);end")
 TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -343,6 +344,22 @@ def check_identity(data: bytes, *, version: str, target: str, source_sha: str, w
         )
     if profile is not None and found_profile != profile:
         raise fail(f"{what} build profile is {found_profile or 'standard'!r}, expected {profile or 'standard'!r}")
+
+
+def check_app_profile(data: bytes, *, version: str, what: str, profile: str) -> None:
+    """The app executable embeds a profile record only in the `validation-feed`
+    build; a standard build carries none. `profile` is the exact profile required."""
+    matches = set(APP_PROFILE_RE.findall(data))
+    if len(matches) > 1:
+        raise fail(f"{what} carries conflicting build profile records")
+    found = ""
+    if matches:
+        found_version, found_profile = next(iter(matches))
+        if found_version.decode() != version:
+            raise fail(f"{what} build profile record is for version {found_version.decode()}, expected {version}")
+        found = found_profile.decode()
+    if found != profile:
+        raise fail(f"{what} build profile is {found or 'standard'!r}, expected {profile or 'standard'!r}")
 
 
 LC_CODE_SIGNATURE = 0x1D
@@ -687,6 +704,7 @@ def verify_windows_zip(path: Path, *, version: str, source_sha: str, trust: Trus
         for exe in ("hane.exe", "hane-updater.exe", dll):
             if not archive.read(exe)[:2] == b"MZ":
                 raise fail(f"{exe} is not a Windows executable image")
+        check_app_profile(archive.read("hane.exe"), version=version, what="hane.exe", profile=profile)
         check_identity(archive.read("hane-updater.exe"), version=version, target=WINDOWS_TARGET,
                        source_sha=source_sha, what="hane-updater.exe", profile=profile)
         msix_check(archive.read("Hane.ShellIntegration.msix"), version)
@@ -1188,6 +1206,7 @@ def main(argv: list[str] | None = None) -> int:
     add("require-env").add_argument("names", nargs="+")
     add("binary-identity", "binary", "version", "target", "source-sha").add_argument(
         "--validation-feed", action="store_true")
+    add("app-profile", "binary", "version").add_argument("--validation-feed", action="store_true")
     add("macho-signed", "binary")
     add("verify-macos-codesign", "app")
     add("macos-sidecar-dir", "version", "source-sha")
@@ -1231,6 +1250,9 @@ def _dispatch(args: argparse.Namespace) -> int:
         check_identity(Path(args.binary).read_bytes(), version=args.version, target=args.target,
                        source_sha=args.source_sha, what=args.binary,
                        profile=PROFILE_VALIDATION_FEED if args.validation_feed else None)
+    elif cmd == "app-profile":
+        check_app_profile(Path(args.binary).read_bytes(), version=args.version, what=args.binary,
+                          profile=PROFILE_VALIDATION_FEED if args.validation_feed else PROFILE_STANDARD)
     elif cmd == "macho-signed":
         check_macho_signed(Path(args.binary).read_bytes(), args.binary)
     elif cmd == "verify-macos-codesign":

@@ -46,6 +46,12 @@ def pe(version=VERSION, source=SHA, target=rc.WINDOWS_TARGET, profile="") -> byt
     return b"MZ\x90\x00" + b"\0" * 32 + identity(version, target, source, profile=profile) + b"\0" * 32
 
 
+def app_pe(version=VERSION, profile="") -> bytes:
+    """A Windows app image; only the validation-feed build embeds a profile record."""
+    record = f"hane-app-profile-v1;version={version};profile={profile};end".encode() if profile else b""
+    return b"MZ\x90\x00" + b"\0" * 32 + record + b"\0" * 32
+
+
 def macho(version=VERSION, source=SHA, signed=True) -> bytes:
     """A 64-bit Mach-O header with (by default) an LC_CODE_SIGNATURE load command."""
     command = (0x1D).to_bytes(4, "little") + (16).to_bytes(4, "little") + b"\0" * 8 if signed else b""
@@ -104,10 +110,12 @@ class Fixture:
         return rc.make_signature_file(domain, raw, key_id, self.seed)
 
     def windows_files(self, *, version=VERSION, source=SHA, dll_version=None, manifest_version=None,
-                      signed_msix=True, helper=None, profile="") -> dict:
+                      signed_msix=True, helper=None, profile="", app_profile=None) -> dict:
+        """`profile` labels both binaries; `app_profile` overrides the app alone."""
         dll_version = dll_version or version
+        app_profile = profile if app_profile is None else app_profile
         return {
-            "hane.exe": pe(version, source),
+            "hane.exe": app_pe(version, app_profile),
             "hane-updater.exe": helper if helper is not None else pe(version, source, profile=profile),
             "Hane.ShellIntegration.msix": msix(manifest_version or version, dll_version, signed_msix),
             "Hane.ShellIntegration.cer": b"-----CERT-----",
@@ -598,6 +606,36 @@ class MacosZipTests(TempCase):
         other = self.fx.windows_zip(self.tmp / "other-w.zip", profile="other-feed")
         with self.assertRaisesRegex(ReleaseError, "build profile"):
             rc.verify_windows_zip(other, validation_feed=True, **kwargs)
+
+    def test_a_mixed_app_and_helper_profile_is_rejected_in_both_directions(self):
+        kwargs = dict(version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        validation = rc.PROFILE_VALIDATION_FEED
+        # Standard app + validation updater.
+        standard_app = self.fx.windows_zip(self.tmp / "std-app.zip", profile=validation, app_profile="")
+        with self.assertRaisesRegex(ReleaseError, "hane.exe build profile"):
+            rc.verify_windows_zip(standard_app, validation_feed=True, **kwargs)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(standard_app, **kwargs)
+        # Validation app + standard updater.
+        standard_helper = self.fx.windows_zip(self.tmp / "std-helper.zip", profile="", app_profile=validation)
+        with self.assertRaisesRegex(ReleaseError, "hane-updater.exe build profile"):
+            rc.verify_windows_zip(standard_helper, validation_feed=True, **kwargs)
+        with self.assertRaisesRegex(ReleaseError, "hane.exe build profile"):
+            rc.verify_windows_zip(standard_helper, **kwargs)
+        # A fully standard ZIP is refused by the validation catalog, a fully
+        # validation ZIP by the production catalog.
+        standard = self.fx.windows_zip(self.tmp / "std-both.zip")
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(standard, validation_feed=True, **kwargs)
+        both = self.fx.windows_zip(self.tmp / "val-both.zip", profile=validation)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(both, **kwargs)
+        rc.verify_windows_zip(both, validation_feed=True, **kwargs)
+        # The app record must belong to the package version.
+        stale = self.fx.windows_zip(self.tmp / "stale-app.zip", profile=validation,
+                                    extra={"hane.exe": app_pe("0.1.0", validation)})
+        with self.assertRaisesRegex(ReleaseError, "hane.exe build profile record"):
+            rc.verify_windows_zip(stale, validation_feed=True, **kwargs)
 
     def test_an_unsealed_bundle_is_rejected(self):
         with self.assertRaisesRegex(ReleaseError, "CodeResources"):

@@ -18,12 +18,21 @@ if ($SourceSha -notmatch '^[0-9a-f]{40}$') {
 }
 
 $env:HANE_SOURCE_SHA = $SourceSha
-cargo build --release --locked -p hane -p hane-updater `
+$Target = 'x86_64-pc-windows-msvc'
+cargo build --release --locked --target $Target -p hane -p hane-updater `
     --features hane/validation-feed,hane-updater/validation-feed
 if ($LASTEXITCODE -ne 0) { throw 'The validation-feed build failed.' }
 
+# With an explicit --target the artifacts are under target/<triple>/release.
+$OutDir = "target/$Target/release"
+
 python scripts/release_catalog.py binary-identity `
-    --binary target/release/hane-updater.exe `
-    --version $Version --target x86_64-pc-windows-msvc `
+    --binary "$OutDir/hane-updater.exe" `
+    --version $Version --target $Target `
     --source-sha $SourceSha --validation-feed
 if ($LASTEXITCODE -ne 0) { throw 'The helper does not report the validation-feed profile.' }
+
+python scripts/release_catalog.py app-profile `
+    --binary "$OutDir/hane.exe" `
+    --version $Version --validation-feed
+if ($LASTEXITCODE -ne 0) { throw 'The app does not report the validation-feed profile.' }

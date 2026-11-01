@@ -535,12 +535,28 @@ fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
     }
 }
 
+/// Profile record that `scripts/release_catalog.py` reads back from the built
+/// executable. Only the isolated `validation-feed` build carries it; a standard
+/// build embeds nothing. It is consulted at startup so the bytes stay in the
+/// final binary because they are used.
+#[cfg(feature = "validation-feed")]
+const APP_PROFILE_RECORD: &str = concat!(
+    "hane-app-profile-v1;version=",
+    env!("CARGO_PKG_VERSION"),
+    ";profile=validation-feed;end"
+);
+
 fn main() {
     // The isolated validation build never falls back to the per-user default
     // state: from here on every state-root resolution requires a pinned or
     // explicit absolute `HANE_STATE_DIR`.
     #[cfg(feature = "validation-feed")]
-    hane_session::require_explicit_state_root();
+    {
+        if !std::hint::black_box(APP_PROFILE_RECORD).starts_with("hane-app-profile-v1;") {
+            std::process::exit(70);
+        }
+        hane_session::require_explicit_state_root();
+    }
     // First of all, before the AI service, state stores, any window or open
     // request: settle a pending update transaction or stop. The guard is the
     // shared runtime lease and lives until the process ends.
