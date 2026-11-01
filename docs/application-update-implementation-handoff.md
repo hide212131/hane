@@ -12,7 +12,7 @@
 
 ## Windows UACフェーズ（2026-10-31追加）
 
-利用者が必要時UAC方針を採用した。詳細は[Windows UAC設計](implementation/issue-510-windows-uac.md)。本体一般権限、最小helperのrunas、取消時旧版保持、昇格後検証、一般権限再起動を実装・受入する。製品未実装・実機未検証であり、以下の旧時点の同一owner/非昇格前提をWindows UACの制約として使わない。#656のbasename修正と#657の検証feedは別PRとして保持する。
+利用者が必要時UAC方針を採用した。詳細は[Windows UAC設計](implementation/issue-510-windows-uac.md)。本体一般権限、最小helperのrunas、取消時旧版保持、昇格後検証、一般権限再起動を実装・受入する。現状は部分実装済みだが、製品受入は未完了で実機UACは未検証であり、以下の旧時点の同一owner/非昇格前提をWindows UACの制約として使わない。#656のbasename修正と#657の検証feedは別PRとして保持する。
 
 ## 0. 進捗の要約
 

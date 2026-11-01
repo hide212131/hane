@@ -2,7 +2,7 @@
 
 日付: 2026-10-31 JST
 基準main: `29ed353d1548db7d2df61ffa85085dc4457c98cc`
-状態: 利用者が採用した方針の実装準備。製品未実装・実機未検証。
+状態: 部分実装済み（第1〜5段階の接続あり。`asInvoker` manifest、owner HWND、UI事前案内などは未実装）。製品受入未完了・実機のUAC/GUI未検証。
 要求の正本: [Issue #510](https://github.com/hide212131/hane/issues/510)
 判断の正本: [ADR-0034](../adr/0034-zip-application-updates.md)
 

@@ -15,7 +15,7 @@
 - restart ticketのscroll/caret保存は初回公開の必須条件から外し、位置の完全復元は後続候補とする。保存済み文書・active path・work folderの復元と、設定・AIデータの保護は維持する。
 - 署名・hash・版・対象OS・配置・所有権の検査、未保存データ保護、限定health、durable commit、rollback/RecoveryRequired、Windows ExplorerとmacOS配布の制約は変更しない。
 
-2026-10-31の追加設計: Windowsの必要時UAC昇格は[Windows UAC設計](implementation/issue-510-windows-uac.md)に従う。以下の一般権限・同一owner・stdio/child直接起動の記述に対するWindows専用の変更点を同文書に集約する。製品未実装・未検証。macOSの契約は維持する。
+2026-10-31の追加設計: Windowsの必要時UAC昇格は[Windows UAC設計](implementation/issue-510-windows-uac.md)に従う。以下の一般権限・同一owner・stdio/child直接起動の記述に対するWindows専用の変更点を同文書に集約する。部分実装済み・製品受入未完了・実機UAC未検証。macOSの契約は維持する。
 
 ## 1. 要求と到達点
 
