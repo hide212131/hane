@@ -58,6 +58,7 @@ macOS の `swift` / `screencapture` / `sips` に依存するため、実際の�
 | `HANE_GUI_VALIDATE_REQUEST_ID` | `<UTC timestamp>-<pid>` | 依頼 ID。実行ごとの保存先ディレクトリ名にもなる |
 | `HANE_GUI_VALIDATE_GENERATION` | `1` | 実行世代。再配送・再実行の識別に使う |
 | `HANE_GUI_VALIDATE_RUN_DIR` | `target/gui-validate/<request-id>/<generation>` | 証拠一式の保存先。checkout内はGitの無視対象に限る。非無視パスは証拠作成前にusage errorとして拒否 |
+| `HANE_GUI_VALIDATE_PROFILE` | `debug` | ビルド種別。`debug` または `release`。`release` のときだけ Cargo に `--release` を渡す。それ以外の値はビルド・起動の前に usage error（終了コード3）で拒否する |
 | `HANE_GUI_VALIDATE_STARTUP_TIMEOUT_SECS` | `15` | `hane_ready` を待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_TIMEOUT_SECS` | `5` | 対象ウィンドウを待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_ID_CMD` | なし（既定は `swift window_id.swift`） | ウィンドウ確認コマンドの差し替え。自動テストで実画面なしに注入する用途 |
@@ -66,6 +67,12 @@ macOS の `swift` / `screencapture` / `sips` に依存するため、実際の�
 | `HANE_CAPTURE_FIXTURE` | なし | editorで開く既存文書 |
 | `HANE_CAPTURE_CURSOR_OFFSET` | `11` | cursor-boundaryの文字位置。固定文書内の整数 `0`〜`23` |
 | `HANE_CAPTURE_CURSOR_DOWN` | `32` | cursor-scrollの移動回数。固定文書に応じた整数 `0`〜`40` |
+
+### ビルド種別（profile）
+
+既定は Debug で、通常のシナリオは Debug のまま実行する。Release は、受入条件が最適化・配布物に近い挙動を明示的に要求するときだけ `HANE_GUI_VALIDATE_PROFILE=release` で指定する。単に配布版に近いという理由では使わない。Debug と Release の結果は相互に代用しない。
+
+`result.json` の `build.profile` に選択した profile を記録し、`build.binary_path` と `build.binary_sha256` には、その profile で Cargo が出力した実行バイナリのパスと SHA-256 を記録する。実行バイナリが選択した profile の出力先にない場合は `build` 工程の失敗（`fail`）にする。feature 指定、対象 SHA、clean 確認、排他 lock、専用 state、起動・後片付けは profile によらず同じである。
 
 `HANE_STATE_DIR` は毎回 `<run-dir>/state` に固定され、呼び出し側からは上書きできない。普段の設定・Recent Files を使わないためである。
 

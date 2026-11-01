@@ -116,6 +116,10 @@ class Config:
     window_id_cmd: Optional[list[str]] = None
     capture_cmd: Optional[list[str]] = None
     capture_timeout_seconds: float = 15.0
+    profile: str = "debug"
+
+
+PROFILES = ("debug", "release")
 
 
 class Clock:
@@ -159,7 +163,8 @@ class Environment:
     def missing_tools(self, config: Config) -> list[str]:
         raise NotImplementedError
 
-    def build(self, workspace_dir: Path, features: list[str], source_sha: Optional[str] = None) -> tuple[Path, dict]:
+    def build(self, workspace_dir: Path, features: list[str], source_sha: Optional[str] = None,
+              profile: str = "debug") -> tuple[Path, dict]:
         raise NotImplementedError
 
     def launch(self, binary_path: Path, config: Config):
@@ -314,7 +319,10 @@ class RealEnvironment(Environment):
             raise EnvError(f"ビルド用checkoutを作成できない: {exc}") from exc
         return snapshot
 
-    def build(self, workspace_dir: Path, features: list[str], source_sha: Optional[str] = None) -> tuple[Path, dict]:
+    def build(self, workspace_dir: Path, features: list[str], source_sha: Optional[str] = None,
+              profile: str = "debug") -> tuple[Path, dict]:
+        if profile not in PROFILES:
+            raise BuildError(f"未対応のbuild profile: {profile!r}")
         source_sha = source_sha or self.git_head(workspace_dir)
         snapshot = self.snapshot_checkout(workspace_dir, source_sha)
         target_dir = snapshot.parent / "target"
@@ -332,6 +340,8 @@ class RealEnvironment(Environment):
             "hane",
             "--message-format=json-render-diagnostics",
         ]
+        if profile == "release":
+            args.append("--release")
         if features:
             args += ["--features", ",".join(features)]
         try:
@@ -360,6 +370,8 @@ class RealEnvironment(Environment):
                 binary_path = Path(executable)
         if binary_path is None:
             raise BuildError("cargo build の出力から実行ファイルのパスを特定できなかった")
+        if binary_path.parent.name != profile:
+            raise BuildError(f"実行ファイルが選択したprofile（{profile}）の出力先にない: {binary_path}")
 
         def tool_version(args: list[str]) -> str:
             try:
@@ -370,7 +382,7 @@ class RealEnvironment(Environment):
 
         digest = hashlib.sha256(binary_path.read_bytes()).hexdigest()
         build_info = {
-            "profile": "debug",
+            "profile": profile,
             "features": features,
             "rustc_version": tool_version(["rustc", "--version"]),
             "cargo_version": tool_version(["cargo", "--version"]),
@@ -609,7 +621,8 @@ def do_build(env: Environment, config: Config, baseline_sha: Optional[str] = Non
             return make_step("build", "blocked", reason="ビルド直前に checkout が変更されたため実行しない",
                              actual_sha=initial_sha, dirty_paths=initial_dirty), None, {}
         try:
-            binary_path, build_info = env.build(config.workspace_dir, config.features, source_sha=initial_sha)
+            binary_path, build_info = env.build(config.workspace_dir, config.features, source_sha=initial_sha,
+                                            profile=config.profile)
         except BuildError as exc:
             build_error = exc
         actual_sha = env.git_head(config.workspace_dir)
@@ -940,6 +953,9 @@ def _env_cmd(name: str) -> Optional[list[str]]:
 
 
 def build_config(scenario: str, workspace_dir: Path) -> Config:
+    profile = os.environ.get("HANE_GUI_VALIDATE_PROFILE", "debug")
+    if profile not in PROFILES:
+        raise ValueError(f"HANE_GUI_VALIDATE_PROFILE は {' / '.join(PROFILES)} のいずれかである必要がある: {profile!r}")
     request_id = os.environ.get("HANE_GUI_VALIDATE_REQUEST_ID") or (
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
     )
@@ -988,6 +1004,7 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
         window_id_cmd=_env_cmd("HANE_GUI_VALIDATE_WINDOW_ID_CMD"),
         capture_cmd=_env_cmd("HANE_GUI_VALIDATE_CAPTURE_CMD"),
         capture_timeout_seconds=_env_float("HANE_GUI_VALIDATE_CAPTURE_TIMEOUT_SECS", 15.0),
+        profile=profile,
     )
 
 

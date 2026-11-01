@@ -28,7 +28,11 @@ base の変更が scenario に影響しないと扱うかどうかは GUI worker
 
 ## 現在使える実行手段
 
-Computer Use を必須条件にしない。現在は GitHub-hosted macOS の Hosted GUI Validation と、ローカル Mac の CLI を用途に応じて使える。
+Computer Use を必須条件にしない。GitHub-hosted macOS の Hosted GUI Validation、ローカル Mac の CLI、および対象OSで直接実行するagent-desktopを用途に応じて使える。
+
+### agent-desktop（macOS / Windows）
+
+導入、同梱skillの読み込み、Haneの隔離起動、AX/UIA参照・画像・物理入力と保存結果の確認は[agent-desktop GUI検証手順](agent-desktop-gui-testing.md)を参照する。Windowsは接続先Windowsアプリから直接実行する。Macでの導入smokeとWindows実機合格、数字入力とIME変換、操作送信と期待結果の観測を区別する。
 
 ### Hosted GUI Validation
 
