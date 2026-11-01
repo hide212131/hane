@@ -699,7 +699,7 @@ class ScenarioSetupTests(unittest.TestCase):
     def test_run_validation_passes_configured_profile_to_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp), profile="release")
-            env = FakeEnvironment()
+            env = FakeEnvironment(process=FakeProcess(42))
             gv.run_validation(env, config)
             self.assertEqual(env.build_profile, "release")
 
@@ -863,8 +863,8 @@ class ExecutionIntegrityTests(unittest.TestCase):
                 compiled_inputs.append((build_dir / 'source.txt').read_text())
                 source.write_text('recorded commit input')
                 target = Path(args[args.index('--target-dir') + 1])
-                target.mkdir()
-                binary = target / 'hane'
+                (target / 'debug').mkdir(parents=True)
+                binary = target / 'debug' / 'hane'
                 binary.write_bytes(b'private snapshot executable')
                 output = json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'hane'}, 'executable': str(binary)})
                 return subprocess.CompletedProcess(args, 0, output, '')
