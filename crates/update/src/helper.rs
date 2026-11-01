@@ -1090,6 +1090,17 @@ impl RunningHelper {
 /// How long the application waits for the elevated helper's `Prepared`.
 const ELEVATED_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The inputs that identify one helper launch. `trusted` is the identity taken
+/// from the signed inventory, never from the rewritable helper record.
+#[derive(Clone, Copy)]
+struct HelperLaunch<'a> {
+    copy: &'a Path,
+    trusted: &'a crate::identity::FileIdentity,
+    request: &'a HelloRequest,
+    coordination: &'a Coordination,
+    install_root: &'a Path,
+}
+
 /// Chooses the route from the install's classification and the current token's
 /// verified write access (see [`crate::elevation::choose_route`]), before the
 /// helper is started and before anything is applied. A writable install starts
@@ -1100,30 +1111,19 @@ const ELEVATED_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Returns the failure together with whether the helper is certain not to be
 /// running.
 fn start_running_helper(
-    copy: &Path,
-    trusted: &crate::identity::FileIdentity,
-    request: &HelloRequest,
-    coordination: &Coordination,
-    install_root: &Path,
+    launch: &HelperLaunch<'_>,
     os: &dyn ElevationOs,
     prepare_timeout: Duration,
     normal: impl FnOnce() -> std::result::Result<SpawnedHelper, (UpdateError, bool)>,
 ) -> std::result::Result<RunningHelper, (UpdateError, bool)> {
     use crate::elevation::{Route, StandardAttempt, choose_route};
-    let access = os.placement_access(install_root);
+    let access = os.placement_access(launch.install_root);
     match choose_route(access.protected, access.write, StandardAttempt::NotTried) {
         Route::Standard => normal().map(RunningHelper::Standard),
-        Route::Elevated(_) => start_elevated_helper(
-            copy,
-            trusted,
-            request,
-            coordination,
-            install_root,
-            os,
-            prepare_timeout,
-            crate::elevation::protected_placement_error(),
-        )
-        .map(RunningHelper::Elevated),
+        Route::Elevated(_) => {
+            start_elevated_helper(launch, os, prepare_timeout, crate::elevation::protected_placement_error())
+                .map(RunningHelper::Elevated)
+        }
         Route::Refused(reason) => Err((crate::elevation::route_refused_error(&reason), true)),
     }
 }
@@ -1133,15 +1133,12 @@ fn start_running_helper(
 /// requesting account, and completes the same `Hello`/`Prepared` handshake as
 /// the normal start over the verified channel.
 fn start_elevated_helper(
-    copy: &Path,
-    trusted: &crate::identity::FileIdentity,
-    request: &HelloRequest,
-    coordination: &Coordination,
-    install_root: &Path,
+    launch: &HelperLaunch<'_>,
     os: &dyn ElevationOs,
     prepare_timeout: Duration,
     cause: UpdateError,
 ) -> std::result::Result<ElevatedHelper, (UpdateError, bool)> {
+    let HelperLaunch { copy, trusted, request, coordination, install_root } = *launch;
     // A build that cannot finish an elevated apply must not show a prompt.
     if !os.standard_restart_available() {
         return Err((cause, true));
@@ -1385,12 +1382,15 @@ pub fn prepare_restart_with(
         transaction_id: transaction.clone(),
         candidate_id: Some(candidate_id.to_owned()),
     };
+    let launch = HelperLaunch {
+        copy: &copy,
+        trusted: &source.identity,
+        request: &request,
+        coordination: &coordination,
+        install_root: &placement.install_root,
+    };
     let spawned = match start_running_helper(
-        &copy,
-        &source.identity,
-        &request,
-        &coordination,
-        &placement.install_root,
+        &launch,
         os,
         ELEVATED_PREPARE_TIMEOUT,
         || spawn_helper_checked(&copy, &request, PREPARE_TIMEOUT),
@@ -2585,12 +2585,16 @@ mod tests {
             transaction_id: fx.txn.clone(),
             candidate_id: Some("cand".to_owned()),
         };
+        let trusted = crate::identity::FileIdentity::of(b"helper");
+        let launch = HelperLaunch {
+            copy: Path::new("C:\\h\\hane-updater.exe"),
+            trusted: &trusted,
+            request: &hello,
+            coordination: &fx.coord,
+            install_root: Path::new("C:\\hane"),
+        };
         start_running_helper(
-            Path::new("C:\\h\\hane-updater.exe"),
-            &crate::identity::FileIdentity::of(b"helper"),
-            &hello,
-            &fx.coord,
-            Path::new("C:\\hane"),
+            &launch,
             os,
             ELEVATED_TEST_TIMEOUT,
             || Err(normal),
@@ -2636,12 +2640,16 @@ mod tests {
             candidate_id: Some("cand".to_owned()),
         };
         let normal_starts = std::cell::Cell::new(0_usize);
+        let trusted = crate::identity::FileIdentity::of(b"helper");
+        let launch = HelperLaunch {
+            copy: Path::new("C:\\h\\hane-worker.exe"),
+            trusted: &trusted,
+            request: &hello,
+            coordination: &fx.coord,
+            install_root: Path::new("C:\\hane"),
+        };
         let result = start_running_helper(
-            Path::new("C:\\h\\hane-worker.exe"),
-            &crate::identity::FileIdentity::of(b"helper"),
-            &hello,
-            &fx.coord,
-            Path::new("C:\\hane"),
+            &launch,
             os,
             ELEVATED_TEST_TIMEOUT,
             || {
