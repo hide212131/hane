@@ -147,6 +147,18 @@ pub fn choose_route(
     }
 }
 
+/// Combines the write access of every directory the product writes before an
+/// update (the install root and the coordination parent). Any verified denial
+/// wins, an unknown is never promoted to writable, and only all-writable is
+/// writable.
+pub fn combine_write_access(first: WriteAccess, second: WriteAccess) -> WriteAccess {
+    match (first, second) {
+        (WriteAccess::Denied, _) | (_, WriteAccess::Denied) => WriteAccess::Denied,
+        (WriteAccess::Unknown, _) | (_, WriteAccess::Unknown) => WriteAccess::Unknown,
+        (WriteAccess::Writable, WriteAccess::Writable) => WriteAccess::Writable,
+    }
+}
+
 // --------------------------------------------------------------- principals
 
 const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
@@ -710,6 +722,42 @@ pub fn is_declined(err: &UpdateError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_denied_coordination_parent_is_not_a_standard_route() {
+        let write = combine_write_access(WriteAccess::Writable, WriteAccess::Denied);
+        assert_eq!(write, WriteAccess::Denied);
+        assert_eq!(
+            choose_route(true, write, StandardAttempt::NotTried),
+            Route::Elevated(ElevationReason::ProtectedPlacement)
+        );
+        assert!(matches!(
+            choose_route(false, write, StandardAttempt::NotTried),
+            Route::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn an_unknown_coordination_parent_fails_closed() {
+        let write = combine_write_access(WriteAccess::Writable, WriteAccess::Unknown);
+        assert_eq!(write, WriteAccess::Unknown);
+        assert!(matches!(
+            choose_route(true, write, StandardAttempt::NotTried),
+            Route::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn only_all_writable_directories_are_writable() {
+        assert_eq!(
+            combine_write_access(WriteAccess::Writable, WriteAccess::Writable),
+            WriteAccess::Writable
+        );
+        assert_eq!(
+            combine_write_access(WriteAccess::Unknown, WriteAccess::Denied),
+            WriteAccess::Denied
+        );
+    }
 
     #[test]
     fn a_writable_placement_never_prompts() {

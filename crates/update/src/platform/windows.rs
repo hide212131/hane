@@ -1408,7 +1408,16 @@ impl ElevationOs for WindowsElevation {
             }
             Err(_) => false,
         };
-        crate::elevation::PlacementAccess { protected, write: super::probe_write_access(install_root) }
+        // The coordination directory is created in the install root's parent
+        // before the update, so both must be writable for the standard route.
+        let root_write = super::probe_write_access(install_root);
+        let write = match install_root.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            Some(parent) => {
+                crate::elevation::combine_write_access(root_write, super::probe_write_access(parent))
+            }
+            None => root_write,
+        };
+        crate::elevation::PlacementAccess { protected, write }
     }
 
     fn current_principals(&self, install_root: &Path) -> Result<(String, String)> {
