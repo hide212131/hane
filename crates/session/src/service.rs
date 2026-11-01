@@ -1001,6 +1001,41 @@ fn install_checked(
     // the move-aside and the install; that file is judged on the next round.
     for _ in 0..MAX_INSTALL_ATTEMPTS {
         let aside = displaced_path(path);
+        // Pin the current version under a second name instead of moving it:
+        // `path` stays openable for readers the whole time, and the pinned
+        // name is exactly the object that gets checked. The final rename then
+        // swaps the new file in atomically, so a reader sees the old or the new
+        // version in full, and an interrupted save leaves the old file at
+        // `path`.
+        match fs::hard_link(path, &aside) {
+            Ok(()) => {
+                if let Err(failure) = check(&aside) {
+                    let _ = fs::remove_file(&aside);
+                    return Err(failure);
+                }
+                if !same_file_object(path, &aside) {
+                    // Another writer replaced the file after it was pinned;
+                    // judge the new version on the next round.
+                    let _ = fs::remove_file(&aside);
+                    continue;
+                }
+                let installed = fs::rename(temporary, path);
+                let _ = fs::remove_file(&aside);
+                return installed.map_err(SaveFailure::Io);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                check(path)?;
+                match rename_file_without_replace(temporary, path) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(SaveFailure::Io(error)),
+                }
+            }
+            // Hard links are unavailable here: fall back to moving the
+            // version aside, which is the only way left to check exactly what
+            // is replaced.
+            Err(_) => {}
+        }
         match rename_file_without_replace(path, &aside) {
             Ok(()) => {
                 if let Err(failure) = check(&aside) {
@@ -1031,6 +1066,24 @@ fn install_checked(
         }
     }
     Err(SaveFailure::ExternalChange)
+}
+
+/// Whether both names refer to the same file object. Platforms without a
+/// stable file identity in the standard library report `true`; the pinned
+/// version has been checked and the replace follows immediately.
+#[cfg(unix)]
+fn same_file_object(first: &Path, second: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (fs::symlink_metadata(first), fs::symlink_metadata(second)) {
+        (Ok(first), Ok(second)) => first.dev() == second.dev() && first.ino() == second.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file_object(_first: &Path, _second: &Path) -> bool {
+    true
 }
 
 /// Puts a displaced version back at `path` and returns `failure`. If another
@@ -1699,6 +1752,66 @@ mod tests {
         );
         let leftovers = fs::read_dir(&root).unwrap().count();
         assert_eq!(leftovers, 1, "no temporary or displaced file may remain");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_target_stays_readable_while_an_existing_file_is_replaced() {
+        let root = temporary_directory("save-replace-visible");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("visible.md");
+        fs::write(&path, "one\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+        let observed = std::cell::RefCell::new(Vec::new());
+
+        OsFileService
+            .save_checked(&path, &edited, true, &|_| {
+                let mut reader = OsFileService.open_reader(&path).unwrap();
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).unwrap();
+                observed.borrow_mut().push(bytes);
+                Ok(())
+            })
+            .unwrap();
+
+        // Every check (the one before the write and the one on the pinned
+        // version) found the complete old file at the target.
+        assert!(!observed.borrow().is_empty());
+        assert!(observed.borrow().iter().all(|bytes| bytes == b"one\n"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "my edit\n");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_replace_leaves_the_old_content_readable() {
+        let root = temporary_directory("save-replace-interrupted");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("interrupted.md");
+        fs::write(&path, "one\n").unwrap();
+        let edited = RopeBuffer::from_text("my edit\n");
+        let calls = std::cell::Cell::new(0);
+
+        // The process dies while the version being replaced is checked.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = OsFileService.save_checked(&path, &edited, true, &|_| {
+                calls.set(calls.get() + 1);
+                if calls.get() > 1 {
+                    panic!("simulated interruption");
+                }
+                Ok(())
+            });
+        }));
+
+        assert!(outcome.is_err());
+        let loaded = OsFileService.load(&path).unwrap();
+        assert_eq!(loaded.document.full_text(), "one\n");
+        let mut reader = OsFileService.open_reader(&path).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"one\n");
         fs::remove_dir_all(root).unwrap();
     }
 
