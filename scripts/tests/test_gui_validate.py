@@ -7,6 +7,7 @@ The state-machine tests never launch Hane, Cargo, or screen/input tools.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -109,8 +110,9 @@ class FakeEnvironment(gv.Environment):
     def missing_tools(self, config):
         return self.missing
 
-    def build(self, workspace_dir, features, source_sha=None):
+    def build(self, workspace_dir, features, source_sha=None, profile="debug"):
         self.build_calls += 1
+        self.build_profile = profile
         if isinstance(self.build_result, Exception):
             raise self.build_result
         path, info = self.build_result
@@ -599,7 +601,8 @@ class ScenarioSetupTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            binary = root / "hane"
+            binary = root / "debug" / "hane"
+            binary.parent.mkdir()
             binary.write_bytes(b"test executable")
             calls = []
             def command(args, **kwargs):
@@ -616,8 +619,89 @@ class ScenarioSetupTests(unittest.TestCase):
             self.assertEqual(path, binary)
             self.assertIn("--locked", calls[0][0])
             self.assertIn("--target-dir", calls[0][0])
+            self.assertNotIn("--release", calls[0][0])
             self.assertTrue(all(options["cwd"] == root for _, options in calls))
             self.assertEqual(build["features"], ["timing-probe"])
+            self.assertEqual(build["profile"], "debug")
+
+    def test_release_profile_passes_release_and_records_selected_binary(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "release" / "hane"
+            binary.parent.mkdir()
+            binary.write_bytes(b"release executable")
+            calls = []
+            def command(args, **kwargs):
+                calls.append(args)
+                output = json.dumps({"reason": "compiler-artifact", "target": {"name": "hane"},
+                                     "executable": str(binary)}) if "build" in args else "test version"
+                return subprocess.CompletedProcess(args, 0, output, "")
+            env = gv.RealEnvironment()
+            with patch.object(env, 'snapshot_checkout', return_value=root), \
+                    patch.object(env, 'git_head', return_value='a' * 40), \
+                    patch.object(env, 'git_dirty_paths', return_value=[]), \
+                    patch.object(gv.subprocess, "run", side_effect=command):
+                path, build = env.build(root, ["timing-probe"], source_sha='a' * 40, profile="release")
+            self.assertEqual(path, binary)
+            self.assertIn("--release", calls[0])
+            self.assertIn("timing-probe", calls[0])
+            self.assertEqual(build["profile"], "release")
+            self.assertEqual(build["binary_path"], str(binary))
+            self.assertEqual(build["binary_sha256"], hashlib.sha256(b"release executable").hexdigest())
+
+    def test_build_rejects_binary_outside_selected_profile_and_unknown_profile(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "debug" / "hane"
+            binary.parent.mkdir()
+            binary.write_bytes(b"debug executable")
+            def command(args, **kwargs):
+                output = json.dumps({"reason": "compiler-artifact", "target": {"name": "hane"},
+                                     "executable": str(binary)})
+                return subprocess.CompletedProcess(args, 0, output, "")
+            env = gv.RealEnvironment()
+            with patch.object(env, 'snapshot_checkout', return_value=root), \
+                    patch.object(env, 'git_head', return_value='a' * 40), \
+                    patch.object(env, 'git_dirty_paths', return_value=[]), \
+                    patch.object(gv.subprocess, "run", side_effect=command) as run:
+                with self.assertRaises(gv.BuildError):
+                    env.build(root, [], source_sha='a' * 40, profile="release")
+                run.reset_mock()
+                with self.assertRaises(gv.BuildError):
+                    env.build(root, [], source_sha='a' * 40, profile="fast")
+                run.assert_not_called()
+
+    def test_profile_defaults_to_debug_and_rejects_invalid_values_before_execution(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = {"HANE_GUI_VALIDATE_RUN_DIR": str(root / "run"), "HANE_CAPTURE_FIXTURE": ""}
+            with patch.dict(os.environ, base):
+                os.environ.pop("HANE_GUI_VALIDATE_PROFILE", None)
+                self.assertEqual(gv.build_config("editor", root / "checkout").profile, "debug")
+            with patch.dict(os.environ, {**base, "HANE_GUI_VALIDATE_PROFILE": "release"}):
+                self.assertEqual(gv.build_config("editor", root / "checkout").profile, "release")
+            for value in ("", "Release", "fast", "debug,release"):
+                with self.subTest(value=value), patch.dict(os.environ, {**base, "HANE_GUI_VALIDATE_PROFILE": value}), \
+                        patch.object(gv, 'RealEnvironment') as environment, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(gv.main(['gui_validate.py', 'editor']), gv.EXIT_USAGE)
+                    environment.assert_not_called()
+                    self.assertFalse((root / "run").exists())
+
+    def test_run_validation_passes_configured_profile_to_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), profile="release")
+            env = FakeEnvironment()
+            gv.run_validation(env, config)
+            self.assertEqual(env.build_profile, "release")
 
     def test_launch_uses_only_owned_and_validated_hane_environment(self):
         from unittest.mock import patch
