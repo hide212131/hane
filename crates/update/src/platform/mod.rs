@@ -35,12 +35,9 @@ pub const HELPER_FILE_NAME: &str = "hane-updater.exe";
 #[cfg(not(windows))]
 pub const HELPER_FILE_NAME: &str = "hane-updater";
 
-/// The basename of the transaction-private helper copy. On Windows the copy
-/// is launched under a neutral name: a byte-identical helper named
-/// `hane-updater.exe` failed to start with `ERROR_ELEVATION_REQUIRED` (740) on
-/// an affected machine while the same bytes started as `hane-worker.exe`. The
-/// installed file and the signed inventory keep `HELPER_FILE_NAME`; the copy's
-/// location is validated by its directory chain, never by this name.
+/// The name of the staged helper copy. A neutral name: Windows starts an image
+/// whose name looks like an installer or updater with `ERROR_ELEVATION_REQUIRED`
+/// (740), which says nothing about the install's placement.
 #[cfg(windows)]
 pub const STAGED_HELPER_FILE_NAME: &str = "hane-worker.exe";
 #[cfg(not(windows))]
@@ -86,6 +83,81 @@ impl Placement {
     }
 }
 
+/// The OS seam of the elevated update route: the Windows consent prompt and its
+/// local channel, or nothing on an OS without one.
+pub fn system_elevation() -> Box<dyn crate::elevation::ElevationOs> {
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(windows::WindowsElevation::default())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Box::new(crate::elevation::UnavailableElevation)
+    }
+}
+
+/// Whether the current token can create files in `root`, proven by creating
+/// one: a permission error is `Denied`, every other failure `Unknown`. The probe
+/// is removed on close (Windows) or right away, and never touches a managed file.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn probe_write_access(root: &Path) -> crate::elevation::WriteAccess {
+    use crate::elevation::WriteAccess;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let probe = root.join(format!(".hane-write-probe-{}-{nanos}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+    match options.open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            WriteAccess::Writable
+        }
+        Err(err) => access_from_error(&err),
+    }
+}
+
+/// Whether the current token can create a directory in `root`, proven by
+/// creating one: the update prepares its coordination directory as a directory
+/// in the install root's parent, where file creation may be forbidden while
+/// directory creation is allowed. Classified like [`probe_write_access`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn probe_create_dir_access(root: &Path) -> crate::elevation::WriteAccess {
+    use crate::elevation::WriteAccess;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let probe = root.join(format!(".hane-dir-probe-{}-{nanos}", std::process::id()));
+    match fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = fs::remove_dir(&probe);
+            WriteAccess::Writable
+        }
+        Err(err) => access_from_error(&err),
+    }
+}
+
+/// A permission error is `Denied`; every other failure is `Unknown`, never a
+/// reason to elevate.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn access_from_error(err: &std::io::Error) -> crate::elevation::WriteAccess {
+    use crate::elevation::WriteAccess;
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        WriteAccess::Denied
+    } else {
+        WriteAccess::Unknown
+    }
+}
+
 pub(crate) fn unsupported(detail: impl Into<String>) -> UpdateError {
     UpdateError::new(ErrorCode::UnsupportedInstall, detail)
 }
@@ -124,7 +196,7 @@ pub(crate) fn owner_from(principal: Result<String>) -> Result<String> {
 /// another `InstallId`, with a pending journal overlooked. A mismatch or an
 /// unreadable owner is never `UnsupportedInstall`, so startup stops instead of
 /// treating the install as unmanaged.
-#[cfg(any(target_os = "windows", target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn require_root_owner(owner: Result<String>, principal: Result<String>) -> Result<()> {
     let principal = owner_from(principal)?;
     let owner = owner_from(owner)?;
@@ -138,7 +210,7 @@ pub(crate) fn require_root_owner(owner: Result<String>, principal: Result<String
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn require_install_root_owner(root: &Path) -> Result<()> {
     require_root_owner(acl::directory_owner_id(root), acl::principal_id())
 }
@@ -236,6 +308,17 @@ fn candidate_exe(dir: &Path) -> PathBuf {
     }
 }
 
+/// The placement the installed helper `helper` belongs to, derived from where it
+/// lives (the application sits beside it) and verified exactly as the running
+/// application verifies its own placement, with this process's own principal.
+/// Nothing the requesting side says is consulted.
+pub fn placement_of_installed_helper(helper: &Path) -> Result<Placement> {
+    let dir = helper
+        .parent()
+        .ok_or_else(|| unsupported("the helper has no directory"))?;
+    locate(&candidate_exe(dir))
+}
+
 /// Finds the installation a coordination directory belongs to without being
 /// told any path: only a sibling whose own verified `InstallId` equals the
 /// coordination directory's is accepted.
@@ -305,6 +388,40 @@ pub fn stage_helper_copy(
     transaction: &TransactionId,
     source: &HelperSource,
 ) -> Result<PathBuf> {
+    stage_helper_copy_as(coordination, transaction, source, None)
+}
+
+/// [`stage_helper_copy`] for the elevated helper of a protected placement: every
+/// directory and file it creates is owned by the requesting user, because the
+/// standard process of that account has to use and later recover it. The
+/// transaction and helper directories are pinned in `pins`, and stay pinned
+/// while the copy and its identity record are written.
+pub fn stage_helper_copy_user_owned(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    source: &HelperSource,
+    pins: &mut lease::BootstrapPins,
+) -> Result<PathBuf> {
+    stage_helper_copy_as(coordination, transaction, source, Some(pins))
+}
+
+/// Restricts a file just created to this principal (and, when `user_owned`,
+/// makes the user SID its owner), then proves it.
+fn secure_file(path: &Path, mode: u32, user_owned: bool) -> Result<()> {
+    if user_owned {
+        acl::secure_new_user_owned(path, false, mode).and_then(|()| acl::verify_user_owned(path, false))
+    } else {
+        acl::secure_new(path, false, mode).and_then(|()| acl::verify(path, false))
+    }
+}
+
+fn stage_helper_copy_as(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    source: &HelperSource,
+    pins: Option<&mut lease::BootstrapPins>,
+) -> Result<PathBuf> {
+    let user_owned = pins.is_some();
     let bytes = read_limited(&source.path, MAX_ENTRY_BYTES)?.ok_or_else(|| {
         UpdateError::new(ErrorCode::NotFound, "the installed helper is missing")
     })?;
@@ -314,12 +431,16 @@ pub fn stage_helper_copy(
             "the installed helper differs from the signed identity",
         ));
     }
-    let dir = coordination.ensure_helper_dir(transaction)?;
+    let dir = if let Some(pins) = pins {
+        coordination.ensure_helper_dir_user_owned(transaction, pins)?
+    } else {
+        coordination.ensure_helper_dir(transaction)?
+    };
     let dest = dir.join(STAGED_HELPER_FILE_NAME);
     durable_write(&dest, &bytes)?;
     // The copy must be owned by this principal and writable by nobody else
     // before it is hashed and run; the private subtree keeps it that way.
-    if let Err(err) = acl::secure_new(&dest, false, 0o700).and_then(|()| acl::verify(&dest, false)) {
+    if let Err(err) = secure_file(&dest, 0o700, user_owned) {
         let _ = fs::remove_file(&dest);
         return Err(err);
     }
@@ -327,7 +448,9 @@ pub fn stage_helper_copy(
     if copied.as_ref() == Some(&source.identity) {
         // Recovery after a crash must not trust the live install, which may be
         // half replaced. It runs this copy, bound to the identity recorded here.
-        if let Err(err) = write_helper_record(coordination, transaction, &source.identity, &dest) {
+        if let Err(err) =
+            write_helper_record(coordination, transaction, &source.identity, &dest, user_owned)
+        {
             let _ = fs::remove_file(&dest);
             return Err(err);
         }
@@ -369,6 +492,7 @@ fn write_helper_record(
     transaction: &TransactionId,
     identity: &FileIdentity,
     staged: &Path,
+    user_owned: bool,
 ) -> Result<()> {
     let record = helper_record_path(coordination, transaction);
     // The copy must still be exactly what was verified before it is vouched for.
@@ -381,7 +505,7 @@ fn write_helper_record(
         ));
     }
     durable_write(&record, record_text(coordination, transaction, identity).as_bytes())?;
-    if let Err(err) = acl::secure_new(&record, false, 0o600).and_then(|()| acl::verify(&record, false)) {
+    if let Err(err) = secure_file(&record, 0o600, user_owned) {
         let _ = fs::remove_file(&record);
         return Err(err);
     }
@@ -393,13 +517,26 @@ fn write_helper_record(
 /// recovery may run: the live install may be half replaced after a power loss.
 /// A missing, altered or foreign copy or record is an error, never a fallback.
 pub fn staged_helper(coordination: &Coordination, transaction: &TransactionId) -> Result<PathBuf> {
-    staged_helper_named(coordination, transaction, STAGED_HELPER_FILE_NAME, LEGACY_STAGED_HELPER_FILE_NAME)
+    staged_helper_verified(coordination, transaction).map(|(staged, _)| staged)
 }
 
-/// The basename earlier versions gave the transaction-private copy on Windows.
-/// A pending transaction journaled by such a version may still hold its copy
-/// under this name. It is never executed under it: recovery renames the
-/// verified file to the neutral name (a rename, not a launch) and runs that.
+/// [`staged_helper`] together with the identity it was verified against.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn staged_helper_verified(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+) -> Result<(PathBuf, FileIdentity)> {
+    staged_helper_named(
+        coordination,
+        transaction,
+        STAGED_HELPER_FILE_NAME,
+        LEGACY_STAGED_HELPER_FILE_NAME,
+    )
+}
+
+/// A pending transaction may have been written by a version that used the
+/// installed helper name. Verify and migrate that copy before running it under
+/// the neutral staged name. The name itself does not establish trust.
 #[cfg(windows)]
 const LEGACY_STAGED_HELPER_FILE_NAME: &str = HELPER_FILE_NAME;
 #[cfg(not(windows))]
@@ -410,7 +547,7 @@ fn staged_helper_named(
     transaction: &TransactionId,
     staged_name: &str,
     legacy_name: &str,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, FileIdentity)> {
     let refuse = |detail: &str| UpdateError::new(ErrorCode::IdentityMismatch, detail.to_owned());
     let record = helper_record_path(coordination, transaction);
     let raw = read_limited(&record, HELPER_RECORD_LIMIT)?
@@ -432,24 +569,47 @@ fn staged_helper_named(
     };
     let helper_dir = coordination.transaction_dir(transaction).join(lease::HELPER_DIR);
     let staged = helper_dir.join(staged_name);
-    if legacy_name != staged_name {
-        let legacy = helper_dir.join(legacy_name);
-        // Any entry under the old name, of any kind, next to the neutral one is
-        // ambiguous: neither is chosen.
-        if fs::symlink_metadata(&legacy).is_ok() {
-            if fs::symlink_metadata(&staged).is_ok() {
-                return Err(refuse("both the current and the legacy staged helper are present"));
-            }
+    let legacy = helper_dir.join(legacy_name);
+    let entry_exists = |path: &Path| -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    };
+    let staged_exists = entry_exists(&staged)?;
+    // Where both names are the same, there is only one path.
+    let legacy_exists = staged != legacy && entry_exists(&legacy)?;
+    match (staged_exists, legacy_exists) {
+        (true, true) => {
+            // Any entry kind under both names is ambiguous. Never pick the one
+            // that happens to look valid.
+            return Err(refuse("both the neutral and the legacy staged helper exist"));
+        }
+        (false, false) => {
+            return Err(UpdateError::new(ErrorCode::NotFound, "the staged helper is missing"));
+        }
+        (true, false) => {}
+        (false, true) => {
+            // A transaction journaled by an earlier build staged the copy under
+            // the installed name. Verify the regular file, identity, and ACL
+            // before renaming it; never execute it under its legacy name.
             let found = hash_regular_file(&legacy)?
                 .ok_or_else(|| UpdateError::new(ErrorCode::NotFound, "the legacy staged helper is missing"))?;
-            if (FileIdentity { size: found.0, sha256: found.1 }) != identity {
+            let found = FileIdentity { size: found.0, sha256: found.1 };
+            if found != identity {
                 return Err(UpdateError::new(
                     ErrorCode::HashMismatch,
                     "the legacy staged helper differs from its recorded identity",
                 ));
             }
             acl::verify(&legacy, false)?;
-            fs::rename(&legacy, &staged)?;
+            fs::rename(&legacy, &staged).map_err(|err| {
+                UpdateError::new(
+                    ErrorCode::IdentityMismatch,
+                    format!("the legacy staged helper could not be renamed: {err}"),
+                )
+            })?;
         }
     }
     let present = hash_regular_file(&staged)?
@@ -461,7 +621,7 @@ fn staged_helper_named(
         ));
     }
     acl::verify(&staged, false)?;
-    Ok(staged)
+    Ok((staged, identity))
 }
 
 #[cfg(test)]
@@ -495,10 +655,6 @@ mod tests {
         };
         let copy = stage_helper_copy(&coord, &txn, &good).unwrap();
         assert_eq!(fs::read(&copy).unwrap(), b"helper-bytes");
-        assert_eq!(copy.file_name().unwrap(), STAGED_HELPER_FILE_NAME);
-        assert_eq!(staged_helper(&coord, &txn).unwrap(), copy);
-        #[cfg(windows)]
-        assert_eq!(copy.file_name().unwrap(), "hane-worker.exe");
         assert!(
             Coordination::from_helper_exe(&copy).is_ok(),
             "the copy lives where the helper derives its identity from"
@@ -537,12 +693,12 @@ mod tests {
     fn a_legacy_named_staged_helper_is_recovered_under_the_neutral_name() {
         let dir = TempDir::new("legacy-helper");
         let (coord, txn, helper_dir) = legacy_staged(&dir);
-        let staged = staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap();
+        let (staged, identity) = staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap();
         assert_eq!(staged, helper_dir.join(NEUTRAL));
         assert_eq!(fs::read(&staged).unwrap(), b"helper-bytes");
+        assert_eq!(identity, FileIdentity::of(b"helper-bytes"));
         assert!(fs::symlink_metadata(helper_dir.join(LEGACY)).is_err(), "the old name is gone");
-        // A second call finds the neutral copy as usual.
-        assert_eq!(staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap(), staged);
+        assert_eq!(staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).unwrap().0, staged);
     }
 
     #[test]
@@ -563,7 +719,6 @@ mod tests {
         let other = TransactionId::generate().unwrap();
         let other_dir = coord.ensure_helper_dir(&other).unwrap();
         fs::copy(helper_dir.join(LEGACY), other_dir.join(LEGACY)).unwrap();
-        // No record for `other`: the file alone is never vouched for.
         assert!(staged_helper_named(&coord, &other, NEUTRAL, LEGACY).is_err());
         assert!(fs::symlink_metadata(other_dir.join(NEUTRAL)).is_err());
         assert!(staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).is_ok());
@@ -592,6 +747,114 @@ mod tests {
         fs::create_dir(helper_dir.join(LEGACY)).unwrap();
         assert!(staged_helper_named(&coord, &txn, NEUTRAL, LEGACY).is_err());
         assert!(fs::symlink_metadata(helper_dir.join(NEUTRAL)).is_err());
+    }
+
+    #[test]
+    fn the_write_probe_reports_what_the_token_can_do_and_leaves_nothing() {
+        use crate::elevation::WriteAccess;
+        let dir = TempDir::new("write-probe");
+        assert_eq!(probe_write_access(dir.path()), WriteAccess::Writable);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(probe_write_access(&dir.path().join("absent")), WriteAccess::Unknown);
+    }
+
+    #[test]
+    fn the_directory_probe_reports_directory_creation_and_leaves_nothing() {
+        use crate::elevation::WriteAccess;
+        let dir = TempDir::new("dir-probe");
+        assert_eq!(probe_create_dir_access(dir.path()), WriteAccess::Writable);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(probe_create_dir_access(&dir.path().join("absent")), WriteAccess::Unknown);
+    }
+
+    #[test]
+    fn only_a_permission_error_is_denied_access() {
+        use crate::elevation::WriteAccess;
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            access_from_error(&Error::from(ErrorKind::PermissionDenied)),
+            WriteAccess::Denied
+        );
+        assert_eq!(access_from_error(&Error::from(ErrorKind::NotFound)), WriteAccess::Unknown);
+        assert_eq!(access_from_error(&Error::from(ErrorKind::Other)), WriteAccess::Unknown);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_keeps_the_installed_helper_name_and_a_single_path() {
+        assert_eq!(STAGED_HELPER_FILE_NAME, HELPER_FILE_NAME);
+        let dir = TempDir::new("helper-single-name");
+        let coord = coordination(&dir);
+        let txn = TransactionId::generate().unwrap();
+        let source = dir.path().join("hane-updater-source");
+        fs::write(&source, b"helper-bytes").unwrap();
+        let verified = HelperSource { path: source, identity: FileIdentity::of(b"helper-bytes") };
+        let copy = stage_helper_copy(&coord, &txn, &verified).unwrap();
+        assert_eq!(copy.file_name().and_then(|n| n.to_str()), Some(HELPER_FILE_NAME));
+        let (path, identity) = staged_helper_verified(&coord, &txn).unwrap();
+        assert_eq!(path, copy, "the one copy is not mistaken for two");
+        assert!(identity == FileIdentity::of(b"helper-bytes"));
+
+        // The record still binds the bytes.
+        fs::write(&copy, b"tampered").unwrap();
+        assert!(staged_helper(&coord, &txn).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_copy_is_staged_under_the_neutral_name_and_a_legacy_copy_is_still_recovered() {
+        let dir = TempDir::new("helper-names");
+        let coord = coordination(&dir);
+        let txn = TransactionId::generate().unwrap();
+        let source = dir.path().join("hane-updater-source");
+        fs::write(&source, b"helper-bytes").unwrap();
+        let verified = HelperSource { path: source, identity: FileIdentity::of(b"helper-bytes") };
+        let copy = stage_helper_copy(&coord, &txn, &verified).unwrap();
+        assert_eq!(copy.file_name().and_then(|n| n.to_str()), Some(STAGED_HELPER_FILE_NAME));
+        assert_eq!(staged_helper(&coord, &txn).unwrap(), copy);
+
+        // An earlier build's transaction holds the copy under the installed name.
+        let legacy = copy.with_file_name(HELPER_FILE_NAME);
+        fs::rename(&copy, &legacy).unwrap();
+        let (path, identity) = staged_helper_verified(&coord, &txn).unwrap();
+        assert_eq!(path, copy, "the legacy copy is renamed to the neutral name");
+        assert!(identity == FileIdentity::of(b"helper-bytes"));
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(&copy).unwrap(), b"helper-bytes");
+
+        // Both names present is ambiguous and refused, whichever is valid.
+        fs::write(&legacy, b"helper-bytes").unwrap();
+        assert!(staged_helper(&coord, &txn).is_err());
+        assert!(copy.exists() && legacy.exists());
+
+        // A legacy copy that differs from its record is never accepted or renamed.
+        fs::remove_file(&copy).unwrap();
+        fs::remove_file(&legacy).unwrap();
+        fs::write(&legacy, b"tampered").unwrap();
+        assert!(staged_helper(&coord, &txn).is_err());
+        assert!(legacy.exists() && !copy.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_legacy_copy_with_another_transactions_record_is_not_migrated() {
+        let dir = TempDir::new("helper-foreign");
+        let coord = coordination(&dir);
+        let txn = TransactionId::generate().unwrap();
+        let other = TransactionId::generate().unwrap();
+        let source = dir.path().join("hane-updater-source");
+        fs::write(&source, b"helper-bytes").unwrap();
+        let verified = HelperSource { path: source, identity: FileIdentity::of(b"helper-bytes") };
+        let copy = stage_helper_copy(&coord, &txn, &verified).unwrap();
+        let legacy = copy.with_file_name(HELPER_FILE_NAME);
+        fs::rename(&copy, &legacy).unwrap();
+
+        // The record names another transaction: the copy is refused untouched.
+        let record = helper_record_path(&coord, &txn);
+        let foreign = record_text(&coord, &other, &FileIdentity::of(b"helper-bytes"));
+        fs::write(&record, foreign.as_bytes()).unwrap();
+        assert!(staged_helper_verified(&coord, &txn).is_err());
+        assert!(legacy.exists() && !copy.exists());
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

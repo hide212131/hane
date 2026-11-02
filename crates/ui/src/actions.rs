@@ -63,6 +63,9 @@ macro_rules! command_actions {
                     if self.settings_open() && stringify!($action) != "CancelComposition" {
                         return;
                     }
+                    if self.external_comparison_blocks_body() && !self.settings_open() {
+                        return;
+                    }
                     let $view = self;
                     let $window = window;
                     let $cx = cx;

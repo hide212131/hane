@@ -99,7 +99,7 @@ use crate::trust::{SeenStore, TrustPolicy};
 use crate::util::is_lower_hex;
 use crate::windows_apply::{
     CANDIDATE_ARCHIVE, CANDIDATE_CATALOG, CANDIDATE_DIR, CANDIDATE_SIGNATURE, NoChild,
-    settled_result, valid_candidate_id,
+    reconfirm_user_floor, settled_result, valid_candidate_id,
 };
 
 /// The journal's one step and its backup path. They are names inside the
@@ -1189,6 +1189,9 @@ struct Verified {
     slot: PathBuf,
     /// Sidecar generation of the candidate (`<version>-<source_sha>`).
     generation: String,
+    /// Holds the application's sequence-receipt lock (when the candidate
+    /// declared one) until `apply_bundle` returns, which is after the exchange.
+    _floor_guard: Option<Box<dyn Send>>,
 }
 
 fn require_local_apfs(host: &dyn BundleHost, path: &Path, what: &str) -> Result<VolumeFacts> {
@@ -1767,6 +1770,11 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
             )
         })?
         .ok_or_else(|| missing("the catalog sequence receipt"))?;
+    // The staged copy is not the latest floor: the application's own receipt is
+    // re-read last from the OS-derived location and its lock is kept, so a
+    // sequence recorded after staging raises the floor here and none can be
+    // recorded between this check and the exchange.
+    let (seen, floor_guard) = reconfirm_user_floor(coordination, &candidate_dir, seen)?;
     let candidate = verify_catalog(
         &catalog,
         &signature,
@@ -1902,6 +1910,7 @@ fn verify_and_plan(inputs: &BundleApplyInputs<'_>) -> Result<Verified> {
         plan,
         slot,
         generation: macos_generation(&version, &next.source_commit),
+        _floor_guard: floor_guard,
     })
 }
 
@@ -2198,6 +2207,7 @@ mod tests {
         FixedClock, TEST_SOURCE_SHA, TempDir, ZipEntry, build_zip, catalog_doc, macos_entry,
         macos_inventory, sign_catalog, test_now, test_policy,
     };
+    use crate::trust::SeenCatalog;
     use crate::windows_apply::{CandidateSource, stage_candidate};
 
     const OLD: &str = "0.25.0";
@@ -2305,6 +2315,9 @@ mod tests {
         after_swap: RefCell<Option<Box<dyn Fn()>>>,
         /// Run the real [`verify_bundle_inventory`] instead of the stub.
         real_inventory: Cell<bool>,
+        /// Runs on the free-space query, which `apply_bundle` makes after the
+        /// verification and before the first mutation.
+        on_available: RefCell<Option<Box<dyn Fn()>>>,
     }
 
     fn mark_key(path: &Path) -> Result<String> {
@@ -2344,6 +2357,7 @@ mod tests {
                 swap_syncs: RefCell::new(Vec::new()),
                 after_swap: RefCell::new(None),
                 real_inventory: Cell::new(false),
+                on_available: RefCell::new(None),
             }
         }
     }
@@ -2361,6 +2375,9 @@ mod tests {
         }
 
         fn available_bytes(&self, _path: &Path) -> Result<u64> {
+            if let Some(hook) = self.on_available.borrow_mut().take() {
+                hook();
+            }
             self.available
                 .get()
                 .ok_or_else(|| UpdateError::new(ErrorCode::Io, "free space unavailable"))
@@ -2540,6 +2557,7 @@ mod tests {
                 catalog: &ready.join("c"),
                 signature: &ready.join("s"),
                 archive: &ready.join("a"),
+                seen: None,
             },
         )
         .unwrap();
@@ -4028,5 +4046,164 @@ mod tests {
         assert!(crate::startup::ensure_prior_receipts_current(&fx.coordination, &view).is_ok());
         fs::write(fx.live().join("Contents/MacOS/hane"), b"changed later").unwrap();
         assert!(crate::startup::ensure_prior_receipts_current(&fx.coordination, &view).is_err());
+    }
+
+    // ------------------------------------- the application's sequence floor
+
+    /// Declares the application's own receipt for the fixture's staged
+    /// candidate, as `stage_candidate` does when given a `seen` path, below a
+    /// state root the helper trusts in this test.
+    fn declare_user_receipt(fx: &Fixture) -> PathBuf {
+        let root = fx.placement.coordination_parent.join("state");
+        let receipts = root.join("updates").join(fx.placement.install_id.as_str()).join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        let mut dir = receipts.clone();
+        while dir != root.parent().unwrap() {
+            crate::platform::acl::secure_new(&dir, true, 0o700).unwrap();
+            dir.pop();
+        }
+        crate::windows_apply::set_trusted_state_root(Some(root));
+        let path = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
+        let ready = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
+        let mut store = FileSeenStore::new(path.clone());
+        store.store(&ready).unwrap();
+        // The application's own writer has created the lock file by now; the
+        // helper never creates it.
+        drop(store.lock().unwrap());
+        let marker = fx
+            .coordination
+            .transaction_dir(&fx.transaction)
+            .join(CANDIDATE_DIR)
+            .join(crate::windows_apply::CANDIDATE_SEEN_SOURCE);
+        fs::write(marker, path.to_str().unwrap()).unwrap();
+        path
+    }
+
+    /// Nothing of the install, the journal or the candidate's data was touched.
+    fn refused_untouched(fx: &Fixture) -> bool {
+        fx.untouched() && !fx.coordination.inventories_dir().exists() && fx.host.marks.borrow().is_empty()
+    }
+
+    #[test]
+    fn a_matching_user_receipt_lets_the_candidate_apply() {
+        let fx = fixture();
+        declare_user_receipt(&fx);
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+        assert!(fx.live_is_new());
+    }
+
+    #[test]
+    fn a_floor_recorded_in_the_user_receipt_after_staging_rejects_the_candidate() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        // Another service records a higher sequence after the candidate was
+        // staged: only the application's receipt moves.
+        FileSeenStore::new(user).store(&SeenCatalog::new(3, "b".repeat(64))).unwrap();
+        assert_eq!(apply_bundle(&fx.inputs()).err().unwrap().code, ErrorCode::SequenceRegression);
+        assert!(refused_untouched(&fx));
+    }
+
+    #[test]
+    fn the_user_receipt_with_other_bytes_for_the_same_sequence_is_rejected() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        FileSeenStore::new(user).store(&SeenCatalog::new(2, "b".repeat(64))).unwrap();
+        assert_eq!(apply_bundle(&fx.inputs()).err().unwrap().code, ErrorCode::SequenceConflict);
+        assert!(refused_untouched(&fx));
+    }
+
+    #[test]
+    fn a_declared_but_missing_or_corrupt_user_receipt_fails_closed() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::remove_file(&user).unwrap();
+        assert_eq!(apply_bundle(&fx.inputs()).err().unwrap().code, ErrorCode::NotFound);
+        assert!(refused_untouched(&fx));
+
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::write(&user, b"{not json").unwrap();
+        assert!(apply_bundle(&fx.inputs()).is_err());
+        assert!(refused_untouched(&fx));
+    }
+
+    #[test]
+    fn a_receipt_location_other_than_the_trusted_one_is_refused() {
+        let fx = fixture();
+        declare_user_receipt(&fx);
+        let forged = fx.placement.coordination_parent.join("elsewhere").join("seen-catalog.json");
+        fs::write(
+            fx.coordination
+                .transaction_dir(&fx.transaction)
+                .join(CANDIDATE_DIR)
+                .join(crate::windows_apply::CANDIDATE_SEEN_SOURCE),
+            forged.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(apply_bundle(&fx.inputs()).err().unwrap().code, ErrorCode::IdentityMismatch);
+        assert!(refused_untouched(&fx));
+    }
+
+    /// A competing writer started between the final floor check and the first
+    /// mutation must wait for the lock until the exchange has happened.
+    #[test]
+    fn a_competing_writer_waits_for_the_lock_until_the_bundle_is_exchanged() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        type ObservedReceiver = Option<std::sync::mpsc::Receiver<(bool, bool)>>;
+        let observed: Rc<RefCell<ObservedReceiver>> = Rc::new(RefCell::new(None));
+        let (slot, receipt, live, before, journal) = (
+            Rc::clone(&observed),
+            user.clone(),
+            fx.live().to_path_buf(),
+            tree(fx.live()),
+            fx.journal_path(),
+        );
+        *fx.host.on_available.borrow_mut() = Some(Box::new(move || {
+            let lock_path = receipt.with_extension("lock");
+            let probe = OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
+            assert!(
+                matches!(probe.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "the helper must hold the application receipt lock before the first mutation"
+            );
+            drop(probe);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (receipt, live, before, journal) =
+                (receipt.clone(), live.clone(), before.clone(), journal.clone());
+            std::thread::spawn(move || {
+                let store = FileSeenStore::new(receipt);
+                let _lock = store.lock().unwrap();
+                let _ = tx.send((journal.exists(), tree(&live) == before));
+            });
+            assert!(
+                matches!(
+                    rx.recv_timeout(Duration::from_millis(300)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "a competing writer got the sequence lock before the bundle was exchanged"
+            );
+            *slot.borrow_mut() = Some(rx);
+        }));
+        let applied = apply_bundle(&fx.inputs()).unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+        drop(applied);
+
+        let rx = observed.borrow_mut().take().expect("the hook ran under the lock");
+        let (journal_exists, live_unchanged) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(journal_exists, "the writer got the lock before the journal existed");
+        assert!(!live_unchanged, "the writer got the lock before the bundle was exchanged");
+    }
+
+    #[test]
+    fn a_refused_apply_releases_the_lock_with_the_install_untouched() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fx.host.available.set(Some(0));
+        assert_eq!(apply_bundle(&fx.inputs()).err().unwrap().code, ErrorCode::InsufficientSpace);
+        assert!(fx.untouched());
+        // The refusal dropped the guard: a writer can lock again.
+        let store = FileSeenStore::new(user);
+        drop(store.lock().unwrap());
     }
 }

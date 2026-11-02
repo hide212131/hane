@@ -3,6 +3,10 @@ use super::*;
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_external_open_guard();
+        // Registered once; then only a path-set comparison per frame, never
+        // file I/O (the checks themselves run on the background executor).
+        self.observe_window_return(window, cx);
+        self.sync_document_watches(cx);
         // Erase the opaque type so the element no longer borrows `self`.
         let element = self.render_frame(window, cx).into_any_element();
         // `editor_mut` raises the external-open guard even for access that does
@@ -89,6 +93,7 @@ impl EditorView {
         {
             self.tab_close_confirm = None;
         }
+        self.prune_external_comparison();
         self.begin_mermaid_frame(window, cx);
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
@@ -604,6 +609,11 @@ impl EditorView {
         };
         let rendered = if let Some(confirm) = self.tab_close_confirm.as_ref() {
             rendered.child(self.tab_close_confirm_element(confirm, cx))
+        } else {
+            rendered
+        };
+        let rendered = if let Some(overlay) = self.external_comparison_overlay(cx) {
+            rendered.child(overlay)
         } else {
             rendered
         };

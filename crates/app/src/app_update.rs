@@ -57,8 +57,48 @@ pub struct UpdateServiceConfig {
     pub install_id: InstallId,
     /// `<state root>/updates/<InstallId>`: candidates and work directories.
     pub updates_root: PathBuf,
-    /// Private directory for the highest-seen catalog sequence.
+    /// Private directory for the highest-seen catalog sequence. It lives in the
+    /// user's state, never below the install, so a protected install is not
+    /// written before the user chooses to apply. The helper carries the floor
+    /// into the coordination receipts once that exists.
     pub receipts_dir: PathBuf,
+    /// The earlier location of the sequence floor (the coordination receipts of
+    /// a supported install). A valid floor found there is carried into
+    /// `receipts_dir` before any check or restore uses the floor; an unreadable
+    /// or conflicting one refuses instead of meaning "no floor".
+    pub legacy_seen: Option<PathBuf>,
+}
+
+/// Carries a floor stored at the earlier location into the user's receipts.
+/// The stored floor never goes down: a higher one stays, and the same sequence
+/// with different catalog bytes is a conflict. A missing legacy file is the
+/// normal case; a corrupt or unreadable one is a refusal.
+fn migrate_legacy_floor(legacy: &Path, target: &Path) -> Result<(), UpdateError> {
+    let Some(carried) = FileSeenStore::new(legacy.to_path_buf()).load()? else {
+        return Ok(());
+    };
+    carried.validate()?;
+    if let Some(parent) = target.parent() {
+        create_private_dir(parent)?;
+    }
+    let mut store = FileSeenStore::new(target.to_path_buf());
+    let _guard = store.lock()?;
+    if let Some(existing) = store.load()? {
+        existing.validate()?;
+        if existing.sequence > carried.sequence {
+            return Ok(());
+        }
+        if existing.sequence == carried.sequence {
+            if existing.catalog_sha256 != carried.catalog_sha256 {
+                return Err(UpdateError::new(
+                    ErrorCode::SequenceConflict,
+                    "same catalog sequence with different bytes",
+                ));
+            }
+            return Ok(());
+        }
+    }
+    store.store(&carried)
 }
 
 /// What the service needs to hand a Ready update to the helper. A service
@@ -529,6 +569,15 @@ impl Inner {
         FileSeenStore::new(self.config.receipts_dir.join(SEEN_FILE))
     }
 
+    /// Loads the sequence floor after carrying over one from the earlier
+    /// location, so no check or restore runs with a lower floor than recorded.
+    fn load_floor(&self) -> Result<Option<hane_update::trust::SeenCatalog>, UpdateError> {
+        if let Some(legacy) = &self.config.legacy_seen {
+            migrate_legacy_floor(legacy, &self.config.receipts_dir.join(SEEN_FILE))?;
+        }
+        self.seen_store().load()
+    }
+
     /// Runs `task` in the background. If the runner cannot start it, the
     /// operation identified by `op` fails instead of waiting forever.
     fn dispatch(self: &Arc<Self>, op: u64, task: Task) {
@@ -667,7 +716,7 @@ impl Inner {
         let deadline = fetcher.metadata_deadline();
         let selection = fetcher.check_latest_within(&current, target, &deadline, cancel)?;
         let (catalog, signature) = fetcher.fetch_catalog_within(&selection, &deadline, cancel)?;
-        let seen = self.seen_store().load()?;
+        let seen = self.load_floor()?;
         let candidate = verify_catalog(
             &catalog,
             &signature,
@@ -1080,7 +1129,7 @@ impl Inner {
             .ok_or_else(|| missing("catalog is missing"))?;
         let signature = read_limited(&dir.join(SIGNATURE_FILE), MAX_SIGNATURE_BYTES)?
             .ok_or_else(|| missing("signature is missing"))?;
-        let seen = self.seen_store().load()?;
+        let seen = self.load_floor()?;
         let candidate = verify_catalog(
             &catalog,
             &signature,
@@ -1177,6 +1226,45 @@ impl Inner {
                 "the install location changed",
             ));
         }
+        self.confirm_floor(candidate_id)
+    }
+
+    /// The helper re-reads the floor copied when it staged the candidate. If
+    /// another service recorded a higher sequence since, or a different catalog
+    /// for the same sequence, the Ready candidate is refused here (fail-closed)
+    /// before the ticket is written. A missing floor is a refusal too.
+    fn confirm_floor(&self, candidate_id: &str) -> Result<(), UpdateError> {
+        let (sequence, sha256) = {
+            let state = self.lock();
+            match &state.stage {
+                Stage::Ready { offer, .. } if offer.id().as_str() == candidate_id => (
+                    offer.candidate.sequence(),
+                    offer.candidate.catalog_sha256().to_owned(),
+                ),
+                _ => {
+                    return Err(UpdateError::new(
+                        ErrorCode::TransitionInvalid,
+                        "the prepared update changed",
+                    ));
+                }
+            }
+        };
+        let floor = self.load_floor()?.ok_or_else(|| {
+            UpdateError::new(ErrorCode::NotFound, "the catalog sequence receipt is missing")
+        })?;
+        floor.validate()?;
+        if floor.sequence > sequence {
+            return Err(UpdateError::new(
+                ErrorCode::SequenceRegression,
+                "a newer catalog sequence was recorded after the update was prepared",
+            ));
+        }
+        if floor.sequence == sequence && floor.catalog_sha256 != sha256 {
+            return Err(UpdateError::new(
+                ErrorCode::SequenceConflict,
+                "same catalog sequence with different bytes",
+            ));
+        }
         Ok(())
     }
 
@@ -1185,7 +1273,10 @@ impl Inner {
     fn prepare_failure(&self, error: &UpdateError, version: Option<&str>) -> String {
         self.diag
             .record("prepare", error.code.as_str(), &error.detail, version);
-        error.to_string()
+        match hane_update::elevation::elevation_message(error) {
+            Some(message) => message.to_owned(),
+            None => error.to_string(),
+        }
     }
 
     /// Starts the helper for the Ready candidate. The lock is not held while
@@ -1207,12 +1298,34 @@ impl Inner {
                 _ => return Err("準備した更新が変わりました。もう一度お試しください".to_owned()),
             }
         };
+        // The helper derives the receipt from the OS account's Local AppData and
+        // refuses anything else at apply time. Check that before the helper is
+        // started, so the application never gets an exit permit it cannot use.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let receipt = self.config.receipts_dir.join(SEEN_FILE);
+            // Derived from the install id only: the coordination directory is
+            // created later by the elevated bootstrap, never by this check.
+            let checked = hane_update::windows_apply::ensure_receipt_matches_trusted_root(
+                &wiring.placement.install_id,
+                &receipt,
+            );
+            if let Err(err) = checked {
+                self.prepare_failure(&err, Some(&version));
+                return Err(format!(
+                    "保存場所（HANE_STATE_DIRまたはLOCALAPPDATA）が、更新ヘルパーが確認できる既定の場所と一致しないため、更新を適用できません。\
+                     Haneは終了せず、文書とデータには変更を加えていません。理由: {}",
+                    err.detail
+                ));
+            }
+        }
         let prepared = update_restart::start_helper(
             &wiring.placement,
             &self.config.policy,
             candidate_id,
             &dir,
             &wiring.state_root,
+            &self.config.receipts_dir.join(SEEN_FILE),
         )
         .map_err(|err| self.prepare_failure(&err, Some(&version)))?;
         // A failure from here on drops `prepared`, which aborts the helper.
@@ -1378,6 +1491,7 @@ mod tests {
             policy,
             updates_root: dir.path().join("updates").join(id.as_str()),
             receipts_dir: dir.path().join("receipts"),
+            legacy_seen: None,
             install_id: id,
         }
     }
@@ -1423,6 +1537,22 @@ mod tests {
             release,
             tag: format!("v{version}"),
         }
+    }
+
+    #[test]
+    fn route_refusal_is_shown_as_japanese_guidance_and_other_io_stays_generic() {
+        let fixture = fixture("0.1.0", "0.2.0", 1);
+        let refused = hane_update::elevation::route_refused_error("write access unknown");
+        let text = fixture.service.inner.prepare_failure(&refused, None);
+        assert_eq!(text, hane_update::elevation::ROUTE_REFUSED_MESSAGE);
+        assert!(text.contains("更新先の書き込み権限を確認するか、手動で更新してください"));
+        assert!(text.contains("現在のHaneと作業内容"));
+        assert!(!text.contains("write access unknown"));
+
+        let other = UpdateError::new(ErrorCode::Io, "disk failure");
+        let text = fixture.service.inner.prepare_failure(&other, None);
+        assert_eq!(text, other.to_string());
+        assert_ne!(text, hane_update::elevation::ROUTE_REFUSED_MESSAGE);
     }
 
     impl Fixture {
@@ -2323,6 +2453,23 @@ mod tests {
     }
 
     #[test]
+    fn a_candidate_becomes_ready_without_creating_any_coordination_directory() {
+        // The floor is persisted in the configured (user) receipts directory
+        // before the Ready marker; nothing named like the install's
+        // coordination directory exists, as in a protected install.
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let dir = fixture.updates_root().join("candidates").join(fixture.candidate_id());
+        assert!(dir.join("ready").is_file());
+        assert!(fixture.dir.path().join("receipts").join("seen-catalog.json").is_file());
+        let coordination = fs::read_dir(fixture.dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".hane-update-"));
+        assert!(!coordination, "no coordination directory may be created before consent");
+    }
+
+    #[test]
     fn a_write_failure_after_the_download_is_not_reported_as_a_failed_check() {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.script_check();
@@ -2486,6 +2633,93 @@ mod tests {
         assert_eq!(report.matches("code=identity_mismatch").count(), 1, "{report}");
         assert!(!report.contains("code=io"), "{report}");
         assert!(report.contains("candidate=0.27.0"), "{report}");
+    }
+
+    fn write_floor(path: &Path, sequence: u64, fill: char) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = FileSeenStore::new(path.to_path_buf());
+        store
+            .store(&hane_update::trust::SeenCatalog::new(sequence, fill.to_string().repeat(64)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_legacy_floor_is_carried_over_and_never_lowers_a_higher_one() {
+        let dir = TempDir::new("app-update-legacy");
+        let legacy = dir.path().join("coordination").join("seen-catalog.json");
+        let target = dir.path().join("receipts").join("seen-catalog.json");
+
+        // Nothing at the old location is the normal case.
+        migrate_legacy_floor(&legacy, &target).unwrap();
+        assert!(!target.exists());
+
+        write_floor(&legacy, 7, 'a');
+        migrate_legacy_floor(&legacy, &target).unwrap();
+        let carried = FileSeenStore::new(target.clone()).load().unwrap().unwrap();
+        assert_eq!((carried.sequence, carried.catalog_sha256), (7, "a".repeat(64)));
+
+        // A higher stored floor stays.
+        write_floor(&target, 9, 'b');
+        migrate_legacy_floor(&legacy, &target).unwrap();
+        assert_eq!(FileSeenStore::new(target.clone()).load().unwrap().unwrap().sequence, 9);
+
+        // The same sequence with other catalog bytes is a conflict.
+        write_floor(&target, 7, 'c');
+        let err = migrate_legacy_floor(&legacy, &target).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceConflict);
+    }
+
+    #[test]
+    fn a_corrupt_legacy_floor_is_refused_not_read_as_no_floor() {
+        let dir = TempDir::new("app-update-legacy-corrupt");
+        let legacy = dir.path().join("coordination").join("seen-catalog.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"{not json").unwrap();
+        let target = dir.path().join("receipts").join("seen-catalog.json");
+        assert!(migrate_legacy_floor(&legacy, &target).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_legacy_floor_is_applied_before_a_restore_accepts_a_lower_sequence() {
+        let dir = TempDir::new("app-update-legacy-load");
+        let legacy = dir.path().join("coordination").join("seen-catalog.json");
+        write_floor(&legacy, 8, 'd');
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let mut cfg = config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64));
+        cfg.legacy_seen = Some(legacy);
+        let service = AppUpdateService::with_runner(
+            cfg,
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        assert_eq!(service.inner.load_floor().unwrap().unwrap().sequence, 8);
+        let floor = dir.path().join("receipts").join("seen-catalog.json");
+        assert_eq!(FileSeenStore::new(floor).load().unwrap().unwrap().sequence, 8);
+    }
+
+    #[test]
+    fn a_higher_sequence_recorded_after_ready_refuses_the_restart() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate = fixture.candidate_id();
+        let inner = &fixture.service.inner;
+        inner.confirm_floor(&candidate).unwrap();
+
+        let floor = fixture.dir.path().join("receipts").join("seen-catalog.json");
+        write_floor(&floor, 6, 'e');
+        let err = inner.confirm_floor(&candidate).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceRegression);
+
+        // The same sequence with other catalog bytes is refused too.
+        write_floor(&floor, 5, 'f');
+        let err = inner.confirm_floor(&candidate).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceConflict);
+
+        // A missing floor is never "no floor".
+        fs::remove_file(&floor).unwrap();
+        assert!(inner.confirm_floor(&candidate).is_err());
     }
 
     #[test]

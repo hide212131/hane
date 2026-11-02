@@ -18,7 +18,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::helper::{HelloRequest, PREPARE_TIMEOUT, spawn_helper};
 use crate::identity::TransactionId;
 use crate::journal::{
     DiskView, FileJournalStore, FsDiskView, JournalStore, Phase, RecoveryDecision, UpdateJournal,
@@ -28,13 +27,12 @@ use crate::model::Target;
 use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
 use crate::platform::{self, Placement};
 use crate::relocation::{self, RelocationRecord};
-use crate::protocol::{Mode, RecoveryReport, bounded_reason};
+use crate::protocol::{RecoveryReport, bounded_reason};
 use crate::state_root::TicketRestore;
 use crate::trust::TrustPolicy;
 
 /// How long a normal launch waits for a helper that holds the startup gate.
 pub const STARTUP_WAIT: Duration = Duration::from_secs(30);
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Held for the rest of the process: the shared `runtime` lease.
 #[derive(Debug)]
@@ -148,24 +146,45 @@ impl RecoveryRunner for HelperRecoveryRunner {
         // The live install may be half replaced after a power loss, so its
         // helper is neither re-verified nor run; the copy staged before the
         // first mutation is.
+        let os = platform::system_elevation();
         recover_with_staged_helper(coordination, transaction, |copy| {
-            let mut spawned = spawn_helper(
+            let (staged, recorded) = platform::staged_helper_verified(coordination, transaction)?;
+            if staged != copy {
+                return Err(UpdateError::new(
+                    ErrorCode::IdentityMismatch,
+                    "the staged helper changed during recovery",
+                ));
+            }
+            // The record beside the copy is writable by the same user, so it is
+            // not a trust anchor. The elevated launch is pinned to the identity
+            // that the elevated helper stored in the protected coordination
+            // parent before the first mutation: the live install may be half
+            // replaced, so it cannot be asked again. Without a matching
+            // protected record, nothing is elevated.
+            let trusted = recovery_trust(coordination, transaction, &recorded);
+            crate::helper::recover_with_helper_copy(
+                os.as_ref(),
+                placement,
+                coordination,
+                transaction,
                 copy,
-                &HelloRequest {
-                    mode: Mode::Recover,
-                    install_id: placement.install_id.clone(),
-                    transaction_id: transaction.clone(),
-                    candidate_id: None,
-                },
-                PREPARE_TIMEOUT,
-            )?;
-            // A helper that is slow is left alone: it may be mid-rollback, and
-            // the next start settles whatever it leaves from the journal.
-            let report = spawned.link.await_recovered(RECOVERY_TIMEOUT)?;
-            let _ = spawned.child.wait();
-            Ok(report)
+                trusted.as_ref(),
+            )
         })
     }
+}
+
+/// The identity an elevated recovery launch is pinned to: the one stored in the
+/// protected coordination parent for exactly this install and transaction, and
+/// only when the staged helper's own record agrees with it. A missing, altered,
+/// foreign or unprotected record, or a disagreeing staged record, yields `None`.
+fn recovery_trust(
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    recorded: &crate::identity::FileIdentity,
+) -> Option<crate::identity::FileIdentity> {
+    let anchored = crate::helper_anchor::read(coordination, transaction).ok()?;
+    (&anchored == recorded).then_some(anchored)
 }
 
 /// Runs `run` with the transaction's staged helper copy, only after it is bound
@@ -501,6 +520,8 @@ fn sweep_unjournaled(coordination: &Coordination) {
         // removed keeps the directory for the next start.
         crate::helper::discard_unstarted_transaction(coordination, &id);
     }
+    // A record whose transaction directory is gone is orphaned.
+    crate::helper_anchor::sweep_settled(coordination);
 }
 
 /// Runs the gate for a verified placement.
@@ -538,6 +559,10 @@ pub fn startup_gate(placement: &Placement, runner: &dyn RecoveryRunner, wait: Du
             Err(err) => return stop(&UpdateError::from(err)),
             Ok(Some(Pending::Stop(why))) => return GateOutcome::RecoveryRequired(why),
             Ok(None) => {
+                // Nothing is pending, so a protected helper identity record of
+                // a settled transaction has served its purpose. A record that
+                // cannot be removed from here is inert and swept later.
+                crate::helper_anchor::sweep_settled(&coordination);
                 return match coordination.try_acquire(LeaseKind::RuntimeShared, &[&startup]) {
                     Ok(Some(lease)) => {
                         // Read under the startup gate, before it is released.
@@ -2698,6 +2723,116 @@ mod tests {
         fs::create_dir_all(coord.transaction_dir(&transaction).join("backup")).unwrap();
         fs::write(coord.journal_path(&transaction), b"not a journal").unwrap();
         assert_eq!(recovery_backup(&coord, false), BackupGuidance::Unknown);
+    }
+
+    fn anchor_file(coord: &Coordination, transaction: &TransactionId) -> std::path::PathBuf {
+        crate::helper_anchor::anchor_path(
+            coord.dir().parent().unwrap(),
+            coord.install_id(),
+            transaction,
+        )
+    }
+
+    fn staged_identity(coord: &Coordination, transaction: &TransactionId) -> FileIdentity {
+        platform::staged_helper_verified(coord, transaction).unwrap().1
+    }
+
+    #[test]
+    fn recovery_is_pinned_to_the_stored_identity_after_the_live_helper_was_replaced() {
+        let dir = TempDir::new("gate-anchor-partial");
+        // `interrupted` replaced the live helper after the copy was staged, so
+        // the installed helper no longer yields the old identity.
+        let (_placement, coord, transaction) = interrupted(&dir, Phase::Applying);
+        let old = FileIdentity::of(b"old-helper");
+        crate::helper_anchor::write(&coord, &transaction, &old).unwrap();
+        let recorded = staged_identity(&coord, &transaction);
+        assert_eq!(recorded, old);
+        assert_eq!(recovery_trust(&coord, &transaction, &recorded), Some(old));
+    }
+
+    #[test]
+    fn a_missing_altered_foreign_or_unprotected_record_never_pins_an_elevated_recovery() {
+        let dir = TempDir::new("gate-anchor-refused");
+        let (_placement, coord, transaction) = interrupted(&dir, Phase::Applying);
+        let recorded = staged_identity(&coord, &transaction);
+        let journal_before = fs::read(coord.journal_path(&transaction)).unwrap();
+        fs::create_dir_all(coord.transaction_dir(&transaction).join("backup")).unwrap();
+
+        // Missing.
+        assert_eq!(recovery_trust(&coord, &transaction, &recorded), None);
+
+        crate::helper_anchor::write(&coord, &transaction, &recorded).unwrap();
+        let path = anchor_file(&coord, &transaction);
+        let genuine = fs::read_to_string(&path).unwrap();
+        assert_eq!(recovery_trust(&coord, &transaction, &recorded), Some(recorded.clone()));
+
+        // Altered, or moved to another transaction.
+        let evil = FileIdentity::of(b"evil-helper");
+        fs::write(&path, genuine.replace(&recorded.sha256, &evil.sha256)).unwrap();
+        assert_eq!(recovery_trust(&coord, &transaction, &recorded), None);
+        let other = TransactionId::generate().unwrap();
+        fs::write(&path, &genuine).unwrap();
+        fs::write(anchor_file(&coord, &other), &genuine).unwrap();
+        assert_eq!(recovery_trust(&coord, &other, &recorded), None);
+
+        // The staged record disagrees with the stored identity.
+        assert_eq!(recovery_trust(&coord, &transaction, &evil), None);
+
+        // Not verifiably protected.
+        crate::helper_anchor::test_support::refuse_protection(true);
+        let unprotected = recovery_trust(&coord, &transaction, &recorded);
+        crate::helper_anchor::test_support::refuse_protection(false);
+        assert_eq!(unprotected, None);
+
+        // Nothing above touched the journal or the backup.
+        assert_eq!(fs::read(coord.journal_path(&transaction)).unwrap(), journal_before);
+        assert!(coord.transaction_dir(&transaction).join("backup").is_dir());
+    }
+
+    #[test]
+    fn an_unrecoverable_pending_transaction_keeps_its_record_and_blocks_editing() {
+        let dir = TempDir::new("gate-anchor-pending");
+        let (placement, coord, transaction) = interrupted(&dir, Phase::Applying);
+        crate::helper_anchor::write(&coord, &transaction, &FileIdentity::of(b"old-helper")).unwrap();
+        let runner = Runner::new(false, Ok(RecoveryReport::RecoveryRequired("stuck".to_owned())));
+        assert!(matches!(
+            startup_gate(&placement, &runner, Duration::from_millis(50)),
+            GateOutcome::RecoveryRequired(_)
+        ));
+        assert!(anchor_file(&coord, &transaction).is_file());
+        assert!(coord.journal_path(&transaction).is_file());
+    }
+
+    #[test]
+    fn a_settled_transaction_retires_its_record_at_the_next_start() {
+        for phase in [Phase::RolledBack, Phase::Committed] {
+            let dir = TempDir::new("gate-anchor-retire");
+            let placement = placement(&dir);
+            let coord = placement.coordination().unwrap();
+            let transaction = TransactionId::generate().unwrap();
+            match phase {
+                Phase::Committed => {
+                    write_versioned(&coord, &transaction, ("1.0.0", "2.0.0"), Phase::Committed);
+                    fs::write(placement.install_root.join("a.dll"), b"2.0.0").unwrap();
+                }
+                _ => write_journal(&coord, &transaction, Phase::RolledBack),
+            }
+            crate::helper_anchor::write(&coord, &transaction, &FileIdentity::of(b"old-helper")).unwrap();
+            let orphan = TransactionId::generate().unwrap();
+            crate::helper_anchor::write(&coord, &orphan, &FileIdentity::of(b"old-helper")).unwrap();
+            let runner = Runner::new(false, Ok(RecoveryReport::Nothing));
+            assert!(
+                matches!(
+                    startup_gate(&placement, &runner, Duration::from_millis(50)),
+                    GateOutcome::Proceed(_)
+                ),
+                "{phase:?}"
+            );
+            assert_eq!(runner.calls.get(), 0);
+            assert!(!anchor_file(&coord, &transaction).exists(), "{phase:?}: settled record retired");
+            assert!(!anchor_file(&coord, &orphan).exists(), "{phase:?}: orphaned record retired");
+            assert!(coord.journal_path(&transaction).is_file(), "{phase:?}: the receipt stays");
+        }
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

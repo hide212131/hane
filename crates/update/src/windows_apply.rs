@@ -34,13 +34,13 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::apply::{self, ApplyOutcome, FsFileOps, HealthChild, HealthOutcome, ParentProcess};
-use crate::archive::{ArchiveLimits, stage_archive};
+use crate::archive::{ArchiveLimits, stage_archive_held};
 use crate::catalog::{VerifyContext, verify_catalog};
 use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{FileSeenStore, hash_regular_file, read_limited};
 use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, Settled, conclude_with_child};
-use crate::identity::{ApplyPlan, SignedInventory, TransactionId};
+use crate::identity::{ApplyPlan, InstallId, SignedInventory, TransactionId};
 use crate::journal::{
     DurableJournal, FileJournalStore, FsDiskView, Phase, UpdateJournal, check_plan_preconditions,
 };
@@ -49,9 +49,10 @@ use crate::limits::{
     MAX_SIGNATURE_BYTES,
 };
 use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target, UPDATER_PROTOCOL};
+use crate::pinned::PinnedDir;
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
-use crate::trust::{SeenStore, TrustPolicy};
+use crate::trust::{SeenCatalog, SeenStore, TrustPolicy};
 use crate::util::is_sha256_hex;
 
 /// Directory of the transaction that holds the copied candidate.
@@ -59,6 +60,7 @@ pub const CANDIDATE_DIR: &str = "candidate";
 pub const CANDIDATE_CATALOG: &str = "catalog.json";
 pub const CANDIDATE_SIGNATURE: &str = "catalog.sig";
 pub const CANDIDATE_ARCHIVE: &str = "archive.zip";
+pub const CANDIDATE_SEEN_SOURCE: &str = "seen-source";
 const CHILD_EXE: &str = "hane.exe";
 const STAGE_DIR: &str = "stage";
 const BACKUP_DIR: &str = "backup";
@@ -73,6 +75,344 @@ pub struct CandidateSource<'a> {
     pub catalog: &'a Path,
     pub signature: &'a Path,
     pub archive: &'a Path,
+    /// The sequence floor the application persisted before it made the
+    /// candidate Ready, kept outside the install's coordination directory (a
+    /// protected install cannot be written before the user consents). When
+    /// given, [`stage_candidate`] carries it into the coordination receipts,
+    /// which is where the helper re-reads it.
+    pub seen: Option<&'a Path>,
+}
+
+/// Carries the application's sequence floor into the coordination receipts.
+/// The floor never goes down: a higher stored floor stays, and the same
+/// sequence with different catalog bytes is a conflict. A missing or invalid
+/// source is a refusal, never "no floor".
+fn seed_seen_receipt(coordination: &Coordination, source: &Path) -> Result<()> {
+    let unwritable = |what: &str, err: UpdateError| {
+        UpdateError::new(
+            ErrorCode::ReceiptUnwritable,
+            format!("the catalog sequence receipt {what}: {err}"),
+        )
+    };
+    let carried = FileSeenStore::new(source.to_path_buf())
+        .load()
+        .map_err(|err| unwritable("cannot be read", err))?
+        .ok_or_else(|| {
+            UpdateError::new(ErrorCode::NotFound, "the application's catalog sequence receipt is missing")
+        })?;
+    carried.validate()?;
+    let path = coordination.seen_catalog_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| unwritable("cannot be created", UpdateError::from(err)))?;
+    }
+    let mut store = FileSeenStore::new(path);
+    let _guard = store.lock().map_err(|err| unwritable("cannot be locked", err))?;
+    if let Some(existing) = store.load().map_err(|err| unwritable("cannot be read", err))? {
+        existing.validate()?;
+        if existing.sequence > carried.sequence {
+            return Ok(());
+        }
+        if existing.sequence == carried.sequence {
+            if existing.catalog_sha256 != carried.catalog_sha256 {
+                return Err(UpdateError::new(
+                    ErrorCode::SequenceConflict,
+                    "same catalog sequence with different bytes",
+                ));
+            }
+            return Ok(());
+        }
+    }
+    store
+        .store(&SeenCatalog::new(carried.sequence, carried.catalog_sha256))
+        .map_err(|err| unwritable("cannot be stored", err))
+}
+
+/// Records where the application keeps its own sequence receipt, so the helper
+/// can re-read it under the runtime lease. The helper only ever reads it, and
+/// only ever raises its own floor from it (a refusal), never lowers anything.
+fn record_seen_source(candidate_dir: &Path, source: &Path) -> Result<()> {
+    let text = source.to_str().ok_or_else(|| {
+        UpdateError::new(ErrorCode::ReceiptUnwritable, "the sequence receipt path is not valid text")
+    })?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(candidate_dir.join(CANDIDATE_SEEN_SOURCE))?;
+    io::Write::write_all(&mut output, text.as_bytes())?;
+    output.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the OS-derived state root in tests.
+    static TRUSTED_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Fixes the state root the helper trusts in a test.
+#[cfg(test)]
+pub(crate) fn set_trusted_state_root(root: Option<PathBuf>) {
+    TRUSTED_ROOT.with(|slot| *slot.borrow_mut() = root);
+}
+
+/// The one state root this helper may derive the application's receipt from:
+/// the default state directory of the helper's own account, taken from the OS
+/// (known folder of the process token). Nothing the requesting side can write
+/// (candidate directory, `state-root.binding`, environment) takes part. A
+/// custom `HANE_STATE_DIR` therefore cannot be verified here and is refused
+/// rather than replaced by another profile's directory.
+fn trusted_state_root() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TRUSTED_ROOT.with(|slot| slot.borrow().clone()) {
+        return Ok(root);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::own_local_app_data().map(|dir| dir.join("Hane"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::own_home_dir().map(|dir| dir.join("Library").join("Application Support").join("Hane"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the trusted state root of the account is not available on this platform",
+        ))
+    }
+}
+
+fn receipt_io(err: io::Error, what: &str) -> UpdateError {
+    if err.kind() == io::ErrorKind::NotFound {
+        UpdateError::new(ErrorCode::NotFound, format!("{what} is missing"))
+    } else {
+        UpdateError::new(ErrorCode::ReceiptUnwritable, format!("{what} cannot be opened: {err}"))
+    }
+}
+
+/// Opens without following a final link. Directories are opened with a share
+/// mode that forbids rename and delete on Windows, so a pinned directory (and
+/// with it every parent) cannot be replaced while the handle lives.
+fn no_follow(options: &mut OpenOptions, directory: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        if directory {
+            flags |= libc::O_DIRECTORY;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        if directory {
+            options
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .share_mode(FILE_SHARE_READ);
+        } else {
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (options, directory);
+}
+
+/// The opened object must be the entry the path names now. Windows relies on
+/// the pinned parents (no rename or replace while they are open); POSIX also
+/// compares device and inode.
+#[cfg(unix)]
+fn same_object(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the application's receipt location changed while it was being checked",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn same_object(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Opens a plain owned directory and keeps the handle: the object that was
+/// checked is the one that stays in place.
+fn pin_dir(path: &Path, what: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options, true);
+    let dir = options.open(path).map_err(|err| receipt_io(err, what))?;
+    if !dir.metadata()?.is_dir() {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, format!("{what} is not a plain directory")));
+    }
+    crate::platform::acl::verify(path, true)?;
+    same_object(&dir, path)?;
+    Ok(dir)
+}
+
+/// Opens an existing plain owned file for the life of the handle; nothing is
+/// created.
+fn pin_file(path: &Path, what: &str, write: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    no_follow(&mut options, false);
+    let file = options.open(path).map_err(|err| receipt_io(err, what))?;
+    if !file.metadata()?.is_file() {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, format!("{what} is not a plain file")));
+    }
+    crate::platform::acl::verify(path, false)?;
+    same_object(&file, path)?;
+    Ok(file)
+}
+
+/// The application's receipt as the helper holds it: the directories down to
+/// it stay pinned, its lock file is locked through the handle that was
+/// checked, and the receipt is read through the handle that was checked. Drop
+/// releases everything.
+struct PinnedReceipt {
+    receipt: File,
+    _lock: File,
+    _dirs: Vec<File>,
+}
+
+/// Helper side: the application's receipt location derived without trusting
+/// the candidate directory or the binding: `<state root>/updates/<install
+/// id>/receipts/` below the account's own trusted state root.
+fn expected_user_receipt(coordination: &Coordination) -> Result<(PathBuf, PathBuf)> {
+    expected_user_receipt_for(coordination.install_id())
+}
+
+/// The same derivation from the install id alone, so the application can run it
+/// before any coordination directory exists. Reads only; nothing is created.
+fn expected_user_receipt_for(install_id: &InstallId) -> Result<(PathBuf, PathBuf)> {
+    let root = trusted_state_root()?;
+    if !root.is_absolute() {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, "the trusted state root is not absolute"));
+    }
+    let receipts = root.join("updates").join(install_id.as_str()).join("receipts");
+    let receipt = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
+    Ok((root, receipt))
+}
+
+/// Application side, before the helper is started: refuses a sequence receipt
+/// that is not the one the helper will derive from the OS account (custom
+/// `HANE_STATE_DIR`, or a `LOCALAPPDATA` that differs from the known folder).
+/// The helper would reject it at apply time, after the application was allowed
+/// to quit; detecting it here keeps the running application open. Only reads
+/// the OS-derived path; nothing is opened or written.
+pub fn ensure_receipt_matches_trusted_root(install_id: &InstallId, seen: &Path) -> Result<()> {
+    let (_, expected) = expected_user_receipt_for(install_id)?;
+    if seen != expected {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            format!(
+                "the application's state root differs from the account's default state root, so the update helper cannot verify the sequence receipt (application: {}, helper: {})",
+                seen.display(),
+                expected.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Pins the chain from the trusted root down to the receipt (every directory
+/// must be plain, owned and closed to other writers; the lock file and the
+/// receipt must already exist) and takes the lock. A parent or file replaced
+/// by a link or another object is refused, never followed.
+fn open_pinned_receipt(root: &Path, receipt: &Path) -> Result<PinnedReceipt> {
+    let receipts = receipt
+        .parent()
+        .ok_or_else(|| UpdateError::new(ErrorCode::IdentityMismatch, "malformed receipt location"))?;
+    let install = receipts.parent().ok_or_else(|| UpdateError::new(ErrorCode::IdentityMismatch, "malformed receipt location"))?;
+    let updates = install.parent().ok_or_else(|| UpdateError::new(ErrorCode::IdentityMismatch, "malformed receipt location"))?;
+    let mut dirs = Vec::with_capacity(4);
+    for dir in [root, updates, install, receipts] {
+        dirs.push(pin_dir(dir, "the application's receipt directory")?);
+    }
+    let lock = pin_file(&receipt.with_extension("lock"), "the catalog sequence receipt lock", true)?;
+    lock.lock().map_err(|err| {
+        UpdateError::new(
+            ErrorCode::ReceiptUnwritable,
+            format!("the catalog sequence receipt cannot be locked: {err}"),
+        )
+    })?;
+    let file = pin_file(receipt, "the application's catalog sequence receipt", false)?;
+    Ok(PinnedReceipt { receipt: file, _lock: lock, _dirs: dirs })
+}
+
+fn read_pinned_receipt(pinned: &PinnedReceipt) -> Result<SeenCatalog> {
+    let mut data = Vec::new();
+    (&pinned.receipt)
+        .take(crate::limits::MAX_JOURNAL_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|err| {
+            UpdateError::new(
+                ErrorCode::ReceiptUnwritable,
+                format!("the catalog sequence receipt cannot be read: {err}"),
+            )
+        })?;
+    if data.len() as u64 > crate::limits::MAX_JOURNAL_BYTES {
+        return Err(UpdateError::new(ErrorCode::LimitExceeded, "the catalog sequence receipt is too large"));
+    }
+    let seen: SeenCatalog = crate::util::parse_strict(&data)?;
+    seen.validate()?;
+    Ok(seen)
+}
+
+/// Helper side: re-reads the application's receipt now and returns the
+/// effective floor, the higher of it and `coordination_floor`. The returned
+/// guard holds the receipt's cross-process lock; the caller keeps it until the
+/// first install mutation, so no service can record a higher sequence between
+/// this check and the mutation. A candidate that declared a receipt but whose
+/// receipt is missing, corrupt, unlockable or in conflict is refused.
+pub(crate) fn reconfirm_user_floor(
+    coordination: &Coordination,
+    candidate_dir: &Path,
+    coordination_floor: SeenCatalog,
+) -> Result<(SeenCatalog, Option<Box<dyn Send>>)> {
+    let Some(raw) = read_limited(&candidate_dir.join(CANDIDATE_SEEN_SOURCE), 4096)? else {
+        return Ok((coordination_floor, None));
+    };
+    let declared = String::from_utf8(raw)
+        .map(PathBuf::from)
+        .map_err(|_| UpdateError::new(ErrorCode::ReceiptUnwritable, "the sequence receipt path is not valid text"))?;
+    // The candidate directory is user-writable, so the declared path is only a
+    // claim. The one location this (possibly elevated) helper opens or locks is
+    // derived from the OS profile of its own account; anything else is refused
+    // before any path is opened.
+    let (root, path) = expected_user_receipt(coordination)?;
+    if declared != path {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the declared sequence receipt is not the application's receipt location",
+        ));
+    }
+    let pinned = open_pinned_receipt(&root, &path)?;
+    let user = read_pinned_receipt(&pinned)?;
+    let guard: Box<dyn Send> = Box::new(pinned);
+    let effective = if user.sequence > coordination_floor.sequence {
+        user
+    } else if user.sequence == coordination_floor.sequence {
+        if user.catalog_sha256 != coordination_floor.catalog_sha256 {
+            return Err(UpdateError::new(
+                ErrorCode::SequenceConflict,
+                "same catalog sequence with different bytes",
+            ));
+        }
+        coordination_floor
+    } else {
+        coordination_floor
+    };
+    Ok((effective, Some(guard)))
 }
 
 fn copy_regular(source: &Path, dest: &Path, limit: u64) -> Result<()> {
@@ -116,7 +456,12 @@ pub fn stage_candidate(
         .and_then(|()| {
             copy_regular(source.signature, &dir.join(CANDIDATE_SIGNATURE), MAX_SIGNATURE_BYTES)
         })
-        .and_then(|()| copy_regular(source.archive, &dir.join(CANDIDATE_ARCHIVE), MAX_ARCHIVE_BYTES));
+        .and_then(|()| copy_regular(source.archive, &dir.join(CANDIDATE_ARCHIVE), MAX_ARCHIVE_BYTES))
+        .and_then(|()| {
+            source.seen.map_or(Ok(()), |seen| {
+                seed_seen_receipt(coordination, seen).and_then(|()| record_seen_source(&dir, seen))
+            })
+        });
     if let Err(err) = copied {
         let _ = fs::remove_dir_all(&dir);
         return Err(err);
@@ -243,7 +588,11 @@ fn read_installed_inventory(root: &Path, policy: &TrustPolicy) -> Result<SignedI
 /// Independently re-verifies placement, install, candidate and archive, stages
 /// the archive and builds the plan from the two signed inventories. Nothing in
 /// the install is changed.
-fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
+///
+/// The returned guard (when the candidate declared the application's receipt)
+/// keeps the sequence floor from advancing; the caller holds it until the first
+/// install mutation.
+fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<(ApplyPlan, Option<Box<dyn Send>>)> {
     let coordination = inputs.coordination;
     let placement = inputs.placement;
     if placement.target != Target::WindowsX64 {
@@ -301,6 +650,10 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
         .ok_or_else(|| {
             UpdateError::new(ErrorCode::NotFound, "the catalog sequence receipt is missing")
         })?;
+    // The application's own receipt is re-read last and its lock is kept: a
+    // service that recorded a higher sequence after the candidate was staged
+    // raises the effective floor here, and none can after this point.
+    let (seen, floor_guard) = reconfirm_user_floor(coordination, &candidate_dir, seen)?;
     let candidate = verify_catalog(
         &catalog,
         &signature,
@@ -336,6 +689,14 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
         ));
     }
     let stage = txn_dir.join(STAGE_DIR);
+    // The user can write the transaction directory, while this code may run
+    // elevated. Every directory from the coordination directory down to the
+    // stage is held open (Windows) before anything is created beneath it and
+    // until the apply ends, so none can be swapped for a junction and the
+    // extraction and the later reads resolve inside the real stage. A chain
+    // that cannot be pinned refuses the apply.
+    let mut hold = StageHold::default();
+    hold.pin_chain(coordination.dir(), &txn_dir)?;
     match fs::create_dir(&stage) {
         Ok(()) => {}
         // An existing stage is accepted only if it is empty; the extractor
@@ -344,7 +705,9 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
         Err(err) => return Err(err.into()),
     }
     let mut archive = File::open(&archive_path)?;
-    let inspected = stage_archive(&mut archive, &candidate, inputs.policy, &ArchiveLimits::default(), &stage)?;
+    let (inspected, stage_pins) =
+        stage_archive_held(&mut archive, &candidate, inputs.policy, &ArchiveLimits::default(), &stage)?;
+    hold.pins.extend(stage_pins);
     drop(archive);
     let new_inventory = inspected.inventory.ok_or_else(|| {
         UpdateError::new(ErrorCode::ArchiveRejected, "the archive carries no signed inventory")
@@ -358,7 +721,51 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
         &candidate,
     )?;
     check_plan_preconditions(&plan, &FsDiskView::new(&placement.install_root))?;
-    Ok(plan)
+    hold.floor = floor_guard;
+    Ok((plan, Some(Box::new(hold))))
+}
+
+/// What `verify_and_plan` keeps alive until the apply ends: the sequence-floor
+/// guard and the directory handles that fix the transaction chain and the
+/// staged tree (Windows).
+#[derive(Default)]
+struct StageHold {
+    floor: Option<Box<dyn Send>>,
+    pins: Vec<PinnedDir>,
+}
+
+impl StageHold {
+    /// Pins `anchor` and every directory beneath it down to `leaf`, outermost
+    /// first. `leaf` must be inside `anchor`.
+    #[cfg_attr(not(windows), allow(unused_variables, reason = "only Windows pins directories"))]
+    fn pin_chain(&mut self, anchor: &Path, leaf: &Path) -> Result<()> {
+        if !leaf.starts_with(anchor) {
+            return Err(UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "the transaction directory is not inside the coordination directory",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let mut chain: Vec<&Path> = Vec::new();
+            for dir in leaf.ancestors() {
+                chain.push(dir);
+                if dir == anchor {
+                    break;
+                }
+            }
+            for dir in chain.into_iter().rev() {
+                let pin = PinnedDir::open(dir)?.ok_or_else(|| {
+                    UpdateError::new(
+                        ErrorCode::InstallModified,
+                        format!("{} vanished while it was being checked", dir.display()),
+                    )
+                })?;
+                self.pins.push(pin);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Files replaced and awaiting a health verdict.
@@ -384,7 +791,9 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
             "the application process is still running",
         ));
     }
-    let plan = verify_and_plan(inputs)?;
+    // `_floor_guard` lives until this function returns, which is after the
+    // first install mutation.
+    let (plan, _floor_guard) = verify_and_plan(inputs)?;
     // Before the receipts are retired, the backup directory exists or any
     // journal is written: a refusal here leaves the install untouched.
     ensure_free_space(inputs, &plan)?;
@@ -400,16 +809,12 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     crate::startup::retire_prior_receipts(inputs.coordination, inputs.transaction)?;
     let txn_dir = inputs.coordination.transaction_dir(inputs.transaction);
     let backup = txn_dir.join(BACKUP_DIR);
-    fs::create_dir_all(&backup)?;
-
-    let journal = UpdateJournal::begin(&plan, None)?;
-    let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
-    let mut journal = DurableJournal::create(store, journal)?;
     let ops = FsFileOps::new(
         inputs.placement.install_root.clone(),
         backup,
         txn_dir.join(STAGE_DIR),
     )
+    .with_backup_anchor(inputs.coordination.dir().to_path_buf())
     .with_unchanged(
         plan.unchanged
             .iter()
@@ -419,6 +824,18 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     #[cfg(windows)]
     let ops = ops.with_scratch_ledger(inputs.coordination, inputs.transaction);
     let mut ops = ops;
+    // The backup area is where an elevated helper writes and restores from. It
+    // is created and pinned through the verified coordination chain; a link or
+    // reparse point anywhere on it refuses the apply before any journal exists.
+    ops.prepare_backup_area()?;
+
+    let journal = UpdateJournal::begin(&plan, None)?;
+    // A protected placement's recovery plan is sealed in the protected
+    // coordination parent before the journal exists and before any mutation: an
+    // elevated recovery trusts that seal, never the user-writable journal alone.
+    crate::recovery_seal::seal_if_protected(inputs.coordination, &journal)?;
+    let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
+    let mut journal = DurableJournal::create(store, journal)?;
     // Before the first install mutation: bind the original identities outside
     // the inventory, so an interrupted update or a moved install still reaches
     // this transaction's journal at startup. Without it nothing is mutated.
@@ -662,6 +1079,7 @@ mod tests {
                 catalog: &ready.join("c"),
                 signature: &ready.join("s"),
                 archive: &ready.join("a"),
+                seen: None,
             },
         )
         .unwrap();
@@ -763,6 +1181,60 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stage_replaced_by_a_junction_is_refused_and_nothing_is_written_outside() {
+        let fx = fixture();
+        let txn_dir = fx.coordination.transaction_dir(&fx.transaction);
+        let outside = crate::testing::TempDir::new("stage-junction-outside");
+        let stage = txn_dir.join(STAGE_DIR);
+        assert!(!stage.exists(), "the fixture must not have a stage yet");
+        assert!(make_junction(&stage, outside.path()));
+
+        let err = apply_owned_files(&fx.inputs()).err().unwrap();
+        assert_ne!(err.code, ErrorCode::Io, "{err:?}");
+        assert_eq!(
+            fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "the extraction wrote through the junction"
+        );
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_stage_and_its_ancestors_cannot_be_swapped_while_the_apply_holds_them() {
+        let fx = fixture();
+        let txn_dir = fx.coordination.transaction_dir(&fx.transaction);
+        let (_plan, hold) = verify_and_plan(&fx.inputs()).unwrap();
+        let outside = crate::testing::TempDir::new("stage-swap-outside");
+        let stage = txn_dir.join(STAGE_DIR);
+
+        // The unprivileged side tries to move the stage, a staged directory's
+        // parent and the transaction directory away to put a junction in place.
+        for victim in [stage.clone(), txn_dir.clone()] {
+            let moved = victim.with_file_name(format!(
+                "{}-moved",
+                victim.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(fs::rename(&victim, &moved).is_err(), "{victim:?} could be renamed");
+            assert!(!make_junction(&victim, outside.path()));
+        }
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        drop(hold);
+    }
+
     #[test]
     fn too_little_free_space_refuses_before_any_mutation() {
         for available in [Some(0), Some(JOURNAL_RESERVE_BYTES), Some(JOURNAL_RESERVE_BYTES + 1), None] {
@@ -797,7 +1269,7 @@ mod tests {
     /// backups, the largest copy and the reserve were counted.
     fn plan_requirement() -> PlanRequirement {
         let fx = fixture();
-        let plan = verify_and_plan(&fx.inputs()).unwrap();
+        let (plan, _guard) = verify_and_plan(&fx.inputs()).unwrap();
         let mut backups = 0_u64;
         let mut largest = 0_u64;
         for step in &plan.steps {
@@ -1156,6 +1628,355 @@ mod tests {
         assert!(apply_owned_files(&fx.inputs()).is_ok());
     }
 
+    /// Declares the application's own receipt for the fixture's staged
+    /// candidate, as `stage_candidate` does when given a `seen` path.
+    fn declare_user_receipt(fx: &Fixture) -> PathBuf {
+        let root = fx.placement.coordination_parent.join("state");
+        let receipts = root.join("updates").join(fx.placement.install_id.as_str()).join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        let mut dir = receipts.clone();
+        while dir != root.parent().unwrap() {
+            crate::platform::acl::secure_new(&dir, true, 0o700).unwrap();
+            dir.pop();
+        }
+        crate::state_root::publish_binding(&fx.coordination, &fx.transaction, &root).unwrap();
+        set_trusted_state_root(Some(root.clone()));
+        let path = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
+        let ready = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
+        let mut store = FileSeenStore::new(path.clone());
+        store.store(&ready).unwrap();
+        // The application's own writer has created the lock file by now; the
+        // helper never creates it.
+        drop(store.lock().unwrap());
+        let dir = fx.coordination.transaction_dir(&fx.transaction).join(CANDIDATE_DIR);
+        record_seen_source(&dir, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn receipt_outside_the_trusted_root_is_refused_before_the_helper_starts() {
+        let fx = fixture();
+        let matching = declare_user_receipt(&fx);
+        assert!(ensure_receipt_matches_trusted_root(&fx.placement.install_id, &matching).is_ok());
+
+        let custom = fx
+            .placement
+            .coordination_parent
+            .join("custom-state")
+            .join("updates")
+            .join(fx.placement.install_id.as_str())
+            .join("receipts")
+            .join(crate::platform::lease::SEEN_CATALOG_FILE);
+        let err = ensure_receipt_matches_trusted_root(&fx.placement.install_id, &custom).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert!(err.detail.contains("custom-state"));
+        set_trusted_state_root(None);
+    }
+
+    #[test]
+    fn the_pre_check_does_not_create_the_coordination_directory() {
+        let fx = fixture();
+        let matching = declare_user_receipt(&fx);
+        let coordination_dir = fx
+            .placement
+            .coordination_parent
+            .join(fx.placement.install_id.coordination_dir_name());
+        fs::remove_dir_all(&coordination_dir).unwrap();
+
+        assert!(ensure_receipt_matches_trusted_root(&fx.placement.install_id, &matching).is_ok());
+        assert!(!coordination_dir.exists());
+
+        let custom = fx.placement.coordination_parent.join("custom-state").join("seen.json");
+        assert!(ensure_receipt_matches_trusted_root(&fx.placement.install_id, &custom).is_err());
+        assert!(!coordination_dir.exists());
+        set_trusted_state_root(None);
+    }
+
+    /// Free-space query that runs after the helper re-read and locked the
+    /// application's receipt and before the first install mutation. On its
+    /// first call it proves the lock is held and starts a competing writer that
+    /// reports what the install looked like when it finally got the lock.
+    struct CompetingWriterProbe {
+        available: u64,
+        user_receipt: PathBuf,
+        install_root: PathBuf,
+        before: BTreeMap<String, Vec<u8>>,
+        journal_path: PathBuf,
+        started: Cell<bool>,
+        /// `(journal exists, install unchanged)` seen by the writer on locking.
+        observed: RefCell<Option<std::sync::mpsc::Receiver<(bool, bool)>>>,
+    }
+
+    impl FreeSpace for CompetingWriterProbe {
+        fn available_bytes(&self, _path: &Path) -> Result<u64> {
+            if !self.started.replace(true) {
+                let lock_path = self.user_receipt.with_extension("lock");
+                let probe = OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
+                assert!(
+                    matches!(probe.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                    "the helper must hold the application receipt lock before the first mutation"
+                );
+                drop(probe);
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (receipt, root, before, journal) = (
+                    self.user_receipt.clone(),
+                    self.install_root.clone(),
+                    self.before.clone(),
+                    self.journal_path.clone(),
+                );
+                std::thread::spawn(move || {
+                    let store = FileSeenStore::new(receipt);
+                    let _lock = store.lock().unwrap();
+                    let _ = tx.send((journal.exists(), snapshot(&root) == before));
+                });
+                // The writer is waiting for the lock: it must not get in while
+                // the helper is still before its first mutation.
+                assert!(
+                    matches!(
+                        rx.recv_timeout(Duration::from_millis(300)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "a competing writer got the sequence lock before the install was mutated"
+                );
+                *self.observed.borrow_mut() = Some(rx);
+            }
+            Ok(self.available)
+        }
+    }
+
+    fn competing_writer_probe(fx: &Fixture, user_receipt: PathBuf, available: u64) -> CompetingWriterProbe {
+        CompetingWriterProbe {
+            available,
+            user_receipt,
+            install_root: fx.placement.install_root.clone(),
+            before: fx.before.clone(),
+            journal_path: fx.journal_path(),
+            started: Cell::new(false),
+            observed: RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn a_competing_writer_waits_for_the_lock_until_the_install_is_mutated() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let probe = competing_writer_probe(&fx, user, u64::MAX);
+        let mut inputs = fx.inputs();
+        inputs.free_space = &probe;
+        let applied = apply_owned_files(&inputs).unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+        drop(applied);
+
+        let rx = probe.observed.borrow_mut().take().expect("the probe ran under the lock");
+        let (journal_exists, install_unchanged) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(journal_exists, "the writer got the lock before the journal existed");
+        assert!(!install_unchanged, "the writer got the lock before the install was mutated");
+    }
+
+    #[test]
+    fn a_refused_apply_keeps_the_lock_and_leaves_install_and_journal_untouched() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let probe = competing_writer_probe(&fx, user, 0);
+        let mut inputs = fx.inputs();
+        inputs.free_space = &probe;
+        assert_eq!(apply_owned_files(&inputs).err().unwrap().code, ErrorCode::InsufficientSpace);
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+
+        // The writer only proceeds once the refused apply released the lock,
+        // and finds the install and journal as they were.
+        let rx = probe.observed.borrow_mut().take().expect("the probe ran under the lock");
+        let (journal_exists, install_unchanged) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!journal_exists);
+        assert!(install_unchanged);
+    }
+
+    #[test]
+    fn a_floor_recorded_in_the_user_receipt_after_staging_rejects_the_candidate() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        // Another service records a higher sequence after the candidate was
+        // staged: only the application's receipt moves.
+        FileSeenStore::new(user).store(&SeenCatalog::new(3, "b".repeat(64))).unwrap();
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::SequenceRegression
+        );
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[test]
+    fn the_user_receipt_with_other_bytes_for_the_same_sequence_is_rejected() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        FileSeenStore::new(user).store(&SeenCatalog::new(2, "b".repeat(64))).unwrap();
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::SequenceConflict
+        );
+        assert!(fx.unchanged());
+    }
+
+    #[test]
+    fn a_declared_but_missing_or_corrupt_user_receipt_fails_closed() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::remove_file(&user).unwrap();
+        assert_eq!(apply_owned_files(&fx.inputs()).err().unwrap().code, ErrorCode::NotFound);
+        assert!(fx.unchanged());
+
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::write(&user, b"{not json").unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[test]
+    fn a_tampered_receipt_path_is_refused_before_anything_is_opened_or_created() {
+        let fx = fixture();
+        let genuine = declare_user_receipt(&fx);
+        let marker = fx.candidate_file(CANDIDATE_SEEN_SOURCE);
+
+        // An absolute path elsewhere, with a valid-looking receipt, and one in a
+        // directory that does not exist (the lock file would create it).
+        let elsewhere = fx.placement.coordination_parent.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let forged = elsewhere.join("seen-catalog.json");
+        let ready = FileSeenStore::new(genuine.clone()).load().unwrap().unwrap();
+        FileSeenStore::new(forged.clone()).store(&ready).unwrap();
+        let missing_parent = fx.placement.coordination_parent.join("nowhere").join("seen-catalog.json");
+        let relative = PathBuf::from("seen-catalog.json");
+        let dotted = genuine.parent().unwrap().join("..").join("receipts").join("seen-catalog.json");
+
+        for bad in [forged.clone(), missing_parent.clone(), relative, dotted] {
+            fs::write(&marker, bad.to_str().unwrap()).unwrap();
+            assert_eq!(
+                apply_owned_files(&fx.inputs()).err().unwrap().code,
+                ErrorCode::IdentityMismatch,
+                "{bad:?}"
+            );
+            assert!(fx.unchanged());
+            assert!(!fx.journal_path().exists());
+            assert!(!forged.with_extension("lock").exists());
+            assert!(!missing_parent.parent().unwrap().exists());
+        }
+
+        // The genuine location still applies.
+        fs::write(&marker, genuine.to_str().unwrap()).unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+    }
+
+    #[test]
+    fn the_binding_and_the_candidate_claim_are_not_a_source_of_authority() {
+        // Neither a removed nor a rewritten binding changes where the helper
+        // looks: the receipt location comes from the account's own root.
+        let fx = fixture();
+        let genuine = declare_user_receipt(&fx);
+        crate::state_root::discard_binding(&fx.coordination, &fx.transaction);
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+
+        let fx = fixture();
+        let genuine_again = declare_user_receipt(&fx);
+        let elsewhere = fx.placement.coordination_parent.join("elsewhere-state");
+        let receipts = elsewhere
+            .join("updates")
+            .join(fx.placement.install_id.as_str())
+            .join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        let mut dir = receipts.clone();
+        while dir != elsewhere.parent().unwrap() {
+            crate::platform::acl::secure_new(&dir, true, 0o700).unwrap();
+            dir.pop();
+        }
+        let forged = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
+        let ready = FileSeenStore::new(genuine_again.clone()).load().unwrap().unwrap();
+        FileSeenStore::new(forged.clone()).store(&ready).unwrap();
+        // Rebind to the other root and point the claim at its receipt.
+        crate::state_root::publish_binding(&fx.coordination, &fx.transaction, &elsewhere).unwrap();
+        fs::write(fx.candidate_file(CANDIDATE_SEEN_SOURCE), forged.to_str().unwrap()).unwrap();
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::IdentityMismatch
+        );
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+        assert!(!forged.with_extension("lock").exists());
+        let _ = genuine;
+    }
+
+    #[test]
+    fn an_untrusted_state_root_refuses_the_declared_receipt() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        set_trusted_state_root(None);
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+        let _ = user;
+    }
+
+    #[test]
+    fn a_missing_lock_file_is_not_created_by_the_helper() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::remove_file(user.with_extension("lock")).unwrap();
+        assert_eq!(apply_owned_files(&fx.inputs()).err().unwrap().code, ErrorCode::NotFound);
+        assert!(!user.with_extension("lock").exists());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_directory_replaced_by_a_link_is_not_followed() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let receipts = user.parent().unwrap().to_path_buf();
+        // A different directory with a complete, valid-looking receipt and lock.
+        let other = fx.placement.coordination_parent.join("swapped");
+        fs::create_dir_all(&other).unwrap();
+        crate::platform::acl::secure_new(&other, true, 0o700).unwrap();
+        let ready = FileSeenStore::new(user.clone()).load().unwrap().unwrap();
+        let mut store = FileSeenStore::new(other.join(crate::platform::lease::SEEN_CATALOG_FILE));
+        store.store(&ready).unwrap();
+        drop(store.lock().unwrap());
+        let moved = receipts.with_file_name("receipts-real");
+        fs::rename(&receipts, &moved).unwrap();
+        std::os::unix::fs::symlink(&other, &receipts).unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+        // The lock of the swapped-in directory was never taken or created anew.
+        assert!(other.join("seen-catalog.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_replaced_by_a_link_is_not_followed() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let target = fx.placement.coordination_parent.join("linked-receipt.json");
+        let ready = FileSeenStore::new(user.clone()).load().unwrap().unwrap();
+        FileSeenStore::new(target.clone()).store(&ready).unwrap();
+        fs::remove_file(&user).unwrap();
+        std::os::unix::fs::symlink(&target, &user).unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[test]
+    fn an_unchanged_user_receipt_still_applies() {
+        let fx = fixture();
+        declare_user_receipt(&fx);
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+    }
+
     #[test]
     fn a_lower_floor_still_allows_the_candidate() {
         let fx = fixture();
@@ -1199,10 +2020,71 @@ mod tests {
                 catalog: &nowhere,
                 signature: &nowhere,
                 archive: &nowhere,
+                seen: None,
             },
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Io);
         assert!(!fx.coordination.transaction_dir(&other).join(CANDIDATE_DIR).exists());
+    }
+
+    #[test]
+    fn staging_carries_the_applications_floor_into_the_coordination_receipts() {
+        let fx = fixture();
+        let scratch = TempDir::new("windows-apply-seed");
+        let ready = scratch.path();
+        for name in ["c", "s", "a"] {
+            fs::write(ready.join(name), b"x").unwrap();
+        }
+        let hash = "a".repeat(64);
+        let user_floor = ready.join("seen-catalog.json");
+        FileSeenStore::new(user_floor.clone())
+            .store(&SeenCatalog::new(9, hash.clone()))
+            .unwrap();
+        // A protected install has no receipts directory until the helper's
+        // bootstrap; the carried floor creates it.
+        fs::remove_dir_all(fx.coordination.dir().join(crate::platform::lease::RECEIPTS_DIR)).unwrap();
+        let stage = |txn: &TransactionId, seen: Option<&Path>| {
+            fx.coordination.ensure_helper_dir(txn).unwrap();
+            stage_candidate(
+                &fx.coordination,
+                txn,
+                &CandidateSource {
+                    catalog: &ready.join("c"),
+                    signature: &ready.join("s"),
+                    archive: &ready.join("a"),
+                    seen,
+                },
+            )
+        };
+
+        let first = TransactionId::generate().unwrap();
+        stage(&first, Some(&user_floor)).unwrap();
+        let stored = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
+        assert_eq!((stored.sequence, stored.catalog_sha256.as_str()), (9, hash.as_str()));
+
+        // A lower carried floor never lowers the stored one.
+        FileSeenStore::new(user_floor.clone())
+            .store(&SeenCatalog::new(3, "b".repeat(64)))
+            .unwrap();
+        let second = TransactionId::generate().unwrap();
+        stage(&second, Some(&user_floor)).unwrap();
+        let stored = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
+        assert_eq!(stored.sequence, 9);
+
+        // The same sequence with other bytes is refused and leaves no candidate.
+        FileSeenStore::new(user_floor.clone())
+            .store(&SeenCatalog::new(9, "c".repeat(64)))
+            .unwrap();
+        let third = TransactionId::generate().unwrap();
+        let err = stage(&third, Some(&user_floor)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceConflict);
+        assert!(!fx.coordination.transaction_dir(&third).join(CANDIDATE_DIR).exists());
+
+        // A missing carried floor is a refusal, not "no floor".
+        let fourth = TransactionId::generate().unwrap();
+        let err = stage(&fourth, Some(&ready.join("missing.json"))).unwrap_err();
+        assert!(matches!(err.code, ErrorCode::NotFound | ErrorCode::ReceiptUnwritable));
+        assert!(!fx.coordination.transaction_dir(&fourth).join(CANDIDATE_DIR).exists());
     }
 }

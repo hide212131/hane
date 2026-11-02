@@ -115,17 +115,117 @@ fn create_dir(path: &Path, _mode: u32) -> io::Result<()> {
 }
 
 fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
+    ensure_dir_as(path, mode, false)
+}
+
+/// [`ensure_dir`]. With `user_owned` the new directory is explicitly owned by
+/// the token's user SID, so a standard process of the same account that did not
+/// create it still passes the ownership check (an elevated creator would
+/// otherwise leave the Administrators group as owner).
+fn ensure_dir_as(path: &Path, mode: u32, user_owned: bool) -> Result<()> {
+    ensure_dir_pinned(path, mode, user_owned, None)
+}
+
+/// Directories of the elevated bootstrap, each pinned right after it is created
+/// (or adopted) as a non-reparse directory handle without delete sharing. While
+/// a pin lives its directory cannot be renamed, replaced by a junction or
+/// deleted, so every ACL change, copy and record written beneath it stays inside
+/// the chain the elevated helper created, even though the requesting user owns
+/// those directories. On other platforms nothing is pinned.
+#[derive(Default)]
+pub struct BootstrapPins {
+    #[cfg(windows)]
+    dirs: Vec<crate::pinned::PinnedDir>,
+}
+
+impl BootstrapPins {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(windows)]
+    fn pin(&mut self, path: &Path) -> Result<()> {
+        match crate::pinned::PinnedDir::open(path)? {
+            Some(dir) => {
+                self.dirs.push(dir);
+                Ok(())
+            }
+            None => Err(UpdateError::new(
+                ErrorCode::NotFound,
+                format!("{} vanished before it could be pinned", path.display()),
+            )),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn pin(&mut self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    /// Releases the newest pin, e.g. before the directory it holds is removed.
+    fn unpin_last(&mut self) {
+        #[cfg(windows)]
+        {
+            self.dirs.pop();
+        }
+    }
+
+    /// Keeps only the pins of the coordination and `private/` directories, so
+    /// the transaction directory below them can be removed again while the
+    /// chain above it stays bound.
+    pub fn keep_coordination_and_private(&mut self) {
+        #[cfg(windows)]
+        {
+            self.dirs.truncate(2);
+        }
+    }
+}
+
+fn ensure_dir_pinned(
+    path: &Path,
+    mode: u32,
+    user_owned: bool,
+    mut pins: Option<&mut BootstrapPins>,
+) -> Result<()> {
     match create_dir(path, mode) {
         Ok(()) => {
+            // Pin before anything else touches the new directory by path: a
+            // directory already swapped for a link is refused here, and the
+            // ACL change below then cannot be redirected.
+            if let Some(pins) = pins.as_deref_mut()
+                && let Err(err) = pins.pin(path)
+            {
+                let _ = fs::remove_dir(path);
+                return Err(err);
+            }
             // Restrict first, then confirm; a directory that cannot be made
             // private is removed so it is not left for a later adoption.
-            let secured = acl::secure_new(path, true, mode).and_then(|()| acl::verify(path, true));
+            let secured = if user_owned {
+                acl::secure_new_user_owned(path, true, mode).and_then(|()| acl::verify_user_owned(path, true))
+            } else {
+                acl::secure_new(path, true, mode).and_then(|()| acl::verify(path, true))
+            };
             if secured.is_err() {
+                if let Some(pins) = pins.as_deref_mut() {
+                    pins.unpin_last();
+                }
                 let _ = fs::remove_dir(path);
             }
             secured
         }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => require_plain_dir(path),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if let Some(pins) = pins.as_deref_mut() {
+                pins.pin(path)?;
+            }
+            let verified = require_plain_dir(path);
+            if verified.is_err()
+                && let Some(pins) = pins
+            {
+                pins.unpin_last();
+            }
+            verified
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -136,6 +236,26 @@ impl Coordination {
         let dir = parent.join(install_id.coordination_dir_name());
         // Readable by other users' launches; only the owner can write.
         ensure_dir(&dir, 0o755)?;
+        Ok(Self {
+            dir,
+            install_id: install_id.clone(),
+        })
+    }
+
+    /// [`Coordination::create`] for the elevated helper of a protected
+    /// placement. It runs only after consent and peer verification; the
+    /// directory is owned by the requesting user (not by the elevated token's
+    /// default owner) and closed to everybody else, so the same account's
+    /// standard application can continue to stage into it.
+    ///
+    /// The directory is pinned in `pins` as soon as it exists.
+    pub fn create_user_owned(
+        parent: &Path,
+        install_id: &InstallId,
+        pins: &mut BootstrapPins,
+    ) -> Result<Self> {
+        let dir = parent.join(install_id.coordination_dir_name());
+        ensure_dir_pinned(&dir, 0o755, true, Some(pins))?;
         Ok(Self {
             dir,
             install_id: install_id.clone(),
@@ -238,9 +358,13 @@ impl Coordination {
 
     /// `private/` exists with owner-only permission; created on first use.
     pub fn private_dir(&self) -> Result<PathBuf> {
+        self.private_dir_as(false, None)
+    }
+
+    fn private_dir_as(&self, user_owned: bool, pins: Option<&mut BootstrapPins>) -> Result<PathBuf> {
         require_plain_dir(&self.dir)?;
         let private = self.dir.join(PRIVATE_DIR);
-        ensure_dir(&private, 0o700)?;
+        ensure_dir_pinned(&private, 0o700, user_owned, pins)?;
         Ok(private)
     }
 
@@ -250,11 +374,32 @@ impl Coordination {
 
     /// `private/<TransactionId>/helper/`, owner-only, created on demand.
     pub fn ensure_helper_dir(&self, transaction: &TransactionId) -> Result<PathBuf> {
-        self.private_dir()?;
+        self.ensure_helper_dir_as(transaction, false, None)
+    }
+
+    /// [`Coordination::ensure_helper_dir`] with every new directory owned by
+    /// the requesting user (see [`Coordination::create_user_owned`]). Each
+    /// directory is pinned in `pins` right after it is created; the pins of
+    /// the coordination directory must already be there.
+    pub fn ensure_helper_dir_user_owned(
+        &self,
+        transaction: &TransactionId,
+        pins: &mut BootstrapPins,
+    ) -> Result<PathBuf> {
+        self.ensure_helper_dir_as(transaction, true, Some(pins))
+    }
+
+    fn ensure_helper_dir_as(
+        &self,
+        transaction: &TransactionId,
+        user_owned: bool,
+        mut pins: Option<&mut BootstrapPins>,
+    ) -> Result<PathBuf> {
+        self.private_dir_as(user_owned, pins.as_deref_mut())?;
         let txn_dir = self.transaction_dir(transaction);
-        ensure_dir(&txn_dir, 0o700)?;
+        ensure_dir_pinned(&txn_dir, 0o700, user_owned, pins.as_deref_mut())?;
         let helper = txn_dir.join(HELPER_DIR);
-        ensure_dir(&helper, 0o700)?;
+        ensure_dir_pinned(&helper, 0o700, user_owned, pins)?;
         Ok(helper)
     }
 
@@ -329,7 +474,11 @@ impl Coordination {
         }
         match options.open(&path) {
             Ok(file) => {
-                match acl::secure_new(&path, false, 0o644).and_then(|()| acl::verify(&path, false)) {
+                // The elevated helper and the standard process share this lock,
+                // so the owner is the user SID, not the elevated default owner.
+                match acl::secure_new_user_owned(&path, false, 0o644)
+                    .and_then(|()| acl::verify_user_owned(&path, false))
+                {
                     Ok(()) => Ok(file),
                     Err(err) => {
                         drop(file);

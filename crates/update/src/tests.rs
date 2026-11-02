@@ -1615,6 +1615,76 @@ fn extraction_does_not_enter_a_symlinked_stage() {
     assert_eq!(fs::read_dir(real.as_path()).unwrap().count(), 0);
 }
 
+#[cfg(windows)]
+fn make_stage_junction(link: &Path, target: &Path) -> bool {
+    std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// A failed extraction cleans up while the stage tree is still pinned: an
+/// attacker swapping a created directory for a junction during the cleanup
+/// cannot make the deletions land outside the stage.
+#[cfg(windows)]
+#[test]
+fn failed_extraction_cleanup_never_deletes_outside_the_stage() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fixture = fixture(default_payload(NEW_VERSION));
+    let sandbox = Sandbox::new();
+    let mut cursor = Cursor::new(fixture.release.zip.clone());
+    let mut inspected = crate::archive::inspect_archive(
+        &mut cursor,
+        &fixture.candidate,
+        &fixture.policy,
+        &ArchiveLimits::default(),
+    )
+    .unwrap();
+    // The last file fails its hash check after the earlier ones were created.
+    inspected
+        .entries
+        .iter_mut()
+        .rev()
+        .find(|e| !e.is_dir)
+        .unwrap()
+        .sha256 = "0".repeat(64);
+
+    let outside = sandbox.root.path().join("victim");
+    let sentinel_dir = outside.join(NEW_VERSION);
+    fs::create_dir_all(&sentinel_dir).unwrap();
+    let sentinel = sentinel_dir.join("hane_shell_extension.dll");
+    fs::write(&sentinel, b"sentinel").unwrap();
+
+    let stage_dir = sandbox.stage();
+    let stop = Arc::new(AtomicBool::new(false));
+    let attacker = {
+        let (stop, stage_dir, outside) = (stop.clone(), stage_dir.clone(), outside.clone());
+        std::thread::spawn(move || {
+            let target = stage_dir.join("shell-integration");
+            let moved = stage_dir.parent().unwrap().join("moved-away");
+            while !stop.load(Ordering::Relaxed) {
+                if target.is_dir() && fs::rename(&target, &moved).is_ok() {
+                    let _ = make_stage_junction(&target, &outside);
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    let result = crate::archive::extract_archive_held(&mut cursor, &inspected, &stage_dir);
+    stop.store(true, Ordering::Relaxed);
+    attacker.join().unwrap();
+
+    assert_eq!(code(result.map(drop)), ErrorCode::HashMismatch);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+    assert!(
+        !stage_dir.join("shell-integration").exists(),
+        "the failed extraction must be cleaned up completely"
+    );
+}
+
 fn mac_generation() -> String {
     format!("0.27.1-{}", "a".repeat(40))
 }

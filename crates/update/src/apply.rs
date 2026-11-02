@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::fsutil::{durable_write, hash_regular_file_under, read_limited};
+use crate::fsutil::{durable_write, hash_regular_file_under, is_link_like, read_limited};
 use crate::identity::FileIdentity;
 use crate::journal::{
     DiskView, DurableJournal, JournalStore, Observed, Phase, RecoveryDecision, RollbackAction,
@@ -468,6 +468,14 @@ pub struct FsFileOps {
     root: PathBuf,
     backup_root: PathBuf,
     stage_root: PathBuf,
+    /// The protected directory the backup area must sit beneath (the
+    /// coordination directory). Every directory from it down to `backup_root`
+    /// is checked for links and, on Windows, pinned.
+    backup_anchor: Option<PathBuf>,
+    /// Handles that keep the verified backup chain from being renamed or
+    /// replaced by a junction while this value lives (Windows).
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows pins directories"))]
+    backup_pins: std::sync::Mutex<Vec<PinnedDir>>,
     guard: Result<RootGuard>,
     /// The verified install file the next mutation is bound to (Windows).
     pinned: Option<(String, PinnedFile)>,
@@ -501,6 +509,8 @@ impl FsFileOps {
             root,
             backup_root,
             stage_root,
+            backup_anchor: None,
+            backup_pins: std::sync::Mutex::new(Vec::new()),
             guard,
             pinned: None,
             dir_pins: None,
@@ -510,6 +520,90 @@ impl FsFileOps {
             #[cfg(test)]
             before_mutation: None,
         }
+    }
+
+    /// Binds the backup area to the protected directory it must live beneath.
+    /// Without it only the backup directory itself is checked.
+    pub fn with_backup_anchor(mut self, anchor: PathBuf) -> Self {
+        self.backup_anchor = Some(anchor);
+        self
+    }
+
+    /// Creates (when missing) and secures the backup area. Fails closed when
+    /// any directory on the way is a link or reparse point.
+    pub fn prepare_backup_area(&mut self) -> Result<()> {
+        self.secure_backup_area(true)
+    }
+
+    /// The directories from the anchor (or just the backup root) down to the
+    /// backup root, outermost first.
+    fn backup_chain(&self) -> Result<Vec<PathBuf>> {
+        let mut chain = vec![self.backup_root.clone()];
+        if let Some(anchor) = &self.backup_anchor {
+            if !self.backup_root.starts_with(anchor) {
+                return Err(UpdateError::new(
+                    ErrorCode::IdentityMismatch,
+                    "the backup area is not inside the protected coordination directory",
+                ));
+            }
+            for dir in self.backup_root.ancestors().skip(1) {
+                chain.push(dir.to_path_buf());
+                if dir == anchor.as_path() {
+                    break;
+                }
+            }
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    /// Every backup read or write goes through a chain that is a real directory
+    /// at each level. On Windows each level is also held open without delete
+    /// sharing, so none can be swapped for a junction afterwards and the names
+    /// below resolve inside the protected area. A missing backup root is only
+    /// created when `create` is set.
+    fn secure_backup_area(&self, create: bool) -> Result<()> {
+        let chain = self.backup_chain()?;
+        let mut pins = self
+            .backup_pins
+            .lock()
+            .map_err(|_| UpdateError::new(ErrorCode::Io, "the backup area guard is poisoned"))?;
+        if !pins.is_empty() && pins.len() == chain.len() {
+            return Ok(());
+        }
+        pins.clear();
+        let last = chain.len() - 1;
+        for (index, dir) in chain.iter().enumerate() {
+            match std::fs::symlink_metadata(dir) {
+                Ok(meta) => {
+                    if is_link_like(&meta) || !meta.is_dir() {
+                        return Err(UpdateError::new(
+                            ErrorCode::InstallModified,
+                            format!("{} is not a plain directory", dir.display()),
+                        ));
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && index == last => {
+                    if !create {
+                        pins.clear();
+                        return Ok(());
+                    }
+                    std::fs::create_dir(dir)?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+            #[cfg(windows)]
+            {
+                let pin = PinnedDir::open(dir)?.ok_or_else(|| {
+                    UpdateError::new(
+                        ErrorCode::InstallModified,
+                        format!("{} vanished while it was being checked", dir.display()),
+                    )
+                })?;
+                pins.push(pin);
+            }
+        }
+        Ok(())
     }
 
     /// Windows: scratch directories that cannot be removed right away are
@@ -579,7 +673,10 @@ impl FsFileOps {
         validate_rel_path(rel_path)?;
         self.verify_root()?;
         Ok(match rel_path.strip_prefix(BACKUP_PREFIX) {
-            Some(rest) => (self.backup_root.as_path(), rest),
+            Some(rest) => {
+                self.secure_backup_area(false)?;
+                (self.backup_root.as_path(), rest)
+            }
             None => (self.root.as_path(), rel_path),
         })
     }
@@ -661,8 +758,14 @@ impl FsFileOps {
         pin: Option<PinnedFile>,
     ) -> Result<()> {
         if rel_path.starts_with(BACKUP_PREFIX) {
+            validate_rel_path(rel_path)?;
+            self.secure_backup_area(true)?;
+            // Held until the file is placed (Windows): the nested backup
+            // directories cannot be swapped for links meanwhile.
+            let _dirs = self.pin_hierarchy(rel_path, true)?;
             let (base, rest) = self.locate(rel_path)?;
             let path = base.join(rest);
+            #[cfg(not(windows))]
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -2008,6 +2111,78 @@ mod tests {
             root,
             ops,
         }
+    }
+
+    /// Links `link` to `target` (a symlink on Unix, a junction on Windows).
+    #[cfg(any(windows, unix))]
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "cannot create the junction");
+        }
+    }
+
+    /// A backup area reached through a link below the protected anchor never
+    /// receives a write, and nothing is read back through it.
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn a_linked_backup_area_is_refused_for_every_write_and_read() {
+        let dir = TempDir::new("apply-backup-link");
+        let anchor = dir.path().join("coordination");
+        let outside = dir.path().join("other-install");
+        let root = dir.path().join("install");
+        let stage = dir.path().join("stage");
+        for sub in [&anchor, &outside, &root, &stage] {
+            fs::create_dir_all(sub).unwrap();
+        }
+        fs::write(root.join("a.dll"), OLD_DLL).unwrap();
+        fs::write(outside.join("a.dll"), b"other install").unwrap();
+        // The transaction directory is swapped for a link to another place.
+        let txn = anchor.join("txn");
+        link_dir(&outside, &txn);
+        let mut ops = FsFileOps::new(root, txn.join("backup"), stage)
+            .with_backup_anchor(anchor.clone());
+        assert!(ops.prepare_backup_area().is_err());
+        assert!(ops.backup("a.dll", "backup/a.dll").is_err());
+        assert!(ops.observe("backup/a.dll").is_err());
+        assert!(
+            ops.restore("a.dll", "backup/a.dll", &FileIdentity::of(b"other install")).is_err()
+        );
+        assert_eq!(fs::read(outside.join("a.dll")).unwrap(), b"other install");
+        assert!(!outside.join("backup").exists());
+    }
+
+    /// The protected layout still gets its backup area and round-trips a file.
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn a_plain_protected_backup_area_still_backs_up_and_restores() {
+        let dir = TempDir::new("apply-backup-plain");
+        let anchor = dir.path().join("coordination");
+        let root = dir.path().join("install");
+        let stage = dir.path().join("stage");
+        let txn = anchor.join("private").join("txn");
+        for sub in [&txn, &root, &stage] {
+            fs::create_dir_all(sub).unwrap();
+        }
+        fs::write(root.join("a.dll"), OLD_DLL).unwrap();
+        let mut ops = FsFileOps::new(root.clone(), txn.join("backup"), stage)
+            .with_backup_anchor(anchor);
+        ops.prepare_backup_area().unwrap();
+        ops.backup("a.dll", "backup/a.dll").unwrap();
+        fs::write(root.join("a.dll"), NEW_DLL).unwrap();
+        ops.bind_target("a.dll", &Some(FileIdentity::of(NEW_DLL))).unwrap();
+        ops.restore("a.dll", "backup/a.dll", &FileIdentity::of(OLD_DLL)).unwrap();
+        assert_eq!(fs::read(root.join("a.dll")).unwrap(), OLD_DLL);
     }
 
     /// Hook that, between the identity check and the mutation, tries to move
