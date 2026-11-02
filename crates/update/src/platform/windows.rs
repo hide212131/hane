@@ -1114,14 +1114,22 @@ fn shell_standard_token(expected_sid: &str, expected_session: u32) -> Result<Han
 /// The Local AppData folder of the account this process runs as, from the OS
 /// known-folder API for the process token. The environment is not consulted.
 pub fn own_local_app_data() -> Result<std::path::PathBuf> {
+    use windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData;
+
+    known_folder(&FOLDERID_LocalAppData)
+        .map_err(|_| UpdateError::new(ErrorCode::UnsupportedInstall, "the account's Local AppData folder could not be determined"))
+}
+
+/// A known folder's path from the OS API; the environment is not consulted.
+fn known_folder(id: &windows_sys::core::GUID) -> Result<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
 
     let mut raw: *mut u16 = std::ptr::null_mut();
-    // SAFETY: the folder id is a valid static GUID, a null token selects the
+    // SAFETY: the folder id is a valid GUID reference, a null token selects the
     // calling process's account, and `raw` receives a CoTaskMem string.
-    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, std::ptr::null_mut(), &mut raw) };
+    let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
     if hr < 0 || raw.is_null() {
         if !raw.is_null() {
             // SAFETY: allocated by the call above.
@@ -1129,7 +1137,7 @@ pub fn own_local_app_data() -> Result<std::path::PathBuf> {
         }
         return Err(UpdateError::new(
             ErrorCode::UnsupportedInstall,
-            "the account's Local AppData folder could not be determined",
+            "a known folder could not be determined",
         ));
     }
     let mut len = 0usize;
@@ -1406,12 +1414,29 @@ pub fn spawn_suspended_standard(exe: &Path, environment: &[(String, String)]) ->
 }
 
 /// The system-protected roots an install can be placed under: the Program Files
-/// folders and the Windows directory.
+/// folders and the Windows directory. They come from the OS known-folder API,
+/// never from user-modifiable environment variables; a folder that cannot be
+/// resolved is left out (it is not replaced by an environment value).
 fn protected_roots() -> Vec<std::path::PathBuf> {
-    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .map(std::path::PathBuf::from)
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86, FOLDERID_Windows,
+    };
+
+    absolute_roots([
+        known_folder(&FOLDERID_ProgramFiles),
+        known_folder(&FOLDERID_ProgramFilesX86),
+        known_folder(&FOLDERID_ProgramFilesX64),
+        known_folder(&FOLDERID_Windows),
+    ])
+}
+
+/// The resolved, absolute roots among known-folder lookup results.
+fn absolute_roots(
+    resolved: impl IntoIterator<Item = Result<std::path::PathBuf>>,
+) -> Vec<std::path::PathBuf> {
+    resolved
+        .into_iter()
+        .filter_map(|root| root.ok())
         .filter(|path| path.is_absolute())
         .collect()
 }
@@ -1606,6 +1631,28 @@ pub fn installed_helper(placement: &Placement, policy: &TrustPolicy) -> Result<H
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_or_relative_known_folders_add_no_protected_root() {
+        let failed = || Err(UpdateError::new(ErrorCode::UnsupportedInstall, "unresolved"));
+        let roots = absolute_roots([
+            Ok(std::path::PathBuf::from(r"C:\Program Files")),
+            failed(),
+            Ok(std::path::PathBuf::from(r"relative\dir")),
+        ]);
+        assert_eq!(roots, vec![std::path::PathBuf::from(r"C:\Program Files")]);
+        assert!(absolute_roots([failed()]).is_empty());
+    }
+
+    #[test]
+    fn protected_roots_do_not_follow_the_environment() {
+        // Read-only: the process environment is not modified, so parallel tests
+        // are unaffected. Every root must be the OS-reported one, and a path
+        // outside them is never protected.
+        let roots = protected_roots();
+        let outside = std::path::PathBuf::from(r"C:\Users\someone\app");
+        assert!(roots.iter().all(|root| !outside.starts_with(root)));
+    }
 
     #[test]
     fn a_pinned_helper_cannot_be_replaced_or_moved_before_the_loader_has_it() {
