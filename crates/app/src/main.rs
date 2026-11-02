@@ -218,18 +218,21 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let install_dir = exe.parent()?.to_path_buf();
     // A supported placement supplies the real install identity, the same one
-    // the startup gate leases on, and keeps its receipts in the coordination
-    // directory beside the install. Anything else keeps the interim identity;
-    // such a placement never becomes applicable.
+    // the startup gate leases on. Its sequence receipt is kept in the user's
+    // state, not beside the install: a protected install cannot be written
+    // before the user consents, and the helper carries the floor into the
+    // coordination directory when it stages the candidate. Anything else keeps
+    // the interim identity; such a placement never becomes applicable.
     // The failure is kept: a placement that cannot be resolved must not be
     // read as a normal unmanaged install (see `block_placement` below).
     let located = hane_update::platform::locate(&exe);
     let (install_id, receipts_dir) = match &located {
         Ok(placement) => {
-            let receipts = hane_update::platform::lease::Coordination::receipts_dir_for(
-                &placement.coordination_parent,
-                &placement.install_id,
-            );
+            let receipts = state
+                .root()
+                .join("updates")
+                .join(placement.install_id.as_str())
+                .join("receipts");
             (placement.install_id.clone(), receipts)
         }
         Err(_) => {
@@ -257,6 +260,12 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             (install_id, receipts)
         }
     };
+    // Earlier builds kept the floor in the coordination receipts. It is carried
+    // into the user's receipts before any check uses the floor.
+    let legacy_seen = match &located {
+        Ok(placement) => Some(legacy_seen_path(&placement.coordination_parent, &placement.install_id)),
+        Err(_) => None,
+    };
     let updates_root = state.root().join("updates").join(install_id.as_str());
     // The standard build always uses the fixed GitHub HTTPS transport. Only the
     // opt-in `validation-feed` build swaps in the loopback fixture transport;
@@ -280,6 +289,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             install_id,
             updates_root,
             receipts_dir,
+            legacy_seen,
         },
         transport,
         Arc::new(SystemClock::new()),
@@ -298,6 +308,46 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
         Err(error) => service.block_placement(&error, &exe),
     }
     Some(service)
+}
+
+/// Where earlier builds kept the sequence floor. Derived from the placement
+/// alone, without creating the coordination directory, so a transient failure
+/// to create it cannot make the old floor unreadable and accept a lower sequence.
+fn legacy_seen_path(parent: &Path, install_id: &InstallId) -> PathBuf {
+    hane_update::platform::lease::Coordination::receipts_dir_for(parent, install_id)
+        .join(hane_update::platform::lease::SEEN_CATALOG_FILE)
+}
+
+#[cfg(test)]
+mod legacy_seen_path_tests {
+    use super::legacy_seen_path;
+    use hane_update::identity::{InstallFacts, InstallId};
+    use hane_update::testing::TempDir;
+
+    #[test]
+    fn legacy_path_is_derived_without_creating_the_coordination_directory() {
+        let parent = TempDir::new("legacy-seen-path");
+        let install_id = InstallId::derive(&InstallFacts {
+            os: "test-os",
+            volume_id: "vol",
+            install_path: "/install/hane",
+            owner: "owner",
+        })
+        .expect("install id");
+        let path = legacy_seen_path(parent.path(), &install_id);
+        assert_eq!(
+            path,
+            parent
+                .path()
+                .join(install_id.coordination_dir_name())
+                .join("receipts")
+                .join("seen-catalog.json")
+        );
+        assert!(
+            !parent.path().join(install_id.coordination_dir_name()).exists(),
+            "deriving the legacy receipt path must not create the coordination directory"
+        );
+    }
 }
 
 const AI_CREDENTIAL_SERVICE: &str = "com.hide212131.hane.ai";
