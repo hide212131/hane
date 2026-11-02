@@ -132,20 +132,18 @@ struct DaclEntry {
     trustee: Trustee,
 }
 
-/// How a DACL ACE type is read. `None` is only for the known audit, alarm and
-/// label types, which grant or deny no access. Every other type that is not a
-/// basic allow or deny (compound, object and callback forms, including the
-/// deny types 6, 10 and 12, or a type not known at all) is `Opaque`, so it
-/// fails closed instead of being skipped.
+/// How a DACL ACE type is read. Only the basic allow (0) and deny (1) types
+/// are interpreted. Every other type (compound, object and callback forms,
+/// including the deny types 6, 10 and 12, the SACL-only audit, alarm and label
+/// types that must not appear in a DACL and whose effect there is
+/// unspecified, or a type not known at all) is `Opaque`, so it fails closed
+/// instead of being skipped.
 #[cfg(any(windows, test))]
-fn ace_entry_kind(ace_type: u8) -> Option<EntryKind> {
+fn ace_entry_kind(ace_type: u8) -> EntryKind {
     match ace_type {
-        0 => Some(EntryKind::Allow),
-        1 => Some(EntryKind::Deny),
-        // Audit, alarm (2, 3, 7, 8, 13-16), mandatory label, resource
-        // attribute, scoped policy id, process trust label, access filter.
-        2 | 3 | 7 | 8 | 13..=21 => None,
-        _ => Some(EntryKind::Opaque),
+        0 => EntryKind::Allow,
+        1 => EntryKind::Deny,
+        _ => EntryKind::Opaque,
     }
 }
 
@@ -810,7 +808,7 @@ mod imp {
     /// requesting account, never a different one). Only that SID or a group
     /// every standard user belongs to counts as the user's write access.
     pub fn classify_directory(path: &Path) -> Result<super::DirProtection> {
-        use super::{DaclEntry, EntryKind, Trustee, classify_dacl};
+        use super::{DaclEntry, EntryKind, Trustee};
         let meta = fs::symlink_metadata(path)?;
         if meta.file_type().is_symlink()
             || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -867,11 +865,9 @@ mod imp {
                     return Err(failure("an access control entry"));
                 }
                 let header = &*ace.cast::<ACE_HEADER>();
-                // Only known audit-class entries are skipped; any other
-                // unrecognised access entry is `Opaque` and refused.
-                let Some(kind) = super::ace_entry_kind(header.AceType) else {
-                    continue;
-                };
+                // Only basic allow and deny entries are interpreted; every
+                // other type is `Opaque` and refused, never skipped.
+                let kind = super::ace_entry_kind(header.AceType);
                 if kind == EntryKind::Opaque {
                     entries.push(DaclEntry {
                         kind,
@@ -1225,20 +1221,16 @@ mod tests {
         use super::{EntryKind, ace_entry_kind, classify_dacl};
         let system = entry(EntryKind::Allow, super::Trustee::System, true, true);
         let common_create = entry(EntryKind::Allow, super::Trustee::CommonGroup, true, true);
-        for ace_type in [6u8, 10, 12] {
-            let kind = ace_entry_kind(ace_type).expect("deny forms are access entries");
-            assert_eq!(kind, EntryKind::Opaque);
-            let deny = entry(kind, super::Trustee::Other, false, false);
-            assert!(classify_dacl(&[system, deny, common_create]).is_err());
-            assert!(classify_dacl(&[system, common_create, deny]).is_err());
+        // Deny forms, SACL-only types and unknown types are all opaque.
+        for ace_type in [2u8, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 200] {
+            let kind = ace_entry_kind(ace_type);
+            assert_eq!(kind, EntryKind::Opaque, "ace type {ace_type}");
+            let opaque = entry(kind, super::Trustee::Other, false, false);
+            assert!(classify_dacl(&[system, opaque, common_create]).is_err());
+            assert!(classify_dacl(&[system, common_create, opaque]).is_err());
         }
-        // An unknown type is an access entry too; only known audit types skip.
-        assert_eq!(ace_entry_kind(200), Some(EntryKind::Opaque));
-        for ace_type in [2u8, 3, 7, 8, 13, 17] {
-            assert_eq!(ace_entry_kind(ace_type), None);
-        }
-        assert_eq!(ace_entry_kind(0), Some(EntryKind::Allow));
-        assert_eq!(ace_entry_kind(1), Some(EntryKind::Deny));
+        assert_eq!(ace_entry_kind(0), EntryKind::Allow);
+        assert_eq!(ace_entry_kind(1), EntryKind::Deny);
     }
 
     #[cfg(unix)]
