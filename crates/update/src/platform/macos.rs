@@ -38,6 +38,33 @@ const MAX_PLIST_BYTES: u64 = 256 << 10;
 /// `RENAME_SWAP` of `<sys/stdio.h>`: exchange the two names atomically.
 const RENAME_SWAP: libc::c_uint = 0x2;
 
+/// The home directory of the helper's own account from the user database, never
+/// from `HOME` or anything else the requesting side could influence.
+pub(crate) fn own_home_dir() -> Result<std::path::PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    let unavailable = || UpdateError::new(ErrorCode::UnsupportedInstall, "the home directory of the account cannot be determined");
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero `passwd` is a valid value for `getpwuid_r` to fill.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer refers to a live local, and `buffer.len()` is its
+    // exact size; `geteuid` has no preconditions.
+    let status = unsafe {
+        libc::getpwuid_r(libc::geteuid(), &mut entry, buffer.as_mut_ptr(), buffer.len(), &mut found)
+    };
+    if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return Err(unavailable());
+    }
+    // SAFETY: `pw_dir` is a NUL-terminated string inside `buffer`, which is
+    // still alive.
+    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
+    let dir = std::path::PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
+    if !dir.is_absolute() {
+        return Err(unavailable());
+    }
+    Ok(dir)
+}
+
 unsafe extern "C" {
     fn renamex_np(
         from: *const libc::c_char,
