@@ -142,6 +142,31 @@ fn record_seen_source(candidate_dir: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Helper side: the application's receipt location, derived without trusting
+/// the candidate directory: `<state root>/updates/<install id>/receipts/` below
+/// the root bound for this transaction (absolute, normalized, owned by the
+/// current principal and closed to other writers). Every directory down to the
+/// receipt must be a plain owned directory, and the receipt an existing plain
+/// file, so no link or foreign parent is followed and nothing is created.
+fn expected_user_receipt(coordination: &Coordination, transaction: &TransactionId) -> Result<PathBuf> {
+    let root = crate::state_root::read_binding(coordination, transaction)?;
+    let updates = root.join("updates");
+    let install = updates.join(coordination.install_id().as_str());
+    let receipts = install.join("receipts");
+    for dir in [&updates, &install, &receipts] {
+        crate::platform::acl::verify(dir, true)?;
+    }
+    let path = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
+    if matches!(fs::symlink_metadata(&path), Err(err) if err.kind() == io::ErrorKind::NotFound) {
+        return Err(UpdateError::new(
+            ErrorCode::NotFound,
+            "the application's catalog sequence receipt is missing",
+        ));
+    }
+    crate::platform::acl::verify(&path, false)?;
+    Ok(path)
+}
+
 /// Helper side: re-reads the application's receipt now and returns the
 /// effective floor, the higher of it and `coordination_floor`. The returned
 /// guard holds the receipt's cross-process lock; the caller keeps it until the
@@ -149,19 +174,26 @@ fn record_seen_source(candidate_dir: &Path, source: &Path) -> Result<()> {
 /// this check and the mutation. A candidate that declared a receipt but whose
 /// receipt is missing, corrupt, unlockable or in conflict is refused.
 fn reconfirm_user_floor(
+    coordination: &Coordination,
+    transaction: &TransactionId,
     candidate_dir: &Path,
     coordination_floor: SeenCatalog,
 ) -> Result<(SeenCatalog, Option<Box<dyn Send>>)> {
     let Some(raw) = read_limited(&candidate_dir.join(CANDIDATE_SEEN_SOURCE), 4096)? else {
         return Ok((coordination_floor, None));
     };
-    let path = String::from_utf8(raw)
+    let declared = String::from_utf8(raw)
         .map(PathBuf::from)
         .map_err(|_| UpdateError::new(ErrorCode::ReceiptUnwritable, "the sequence receipt path is not valid text"))?;
-    if !path.is_absolute() {
+    // The candidate directory is user-writable, so the declared path is only a
+    // claim. The one location this (possibly elevated) helper opens or locks is
+    // derived independently from the validated state root binding and the
+    // install id; anything else is refused before any path is opened.
+    let path = expected_user_receipt(coordination, transaction)?;
+    if declared != path {
         return Err(UpdateError::new(
-            ErrorCode::ReceiptUnwritable,
-            "the sequence receipt path is not absolute",
+            ErrorCode::IdentityMismatch,
+            "the declared sequence receipt is not the application's receipt location",
         ));
     }
     let store = FileSeenStore::new(path);
@@ -437,7 +469,7 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<(ApplyPlan, Option<Box<dy
     // The application's own receipt is re-read last and its lock is kept: a
     // service that recorded a higher sequence after the candidate was staged
     // raises the effective floor here, and none can after this point.
-    let (seen, floor_guard) = reconfirm_user_floor(&candidate_dir, seen)?;
+    let (seen, floor_guard) = reconfirm_user_floor(coordination, inputs.transaction, &candidate_dir, seen)?;
     let candidate = verify_catalog(
         &catalog,
         &signature,
@@ -1303,8 +1335,16 @@ mod tests {
     /// Declares the application's own receipt for the fixture's staged
     /// candidate, as `stage_candidate` does when given a `seen` path.
     fn declare_user_receipt(fx: &Fixture) -> PathBuf {
-        let path = fx.placement.coordination_parent.join("user-receipts").join("seen-catalog.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let root = fx.placement.coordination_parent.join("state");
+        let receipts = root.join("updates").join(fx.placement.install_id.as_str()).join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        let mut dir = receipts.clone();
+        while dir != root.parent().unwrap() {
+            crate::platform::acl::secure_new(&dir, true, 0o700).unwrap();
+            dir.pop();
+        }
+        crate::state_root::publish_binding(&fx.coordination, &fx.transaction, &root).unwrap();
+        let path = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
         let ready = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
         FileSeenStore::new(path.clone()).store(&ready).unwrap();
         let dir = fx.coordination.transaction_dir(&fx.transaction).join(CANDIDATE_DIR);
@@ -1454,6 +1494,52 @@ mod tests {
         assert!(apply_owned_files(&fx.inputs()).is_err());
         assert!(fx.unchanged());
         assert!(!fx.journal_path().exists());
+    }
+
+    #[test]
+    fn a_tampered_receipt_path_is_refused_before_anything_is_opened_or_created() {
+        let fx = fixture();
+        let genuine = declare_user_receipt(&fx);
+        let marker = fx.candidate_file(CANDIDATE_SEEN_SOURCE);
+
+        // An absolute path elsewhere, with a valid-looking receipt, and one in a
+        // directory that does not exist (the lock file would create it).
+        let elsewhere = fx.placement.coordination_parent.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let forged = elsewhere.join("seen-catalog.json");
+        let ready = FileSeenStore::new(genuine.clone()).load().unwrap().unwrap();
+        FileSeenStore::new(forged.clone()).store(&ready).unwrap();
+        let missing_parent = fx.placement.coordination_parent.join("nowhere").join("seen-catalog.json");
+        let relative = PathBuf::from("seen-catalog.json");
+        let dotted = genuine.parent().unwrap().join("..").join("receipts").join("seen-catalog.json");
+
+        for bad in [forged.clone(), missing_parent.clone(), relative, dotted] {
+            fs::write(&marker, bad.to_str().unwrap()).unwrap();
+            assert_eq!(
+                apply_owned_files(&fx.inputs()).err().unwrap().code,
+                ErrorCode::IdentityMismatch,
+                "{bad:?}"
+            );
+            assert!(fx.unchanged());
+            assert!(!fx.journal_path().exists());
+            assert!(!forged.with_extension("lock").exists());
+            assert!(!missing_parent.parent().unwrap().exists());
+        }
+
+        // The genuine location still applies.
+        fs::write(&marker, genuine.to_str().unwrap()).unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+    }
+
+    #[test]
+    fn a_declared_receipt_without_a_state_root_binding_is_refused() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        crate::state_root::discard_binding(&fx.coordination, &fx.transaction);
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+        assert!(!user.with_extension("lock").exists());
     }
 
     #[test]
