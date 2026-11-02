@@ -944,7 +944,8 @@ pub fn recover_pending_with(
             placement.install_root.clone(),
             txn_dir.join("backup"),
             txn_dir.join("stage"),
-        );
+        )
+        .with_backup_anchor(coord.dir().to_path_buf());
         #[cfg(windows)]
         let ops = ops.with_scratch_ledger(coord, transaction);
         let mut ops = GuardedOps {

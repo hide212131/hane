@@ -203,7 +203,7 @@ pub fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
 }
 
 /// True for symlinks and, on Windows, any reparse point (junctions included).
-fn is_link_like(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_link_like(meta: &fs::Metadata) -> bool {
     if meta.file_type().is_symlink() {
         return true;
     }

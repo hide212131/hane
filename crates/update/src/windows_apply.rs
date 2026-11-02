@@ -744,20 +744,12 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     crate::startup::retire_prior_receipts(inputs.coordination, inputs.transaction)?;
     let txn_dir = inputs.coordination.transaction_dir(inputs.transaction);
     let backup = txn_dir.join(BACKUP_DIR);
-    fs::create_dir_all(&backup)?;
-
-    let journal = UpdateJournal::begin(&plan, None)?;
-    // A protected placement's recovery plan is sealed in the protected
-    // coordination parent before the journal exists and before any mutation: an
-    // elevated recovery trusts that seal, never the user-writable journal alone.
-    crate::recovery_seal::seal_if_protected(inputs.coordination, &journal)?;
-    let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
-    let mut journal = DurableJournal::create(store, journal)?;
     let ops = FsFileOps::new(
         inputs.placement.install_root.clone(),
         backup,
         txn_dir.join(STAGE_DIR),
     )
+    .with_backup_anchor(inputs.coordination.dir().to_path_buf())
     .with_unchanged(
         plan.unchanged
             .iter()
@@ -767,6 +759,18 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     #[cfg(windows)]
     let ops = ops.with_scratch_ledger(inputs.coordination, inputs.transaction);
     let mut ops = ops;
+    // The backup area is where an elevated helper writes and restores from. It
+    // is created and pinned through the verified coordination chain; a link or
+    // reparse point anywhere on it refuses the apply before any journal exists.
+    ops.prepare_backup_area()?;
+
+    let journal = UpdateJournal::begin(&plan, None)?;
+    // A protected placement's recovery plan is sealed in the protected
+    // coordination parent before the journal exists and before any mutation: an
+    // elevated recovery trusts that seal, never the user-writable journal alone.
+    crate::recovery_seal::seal_if_protected(inputs.coordination, &journal)?;
+    let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
+    let mut journal = DurableJournal::create(store, journal)?;
     // Before the first install mutation: bind the original identities outside
     // the inventory, so an interrupted update or a moved install still reaches
     // this transaction's journal at startup. Without it nothing is mutated.
