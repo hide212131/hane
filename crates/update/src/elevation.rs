@@ -243,6 +243,30 @@ pub fn is_protected_placement(
         })
 }
 
+/// Accepts the owner of a located install. The requesting user's own
+/// directory continues as before; a protected owner is accepted only for a
+/// known protected root, where the route decision may then choose elevation.
+/// An unknown or unreadable owner, or a protected owner of any other
+/// directory, is refused without being treated as unmanaged.
+#[cfg(any(windows, test))]
+pub(crate) fn require_placement_owner(
+    owner: Result<String>,
+    principal: Result<String>,
+    install_root: &Path,
+    protected_roots: &[std::path::PathBuf],
+) -> Result<()> {
+    let principal = crate::platform::owner_from(principal)?;
+    let owner = crate::platform::owner_from(owner)?;
+    if owner == principal || is_protected_placement(&principal, &owner, install_root, protected_roots) {
+        Ok(())
+    } else {
+        Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            "the install root is not owned by the current user or a protected owner of a protected root",
+        ))
+    }
+}
+
 /// The refusal of the update before any change when the route cannot be chosen.
 pub fn route_refused_error(reason: &str) -> UpdateError {
     UpdateError::new(ErrorCode::Io, format!("{ROUTE_REFUSED_MARKER}: {reason}"))
@@ -897,6 +921,56 @@ mod tests {
         assert!(!is_protected_placement(user, user, Path::new(r"C:\Program Files"), &roots));
         assert!(!is_protected_placement(user, user, Path::new(r"C:\Program Files Extra\Hane"), &roots));
         assert!(!is_protected_placement(user, user, under, &[]));
+    }
+
+    #[test]
+    fn locate_accepts_the_users_own_root_and_a_protected_owner_only_under_a_protected_root() {
+        let roots = [std::path::PathBuf::from(r"C:\Program Files")];
+        let user = "sid:0102";
+        let under = Path::new(r"C:\Program Files\Hane");
+        let own = Path::new(r"C:\Users\me\Hane");
+        let accept = |owner: &str, root: &Path| {
+            require_placement_owner(Ok(owner.into()), Ok(user.into()), root, &roots)
+        };
+        // The current user's own root, protected or not, continues as before.
+        accept(user, own).unwrap();
+        accept(user, under).unwrap();
+        // A known protected owner of a protected root reaches the route decision,
+        // which then chooses the elevated route for an unwritable placement.
+        for owner in [SID_ADMINISTRATORS, SID_SYSTEM, BINARY_SID_ADMINISTRATORS] {
+            accept(owner, under).unwrap();
+            assert!(is_protected_placement(user, owner, under, &roots));
+            let protected = is_protected_placement(user, owner, under, &roots);
+            assert_eq!(
+                choose_route(protected, WriteAccess::Denied, StandardAttempt::NotTried),
+                Route::Elevated(ElevationReason::ProtectedPlacement)
+            );
+        }
+        // A protected owner outside every protected root and an unknown owner fail closed.
+        for (owner, root) in [
+            (SID_ADMINISTRATORS, own),
+            (BINARY_SID_SYSTEM, Path::new(r"C:\Program Files Extra\Hane")),
+            ("sid:0999", under),
+        ] {
+            let err = accept(owner, root).unwrap_err();
+            assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        }
+    }
+
+    #[test]
+    fn locate_refuses_an_unreadable_owner_or_principal_even_under_a_protected_root() {
+        let roots = [std::path::PathBuf::from(r"C:\Program Files")];
+        let under = Path::new(r"C:\Program Files\Hane");
+        let failure = || UpdateError::new(ErrorCode::Io, "no owner");
+        let err = require_placement_owner(Err(failure()), Ok("sid:0102".into()), under, &roots)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        let err = require_placement_owner(Ok(SID_ADMINISTRATORS.into()), Err(failure()), under, &roots)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        let err = require_placement_owner(Ok(String::new()), Ok("sid:0102".into()), under, &roots)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
     }
 
     fn principals(user: &str, owner: &str, elevated: &str) -> Principals {

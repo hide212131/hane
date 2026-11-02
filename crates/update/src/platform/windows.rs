@@ -1512,7 +1512,14 @@ pub fn locate(exe: &Path) -> Result<Placement> {
             format!("{name} is missing from a managed install"),
         ));
     }
-    super::require_install_root_owner(&install_dir)?;
+    // A protected owner is accepted only for a known protected root, so that the
+    // route decision can reach the elevated route; the user's own root is as before.
+    crate::elevation::require_placement_owner(
+        super::acl::directory_owner_id(&install_dir),
+        super::acl::principal_id(),
+        &install_dir,
+        &protected_roots(),
+    )?;
     let path_text = crate::identity::install_path_text(&install_dir)?;
     let path_text = path_text.strip_prefix(r"\\?\").unwrap_or(path_text).to_owned();
     let install_id = InstallId::derive(&InstallFacts {
