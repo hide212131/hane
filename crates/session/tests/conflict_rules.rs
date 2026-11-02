@@ -504,7 +504,17 @@ fn a_delete_keeps_the_unsaved_document_and_a_save_recreates_the_file() {
     );
 
     let session = sessions.active_mut();
+    // An ordinary save never silently recreates a file that existed and is
+    // gone; recreating is a separate, explicit decision.
     let decision = session.request_save(SaveIntent::Current);
+    assert!(matches!(
+        complete(session, &service, decision),
+        SaveOutcome::Conflict
+    ));
+    assert!(service.contents("/notes/a.md").is_none());
+    assert!(session.is_dirty());
+
+    let decision = session.request_save(SaveIntent::Overwrite);
     assert!(matches!(
         complete(session, &service, decision),
         SaveOutcome::Saved
