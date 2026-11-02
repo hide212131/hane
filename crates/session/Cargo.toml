@@ -8,6 +8,7 @@ license.workspace = true
 hane-document.workspace = true
 hane-editor.workspace = true
 hane-network.workspace = true
+icu_normalizer.workspace = true
 libc.workspace = true
 notify.workspace = true
 grep-matcher.workspace = true

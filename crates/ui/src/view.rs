@@ -106,6 +106,16 @@ mod content_search;
 mod document_find;
 mod editor_context_menu;
 use editor_context_menu::EditorContextMenu;
+mod document_watch;
+mod external_change;
+mod external_comparison;
+#[cfg(any(test, feature = "instrument"))]
+#[cfg_attr(
+    not(feature = "instrument"),
+    allow(dead_code, reason = "the call sites exist only in `instrument` builds")
+)]
+mod external_read_gate;
+use external_change::{ResolutionAction, ResolutionChoices};
 mod folder_watch;
 mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
@@ -952,6 +962,10 @@ pub struct EditorView {
     /// raised for, so a record that outlives its document is never shown, and
     /// it is cleared only by a valid save success of that same document.
     save_problems: HashMap<SessionId, ScopedSaveProblem>,
+    /// The read-only disk / editing comparison of an external change, if open.
+    /// Fixed snapshots bound to the document instance, revision and observed
+    /// disk fingerprint; never persisted and never used to change a document.
+    external_comparison: Option<external_comparison::ExternalComparison>,
     /// The last failure to write the settings file, shown in the general
     /// settings page. Kept apart from `settings_error`, which belongs to the
     /// Windows integration.
@@ -1095,6 +1109,10 @@ pub struct EditorView {
     /// dropped (releasing the watch) when the folder is replaced or the
     /// window closes.
     folder_watch: folder_watch::FolderWatchState,
+    /// The directory watches of open files outside the watched work folder,
+    /// the first-check bookkeeping, and the window-return observer; see
+    /// `document_watch`.
+    document_watch: document_watch::DocumentWatchState,
     /// Start order of every work folder listing scan; see
     /// `folder_watch::ListingRequests`.
     listing_requests: folder_watch::ListingRequests,
@@ -3192,6 +3210,7 @@ impl EditorView {
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
         self.save_problems.clear();
+        self.external_comparison = None;
         // Any background read still in flight for the old folder (or for
         // single-file state) is now for a session that no longer exists;
         // bumping this makes `finish_open` discard it instead of merging a
@@ -13710,6 +13729,7 @@ mod tests {
                 document: RopeBuffer::from_text("active\n"),
                 identity: hane_session::FileIdentity::lexical(active_path),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -13717,6 +13737,7 @@ mod tests {
                     document: RopeBuffer::from_text("clicked\n"),
                     identity: hane_session::FileIdentity::lexical(clicked_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -13791,6 +13812,7 @@ mod tests {
                 document: RopeBuffer::from_text("first\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -13798,6 +13820,7 @@ mod tests {
                     document: RopeBuffer::from_text("second\n"),
                     identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -13984,6 +14007,7 @@ mod tests {
                 document: RopeBuffer::from_text("body\n"),
                 identity: hane_session::FileIdentity::lexical(path),
                 stamp: None,
+                fingerprint: None,
             });
             EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
         });
@@ -14027,6 +14051,7 @@ mod tests {
                 document: RopeBuffer::from_text("active\n"),
                 identity: hane_session::FileIdentity::lexical(active_path),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -14034,6 +14059,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -14191,6 +14217,7 @@ mod tests {
                     document: RopeBuffer::from_text("active\n"),
                     identity: hane_session::FileIdentity::lexical(active_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14204,6 +14231,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(view.sessions.activate(SessionId(0)));
@@ -14238,6 +14266,7 @@ mod tests {
                     document: RopeBuffer::from_text("first\n"),
                     identity: hane_session::FileIdentity::lexical(PathBuf::from("first.md")),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14252,6 +14281,7 @@ mod tests {
                     document: RopeBuffer::from_text("second\n"),
                     identity: hane_session::FileIdentity::lexical(PathBuf::from("second.md")),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             (first, second)
@@ -14556,6 +14586,7 @@ mod tests {
                     document: RopeBuffer::from_text("first\n"),
                     identity: hane_session::FileIdentity::lexical(first_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14570,6 +14601,7 @@ mod tests {
                     document: RopeBuffer::from_text("second\n"),
                     identity: hane_session::FileIdentity::lexical(second_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             let third = view.sessions.apply_open(
@@ -14578,6 +14610,7 @@ mod tests {
                     document: RopeBuffer::from_text("third\n"),
                     identity: hane_session::FileIdentity::lexical(third_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(view.sessions.activate(third));
@@ -14676,6 +14709,7 @@ mod tests {
                     document: RopeBuffer::from_text("body\n"),
                     identity: hane_session::FileIdentity::lexical(long_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14689,6 +14723,7 @@ mod tests {
                     document: RopeBuffer::from_text("body\n"),
                     identity: hane_session::FileIdentity::lexical(other_path),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(view.sessions.activate(SessionId(0)));
@@ -14728,6 +14763,7 @@ mod tests {
                 document: RopeBuffer::from_text("active\n"),
                 identity: hane_session::FileIdentity::lexical(active_path),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -14735,6 +14771,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path.clone()),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -14781,6 +14818,7 @@ mod tests {
                     document: RopeBuffer::from_text("before"),
                     identity: hane_session::FileIdentity::lexical(path.clone()),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -14903,6 +14941,7 @@ mod tests {
                 document: RopeBuffer::from_text("before"),
                 identity: hane_session::FileIdentity::lexical(path.clone()),
                 stamp: None,
+                fingerprint: None,
             });
             sessions.apply_open(
                 None,
@@ -14910,6 +14949,7 @@ mod tests {
                     document: RopeBuffer::from_text("other\n"),
                     identity: hane_session::FileIdentity::lexical(other_path.clone()),
                     stamp: None,
+                    fingerprint: None,
                 },
             );
             assert!(sessions.activate(SessionId(0)));
@@ -15034,6 +15074,7 @@ mod tests {
                     document: RopeBuffer::from_text("before"),
                     identity: hane_session::FileIdentity::lexical(missing_path),
                     stamp: None,
+                    fingerprint: None,
                 }),
                 Arc::new(OsFileService),
                 StateStores::memory(),
@@ -15295,12 +15336,20 @@ mod tests {
                 !view.tab_close_after_save.contains_key(&id),
                 "a refused save must drop the close request rather than let a coincidentally clean document close it"
             );
+            // Issue #653: the document had no unsaved edits when the refused
+            // write's conflict was noticed, so the external check reloads the
+            // latest disk content instead of leaving a conflict warning.
+            assert_eq!(
+                view.editor().document().full_text(),
+                "someone else's edit, longer than before",
+                "a clean document must follow the external content"
+            );
             assert_eq!(
                 view.active_save_display(),
-                footer::SaveDisplay::Conflict,
-                "the conflict must stay in the document's footer warning"
+                footer::SaveDisplay::Saved,
+                "the reloaded clean document must read as saved"
             );
-            assert_eq!(view.footer_warnings().len(), 1);
+            assert!(view.footer_warnings().is_empty());
         });
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -15534,6 +15583,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             assert_ne!(
                 view.sessions.active().generation(),
@@ -15852,6 +15902,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             (id, confirm)
         });
@@ -15933,6 +15984,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.editor_mut().insert_text("draft").unwrap();
             view.after_input(cx);
@@ -16006,6 +16058,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.editor_mut().insert_text("draft").unwrap();
             view.after_input(cx);
@@ -16072,6 +16125,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             DocumentInstance {
                 generation: view.sessions.active().generation(),
@@ -16161,6 +16215,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             // Bookkeeping belonging entirely to the replacement document —
             // a close-and-save request of its own, armed after the dialog
@@ -16236,6 +16291,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.status = Some("current document status".to_owned());
             (id, stale_instance)
@@ -16454,6 +16510,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.status = Some("current document status".to_owned());
             (id, stale_instance)
@@ -16511,6 +16568,7 @@ mod tests {
                 document: RopeBuffer::from_text("replaced\n"),
                 identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
                 stamp: None,
+                fingerprint: None,
             });
             view.status = Some("current document status".to_owned());
             (id, stale_instance)

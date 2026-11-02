@@ -4478,6 +4478,7 @@ mod tests {
                 document: hane_document::RopeBuffer::from_text("buffer-only"),
                 identity: FileIdentity::lexical(&path),
                 stamp: None,
+                fingerprint: None,
             },
         );
         assert!(sessions.activate(draft_id));
