@@ -57,7 +57,10 @@ pub struct UpdateServiceConfig {
     pub install_id: InstallId,
     /// `<state root>/updates/<InstallId>`: candidates and work directories.
     pub updates_root: PathBuf,
-    /// Private directory for the highest-seen catalog sequence.
+    /// Private directory for the highest-seen catalog sequence. It lives in the
+    /// user's state, never below the install, so a protected install is not
+    /// written before the user chooses to apply. The helper carries the floor
+    /// into the coordination receipts once that exists.
     pub receipts_dir: PathBuf,
 }
 
@@ -1216,6 +1219,7 @@ impl Inner {
             candidate_id,
             &dir,
             &wiring.state_root,
+            &self.config.receipts_dir.join(SEEN_FILE),
         )
         .map_err(|err| self.prepare_failure(&err, Some(&version)))?;
         // A failure from here on drops `prepared`, which aborts the helper.
@@ -2339,6 +2343,23 @@ mod tests {
             assert!(!text.contains("sk-"), "{text}");
         }
         drop(ai);
+    }
+
+    #[test]
+    fn a_candidate_becomes_ready_without_creating_any_coordination_directory() {
+        // The floor is persisted in the configured (user) receipts directory
+        // before the Ready marker; nothing named like the install's
+        // coordination directory exists, as in a protected install.
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let dir = fixture.updates_root().join("candidates").join(fixture.candidate_id());
+        assert!(dir.join("ready").is_file());
+        assert!(fixture.dir.path().join("receipts").join("seen-catalog.json").is_file());
+        let coordination = fs::read_dir(fixture.dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".hane-update-"));
+        assert!(!coordination, "no coordination directory may be created before consent");
     }
 
     #[test]

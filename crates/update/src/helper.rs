@@ -3293,7 +3293,7 @@ mod tests {
     fn prepare_unwritable(fx: &Fixture, os: &dyn ElevationOs) -> UpdateError {
         let (placement, blocker) = unwritable_parent_placement(fx);
         let candidate = fx._dir.path().join("candidate");
-        let source = CandidateSource { catalog: &candidate, signature: &candidate, archive: &candidate };
+        let source = CandidateSource { catalog: &candidate, signature: &candidate, archive: &candidate, seen: None };
         let err = prepare_restart_with(
             &placement,
             &crate::testing::test_policy(),
@@ -3545,7 +3545,7 @@ mod tests {
                 self.candidate.join("catalog.sig"),
                 self.candidate.join("archive.zip"),
             );
-            let candidate = CandidateSource { catalog: &catalog, signature: &signature, archive: &archive };
+            let candidate = CandidateSource { catalog: &catalog, signature: &signature, archive: &archive, seen: None };
             prepare_protected_with(
                 &self.placement,
                 || Ok(self.source.clone()),

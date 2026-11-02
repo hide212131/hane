@@ -49,6 +49,7 @@ pub fn start_helper(
     candidate_id: &str,
     candidate_dir: &Path,
     state_root: &Path,
+    seen: &Path,
 ) -> Result<PreparedRestart, UpdateError> {
     if candidate_dir.file_name().and_then(|name| name.to_str()) != Some(candidate_id) {
         return Err(UpdateError::new(
@@ -64,6 +65,7 @@ pub fn start_helper(
             catalog: &candidate_dir.join(CATALOG_FILE),
             signature: &candidate_dir.join(SIGNATURE_FILE),
             archive: &candidate_dir.join(ARCHIVE_FILE),
+            seen: Some(seen),
         },
         state_root,
     )

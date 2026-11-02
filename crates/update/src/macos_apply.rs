@@ -2540,6 +2540,7 @@ mod tests {
                 catalog: &ready.join("c"),
                 signature: &ready.join("s"),
                 archive: &ready.join("a"),
+                seen: None,
             },
         )
         .unwrap();

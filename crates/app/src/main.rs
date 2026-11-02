@@ -218,18 +218,21 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let install_dir = exe.parent()?.to_path_buf();
     // A supported placement supplies the real install identity, the same one
-    // the startup gate leases on, and keeps its receipts in the coordination
-    // directory beside the install. Anything else keeps the interim identity;
-    // such a placement never becomes applicable.
+    // the startup gate leases on. Its sequence receipt is kept in the user's
+    // state, not beside the install: a protected install cannot be written
+    // before the user consents, and the helper carries the floor into the
+    // coordination directory when it stages the candidate. Anything else keeps
+    // the interim identity; such a placement never becomes applicable.
     // The failure is kept: a placement that cannot be resolved must not be
     // read as a normal unmanaged install (see `block_placement` below).
     let located = hane_update::platform::locate(&exe);
     let (install_id, receipts_dir) = match &located {
         Ok(placement) => {
-            let receipts = hane_update::platform::lease::Coordination::receipts_dir_for(
-                &placement.coordination_parent,
-                &placement.install_id,
-            );
+            let receipts = state
+                .root()
+                .join("updates")
+                .join(placement.install_id.as_str())
+                .join("receipts");
             (placement.install_id.clone(), receipts)
         }
         Err(_) => {

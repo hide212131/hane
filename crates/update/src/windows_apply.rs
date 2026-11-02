@@ -51,7 +51,7 @@ use crate::limits::{
 use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target, UPDATER_PROTOCOL};
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
-use crate::trust::{SeenStore, TrustPolicy};
+use crate::trust::{SeenCatalog, SeenStore, TrustPolicy};
 use crate::util::is_sha256_hex;
 
 /// Directory of the transaction that holds the copied candidate.
@@ -73,6 +73,56 @@ pub struct CandidateSource<'a> {
     pub catalog: &'a Path,
     pub signature: &'a Path,
     pub archive: &'a Path,
+    /// The sequence floor the application persisted before it made the
+    /// candidate Ready, kept outside the install's coordination directory (a
+    /// protected install cannot be written before the user consents). When
+    /// given, [`stage_candidate`] carries it into the coordination receipts,
+    /// which is where the helper re-reads it.
+    pub seen: Option<&'a Path>,
+}
+
+/// Carries the application's sequence floor into the coordination receipts.
+/// The floor never goes down: a higher stored floor stays, and the same
+/// sequence with different catalog bytes is a conflict. A missing or invalid
+/// source is a refusal, never "no floor".
+fn seed_seen_receipt(coordination: &Coordination, source: &Path) -> Result<()> {
+    let unwritable = |what: &str, err: UpdateError| {
+        UpdateError::new(
+            ErrorCode::ReceiptUnwritable,
+            format!("the catalog sequence receipt {what}: {err}"),
+        )
+    };
+    let carried = FileSeenStore::new(source.to_path_buf())
+        .load()
+        .map_err(|err| unwritable("cannot be read", err))?
+        .ok_or_else(|| {
+            UpdateError::new(ErrorCode::NotFound, "the application's catalog sequence receipt is missing")
+        })?;
+    carried.validate()?;
+    let path = coordination.seen_catalog_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| unwritable("cannot be created", UpdateError::from(err)))?;
+    }
+    let mut store = FileSeenStore::new(path);
+    let _guard = store.lock().map_err(|err| unwritable("cannot be locked", err))?;
+    if let Some(existing) = store.load().map_err(|err| unwritable("cannot be read", err))? {
+        existing.validate()?;
+        if existing.sequence > carried.sequence {
+            return Ok(());
+        }
+        if existing.sequence == carried.sequence {
+            if existing.catalog_sha256 != carried.catalog_sha256 {
+                return Err(UpdateError::new(
+                    ErrorCode::SequenceConflict,
+                    "same catalog sequence with different bytes",
+                ));
+            }
+            return Ok(());
+        }
+    }
+    store
+        .store(&SeenCatalog::new(carried.sequence, carried.catalog_sha256))
+        .map_err(|err| unwritable("cannot be stored", err))
 }
 
 fn copy_regular(source: &Path, dest: &Path, limit: u64) -> Result<()> {
@@ -116,7 +166,8 @@ pub fn stage_candidate(
         .and_then(|()| {
             copy_regular(source.signature, &dir.join(CANDIDATE_SIGNATURE), MAX_SIGNATURE_BYTES)
         })
-        .and_then(|()| copy_regular(source.archive, &dir.join(CANDIDATE_ARCHIVE), MAX_ARCHIVE_BYTES));
+        .and_then(|()| copy_regular(source.archive, &dir.join(CANDIDATE_ARCHIVE), MAX_ARCHIVE_BYTES))
+        .and_then(|()| source.seen.map_or(Ok(()), |seen| seed_seen_receipt(coordination, seen)));
     if let Err(err) = copied {
         let _ = fs::remove_dir_all(&dir);
         return Err(err);
@@ -662,6 +713,7 @@ mod tests {
                 catalog: &ready.join("c"),
                 signature: &ready.join("s"),
                 archive: &ready.join("a"),
+                seen: None,
             },
         )
         .unwrap();
@@ -1199,10 +1251,71 @@ mod tests {
                 catalog: &nowhere,
                 signature: &nowhere,
                 archive: &nowhere,
+                seen: None,
             },
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Io);
         assert!(!fx.coordination.transaction_dir(&other).join(CANDIDATE_DIR).exists());
+    }
+
+    #[test]
+    fn staging_carries_the_applications_floor_into_the_coordination_receipts() {
+        let fx = fixture();
+        let scratch = TempDir::new("windows-apply-seed");
+        let ready = scratch.path();
+        for name in ["c", "s", "a"] {
+            fs::write(ready.join(name), b"x").unwrap();
+        }
+        let hash = "a".repeat(64);
+        let user_floor = ready.join("seen-catalog.json");
+        FileSeenStore::new(user_floor.clone())
+            .store(&SeenCatalog::new(9, hash.clone()))
+            .unwrap();
+        // A protected install has no receipts directory until the helper's
+        // bootstrap; the carried floor creates it.
+        fs::remove_dir_all(fx.coordination.dir().join(crate::platform::lease::RECEIPTS_DIR)).unwrap();
+        let stage = |txn: &TransactionId, seen: Option<&Path>| {
+            fx.coordination.ensure_helper_dir(txn).unwrap();
+            stage_candidate(
+                &fx.coordination,
+                txn,
+                &CandidateSource {
+                    catalog: &ready.join("c"),
+                    signature: &ready.join("s"),
+                    archive: &ready.join("a"),
+                    seen,
+                },
+            )
+        };
+
+        let first = TransactionId::generate().unwrap();
+        stage(&first, Some(&user_floor)).unwrap();
+        let stored = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
+        assert_eq!((stored.sequence, stored.catalog_sha256.as_str()), (9, hash.as_str()));
+
+        // A lower carried floor never lowers the stored one.
+        FileSeenStore::new(user_floor.clone())
+            .store(&SeenCatalog::new(3, "b".repeat(64)))
+            .unwrap();
+        let second = TransactionId::generate().unwrap();
+        stage(&second, Some(&user_floor)).unwrap();
+        let stored = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
+        assert_eq!(stored.sequence, 9);
+
+        // The same sequence with other bytes is refused and leaves no candidate.
+        FileSeenStore::new(user_floor.clone())
+            .store(&SeenCatalog::new(9, "c".repeat(64)))
+            .unwrap();
+        let third = TransactionId::generate().unwrap();
+        let err = stage(&third, Some(&user_floor)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceConflict);
+        assert!(!fx.coordination.transaction_dir(&third).join(CANDIDATE_DIR).exists());
+
+        // A missing carried floor is a refusal, not "no floor".
+        let fourth = TransactionId::generate().unwrap();
+        let err = stage(&fourth, Some(&ready.join("missing.json"))).unwrap_err();
+        assert!(matches!(err.code, ErrorCode::NotFound | ErrorCode::ReceiptUnwritable));
+        assert!(!fx.coordination.transaction_dir(&fourth).join(CANDIDATE_DIR).exists());
     }
 }
