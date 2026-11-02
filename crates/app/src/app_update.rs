@@ -1298,6 +1298,24 @@ impl Inner {
                 _ => return Err("準備した更新が変わりました。もう一度お試しください".to_owned()),
             }
         };
+        // The helper derives the receipt from the OS account's Local AppData and
+        // refuses anything else at apply time. Check that before the helper is
+        // started, so the application never gets an exit permit it cannot use.
+        #[cfg(target_os = "windows")]
+        {
+            let receipt = self.config.receipts_dir.join(SEEN_FILE);
+            let checked = wiring.placement.coordination().and_then(|coordination| {
+                hane_update::windows_apply::ensure_receipt_matches_trusted_root(&coordination, &receipt)
+            });
+            if let Err(err) = checked {
+                self.prepare_failure(&err, Some(&version));
+                return Err(format!(
+                    "保存場所（HANE_STATE_DIRまたはLOCALAPPDATA）が、更新ヘルパーが確認できる既定の場所と一致しないため、更新を適用できません。\
+                     Haneは終了せず、文書とデータには変更を加えていません。理由: {}",
+                    err.detail
+                ));
+            }
+        }
         let prepared = update_restart::start_helper(
             &wiring.placement,
             &self.config.policy,

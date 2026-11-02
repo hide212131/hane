@@ -292,6 +292,27 @@ fn expected_user_receipt(coordination: &Coordination) -> Result<(PathBuf, PathBu
     Ok((root, receipt))
 }
 
+/// Application side, before the helper is started: refuses a sequence receipt
+/// that is not the one the helper will derive from the OS account (custom
+/// `HANE_STATE_DIR`, or a `LOCALAPPDATA` that differs from the known folder).
+/// The helper would reject it at apply time, after the application was allowed
+/// to quit; detecting it here keeps the running application open. Only reads
+/// the OS-derived path; nothing is opened or written.
+pub fn ensure_receipt_matches_trusted_root(coordination: &Coordination, seen: &Path) -> Result<()> {
+    let (_, expected) = expected_user_receipt(coordination)?;
+    if seen != expected {
+        return Err(UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            format!(
+                "the application's state root differs from the account's default state root, so the update helper cannot verify the sequence receipt (application: {}, helper: {})",
+                seen.display(),
+                expected.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Pins the chain from the trusted root down to the receipt (every directory
 /// must be plain, owned and closed to other writers; the lock file and the
 /// receipt must already exist) and takes the lock. A parent or file replaced
@@ -1507,6 +1528,26 @@ mod tests {
         let dir = fx.coordination.transaction_dir(&fx.transaction).join(CANDIDATE_DIR);
         record_seen_source(&dir, &path).unwrap();
         path
+    }
+
+    #[test]
+    fn receipt_outside_the_trusted_root_is_refused_before_the_helper_starts() {
+        let fx = fixture();
+        let matching = declare_user_receipt(&fx);
+        assert!(ensure_receipt_matches_trusted_root(&fx.coordination, &matching).is_ok());
+
+        let custom = fx
+            .placement
+            .coordination_parent
+            .join("custom-state")
+            .join("updates")
+            .join(fx.placement.install_id.as_str())
+            .join("receipts")
+            .join(crate::platform::lease::SEEN_CATALOG_FILE);
+        let err = ensure_receipt_matches_trusted_root(&fx.coordination, &custom).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert!(err.detail.contains("custom-state"));
+        set_trusted_state_root(None);
     }
 
     /// Free-space query that runs after the helper re-read and locked the
