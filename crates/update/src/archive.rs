@@ -898,7 +898,7 @@ pub(crate) fn extract_archive_held<R: Read + Seek>(
     stage: &Path,
 ) -> Result<Vec<PinnedDir>> {
     let mut pins: Vec<PinnedDir> = Vec::new();
-    pin_dir(&mut pins, stage)?;
+    pins.extend(pin_dir(stage)?);
     prepare_stage(stage)?;
     let mut created: Vec<(PathBuf, bool)> = Vec::new();
     let result = extract_entries(reader, inspected, stage, &mut created, &mut pins);
@@ -920,15 +920,18 @@ pub(crate) fn extract_archive_held<R: Read + Seek>(
 /// Windows: holds `path` as a verified non-reparse directory. A link, a
 /// non-directory or a vanished directory refuses the extraction.
 #[cfg_attr(not(windows), allow(unused_variables, reason = "only Windows pins directories"))]
-fn pin_dir(pins: &mut Vec<PinnedDir>, path: &Path) -> Result<()> {
+fn pin_dir(path: &Path) -> Result<Option<PinnedDir>> {
     #[cfg(windows)]
     {
         let pin = PinnedDir::open(path)?.ok_or_else(|| {
             reject(format!("{} vanished while it was being checked", path.display()))
         })?;
-        pins.push(pin);
+        Ok(Some(pin))
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        Ok(None)
+    }
 }
 
 fn extract_entries<R: Read + Seek>(
@@ -959,7 +962,7 @@ fn extract_entries<R: Read + Seek>(
                 Err(err) => return Err(err.into()),
             }
             if pinned.insert(current.clone()) {
-                pin_dir(pins, &current)?;
+                pins.extend(pin_dir(&current)?);
             }
         }
         let Some(file_name) = file_name else {
