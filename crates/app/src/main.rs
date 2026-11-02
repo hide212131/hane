@@ -571,6 +571,14 @@ fn hand_off_to_next_process(path: &std::path::Path) {
 
 #[cfg(target_os = "windows")]
 fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
+    // The isolated validation build shares the standard Hane's HKCU keys, so it
+    // refuses both flags instead of registering or removing them.
+    if !hane_ui::context_menu::registration_change_allowed()
+        && (flag == "--register-context-menu" || flag == "--unregister-context-menu")
+    {
+        eprintln!("検証用ビルドでは通常版のExplorer右クリック登録を変更できません。");
+        std::process::exit(2);
+    }
     if flag == "--register-context-menu" {
         let exe = std::env::current_exe().expect("resolve current exe path");
         hane_ui::context_menu::register(&exe).expect("register Explorer context menu");

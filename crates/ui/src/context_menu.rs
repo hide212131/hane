@@ -38,7 +38,33 @@ pub fn current_file_context_menu_state() -> FileContextMenuState {
     }
 }
 
+/// Whether this build may change the per-user Explorer registration. The
+/// isolated `validation-feed` build shares the HKCU keys with the standard Hane
+/// (`HANE_STATE_DIR` does not isolate them), so it must never write or remove
+/// them.
+pub const fn registration_change_allowed() -> bool {
+    !cfg!(feature = "validation-feed")
+}
+
+/// Runs `change` only when registration changes are allowed; otherwise it is
+/// refused without touching the registration.
+fn guard_registration_change<T>(
+    allowed: bool,
+    change: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    if !allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "検証用ビルドでは通常版のExplorer右クリック登録を変更できません",
+        ));
+    }
+    change()
+}
+
 pub fn set_file_context_menu(enabled: bool) -> io::Result<()> {
+    if !registration_change_allowed() {
+        return guard_registration_change(false, || Ok(()));
+    }
     #[cfg(windows)]
     {
         let exe = std::env::current_exe()?;
@@ -856,7 +882,29 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::{inspect, register, register_file, unregister, unregister_file};
+pub use windows::inspect;
+
+#[cfg(windows)]
+pub fn register(exe: &Path) -> io::Result<()> {
+    guard_registration_change(registration_change_allowed(), || windows::register(exe))
+}
+
+#[cfg(windows)]
+pub fn unregister() -> io::Result<()> {
+    guard_registration_change(registration_change_allowed(), windows::unregister)
+}
+
+#[cfg(windows)]
+pub fn register_file(exe: &Path) -> io::Result<()> {
+    guard_registration_change(registration_change_allowed(), || {
+        windows::register_file(exe)
+    })
+}
+
+#[cfg(windows)]
+pub fn unregister_file() -> io::Result<()> {
+    guard_registration_change(registration_change_allowed(), windows::unregister_file)
+}
 
 #[cfg(not(windows))]
 pub fn register(_exe: &Path) -> io::Result<()> {
@@ -866,6 +914,53 @@ pub fn register(_exe: &Path) -> io::Result<()> {
 #[cfg(not(windows))]
 pub fn unregister() -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "Windows only"))
+}
+
+#[cfg(test)]
+mod registration_guard_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // The fake registry stands in for HKCU, so no test touches the real user's
+    // Explorer registration.
+    #[test]
+    fn a_refused_change_leaves_the_standard_registration() {
+        let standard_registered = Cell::new(true);
+        let result = guard_registration_change(false, || {
+            standard_registered.set(false);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(standard_registered.get());
+    }
+
+    #[test]
+    fn an_allowed_change_still_runs() {
+        let registered = Cell::new(true);
+        guard_registration_change(true, || {
+            registered.set(false);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!registered.get());
+    }
+
+    #[test]
+    fn only_the_validation_feed_profile_refuses_changes() {
+        assert_eq!(
+            registration_change_allowed(),
+            !cfg!(feature = "validation-feed")
+        );
+    }
+
+    #[cfg(feature = "validation-feed")]
+    #[test]
+    fn the_validation_profile_refuses_the_settings_file_verb() {
+        let err = set_file_context_menu(true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let err = set_file_context_menu(false).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
 }
 
 #[cfg(test)]
