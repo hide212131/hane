@@ -4151,8 +4151,8 @@ mod tests {
     fn a_competing_writer_waits_for_the_lock_until_the_bundle_is_exchanged() {
         let fx = fixture();
         let user = declare_user_receipt(&fx);
-        let observed: Rc<RefCell<Option<std::sync::mpsc::Receiver<(bool, bool)>>>> =
-            Rc::new(RefCell::new(None));
+        type ObservedReceiver = Option<std::sync::mpsc::Receiver<(bool, bool)>>;
+        let observed: Rc<RefCell<ObservedReceiver>> = Rc::new(RefCell::new(None));
         let (slot, receipt, live, before, journal) = (
             Rc::clone(&observed),
             user.clone(),
