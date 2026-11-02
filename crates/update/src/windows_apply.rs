@@ -1387,7 +1387,6 @@ mod tests {
         let applied = apply_owned_files(&inputs).unwrap();
         assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
         drop(applied);
-        drop(inputs);
 
         let rx = probe.observed.borrow_mut().take().expect("the probe ran under the lock");
         let (journal_exists, install_unchanged) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1403,7 +1402,6 @@ mod tests {
         let mut inputs = fx.inputs();
         inputs.free_space = &probe;
         assert_eq!(apply_owned_files(&inputs).err().unwrap().code, ErrorCode::InsufficientSpace);
-        drop(inputs);
         assert!(fx.unchanged());
         assert!(!fx.journal_path().exists());
 
