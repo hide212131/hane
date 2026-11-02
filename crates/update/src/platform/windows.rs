@@ -1468,12 +1468,14 @@ impl ElevationOs for WindowsElevation {
             Err(_) => false,
         };
         // The coordination directory is created in the install root's parent
-        // before the update, so both must be writable for the standard route.
+        // before the update, so the root must accept files and the parent must
+        // accept the directory the update actually creates there.
         let root_write = super::probe_write_access(install_root);
         let write = match install_root.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            Some(parent) => {
-                crate::elevation::combine_write_access(root_write, super::probe_write_access(parent))
-            }
+            Some(parent) => crate::elevation::combine_write_access(
+                root_write,
+                super::probe_create_dir_access(parent),
+            ),
             None => root_write,
         };
         crate::elevation::PlacementAccess { protected, write }
@@ -1642,6 +1644,26 @@ mod tests {
         ]);
         assert_eq!(roots, vec![std::path::PathBuf::from(r"C:\Program Files")]);
         assert!(absolute_roots([failed()]).is_empty());
+    }
+
+    #[test]
+    fn a_writable_placement_reaches_the_standard_route_without_a_prompt() {
+        // The production probe (file in the root, directory in the parent) feeds
+        // the production route selection: an ordinary writable layout is
+        // neither refused nor elevated.
+        let dir = crate::testing::TempDir::new("placement-route");
+        let root = dir.path().join("app");
+        fs::create_dir(&root).unwrap();
+        let access = WindowsElevation::default().placement_access(&root);
+        assert_eq!(access.write, crate::elevation::WriteAccess::Writable);
+        assert_eq!(
+            crate::elevation::choose_route(
+                access.protected,
+                access.write,
+                crate::elevation::StandardAttempt::NotTried
+            ),
+            crate::elevation::Route::Standard
+        );
     }
 
     #[test]

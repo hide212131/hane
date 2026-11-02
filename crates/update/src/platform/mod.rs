@@ -102,7 +102,6 @@ pub fn system_elevation() -> Box<dyn crate::elevation::ElevationOs> {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn probe_write_access(root: &Path) -> crate::elevation::WriteAccess {
     use crate::elevation::WriteAccess;
-    use std::io::ErrorKind;
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -122,8 +121,40 @@ pub(crate) fn probe_write_access(root: &Path) -> crate::elevation::WriteAccess {
             let _ = fs::remove_file(&probe);
             WriteAccess::Writable
         }
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => WriteAccess::Denied,
-        Err(_) => WriteAccess::Unknown,
+        Err(err) => access_from_error(&err),
+    }
+}
+
+/// Whether the current token can create a directory in `root`, proven by
+/// creating one: the update prepares its coordination directory as a directory
+/// in the install root's parent, where file creation may be forbidden while
+/// directory creation is allowed. Classified like [`probe_write_access`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn probe_create_dir_access(root: &Path) -> crate::elevation::WriteAccess {
+    use crate::elevation::WriteAccess;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let probe = root.join(format!(".hane-dir-probe-{}-{nanos}", std::process::id()));
+    match fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = fs::remove_dir(&probe);
+            WriteAccess::Writable
+        }
+        Err(err) => access_from_error(&err),
+    }
+}
+
+/// A permission error is `Denied`; every other failure is `Unknown`, never a
+/// reason to elevate.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn access_from_error(err: &std::io::Error) -> crate::elevation::WriteAccess {
+    use crate::elevation::WriteAccess;
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        WriteAccess::Denied
+    } else {
+        WriteAccess::Unknown
     }
 }
 
@@ -721,6 +752,27 @@ mod tests {
         assert_eq!(probe_write_access(dir.path()), WriteAccess::Writable);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
         assert_eq!(probe_write_access(&dir.path().join("absent")), WriteAccess::Unknown);
+    }
+
+    #[test]
+    fn the_directory_probe_reports_directory_creation_and_leaves_nothing() {
+        use crate::elevation::WriteAccess;
+        let dir = TempDir::new("dir-probe");
+        assert_eq!(probe_create_dir_access(dir.path()), WriteAccess::Writable);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(probe_create_dir_access(&dir.path().join("absent")), WriteAccess::Unknown);
+    }
+
+    #[test]
+    fn only_a_permission_error_is_denied_access() {
+        use crate::elevation::WriteAccess;
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            access_from_error(&Error::from(ErrorKind::PermissionDenied)),
+            WriteAccess::Denied
+        );
+        assert_eq!(access_from_error(&Error::from(ErrorKind::NotFound)), WriteAccess::Unknown);
+        assert_eq!(access_from_error(&Error::from(ErrorKind::Other)), WriteAccess::Unknown);
     }
 
     #[cfg(not(windows))]
