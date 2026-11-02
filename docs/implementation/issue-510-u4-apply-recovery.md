@@ -79,4 +79,12 @@
 - 管理者権限による昇格、強制終了、自動更新/起動時通信、delta更新、任意file/command実行。
 - #500/#507のPR branch。freeze中の共通open入口は#512で導入済みの境界を使い、両PRの変更を複製しない。
 
+## 昇格helperのreceipt経路の信頼境界
+
+- helperはcandidateの`seen-source`も`state-root.binding`も権限根拠にしない。どちらも通常権限側が書き換えられるため、申告pathの照合にだけ使う。
+- 期待するreceiptの場所は、helper自身のアカウントのOS known folder（Local AppData、環境変数は使わない）の`Hane`から導出する。`HANE_STATE_DIR`などで別の場所を使う場合や、別SIDの資格情報の場合は、昇格先の既定profileへ切り替えず拒否する。
+- 申告pathが導出した場所と一致しなければ、何も開かず・作らず拒否する。
+- 一致した場合も、root・`updates`・install・`receipts`を順にdirectory handleでpinしてから検査する（Windowsでは削除・rename共有を許さないshare modeと`FILE_FLAG_OPEN_REPARSE_POINT`、POSIXでは`O_NOFOLLOW`とdev/inode照合）。lock fileとreceiptも既存のものだけを同じhandleで検査・lock・読込する。helperはlock fileを作らず、存在しなければ拒否する。
+- 未検証の境界: 同一アカウントの通常権限側が、pin前に配置済みの正規receipt内容を書き換えることは防げない（receiptは通常権限側の記録であり、floorの引き上げ＝拒否にしか使わない）。
+
 この文書はClaude実装用PRの準備差分だけであり、製品実装、検証、Issue #510の受入完了を意味しない。

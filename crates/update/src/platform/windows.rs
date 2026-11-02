@@ -1111,6 +1111,40 @@ fn shell_standard_token(expected_sid: &str, expected_session: u32) -> Result<Han
     Ok(primary)
 }
 
+/// The Local AppData folder of the account this process runs as, from the OS
+/// known-folder API for the process token. The environment is not consulted.
+pub fn own_local_app_data() -> Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
+
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the folder id is a valid static GUID, a null token selects the
+    // calling process's account, and `raw` receives a CoTaskMem string.
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, std::ptr::null_mut(), &mut raw) };
+    if hr < 0 || raw.is_null() {
+        if !raw.is_null() {
+            // SAFETY: allocated by the call above.
+            unsafe { CoTaskMemFree(raw.cast::<c_void>()) };
+        }
+        return Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the account's Local AppData folder could not be determined",
+        ));
+    }
+    let mut len = 0usize;
+    // SAFETY: the string is NUL-terminated; the scan stops at the terminator.
+    while unsafe { *raw.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` code units were just read from the same allocation.
+    let units = unsafe { std::slice::from_raw_parts(raw, len) };
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(units));
+    // SAFETY: allocated by `SHGetKnownFolderPath`, freed once.
+    unsafe { CoTaskMemFree(raw.cast::<c_void>()) };
+    Ok(path)
+}
+
 /// Whether an unelevated token of the process's own account can be obtained
 /// here: the precondition of a restart that does not inherit an administrator
 /// token. Nothing is started.

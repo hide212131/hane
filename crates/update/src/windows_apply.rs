@@ -142,29 +142,198 @@ fn record_seen_source(candidate_dir: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Helper side: the application's receipt location, derived without trusting
-/// the candidate directory: `<state root>/updates/<install id>/receipts/` below
-/// the root bound for this transaction (absolute, normalized, owned by the
-/// current principal and closed to other writers). Every directory down to the
-/// receipt must be a plain owned directory, and the receipt an existing plain
-/// file, so no link or foreign parent is followed and nothing is created.
-fn expected_user_receipt(coordination: &Coordination, transaction: &TransactionId) -> Result<PathBuf> {
-    let root = crate::state_root::read_binding(coordination, transaction)?;
-    let updates = root.join("updates");
-    let install = updates.join(coordination.install_id().as_str());
-    let receipts = install.join("receipts");
-    for dir in [&updates, &install, &receipts] {
-        crate::platform::acl::verify(dir, true)?;
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the OS-derived state root in tests.
+    static TRUSTED_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Fixes the state root the helper trusts in a test.
+#[cfg(test)]
+fn set_trusted_state_root(root: Option<PathBuf>) {
+    TRUSTED_ROOT.with(|slot| *slot.borrow_mut() = root);
+}
+
+/// The one state root this helper may derive the application's receipt from:
+/// the default state directory of the helper's own account, taken from the OS
+/// (known folder of the process token). Nothing the requesting side can write
+/// (candidate directory, `state-root.binding`, environment) takes part. A
+/// custom `HANE_STATE_DIR` therefore cannot be verified here and is refused
+/// rather than replaced by another profile's directory.
+fn trusted_state_root() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TRUSTED_ROOT.with(|slot| slot.borrow().clone()) {
+        return Ok(root);
     }
-    let path = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
-    if matches!(fs::symlink_metadata(&path), Err(err) if err.kind() == io::ErrorKind::NotFound) {
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::own_local_app_data().map(|dir| dir.join("Hane"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the trusted state root of the account is not available on this platform",
+        ))
+    }
+}
+
+fn receipt_io(err: io::Error, what: &str) -> UpdateError {
+    if err.kind() == io::ErrorKind::NotFound {
+        UpdateError::new(ErrorCode::NotFound, format!("{what} is missing"))
+    } else {
+        UpdateError::new(ErrorCode::ReceiptUnwritable, format!("{what} cannot be opened: {err}"))
+    }
+}
+
+/// Opens without following a final link. Directories are opened with a share
+/// mode that forbids rename and delete on Windows, so a pinned directory (and
+/// with it every parent) cannot be replaced while the handle lives.
+fn no_follow(options: &mut OpenOptions, directory: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        if directory {
+            flags |= libc::O_DIRECTORY;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        if directory {
+            options
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .share_mode(FILE_SHARE_READ);
+        } else {
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (options, directory);
+}
+
+/// The opened object must be the entry the path names now. Windows relies on
+/// the pinned parents (no rename or replace while they are open); POSIX also
+/// compares device and inode.
+#[cfg(unix)]
+fn same_object(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if opened.dev() != named.dev() || opened.ino() != named.ino() {
         return Err(UpdateError::new(
-            ErrorCode::NotFound,
-            "the application's catalog sequence receipt is missing",
+            ErrorCode::IdentityMismatch,
+            "the application's receipt location changed while it was being checked",
         ));
     }
-    crate::platform::acl::verify(&path, false)?;
-    Ok(path)
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn same_object(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Opens a plain owned directory and keeps the handle: the object that was
+/// checked is the one that stays in place.
+fn pin_dir(path: &Path, what: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options, true);
+    let dir = options.open(path).map_err(|err| receipt_io(err, what))?;
+    if !dir.metadata()?.is_dir() {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, format!("{what} is not a plain directory")));
+    }
+    crate::platform::acl::verify(path, true)?;
+    same_object(&dir, path)?;
+    Ok(dir)
+}
+
+/// Opens an existing plain owned file for the life of the handle; nothing is
+/// created.
+fn pin_file(path: &Path, what: &str, write: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    no_follow(&mut options, false);
+    let file = options.open(path).map_err(|err| receipt_io(err, what))?;
+    if !file.metadata()?.is_file() {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, format!("{what} is not a plain file")));
+    }
+    crate::platform::acl::verify(path, false)?;
+    same_object(&file, path)?;
+    Ok(file)
+}
+
+/// The application's receipt as the helper holds it: the directories down to
+/// it stay pinned, its lock file is locked through the handle that was
+/// checked, and the receipt is read through the handle that was checked. Drop
+/// releases everything.
+struct PinnedReceipt {
+    receipt: File,
+    _lock: File,
+    _dirs: Vec<File>,
+}
+
+/// Helper side: the application's receipt location derived without trusting
+/// the candidate directory or the binding: `<state root>/updates/<install
+/// id>/receipts/` below the account's own trusted state root.
+fn expected_user_receipt(coordination: &Coordination) -> Result<(PathBuf, PathBuf)> {
+    let root = trusted_state_root()?;
+    if !root.is_absolute() {
+        return Err(UpdateError::new(ErrorCode::IdentityMismatch, "the trusted state root is not absolute"));
+    }
+    let receipts = root.join("updates").join(coordination.install_id().as_str()).join("receipts");
+    let receipt = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
+    Ok((root, receipt))
+}
+
+/// Pins the chain from the trusted root down to the receipt (every directory
+/// must be plain, owned and closed to other writers; the lock file and the
+/// receipt must already exist) and takes the lock. A parent or file replaced
+/// by a link or another object is refused, never followed.
+fn open_pinned_receipt(root: &Path, receipt: &Path) -> Result<PinnedReceipt> {
+    let receipts = receipt
+        .parent()
+        .ok_or_else(|| UpdateError::new(ErrorCode::IdentityMismatch, "malformed receipt location"))?;
+    let install = receipts.parent().ok_or_else(|| UpdateError::new(ErrorCode::IdentityMismatch, "malformed receipt location"))?;
+    let updates = install.parent().ok_or_else(|| UpdateError::new(ErrorCode::IdentityMismatch, "malformed receipt location"))?;
+    let mut dirs = Vec::with_capacity(4);
+    for dir in [root, updates, install, receipts] {
+        dirs.push(pin_dir(dir, "the application's receipt directory")?);
+    }
+    let lock = pin_file(&receipt.with_extension("lock"), "the catalog sequence receipt lock", true)?;
+    lock.lock().map_err(|err| {
+        UpdateError::new(
+            ErrorCode::ReceiptUnwritable,
+            format!("the catalog sequence receipt cannot be locked: {err}"),
+        )
+    })?;
+    let file = pin_file(receipt, "the application's catalog sequence receipt", false)?;
+    Ok(PinnedReceipt { receipt: file, _lock: lock, _dirs: dirs })
+}
+
+fn read_pinned_receipt(pinned: &PinnedReceipt) -> Result<SeenCatalog> {
+    let mut data = Vec::new();
+    (&pinned.receipt)
+        .take(crate::limits::MAX_JOURNAL_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|err| {
+            UpdateError::new(
+                ErrorCode::ReceiptUnwritable,
+                format!("the catalog sequence receipt cannot be read: {err}"),
+            )
+        })?;
+    if data.len() as u64 > crate::limits::MAX_JOURNAL_BYTES {
+        return Err(UpdateError::new(ErrorCode::LimitExceeded, "the catalog sequence receipt is too large"));
+    }
+    let seen: SeenCatalog = crate::util::parse_strict(&data)?;
+    seen.validate()?;
+    Ok(seen)
 }
 
 /// Helper side: re-reads the application's receipt now and returns the
@@ -175,7 +344,6 @@ fn expected_user_receipt(coordination: &Coordination, transaction: &TransactionI
 /// receipt is missing, corrupt, unlockable or in conflict is refused.
 fn reconfirm_user_floor(
     coordination: &Coordination,
-    transaction: &TransactionId,
     candidate_dir: &Path,
     coordination_floor: SeenCatalog,
 ) -> Result<(SeenCatalog, Option<Box<dyn Send>>)> {
@@ -187,34 +355,18 @@ fn reconfirm_user_floor(
         .map_err(|_| UpdateError::new(ErrorCode::ReceiptUnwritable, "the sequence receipt path is not valid text"))?;
     // The candidate directory is user-writable, so the declared path is only a
     // claim. The one location this (possibly elevated) helper opens or locks is
-    // derived independently from the validated state root binding and the
-    // install id; anything else is refused before any path is opened.
-    let path = expected_user_receipt(coordination, transaction)?;
+    // derived from the OS profile of its own account; anything else is refused
+    // before any path is opened.
+    let (root, path) = expected_user_receipt(coordination)?;
     if declared != path {
         return Err(UpdateError::new(
             ErrorCode::IdentityMismatch,
             "the declared sequence receipt is not the application's receipt location",
         ));
     }
-    let store = FileSeenStore::new(path);
-    let guard = store.lock().map_err(|err| {
-        UpdateError::new(
-            ErrorCode::ReceiptUnwritable,
-            format!("the catalog sequence receipt cannot be locked: {err}"),
-        )
-    })?;
-    let user = store
-        .load()
-        .map_err(|err| {
-            UpdateError::new(
-                ErrorCode::ReceiptUnwritable,
-                format!("the catalog sequence receipt cannot be read: {err}"),
-            )
-        })?
-        .ok_or_else(|| {
-            UpdateError::new(ErrorCode::NotFound, "the application's catalog sequence receipt is missing")
-        })?;
-    user.validate()?;
+    let pinned = open_pinned_receipt(&root, &path)?;
+    let user = read_pinned_receipt(&pinned)?;
+    let guard: Box<dyn Send> = Box::new(pinned);
     let effective = if user.sequence > coordination_floor.sequence {
         user
     } else if user.sequence == coordination_floor.sequence {
@@ -469,7 +621,7 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<(ApplyPlan, Option<Box<dy
     // The application's own receipt is re-read last and its lock is kept: a
     // service that recorded a higher sequence after the candidate was staged
     // raises the effective floor here, and none can after this point.
-    let (seen, floor_guard) = reconfirm_user_floor(coordination, inputs.transaction, &candidate_dir, seen)?;
+    let (seen, floor_guard) = reconfirm_user_floor(coordination, &candidate_dir, seen)?;
     let candidate = verify_catalog(
         &catalog,
         &signature,
@@ -1344,9 +1496,14 @@ mod tests {
             dir.pop();
         }
         crate::state_root::publish_binding(&fx.coordination, &fx.transaction, &root).unwrap();
+        set_trusted_state_root(Some(root.clone()));
         let path = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
         let ready = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
-        FileSeenStore::new(path.clone()).store(&ready).unwrap();
+        let mut store = FileSeenStore::new(path.clone());
+        store.store(&ready).unwrap();
+        // The application's own writer has created the lock file by now; the
+        // helper never creates it.
+        drop(store.lock().unwrap());
         let dir = fx.coordination.transaction_dir(&fx.transaction).join(CANDIDATE_DIR);
         record_seen_source(&dir, &path).unwrap();
         path
@@ -1532,14 +1689,102 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_receipt_without_a_state_root_binding_is_refused() {
+    fn the_binding_and_the_candidate_claim_are_not_a_source_of_authority() {
+        // Neither a removed nor a rewritten binding changes where the helper
+        // looks: the receipt location comes from the account's own root.
+        let fx = fixture();
+        let genuine = declare_user_receipt(&fx);
+        crate::state_root::discard_binding(&fx.coordination, &fx.transaction);
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+
+        let fx = fixture();
+        let genuine_again = declare_user_receipt(&fx);
+        let elsewhere = fx.placement.coordination_parent.join("elsewhere-state");
+        let receipts = elsewhere
+            .join("updates")
+            .join(fx.placement.install_id.as_str())
+            .join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        let mut dir = receipts.clone();
+        while dir != elsewhere.parent().unwrap() {
+            crate::platform::acl::secure_new(&dir, true, 0o700).unwrap();
+            dir.pop();
+        }
+        let forged = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
+        let ready = FileSeenStore::new(genuine_again.clone()).load().unwrap().unwrap();
+        FileSeenStore::new(forged.clone()).store(&ready).unwrap();
+        // Rebind to the other root and point the claim at its receipt.
+        crate::state_root::publish_binding(&fx.coordination, &fx.transaction, &elsewhere).unwrap();
+        fs::write(fx.candidate_file(CANDIDATE_SEEN_SOURCE), forged.to_str().unwrap()).unwrap();
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::IdentityMismatch
+        );
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+        assert!(!forged.with_extension("lock").exists());
+        let _ = genuine;
+    }
+
+    #[test]
+    fn an_untrusted_state_root_refuses_the_declared_receipt() {
         let fx = fixture();
         let user = declare_user_receipt(&fx);
-        crate::state_root::discard_binding(&fx.coordination, &fx.transaction);
+        set_trusted_state_root(None);
         assert!(apply_owned_files(&fx.inputs()).is_err());
         assert!(fx.unchanged());
         assert!(!fx.journal_path().exists());
+        let _ = user;
+    }
+
+    #[test]
+    fn a_missing_lock_file_is_not_created_by_the_helper() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::remove_file(user.with_extension("lock")).unwrap();
+        assert_eq!(apply_owned_files(&fx.inputs()).err().unwrap().code, ErrorCode::NotFound);
         assert!(!user.with_extension("lock").exists());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_directory_replaced_by_a_link_is_not_followed() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let receipts = user.parent().unwrap().to_path_buf();
+        // A different directory with a complete, valid-looking receipt and lock.
+        let other = fx.placement.coordination_parent.join("swapped");
+        fs::create_dir_all(&other).unwrap();
+        crate::platform::acl::secure_new(&other, true, 0o700).unwrap();
+        let ready = FileSeenStore::new(user.clone()).load().unwrap().unwrap();
+        let mut store = FileSeenStore::new(other.join(crate::platform::lease::SEEN_CATALOG_FILE));
+        store.store(&ready).unwrap();
+        drop(store.lock().unwrap());
+        let moved = receipts.with_file_name("receipts-real");
+        fs::rename(&receipts, &moved).unwrap();
+        std::os::unix::fs::symlink(&other, &receipts).unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+        // The lock of the swapped-in directory was never taken or created anew.
+        assert!(other.join("seen-catalog.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_replaced_by_a_link_is_not_followed() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let target = fx.placement.coordination_parent.join("linked-receipt.json");
+        let ready = FileSeenStore::new(user.clone()).load().unwrap().unwrap();
+        FileSeenStore::new(target.clone()).store(&ready).unwrap();
+        fs::remove_file(&user).unwrap();
+        std::os::unix::fs::symlink(&target, &user).unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
     }
 
     #[test]
