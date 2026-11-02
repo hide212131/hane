@@ -780,17 +780,18 @@ def verify_archive_inventory(archive: Archive, *, prefix: str, inventory_path: s
 def verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust) -> dict:
     """Release verifier: accepts the product bundle identifier only."""
     return _verify_macos_zip(path, version=version, source_sha=source_sha, trust=trust,
-                             bundle_id=MACOS_BUNDLE_ID)
+                             bundle_id=MACOS_BUNDLE_ID, profile=PROFILE_STANDARD)
 
 
 def verify_validation_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust) -> dict:
     """Verifier of the isolated `validation-feed` package (Issue #510): the fixed
     validation bundle identifier only. Never used by the Release path."""
     return _verify_macos_zip(path, version=version, source_sha=source_sha, trust=trust,
-                             bundle_id=VALIDATION_MACOS_BUNDLE_ID)
+                             bundle_id=VALIDATION_MACOS_BUNDLE_ID, profile=PROFILE_VALIDATION_FEED)
 
 
-def _verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust, bundle_id: str) -> dict:
+def _verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust, bundle_id: str,
+                      profile: str) -> dict:
     inventory_path, signature_path = macos_sidecar_paths(version, source_sha)
     sidecar_dir = macos_sidecar_dir(version, source_sha)
     with Archive(path) as archive:
@@ -835,8 +836,11 @@ def _verify_macos_zip(path: Path, *, version: str, source_sha: str, trust: Trust
         # on the extracted app with Apple's own tool.
         for binary in ("Contents/MacOS/hane", "Contents/Helpers/hane-updater"):
             check_macho_signed(archive.read(f"{MACOS_APP}/{binary}"), binary)
+        check_app_profile(archive.read(f"{MACOS_APP}/Contents/MacOS/hane"), version=version,
+                          what="Contents/MacOS/hane", profile=profile)
         check_identity(archive.read(f"{MACOS_APP}/Contents/Helpers/hane-updater"), version=version,
-                       target=MACOS_TARGET, source_sha=source_sha, what="Contents/Helpers/hane-updater")
+                       target=MACOS_TARGET, source_sha=source_sha, what="Contents/Helpers/hane-updater",
+                       profile=profile)
         inventory_sha256 = verify_archive_inventory(
             archive, prefix=f"{MACOS_APP}/", inventory_path=inventory_path, signature_path=signature_path,
             version=version, target=MACOS_TARGET, source_sha=source_sha, layout=MACOS_LAYOUT, trust=trust)
