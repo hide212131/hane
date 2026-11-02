@@ -132,6 +132,23 @@ struct DaclEntry {
     trustee: Trustee,
 }
 
+/// How a DACL ACE type is read. `None` is only for the known audit, alarm and
+/// label types, which grant or deny no access. Every other type that is not a
+/// basic allow or deny (compound, object and callback forms, including the
+/// deny types 6, 10 and 12, or a type not known at all) is `Opaque`, so it
+/// fails closed instead of being skipped.
+#[cfg(any(windows, test))]
+fn ace_entry_kind(ace_type: u8) -> Option<EntryKind> {
+    match ace_type {
+        0 => Some(EntryKind::Allow),
+        1 => Some(EntryKind::Deny),
+        // Audit, alarm (2, 3, 7, 8, 13-16), mandatory label, resource
+        // attribute, scoped policy id, process trust label, access filter.
+        2 | 3 | 7 | 8 | 13..=21 => None,
+        _ => Some(EntryKind::Opaque),
+    }
+}
+
 /// Decides, from a system-owned directory's DACL entries, whether the
 /// requesting user can create entries in it. A write right held by an
 /// unrelated principal, a partial write right of the user, a deny entry that
@@ -850,12 +867,10 @@ mod imp {
                     return Err(failure("an access control entry"));
                 }
                 let header = &*ace.cast::<ACE_HEADER>();
-                let kind = match header.AceType {
-                    0 => EntryKind::Allow,
-                    1 => EntryKind::Deny,
-                    t if OPAQUE_ALLOW_TYPES.contains(&t) => EntryKind::Opaque,
-                    // Audit and other non-access entries grant or deny nothing.
-                    _ => continue,
+                // Only known audit-class entries are skipped; any other
+                // unrecognised access entry is `Opaque` and refused.
+                let Some(kind) = super::ace_entry_kind(header.AceType) else {
+                    continue;
                 };
                 if kind == EntryKind::Opaque {
                     entries.push(DaclEntry {
@@ -1203,6 +1218,27 @@ mod tests {
             classify_dacl(&[system, entry(Deny, Other, false, false)]).unwrap(),
             DirProtection::Protected
         );
+    }
+
+    #[test]
+    fn object_and_callback_deny_aces_are_unknown_never_writable() {
+        use super::{EntryKind, ace_entry_kind, classify_dacl};
+        let system = entry(EntryKind::Allow, super::Trustee::System, true, true);
+        let common_create = entry(EntryKind::Allow, super::Trustee::CommonGroup, true, true);
+        for ace_type in [6u8, 10, 12] {
+            let kind = ace_entry_kind(ace_type).expect("deny forms are access entries");
+            assert_eq!(kind, EntryKind::Opaque);
+            let deny = entry(kind, super::Trustee::Other, false, false);
+            assert!(classify_dacl(&[system, deny, common_create]).is_err());
+            assert!(classify_dacl(&[system, common_create, deny]).is_err());
+        }
+        // An unknown type is an access entry too; only known audit types skip.
+        assert_eq!(ace_entry_kind(200), Some(EntryKind::Opaque));
+        for ace_type in [2u8, 3, 7, 8, 13, 17] {
+            assert_eq!(ace_entry_kind(ace_type), None);
+        }
+        assert_eq!(ace_entry_kind(0), Some(EntryKind::Allow));
+        assert_eq!(ace_entry_kind(1), Some(EntryKind::Deny));
     }
 
     #[cfg(unix)]
