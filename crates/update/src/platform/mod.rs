@@ -165,7 +165,7 @@ pub(crate) fn owner_from(principal: Result<String>) -> Result<String> {
 /// another `InstallId`, with a pending journal overlooked. A mismatch or an
 /// unreadable owner is never `UnsupportedInstall`, so startup stops instead of
 /// treating the install as unmanaged.
-#[cfg(any(target_os = "windows", target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn require_root_owner(owner: Result<String>, principal: Result<String>) -> Result<()> {
     let principal = owner_from(principal)?;
     let owner = owner_from(owner)?;
@@ -179,7 +179,7 @@ pub(crate) fn require_root_owner(owner: Result<String>, principal: Result<String
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn require_install_root_owner(root: &Path) -> Result<()> {
     require_root_owner(acl::directory_owner_id(root), acl::principal_id())
 }
