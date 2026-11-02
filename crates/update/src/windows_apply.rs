@@ -59,6 +59,7 @@ pub const CANDIDATE_DIR: &str = "candidate";
 pub const CANDIDATE_CATALOG: &str = "catalog.json";
 pub const CANDIDATE_SIGNATURE: &str = "catalog.sig";
 pub const CANDIDATE_ARCHIVE: &str = "archive.zip";
+pub const CANDIDATE_SEEN_SOURCE: &str = "seen-source";
 const CHILD_EXE: &str = "hane.exe";
 const STAGE_DIR: &str = "stage";
 const BACKUP_DIR: &str = "backup";
@@ -125,6 +126,79 @@ fn seed_seen_receipt(coordination: &Coordination, source: &Path) -> Result<()> {
         .map_err(|err| unwritable("cannot be stored", err))
 }
 
+/// Records where the application keeps its own sequence receipt, so the helper
+/// can re-read it under the runtime lease. The helper only ever reads it, and
+/// only ever raises its own floor from it (a refusal), never lowers anything.
+fn record_seen_source(candidate_dir: &Path, source: &Path) -> Result<()> {
+    let text = source.to_str().ok_or_else(|| {
+        UpdateError::new(ErrorCode::ReceiptUnwritable, "the sequence receipt path is not valid text")
+    })?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(candidate_dir.join(CANDIDATE_SEEN_SOURCE))?;
+    io::Write::write_all(&mut output, text.as_bytes())?;
+    output.sync_all()?;
+    Ok(())
+}
+
+/// Helper side: re-reads the application's receipt now and returns the
+/// effective floor, the higher of it and `coordination_floor`. The returned
+/// guard holds the receipt's cross-process lock; the caller keeps it until the
+/// first install mutation, so no service can record a higher sequence between
+/// this check and the mutation. A candidate that declared a receipt but whose
+/// receipt is missing, corrupt, unlockable or in conflict is refused.
+fn reconfirm_user_floor(
+    candidate_dir: &Path,
+    coordination_floor: SeenCatalog,
+) -> Result<(SeenCatalog, Option<Box<dyn Send>>)> {
+    let Some(raw) = read_limited(&candidate_dir.join(CANDIDATE_SEEN_SOURCE), 4096)? else {
+        return Ok((coordination_floor, None));
+    };
+    let path = String::from_utf8(raw)
+        .map(PathBuf::from)
+        .map_err(|_| UpdateError::new(ErrorCode::ReceiptUnwritable, "the sequence receipt path is not valid text"))?;
+    if !path.is_absolute() {
+        return Err(UpdateError::new(
+            ErrorCode::ReceiptUnwritable,
+            "the sequence receipt path is not absolute",
+        ));
+    }
+    let store = FileSeenStore::new(path);
+    let guard = store.lock().map_err(|err| {
+        UpdateError::new(
+            ErrorCode::ReceiptUnwritable,
+            format!("the catalog sequence receipt cannot be locked: {err}"),
+        )
+    })?;
+    let user = store
+        .load()
+        .map_err(|err| {
+            UpdateError::new(
+                ErrorCode::ReceiptUnwritable,
+                format!("the catalog sequence receipt cannot be read: {err}"),
+            )
+        })?
+        .ok_or_else(|| {
+            UpdateError::new(ErrorCode::NotFound, "the application's catalog sequence receipt is missing")
+        })?;
+    user.validate()?;
+    let effective = if user.sequence > coordination_floor.sequence {
+        user
+    } else if user.sequence == coordination_floor.sequence {
+        if user.catalog_sha256 != coordination_floor.catalog_sha256 {
+            return Err(UpdateError::new(
+                ErrorCode::SequenceConflict,
+                "same catalog sequence with different bytes",
+            ));
+        }
+        coordination_floor
+    } else {
+        coordination_floor
+    };
+    Ok((effective, Some(guard)))
+}
+
 fn copy_regular(source: &Path, dest: &Path, limit: u64) -> Result<()> {
     let meta = fs::symlink_metadata(source)?;
     if meta.file_type().is_symlink() || !meta.is_file() {
@@ -167,7 +241,11 @@ pub fn stage_candidate(
             copy_regular(source.signature, &dir.join(CANDIDATE_SIGNATURE), MAX_SIGNATURE_BYTES)
         })
         .and_then(|()| copy_regular(source.archive, &dir.join(CANDIDATE_ARCHIVE), MAX_ARCHIVE_BYTES))
-        .and_then(|()| source.seen.map_or(Ok(()), |seen| seed_seen_receipt(coordination, seen)));
+        .and_then(|()| {
+            source.seen.map_or(Ok(()), |seen| {
+                seed_seen_receipt(coordination, seen).and_then(|()| record_seen_source(&dir, seen))
+            })
+        });
     if let Err(err) = copied {
         let _ = fs::remove_dir_all(&dir);
         return Err(err);
@@ -294,7 +372,11 @@ fn read_installed_inventory(root: &Path, policy: &TrustPolicy) -> Result<SignedI
 /// Independently re-verifies placement, install, candidate and archive, stages
 /// the archive and builds the plan from the two signed inventories. Nothing in
 /// the install is changed.
-fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
+///
+/// The returned guard (when the candidate declared the application's receipt)
+/// keeps the sequence floor from advancing; the caller holds it until the first
+/// install mutation.
+fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<(ApplyPlan, Option<Box<dyn Send>>)> {
     let coordination = inputs.coordination;
     let placement = inputs.placement;
     if placement.target != Target::WindowsX64 {
@@ -352,6 +434,10 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
         .ok_or_else(|| {
             UpdateError::new(ErrorCode::NotFound, "the catalog sequence receipt is missing")
         })?;
+    // The application's own receipt is re-read last and its lock is kept: a
+    // service that recorded a higher sequence after the candidate was staged
+    // raises the effective floor here, and none can after this point.
+    let (seen, floor_guard) = reconfirm_user_floor(&candidate_dir, seen)?;
     let candidate = verify_catalog(
         &catalog,
         &signature,
@@ -409,7 +495,7 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<ApplyPlan> {
         &candidate,
     )?;
     check_plan_preconditions(&plan, &FsDiskView::new(&placement.install_root))?;
-    Ok(plan)
+    Ok((plan, floor_guard))
 }
 
 /// Files replaced and awaiting a health verdict.
@@ -435,7 +521,9 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
             "the application process is still running",
         ));
     }
-    let plan = verify_and_plan(inputs)?;
+    // `_floor_guard` lives until this function returns, which is after the
+    // first install mutation.
+    let (plan, _floor_guard) = verify_and_plan(inputs)?;
     // Before the receipts are retired, the backup directory exists or any
     // journal is written: a refusal here leaves the install untouched.
     ensure_free_space(inputs, &plan)?;
@@ -853,7 +941,7 @@ mod tests {
     /// backups, the largest copy and the reserve were counted.
     fn plan_requirement() -> PlanRequirement {
         let fx = fixture();
-        let plan = verify_and_plan(&fx.inputs()).unwrap();
+        let (plan, _guard) = verify_and_plan(&fx.inputs()).unwrap();
         let mut backups = 0_u64;
         let mut largest = 0_u64;
         for step in &plan.steps {
@@ -1209,6 +1297,68 @@ mod tests {
 
         // The fixture's own receipt (same sequence, same bytes) is allowed.
         let fx = fixture();
+        assert!(apply_owned_files(&fx.inputs()).is_ok());
+    }
+
+    /// Declares the application's own receipt for the fixture's staged
+    /// candidate, as `stage_candidate` does when given a `seen` path.
+    fn declare_user_receipt(fx: &Fixture) -> PathBuf {
+        let path = fx.placement.coordination_parent.join("user-receipts").join("seen-catalog.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let ready = FileSeenStore::new(fx.coordination.seen_catalog_path()).load().unwrap().unwrap();
+        FileSeenStore::new(path.clone()).store(&ready).unwrap();
+        let dir = fx.coordination.transaction_dir(&fx.transaction).join(CANDIDATE_DIR);
+        record_seen_source(&dir, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_floor_recorded_in_the_user_receipt_after_staging_rejects_the_candidate() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        // Another service records a higher sequence after the candidate was
+        // staged: only the application's receipt moves.
+        FileSeenStore::new(user).store(&SeenCatalog::new(3, "b".repeat(64))).unwrap();
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::SequenceRegression
+        );
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[test]
+    fn the_user_receipt_with_other_bytes_for_the_same_sequence_is_rejected() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        FileSeenStore::new(user).store(&SeenCatalog::new(2, "b".repeat(64))).unwrap();
+        assert_eq!(
+            apply_owned_files(&fx.inputs()).err().unwrap().code,
+            ErrorCode::SequenceConflict
+        );
+        assert!(fx.unchanged());
+    }
+
+    #[test]
+    fn a_declared_but_missing_or_corrupt_user_receipt_fails_closed() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::remove_file(&user).unwrap();
+        assert_eq!(apply_owned_files(&fx.inputs()).err().unwrap().code, ErrorCode::NotFound);
+        assert!(fx.unchanged());
+
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        fs::write(&user, b"{not json").unwrap();
+        assert!(apply_owned_files(&fx.inputs()).is_err());
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[test]
+    fn an_unchanged_user_receipt_still_applies() {
+        let fx = fixture();
+        declare_user_receipt(&fx);
         assert!(apply_owned_files(&fx.inputs()).is_ok());
     }
 

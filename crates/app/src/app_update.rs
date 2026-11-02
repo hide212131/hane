@@ -2615,6 +2615,7 @@ mod tests {
     }
 
     fn write_floor(path: &Path, sequence: u64, fill: char) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut store = FileSeenStore::new(path.to_path_buf());
         store
             .store(&hane_update::trust::SeenCatalog::new(sequence, fill.to_string().repeat(64)))
