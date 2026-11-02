@@ -921,6 +921,14 @@ pub fn recover_pending_with(
             "the journal belongs to another transaction or installation".to_owned(),
         ));
     }
+    // Before anything is restored: the journal and the backups are writable by
+    // the requesting account, so a protected transaction recovers only a plan
+    // that matches the seal the elevated helper stored in the protected parent.
+    if let Err(err) = crate::recovery_seal::verify_if_protected(coord, journal.journal()) {
+        return Ok(RecoveryReport::RecoveryRequired(bounded_reason(&format!(
+            "the recovery plan cannot be trusted; the journal and backups are kept: {err}"
+        ))));
+    }
     let placement = crate::platform::find_install(coord)?;
     let recovered = if placement.target == Target::MacosArm64 {
         match bundle_host {

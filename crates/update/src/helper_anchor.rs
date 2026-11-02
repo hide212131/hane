@@ -36,12 +36,12 @@ pub(crate) type VerifyProtected<'a> = &'a dyn Fn(&Path) -> Result<()>;
 /// system principal, so a test build checks only that the entry is a plain file,
 /// unless the test asks for a refusal with [`test_support::refuse_protection`].
 #[cfg(not(test))]
-fn protected(path: &Path) -> Result<()> {
+pub(crate) fn protected(path: &Path) -> Result<()> {
     crate::platform::acl::verify_protected(path)
 }
 
 #[cfg(test)]
-fn protected(path: &Path) -> Result<()> {
+pub(crate) fn protected(path: &Path) -> Result<()> {
     if test_support::REFUSE.with(std::cell::Cell::get) {
         return Err(UpdateError::new(ErrorCode::UnsupportedInstall, "not protected"));
     }
@@ -218,6 +218,9 @@ pub(crate) fn retire_in(
     install_id: &InstallId,
     transaction: &TransactionId,
 ) -> Result<()> {
+    // The recovery seal goes first: if it cannot be removed the record stays,
+    // and the next sweep retries both.
+    crate::recovery_seal::retire_in(parent, install_id, transaction)?;
     match remove_file_durable(&anchor_path(parent, install_id, transaction)) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),

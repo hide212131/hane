@@ -213,6 +213,52 @@ impl UpdateJournal {
         Ok(())
     }
 
+    /// Digest of everything a recovery acts on: the install and transaction, the
+    /// plan, both releases, and per step the path, the old and new identities and
+    /// the backup path, plus the unchanged files. Progress (phase, step states,
+    /// generation) is not part of it, so the digest of the journal as first
+    /// written still matches the journal at any later point.
+    pub fn recovery_digest(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct SealedStep<'a> {
+            rel_path: &'a str,
+            old: &'a Option<FileIdentity>,
+            new: &'a Option<FileIdentity>,
+            backup_rel: &'a Option<String>,
+        }
+        #[derive(Serialize)]
+        struct Sealed<'a> {
+            transaction_id: &'a TransactionId,
+            install_id: &'a InstallId,
+            plan_hash: &'a str,
+            source: &'a ReleaseIdentity,
+            destination: &'a ReleaseIdentity,
+            steps: Vec<SealedStep<'a>>,
+            unchanged: &'a [UnchangedFile],
+        }
+        let sealed = Sealed {
+            transaction_id: &self.transaction_id,
+            install_id: &self.install_id,
+            plan_hash: &self.plan_hash,
+            source: &self.source,
+            destination: &self.destination,
+            steps: self
+                .steps
+                .iter()
+                .map(|step| SealedStep {
+                    rel_path: &step.rel_path,
+                    old: &step.old,
+                    new: &step.new,
+                    backup_rel: &step.backup_rel,
+                })
+                .collect(),
+            unchanged: &self.unchanged,
+        };
+        let bytes = serde_json::to_vec(&sealed)
+            .map_err(|err| UpdateError::new(ErrorCode::Io, err.to_string()))?;
+        Ok(crate::util::sha256_hex(&bytes))
+    }
+
     pub fn transition(&mut self, next: Phase) -> Result<()> {
         if !self.phase.may_follow(next) {
             return Err(UpdateError::new(

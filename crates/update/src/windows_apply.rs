@@ -454,6 +454,10 @@ pub fn apply_owned_files(inputs: &ApplyInputs<'_>) -> Result<AppliedFiles> {
     fs::create_dir_all(&backup)?;
 
     let journal = UpdateJournal::begin(&plan, None)?;
+    // A protected placement's recovery plan is sealed in the protected
+    // coordination parent before the journal exists and before any mutation: an
+    // elevated recovery trusts that seal, never the user-writable journal alone.
+    crate::recovery_seal::seal_if_protected(inputs.coordination, &journal)?;
     let store = FileJournalStore::new(inputs.coordination.journal_path(inputs.transaction));
     let mut journal = DurableJournal::create(store, journal)?;
     let ops = FsFileOps::new(

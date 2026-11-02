@@ -54,6 +54,7 @@ pub mod paths;
 pub mod platform;
 mod pinned;
 pub mod protocol;
+pub(crate) mod recovery_seal;
 pub mod release;
 pub(crate) mod relocation;
 pub mod root_guard;
