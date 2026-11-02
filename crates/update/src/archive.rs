@@ -897,24 +897,31 @@ pub(crate) fn extract_archive_held<R: Read + Seek>(
     inspected: &InspectedArchive,
     stage: &Path,
 ) -> Result<Vec<PinnedDir>> {
-    let mut pins: Vec<PinnedDir> = Vec::new();
-    pins.extend(pin_dir(stage)?);
+    let mut pins: Vec<(PathBuf, PinnedDir)> = Vec::new();
+    pins.extend(pin_dir(stage)?.map(|pin| (stage.to_path_buf(), pin)));
     prepare_stage(stage)?;
     let mut created: Vec<(PathBuf, bool)> = Vec::new();
     let result = extract_entries(reader, inspected, stage, &mut created, &mut pins);
     if let Err(err) = result {
-        // Pinned directories cannot be removed, so release them first.
-        drop(pins);
+        // Every ancestor stays pinned while its children are removed, so no
+        // name can be redirected by a junction mid-cleanup. Children are
+        // removed before their parents (reverse creation order); only the
+        // directory about to be removed has its own pin released first, and
+        // removing a replaced junction would delete just the link itself.
         for (path, is_dir) in created.iter().rev() {
-            let _ = if *is_dir {
-                fs::remove_dir(path)
+            if *is_dir {
+                if let Some(index) = pins.iter().position(|(pinned, _)| pinned == path) {
+                    drop(pins.remove(index));
+                }
+                let _ = fs::remove_dir(path);
             } else {
-                fs::remove_file(path)
-            };
+                let _ = fs::remove_file(path);
+            }
         }
+        drop(pins);
         return Err(err);
     }
-    Ok(pins)
+    Ok(pins.into_iter().map(|(_, pin)| pin).collect())
 }
 
 /// Windows: holds `path` as a verified non-reparse directory. A link, a
@@ -939,7 +946,7 @@ fn extract_entries<R: Read + Seek>(
     inspected: &InspectedArchive,
     stage: &Path,
     created: &mut Vec<(PathBuf, bool)>,
-    pins: &mut Vec<PinnedDir>,
+    pins: &mut Vec<(PathBuf, PinnedDir)>,
 ) -> Result<()> {
     let mut pinned: HashSet<PathBuf> = HashSet::new();
     for entry in &inspected.entries {
@@ -962,7 +969,7 @@ fn extract_entries<R: Read + Seek>(
                 Err(err) => return Err(err.into()),
             }
             if pinned.insert(current.clone()) {
-                pins.extend(pin_dir(&current)?);
+                pins.extend(pin_dir(&current)?.map(|pin| (current.clone(), pin)));
             }
         }
         let Some(file_name) = file_name else {
