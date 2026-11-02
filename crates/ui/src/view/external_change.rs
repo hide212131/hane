@@ -115,11 +115,23 @@ impl EditorView {
             return;
         };
         let files = self.files.clone();
+        // Test-only pause points (see `external_read_gate`); absent from
+        // builds without the `instrument` feature.
+        #[cfg(feature = "instrument")]
+        let gate = super::external_read_gate::admit(request.path());
         cx.spawn(async move |view, cx| {
             let (ticket, result) = cx
                 .background_executor()
                 .spawn(async move {
+                    #[cfg(feature = "instrument")]
+                    if let Some(gate) = &gate {
+                        gate.hold(super::external_read_gate::Stage::Reading);
+                    }
                     let result = run_external_check(files.as_ref(), &request);
+                    #[cfg(feature = "instrument")]
+                    if let Some(gate) = &gate {
+                        gate.hold(super::external_read_gate::Stage::Applying);
+                    }
                     (request.ticket, result)
                 })
                 .await;

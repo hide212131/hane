@@ -109,6 +109,12 @@ use editor_context_menu::EditorContextMenu;
 mod document_watch;
 mod external_change;
 mod external_comparison;
+#[cfg(any(test, feature = "instrument"))]
+#[cfg_attr(
+    not(feature = "instrument"),
+    allow(dead_code, reason = "the call sites exist only in `instrument` builds")
+)]
+mod external_read_gate;
 use external_change::{ResolutionAction, ResolutionChoices};
 mod folder_watch;
 mod footer;

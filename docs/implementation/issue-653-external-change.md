@@ -100,6 +100,23 @@ baselineと観測外部版を分け、内容fingerprint・file identityで同sta
 - テスト（未実行）: `external_comparison.rs` に、開く／閉じるで本文・revision・dirty・ディスク内容が不変、手元編集・外部版更新・文書置換後のstale／Gone、再比較、観測なしで開かない、footer actionとstale時の再読込・上書き・別名保存の拒否、行範囲・行数上限の単体テスト。undo/redo・draftの直接検証、IME中の比較は追加していない。
 - 未実行: build・tests・Clippy（macOS / Windows）、focused GUI（T04）。
 
+### T03 / T07 決定的GUI確認用の読込gate（Claude worker、未検証）
+
+このworkerはshell・test・build・lintを実行していない。コードを書いた範囲の記録であり、検証済みを意味しない。
+
+- `crates/ui/src/view/external_read_gate.rs`（新規）: 外部変更確認の背景readを、`instrument` featureのDebug build限定で2段階に保留する。通常build・release・配布物には呼び出し点（`external_change.rs` の `start_external_check`）自体がコンパイルされず、既定では無効。環境変数 `HANE_EXTERNAL_READ_GATE_DIR` を指定した場合だけ有効になる。
+- 段階: `read`（要求発行後、ファイルを読む前＝T03のread進行中）、`apply`（旧版を読み終え、UIへ適用する直前＝T07）。
+- 任意の絞り込み: `HANE_EXTERNAL_READ_GATE_FILE`（ファイル名のみ。pathではない）、`HANE_EXTERNAL_READ_GATE_STAGES`（`read` / `apply` / `read,apply`、既定は両方）。
+- 観測・解放（gateディレクトリ内、要求は開始順の `rNNNN`。利用者の実path・内容は書かない）:
+  - `rNNNN.<stage>.waiting`: 保留中。作成されてから背景threadが待つため、存在がその状態の証拠になる。
+  - `rNNNN.<stage>.release`: 検証者が作ると続行する（消費され、`.released` が残る）。
+  - `rNNNN.<stage>.expired`: 300秒解放されず自動続行した印。この場合の結果は証拠にしない。
+- 待ち合わせは明示的な `.waiting` / `.release` の同期で行い、sleepや遅延秒数を合否の根拠にしない（内部のポーリング間隔は合否に関与しない）。
+- 手順 T03: gateディレクトリを空で用意し `HANE_EXTERNAL_READ_GATE_DIR` / `…_STAGES=read` を付けてDebug候補を起動 → 対象文書を開く（初回確認の `rNNNN.read.waiting` は必要なら先に `release`）→ 外部でファイルを書き換え、`.read.waiting` の出現を待つ → 本文でIME未確定入力を開始して保持 → `.read.release` を作成 → 本文・IME未確定文字列・競合通知を確認する。
+- 手順 T07: `…_STAGES=apply` で起動 → 版Bの文書を開き、外部で変更して `rNNNN.apply.waiting`（Bの結果）を待つ → 文書を閉じ、同じpathに版Cを置いて開く（Cの初回確認の `apply.waiting` が出る場合は、Bとは別の `rNNNN` として扱う）→ Bの `.apply.release` を作成 → Cの本文が置換されないことを確認し、最後にCを解放する。
+- テスト（未実行）: `external_read_gate.rs` に、無効時、連番識別子に実pathが含まれないこと、ファイル名絞り込み、段階選択、保留の観測と解放、別要求の解放が混ざらないこと、の直接関連テスト。
+- 未実行: build・tests・Clippy、Windows focused GUI（T03 / T07）。
+
 ### 実装済みと、受入に未確認・未測定の残条件
 
 実装済みであることは受入済みを意味しない。
