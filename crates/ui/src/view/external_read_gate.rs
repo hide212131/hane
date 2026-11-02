@@ -17,17 +17,25 @@
 //! The gate is off unless `HANE_EXTERNAL_READ_GATE_DIR` names a directory.
 //! Product builds do not compile the call sites (`feature = "instrument"`).
 //!
-//! Protocol, in that directory, per request `rNNNN` and stage `read` / `apply`:
+//! Protocol: each process run creates its own subdirectory
+//! `run-<pid>-<nanos>-<n>` inside that directory (when its first request is
+//! held), and uses it for all markers, so a restart that reuses the same gate
+//! directory never meets markers of an earlier run. The validator uses the
+//! newest `run-*` directory created after launching the app. Inside it, per
+//! request `rNNNN` and stage `read` / `apply`:
 //!
 //! - `rNNNN.<stage>.waiting`: the request is held here. Created before the
 //!   check blocks, so seeing it proves the state.
 //! - `rNNNN.<stage>.release`: created by the validator to let it continue.
-//! - `rNNNN.<stage>.released`: the check continued (the release file is
-//!   consumed and the waiting file removed first).
+//!   It is consumed (deleted) when the check continues.
+//! - `rNNNN.<stage>.released`: the check continued after a release. Published
+//!   only after `waiting` was removed, so `waiting` and a completed marker are
+//!   never both present as evidence.
 //! - `rNNNN.<stage>.expired`: nobody released it within [`MAX_HOLD`]; the
-//!   check continued on its own and the run must not count as evidence.
+//!   check continued on its own (same ordering) and the run must not count as
+//!   evidence.
 //!
-//! Requests are numbered in the order they start. The user's file path and
+//! Requests are numbered in the order they start within a run. The user's file path and
 //! content are never written; `HANE_EXTERNAL_READ_GATE_FILE` limits the gate to
 //! files with that name (the name only, not a path) and
 //! `HANE_EXTERNAL_READ_GATE_STAGES` (`read`, `apply` or `read,apply`, default
@@ -114,8 +122,19 @@ impl ReadGate {
                 list.split(',').any(|item| item.trim() == "apply"),
             ),
         };
+        // Every process run gets its own subdirectory, so markers left by an
+        // earlier run in the same gate directory are never taken for this one.
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let run = format!(
+            "run-{}-{nanos}-{}",
+            std::process::id(),
+            RUNS.fetch_add(1, Ordering::Relaxed)
+        );
         Some(Self {
-            dir,
+            dir: dir.join(run),
             file_name: file_name.filter(|value| !value.is_empty()),
             reading,
             applying,
@@ -183,8 +202,10 @@ impl GateRequest {
             }
             std::thread::sleep(POLL_INTERVAL);
         };
-        let _ = std::fs::write(self.marker(stage, outcome), outcome);
+        // Withdraw `waiting` before publishing the completed marker, so an
+        // observer never sees both at once.
         let _ = std::fs::remove_file(self.marker(stage, "waiting"));
+        let _ = std::fs::write(self.marker(stage, outcome), outcome);
     }
 }
 
@@ -271,6 +292,42 @@ mod tests {
         assert!(!request.marker(Stage::Applying, "release").exists());
         assert!(request.marker(Stage::Applying, "released").exists());
         assert!(!request.marker(Stage::Applying, "expired").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_in_the_same_directory_does_not_see_old_markers() {
+        let dir = gate_dir("restart");
+        let old = gate(&dir, None, None).admit(Path::new("a.md")).expect("admitted");
+        old.announce(Stage::Reading);
+        std::fs::write(old.marker(Stage::Reading, "release"), "").expect("release");
+        std::fs::write(old.marker(Stage::Reading, "released"), "released").expect("old");
+
+        let new = gate(&dir, None, None).admit(Path::new("a.md")).expect("admitted");
+        assert_eq!(old.id, new.id);
+        assert_ne!(old.dir, new.dir);
+        assert!(new.dir.starts_with(&dir));
+        assert!(!new.marker(Stage::Reading, "waiting").exists());
+        assert!(!new.marker(Stage::Reading, "release").exists());
+
+        // The old release does not free the new request.
+        new.announce(Stage::Reading);
+        new.wait_for_release(Stage::Reading, Duration::ZERO);
+        assert!(new.marker(Stage::Reading, "expired").exists());
+        assert!(!new.marker(Stage::Reading, "released").exists());
+        assert!(old.marker(Stage::Reading, "release").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waiting_is_gone_once_a_completed_marker_exists() {
+        let dir = gate_dir("exclusive");
+        let request = gate(&dir, None, None).admit(Path::new("a.md")).expect("admitted");
+        request.announce(Stage::Reading);
+        request.wait_for_release(Stage::Reading, Duration::ZERO);
+        let waiting = request.marker(Stage::Reading, "waiting").exists();
+        let expired = request.marker(Stage::Reading, "expired").exists();
+        assert!(expired && !waiting);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
