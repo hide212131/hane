@@ -263,7 +263,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     // Earlier builds kept the floor in the coordination receipts. It is carried
     // into the user's receipts before any check uses the floor.
     let legacy_seen = match &located {
-        Ok(placement) => placement.coordination().ok().map(|c| c.seen_catalog_path()),
+        Ok(placement) => Some(legacy_seen_path(&placement.coordination_parent, &placement.install_id)),
         Err(_) => None,
     };
     let updates_root = state.root().join("updates").join(install_id.as_str());
@@ -297,6 +297,46 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
         Err(error) => service.block_placement(&error, &exe),
     }
     Some(service)
+}
+
+/// Where earlier builds kept the sequence floor. Derived from the placement
+/// alone, without creating the coordination directory, so a transient failure
+/// to create it cannot make the old floor unreadable and accept a lower sequence.
+fn legacy_seen_path(parent: &Path, install_id: &InstallId) -> PathBuf {
+    hane_update::platform::lease::Coordination::receipts_dir_for(parent, install_id)
+        .join(hane_update::platform::lease::SEEN_CATALOG_FILE)
+}
+
+#[cfg(test)]
+mod legacy_seen_path_tests {
+    use super::legacy_seen_path;
+    use hane_update::identity::{InstallFacts, InstallId};
+    use hane_update::testing::TempDir;
+
+    #[test]
+    fn legacy_path_is_derived_without_creating_the_coordination_directory() {
+        let parent = TempDir::new("legacy-seen-path");
+        let install_id = InstallId::derive(&InstallFacts {
+            os: "test-os",
+            volume_id: "vol",
+            install_path: "/install/hane",
+            owner: "owner",
+        })
+        .expect("install id");
+        let path = legacy_seen_path(parent.path(), &install_id);
+        assert_eq!(
+            path,
+            parent
+                .path()
+                .join(install_id.coordination_dir_name())
+                .join("receipts")
+                .join("seen-catalog.json")
+        );
+        assert!(
+            !parent.path().join(install_id.coordination_dir_name()).exists(),
+            "deriving the legacy receipt path must not create the coordination directory"
+        );
+    }
 }
 
 fn start_ai_service() -> Option<AiService> {
