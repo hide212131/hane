@@ -1304,9 +1304,12 @@ impl Inner {
         #[cfg(target_os = "windows")]
         {
             let receipt = self.config.receipts_dir.join(SEEN_FILE);
-            let checked = wiring.placement.coordination().and_then(|coordination| {
-                hane_update::windows_apply::ensure_receipt_matches_trusted_root(&coordination, &receipt)
-            });
+            // Derived from the install id only: the coordination directory is
+            // created later by the elevated bootstrap, never by this check.
+            let checked = hane_update::windows_apply::ensure_receipt_matches_trusted_root(
+                &wiring.placement.install_id,
+                &receipt,
+            );
             if let Err(err) = checked {
                 self.prepare_failure(&err, Some(&version));
                 return Err(format!(

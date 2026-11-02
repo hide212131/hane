@@ -40,7 +40,7 @@ use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
 use crate::fsutil::{FileSeenStore, hash_regular_file, read_limited};
 use crate::health::{HealthLauncher, LaunchFailure, LaunchRequest, Settled, conclude_with_child};
-use crate::identity::{ApplyPlan, SignedInventory, TransactionId};
+use crate::identity::{ApplyPlan, InstallId, SignedInventory, TransactionId};
 use crate::journal::{
     DurableJournal, FileJournalStore, FsDiskView, Phase, UpdateJournal, check_plan_preconditions,
 };
@@ -283,11 +283,17 @@ struct PinnedReceipt {
 /// the candidate directory or the binding: `<state root>/updates/<install
 /// id>/receipts/` below the account's own trusted state root.
 fn expected_user_receipt(coordination: &Coordination) -> Result<(PathBuf, PathBuf)> {
+    expected_user_receipt_for(coordination.install_id())
+}
+
+/// The same derivation from the install id alone, so the application can run it
+/// before any coordination directory exists. Reads only; nothing is created.
+fn expected_user_receipt_for(install_id: &InstallId) -> Result<(PathBuf, PathBuf)> {
     let root = trusted_state_root()?;
     if !root.is_absolute() {
         return Err(UpdateError::new(ErrorCode::IdentityMismatch, "the trusted state root is not absolute"));
     }
-    let receipts = root.join("updates").join(coordination.install_id().as_str()).join("receipts");
+    let receipts = root.join("updates").join(install_id.as_str()).join("receipts");
     let receipt = receipts.join(crate::platform::lease::SEEN_CATALOG_FILE);
     Ok((root, receipt))
 }
@@ -298,8 +304,8 @@ fn expected_user_receipt(coordination: &Coordination) -> Result<(PathBuf, PathBu
 /// The helper would reject it at apply time, after the application was allowed
 /// to quit; detecting it here keeps the running application open. Only reads
 /// the OS-derived path; nothing is opened or written.
-pub fn ensure_receipt_matches_trusted_root(coordination: &Coordination, seen: &Path) -> Result<()> {
-    let (_, expected) = expected_user_receipt(coordination)?;
+pub fn ensure_receipt_matches_trusted_root(install_id: &InstallId, seen: &Path) -> Result<()> {
+    let (_, expected) = expected_user_receipt_for(install_id)?;
     if seen != expected {
         return Err(UpdateError::new(
             ErrorCode::IdentityMismatch,
@@ -1538,7 +1544,7 @@ mod tests {
     fn receipt_outside_the_trusted_root_is_refused_before_the_helper_starts() {
         let fx = fixture();
         let matching = declare_user_receipt(&fx);
-        assert!(ensure_receipt_matches_trusted_root(&fx.coordination, &matching).is_ok());
+        assert!(ensure_receipt_matches_trusted_root(&fx.placement.install_id, &matching).is_ok());
 
         let custom = fx
             .placement
@@ -1548,9 +1554,28 @@ mod tests {
             .join(fx.placement.install_id.as_str())
             .join("receipts")
             .join(crate::platform::lease::SEEN_CATALOG_FILE);
-        let err = ensure_receipt_matches_trusted_root(&fx.coordination, &custom).unwrap_err();
+        let err = ensure_receipt_matches_trusted_root(&fx.placement.install_id, &custom).unwrap_err();
         assert_eq!(err.code, ErrorCode::IdentityMismatch);
         assert!(err.detail.contains("custom-state"));
+        set_trusted_state_root(None);
+    }
+
+    #[test]
+    fn the_pre_check_does_not_create_the_coordination_directory() {
+        let fx = fixture();
+        let matching = declare_user_receipt(&fx);
+        let coordination_dir = fx
+            .placement
+            .coordination_parent
+            .join(fx.placement.install_id.coordination_dir_name());
+        fs::remove_dir_all(&coordination_dir).unwrap();
+
+        assert!(ensure_receipt_matches_trusted_root(&fx.placement.install_id, &matching).is_ok());
+        assert!(!coordination_dir.exists());
+
+        let custom = fx.placement.coordination_parent.join("custom-state").join("seen.json");
+        assert!(ensure_receipt_matches_trusted_root(&fx.placement.install_id, &custom).is_err());
+        assert!(!coordination_dir.exists());
         set_trusted_state_root(None);
     }
 
