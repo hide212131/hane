@@ -151,7 +151,7 @@ thread_local! {
 
 /// Fixes the state root the helper trusts in a test.
 #[cfg(test)]
-fn set_trusted_state_root(root: Option<PathBuf>) {
+pub(crate) fn set_trusted_state_root(root: Option<PathBuf>) {
     TRUSTED_ROOT.with(|slot| *slot.borrow_mut() = root);
 }
 
@@ -170,13 +170,46 @@ fn trusted_state_root() -> Result<PathBuf> {
     {
         crate::platform::windows::own_local_app_data().map(|dir| dir.join("Hane"))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        own_home_dir().map(|dir| dir.join("Library").join("Application Support").join("Hane"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Err(UpdateError::new(
             ErrorCode::UnsupportedInstall,
             "the trusted state root of the account is not available on this platform",
         ))
     }
+}
+
+/// The home directory of the helper's own account from the user database, never
+/// from `HOME` or anything else the requesting side could influence.
+#[cfg(target_os = "macos")]
+fn own_home_dir() -> Result<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    let unavailable = || UpdateError::new(ErrorCode::UnsupportedInstall, "the home directory of the account cannot be determined");
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero `passwd` is a valid value for `getpwuid_r` to fill.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer refers to a live local, and `buffer.len()` is its
+    // exact size; `geteuid` has no preconditions.
+    let status = unsafe {
+        libc::getpwuid_r(libc::geteuid(), &mut entry, buffer.as_mut_ptr(), buffer.len(), &mut found)
+    };
+    if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return Err(unavailable());
+    }
+    // SAFETY: `pw_dir` is a NUL-terminated string inside `buffer`, which is
+    // still alive.
+    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
+    let dir = PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
+    if !dir.is_absolute() {
+        return Err(unavailable());
+    }
+    Ok(dir)
 }
 
 fn receipt_io(err: io::Error, what: &str) -> UpdateError {
@@ -370,7 +403,7 @@ fn read_pinned_receipt(pinned: &PinnedReceipt) -> Result<SeenCatalog> {
 /// first install mutation, so no service can record a higher sequence between
 /// this check and the mutation. A candidate that declared a receipt but whose
 /// receipt is missing, corrupt, unlockable or in conflict is refused.
-fn reconfirm_user_floor(
+pub(crate) fn reconfirm_user_floor(
     coordination: &Coordination,
     candidate_dir: &Path,
     coordination_floor: SeenCatalog,

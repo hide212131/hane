@@ -1301,7 +1301,7 @@ impl Inner {
         // The helper derives the receipt from the OS account's Local AppData and
         // refuses anything else at apply time. Check that before the helper is
         // started, so the application never gets an exit permit it cannot use.
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let receipt = self.config.receipts_dir.join(SEEN_FILE);
             // Derived from the install id only: the coordination directory is
