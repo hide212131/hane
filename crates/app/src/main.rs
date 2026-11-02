@@ -260,6 +260,12 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             (install_id, receipts)
         }
     };
+    // Earlier builds kept the floor in the coordination receipts. It is carried
+    // into the user's receipts before any check uses the floor.
+    let legacy_seen = match &located {
+        Ok(placement) => placement.coordination().ok().map(|c| c.seen_catalog_path()),
+        Err(_) => None,
+    };
     let updates_root = state.root().join("updates").join(install_id.as_str());
     let service = Arc::new(app_update::AppUpdateService::new(
         app_update::UpdateServiceConfig {
@@ -272,6 +278,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             install_id,
             updates_root,
             receipts_dir,
+            legacy_seen,
         },
         Arc::new(https_transport::LazyHttpsTransport::new(Arc::new(network_context))),
         Arc::new(SystemClock::new()),

@@ -62,6 +62,43 @@ pub struct UpdateServiceConfig {
     /// written before the user chooses to apply. The helper carries the floor
     /// into the coordination receipts once that exists.
     pub receipts_dir: PathBuf,
+    /// The earlier location of the sequence floor (the coordination receipts of
+    /// a supported install). A valid floor found there is carried into
+    /// `receipts_dir` before any check or restore uses the floor; an unreadable
+    /// or conflicting one refuses instead of meaning "no floor".
+    pub legacy_seen: Option<PathBuf>,
+}
+
+/// Carries a floor stored at the earlier location into the user's receipts.
+/// The stored floor never goes down: a higher one stays, and the same sequence
+/// with different catalog bytes is a conflict. A missing legacy file is the
+/// normal case; a corrupt or unreadable one is a refusal.
+fn migrate_legacy_floor(legacy: &Path, target: &Path) -> Result<(), UpdateError> {
+    let Some(carried) = FileSeenStore::new(legacy.to_path_buf()).load()? else {
+        return Ok(());
+    };
+    carried.validate()?;
+    if let Some(parent) = target.parent() {
+        create_private_dir(parent)?;
+    }
+    let mut store = FileSeenStore::new(target.to_path_buf());
+    let _guard = store.lock()?;
+    if let Some(existing) = store.load()? {
+        existing.validate()?;
+        if existing.sequence > carried.sequence {
+            return Ok(());
+        }
+        if existing.sequence == carried.sequence {
+            if existing.catalog_sha256 != carried.catalog_sha256 {
+                return Err(UpdateError::new(
+                    ErrorCode::SequenceConflict,
+                    "same catalog sequence with different bytes",
+                ));
+            }
+            return Ok(());
+        }
+    }
+    store.store(&carried)
 }
 
 /// What the service needs to hand a Ready update to the helper. A service
@@ -532,6 +569,15 @@ impl Inner {
         FileSeenStore::new(self.config.receipts_dir.join(SEEN_FILE))
     }
 
+    /// Loads the sequence floor after carrying over one from the earlier
+    /// location, so no check or restore runs with a lower floor than recorded.
+    fn load_floor(&self) -> Result<Option<hane_update::trust::SeenCatalog>, UpdateError> {
+        if let Some(legacy) = &self.config.legacy_seen {
+            migrate_legacy_floor(legacy, &self.config.receipts_dir.join(SEEN_FILE))?;
+        }
+        self.seen_store().load()
+    }
+
     /// Runs `task` in the background. If the runner cannot start it, the
     /// operation identified by `op` fails instead of waiting forever.
     fn dispatch(self: &Arc<Self>, op: u64, task: Task) {
@@ -670,7 +716,7 @@ impl Inner {
         let deadline = fetcher.metadata_deadline();
         let selection = fetcher.check_latest_within(&current, target, &deadline, cancel)?;
         let (catalog, signature) = fetcher.fetch_catalog_within(&selection, &deadline, cancel)?;
-        let seen = self.seen_store().load()?;
+        let seen = self.load_floor()?;
         let candidate = verify_catalog(
             &catalog,
             &signature,
@@ -1083,7 +1129,7 @@ impl Inner {
             .ok_or_else(|| missing("catalog is missing"))?;
         let signature = read_limited(&dir.join(SIGNATURE_FILE), MAX_SIGNATURE_BYTES)?
             .ok_or_else(|| missing("signature is missing"))?;
-        let seen = self.seen_store().load()?;
+        let seen = self.load_floor()?;
         let candidate = verify_catalog(
             &catalog,
             &signature,
@@ -1178,6 +1224,45 @@ impl Inner {
             return Err(UpdateError::new(
                 ErrorCode::IdentityMismatch,
                 "the install location changed",
+            ));
+        }
+        self.confirm_floor(candidate_id)
+    }
+
+    /// The helper re-reads the floor copied when it staged the candidate. If
+    /// another service recorded a higher sequence since, or a different catalog
+    /// for the same sequence, the Ready candidate is refused here (fail-closed)
+    /// before the ticket is written. A missing floor is a refusal too.
+    fn confirm_floor(&self, candidate_id: &str) -> Result<(), UpdateError> {
+        let (sequence, sha256) = {
+            let state = self.lock();
+            match &state.stage {
+                Stage::Ready { offer, .. } if offer.id().as_str() == candidate_id => (
+                    offer.candidate.sequence(),
+                    offer.candidate.catalog_sha256().to_owned(),
+                ),
+                _ => {
+                    return Err(UpdateError::new(
+                        ErrorCode::TransitionInvalid,
+                        "the prepared update changed",
+                    ));
+                }
+            }
+        };
+        let floor = self.load_floor()?.ok_or_else(|| {
+            UpdateError::new(ErrorCode::NotFound, "the catalog sequence receipt is missing")
+        })?;
+        floor.validate()?;
+        if floor.sequence > sequence {
+            return Err(UpdateError::new(
+                ErrorCode::SequenceRegression,
+                "a newer catalog sequence was recorded after the update was prepared",
+            ));
+        }
+        if floor.sequence == sequence && floor.catalog_sha256 != sha256 {
+            return Err(UpdateError::new(
+                ErrorCode::SequenceConflict,
+                "same catalog sequence with different bytes",
             ));
         }
         Ok(())
@@ -1385,6 +1470,7 @@ mod tests {
             policy,
             updates_root: dir.path().join("updates").join(id.as_str()),
             receipts_dir: dir.path().join("receipts"),
+            legacy_seen: None,
             install_id: id,
         }
     }
@@ -2526,6 +2612,92 @@ mod tests {
         assert_eq!(report.matches("code=identity_mismatch").count(), 1, "{report}");
         assert!(!report.contains("code=io"), "{report}");
         assert!(report.contains("candidate=0.27.0"), "{report}");
+    }
+
+    fn write_floor(path: &Path, sequence: u64, fill: char) {
+        let mut store = FileSeenStore::new(path.to_path_buf());
+        store
+            .store(&hane_update::trust::SeenCatalog::new(sequence, fill.to_string().repeat(64)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_legacy_floor_is_carried_over_and_never_lowers_a_higher_one() {
+        let dir = TempDir::new("app-update-legacy");
+        let legacy = dir.path().join("coordination").join("seen-catalog.json");
+        let target = dir.path().join("receipts").join("seen-catalog.json");
+
+        // Nothing at the old location is the normal case.
+        migrate_legacy_floor(&legacy, &target).unwrap();
+        assert!(!target.exists());
+
+        write_floor(&legacy, 7, 'a');
+        migrate_legacy_floor(&legacy, &target).unwrap();
+        let carried = FileSeenStore::new(target.clone()).load().unwrap().unwrap();
+        assert_eq!((carried.sequence, carried.catalog_sha256), (7, "a".repeat(64)));
+
+        // A higher stored floor stays.
+        write_floor(&target, 9, 'b');
+        migrate_legacy_floor(&legacy, &target).unwrap();
+        assert_eq!(FileSeenStore::new(target.clone()).load().unwrap().unwrap().sequence, 9);
+
+        // The same sequence with other catalog bytes is a conflict.
+        write_floor(&target, 7, 'c');
+        let err = migrate_legacy_floor(&legacy, &target).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceConflict);
+    }
+
+    #[test]
+    fn a_corrupt_legacy_floor_is_refused_not_read_as_no_floor() {
+        let dir = TempDir::new("app-update-legacy-corrupt");
+        let legacy = dir.path().join("coordination").join("seen-catalog.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"{not json").unwrap();
+        let target = dir.path().join("receipts").join("seen-catalog.json");
+        assert!(migrate_legacy_floor(&legacy, &target).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_legacy_floor_is_applied_before_a_restore_accepts_a_lower_sequence() {
+        let dir = TempDir::new("app-update-legacy-load");
+        let legacy = dir.path().join("coordination").join("seen-catalog.json");
+        write_floor(&legacy, 8, 'd');
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let mut cfg = config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64));
+        cfg.legacy_seen = Some(legacy);
+        let service = AppUpdateService::with_runner(
+            cfg,
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&queue),
+        );
+        assert_eq!(service.inner.load_floor().unwrap().unwrap().sequence, 8);
+        let floor = dir.path().join("receipts").join("seen-catalog.json");
+        assert_eq!(FileSeenStore::new(floor).load().unwrap().unwrap().sequence, 8);
+    }
+
+    #[test]
+    fn a_higher_sequence_recorded_after_ready_refuses_the_restart() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let candidate = fixture.candidate_id();
+        let inner = &fixture.service.inner;
+        inner.confirm_floor(&candidate).unwrap();
+
+        let floor = fixture.dir.path().join("receipts").join("seen-catalog.json");
+        write_floor(&floor, 6, 'e');
+        let err = inner.confirm_floor(&candidate).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceRegression);
+
+        // The same sequence with other catalog bytes is refused too.
+        write_floor(&floor, 5, 'f');
+        let err = inner.confirm_floor(&candidate).unwrap_err();
+        assert_eq!(err.code, ErrorCode::SequenceConflict);
+
+        // A missing floor is never "no floor".
+        fs::remove_file(&floor).unwrap();
+        assert!(inner.confirm_floor(&candidate).is_err());
     }
 
     #[test]
