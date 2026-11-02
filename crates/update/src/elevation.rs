@@ -238,7 +238,23 @@ pub fn is_protected_placement(
 
 /// The refusal of the update before any change when the route cannot be chosen.
 pub fn route_refused_error(reason: &str) -> UpdateError {
-    UpdateError::new(ErrorCode::Io, format!("the update route was refused: {reason}"))
+    UpdateError::new(ErrorCode::Io, format!("{ROUTE_REFUSED_MARKER}: {reason}"))
+}
+
+/// Start of [`UpdateError::detail`] for the refusal of the update route.
+pub const ROUTE_REFUSED_MARKER: &str = "the update route was refused";
+
+/// Shown when the update route was refused before any change. The technical
+/// reason stays in the diagnostics only.
+pub const ROUTE_REFUSED_MESSAGE: &str = "更新先への書き込み可否を確認できないため、更新を進めませんでした。現在のHaneと作業内容はそのままです。更新先の書き込み権限を確認するか、手動で更新してください。";
+
+/// Whether `err` is the refusal of the update route made by [`route_refused_error`].
+pub fn is_route_refused(err: &UpdateError) -> bool {
+    err.code == ErrorCode::Io
+        && err
+            .detail
+            .strip_prefix(ROUTE_REFUSED_MARKER)
+            .is_some_and(|rest| rest.starts_with(':'))
 }
 
 /// A known protected placement that needs the consent prompt, in a build that
@@ -753,6 +769,8 @@ pub fn elevation_message(err: &UpdateError) -> Option<&'static str> {
         Some(ELEVATION_UNAVAILABLE_MESSAGE)
     } else if is_standard_token_unavailable(err) {
         Some(STANDARD_TOKEN_UNAVAILABLE_MESSAGE)
+    } else if is_route_refused(err) {
+        Some(ROUTE_REFUSED_MESSAGE)
     } else {
         None
     }
@@ -1056,6 +1074,19 @@ mod tests {
         }
         assert!(is_elevation_required(&protected_placement_error()));
         assert_eq!(elevation_message(&protected_placement_error()), Some(ELEVATION_UNAVAILABLE_MESSAGE));
+        let refused = route_refused_error("write access unknown");
+        assert!(is_route_refused(&refused));
+        assert_eq!(refused.code, ErrorCode::Io);
+        assert!(refused.detail.contains("write access unknown"));
+        assert_eq!(elevation_message(&refused), Some(ROUTE_REFUSED_MESSAGE));
+        assert!(!is_route_refused(&required));
+        assert!(!is_route_refused(&protected_placement_error()));
+        assert!(!is_route_refused(&standard_token_unavailable_error()));
+        assert!(!is_route_refused(&UpdateError::new(ErrorCode::Io, "disk failure")));
+        assert!(!is_route_refused(&UpdateError::new(
+            ErrorCode::IdentityMismatch,
+            format!("{ROUTE_REFUSED_MARKER}: x")
+        )));
         for other in [Some(5), Some(1223), None] {
             let err = normal_start_error(other, path);
             assert!(!is_elevation_required(&err));

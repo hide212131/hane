@@ -1428,6 +1428,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn route_refusal_is_shown_as_japanese_guidance_and_other_io_stays_generic() {
+        let fixture = fixture("0.1.0", "0.2.0", 1);
+        let refused = hane_update::elevation::route_refused_error("write access unknown");
+        let text = fixture.service.inner.prepare_failure(&refused, None);
+        assert_eq!(text, hane_update::elevation::ROUTE_REFUSED_MESSAGE);
+        assert!(text.contains("更新先の書き込み権限を確認するか、手動で更新してください"));
+        assert!(text.contains("現在のHaneと作業内容"));
+        assert!(!text.contains("write access unknown"));
+
+        let other = UpdateError::new(ErrorCode::Io, "disk failure");
+        let text = fixture.service.inner.prepare_failure(&other, None);
+        assert_eq!(text, other.to_string());
+        assert_ne!(text, hane_update::elevation::ROUTE_REFUSED_MESSAGE);
+    }
+
     impl Fixture {
         fn script_check(&self) {
             let json = release_json_sized(
