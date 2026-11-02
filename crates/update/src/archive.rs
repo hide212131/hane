@@ -32,6 +32,7 @@ use crate::model::{
     MACOS_LEGACY_INVENTORY_REL, MACOS_LEGACY_INVENTORY_SIGNATURE_REL, MACOS_SIDECAR_DIR, Target,
     macos_generation, parse_macos_generation,
 };
+use crate::pinned::PinnedDir;
 use crate::paths::{ancestors, collision_key, validate_rel_path};
 use crate::trust::TrustPolicy;
 use crate::util::{hex_encode, sha256_context};
@@ -868,10 +869,42 @@ pub fn extract_archive<R: Read + Seek>(
     inspected: &InspectedArchive,
     stage: &Path,
 ) -> Result<()> {
+    extract_archive_held(reader, inspected, stage).map(drop)
+}
+
+/// Like [`stage_archive`], but returns the directory handles that keep the
+/// stage and every directory beneath it from being renamed or replaced by a
+/// junction (Windows; empty elsewhere). The caller holds them for as long as
+/// the staged tree is used.
+pub(crate) fn stage_archive_held<R: Read + Seek>(
+    reader: &mut R,
+    candidate: &VerifiedCandidate,
+    policy: &TrustPolicy,
+    limits: &ArchiveLimits,
+    stage: &Path,
+) -> Result<(InspectedArchive, Vec<PinnedDir>)> {
+    let inspected = inspect_archive(reader, candidate, policy, limits)?;
+    let pins = extract_archive_held(reader, &inspected, stage)?;
+    Ok((inspected, pins))
+}
+
+/// [`extract_archive`] that keeps the stage tree pinned (Windows). The stage
+/// itself is pinned before it is checked, and each directory is pinned as soon
+/// as it is verified or created, so no name is created through an unpinned
+/// directory.
+pub(crate) fn extract_archive_held<R: Read + Seek>(
+    reader: &mut R,
+    inspected: &InspectedArchive,
+    stage: &Path,
+) -> Result<Vec<PinnedDir>> {
+    let mut pins: Vec<PinnedDir> = Vec::new();
+    pin_dir(&mut pins, stage)?;
     prepare_stage(stage)?;
     let mut created: Vec<(PathBuf, bool)> = Vec::new();
-    let result = extract_entries(reader, inspected, stage, &mut created);
-    if result.is_err() {
+    let result = extract_entries(reader, inspected, stage, &mut created, &mut pins);
+    if let Err(err) = result {
+        // Pinned directories cannot be removed, so release them first.
+        drop(pins);
         for (path, is_dir) in created.iter().rev() {
             let _ = if *is_dir {
                 fs::remove_dir(path)
@@ -879,8 +912,23 @@ pub fn extract_archive<R: Read + Seek>(
                 fs::remove_file(path)
             };
         }
+        return Err(err);
     }
-    result
+    Ok(pins)
+}
+
+/// Windows: holds `path` as a verified non-reparse directory. A link, a
+/// non-directory or a vanished directory refuses the extraction.
+#[cfg_attr(not(windows), allow(unused_variables, reason = "only Windows pins directories"))]
+fn pin_dir(pins: &mut Vec<PinnedDir>, path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let pin = PinnedDir::open(path)?.ok_or_else(|| {
+            reject(format!("{} vanished while it was being checked", path.display()))
+        })?;
+        pins.push(pin);
+    }
+    Ok(())
 }
 
 fn extract_entries<R: Read + Seek>(
@@ -888,7 +936,9 @@ fn extract_entries<R: Read + Seek>(
     inspected: &InspectedArchive,
     stage: &Path,
     created: &mut Vec<(PathBuf, bool)>,
+    pins: &mut Vec<PinnedDir>,
 ) -> Result<()> {
+    let mut pinned: HashSet<PathBuf> = HashSet::new();
     for entry in &inspected.entries {
         let parts: Vec<&str> = entry.path.split('/').collect();
         let (dirs, file_name) = if entry.is_dir {
@@ -907,6 +957,9 @@ fn extract_entries<R: Read + Seek>(
                     created.push((current.clone(), true));
                 }
                 Err(err) => return Err(err.into()),
+            }
+            if pinned.insert(current.clone()) {
+                pin_dir(pins, &current)?;
             }
         }
         let Some(file_name) = file_name else {

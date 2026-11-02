@@ -34,7 +34,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::apply::{self, ApplyOutcome, FsFileOps, HealthChild, HealthOutcome, ParentProcess};
-use crate::archive::{ArchiveLimits, stage_archive};
+use crate::archive::{ArchiveLimits, stage_archive_held};
 use crate::catalog::{VerifyContext, verify_catalog};
 use crate::clock::Clock;
 use crate::error::{ErrorCode, Result, UpdateError};
@@ -49,6 +49,7 @@ use crate::limits::{
     MAX_SIGNATURE_BYTES,
 };
 use crate::model::{INVENTORY_FILE_NAME, INVENTORY_SIGNATURE_FILE_NAME, Target, UPDATER_PROTOCOL};
+use crate::pinned::PinnedDir;
 use crate::platform::Placement;
 use crate::platform::lease::Coordination;
 use crate::trust::{SeenCatalog, SeenStore, TrustPolicy};
@@ -684,6 +685,14 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<(ApplyPlan, Option<Box<dy
         ));
     }
     let stage = txn_dir.join(STAGE_DIR);
+    // The user can write the transaction directory, while this code may run
+    // elevated. Every directory from the coordination directory down to the
+    // stage is held open (Windows) before anything is created beneath it and
+    // until the apply ends, so none can be swapped for a junction and the
+    // extraction and the later reads resolve inside the real stage. A chain
+    // that cannot be pinned refuses the apply.
+    let mut hold = StageHold::default();
+    hold.pin_chain(coordination.dir(), &txn_dir)?;
     match fs::create_dir(&stage) {
         Ok(()) => {}
         // An existing stage is accepted only if it is empty; the extractor
@@ -692,7 +701,9 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<(ApplyPlan, Option<Box<dy
         Err(err) => return Err(err.into()),
     }
     let mut archive = File::open(&archive_path)?;
-    let inspected = stage_archive(&mut archive, &candidate, inputs.policy, &ArchiveLimits::default(), &stage)?;
+    let (inspected, stage_pins) =
+        stage_archive_held(&mut archive, &candidate, inputs.policy, &ArchiveLimits::default(), &stage)?;
+    hold.pins.extend(stage_pins);
     drop(archive);
     let new_inventory = inspected.inventory.ok_or_else(|| {
         UpdateError::new(ErrorCode::ArchiveRejected, "the archive carries no signed inventory")
@@ -706,7 +717,51 @@ fn verify_and_plan(inputs: &ApplyInputs<'_>) -> Result<(ApplyPlan, Option<Box<dy
         &candidate,
     )?;
     check_plan_preconditions(&plan, &FsDiskView::new(&placement.install_root))?;
-    Ok((plan, floor_guard))
+    hold.floor = floor_guard;
+    Ok((plan, Some(Box::new(hold))))
+}
+
+/// What `verify_and_plan` keeps alive until the apply ends: the sequence-floor
+/// guard and the directory handles that fix the transaction chain and the
+/// staged tree (Windows).
+#[derive(Default)]
+struct StageHold {
+    floor: Option<Box<dyn Send>>,
+    pins: Vec<PinnedDir>,
+}
+
+impl StageHold {
+    /// Pins `anchor` and every directory beneath it down to `leaf`, outermost
+    /// first. `leaf` must be inside `anchor`.
+    #[cfg_attr(not(windows), allow(unused_variables, reason = "only Windows pins directories"))]
+    fn pin_chain(&mut self, anchor: &Path, leaf: &Path) -> Result<()> {
+        if !leaf.starts_with(anchor) {
+            return Err(UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "the transaction directory is not inside the coordination directory",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let mut chain: Vec<&Path> = Vec::new();
+            for dir in leaf.ancestors() {
+                chain.push(dir);
+                if dir == anchor {
+                    break;
+                }
+            }
+            for dir in chain.into_iter().rev() {
+                let pin = PinnedDir::open(dir)?.ok_or_else(|| {
+                    UpdateError::new(
+                        ErrorCode::InstallModified,
+                        format!("{} vanished while it was being checked", dir.display()),
+                    )
+                })?;
+                self.pins.push(pin);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Files replaced and awaiting a health verdict.
@@ -1120,6 +1175,60 @@ mod tests {
                 "unexpected file {path}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stage_replaced_by_a_junction_is_refused_and_nothing_is_written_outside() {
+        let fx = fixture();
+        let txn_dir = fx.coordination.transaction_dir(&fx.transaction);
+        let outside = crate::testing::TempDir::new("stage-junction-outside");
+        let stage = txn_dir.join(STAGE_DIR);
+        assert!(!stage.exists(), "the fixture must not have a stage yet");
+        assert!(make_junction(&stage, outside.path()));
+
+        let err = apply_owned_files(&fx.inputs()).err().unwrap();
+        assert_ne!(err.code, ErrorCode::Io, "{err:?}");
+        assert_eq!(
+            fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "the extraction wrote through the junction"
+        );
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_stage_and_its_ancestors_cannot_be_swapped_while_the_apply_holds_them() {
+        let fx = fixture();
+        let txn_dir = fx.coordination.transaction_dir(&fx.transaction);
+        let (_plan, hold) = verify_and_plan(&fx.inputs()).unwrap();
+        let outside = crate::testing::TempDir::new("stage-swap-outside");
+        let stage = txn_dir.join(STAGE_DIR);
+
+        // The unprivileged side tries to move the stage, a staged directory's
+        // parent and the transaction directory away to put a junction in place.
+        for victim in [stage.clone(), txn_dir.clone()] {
+            let moved = victim.with_file_name(format!(
+                "{}-moved",
+                victim.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(fs::rename(&victim, &moved).is_err(), "{victim:?} could be renamed");
+            assert!(!make_junction(&victim, outside.path()));
+        }
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        drop(hold);
     }
 
     #[test]
