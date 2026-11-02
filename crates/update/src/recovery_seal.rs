@@ -69,13 +69,25 @@ fn parent_of(coordination: &Coordination) -> Result<&Path> {
 #[cfg(not(test))]
 fn parent_is_protected(parent: &Path) -> Result<bool> {
     use crate::platform::acl;
-    if acl::directory_owner_id(parent)? == acl::principal_id()? {
+    let owned = acl::directory_owner_id(parent)? == acl::principal_id()?;
+    // Owned by someone else but shown to be writable by the requesting user
+    // (an administrator-owned, user-writable parent): the same ordinary
+    // placement the install route accepts, so no seal is required. Whether the
+    // user can write is established only when needed, and a classification
+    // that fails is an error, never "writable".
+    protection_decision(owned, || acl::directory_protection(parent))
+}
+
+#[cfg_attr(test, allow(dead_code, reason = "the test build sets the parent state"))]
+fn protection_decision(
+    owned_by_requester: bool,
+    classify: impl FnOnce() -> Result<crate::platform::acl::DirProtection>,
+) -> Result<bool> {
+    use crate::platform::acl::DirProtection;
+    if owned_by_requester {
         return Ok(false);
     }
-    // Owned by someone else but determinably writable by the requesting
-    // user's account (an administrator-owned, user-writable parent): the same
-    // ordinary placement the install route accepts, so no seal is required.
-    Ok(acl::directory_protection(parent)? == acl::DirProtection::Protected)
+    Ok(classify()? == DirProtection::Protected)
 }
 
 /// Test build: the state the test sets, unprotected by default.
@@ -449,6 +461,21 @@ mod tests {
             ErrorCode::JournalInvalid
         );
         test_support::set_parent(test_support::Parent::Unprotected);
+    }
+
+    #[test]
+    fn the_seal_requirement_follows_the_requesters_own_write_access() {
+        use crate::platform::acl::DirProtection;
+        // A parent the requester owns, or a system-owned one the requester can
+        // write, is an ordinary placement; a protected one needs the seal.
+        assert!(!protection_decision(true, || Err(UpdateError::new(ErrorCode::Io, "unused"))).unwrap());
+        assert!(!protection_decision(false, || Ok(DirProtection::UserWritable)).unwrap());
+        assert!(protection_decision(false, || Ok(DirProtection::Protected)).unwrap());
+        // A classification that cannot be made is never read as writable.
+        assert!(
+            protection_decision(false, || Err(UpdateError::new(ErrorCode::UnsupportedInstall, "unknown")))
+                .is_err()
+        );
     }
 
     #[test]

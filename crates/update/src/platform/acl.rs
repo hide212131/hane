@@ -79,14 +79,96 @@ pub(crate) enum DirProtection {
     UserWritable,
 }
 
-/// Classifies a directory. A state that cannot be determined, or that is
-/// neither protected nor determinably writable, is an error (fail closed).
+/// Classifies a system-owned directory for the requesting user. The process
+/// is that user's own account (an elevated Windows token is verified to be the
+/// requesting account; a macOS process runs as the user), so its identity is
+/// the requester. `UserWritable` is returned only when that user is shown to
+/// be able to create entries in the directory: on POSIX the kernel's effective
+/// access check, on Windows an allow entry for the user's own SID or for a
+/// group every standard user belongs to (Everyone, Authenticated Users,
+/// Users). Write access for any other principal, an unreadable or opaque
+/// entry, a deny entry for the user, or a non-system owner is an error (fail
+/// closed), never read as writable.
 #[cfg_attr(test, allow(dead_code, reason = "tests stand in for the parent state"))]
 pub(crate) fn directory_protection(path: &Path) -> Result<DirProtection> {
-    match imp::inspect(path, true, OwnerRule::Protected)? {
-        Ok(()) => Ok(DirProtection::Protected),
-        Err(_) => Ok(DirProtection::UserWritable),
+    imp::classify_directory(path)
+}
+
+/// Who an access entry of a directory's DACL applies to, relative to the
+/// requesting user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code, reason = "Windows DACL model"))]
+enum Trustee {
+    /// SYSTEM, Administrators or TrustedInstaller.
+    System,
+    /// The requesting user's own SID.
+    User,
+    /// A group every standard user belongs to (Everyone, Authenticated Users,
+    /// Users).
+    CommonGroup,
+    /// Any other principal: membership of the requesting user is not shown.
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code, reason = "Windows DACL model"))]
+enum EntryKind {
+    Allow,
+    Deny,
+    /// An allow type this check does not interpret.
+    Opaque,
+    /// Audit and other non-access entries.
+    Ignored,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code, reason = "Windows DACL model"))]
+struct DaclEntry {
+    kind: EntryKind,
+    /// Inherit-only entries do not apply to the directory itself.
+    inherit_only: bool,
+    /// Whether the mask contains any write-class right.
+    writes: bool,
+    /// Whether the mask lets the trustee create files and directories.
+    creates: bool,
+    trustee: Trustee,
+}
+
+/// Decides, from a system-owned directory's DACL entries, whether the
+/// requesting user can create entries in it. A write right held by an
+/// unrelated principal, a partial write right of the user, a deny entry that
+/// touches the user, or an entry that cannot be interpreted is an error: the
+/// state is not established and must not be read as writable.
+#[cfg_attr(not(any(windows, test)), allow(dead_code, reason = "Windows DACL model"))]
+fn classify_dacl(entries: &[DaclEntry]) -> Result<DirProtection> {
+    let mut writable = false;
+    for entry in entries.iter().filter(|e| !e.inherit_only) {
+        match entry.kind {
+            EntryKind::Ignored => {}
+            EntryKind::Opaque => {
+                return Err(refuse("an access entry of the directory cannot be checked"));
+            }
+            EntryKind::Deny => {
+                if entry.writes && matches!(entry.trustee, Trustee::User | Trustee::CommonGroup) {
+                    return Err(refuse("a deny entry may remove the user's write access"));
+                }
+            }
+            EntryKind::Allow => {
+                if !entry.writes || entry.trustee == Trustee::System {
+                    continue;
+                }
+                match entry.trustee {
+                    Trustee::User | Trustee::CommonGroup if entry.creates => writable = true,
+                    _ => {
+                        return Err(refuse(
+                            "the write access of the directory cannot be attributed to the requesting user",
+                        ));
+                    }
+                }
+            }
+        }
     }
+    Ok(if writable { DirProtection::UserWritable } else { DirProtection::Protected })
 }
 
 /// Like [`secure_new`], and additionally makes the token's user SID the owner
@@ -373,10 +455,49 @@ mod imp {
         inspect(path, is_dir, rule)?
     }
 
+    /// Root-owned plain directory: writable when the kernel grants this
+    /// process (the requesting user) create access, else protected from it.
+    pub fn classify_directory(path: &Path) -> Result<super::DirProtection> {
+        use std::os::unix::ffi::OsStrExt;
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(refuse(format!("{} is not a plain entry", path.display())));
+        }
+        if meta.uid() != 0 {
+            return Err(refuse(format!(
+                "the protection of {} cannot be determined",
+                path.display()
+            )));
+        }
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| refuse("the path contains a NUL byte"))?;
+        // SAFETY: `name` is a valid NUL-terminated path; AT_EACCESS makes the
+        // check use the effective ids, which are the requesting user's.
+        let rc = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                libc::W_OK | libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        };
+        if rc == 0 {
+            return Ok(super::DirProtection::UserWritable);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::EACCES || code == libc::EPERM || code == libc::EROFS => {
+                Ok(super::DirProtection::Protected)
+            }
+            other => Err(refuse(format!(
+                "the access to {} could not be determined: {other:?}",
+                path.display()
+            ))),
+        }
+    }
+
     /// The outer error means the state could not be determined or does not
     /// match (owner, kind, ACL); the inner one means it was determined to be
-    /// writable by group or others, which is what makes a root-owned directory
-    /// an ordinary user-writable placement rather than a protected one.
+    /// writable by group or others.
     pub fn inspect(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<Result<()>> {
         let meta = fs::symlink_metadata(path)?;
         let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
@@ -437,6 +558,15 @@ mod imp {
     const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
     /// The `sid_text` form of the TrustedInstaller service SID (S-1-5-80-...).
     const TRUSTED_INSTALLER_PREFIX: &str = "sid:010600000000000550000000";
+    const WIN_WORLD_SID: i32 = 1;
+    const WIN_AUTHENTICATED_USER_SID: i32 = 17;
+    const WIN_BUILTIN_USERS_SID: i32 = 27;
+    /// ACE flag: the entry only applies to children, not to the directory.
+    const INHERIT_ONLY_ACE: u8 = 0x08;
+    /// FILE_ADD_FILE and FILE_ADD_SUBDIRECTORY: creating files and directories.
+    const CREATE_MASK: u32 = 0x0002 | 0x0004;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
     const ACL_REVISION: u32 = 2;
     const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
     const INHERIT_CONTAINER_AND_OBJECT: u32 = 0x3;
@@ -658,11 +788,116 @@ mod imp {
         inspect(path, is_dir, rule)?
     }
 
+    /// A system-owned plain directory classified for the requesting user: the
+    /// process token's user SID (an elevated helper is verified to be the
+    /// requesting account, never a different one). Only that SID or a group
+    /// every standard user belongs to counts as the user's write access.
+    pub fn classify_directory(path: &Path) -> Result<super::DirProtection> {
+        use super::{DaclEntry, EntryKind, Trustee, classify_dacl};
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink()
+            || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !meta.is_dir()
+        {
+            return Err(refuse(format!("{} is not a plain entry", path.display())));
+        }
+        let user = token_sid(TOKEN_USER_CLASS)?;
+        let name = wide(path);
+        let mut owner: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated and every out-pointer is a live local.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        let _release = Local(descriptor);
+        if rc != 0 {
+            return Err(failure(&format!("the security of {}", path.display())));
+        }
+        if owner.is_null() || dacl.is_null() {
+            return Err(refuse(format!("{} has no usable owner or access list", path.display())));
+        }
+        let system_principal = |sid: *mut c_void| {
+            well_known(sid, WIN_LOCAL_SYSTEM_SID)
+                || well_known(sid, WIN_BUILTIN_ADMINISTRATORS_SID)
+                || sid_text(sid).starts_with(TRUSTED_INSTALLER_PREFIX)
+        };
+        if !(well_known(owner, WIN_LOCAL_SYSTEM_SID)
+            || well_known(owner, WIN_BUILTIN_ADMINISTRATORS_SID)
+            || sid_text(owner).starts_with(TRUSTED_INSTALLER_PREFIX))
+        {
+            return Err(refuse(format!(
+                "the protection of {} cannot be determined",
+                path.display()
+            )));
+        }
+        let mut entries = Vec::new();
+        // SAFETY: `dacl` points into the descriptor kept alive by `_release`;
+        // each ACE pointer comes from `GetAce` for an index below the count.
+        unsafe {
+            for index in 0..u32::from((*dacl).AceCount) {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut ace) == 0 || ace.is_null() {
+                    return Err(failure("an access control entry"));
+                }
+                let header = &*ace.cast::<ACE_HEADER>();
+                let kind = match header.AceType {
+                    0 => EntryKind::Allow,
+                    1 => EntryKind::Deny,
+                    t if OPAQUE_ALLOW_TYPES.contains(&t) => EntryKind::Opaque,
+                    _ => EntryKind::Ignored,
+                };
+                if kind == EntryKind::Ignored || kind == EntryKind::Opaque {
+                    entries.push(DaclEntry {
+                        kind,
+                        inherit_only: false,
+                        writes: false,
+                        creates: false,
+                        trustee: Trustee::Other,
+                    });
+                    continue;
+                }
+                // ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE share this layout.
+                let basic = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                let sid = std::ptr::addr_of!(basic.SidStart) as *mut c_void;
+                let trustee = if system_principal(sid) {
+                    Trustee::System
+                } else if same_sid(sid, &user) {
+                    Trustee::User
+                } else if well_known(sid, WIN_WORLD_SID)
+                    || well_known(sid, WIN_AUTHENTICATED_USER_SID)
+                    || well_known(sid, WIN_BUILTIN_USERS_SID)
+                {
+                    Trustee::CommonGroup
+                } else {
+                    Trustee::Other
+                };
+                let mask = basic.Mask;
+                entries.push(DaclEntry {
+                    kind,
+                    inherit_only: header.AceFlags & INHERIT_ONLY_ACE != 0,
+                    writes: mask & WRITE_MASK != 0,
+                    creates: mask & (GENERIC_ALL | GENERIC_WRITE) != 0
+                        || mask & CREATE_MASK == CREATE_MASK,
+                    trustee,
+                });
+            }
+        }
+        super::classify_dacl(&entries)
+    }
+
     /// The outer error means the state could not be determined or does not
     /// match (owner, kind, entries); the inner one means the DACL was read and
-    /// grants write access to a principal other than the trusted ones, which is
-    /// what makes an administrator-owned directory an ordinary writable
-    /// placement rather than a protected one.
+    /// grants write access to a principal other than the trusted ones.
     pub fn inspect(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<Result<()>> {
         let meta = fs::symlink_metadata(path)?;
         let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
@@ -776,6 +1011,10 @@ mod imp {
         Err(refuse("ownership cannot be checked on this OS"))
     }
 
+    pub fn classify_directory(_path: &Path) -> Result<super::DirProtection> {
+        Err(refuse("ownership cannot be checked on this OS"))
+    }
+
     pub fn principal_id() -> Result<String> {
         Err(refuse("the OS principal is unavailable on this OS"))
     }
@@ -870,6 +1109,64 @@ mod tests {
             assert!(super::directory_protection(&dir).is_err());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_owned_directory_the_user_cannot_write_is_protected() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = Path::new("/usr");
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let non_root = unsafe { libc::geteuid() } != 0;
+        if non_root && std::fs::metadata(dir).is_ok_and(|m| m.uid() == 0) {
+            assert_eq!(super::directory_protection(dir).unwrap(), super::DirProtection::Protected);
+        }
+    }
+
+    fn entry(
+        kind: super::EntryKind,
+        trustee: super::Trustee,
+        writes: bool,
+        creates: bool,
+    ) -> super::DaclEntry {
+        super::DaclEntry { kind, inherit_only: false, writes, creates, trustee }
+    }
+
+    #[test]
+    fn an_admin_owned_directory_is_writable_only_when_the_requesting_user_can_create() {
+        use super::{DirProtection, EntryKind::*, Trustee::*, classify_dacl};
+        let system = entry(Allow, System, true, true);
+        let read_only_users = entry(Allow, CommonGroup, false, false);
+        // Administrator-owned, the user's own SID (or Users) may create.
+        assert_eq!(
+            classify_dacl(&[system, entry(Allow, User, true, true)]).unwrap(),
+            DirProtection::UserWritable
+        );
+        assert_eq!(
+            classify_dacl(&[system, entry(Allow, CommonGroup, true, true)]).unwrap(),
+            DirProtection::UserWritable
+        );
+        // Administrator-owned, the user has no write: protected.
+        assert_eq!(classify_dacl(&[system, read_only_users]).unwrap(), DirProtection::Protected);
+        // An inherit-only grant does not apply to the directory itself.
+        let mut inherited = entry(Allow, User, true, true);
+        inherited.inherit_only = true;
+        assert_eq!(classify_dacl(&[system, inherited]).unwrap(), DirProtection::Protected);
+    }
+
+    #[test]
+    fn an_unrelated_principal_or_unreadable_entry_is_unknown_never_writable() {
+        use super::{EntryKind::*, Trustee::*, classify_dacl};
+        let system = entry(Allow, System, true, true);
+        // Another SID with write access says nothing about the requesting user.
+        assert!(classify_dacl(&[system, entry(Allow, Other, true, true)]).is_err());
+        // A partial write right of the user does not show create access.
+        assert!(classify_dacl(&[system, entry(Allow, User, true, false)]).is_err());
+        // A deny entry for the user, or an entry that cannot be interpreted.
+        assert!(
+            classify_dacl(&[entry(Deny, User, true, false), entry(Allow, User, true, true)]).is_err()
+        );
+        assert!(classify_dacl(&[system, entry(Opaque, Other, false, false)]).is_err());
     }
 
     #[cfg(unix)]
