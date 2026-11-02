@@ -193,11 +193,11 @@ fn ensure_dir_pinned(
             // Pin before anything else touches the new directory by path: a
             // directory already swapped for a link is refused here, and the
             // ACL change below then cannot be redirected.
-            if let Some(pins) = pins.as_deref_mut() {
-                if let Err(err) = pins.pin(path) {
-                    let _ = fs::remove_dir(path);
-                    return Err(err);
-                }
+            if let Some(pins) = pins.as_deref_mut()
+                && let Err(err) = pins.pin(path)
+            {
+                let _ = fs::remove_dir(path);
+                return Err(err);
             }
             // Restrict first, then confirm; a directory that cannot be made
             // private is removed so it is not left for a later adoption.
@@ -219,10 +219,10 @@ fn ensure_dir_pinned(
                 pins.pin(path)?;
             }
             let verified = require_plain_dir(path);
-            if verified.is_err() {
-                if let Some(pins) = pins.as_deref_mut() {
-                    pins.unpin_last();
-                }
+            if verified.is_err()
+                && let Some(pins) = pins
+            {
+                pins.unpin_last();
             }
             verified
         }
