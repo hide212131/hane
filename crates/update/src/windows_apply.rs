@@ -1312,6 +1312,109 @@ mod tests {
         path
     }
 
+    /// Free-space query that runs after the helper re-read and locked the
+    /// application's receipt and before the first install mutation. On its
+    /// first call it proves the lock is held and starts a competing writer that
+    /// reports what the install looked like when it finally got the lock.
+    struct CompetingWriterProbe {
+        available: u64,
+        user_receipt: PathBuf,
+        install_root: PathBuf,
+        before: BTreeMap<String, Vec<u8>>,
+        journal_path: PathBuf,
+        started: Cell<bool>,
+        /// `(journal exists, install unchanged)` seen by the writer on locking.
+        observed: RefCell<Option<std::sync::mpsc::Receiver<(bool, bool)>>>,
+    }
+
+    impl FreeSpace for CompetingWriterProbe {
+        fn available_bytes(&self, _path: &Path) -> Result<u64> {
+            if !self.started.replace(true) {
+                let lock_path = self.user_receipt.with_extension("lock");
+                let probe = OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
+                assert!(
+                    matches!(probe.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                    "the helper must hold the application receipt lock before the first mutation"
+                );
+                drop(probe);
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (receipt, root, before, journal) = (
+                    self.user_receipt.clone(),
+                    self.install_root.clone(),
+                    self.before.clone(),
+                    self.journal_path.clone(),
+                );
+                std::thread::spawn(move || {
+                    let store = FileSeenStore::new(receipt);
+                    let _lock = store.lock().unwrap();
+                    let _ = tx.send((journal.exists(), snapshot(&root) == before));
+                });
+                // The writer is waiting for the lock: it must not get in while
+                // the helper is still before its first mutation.
+                assert!(
+                    matches!(
+                        rx.recv_timeout(Duration::from_millis(300)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "a competing writer got the sequence lock before the install was mutated"
+                );
+                *self.observed.borrow_mut() = Some(rx);
+            }
+            Ok(self.available)
+        }
+    }
+
+    fn competing_writer_probe(fx: &Fixture, user_receipt: PathBuf, available: u64) -> CompetingWriterProbe {
+        CompetingWriterProbe {
+            available,
+            user_receipt,
+            install_root: fx.placement.install_root.clone(),
+            before: fx.before.clone(),
+            journal_path: fx.journal_path(),
+            started: Cell::new(false),
+            observed: RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn a_competing_writer_waits_for_the_lock_until_the_install_is_mutated() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let probe = competing_writer_probe(&fx, user, u64::MAX);
+        let mut inputs = fx.inputs();
+        inputs.free_space = &probe;
+        let applied = apply_owned_files(&inputs).unwrap();
+        assert_eq!(applied.journal().phase, Phase::AwaitingHealth);
+        drop(applied);
+        drop(inputs);
+
+        let rx = probe.observed.borrow_mut().take().expect("the probe ran under the lock");
+        let (journal_exists, install_unchanged) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(journal_exists, "the writer got the lock before the journal existed");
+        assert!(!install_unchanged, "the writer got the lock before the install was mutated");
+    }
+
+    #[test]
+    fn a_refused_apply_keeps_the_lock_and_leaves_install_and_journal_untouched() {
+        let fx = fixture();
+        let user = declare_user_receipt(&fx);
+        let probe = competing_writer_probe(&fx, user, 0);
+        let mut inputs = fx.inputs();
+        inputs.free_space = &probe;
+        assert_eq!(apply_owned_files(&inputs).err().unwrap().code, ErrorCode::InsufficientSpace);
+        drop(inputs);
+        assert!(fx.unchanged());
+        assert!(!fx.journal_path().exists());
+
+        // The writer only proceeds once the refused apply released the lock,
+        // and finds the install and journal as they were.
+        let rx = probe.observed.borrow_mut().take().expect("the probe ran under the lock");
+        let (journal_exists, install_unchanged) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!journal_exists);
+        assert!(install_unchanged);
+    }
+
     #[test]
     fn a_floor_recorded_in_the_user_receipt_after_staging_rejects_the_candidate() {
         let fx = fixture();
