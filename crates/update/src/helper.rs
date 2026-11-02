@@ -257,7 +257,13 @@ pub fn serve_bootstrap<R: Read, W: Write>(
     {
         return Err(mismatch("the transaction already exists"));
     }
-    let coordination = Coordination::create_user_owned(&placement.coordination_parent, &placement.install_id)?;
+    // Every directory created below is pinned as a non-reparse handle until the
+    // bootstrap ends, so the requesting user, who owns them, cannot redirect the
+    // elevated writes into them with a junction. A directory that cannot be
+    // pinned fails the bootstrap before anything is written into it.
+    let mut pins = crate::platform::lease::BootstrapPins::new();
+    let coordination =
+        Coordination::create_user_owned(&placement.coordination_parent, &placement.install_id, &mut pins)?;
     // Records settled by earlier updates are retired while this side can still
     // write the protected parent.
     crate::helper_anchor::sweep_settled(&coordination);
@@ -269,12 +275,18 @@ pub fn serve_bootstrap<R: Read, W: Write>(
         let _ = crate::helper_anchor::retire(&coordination, &transaction);
         return Err(err);
     }
-    if let Err(err) = crate::platform::stage_helper_copy_user_owned(&coordination, &transaction, source) {
+    if let Err(err) =
+        crate::platform::stage_helper_copy_user_owned(&coordination, &transaction, source, &mut pins)
+    {
+        // The transaction directory cannot be removed while it is pinned; the
+        // coordination and `private/` pins stay for the removal.
+        pins.keep_coordination_and_private();
         let _ = coordination.remove_unjournaled_transaction(&transaction);
         let _ = crate::helper_anchor::retire(&coordination, &transaction);
         return Err(err);
     }
     if let Err(err) = writer.write_all(&[BOOTSTRAP_ACK]).and_then(|()| writer.flush()) {
+        pins.keep_coordination_and_private();
         let _ = coordination.remove_unjournaled_transaction(&transaction);
         let _ = crate::helper_anchor::retire(&coordination, &transaction);
         return Err(err.into());
@@ -4046,6 +4058,50 @@ mod tests {
         assert_eq!(err.code, ErrorCode::IdentityMismatch);
         assert!(again.is_empty());
         assert!(staged.is_file(), "the first transaction is untouched");
+    }
+
+    /// The same account that owns the bootstrap directories cannot move any
+    /// level of the chain away (to put a junction in its place) while the
+    /// elevated helper writes beneath it, and the refused swap leaves nothing
+    /// outside the chain.
+    #[cfg(windows)]
+    #[test]
+    fn bootstrap_directories_cannot_be_swapped_for_junctions_while_pinned() {
+        use crate::platform::lease::BootstrapPins;
+
+        let fx = protected();
+        let transaction = TransactionId::generate().unwrap();
+        let outside = fx.dir.path().join("outside-root");
+        std::fs::create_dir(&outside).unwrap();
+        let mut pins = BootstrapPins::new();
+        let coordination =
+            Coordination::create_user_owned(&fx.placement.coordination_parent, &fx.placement.install_id, &mut pins)
+                .unwrap();
+        let helper = coordination.ensure_helper_dir_user_owned(&transaction, &mut pins).unwrap();
+        let txn_dir = coordination.transaction_dir(&transaction);
+        let private = coordination.dir().join(crate::platform::lease::PRIVATE_DIR);
+
+        for (index, level) in [coordination.dir().to_path_buf(), private, txn_dir, helper.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let moved = fx.dir.path().join(format!("moved-{index}"));
+            assert!(std::fs::rename(&level, &moved).is_err(), "{} was moved while pinned", level.display());
+            assert!(!moved.exists());
+            assert!(std::fs::remove_dir(&level).is_err(), "{} was removed while pinned", level.display());
+            assert!(
+                !std::fs::symlink_metadata(&level).unwrap().file_type().is_symlink(),
+                "{} became a link",
+                level.display()
+            );
+        }
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+
+        // Released pins make the directories movable again, i.e. the pin is what
+        // held them.
+        drop(pins);
+        let moved = fx.dir.path().join("moved-after-release");
+        std::fs::rename(&helper, &moved).unwrap();
     }
 
     #[test]

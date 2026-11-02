@@ -388,18 +388,21 @@ pub fn stage_helper_copy(
     transaction: &TransactionId,
     source: &HelperSource,
 ) -> Result<PathBuf> {
-    stage_helper_copy_as(coordination, transaction, source, false)
+    stage_helper_copy_as(coordination, transaction, source, None)
 }
 
 /// [`stage_helper_copy`] for the elevated helper of a protected placement: every
 /// directory and file it creates is owned by the requesting user, because the
-/// standard process of that account has to use and later recover it.
+/// standard process of that account has to use and later recover it. The
+/// transaction and helper directories are pinned in `pins`, and stay pinned
+/// while the copy and its identity record are written.
 pub fn stage_helper_copy_user_owned(
     coordination: &Coordination,
     transaction: &TransactionId,
     source: &HelperSource,
+    pins: &mut lease::BootstrapPins,
 ) -> Result<PathBuf> {
-    stage_helper_copy_as(coordination, transaction, source, true)
+    stage_helper_copy_as(coordination, transaction, source, Some(pins))
 }
 
 /// Restricts a file just created to this principal (and, when `user_owned`,
@@ -416,8 +419,9 @@ fn stage_helper_copy_as(
     coordination: &Coordination,
     transaction: &TransactionId,
     source: &HelperSource,
-    user_owned: bool,
+    pins: Option<&mut lease::BootstrapPins>,
 ) -> Result<PathBuf> {
+    let user_owned = pins.is_some();
     let bytes = read_limited(&source.path, MAX_ENTRY_BYTES)?.ok_or_else(|| {
         UpdateError::new(ErrorCode::NotFound, "the installed helper is missing")
     })?;
@@ -427,8 +431,8 @@ fn stage_helper_copy_as(
             "the installed helper differs from the signed identity",
         ));
     }
-    let dir = if user_owned {
-        coordination.ensure_helper_dir_user_owned(transaction)?
+    let dir = if let Some(pins) = pins {
+        coordination.ensure_helper_dir_user_owned(transaction, pins)?
     } else {
         coordination.ensure_helper_dir(transaction)?
     };
