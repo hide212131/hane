@@ -3173,6 +3173,76 @@ mod tests {
         )
     }
 
+    /// A plan for `a.dll` whose old content is `old`, backed up at `backup/a.dll`.
+    fn sealed_plan(fx: &Fixture, old: &[u8]) -> crate::identity::ApplyPlan {
+        use crate::identity::{ApplyPlan, FileIdentity, PlanStep, ReleaseIdentity};
+        let release = |version: &str| ReleaseIdentity {
+            target: "x86_64-pc-windows-msvc".to_owned(),
+            version: version.to_owned(),
+            catalog_sha256: None,
+            inventory_sha256: None,
+            bundle_id: None,
+            team_id: None,
+        };
+        ApplyPlan {
+            install_id: fx.install.clone(),
+            transaction_id: fx.txn.clone(),
+            source: release("0.1.0"),
+            destination: release("0.2.0"),
+            steps: vec![PlanStep {
+                rel_path: "a.dll".to_owned(),
+                old: Some(FileIdentity::of(old)),
+                new: Some(FileIdentity::of(b"new")),
+                backup_rel: Some("backup/a.dll".to_owned()),
+            }],
+            unchanged: Vec::new(),
+        }
+    }
+
+    /// The journal and the backup of a protected transaction are writable by the
+    /// requesting account. A journal that differs from the sealed plan, even with
+    /// a backup forged to match the identity it names, must stop the real
+    /// recovery path before anything is restored, keeping everything as found.
+    #[test]
+    fn a_protected_recovery_refuses_a_journal_that_differs_from_the_seal() {
+        use crate::journal::{DurableJournal, FileJournalStore, Phase, UpdateJournal};
+        let fx = fixture();
+        let install_root = fx._dir.path().join("Hane");
+        std::fs::create_dir_all(&install_root).unwrap();
+        std::fs::write(install_root.join("a.dll"), b"half-written-new").unwrap();
+        fx.coord.ensure_helper_dir(&fx.txn).unwrap();
+
+        // The elevated helper's records: the identity anchor makes the transaction
+        // protected, and the seal pins the genuine plan.
+        crate::helper_anchor::write(&fx.coord, &fx.txn, &crate::identity::FileIdentity::of(b"old-helper"))
+            .unwrap();
+        let genuine = UpdateJournal::begin(&sealed_plan(&fx, b"old"), None).unwrap();
+        crate::recovery_seal::seal_if_protected(&fx.coord, &genuine).unwrap();
+
+        // The ordinary account then writes a different plan and a backup that
+        // matches the forged old identity, so the two agree with each other.
+        let forged = UpdateJournal::begin(&sealed_plan(&fx, b"attacker bytes"), None).unwrap();
+        let mut durable =
+            DurableJournal::create(FileJournalStore::new(fx.coord.journal_path(&fx.txn)), forged).unwrap();
+        durable.advance_phase(Phase::ExitAuthorized).unwrap();
+        durable.advance_phase(Phase::Applying).unwrap();
+        drop(durable);
+        let backup = fx.coord.transaction_dir(&fx.txn).join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("a.dll"), b"attacker bytes").unwrap();
+
+        let journal_before = std::fs::read(fx.coord.journal_path(&fx.txn)).unwrap();
+        let report = recover_pending_with(&fx.coord, &fx.txn, None).unwrap();
+
+        let RecoveryReport::RecoveryRequired(reason) = report else {
+            panic!("a forged plan must not be recovered: {report:?}");
+        };
+        assert!(reason.contains("cannot be trusted"), "{reason}");
+        assert_eq!(std::fs::read(install_root.join("a.dll")).unwrap(), b"half-written-new");
+        assert_eq!(std::fs::read(fx.coord.journal_path(&fx.txn)).unwrap(), journal_before);
+        assert_eq!(std::fs::read(backup.join("a.dll")).unwrap(), b"attacker bytes");
+    }
+
     #[test]
     fn an_elevated_recovery_without_a_trusted_identity_never_prompts() {
         let fx = fixture();
