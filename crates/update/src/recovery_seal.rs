@@ -72,8 +72,10 @@ fn parent_is_protected(parent: &Path) -> Result<bool> {
     if acl::directory_owner_id(parent)? == acl::principal_id()? {
         return Ok(false);
     }
-    acl::verify_protected_dir(parent)?;
-    Ok(true)
+    // Owned by someone else but determinably writable by the requesting
+    // user's account (an administrator-owned, user-writable parent): the same
+    // ordinary placement the install route accepts, so no seal is required.
+    Ok(acl::directory_protection(parent)? == acl::DirProtection::Protected)
 }
 
 /// Test build: the state the test sets, unprotected by default.

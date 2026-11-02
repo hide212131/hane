@@ -68,12 +68,25 @@ pub(crate) fn verify_protected(path: &Path) -> Result<()> {
     imp::verify_with(path, false, OwnerRule::Protected)
 }
 
-/// Like [`verify_protected`] for a directory: a real (non-link) directory that a
-/// system-protected principal owns and that no ordinary user can write. Used to
-/// decide whether the coordination parent is a protected location.
-#[cfg_attr(test, allow(dead_code, reason = "tests stand in for the protected parent"))]
-pub(crate) fn verify_protected_dir(path: &Path) -> Result<()> {
-    imp::verify_with(path, true, OwnerRule::Protected)
+/// How a directory that the requesting user does not own relates to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, allow(dead_code, reason = "tests stand in for the parent state"))]
+pub(crate) enum DirProtection {
+    /// A system-protected directory no ordinary user can write.
+    Protected,
+    /// Owned by a system principal but writable by others (for example the
+    /// user's own account or group): an ordinary user-writable placement.
+    UserWritable,
+}
+
+/// Classifies a directory. A state that cannot be determined, or that is
+/// neither protected nor determinably writable, is an error (fail closed).
+#[cfg_attr(test, allow(dead_code, reason = "tests stand in for the parent state"))]
+pub(crate) fn directory_protection(path: &Path) -> Result<DirProtection> {
+    match imp::inspect(path, true, OwnerRule::Protected)? {
+        Ok(()) => Ok(DirProtection::Protected),
+        Err(_) => Ok(DirProtection::UserWritable),
+    }
 }
 
 /// Like [`secure_new`], and additionally makes the token's user SID the owner
@@ -357,6 +370,14 @@ mod imp {
     }
 
     pub fn verify_with(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<()> {
+        inspect(path, is_dir, rule)?
+    }
+
+    /// The outer error means the state could not be determined or does not
+    /// match (owner, kind, ACL); the inner one means it was determined to be
+    /// writable by group or others, which is what makes a root-owned directory
+    /// an ordinary user-writable placement rather than a protected one.
+    pub fn inspect(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<Result<()>> {
         let meta = fs::symlink_metadata(path)?;
         let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
         if meta.file_type().is_symlink() || !kind_ok {
@@ -376,13 +397,13 @@ mod imp {
             )));
         }
         if meta.mode() & 0o022 != 0 {
-            return Err(refuse(format!(
+            return Ok(Err(refuse(format!(
                 "{} is writable by group or others",
                 path.display()
-            )));
+            ))));
         }
         require_no_acl(path, &meta)?;
-        Ok(())
+        Ok(Ok(()))
     }
 }
 
@@ -634,6 +655,15 @@ mod imp {
     }
 
     pub fn verify_with(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<()> {
+        inspect(path, is_dir, rule)?
+    }
+
+    /// The outer error means the state could not be determined or does not
+    /// match (owner, kind, entries); the inner one means the DACL was read and
+    /// grants write access to a principal other than the trusted ones, which is
+    /// what makes an administrator-owned directory an ordinary writable
+    /// placement rather than a protected one.
+    pub fn inspect(path: &Path, is_dir: bool, rule: OwnerRule) -> Result<Result<()>> {
         let meta = fs::symlink_metadata(path)?;
         let kind_ok = if is_dir { meta.is_dir() } else { meta.is_file() };
         if meta.file_type().is_symlink()
@@ -716,14 +746,14 @@ mod imp {
                 let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
                 let sid = std::ptr::addr_of!(allowed.SidStart) as *mut c_void;
                 if allowed.Mask & WRITE_MASK != 0 && !trusted(sid) {
-                    return Err(refuse(format!(
+                    return Ok(Err(refuse(format!(
                         "{} is writable by another principal",
                         path.display()
-                    )));
+                    ))));
                 }
             }
         }
-        Ok(())
+        Ok(Ok(()))
     }
 }
 
@@ -739,6 +769,10 @@ mod imp {
     }
 
     pub fn verify_with(_path: &Path, _is_dir: bool, _rule: OwnerRule) -> Result<()> {
+        Err(refuse("ownership cannot be checked on this OS"))
+    }
+
+    pub fn inspect(_path: &Path, _is_dir: bool, _rule: OwnerRule) -> Result<Result<()>> {
         Err(refuse("ownership cannot be checked on this OS"))
     }
 
@@ -822,6 +856,20 @@ mod tests {
         assert!(owner_allowed(OwnerRule::UserOrDefaultOwner, false, true));
         assert!(owner_allowed(OwnerRule::UserOrDefaultOwner, true, false));
         assert!(!owner_allowed(OwnerRule::UserOrDefaultOwner, false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_is_not_system_owned_is_neither_protected_nor_writable_but_unknown() {
+        // Owned by the test user (not root): the protection state is not
+        // established, so classification fails closed instead of guessing.
+        let dir = std::env::temp_dir().join(format!("hane-acl-class-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(super::directory_protection(&dir).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
