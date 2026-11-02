@@ -117,8 +117,6 @@ enum EntryKind {
     Deny,
     /// An allow type this check does not interpret.
     Opaque,
-    /// Audit and other non-access entries.
-    Ignored,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,12 +142,14 @@ fn classify_dacl(entries: &[DaclEntry]) -> Result<DirProtection> {
     let mut writable = false;
     for entry in entries.iter().filter(|e| !e.inherit_only) {
         match entry.kind {
-            EntryKind::Ignored => {}
             EntryKind::Opaque => {
                 return Err(refuse("an access entry of the directory cannot be checked"));
             }
             EntryKind::Deny => {
-                if entry.writes && matches!(entry.trustee, Trustee::User | Trustee::CommonGroup) {
+                // A deny for a principal whose membership is not established
+                // (`Other`) may still apply to the requesting user, so only
+                // the system principals are known to be irrelevant.
+                if entry.writes && entry.trustee != Trustee::System {
                     return Err(refuse("a deny entry may remove the user's write access"));
                 }
             }
@@ -854,9 +854,10 @@ mod imp {
                     0 => EntryKind::Allow,
                     1 => EntryKind::Deny,
                     t if OPAQUE_ALLOW_TYPES.contains(&t) => EntryKind::Opaque,
-                    _ => EntryKind::Ignored,
+                    // Audit and other non-access entries grant or deny nothing.
+                    _ => continue,
                 };
-                if kind == EntryKind::Ignored || kind == EntryKind::Opaque {
+                if kind == EntryKind::Opaque {
                     entries.push(DaclEntry {
                         kind,
                         inherit_only: false,
@@ -1167,6 +1168,41 @@ mod tests {
             classify_dacl(&[entry(Deny, User, true, false), entry(Allow, User, true, true)]).is_err()
         );
         assert!(classify_dacl(&[system, entry(Opaque, Other, false, false)]).is_err());
+    }
+
+    #[test]
+    fn a_deny_for_a_principal_of_unknown_membership_is_unknown_never_writable() {
+        use super::{DirProtection, EntryKind::*, Trustee::*, classify_dacl};
+        let system = entry(Allow, System, true, true);
+        let common_create = entry(Allow, CommonGroup, true, true);
+        // The user may belong to the denied group: not established as writable.
+        assert!(
+            classify_dacl(&[system, entry(Deny, Other, true, false), common_create]).is_err()
+        );
+        // Deny order does not matter.
+        assert!(
+            classify_dacl(&[system, common_create, entry(Deny, Other, true, false)]).is_err()
+        );
+        // A deny of CommonGroup is refused as before.
+        assert!(
+            classify_dacl(&[system, entry(Deny, CommonGroup, true, false), common_create])
+                .is_err()
+        );
+        // A deny that grants no write class does not affect creation.
+        assert_eq!(
+            classify_dacl(&[system, entry(Deny, Other, false, false), common_create]).unwrap(),
+            DirProtection::UserWritable
+        );
+        // A deny for the system principals does not touch an ordinary user.
+        assert_eq!(
+            classify_dacl(&[entry(Deny, System, true, false), common_create]).unwrap(),
+            DirProtection::UserWritable
+        );
+        // A protected parent with an unrelated deny stays protected.
+        assert_eq!(
+            classify_dacl(&[system, entry(Deny, Other, false, false)]).unwrap(),
+            DirProtection::Protected
+        );
     }
 
     #[cfg(unix)]
