@@ -1447,11 +1447,12 @@ impl RunningHelper {
 const ELEVATED_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The inputs that identify one helper launch. `trusted` is the identity taken
-/// from the signed inventory, never from the rewritable helper record.
+/// from the signed inventory, never from the rewritable helper record. `None`
+/// means no trusted identity could be derived; an elevated launch is then refused.
 #[derive(Clone, Copy)]
 struct HelperLaunch<'a> {
     copy: &'a Path,
-    trusted: &'a crate::identity::FileIdentity,
+    trusted: Option<&'a crate::identity::FileIdentity>,
     request: &'a HelloRequest,
     coordination: &'a Coordination,
     install_root: &'a Path,
@@ -1499,6 +1500,17 @@ fn start_elevated_helper(
     if !os.standard_restart_available() {
         return Err((cause, true));
     }
+    // Without a trusted identity the helper would only be bound to what a
+    // user-writable file says, so nothing elevated is started.
+    let Some(trusted) = trusted else {
+        return Err((
+            UpdateError::new(
+                ErrorCode::IdentityMismatch,
+                "no trusted helper identity is available for the elevated launch",
+            ),
+            true,
+        ));
+    };
     let transaction = &request.transaction_id;
     let nonce = Nonce::generate().map_err(|err| (err, true))?;
     publish_session_nonce(coordination, transaction, &nonce).map_err(|err| (err, true))?;
@@ -1531,9 +1543,9 @@ fn start_elevated_helper(
 const RECOVERY_VERDICT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Runs the staged helper `copy` of a pending `transaction` in recovery mode and
-/// returns its verdict. `trusted` is the identity the copy was verified against
-/// (see [`crate::platform::staged_helper_verified`]); the elevated launch is
-/// pinned to it. The route is decided as for an apply: a writable install starts
+/// returns its verdict. `trusted` is the identity derived from the signed
+/// inventory, never from the staged record; the elevated launch is pinned to it
+/// and refused when it is `None`. The route is decided as for an apply: a writable install starts
 /// the copy normally, a known protected placement without write access asks for
 /// one consent prompt, and anything else is refused before a prompt or a change.
 /// A declined prompt or an unavailable elevated route is reported as
@@ -1545,7 +1557,7 @@ pub(crate) fn recover_with_helper_copy(
     coordination: &Coordination,
     transaction: &TransactionId,
     copy: &Path,
-    trusted: &crate::identity::FileIdentity,
+    trusted: Option<&crate::identity::FileIdentity>,
 ) -> Result<RecoveryReport> {
     let request = HelloRequest {
         mode: Mode::Recover,
@@ -1833,7 +1845,7 @@ pub fn prepare_restart_with(
     };
     let launch = HelperLaunch {
         copy: &copy,
-        trusted: &source.identity,
+        trusted: Some(&source.identity),
         request: &request,
         coordination: &coordination,
         install_root: &placement.install_root,
@@ -3037,7 +3049,7 @@ mod tests {
         let trusted = crate::identity::FileIdentity::of(b"helper");
         let launch = HelperLaunch {
             copy: Path::new("C:\\h\\hane-updater.exe"),
-            trusted: &trusted,
+            trusted: Some(&trusted),
             request: &hello,
             coordination: &fx.coord,
             install_root: Path::new("C:\\hane"),
@@ -3092,7 +3104,7 @@ mod tests {
         let trusted = crate::identity::FileIdentity::of(b"helper");
         let launch = HelperLaunch {
             copy: Path::new("C:\\h\\hane-worker.exe"),
-            trusted: &trusted,
+            trusted: Some(&trusted),
             request: &hello,
             coordination: &fx.coord,
             install_root: Path::new("C:\\hane"),
@@ -3114,6 +3126,15 @@ mod tests {
     }
 
     fn recovery_with(fx: &Fixture, os: &ConsentOs) -> Result<RecoveryReport> {
+        let trusted = crate::identity::FileIdentity::of(b"helper");
+        recovery_with_trust(fx, os, Some(&trusted))
+    }
+
+    fn recovery_with_trust(
+        fx: &Fixture,
+        os: &ConsentOs,
+        trusted: Option<&crate::identity::FileIdentity>,
+    ) -> Result<RecoveryReport> {
         fx.coord.ensure_helper_dir(&fx.txn).unwrap();
         let placement = crate::platform::Placement {
             target: Target::WindowsX64,
@@ -3121,15 +3142,24 @@ mod tests {
             coordination_parent: std::path::PathBuf::from("C:\\"),
             install_id: fx.install.clone(),
         };
-        let trusted = crate::identity::FileIdentity::of(b"helper");
         recover_with_helper_copy(
             os,
             &placement,
             &fx.coord,
             &fx.txn,
             Path::new("C:\\h\\hane-updater.exe"),
-            &trusted,
+            trusted,
         )
+    }
+
+    #[test]
+    fn an_elevated_recovery_without_a_trusted_identity_never_prompts() {
+        let fx = fixture();
+        let os = ConsentOs::new(&fx);
+        let err = recovery_with_trust(&fx, &os, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdentityMismatch);
+        assert!(os.events().is_empty(), "no launch and no prompt: {:?}", os.events());
+        assert!(fx.coord.transaction_dir(&fx.txn).exists(), "the transaction is kept");
     }
 
     #[test]

@@ -148,22 +148,27 @@ impl RecoveryRunner for HelperRecoveryRunner {
         // first mutation is.
         let os = platform::system_elevation();
         recover_with_staged_helper(coordination, transaction, |copy| {
-            // The identity the copy was verified against binds the elevated
-            // launch of a protected placement; it is checked again there.
-            let (staged, trusted) = platform::staged_helper_verified(coordination, transaction)?;
+            let (staged, _recorded) = platform::staged_helper_verified(coordination, transaction)?;
             if staged != copy {
                 return Err(UpdateError::new(
                     ErrorCode::IdentityMismatch,
                     "the staged helper changed during recovery",
                 ));
             }
+            // The record beside the copy is writable by the same user, so it is
+            // not a trust anchor. The elevated launch is pinned to the identity
+            // of the installed helper verified against the signed inventory;
+            // without one, nothing is elevated.
+            let trusted = platform::installed_helper(placement, &self.policy)
+                .ok()
+                .map(|source| source.identity);
             crate::helper::recover_with_helper_copy(
                 os.as_ref(),
                 placement,
                 coordination,
                 transaction,
                 copy,
-                &trusted,
+                trusted.as_ref(),
             )
         })
     }
