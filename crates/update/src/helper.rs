@@ -1527,6 +1527,71 @@ fn start_elevated_helper(
     }
 }
 
+/// How long startup waits for the verdict of a recovery helper.
+const RECOVERY_VERDICT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs the staged helper `copy` of a pending `transaction` in recovery mode and
+/// returns its verdict. `trusted` is the identity the copy was verified against
+/// (see [`crate::platform::staged_helper_verified`]); the elevated launch is
+/// pinned to it. The route is decided as for an apply: a writable install starts
+/// the copy normally, a known protected placement without write access asks for
+/// one consent prompt, and anything else is refused before a prompt or a change.
+/// A declined prompt or an unavailable elevated route is reported as
+/// `RecoveryRequired` with the manual guidance; the journal and the backup are
+/// never touched here.
+pub(crate) fn recover_with_helper_copy(
+    os: &dyn ElevationOs,
+    placement: &crate::platform::Placement,
+    coordination: &Coordination,
+    transaction: &TransactionId,
+    copy: &Path,
+    trusted: &crate::identity::FileIdentity,
+) -> Result<RecoveryReport> {
+    let request = HelloRequest {
+        mode: Mode::Recover,
+        install_id: placement.install_id.clone(),
+        transaction_id: transaction.clone(),
+        candidate_id: None,
+    };
+    let launch = HelperLaunch {
+        copy,
+        trusted,
+        request: &request,
+        coordination,
+        install_root: &placement.install_root,
+    };
+    let running = start_running_helper(&launch, os, ELEVATED_PREPARE_TIMEOUT, || {
+        spawn_helper_checked(copy, &request, PREPARE_TIMEOUT)
+    });
+    // A helper that is slow is left alone: it may be mid-rollback, and the next
+    // start settles whatever it leaves from the journal.
+    match running {
+        Ok(RunningHelper::Standard(mut spawned)) => {
+            let report = spawned.link.await_recovered(RECOVERY_VERDICT_TIMEOUT)?;
+            let _ = spawned.child.wait();
+            Ok(report)
+        }
+        Ok(RunningHelper::Elevated(mut elevated)) => {
+            let report = elevated.link.await_recovered(RECOVERY_VERDICT_TIMEOUT)?;
+            let _ = elevated.process.wait_exit(ABORT_EXIT_GRACE);
+            Ok(report)
+        }
+        Err((err, _)) => {
+            if crate::elevation::is_declined(&err) {
+                Ok(RecoveryReport::RecoveryRequired(
+                    crate::elevation::RECOVERY_DECLINED_MESSAGE.to_owned(),
+                ))
+            } else if crate::elevation::elevation_message(&err).is_some() {
+                Ok(RecoveryReport::RecoveryRequired(
+                    crate::elevation::RECOVERY_UNAVAILABLE_MESSAGE.to_owned(),
+                ))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 /// A helper that answered `Prepared` for a restart. The application may quit
 /// only while it holds one, and only after its own shutdown work is done.
 /// Dropping it without [`PreparedRestart::authorize_exit`] aborts the helper.
@@ -3046,6 +3111,49 @@ mod tests {
 
     fn access(protected: bool, write: crate::elevation::WriteAccess) -> crate::elevation::PlacementAccess {
         crate::elevation::PlacementAccess { protected, write }
+    }
+
+    fn recovery_with(fx: &Fixture, os: &ConsentOs) -> Result<RecoveryReport> {
+        fx.coord.ensure_helper_dir(&fx.txn).unwrap();
+        let placement = crate::platform::Placement {
+            target: Target::WindowsX64,
+            install_root: std::path::PathBuf::from("C:\\hane"),
+            coordination_parent: std::path::PathBuf::from("C:\\"),
+            install_id: fx.install.clone(),
+        };
+        let trusted = crate::identity::FileIdentity::of(b"helper");
+        recover_with_helper_copy(
+            os,
+            &placement,
+            &fx.coord,
+            &fx.txn,
+            Path::new("C:\\h\\hane-updater.exe"),
+            &trusted,
+        )
+    }
+
+    #[test]
+    fn a_declined_recovery_prompt_keeps_the_transaction_and_asks_for_manual_recovery() {
+        let fx = fixture();
+        let os = ConsentOs::new(&fx);
+        os.consent.store(false, Ordering::SeqCst);
+        let report = recovery_with(&fx, &os).unwrap();
+        assert_eq!(
+            report,
+            RecoveryReport::RecoveryRequired(crate::elevation::RECOVERY_DECLINED_MESSAGE.to_owned())
+        );
+        assert!(fx.coord.transaction_dir(&fx.txn).exists(), "the transaction is kept");
+    }
+
+    #[test]
+    fn recovery_of_an_unknown_placement_never_prompts() {
+        use crate::elevation::WriteAccess;
+        let fx = fixture();
+        let mut os = ConsentOs::new(&fx);
+        os.access = access(false, WriteAccess::Denied);
+        let report = recovery_with(&fx, &os).unwrap();
+        assert!(matches!(report, RecoveryReport::RecoveryRequired(_)));
+        assert!(os.events().is_empty(), "no endpoint and no prompt: {:?}", os.events());
     }
 
     #[test]

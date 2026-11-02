@@ -18,7 +18,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{ErrorCode, Result, UpdateError};
-use crate::helper::{HelloRequest, PREPARE_TIMEOUT, spawn_helper};
 use crate::identity::TransactionId;
 use crate::journal::{
     DiskView, FileJournalStore, FsDiskView, JournalStore, Phase, RecoveryDecision, UpdateJournal,
@@ -28,13 +27,12 @@ use crate::model::Target;
 use crate::platform::lease::{Coordination, Lease, LeaseKind, PRIVATE_DIR};
 use crate::platform::{self, Placement};
 use crate::relocation::{self, RelocationRecord};
-use crate::protocol::{Mode, RecoveryReport, bounded_reason};
+use crate::protocol::{RecoveryReport, bounded_reason};
 use crate::state_root::TicketRestore;
 use crate::trust::TrustPolicy;
 
 /// How long a normal launch waits for a helper that holds the startup gate.
 pub const STARTUP_WAIT: Duration = Duration::from_secs(30);
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Held for the rest of the process: the shared `runtime` lease.
 #[derive(Debug)]
@@ -148,22 +146,25 @@ impl RecoveryRunner for HelperRecoveryRunner {
         // The live install may be half replaced after a power loss, so its
         // helper is neither re-verified nor run; the copy staged before the
         // first mutation is.
+        let os = platform::system_elevation();
         recover_with_staged_helper(coordination, transaction, |copy| {
-            let mut spawned = spawn_helper(
+            // The identity the copy was verified against binds the elevated
+            // launch of a protected placement; it is checked again there.
+            let (staged, trusted) = platform::staged_helper_verified(coordination, transaction)?;
+            if staged != copy {
+                return Err(UpdateError::new(
+                    ErrorCode::IdentityMismatch,
+                    "the staged helper changed during recovery",
+                ));
+            }
+            crate::helper::recover_with_helper_copy(
+                os.as_ref(),
+                placement,
+                coordination,
+                transaction,
                 copy,
-                &HelloRequest {
-                    mode: Mode::Recover,
-                    install_id: placement.install_id.clone(),
-                    transaction_id: transaction.clone(),
-                    candidate_id: None,
-                },
-                PREPARE_TIMEOUT,
-            )?;
-            // A helper that is slow is left alone: it may be mid-rollback, and
-            // the next start settles whatever it leaves from the journal.
-            let report = spawned.link.await_recovered(RECOVERY_TIMEOUT)?;
-            let _ = spawned.child.wait();
-            Ok(report)
+                &trusted,
+            )
         })
     }
 }

@@ -56,6 +56,13 @@ pub const ERROR_CANCELLED: u32 = 1223;
 
 /// The message shown when the user declines the Windows consent prompt.
 pub const CANCELLED_MESSAGE: &str = "Windowsの確認画面で更新が許可されなかったため、更新を中止しました。現在のHaneと作業内容はそのままです。あとで「再起動して更新」をやり直せます。";
+/// Shown at startup when the user declines the prompt that a protected
+/// placement needs to finish an interrupted update. The journal and the backup
+/// are kept.
+pub const RECOVERY_DECLINED_MESSAGE: &str = "Windowsの確認画面で復旧が許可されなかったため、中断した更新の復旧を完了できません。元の版とバックアップは保持しています。もう一度Haneを起動して許可するか、手動で復旧してください。";
+/// Shown at startup when an interrupted update in a protected placement cannot
+/// be recovered through the elevated route. The journal and the backup are kept.
+pub const RECOVERY_UNAVAILABLE_MESSAGE: &str = "この配置では中断した更新の復旧に管理者権限の確認が必要ですが、開始できませんでした。バックアップは保持しています。Haneを起動し直すか、手動で復旧してください。";
 /// The notice shown before "再起動して更新" may open the Windows prompt.
 pub const CONSENT_NOTICE: &str = "この配置では更新の適用にWindowsの確認画面が表示されることがあります。";
 
