@@ -21,9 +21,12 @@
 //! unprotected seal, or a journal that does not match it, stops as
 //! `RecoveryRequired` with the journal and the backups kept.
 //!
-//! The seal is required exactly for the transactions that have a helper identity
-//! record, that is, the ones the elevated helper bootstrapped. It is retired
-//! together with that record.
+//! The seal is required whenever the coordination parent is a protected
+//! location (or the helper identity record exists). Protection is read from the
+//! parent itself, never inferred from a record being present: a record that was
+//! erased must not turn a protected transaction into an unprotected one, and a
+//! parent whose protection cannot be established stops as `RecoveryRequired`.
+//! The seal is retired together with the helper identity record.
 
 use std::fs;
 use std::io::{self, Write};
@@ -58,14 +61,64 @@ fn parent_of(coordination: &Coordination) -> Result<&Path> {
     })
 }
 
-/// Whether this transaction was bootstrapped by the elevated helper, which is
-/// when its recovery plan must be sealed.
+/// Whether the coordination parent is a protected location, decided from the
+/// parent itself and never from the records inside it, which a missing or
+/// retired file would turn into "not protected". A parent owned by the
+/// requesting principal is an unprotected placement; one that is neither that
+/// nor verifiably protected is an error, so an unknown state fails closed.
+#[cfg(not(test))]
+fn parent_is_protected(parent: &Path) -> Result<bool> {
+    use crate::platform::acl;
+    if acl::directory_owner_id(parent)? == acl::principal_id()? {
+        return Ok(false);
+    }
+    acl::verify_protected_dir(parent)?;
+    Ok(true)
+}
+
+/// Test build: the state the test sets, unprotected by default.
+#[cfg(test)]
+fn parent_is_protected(_parent: &Path) -> Result<bool> {
+    match test_support::PARENT.with(std::cell::Cell::get) {
+        test_support::Parent::Unprotected => Ok(false),
+        test_support::Parent::Protected => Ok(true),
+        test_support::Parent::Unknown => Err(UpdateError::new(
+            ErrorCode::UnsupportedInstall,
+            "the protection of the coordination parent cannot be determined",
+        )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum Parent {
+        Unprotected,
+        Protected,
+        Unknown,
+    }
+
+    thread_local! {
+        pub(super) static PARENT: Cell<Parent> = const { Cell::new(Parent::Unprotected) };
+    }
+
+    /// Sets what the coordination parent of this thread reports.
+    pub(crate) fn set_parent(state: Parent) {
+        PARENT.with(|cell| cell.set(state));
+    }
+}
+
+/// Whether this transaction's recovery plan must be sealed: the coordination
+/// parent is protected, or the elevated helper left its identity record for it.
 fn required_in(parent: &Path, install_id: &InstallId, transaction: &TransactionId) -> Result<bool> {
     match fs::symlink_metadata(anchor_path(parent, install_id, transaction)) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err.into()),
+        Ok(_) => return Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
+    parent_is_protected(parent)
 }
 
 /// Seals `journal` if this transaction is a protected one; an error means
@@ -359,6 +412,41 @@ mod tests {
         other.steps[0].old = Some(FileIdentity::of(b"other"));
         assert!(write_with(dir.path(), &other, &accept).is_err());
         verify_with(dir.path(), &sealed, &accept).unwrap();
+    }
+
+    #[test]
+    fn a_protected_parent_needs_the_seal_even_when_the_anchor_is_gone() {
+        let dir = TempDir::new("seal-parent-protected");
+        let install = install_id("/x");
+        let transaction = TransactionId::generate().unwrap();
+        let coordination = Coordination::create(dir.path(), &install).unwrap();
+        let sealed = journal(&install, &transaction);
+
+        // No anchor and no seal: an unprotected parent passes, a protected one
+        // and one whose protection is unknown do not.
+        verify_if_protected(&coordination, &sealed).unwrap();
+        test_support::set_parent(test_support::Parent::Protected);
+        assert_eq!(
+            verify_if_protected(&coordination, &sealed).unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        test_support::set_parent(test_support::Parent::Unknown);
+        assert!(verify_if_protected(&coordination, &sealed).is_err());
+        assert!(seal_if_protected(&coordination, &sealed).is_err());
+        assert!(!seal_path(dir.path(), &install, &transaction).exists());
+
+        // With the seal in place the protected parent accepts the genuine plan
+        // and still refuses a differing one.
+        test_support::set_parent(test_support::Parent::Protected);
+        write_with(dir.path(), &sealed, &accept).unwrap();
+        verify_if_protected(&coordination, &sealed).unwrap();
+        let mut forged = sealed.clone();
+        forged.steps[0].old = Some(FileIdentity::of(b"attacker bytes"));
+        assert_eq!(
+            verify_if_protected(&coordination, &forged).unwrap_err().code,
+            ErrorCode::JournalInvalid
+        );
+        test_support::set_parent(test_support::Parent::Unprotected);
     }
 
     #[test]

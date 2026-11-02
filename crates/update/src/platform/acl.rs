@@ -68,6 +68,14 @@ pub(crate) fn verify_protected(path: &Path) -> Result<()> {
     imp::verify_with(path, false, OwnerRule::Protected)
 }
 
+/// Like [`verify_protected`] for a directory: a real (non-link) directory that a
+/// system-protected principal owns and that no ordinary user can write. Used to
+/// decide whether the coordination parent is a protected location.
+#[cfg_attr(test, allow(dead_code, reason = "tests stand in for the protected parent"))]
+pub(crate) fn verify_protected_dir(path: &Path) -> Result<()> {
+    imp::verify_with(path, true, OwnerRule::Protected)
+}
+
 /// Like [`secure_new`], and additionally makes the token's user SID the owner
 /// (Windows). An elevated token's default owner is the Administrators group;
 /// a file created by it is re-owned by the user so the same account's standard

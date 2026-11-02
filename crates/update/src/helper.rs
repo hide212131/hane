@@ -3256,6 +3256,47 @@ mod tests {
         assert_eq!(std::fs::read(backup.join("a.dll")).unwrap(), b"attacker bytes");
     }
 
+    /// Erasing the anchor and the seal of a protected placement must not make it
+    /// look unprotected: the forged journal and backup stay unrestored, and a
+    /// parent whose protection cannot be established stops the same way.
+    #[test]
+    fn a_protected_parent_without_anchor_and_seal_fails_closed() {
+        use crate::journal::{DurableJournal, FileJournalStore, Phase, UpdateJournal};
+        use crate::recovery_seal::test_support::{Parent, set_parent};
+        for state in [Parent::Protected, Parent::Unknown] {
+            let fx = fixture();
+            let install_root = fx._dir.path().join("Hane");
+            std::fs::create_dir_all(&install_root).unwrap();
+            std::fs::write(install_root.join("a.dll"), b"half-written-new").unwrap();
+            fx.coord.ensure_helper_dir(&fx.txn).unwrap();
+
+            // The anchor and the seal were retired from outside; no record remains.
+            let forged = UpdateJournal::begin(&sealed_plan(&fx, b"attacker bytes"), None).unwrap();
+            let mut durable =
+                DurableJournal::create(FileJournalStore::new(fx.coord.journal_path(&fx.txn)), forged)
+                    .unwrap();
+            durable.advance_phase(Phase::ExitAuthorized).unwrap();
+            durable.advance_phase(Phase::Applying).unwrap();
+            drop(durable);
+            let backup = fx.coord.transaction_dir(&fx.txn).join("backup");
+            std::fs::create_dir_all(&backup).unwrap();
+            std::fs::write(backup.join("a.dll"), b"attacker bytes").unwrap();
+
+            let journal_before = std::fs::read(fx.coord.journal_path(&fx.txn)).unwrap();
+            set_parent(state);
+            let report = recover_pending_with(&fx.coord, &fx.txn, None);
+            set_parent(Parent::Unprotected);
+
+            let Ok(RecoveryReport::RecoveryRequired(reason)) = report else {
+                panic!("a protected parent without a seal must not be recovered: {report:?}");
+            };
+            assert!(reason.contains("cannot be trusted"), "{reason}");
+            assert_eq!(std::fs::read(install_root.join("a.dll")).unwrap(), b"half-written-new");
+            assert_eq!(std::fs::read(fx.coord.journal_path(&fx.txn)).unwrap(), journal_before);
+            assert_eq!(std::fs::read(backup.join("a.dll")).unwrap(), b"attacker bytes");
+        }
+    }
+
     #[test]
     fn an_elevated_recovery_without_a_trusted_identity_never_prompts() {
         let fx = fixture();
