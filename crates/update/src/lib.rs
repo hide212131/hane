@@ -44,6 +44,7 @@ pub mod error;
 pub mod fsutil;
 pub mod health;
 pub mod helper;
+pub(crate) mod helper_anchor;
 pub mod identity;
 pub mod journal;
 pub mod limits;

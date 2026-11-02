@@ -45,13 +45,27 @@ enum OwnerRule {
     /// process that writes it, so an elevated writer and a standard reader of
     /// the same account agree on one owner and no default owner is trusted.
     UserOnly,
+    /// A system-protected owner (root, SYSTEM or Administrators) and no other
+    /// writer: the requesting user can neither change nor replace the entry.
+    /// Never satisfied by the principal itself or its default owner.
+    Protected,
 }
 
 fn owner_allowed(rule: OwnerRule, is_user: bool, is_default_owner: bool) -> bool {
     match rule {
         OwnerRule::UserOrDefaultOwner => is_user || is_default_owner,
         OwnerRule::UserOnly => is_user,
+        OwnerRule::Protected => false,
     }
+}
+
+/// Requires a real (non-link) file that a system-protected principal owns and
+/// that no ordinary user can write. Used for the anchor an elevated helper
+/// leaves in a protected directory; a user-owned or user-writable entry is a
+/// refusal.
+#[cfg_attr(test, allow(dead_code, reason = "tests stand in for the system-owned record"))]
+pub(crate) fn verify_protected(path: &Path) -> Result<()> {
+    imp::verify_with(path, false, OwnerRule::Protected)
 }
 
 /// Like [`secure_new`], and additionally makes the token's user SID the owner
@@ -342,7 +356,12 @@ mod imp {
         }
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        if !owner_allowed(rule, meta.uid() == euid, false) {
+        let owner_ok = if rule == OwnerRule::Protected {
+            meta.uid() == 0
+        } else {
+            owner_allowed(rule, meta.uid() == euid, false)
+        };
+        if !owner_ok {
             return Err(refuse(format!(
                 "{} is not owned by the current user",
                 path.display()
@@ -387,6 +406,8 @@ mod imp {
     const TOKEN_OWNER_CLASS: i32 = 4;
     const WIN_LOCAL_SYSTEM_SID: i32 = 22;
     const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
+    /// The `sid_text` form of the TrustedInstaller service SID (S-1-5-80-...).
+    const TRUSTED_INSTALLER_PREFIX: &str = "sid:010600000000000550000000";
     const ACL_REVISION: u32 = 2;
     const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
     const INHERIT_CONTAINER_AND_OBJECT: u32 = 0x3;
@@ -640,13 +661,27 @@ mod imp {
         if owner.is_null() || dacl.is_null() {
             return Err(refuse(format!("{} has no owner-only access list", path.display())));
         }
-        if !owner_allowed(rule, same_sid(owner, &user), same_sid(owner, &default_owner)) {
+        let protected = rule == OwnerRule::Protected;
+        let system_principal = |sid: *mut c_void| {
+            well_known(sid, WIN_LOCAL_SYSTEM_SID)
+                || well_known(sid, WIN_BUILTIN_ADMINISTRATORS_SID)
+                || sid_text(sid).starts_with(TRUSTED_INSTALLER_PREFIX)
+        };
+        let owner_ok = if protected {
+            well_known(owner, WIN_LOCAL_SYSTEM_SID) || well_known(owner, WIN_BUILTIN_ADMINISTRATORS_SID)
+        } else {
+            owner_allowed(rule, same_sid(owner, &user), same_sid(owner, &default_owner))
+        };
+        if !owner_ok {
             return Err(refuse(format!(
                 "{} is not owned by the current user",
                 path.display()
             )));
         }
         let trusted = |sid: *mut c_void| {
+            if protected {
+                return system_principal(sid);
+            }
             same_sid(sid, &user)
                 || same_sid(sid, &default_owner)
                 || well_known(sid, WIN_LOCAL_SYSTEM_SID)

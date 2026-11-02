@@ -258,12 +258,25 @@ pub fn serve_bootstrap<R: Read, W: Write>(
         return Err(mismatch("the transaction already exists"));
     }
     let coordination = Coordination::create_user_owned(&placement.coordination_parent, &placement.install_id)?;
+    // Records settled by earlier updates are retired while this side can still
+    // write the protected parent.
+    crate::helper_anchor::sweep_settled(&coordination);
+    // The identity of the signed installed helper is recorded in the protected
+    // coordination parent before anything is staged or mutated: after a partial
+    // apply the live install no longer yields it, and the user-writable staging
+    // directory cannot be a trust anchor.
+    if let Err(err) = crate::helper_anchor::write(&coordination, &transaction, &source.identity) {
+        let _ = crate::helper_anchor::retire(&coordination, &transaction);
+        return Err(err);
+    }
     if let Err(err) = crate::platform::stage_helper_copy_user_owned(&coordination, &transaction, source) {
         let _ = coordination.remove_unjournaled_transaction(&transaction);
+        let _ = crate::helper_anchor::retire(&coordination, &transaction);
         return Err(err);
     }
     if let Err(err) = writer.write_all(&[BOOTSTRAP_ACK]).and_then(|()| writer.flush()) {
         let _ = coordination.remove_unjournaled_transaction(&transaction);
+        let _ = crate::helper_anchor::retire(&coordination, &transaction);
         return Err(err.into());
     }
     Ok(Bootstrapped { coordination, transaction, nonce })
