@@ -904,6 +904,10 @@ pub struct EditorView {
     /// session it belongs to gets a real path or closes.
     draft_store: Arc<dyn DraftStore>,
     work_folder_drafts: HashMap<SessionId, WorkFolderDraft>,
+    /// The newest rescue journal write per document (`journal_draft_now`):
+    /// document instance, draft and snapshot sequence. A result that does not
+    /// match is stale and is not shown.
+    rescue_journal_requests: HashMap<SessionId, (DocumentInstance, DraftId, u64)>,
     /// The folder the sidebar currently has selected, used as the target
     /// directory for the next "new note" or "new folder". `None` means the
     /// work folder root. This is independent of what the sidebar shows
@@ -2647,20 +2651,65 @@ impl EditorView {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
+        let Some(instance) = self.document_instance(id) else {
+            return;
+        };
         let text = session.editor().document().full_text();
         let sequence = hane_session::next_draft_snapshot_sequence();
+        let draft_id = draft.draft_id;
+        // The newest request per document decides whether a result is still
+        // current; an older one that lands later is ignored.
+        self.rescue_journal_requests
+            .insert(id, (instance, draft_id, sequence));
         let draft_store = self.draft_store.clone();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = draft_store.write_snapshot(
-                    &root,
-                    draft.draft_id,
-                    &draft.target_directory,
-                    &text,
-                    sequence,
-                );
-            })
-            .detach();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    draft_store
+                        .write_snapshot(&root, draft_id, &draft.target_directory, &text, sequence)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_rescue_journal(id, (instance, draft_id, sequence), result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Accepts the result of `journal_draft_now`. A failure is shown only
+    /// while it is still the newest journal request of the same document
+    /// instance and draft; a replaced document, another workspace, a removed
+    /// draft or a later request makes the result stale and it is dropped. A
+    /// success never touches the status, so other save errors stay visible.
+    fn finish_rescue_journal(
+        &mut self,
+        id: SessionId,
+        request: (DocumentInstance, DraftId, u64),
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rescue_journal_requests.get(&id) != Some(&request) {
+            return;
+        }
+        self.rescue_journal_requests.remove(&id);
+        let (instance, draft_id, _) = request;
+        let Err(error) = result else {
+            return;
+        };
+        if self.document_instance(id) != Some(instance)
+            || self
+                .work_folder_drafts
+                .get(&id)
+                .is_none_or(|draft| draft.draft_id != draft_id)
+        {
+            return;
+        }
+        self.status = Some(format!(
+            "破棄を中止しましたが、回復用の下書きを保存できませんでした: {error}"
+        ));
+        cx.notify();
     }
 
     /// Removes the approved session from the set. Only reached once nothing
@@ -2691,6 +2740,7 @@ impl EditorView {
     fn after_tab_removed(&mut self, id: SessionId, was_active: bool, cx: &mut Context<Self>) {
         self.tab_close_after_save.remove(&id);
         self.tab_discard_pending.remove(&id);
+        self.rescue_journal_requests.remove(&id);
         self.save_problems.remove(&id);
         if self
             .tab_close_confirm
@@ -3622,6 +3672,7 @@ impl EditorView {
         // `finish_tab_discard_removal` finds no matching pending afterwards
         // and ignores the old callback's result.
         self.tab_discard_pending.clear();
+        self.rescue_journal_requests.clear();
         self.save_problems.clear();
         self.external_comparison = None;
         // Any background read still in flight for the old folder (or for
@@ -16532,9 +16583,16 @@ mod tests {
         inner: OsDraftStore,
         remove_mode: std::sync::Mutex<ScriptedRemove>,
         removes: std::sync::atomic::AtomicUsize,
+        fail_snapshots: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedDraftStore {
+        /// Makes every later snapshot write fail without touching the disk.
+        fn fail_snapshots(&self, fail: bool) {
+            self.fail_snapshots
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+
         fn script(&self, mode: ScriptedRemove) {
             *self.remove_mode.lock().unwrap() = mode;
         }
@@ -16563,6 +16621,9 @@ mod tests {
             text: &str,
             sequence: u64,
         ) -> std::io::Result<()> {
+            if self.fail_snapshots.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("journal write denied"));
+            }
             self.inner
                 .write_snapshot(root, id, target_directory, text, sequence)
         }
@@ -16657,6 +16718,86 @@ mod tests {
         let confirm = view.tab_close_confirm.expect("confirm armed");
         view.confirm_discard_tab(confirm, cx);
         confirm
+    }
+
+    #[gpui::test]
+    fn rescue_journal_failure_after_aborted_discard_is_shown_and_keeps_the_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fixture) = draft_discard_view(cx, "rescue-journal-failure", "keep me");
+        fixture.store.script(ScriptedRemove::FailAfterDeleting);
+        fixture.store.fail_snapshots(true);
+
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fixture.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fixture.id).expect("the tab stays");
+            assert_eq!(session.editor().document().full_text(), "keep me");
+            assert_eq!(
+                view.work_folder_drafts
+                    .get(&fixture.id)
+                    .map(|draft| draft.draft_id),
+                Some(fixture.draft_id)
+            );
+            let status = view.status.as_deref().unwrap_or_default();
+            assert!(
+                status.contains("回復用の下書きを保存できませんでした")
+                    && status.contains("journal write denied"),
+                "unexpected status: {status}"
+            );
+        });
+        std::fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn stale_rescue_journal_failure_does_not_reach_another_instance_or_newer_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fixture) = draft_discard_view(cx, "rescue-journal-stale", "keep me");
+        view.update(cx, |view, cx| {
+            view.journal_draft_now(fixture.id, cx);
+            let (instance, draft_id, sequence) = *view
+                .rescue_journal_requests
+                .get(&fixture.id)
+                .expect("request recorded");
+            // An older request that lands after a newer one.
+            view.finish_rescue_journal(
+                fixture.id,
+                (instance, draft_id, sequence.wrapping_sub(1)),
+                Err("old failure".to_owned()),
+                cx,
+            );
+            assert_eq!(view.status, None);
+            // The same request from another workspace instance.
+            let other = DocumentInstance {
+                workspace: instance.workspace.wrapping_add(1),
+                ..instance
+            };
+            view.finish_rescue_journal(
+                fixture.id,
+                (other, draft_id, sequence),
+                Err("other workspace".to_owned()),
+                cx,
+            );
+            assert_eq!(view.status, None);
+            // A success never replaces another error.
+            view.status = Some("other error".to_owned());
+            view.finish_rescue_journal(fixture.id, (instance, draft_id, sequence), Ok(()), cx);
+            assert_eq!(view.status.as_deref(), Some("other error"));
+            // After success the request is settled; a late failure is stale.
+            view.finish_rescue_journal(
+                fixture.id,
+                (instance, draft_id, sequence),
+                Err("late failure".to_owned()),
+                cx,
+            );
+            assert_eq!(view.status.as_deref(), Some("other error"));
+        });
+        cx.run_until_parked();
+        std::fs::remove_dir_all(&fixture.root).unwrap();
     }
 
     fn recovered_texts(root: &Path) -> Vec<String> {

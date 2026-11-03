@@ -171,6 +171,7 @@ impl EditorView {
             document_find: document_find::DocumentFindState::default(),
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
+            rescue_journal_requests: HashMap::new(),
             selected_folder: None,
             sidebar_focus: SidebarFocus::ActiveSession,
             expanded_folders: HashSet::new(),
