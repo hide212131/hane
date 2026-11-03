@@ -623,7 +623,7 @@ impl EditorView {
                     .debug_selector(|| "footer-single-entry".to_owned())
                     // The entry gives way before the update button does, so
                     // the button stays whole and operable at a narrow width.
-                    .flex_shrink()
+                    .flex_shrink(1.0)
                     .min_w(px(0.0))
                     .overflow_hidden()
                     .child(
