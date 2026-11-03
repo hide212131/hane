@@ -650,6 +650,13 @@ struct SidebarContextMenu {
 struct TabCloseConfirm {
     id: SessionId,
     instance: DocumentInstance,
+    /// The text revision the question was asked about. A discard approval is
+    /// only valid while the document still has exactly this text.
+    revision: Revision,
+    /// Distinguishes this question from a later one asked for the same
+    /// document and revision (cancel, then close again), so a click from the
+    /// earlier render cannot approve the newer question.
+    epoch: u64,
 }
 
 /// The user's explicit "discard without saving" approval for one document
@@ -968,6 +975,8 @@ pub struct EditorView {
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
+    /// Counter stamped into every new `TabCloseConfirm`.
+    tab_close_confirm_epoch: u64,
     /// Sessions with a "save, then close" request in flight, keyed to the
     /// document instance the request was made against. An instance mismatch
     /// when a write completes means the document was replaced meanwhile —
@@ -2049,7 +2058,14 @@ impl EditorView {
                     }
                     None => {}
                 }
-                self.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+                let revision = session.revision();
+                self.tab_close_confirm_epoch = self.tab_close_confirm_epoch.wrapping_add(1);
+                self.tab_close_confirm = Some(TabCloseConfirm {
+                    id,
+                    instance,
+                    revision,
+                    epoch: self.tab_close_confirm_epoch,
+                });
                 cx.notify();
             }
         }
@@ -2340,11 +2356,19 @@ impl EditorView {
             cx.notify();
             return;
         }
-        self.tab_close_confirm = None;
         let Some(session) = self.sessions.get(id) else {
             return;
         };
         let revision = session.revision();
+        if revision != requested.revision {
+            // The text changed after the question was asked, so the click
+            // approves content the user was never asked about. Ask again
+            // about the current text instead of discarding it.
+            self.tab_close_confirm = None;
+            self.reconfirm_tab_close(id, cx);
+            return;
+        }
+        self.tab_close_confirm = None;
         self.tab_close_after_save.remove(&id);
         self.tab_discard_pending.insert(
             id,
@@ -16319,6 +16343,75 @@ mod tests {
         });
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_tab_after_an_edit_reconfirms_instead_of_discarding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, "confirm-discard-edited");
+
+        let old = view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            let old = view.tab_close_confirm.expect("confirm armed");
+            // An edit lands (e.g. an async replace-all finishing) while the
+            // question is showing.
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+            old
+        });
+        view.update(cx, |view, cx| view.confirm_discard_tab(old, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some(), "the edited tab is kept");
+            assert!(view.tab_discard_pending.is_empty());
+            let renewed = view.tab_close_confirm.expect("asked again");
+            assert_ne!(renewed, old);
+            assert_eq!(
+                renewed.revision,
+                view.sessions.get(id).unwrap().revision(),
+                "the new question is about the current text"
+            );
+        });
+
+        // A stale click from the old render still does nothing; only the new
+        // question's own choice closes the tab.
+        view.update(cx, |view, cx| view.confirm_discard_tab(old, cx));
+        view.read_with(cx, |view, _| assert!(view.sessions.get(id).is_some()));
+        view.update(cx, |view, cx| {
+            let renewed = view.tab_close_confirm.expect("still asked");
+            view.confirm_discard_tab(renewed, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.sessions.get(id).is_none()));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_tab_ignores_a_click_from_a_cancelled_confirmation_at_the_same_revision(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, "confirm-discard-epoch");
+
+        let old = view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            let old = view.tab_close_confirm.expect("confirm armed");
+            assert!(view.dismiss_tab_close_confirm(cx));
+            view.request_tab_close(id, cx);
+            old
+        });
+        view.update(cx, |view, cx| view.confirm_discard_tab(old, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some(), "the old render's click is stale");
+            assert!(view.tab_close_confirm.is_some(), "the new question stays open");
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     // ---- Issue #672: the discard lifecycle, driven through real events and an
