@@ -17895,10 +17895,17 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx, fx) = draft_discard_view(cx, "discard-valid-flush", "bye");
+        // Requested after the helper's journalled snapshot, before the flush.
+        let removal_sequence = hane_session::next_draft_snapshot_sequence();
         view.update(cx, |view, _| {
             view.draft_store = Arc::new(OsDraftStore);
             let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
             hold_discard_removal(view, fx.id, draft);
+            // The approved removal already reached the journal before the flush.
+            OsDraftStore
+                .remove_ordered(&fx.root, fx.draft_id, removal_sequence)
+                .unwrap();
+            assert!(recovered_texts(&fx.root).is_empty());
             view.flush_pending_drafts();
         });
         assert!(recovered_texts(&fx.root).is_empty());
