@@ -1,5 +1,7 @@
-use hane_document::{Revision, SourceRange};
-use hane_markdown::{LinkParse, MarkdownParse, NodeKind, parse_document};
+use hane_document::{Revision, RopeBuffer, SourceRange, TextBuffer};
+use hane_markdown::{
+    BlockIndex, LinkParse, MarkdownParse, NodeKind, links_intersecting, parse_document,
+};
 
 fn parse(source: &str) -> MarkdownParse {
     parse_document(Revision(1), SourceRange::new(0, source.len()), source)
@@ -86,7 +88,10 @@ fn boundary_table_keeps_the_expected_destination() {
         ),
         ("![https://alt.example](https://img.example)", &[]),
         ("<https://example.com>", &[]),
-        ("<span>https://example.com</span> https://outside.example", &[]),
+        (
+            "<span>https://example.com</span> https://outside.example",
+            &[],
+        ),
     ];
     for (source, expected) in cases {
         assert_eq!(&bare(source), expected, "{source:?}");
@@ -131,14 +136,170 @@ fn local_slice_offsets_stay_document_absolute() {
     );
 }
 
+fn structure(index: &BlockIndex) -> Vec<(NodeKind, SourceRange)> {
+    index
+        .blocks()
+        .map(|block| (block.kind, block.source_range))
+        .collect()
+}
+
+/// Links a formal `BlockIndex::build` hands to presentation, in document order.
+fn formal_links(source: &str) -> Vec<(SourceRange, String)> {
+    let index = BlockIndex::build(Revision(1), source);
+    let mut found = Vec::new();
+    for block in index.blocks() {
+        if let Some(projection) = index.list_projection(&block) {
+            found.extend(
+                projection
+                    .links_in(block.source_range)
+                    .map(|link| (link.text_range, link.destination.to_string())),
+            );
+        }
+    }
+    found
+}
+
+fn edit_and_update(
+    buffer: &mut RopeBuffer,
+    index: &mut BlockIndex,
+    range: SourceRange,
+    text: &str,
+) {
+    let base = buffer.revision();
+    buffer.edit(range, text).expect("edit");
+    let deltas = buffer.deltas_since(base).expect("deltas");
+    let _update = index.update(buffer, &deltas);
+}
+
+fn assert_incremental_matches_full(
+    buffer: &RopeBuffer,
+    index: &BlockIndex,
+    expected: &[&str],
+    label: &str,
+) {
+    let source = buffer.full_text();
+    let full = BlockIndex::from_buffer(buffer);
+    assert_eq!(structure(index), structure(&full), "{label}: block tiling");
+    let parsed = parse(&source);
+    let destinations: Vec<_> = parsed
+        .links
+        .iter()
+        .map(|link| link.destination.to_string())
+        .collect();
+    assert_eq!(destinations, expected, "{label}: destinations");
+    let from_parse: Vec<_> = parsed
+        .links
+        .iter()
+        .map(|link| (link.text_range, link.destination.to_string()))
+        .collect();
+    assert_eq!(formal_links(&source), from_parse, "{label}: formal links");
+    for pair in parsed.links.windows(2) {
+        assert!(
+            pair[0].text_range.end <= pair[1].text_range.start,
+            "{label}: links overlap"
+        );
+    }
+    for link in &parsed.links {
+        assert_eq!(slice(&source, link), &*link.destination, "{label}");
+        let end = link.text_range.end.0;
+        let last_glyph = SourceRange::new(end - 1, end);
+        assert!(
+            links_intersecting(&parsed.links, last_glyph)
+                .iter()
+                .any(|found| found.text_range == link.text_range),
+            "{label}: the final byte still belongs to the link"
+        );
+        let after = SourceRange::new(end, end + 1);
+        assert!(
+            !links_intersecting(&parsed.links, after)
+                .iter()
+                .any(|found| found.text_range == link.text_range),
+            "{label}: the half-open end must not reach the next byte"
+        );
+    }
+}
+
+#[test]
+fn incremental_updates_follow_the_url_through_typing_deleting_and_retyping() {
+    let source = "# 見出し\n\n参照 https://\n\nsee [doc][r] and https://ex.example/p.\n\n[r]: https://ref.example/a\n";
+    let mut buffer = RopeBuffer::from_text(source);
+    let mut index = BlockIndex::from_buffer(&buffer);
+    let without_typed = ["https://ref.example/a", "https://ex.example/p"];
+    let with_typed = [
+        "https://example.com/a",
+        "https://ref.example/a",
+        "https://ex.example/p",
+    ];
+    assert_incremental_matches_full(&buffer, &index, &without_typed, "unfinished https://");
+
+    let tail = "example.com/a";
+    let at = source.find("https://\n").expect("unfinished url") + "https://".len();
+    edit_and_update(
+        &mut buffer,
+        &mut index,
+        SourceRange::empty(at),
+        tail,
+    );
+    assert_incremental_matches_full(&buffer, &index, &with_typed, "completed url");
+
+    edit_and_update(
+        &mut buffer,
+        &mut index,
+        SourceRange::new(at, at + tail.len()),
+        "",
+    );
+    assert_incremental_matches_full(&buffer, &index, &without_typed, "destination removed");
+
+    edit_and_update(&mut buffer, &mut index, SourceRange::empty(at), tail);
+    assert_incremental_matches_full(&buffer, &index, &with_typed, "retyped");
+
+    // A multi-byte prefix shifts every later offset by a non-ASCII byte count.
+    edit_and_update(&mut buffer, &mut index, SourceRange::empty(0), "🙂あ");
+    assert_incremental_matches_full(&buffer, &index, &with_typed, "UTF-8 front edit");
+    let shifted = buffer.full_text();
+    let parsed = parse(&shifted);
+    let first = &parsed.links[0];
+    assert_eq!(
+        first.text_range.start.0,
+        shifted.find("https://example.com/a").expect("typed url")
+    );
+
+    // The definition changes while the bare URLs around it keep their ranges.
+    let definition = shifted.find("ref.example").expect("definition");
+    edit_and_update(
+        &mut buffer,
+        &mut index,
+        SourceRange::new(definition, definition + "ref.example".len()),
+        "ref2.example",
+    );
+    assert_incremental_matches_full(
+        &buffer,
+        &index,
+        &[
+            "https://example.com/a",
+            "https://ref2.example/a",
+            "https://ex.example/p",
+        ],
+        "reference definition updated",
+    );
+}
+
 #[test]
 fn bare_urls_merge_with_markdown_links_in_source_order() {
     let source = "https://a.example [b](https://b.example) https://c.example";
     let parsed = parse(source);
-    let destinations: Vec<_> = parsed.links.iter().map(|l| l.destination.to_string()).collect();
+    let destinations: Vec<_> = parsed
+        .links
+        .iter()
+        .map(|l| l.destination.to_string())
+        .collect();
     assert_eq!(
         destinations,
-        ["https://a.example", "https://b.example", "https://c.example"]
+        [
+            "https://a.example",
+            "https://b.example",
+            "https://c.example"
+        ]
     );
     let node = parsed.tree.node(parsed.links[1].node).expect("link node");
     assert_eq!(node.kind, NodeKind::Link);
