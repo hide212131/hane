@@ -143,9 +143,9 @@ fn structure(index: &BlockIndex) -> Vec<(NodeKind, SourceRange)> {
         .collect()
 }
 
-/// Links a formal `BlockIndex::build` hands to presentation, in document order.
-fn formal_links(source: &str) -> Vec<(SourceRange, String)> {
-    let index = BlockIndex::build(Revision(1), source);
+/// Links the given index's formal projections hand to presentation, in document
+/// order. A projection the index withholds contributes nothing.
+fn projected_links(index: &BlockIndex) -> Vec<(SourceRange, String)> {
     let mut found = Vec::new();
     for block in index.blocks() {
         if let Some(projection) = index.list_projection(&block) {
@@ -171,10 +171,13 @@ fn edit_and_update(
     let _update = index.update(buffer, &deltas);
 }
 
+/// `reference` is the destination the fixture's existing `[doc][r]` link must
+/// resolve to; every other link must be a bare URL owned by a `Text` node.
 fn assert_incremental_matches_full(
     buffer: &RopeBuffer,
     index: &BlockIndex,
     expected: &[&str],
+    reference: &str,
     label: &str,
 ) {
     let source = buffer.full_text();
@@ -192,15 +195,37 @@ fn assert_incremental_matches_full(
         .iter()
         .map(|link| (link.text_range, link.destination.to_string()))
         .collect();
-    assert_eq!(formal_links(&source), from_parse, "{label}: formal links");
+    assert_eq!(projected_links(&full), from_parse, "{label}: full index links");
+    // `update` withholds projections until a formal rebuild, so the incremental
+    // index may expose none; whatever it does expose must be the full result.
+    let incremental = projected_links(index);
+    assert!(
+        incremental.is_empty() || incremental == from_parse,
+        "{label}: incremental index links {incremental:?} != {from_parse:?}"
+    );
     for pair in parsed.links.windows(2) {
         assert!(
             pair[0].text_range.end <= pair[1].text_range.start,
             "{label}: links overlap"
         );
     }
+    let mut references = 0;
     for link in &parsed.links {
-        assert_eq!(slice(&source, link), &*link.destination, "{label}");
+        let owner = parsed.tree.node(link.node).expect("owner node");
+        if owner.kind == NodeKind::Link {
+            // Existing Markdown link: the range covers its label, not the URL.
+            references += 1;
+            assert_eq!(&*link.destination, reference, "{label}: reference");
+            assert!(link.uses_reference, "{label}: uses_reference");
+            assert_eq!(slice(&source, link), "doc", "{label}: reference label");
+        } else {
+            // Bare URL: the Text owner's source is the destination verbatim.
+            assert_eq!(owner.kind, NodeKind::Text, "{label}: bare owner");
+            assert!(!link.uses_reference, "{label}: bare uses_reference");
+            assert_eq!(slice(&source, link), &*link.destination, "{label}");
+            assert!(owner.source_range.start <= link.text_range.start);
+            assert!(link.text_range.end <= owner.source_range.end);
+        }
         let end = link.text_range.end.0;
         let last_glyph = SourceRange::new(end - 1, end);
         assert!(
@@ -217,6 +242,7 @@ fn assert_incremental_matches_full(
             "{label}: the half-open end must not reach the next byte"
         );
     }
+    assert_eq!(references, 1, "{label}: the existing reference link");
 }
 
 #[test]
@@ -230,17 +256,19 @@ fn incremental_updates_follow_the_url_through_typing_deleting_and_retyping() {
         "https://ref.example/a",
         "https://ex.example/p",
     ];
-    assert_incremental_matches_full(&buffer, &index, &without_typed, "unfinished https://");
+    let reference = "https://ref.example/a";
+    assert_incremental_matches_full(
+        &buffer,
+        &index,
+        &without_typed,
+        reference,
+        "unfinished https://",
+    );
 
     let tail = "example.com/a";
     let at = source.find("https://\n").expect("unfinished url") + "https://".len();
-    edit_and_update(
-        &mut buffer,
-        &mut index,
-        SourceRange::empty(at),
-        tail,
-    );
-    assert_incremental_matches_full(&buffer, &index, &with_typed, "completed url");
+    edit_and_update(&mut buffer, &mut index, SourceRange::empty(at), tail);
+    assert_incremental_matches_full(&buffer, &index, &with_typed, reference, "completed url");
 
     edit_and_update(
         &mut buffer,
@@ -248,14 +276,20 @@ fn incremental_updates_follow_the_url_through_typing_deleting_and_retyping() {
         SourceRange::new(at, at + tail.len()),
         "",
     );
-    assert_incremental_matches_full(&buffer, &index, &without_typed, "destination removed");
+    assert_incremental_matches_full(
+        &buffer,
+        &index,
+        &without_typed,
+        reference,
+        "destination removed",
+    );
 
     edit_and_update(&mut buffer, &mut index, SourceRange::empty(at), tail);
-    assert_incremental_matches_full(&buffer, &index, &with_typed, "retyped");
+    assert_incremental_matches_full(&buffer, &index, &with_typed, reference, "retyped");
 
     // A multi-byte prefix shifts every later offset by a non-ASCII byte count.
     edit_and_update(&mut buffer, &mut index, SourceRange::empty(0), "🙂あ");
-    assert_incremental_matches_full(&buffer, &index, &with_typed, "UTF-8 front edit");
+    assert_incremental_matches_full(&buffer, &index, &with_typed, reference, "UTF-8 front edit");
     let shifted = buffer.full_text();
     let parsed = parse(&shifted);
     let first = &parsed.links[0];
@@ -280,6 +314,7 @@ fn incremental_updates_follow_the_url_through_typing_deleting_and_retyping() {
             "https://ref2.example/a",
             "https://ex.example/p",
         ],
+        "https://ref2.example/a",
         "reference definition updated",
     );
 }
