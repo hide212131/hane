@@ -613,12 +613,21 @@ impl EditorView {
         // whichever path the session actually ended up at.
         if let Some(session) = self.sessions.get_mut(id) {
             session.finish_rename(ticket);
-            if let Some(pending) = session.take_pending_save() {
-                self.save_session(id, pending, cx);
-            }
+        }
+        // An approved discard is settled before any queued write starts: a
+        // save queued behind this rename must not put text the user chose to
+        // throw away onto disk. An edit made after the approval turns it back
+        // into a question, which leaves the queued save free to run.
+        self.resolve_pending_tab_discard(id, cx);
+        if !self.tab_discard_pending.contains_key(&id)
+            && let Some(pending) = self
+                .sessions
+                .get_mut(id)
+                .and_then(DocumentSession::take_pending_save)
+        {
+            self.save_session(id, pending, cx);
         }
         self.resolve_pending_tab_close(id, cx);
-        self.resolve_pending_tab_discard(id, cx);
         // Publish the exact state from every session before returning, so a
         // request arriving before the next render does not read a stale value.
         self.sync_external_open_guard();
@@ -1026,10 +1035,15 @@ impl EditorView {
                 self.title_sync_pending.remove(&id);
             }
         }
-        if let Some(pending) = self
-            .sessions
-            .get_mut(id)
-            .and_then(DocumentSession::take_pending_save)
+        // Settled before any queued write starts, as in `finish_title_rename`:
+        // a save queued behind this one must not write text an approved
+        // discard is about to throw away.
+        self.resolve_pending_tab_discard(id, cx);
+        if !self.tab_discard_pending.contains_key(&id)
+            && let Some(pending) = self
+                .sessions
+                .get_mut(id)
+                .and_then(DocumentSession::take_pending_save)
         {
             self.save_session(id, pending, cx);
         }
@@ -1038,7 +1052,6 @@ impl EditorView {
         } else {
             self.tab_close_after_save.remove(&id);
         }
-        self.resolve_pending_tab_discard(id, cx);
         // Recompute from every session after the pending-save chain settled, so
         // the next external request sees the exact state without waiting for a
         // render; other sessions' dirty / saving state keeps it raised.
