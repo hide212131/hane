@@ -2516,6 +2516,12 @@ impl EditorView {
                 self.work_folder_drafts.insert(id, draft);
                 self.content_search_workspace_changed(cx);
                 self.journal_draft_now(id, cx);
+                // The approval is over and the document stays: hand back what
+                // the discard held off. Done before the status below so the
+                // visible error is not hidden by a resumed write.
+                if !edited && !reconfirming {
+                    self.resume_writers_after_discard_settled(id, instance, cx);
+                }
                 if let Err(error) = other {
                     self.status = Some(format!("破棄できませんでした: {error}"));
                 } else if edited {
@@ -2529,6 +2535,39 @@ impl EditorView {
                 cx.notify();
             }
         }
+    }
+
+    /// Re-evaluates the ordinary writers that an approved discard held off
+    /// (a queued save, the autosave timer, the H1 title sync) once the
+    /// approval ended without closing the tab. Each goes back through its
+    /// usual owner, so the existing protections (autosave setting, IME,
+    /// ticket freshness, in-flight slot) still decide. Nothing runs while an
+    /// approval for the document is still active.
+    fn resume_writers_after_discard_settled(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_discard_pending.contains_key(&id)
+            || self.document_instance(id) != Some(instance)
+        {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(id) else {
+            return;
+        };
+        // A write still in flight drains the queue itself when it lands.
+        if !session.save_in_flight()
+            && let Some(pending) = session.take_pending_save()
+        {
+            self.save_session(id, pending, cx);
+        }
+        if self.sessions.active_id() == id {
+            // Re-arms only when autosave is on and the text is unsaved.
+            self.schedule_autosave(cx);
+        }
+        self.retry_title_sync(id, cx);
     }
 
     /// Asks again for a document whose approval no longer matches its text.

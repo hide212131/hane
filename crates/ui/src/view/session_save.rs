@@ -765,7 +765,7 @@ impl EditorView {
     /// rather than waiting on the next keystroke to re-arm the debounce —
     /// which may never come, if the H1 edit that wanted the rename was the
     /// document's last edit before the autosave it lost the race to.
-    fn retry_title_sync(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    pub(super) fn retry_title_sync(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
