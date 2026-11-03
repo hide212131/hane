@@ -80,6 +80,8 @@ Jevにcurrent code・Issue契約・一次仕様・候補を渡し、`local_scann
 
 受入条件はIssue本文を正とする。parserで境界と除外・offset、presentationで色とsource↔visual対応、UIで両mode/OS modifier条件と編集state不変をfocusedに検証する。soft-wrap、URL末尾glyph、scroll/zoom後を確認し、適切な回帰テストを追加する。全域再設計や無関係な性能最適化を混ぜない。認識処理の増分・背景解析への影響がある場合は同じ入力の変更前基準を取り、全文の毎回走査をUIへ追加しない。
 
+cache回帰はFormalとProvisionalを分ける。正式index公開後の安定IDでは無関係編集による実cache再利用と正しい範囲移動・destination・Link色を確認する。正式index未公開時は既存local_block_indexがsource開始offset由来のProvisional IDを返し、前方編集でIDが変わり得るため、cache missからの正当な再presentでも正しいmetadataを必ず確認する。背景正式publish後の同じ結果と成立条件下の再利用、VisualBlock rebaseのsource/glyph整合も確認する。あらゆるProvisional編集で常に再利用する製品最適化は本Issueの要件ではない。根拠はPR #676の観測コメント6611976739とJev判断6612034997。Issueの鮮度・原文保持・操作stateの受入条件は弱めない。
+
 GUIは両OSで編集（macOS Command / Windows Ctrl）、閲覧（無修飾mouse-up）を確認する。編集通常クリックは選択、閲覧の4論理px未満は開く、以上はドラッグ選択、MouseMoveなしreleaseも既存契約を維持する。開くだけでcaret/selection/bytes/revision/Undo/Redoを変えないことをstateテストと前後観測で確認する。ブラウザの実到達URL・対象head/base・binary・PID/path・隔離state・mode・入力と結果を記録し、起動要求だけを到達成功にしない。
 
 Windows GUIは許可済み既存Windowsチャットから直接操作し、Mac経由VMを使わない。GUI操作前にhane-gui-test skillと共有GUIの利用状況を確認する。失敗時は `docs/gui-test-recovery.md` に従い復旧し、unknownをpassにしない。自分の検証アプリだけを終了確認後に片付ける。

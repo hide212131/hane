@@ -152,6 +152,67 @@ fn assert_colored_and_targeted(line: &VisualLine, source: &str, url: &str) {
     assert!(!targets[0].contains(SourceOffset(range.end.0)));
 }
 
+/// An edit in the block in front moves a presented bare URL by `rebase`: the
+/// target range, destination and the glyph-to-source mapping follow the new
+/// UTF-8 offsets and agree with presenting the edited source from scratch.
+#[test]
+fn rebase_after_a_multibyte_edit_in_front_keeps_targets_and_glyphs_aligned() {
+    let url = "https://keep.example/k";
+    let source = format!("head\n\nsee {url} tail\n");
+    let mut block = present(&source).remove(1);
+    let shaper = shaper();
+    let mut layout = layout_block(&block, 2_000.0, &shaper);
+
+    let mut buffer = RopeBuffer::from_text(&source);
+    let before = buffer.revision();
+    buffer
+        .edit(SourceRange::new(4, 4), "🙂")
+        .expect("edit in front of the URL block");
+    let deltas = buffer.deltas_since(before).expect("history is available");
+    let now = buffer.text(SourceRange::new(0, buffer.len_bytes().0)).expect("text");
+    assert_eq!(now, format!("head🙂\n\nsee {url} tail\n"));
+
+    assert!(block.rebase(&deltas, buffer.revision()));
+    assert!(layout.rebase(&deltas, buffer.revision()));
+
+    let expected = range_of(&now, url);
+    assert_eq!(expected.start.0, range_of(&source, url).start.0 + "🙂".len());
+    assert_eq!(block.lines.len(), 1);
+    let line = &block.lines[0];
+    assert_eq!(line.links.len(), 1);
+    assert_eq!(&*line.links[0].destination, url);
+    assert_eq!(line.links[0].source_range, expected);
+    assert_colored_and_targeted(line, &now, url);
+
+    // The rebased presentation equals presenting the edited source again.
+    let fresh = present(&now).remove(1);
+    assert_eq!(
+        fresh.lines[0]
+            .links
+            .iter()
+            .map(|link| (link.destination.to_string(), link.source_range))
+            .collect::<Vec<_>>(),
+        [(url.to_string(), expected)]
+    );
+
+    // Every glyph of the URL resolves to its own new source offset and target.
+    for offset in expected.start.0..expected.end.0 {
+        let point = layout
+            .point_for_source(&block, SourceOffset(offset), &shaper)
+            .expect("every URL character has a point");
+        let glyph = layout.glyph_source_at_xy(&block, point.row, point.x + 1.0, 1.0, &shaper);
+        assert_eq!(glyph, Some(SourceOffset(offset)), "glyph at {offset}");
+        let row = &block.lines[layout.lines[point.row].line];
+        let target = row
+            .links
+            .iter()
+            .find(|link| link.contains(SourceOffset(offset)))
+            .unwrap_or_else(|| panic!("no target at {offset}"));
+        assert_eq!(&*target.destination, url);
+        assert_eq!(target.source_range, expected);
+    }
+}
+
 #[test]
 fn several_urls_in_one_text_each_hit_only_their_own_glyphs() {
     let source = "see https://a.example/x, then https://b.example/y; https://c.example/z end";
