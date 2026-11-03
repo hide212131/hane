@@ -279,13 +279,48 @@ fn table_row_keeps_one_target_each_for_markdown_and_bare_links() {
     for url in ["https://t.example/c", "https://u.example/d"] {
         assert_colored_and_targeted(row, source, url);
     }
-    // The Markdown link text is colored once, not doubled by the bare path.
-    let label = row.visual_text.find('m').expect("link label");
-    assert_eq!(
+    // Existing behavior (same on main): an inactive table row keeps the raw
+    // `[m](https://m.example/)` visual and source, and the Markdown link gets a
+    // target only, with no individual Link color. Issue #673 adds the bare-URL
+    // color/target only; it must not decorate the Markdown link, re-target its
+    // raw destination as a bare URL, or widen the target beyond the label.
+    let markdown = "[m](https://m.example/)";
+    assert!(
+        row.visual_text.contains(markdown),
+        "raw Markdown link stays visible: {:?}",
+        row.visual_text
+    );
+    let label = range_of(source, "[m]");
+    let label = SourceRange::new(label.start.0 + 1, label.start.0 + 2);
+    let markdown_targets = row
+        .links
+        .iter()
+        .filter(|link| &*link.destination == "https://m.example/")
+        .collect::<Vec<_>>();
+    assert_eq!(markdown_targets.len(), 1, "exactly one target for the label");
+    assert_eq!(markdown_targets[0].source_range, label);
+    assert!(markdown_targets[0].contains(label.start));
+    assert!(!markdown_targets[0].contains(label.end));
+    assert!(!markdown_targets[0].uses_reference);
+    // The raw destination text is not a separate bare-URL target.
+    let raw_destination = range_of(source, "(https://m.example/)");
+    assert!(
+        row.links
+            .iter()
+            .filter(|link| &*link.destination != "https://m.example/")
+            .all(|link| link.source_range.end <= raw_destination.start
+                || link.source_range.start >= raw_destination.end),
+        "no other target overlaps the raw Markdown destination"
+    );
+    // No Link color is added over the Markdown link; only the two bare URLs
+    // (checked above) are colored.
+    let visual = row.visual_text.find(markdown).expect("markdown link visible");
+    assert!(
         link_runs(row)
             .iter()
-            .filter(|run| run.0 <= label && label < run.1)
-            .count(),
-        1
+            .all(|run| run.1 <= visual || run.0 >= visual + markdown.len()),
+        "Markdown link is not given a Link color: {:?}",
+        row.style_runs
     );
+    assert_eq!(link_runs(row).len(), 2, "only the two bare URLs are colored");
 }
