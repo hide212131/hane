@@ -99,6 +99,7 @@ impl EditorView {
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height
             - self.theme.footer_height
+            - self.update_panel_reserved_height()
             - self.document_find_reserved_height())
         .max(self.line_height());
         self.step_measurement_scroll(window);
@@ -576,6 +577,7 @@ impl EditorView {
         );
         let editor_column_width =
             (f32::from(window.viewport_size().width) - sidebar_width).max(0.0);
+        let main_column = main_column.children(self.update_panel_element(cx));
         let rendered = root.child(main_column.child(self.footer_element(editor_column_width, cx)));
         let rendered = if let Some(menu) = self.file_tab_context_menu.as_ref() {
             rendered.child(

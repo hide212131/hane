@@ -97,7 +97,7 @@ pub use app_update::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot,
     ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, PreparedUpdate,
     RestartBlocker, RestartObservation, RestartPreparation, RestartTicketFile, RestartTicketSnapshot,
-    SharedExternalOpenQueue,
+    SharedExternalOpenQueue, UpdateWakeReceiver, UpdateWakeSender, update_wake_channel,
 };
 mod ai_settings;
 mod background_parse;
@@ -823,6 +823,14 @@ pub struct EditorView {
     app_update: Option<Arc<dyn AppUpdateController>>,
     /// A card refresh loop is running while the update service is busy.
     app_update_polling: bool,
+    /// Wakes this view when the update service's visible state changes. It
+    /// sleeps while the service waits and ends with the view or a replaced
+    /// service.
+    app_update_wake_task: Option<gpui::Task<()>>,
+    /// The shared update panel above the footer is shown.
+    update_panel_open: bool,
+    /// The one-time startup notice has been shown in this process.
+    update_startup_announced: bool,
     /// Held only for the synchronous restart check; while set, the shared
     /// external-open entrance answers `Busy`.
     restart_freeze: bool,

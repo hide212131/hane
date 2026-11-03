@@ -29,6 +29,7 @@ mod finder_open;
 mod finder_service;
 
 mod app_update;
+mod app_update_schedule;
 mod https_transport;
 mod limited_start;
 mod network_state;
@@ -210,7 +211,9 @@ struct AppOwnedUpdateService(#[allow(dead_code, reason = "owns the service for t
 impl Global for AppOwnedUpdateService {}
 
 /// Builds the app-owned update service. Construction reads no network, ZIP or
-/// update state; the service communicates only after an explicit button press.
+/// update state. Metadata is read after an explicit button press or by the
+/// automatic check armed after the normal window is shown (Issue #649); the
+/// archive is fetched only after the user accepts the candidate.
 /// `None` (no card) when the install location or state root cannot be named.
 fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     let state = FileStateStore::from_environment().ok()?;
@@ -915,6 +918,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         state: network_state(),
     });
     let ai_lifecycle: Arc<dyn AiLifecycle> = ai_owner;
+    // Kept to arm the automatic check once the normal window is shown.
+    let auto_check_service = update_service.clone();
     let update_controller: Option<Arc<dyn AppUpdateController>> = update_service.map(|service| {
         // The service belongs to the application, not to a window.
         cx.set_global(AppOwnedUpdateService(Arc::clone(&service)));
@@ -949,6 +954,9 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                     view.attach_ai_service(ai_service_handle.clone(), cx);
                     view.attach_ai_lifecycle(Some(ai_lifecycle.clone()));
                     view.attach_app_update(update_controller.clone());
+                    // Subscribes to state changes and starts the local Ready
+                    // restore; neither sends a request.
+                    view.watch_app_update(cx);
                     view.attach_network_applier(Some(network_applier.clone()));
                     #[cfg(target_os = "macos")]
                     view.attach_external_open_inbox(Some(finder_requests.clone()));
@@ -966,6 +974,15 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             },
         )
         .expect("open Hane window");
+    // The normal window is shown and the service is connected: the first
+    // metadata check is due 30 seconds from now (and after the local restore).
+    // Debug builds never check on their own. Unsupported placements and
+    // builds without trust material are unavailable and are not armed.
+    if let Some(service) = &auto_check_service
+        && !cfg!(debug_assertions)
+    {
+        service.arm_auto_check();
+    }
     if let Some(plan) = restore {
         // The saved files of the previous version, through the ordinary open
         // path and in order (the active file last, so it is the one shown).

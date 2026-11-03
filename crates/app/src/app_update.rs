@@ -1,8 +1,11 @@
 //! App-owned application update service (Issue #510, stage U3).
 //!
 //! The service lives for the whole process and is created without any network
-//! or archive work. It communicates only after the user presses a button:
-//! `check` reads the latest stable release and its signed catalog, `download`
+//! or archive work. Metadata is read after a button press or, once armed
+//! (Issue #649), by the automatic schedule 30 seconds after the normal window
+//! is shown and then hourly; an archive is fetched only after the user accepts
+//! that candidate. `check` reads the latest stable release and its signed
+//! catalog, `download`
 //! fetches the archive into a private work directory, verifies hash, size and
 //! ZIP layout, extracts it into a private stage and only then offers it as
 //! `Ready`. Applying a Ready update (helper, file replacement, rollback) is not
@@ -18,8 +21,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
-use hane_ui::{AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, PreparedUpdate};
+use hane_ui::{
+    AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, PreparedUpdate, UpdateWakeReceiver,
+    UpdateWakeSender, update_wake_channel,
+};
 use hane_update::archive::{ArchiveLimits, stage_archive};
 use hane_update::catalog::{
     CandidateId, VerifiedCandidate, VerifyContext, confirm_selection, record_seen, verify_catalog,
@@ -35,6 +42,9 @@ use hane_update::version::{VersionRelation, parse_current_version};
 use hane_update::error::io_detail;
 use hane_update::{ErrorCode, UpdateError};
 
+use crate::app_update_schedule::{
+    AutoCheckGuard, AutoSchedule, CheckHealth, CheckOrigin, Monotonic, Signal, SystemMonotonic,
+};
 use crate::update_diagnostics::{Diagnostics, Identity, Redactor, short_id};
 use crate::update_restart::{self, HelperHandoff};
 
@@ -130,6 +140,7 @@ enum Stage {
     Checking {
         op: u64,
         cancel: CancelToken,
+        origin: CheckOrigin,
     },
     UpToDate,
     Available(Arc<Offer>),
@@ -162,11 +173,25 @@ enum Stage {
     },
 }
 
+/// A periodic re-check that runs beside an `Available` candidate. The
+/// candidate stays in `stage`, valid and downloadable, until a verified result
+/// replaces it.
+struct Recheck {
+    op: u64,
+    cancel: CancelToken,
+    origin: CheckOrigin,
+}
+
 struct State {
     next_op: u64,
     stage: Stage,
     restoring: bool,
     restore_started: bool,
+    recheck: Option<Recheck>,
+    /// The one-time startup notice has been decided (shown or ruled out).
+    startup_decided: bool,
+    /// The candidate the startup notice is about.
+    startup_announce: Option<String>,
 }
 
 /// Identity of one asynchronous operation. A result is applied only when the
@@ -191,7 +216,12 @@ impl State {
                 op: *op,
                 candidate: Some(offer.id().clone()),
             }),
-            _ => None,
+            // A re-check beside an Available candidate has its own operation.
+            _ => self.recheck.as_ref().map(|recheck| Ticket {
+                install: install.clone(),
+                op: recheck.op,
+                candidate: None,
+            }),
         }
     }
 }
@@ -201,7 +231,7 @@ enum CheckOutcome {
     Available(Box<Offer>),
 }
 
-struct Inner {
+pub(crate) struct Inner {
     config: UpdateServiceConfig,
     transport: Arc<dyn Transport>,
     clock: Arc<dyn Clock>,
@@ -224,6 +254,16 @@ struct Inner {
     diag: Diagnostics,
     /// Why the default runner could not start its thread, when it could not.
     spawn_error: Arc<Mutex<Option<String>>>,
+    /// Monotonic time for the automatic-check schedule (never the wall clock).
+    mono: Arc<dyn Monotonic>,
+    /// Automatic-check deadline, backoff and pause. Lock order: `state`, then
+    /// `sched`.
+    sched: Mutex<AutoSchedule>,
+    /// Wakes the schedule's wait thread when a visible state changes.
+    signal: Arc<Signal>,
+    /// One sender per subscribed view. Only senders are kept; a view that went
+    /// away is dropped at the next wake.
+    subscribers: Mutex<Vec<UpdateWakeSender>>,
 }
 
 fn new_owner_id() -> String {
@@ -243,6 +283,9 @@ const CANDIDATE_LEASE_SUFFIX: &str = ".candidate";
 
 pub struct AppUpdateService {
     inner: Arc<Inner>,
+    /// Owns the automatic-check wait thread once armed. Dropping the service
+    /// stops and joins the thread.
+    auto: Mutex<Option<AutoCheckGuard>>,
 }
 
 fn thread_runner(spawn_error: Arc<Mutex<Option<String>>>) -> Runner {
@@ -325,11 +368,19 @@ impl AppUpdateService {
     ) -> Self {
         let spawn_error = Arc::new(Mutex::new(None));
         let runner = thread_runner(Arc::clone(&spawn_error));
-        Self::build(config, transport, clock, runner, spawn_error)
+        Self::build(
+            config,
+            transport,
+            clock,
+            runner,
+            spawn_error,
+            Arc::new(SystemMonotonic::new()),
+        )
     }
 
     /// Like [`AppUpdateService::new`] with an explicit task runner, so tests
-    /// can control when background work happens.
+    /// can control when background work happens. Time stands still unless the
+    /// test moves it through [`AppUpdateService::with_runner_and_monotonic`].
     #[cfg(test)]
     pub fn with_runner(
         config: UpdateServiceConfig,
@@ -337,7 +388,33 @@ impl AppUpdateService {
         clock: Arc<dyn Clock>,
         runner: Runner,
     ) -> Self {
-        Self::build(config, transport, clock, runner, Arc::new(Mutex::new(None)))
+        Self::with_runner_and_monotonic(
+            config,
+            transport,
+            clock,
+            runner,
+            Arc::new(crate::app_update_schedule::testing::FakeMonotonic::default()),
+        )
+    }
+
+    /// [`AppUpdateService::with_runner`] with the schedule's monotonic clock
+    /// given, so a test can move 30 seconds or an hour at once.
+    #[cfg(test)]
+    pub fn with_runner_and_monotonic(
+        config: UpdateServiceConfig,
+        transport: Arc<dyn Transport>,
+        clock: Arc<dyn Clock>,
+        runner: Runner,
+        mono: Arc<dyn Monotonic>,
+    ) -> Self {
+        Self::build(
+            config,
+            transport,
+            clock,
+            runner,
+            Arc::new(Mutex::new(None)),
+            mono,
+        )
     }
 
     fn build(
@@ -346,6 +423,7 @@ impl AppUpdateService {
         clock: Arc<dyn Clock>,
         runner: Runner,
         spawn_error: Arc<Mutex<Option<String>>>,
+        mono: Arc<dyn Monotonic>,
     ) -> Self {
         // Without embedded trust material no catalog can ever be verified, so
         // the service says so up front instead of contacting the network.
@@ -390,6 +468,9 @@ impl AppUpdateService {
                     stage,
                     restoring: false,
                     restore_started: false,
+                    recheck: None,
+                    startup_decided: false,
+                    startup_announce: None,
                 }),
                 restart: OnceLock::new(),
                 owner,
@@ -397,7 +478,12 @@ impl AppUpdateService {
                 candidate_lease: Mutex::new(None),
                 diag,
                 spawn_error,
+                mono,
+                sched: Mutex::new(AutoSchedule::default()),
+                signal: Signal::new(),
+                subscribers: Mutex::new(Vec::new()),
             }),
+            auto: Mutex::new(None),
         }
     }
 
@@ -406,6 +492,44 @@ impl AppUpdateService {
     /// offered only when the trust policy is configured.
     pub fn enable_restart(&self, wiring: RestartWiring) {
         let _ = self.inner.restart.set(wiring);
+        self.inner.changed();
+    }
+
+    /// Starts the automatic metadata check schedule: the first check is due 30
+    /// seconds from now (and after the local Ready restore finished), then one
+    /// hour after each completed check. Call it once, after the normal window
+    /// is shown and the service is connected, and only for a build that may
+    /// check on its own. An unavailable service (no trust material, no target,
+    /// unsupported placement) is never armed. `false` when nothing was armed.
+    ///
+    /// The schedule makes no request itself; a due check goes through the
+    /// service's runner like a button press. The wait thread ends when this
+    /// service is dropped.
+    pub fn arm_auto_check(&self) -> bool {
+        if matches!(self.inner.lock().stage, Stage::Unavailable { .. }) {
+            return false;
+        }
+        let mut slot = self.auto.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_some() {
+            return false;
+        }
+        let now = self.inner.mono.now();
+        if !self.inner.sched_lock().arm(now) {
+            return false;
+        }
+        match AutoCheckGuard::spawn(&self.inner, Arc::clone(&self.inner.signal)) {
+            Ok(guard) => {
+                *slot = Some(guard);
+                true
+            }
+            Err(error) => {
+                self.inner.sched_lock().disarm();
+                self.inner
+                    .diag
+                    .record("schedule", ErrorCode::Io.as_str(), &io_detail(&error), None);
+                false
+            }
+        }
     }
 
     /// Records that the running install location cannot be updated. The
@@ -425,6 +549,7 @@ impl AppUpdateService {
             idle
         };
         if blocked {
+            self.inner.changed();
             // The original error is kept: the shown code alone cannot say
             // whether the location, the owner or the I/O failed.
             let shown = placement_block_code(error, exe);
@@ -463,6 +588,35 @@ fn placement_block_code(error: &UpdateError, exe: &Path) -> ErrorCode {
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sched_lock(&self) -> MutexGuard<'_, AutoSchedule> {
+        self.sched.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A visible state changed: tell every subscriber to read the snapshot
+    /// again and let the schedule re-evaluate. Never call this with the state
+    /// lock held. A pending wake already covers a burst of changes.
+    pub(crate) fn changed(&self) {
+        self.subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(UpdateWakeSender::wake);
+        self.signal.poke();
+    }
+
+    /// Pauses or resumes the automatic check (restart preparation).
+    fn set_auto_paused(&self, paused: bool) {
+        self.sched_lock().set_paused(paused);
+        self.signal.poke();
+    }
+
+    /// One evaluation of the schedule, run by the wait thread: starts the due
+    /// automatic check if the service can take one, and returns how long the
+    /// thread may sleep. `None` means it sleeps until a state change.
+    pub(crate) fn auto_step(self: &Arc<Self>) -> Option<Duration> {
+        self.begin_check(true);
+        self.sched_lock().next_wait(self.mono.now())
     }
 
     fn candidates_dir(&self) -> PathBuf {
@@ -591,26 +745,36 @@ impl Inner {
                     }
                     _ => None,
                 };
-                let running = match &state.stage {
-                    Stage::Checking { op: live, .. } | Stage::Downloading { op: live, .. } => {
-                        *live == op
-                    }
-                    _ => false,
-                };
+                let checking = matches!(&state.stage, Stage::Checking { op: live, .. } if *live == op);
+                let rechecking = state.recheck.as_ref().is_some_and(|recheck| recheck.op == op);
+                let running = checking
+                    || rechecking
+                    || matches!(&state.stage, Stage::Downloading { op: live, .. } if *live == op);
                 if running {
-                    state.stage = Stage::Failed {
-                        code: ErrorCode::Io,
-                        stage: "start",
-                    };
+                    if rechecking {
+                        // The known candidate stays; only the re-check failed.
+                        state.recheck = None;
+                    } else {
+                        state.stage = Stage::Failed {
+                            code: ErrorCode::Io,
+                            stage: "start",
+                        };
+                    }
                     self.diag.note(
                         "start",
                         ErrorCode::Io.as_str(),
                         &detail,
                         version.as_deref(),
                     );
+                    if checking || rechecking {
+                        // A check that never ran backs off like a failed one.
+                        self.sched_lock()
+                            .finished(self.mono.now(), CheckHealth::Failure);
+                    }
                 }
             }
             self.diag.flush();
+            self.changed();
         }
     }
 
@@ -625,14 +789,42 @@ impl Inner {
 
     // ------------------------------------------------------------ check
 
+    /// A button press. Joins a running check, never replaces a Ready update
+    /// and cannot shorten a failure backoff.
     fn start_check(self: &Arc<Self>) {
+        self.begin_check(false);
+    }
+
+    /// Starts one check. `auto` asks for the due automatic check (origin fixed
+    /// here as Startup or Periodic); otherwise it is a Manual check. Returns
+    /// whether a check was started.
+    ///
+    /// A manual check replaces an `Available` candidate with `Checking` as
+    /// before. An automatic check beside an `Available` candidate keeps it:
+    /// the candidate stays downloadable until a verified result replaces it.
+    fn begin_check(self: &Arc<Self>, auto: bool) -> bool {
+        let now = self.mono.now();
         let (op, cancel) = {
             let mut state = self.lock();
-            if state.restoring {
-                return;
+            if state.restoring || state.recheck.is_some() {
+                return false;
             }
-            match state.stage {
-                Stage::Idle | Stage::UpToDate | Stage::Available(_) | Stage::Failed { .. } => {}
+            let origin = {
+                let sched = self.sched_lock();
+                if auto {
+                    match sched.auto_origin(now) {
+                        Some(origin) => origin,
+                        None => return false,
+                    }
+                } else if sched.manual_allowed(now) {
+                    CheckOrigin::Manual
+                } else {
+                    return false;
+                }
+            };
+            let keep_candidate = match &state.stage {
+                Stage::Idle | Stage::UpToDate | Stage::Failed { .. } => false,
+                Stage::Available(_) => auto,
                 // A running operation absorbs repeated clicks; a Ready update
                 // is never replaced by a newer check; an unavailable service
                 // has nothing to check.
@@ -640,23 +832,36 @@ impl Inner {
                 | Stage::Downloading { .. }
                 | Stage::Ready { .. }
                 | Stage::Discarding { .. }
-                | Stage::Unavailable { .. } => return,
-            }
+                | Stage::Unavailable { .. } => return false,
+            };
             state.next_op += 1;
             let op = state.next_op;
             let cancel = CancelToken::new();
-            state.stage = Stage::Checking {
-                op,
-                cancel: cancel.clone(),
-            };
+            if keep_candidate {
+                state.recheck = Some(Recheck {
+                    op,
+                    cancel: cancel.clone(),
+                    origin,
+                });
+            } else {
+                state.stage = Stage::Checking {
+                    op,
+                    cancel: cancel.clone(),
+                    origin,
+                };
+            }
+            self.sched_lock().started(origin);
             (op, cancel)
         };
         let inner = Arc::clone(self);
         self.dispatch(op, Box::new(move || inner.run_check(op, &cancel)));
+        self.changed();
+        true
     }
 
     fn run_check(&self, op: u64, cancel: &CancelToken) {
         let result = self.check_latest(cancel);
+        let now = self.mono.now();
         let mut state = self.lock();
         let expected = Ticket {
             install: self.config.install_id.clone(),
@@ -667,23 +872,65 @@ impl Inner {
             // Cancelled or superseded while the request was in flight.
             return;
         }
+        let recheck = state.recheck.take();
+        let origin = match (&recheck, &state.stage) {
+            (Some(recheck), _) => recheck.origin,
+            (None, Stage::Checking { origin, .. }) => *origin,
+            (None, _) => CheckOrigin::Manual,
+        };
+        // The candidate that was shown while this check ran, if any.
+        let known = match (&recheck, &state.stage) {
+            (Some(_), Stage::Available(offer)) => Some(Arc::clone(offer)),
+            _ => None,
+        };
+        let mut health = CheckHealth::Success;
         state.stage = match result {
             Ok(CheckOutcome::UpToDate) => Stage::UpToDate,
-            Ok(CheckOutcome::Available(offer)) => Stage::Available(Arc::from(offer)),
-            Err(error) if error.code == ErrorCode::Cancelled => Stage::Idle,
+            Ok(CheckOutcome::Available(offer)) => {
+                let offer: Arc<Offer> = Arc::from(offer);
+                // The same candidate keeps its displayed object; a new signed
+                // one replaces it in one step.
+                Stage::Available(match known {
+                    Some(old) if old.id() == offer.id() => old,
+                    _ => offer,
+                })
+            }
+            Err(error) if error.code == ErrorCode::Cancelled => {
+                health = CheckHealth::Cancelled;
+                match known {
+                    Some(old) => Stage::Available(old),
+                    None => Stage::Idle,
+                }
+            }
             Err(error) => {
+                health = CheckHealth::Failure;
                 // Only a live operation records, so a late result of a
                 // cancelled or superseded check never reaches the diagnostics.
                 self.diag
                     .note("check", error.code.as_str(), &error.detail, None);
-                Stage::Failed {
-                    code: error.code,
-                    stage: "check",
+                match known {
+                    // A failed re-check is never "up to date" and never
+                    // removes a candidate that is still valid to download.
+                    Some(old) if old.candidate.is_applicable() => Stage::Available(old),
+                    _ => Stage::Failed {
+                        code: error.code,
+                        stage: "check",
+                    },
                 }
             }
         };
+        if origin == CheckOrigin::Startup && !state.startup_decided {
+            state.startup_decided = true;
+            let announced = match &state.stage {
+                Stage::Available(offer) => Some(offer.id().as_str().to_owned()),
+                _ => None,
+            };
+            state.startup_announce = announced;
+        }
+        self.sched_lock().finished(now, health);
         drop(state);
         self.diag.flush();
+        self.changed();
     }
 
     fn verify_context<'a>(
@@ -752,6 +999,12 @@ impl Inner {
                 return;
             }
             let offer = Arc::clone(offer);
+            // A re-check beside this candidate is cancelled: the user chose
+            // this exact candidate, and a late result must not replace it.
+            let cancelled_recheck = state.recheck.take().map(|recheck| recheck.cancel.cancel());
+            if cancelled_recheck.is_some() {
+                self.sched_lock().finished(self.mono.now(), CheckHealth::Cancelled);
+            }
             state.next_op += 1;
             let op = state.next_op;
             let cancel = CancelToken::new();
@@ -770,6 +1023,7 @@ impl Inner {
             op,
             Box::new(move || inner.run_download(op, &offer, &cancel, &received)),
         );
+        self.changed();
     }
 
     fn run_download(&self, op: u64, offer: &Arc<Offer>, cancel: &CancelToken, received: &Arc<AtomicU64>) {
@@ -837,6 +1091,7 @@ impl Inner {
         }
         drop(state);
         self.diag.flush();
+        self.changed();
     }
 
     /// Moves the verified work directory to the shared candidate directory.
@@ -952,17 +1207,33 @@ impl Inner {
 
     fn cancel_running(&self) {
         let mut state = self.lock();
+        let mut changed = false;
         match &state.stage {
             Stage::Checking { cancel, .. } => {
                 cancel.cancel();
                 state.stage = Stage::Idle;
+                self.sched_lock()
+                    .finished(self.mono.now(), CheckHealth::Cancelled);
+                changed = true;
             }
             Stage::Downloading { cancel, offer, .. } => {
                 cancel.cancel();
                 let offer = Arc::clone(offer);
                 state.stage = Stage::Available(offer);
+                changed = true;
             }
-            _ => {}
+            _ => {
+                if let Some(recheck) = state.recheck.take() {
+                    recheck.cancel.cancel();
+                    self.sched_lock()
+                        .finished(self.mono.now(), CheckHealth::Cancelled);
+                    changed = true;
+                }
+            }
+        }
+        drop(state);
+        if changed {
+            self.changed();
         }
     }
 
@@ -1003,6 +1274,7 @@ impl Inner {
             drop(state);
             self.diag.flush();
         }
+        self.changed();
     }
 
     fn run_discard(&self, op: u64, dir: &Path) {
@@ -1034,6 +1306,9 @@ impl Inner {
                 };
             }
         }
+        // The state is final now (Idle, or Ready again); the slow deletion
+        // below must not delay the wake.
+        self.changed();
         match &moved {
             Ok(()) => {
                 // The slow deletion runs after the candidate directory is out
@@ -1068,6 +1343,7 @@ impl Inner {
             }
             self.diag.flush();
         }
+        self.changed();
     }
 
     /// Local re-validation only: no request is made. Anything that does not
@@ -1104,19 +1380,29 @@ impl Inner {
             }
         }
         self.diag.flush();
-        let mut state = self.lock();
-        state.restoring = false;
-        let idle = matches!(state.stage, Stage::Idle);
-        if let (true, Some((offer, dir, lease))) = (idle, found) {
-            *self
-                .candidate_lease
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(lease);
-            state.stage = Stage::Ready {
-                offer: Arc::new(offer),
-                dir,
-            };
+        {
+            let mut state = self.lock();
+            state.restoring = false;
+            let idle = matches!(state.stage, Stage::Idle);
+            if let (true, Some((offer, dir, lease))) = (idle, found) {
+                *self
+                    .candidate_lease
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(lease);
+                // A prepared update found at start-up is the one-time notice;
+                // it needs no request.
+                if !state.startup_decided {
+                    state.startup_decided = true;
+                    state.startup_announce = Some(offer.id().as_str().to_owned());
+                }
+                state.stage = Stage::Ready {
+                    offer: Arc::new(offer),
+                    dir,
+                };
+            }
         }
+        // Restoring is over: the first automatic check may now be due.
+        self.changed();
     }
 
     fn restore_candidate(&self, dir: &Path) -> Result<Offer, UpdateError> {
@@ -1282,6 +1568,24 @@ impl Inner {
     /// Starts the helper for the Ready candidate. The lock is not held while
     /// the helper starts. Nothing is stopped or quit here.
     fn prepare_restart(self: &Arc<Self>, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
+        // No automatic check starts while the restart is prepared. A refusal,
+        // an abort or a dropped handoff resumes it; an authorized exit keeps
+        // it stopped, so nothing is dispatched after the exit is permitted.
+        self.set_auto_paused(true);
+        match self.prepare_restart_paused(candidate_id) {
+            Ok(prepared) => Ok(Box::new(AutoPausedHandoff {
+                handoff: Some(prepared),
+                inner: Arc::clone(self),
+                resume: true,
+            })),
+            Err(reason) => {
+                self.set_auto_paused(false);
+                Err(reason)
+            }
+        }
+    }
+
+    fn prepare_restart_paused(self: &Arc<Self>, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
         let unsupported = || "この環境では更新を適用できません".to_owned();
         if !self.restart_supported() {
             return Err(unsupported());
@@ -1357,6 +1661,8 @@ impl Inner {
         let state = self.lock();
         let mut snapshot = AppUpdateSnapshot::idle(self.config.current_version.clone());
         snapshot.restoring = state.restoring;
+        snapshot.checking = state.recheck.is_some();
+        snapshot.startup_announce = state.startup_announce.clone();
         snapshot.restart_supported = self.restart_supported();
         snapshot.diagnostics_available = self.diag.has_records();
         let describe = |snapshot: &mut AppUpdateSnapshot, offer: &Offer| {
@@ -1411,9 +1717,66 @@ impl Inner {
     }
 }
 
+/// The prepared helper with the automatic check paused for as long as the
+/// restart may still happen. Dropping it (abort, refusal, failure) resumes the
+/// check; only a permitted exit keeps it stopped.
+struct AutoPausedHandoff {
+    handoff: Option<Box<dyn PreparedUpdate>>,
+    inner: Arc<Inner>,
+    resume: bool,
+}
+
+impl PreparedUpdate for AutoPausedHandoff {
+    fn issue_ticket(
+        &mut self,
+        ticket: &hane_ui::RestartTicketSnapshot,
+        permit_is_fresh: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        match self.handoff.as_mut() {
+            Some(handoff) => handoff.issue_ticket(ticket, permit_is_fresh),
+            None => Err("更新の準備が終了しています".to_owned()),
+        }
+    }
+
+    fn authorize_exit(mut self: Box<Self>) -> Result<(), String> {
+        let Some(handoff) = self.handoff.take() else {
+            return Err("更新の準備が終了しています".to_owned());
+        };
+        let outcome = handoff.authorize_exit();
+        if outcome.is_ok() {
+            self.resume = false;
+        }
+        outcome
+    }
+
+    fn abort(mut self: Box<Self>) {
+        if let Some(handoff) = self.handoff.take() {
+            handoff.abort();
+        }
+    }
+}
+
+impl Drop for AutoPausedHandoff {
+    fn drop(&mut self) {
+        if self.resume {
+            self.inner.set_auto_paused(false);
+        }
+    }
+}
+
 impl AppUpdateController for AppUpdateService {
     fn snapshot(&self) -> AppUpdateSnapshot {
         self.inner.snapshot()
+    }
+
+    fn subscribe(&self) -> Option<UpdateWakeReceiver> {
+        let (sender, receiver) = update_wake_channel();
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(sender);
+        Some(receiver)
     }
 
     fn check(&self) {
@@ -1452,6 +1815,7 @@ impl AppUpdateController for AppUpdateService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_update_schedule::testing::FakeMonotonic;
     use hane_update::download::{asset_url, latest_release_url};
     use hane_update::identity::InstallFacts;
     use hane_update::model::{CATALOG_DOMAIN, CATALOG_ASSET_NAME, SIGNATURE_ASSET_NAME};
@@ -1467,6 +1831,7 @@ mod tests {
         dir: TempDir,
         transport: Arc<ScriptedTransport>,
         clock: Arc<FixedClock>,
+        mono: Arc<FakeMonotonic>,
         queue: Arc<Mutex<Vec<Task>>>,
         service: AppUpdateService,
         release: WindowsRelease,
@@ -1522,16 +1887,19 @@ mod tests {
         let transport = Arc::new(ScriptedTransport::new());
         let clock = Arc::new(FixedClock::new(test_now()));
         let queue = Arc::new(Mutex::new(Vec::new()));
-        let service = AppUpdateService::with_runner(
+        let mono = Arc::new(FakeMonotonic::default());
+        let service = AppUpdateService::with_runner_and_monotonic(
             config(&dir, current, test_policy(), Some(Target::WindowsX64)),
             transport.clone(),
             clock.clone(),
             manual_runner(&queue),
+            mono.clone(),
         );
         Fixture {
             dir,
             transport,
             clock,
+            mono,
             queue,
             service,
             release,
@@ -2861,5 +3229,345 @@ mod tests {
         let report = failed.service.diagnostics_text();
         assert!(report.contains("保存: できませんでした"), "{report}");
         assert!(report.contains("code=not_found"), "{report}");
+    }
+
+    // ----------------------------------- automatic check (Issue #649)
+
+    fn secs(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    /// Arms the schedule without the wait thread, so the test drives
+    /// `auto_step` itself and moves the fake monotonic clock.
+    fn arm_schedule(fixture: &Fixture) {
+        assert!(fixture.service.inner.sched_lock().arm(fixture.mono.now()));
+    }
+
+    fn tick(fixture: &Fixture) {
+        fixture.service.inner.auto_step();
+        run_queued(&fixture.queue);
+    }
+
+    fn queued(fixture: &Fixture) -> usize {
+        fixture.queue.lock().unwrap().len()
+    }
+
+    #[test]
+    fn the_first_automatic_check_starts_after_thirty_seconds_and_only_once() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.service.restore_local();
+        run_queued(&fixture.queue);
+        arm_schedule(&fixture);
+        tick(&fixture);
+        assert_eq!(fixture.requests(), 0);
+        fixture.mono.advance(secs(29));
+        tick(&fixture);
+        assert_eq!(fixture.requests(), 0, "nothing before 30 seconds");
+        fixture.mono.advance(secs(1));
+        tick(&fixture);
+        assert_eq!(fixture.requests(), 3, "one metadata set, no archive");
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Available);
+        assert!(snapshot.startup_announce.is_some());
+        assert_eq!(snapshot.startup_announce, snapshot.candidate_id);
+        tick(&fixture);
+        assert_eq!(fixture.requests(), 3, "no second check without a new deadline");
+    }
+
+    #[test]
+    fn the_first_check_waits_for_the_local_restore_to_finish() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.service.restore_local();
+        assert!(fixture.service.snapshot().restoring);
+        arm_schedule(&fixture);
+        fixture.mono.advance(secs(31));
+        fixture.service.inner.auto_step();
+        assert_eq!(queued(&fixture), 1, "only the restore task is queued");
+        assert_eq!(fixture.requests(), 0);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.requests(), 0);
+        tick(&fixture);
+        assert_eq!(fixture.requests(), 3);
+    }
+
+    #[test]
+    fn a_prepared_update_found_at_start_is_announced_without_any_request() {
+        let first = fixture("0.26.0", "0.27.0", 5);
+        first.prepare_ready();
+        // The previous process is gone, so its candidate lease is released.
+        *first.service.inner.candidate_lease.lock().unwrap() = None;
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let mono = Arc::new(FakeMonotonic::default());
+        let second = AppUpdateService::with_runner_and_monotonic(
+            config(&first.dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            first.transport.clone(),
+            first.clock.clone(),
+            manual_runner(&queue),
+            mono.clone(),
+        );
+        let before = first.requests();
+        second.restore_local();
+        run_queued(&queue);
+        assert!(second.inner.sched_lock().arm(mono.now()));
+        mono.advance(secs(40));
+        second.inner.auto_step();
+        run_queued(&queue);
+        let snapshot = second.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Ready);
+        assert_eq!(snapshot.startup_announce, snapshot.candidate_id);
+        assert_eq!(first.requests(), before, "a Ready update is never checked over");
+    }
+
+    #[test]
+    fn an_hourly_recheck_keeps_the_known_candidate_and_is_not_a_second_startup() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        arm_schedule(&fixture);
+        fixture.mono.advance(secs(30));
+        tick(&fixture);
+        let id = fixture.candidate_id();
+        fixture.script_check();
+        fixture.mono.advance(secs(3599));
+        fixture.service.inner.auto_step();
+        assert_eq!(queued(&fixture), 0, "not due one second early");
+        fixture.mono.advance(secs(1));
+        fixture.service.inner.auto_step();
+        let during = fixture.service.snapshot();
+        assert_eq!(during.phase, AppUpdatePhase::Available, "the candidate stays shown");
+        assert!(during.checking);
+        assert!(during.is_busy());
+        assert_eq!(during.candidate_id.as_deref(), Some(id.as_str()));
+        run_queued(&fixture.queue);
+        let after = fixture.service.snapshot();
+        assert_eq!(after.phase, AppUpdatePhase::Available);
+        assert!(!after.checking);
+        assert_eq!(after.candidate_id.as_deref(), Some(id.as_str()));
+        assert_eq!(fixture.requests(), 6);
+    }
+
+    #[test]
+    fn a_failed_recheck_keeps_a_valid_candidate_records_the_failure_and_backs_off() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        arm_schedule(&fixture);
+        fixture.mono.advance(secs(30));
+        tick(&fixture);
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(429));
+        fixture.mono.advance(secs(3600));
+        tick(&fixture);
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Available, "never 'up to date', never lost");
+        assert!(fixture.service.diagnostics_text().contains("code=rate_limited"));
+        // The failure backs off one hour for automatic and manual checks.
+        let requests = fixture.requests();
+        fixture.mono.advance(secs(3599));
+        tick(&fixture);
+        assert_eq!(fixture.requests(), requests);
+        fixture.script_check();
+        fixture.mono.advance(secs(1));
+        tick(&fixture);
+        assert_eq!(fixture.requests(), requests + 3);
+    }
+
+    #[test]
+    fn a_click_on_the_known_candidate_during_a_recheck_downloads_that_candidate() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        arm_schedule(&fixture);
+        fixture.mono.advance(secs(30));
+        tick(&fixture);
+        let id = fixture.candidate_id();
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.mono.advance(secs(3600));
+        fixture.service.inner.auto_step();
+        assert!(fixture.service.snapshot().checking);
+        fixture.service.download(&id);
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Downloading);
+        assert!(!snapshot.checking, "the re-check was cancelled");
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready, "the late re-check changed nothing");
+        assert_eq!(fixture.candidate_id(), id);
+    }
+
+    #[test]
+    fn failures_back_off_one_then_two_hours_for_manual_retries_too() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        arm_schedule(&fixture);
+        fixture.mono.advance(secs(30));
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(429));
+        tick(&fixture);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Failed);
+        assert_eq!(fixture.error_code().as_deref(), Some("rate_limited"));
+        let requests = fixture.requests();
+        fixture.service.check();
+        assert_eq!(queued(&fixture), 0, "a manual retry cannot shorten the backoff");
+        fixture.mono.advance(secs(3599));
+        fixture.service.check();
+        assert_eq!(queued(&fixture), 0);
+        fixture.mono.advance(secs(1));
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        fixture.service.check();
+        assert_eq!(queued(&fixture), 1, "allowed once the hour has passed");
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.requests(), requests + 1);
+        // The second failure in a row waits two hours.
+        fixture.mono.advance(secs(2 * 3600 - 1));
+        fixture.service.check();
+        assert_eq!(queued(&fixture), 0);
+        fixture.mono.advance(secs(1));
+        fixture.service.check();
+        assert_eq!(queued(&fixture), 1);
+    }
+
+    #[test]
+    fn no_automatic_check_runs_over_a_ready_update_and_one_runs_after_it_is_discarded() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        arm_schedule(&fixture);
+        let requests = fixture.requests();
+        fixture.mono.advance(secs(5 * 3600));
+        tick(&fixture);
+        assert_eq!(fixture.requests(), requests);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+        fixture.script_check();
+        fixture.service.discard_ready();
+        run_queued(&fixture.queue);
+        tick(&fixture);
+        assert_eq!(fixture.requests(), requests + 3, "the held deadline runs once");
+        tick(&fixture);
+        assert_eq!(fixture.requests(), requests + 3);
+    }
+
+    #[test]
+    fn a_paused_schedule_starts_nothing_and_resumes_when_the_restart_is_given_up() {
+        struct Dummy;
+        impl PreparedUpdate for Dummy {
+            fn issue_ticket(
+                &mut self,
+                _: &hane_ui::RestartTicketSnapshot,
+                _: &dyn Fn() -> bool,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn authorize_exit(self: Box<Self>) -> Result<(), String> {
+                Ok(())
+            }
+            fn abort(self: Box<Self>) {}
+        }
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        let inner = Arc::clone(&fixture.service.inner);
+        arm_schedule(&fixture);
+        fixture.mono.advance(secs(31));
+
+        inner.set_auto_paused(true);
+        let handoff = AutoPausedHandoff {
+            handoff: Some(Box::new(Dummy)),
+            inner: Arc::clone(&inner),
+            resume: true,
+        };
+        inner.auto_step();
+        assert_eq!(queued(&fixture), 0, "paused while the restart is prepared");
+        drop(handoff);
+        assert!(
+            inner.sched_lock().auto_origin(fixture.mono.now()).is_some(),
+            "an abandoned restart resumes the check"
+        );
+
+        inner.set_auto_paused(true);
+        let handoff = AutoPausedHandoff {
+            handoff: Some(Box::new(Dummy)),
+            inner: Arc::clone(&inner),
+            resume: true,
+        };
+        Box::new(handoff).authorize_exit().unwrap();
+        assert!(
+            inner.sched_lock().auto_origin(fixture.mono.now()).is_none(),
+            "after the exit is permitted no check is dispatched"
+        );
+    }
+
+    #[test]
+    fn a_refused_restart_preparation_leaves_the_schedule_running() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        arm_schedule(&fixture);
+        fixture.mono.advance(secs(31));
+        assert!(fixture.service.prepare_restart(&"a".repeat(64)).is_err());
+        assert!(fixture
+            .service
+            .inner
+            .sched_lock()
+            .auto_origin(fixture.mono.now())
+            .is_some());
+    }
+
+    #[test]
+    fn every_subscriber_gets_its_own_coalesced_wake_and_closed_ones_are_dropped() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        let first = AppUpdateController::subscribe(&fixture.service).unwrap();
+        let second = AppUpdateController::subscribe(&fixture.service).unwrap();
+        assert!(!first.try_wait(), "subscribing alone wakes nobody");
+        fixture.script_check();
+        fixture.service.check();
+        fixture.service.cancel();
+        assert!(first.try_wait());
+        assert!(!first.try_wait(), "several changes merge into one pending wake");
+        assert!(second.try_wait());
+        drop(second);
+        run_queued(&fixture.queue);
+        fixture.script_check();
+        fixture.service.check();
+        run_queued(&fixture.queue);
+        assert!(first.try_wait());
+        assert_eq!(fixture.service.inner.subscribers.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_start_wakes_subscribers_and_backs_off() {
+        let dir = TempDir::new("app-update-auto-runner");
+        let mono = Arc::new(FakeMonotonic::default());
+        let service = AppUpdateService::with_runner_and_monotonic(
+            config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            Box::new(|_| false),
+            mono.clone(),
+        );
+        let wake = AppUpdateController::subscribe(&service).unwrap();
+        assert!(service.inner.sched_lock().arm(mono.now()));
+        mono.advance(secs(31));
+        service.inner.auto_step();
+        assert_eq!(service.snapshot().phase, AppUpdatePhase::Failed);
+        assert!(wake.try_wait());
+        assert!(!service.inner.sched_lock().manual_allowed(mono.now()));
+    }
+
+    #[test]
+    fn only_a_service_that_can_check_is_armed_and_dropping_it_ends_the_timer() {
+        let dir = TempDir::new("app-update-arm");
+        let unavailable = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", TrustPolicy::production(), Some(Target::WindowsX64)),
+            Arc::new(ScriptedTransport::new()),
+            Arc::new(FixedClock::new(test_now())),
+            manual_runner(&Arc::new(Mutex::new(Vec::new()))),
+        );
+        assert!(!unavailable.arm_auto_check(), "no trust material, nothing to arm");
+
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        assert!(fixture.service.arm_auto_check());
+        assert!(!fixture.service.arm_auto_check(), "arming twice adds no timer");
+        assert_eq!(fixture.requests(), 0, "arming sends nothing");
+        // Dropping joins the wait thread; a timer that outlived its service
+        // would hang this test.
+        drop(fixture);
     }
 }
