@@ -3616,6 +3616,12 @@ impl EditorView {
         self.editor_context_menu = None;
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
+        // A discard still waiting on its draft removal belongs to the old
+        // document; the new sessions reuse its id, so left in place it would
+        // keep suppressing the new document's autosave and title sync.
+        // `finish_tab_discard_removal` finds no matching pending afterwards
+        // and ignores the old callback's result.
+        self.tab_discard_pending.clear();
         self.save_problems.clear();
         self.external_comparison = None;
         // Any background read still in flight for the old folder (or for
@@ -17198,6 +17204,62 @@ mod tests {
                 "an id of a later workspace must not be closed by the earlier approval"
             );
             assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_workspace_switch_drops_the_old_pending_discard_and_ignores_its_late_result(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-workspace-switch-pending", "draft body");
+        let (old_instance, old_draft_id) = view.update(cx, |view, cx| {
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            let held = hold_discard_removal(view, fx.id, draft);
+            view.reset_for_work_folder_switch(cx);
+            held
+        });
+
+        view.update(cx, |view, cx| {
+            assert!(
+                view.tab_discard_pending.is_empty(),
+                "the old document's pending discard must not outlive the switch"
+            );
+            let new_instance = view.document_instance(fx.id).expect("reused id");
+            assert_ne!(new_instance, old_instance);
+
+            // A new document with the same id gets its own pending discard.
+            let new_draft = WorkFolderDraft {
+                draft_id: DraftId::generate(),
+                target_directory: fx.root.clone(),
+            };
+            let new_draft_id = new_draft.draft_id;
+            let (held_instance, _) = hold_discard_removal(view, fx.id, new_draft);
+            assert_eq!(held_instance, new_instance);
+
+            // The old callback reports back (Ok, then Err): neither touches
+            // the new document, its pending state, or the visible status.
+            let status_before = view.status.clone();
+            view.finish_tab_discard_removal(fx.id, old_instance, old_draft_id, Ok(()), cx);
+            view.finish_tab_discard_removal(
+                fx.id,
+                old_instance,
+                old_draft_id,
+                Err("late failure".to_owned()),
+                cx,
+            );
+            assert!(view.sessions.get(fx.id).is_some());
+            assert_eq!(view.status, status_before);
+            assert!(
+                view.tab_discard_pending
+                    .get(&fx.id)
+                    .is_some_and(|pending| pending
+                        .removing
+                        .as_ref()
+                        .is_some_and(|draft| draft.draft_id == new_draft_id)),
+                "the new pending discard keeps its owner"
+            );
         });
 
         std::fs::remove_dir_all(&fx.root).unwrap();
