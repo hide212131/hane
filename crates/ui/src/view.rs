@@ -6946,6 +6946,426 @@ mod tests {
         });
     }
 
+    // Issue #673 diagnostic probe. Test-only observation of which `cached_block`
+    // gate rejects a cached link presentation after an unrelated edit. The
+    // gate observations run on clones of the real cache entries and never feed
+    // back into the view; they measure and assert nothing about acceptance.
+
+    fn probe_range(range: SourceRange) -> String {
+        format!("{}..{}", range.start.0, range.end.0)
+    }
+
+    fn probe_opt_range(range: Option<SourceRange>) -> String {
+        range.map_or_else(|| "none".to_owned(), probe_range)
+    }
+
+    fn probe_log(fixture: &str, stage: &str, message: &str) {
+        eprintln!("HANE673_CACHE_PROBE fixture={fixture} stage={stage} {message}");
+    }
+
+    /// The indexed block of the `see` paragraph and the lines `cached_block`
+    /// is asked to present for it.
+    fn bare_url_probe_locate(view: &EditorView) -> (IndexedBlock, Range<usize>) {
+        let text = view.editor().document().full_text();
+        let at = SourceOffset(text.find("see").expect("probe text"));
+        let indexed = view.block_at_offset(at).expect("block");
+        let span = block_line_span(view.editor().document(), &indexed).expect("span");
+        (indexed, span)
+    }
+
+    /// The indexed block, the real cache entry, its layout and the background
+    /// generation, as they are right now.
+    fn bare_url_probe_state(
+        view: &EditorView,
+        fixture: &str,
+        stage: &str,
+        indexed: &IndexedBlock,
+        span: &Range<usize>,
+    ) {
+        probe_log(
+            fixture,
+            stage,
+            &format!(
+                "state current_revision={} indexed_id={} indexed_range={} indexed_confidence={:?} indexed_kind={:?} indexed_revision={} visible_span={}..{} formal_index_current={} background_presentation_generation={}",
+                view.editor().document().revision().0,
+                indexed.id.0,
+                probe_range(indexed.source_range),
+                indexed.confidence,
+                indexed.kind,
+                indexed.revision.0,
+                span.start,
+                span.end,
+                view.current_index().is_some(),
+                view.background_presentation_generation,
+            ),
+        );
+        match view.block_cache.get(&indexed.id) {
+            None => probe_log(fixture, stage, "block_cache entry=absent"),
+            Some(entry) => {
+                probe_log(
+                    fixture,
+                    stage,
+                    &format!(
+                        "block_cache entry=present revision={} range={} confidence={:?} kind={:?} span={}..{} lines_before={} lines_after={} lines={}",
+                        entry.revision.0,
+                        probe_range(entry.source_range),
+                        entry.confidence,
+                        entry.kind,
+                        entry.span.start,
+                        entry.span.end,
+                        entry.lines_before,
+                        entry.lines_after,
+                        entry.lines.len(),
+                    ),
+                );
+                for line in &entry.lines {
+                    let links = line
+                        .links
+                        .iter()
+                        .map(|link| {
+                            format!(
+                                "[range={} destination={} uses_reference={}]",
+                                probe_range(link.source_range),
+                                link.destination,
+                                link.uses_reference
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    probe_log(
+                        fixture,
+                        stage,
+                        &format!(
+                            "block_cache line line_id={} source_range={} disclosure={} links={}",
+                            line.line_id,
+                            probe_range(line.source_range),
+                            probe_opt_range(line.disclosure),
+                            if links.is_empty() { "none" } else { links.as_str() },
+                        ),
+                    );
+                }
+            }
+        }
+        match view.layout_cache.get(&indexed.id) {
+            None => probe_log(fixture, stage, "layout_cache entry=absent"),
+            Some(entry) => {
+                let rows = entry
+                    .layout
+                    .lines
+                    .iter()
+                    .map(|row| probe_range(row.source_range))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                probe_log(
+                    fixture,
+                    stage,
+                    &format!(
+                        "layout_cache entry=present revision={} rows={rows}",
+                        entry.layout.revision.0
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The conditions of `cached_block`, one by one, on clones of the entry
+    /// and layout the view holds. The real cache is never changed.
+    fn bare_url_probe_gates(
+        view: &EditorView,
+        fixture: &str,
+        stage: &str,
+        indexed: &IndexedBlock,
+        span: &Range<usize>,
+    ) {
+        let log = |message: String| probe_log(fixture, stage, &format!("gate {message}"));
+        let revision = view.editor().document().revision();
+        let Some(entry) = view.block_cache.get(&indexed.id) else {
+            log("block_cache entry=absent; every gate is unknown".to_owned());
+            return;
+        };
+        let mut cached = entry.clone();
+        let revision_equal = cached.revision == revision;
+        log(format!(
+            "cached_revision={} current_revision={} revision_equal={revision_equal}",
+            cached.revision.0, revision.0
+        ));
+        let Ok(deltas) = view.editor().document().deltas_since(cached.revision) else {
+            log("deltas_since=err; rebase, matches, covers and disclosure gates are unknown".to_owned());
+            return;
+        };
+        log(format!("deltas_since=ok count={}", deltas.len()));
+        let mut any_affects = false;
+        for (index, delta) in deltas.iter().enumerate() {
+            let affects = edit_affects_range(*delta, cached.source_range);
+            any_affects |= affects;
+            log(format!(
+                "delta[{index}] edited_source_range_before={} cached_source_range={} edit_affects_range={affects}",
+                probe_range(delta.edited_source_range_before),
+                probe_range(cached.source_range),
+            ));
+        }
+        let uses_reference = cached
+            .lines
+            .iter()
+            .any(|line| line.links.iter().any(|link| link.uses_reference));
+        let reference_blocks = uses_reference && !deltas.is_empty();
+        log(format!(
+            "any_edit_affects_range={any_affects} uses_reference={uses_reference} reference_dependency_blocks_reuse={reference_blocks}"
+        ));
+        let rebase_ok = cached.rebase(&deltas, revision);
+        log(format!(
+            "VisualBlock::rebase={rebase_ok} (values below are of the rebased clone; partially rebased when false)"
+        ));
+        let layout_rebase = view.layout_cache.get(&indexed.id).map(|entry| {
+            let mut layout = entry.layout.clone();
+            layout.rebase(&deltas, revision)
+        });
+        log(format!(
+            "BlockLayout::rebase={}",
+            layout_rebase.map_or_else(
+                || "no_layout_entry (is_none_or treats this as true)".to_owned(),
+                |ok| ok.to_string()
+            )
+        ));
+        let layout_ok = layout_rebase.is_none_or(|ok| ok);
+        let reusable = revision_equal
+            || (!any_affects && !reference_blocks && rebase_ok && layout_ok);
+        log(format!("reusable_branch={reusable}"));
+
+        let id_match = cached.id == indexed.id;
+        let range_match = cached.source_range == indexed.source_range;
+        let confidence_match = cached.confidence == indexed.confidence;
+        let matches = cached.matches(indexed);
+        let kind_match = if id_match && range_match && confidence_match {
+            matches.to_string()
+        } else {
+            "unknown (not derivable while another matches() term is false)".to_owned()
+        };
+        log(format!(
+            "matches id_match={id_match} range_match={range_match} (cached={} indexed={}) confidence_match={confidence_match} (cached={:?} indexed={:?}) kind_match={kind_match} (cached={:?} indexed={:?}) matches_total={matches}",
+            probe_range(cached.source_range),
+            probe_range(indexed.source_range),
+            cached.confidence,
+            indexed.confidence,
+            cached.kind,
+            indexed.kind,
+        ));
+        let covers = cached.covers(span);
+        log(format!("covers={covers} wanted_span={}..{}", span.start, span.end));
+        let disclosures_current = view.disclosures_are_current(indexed, &cached);
+        log(format!("disclosures_are_current={disclosures_current}"));
+        let render = cached.span.start + cached.lines_before
+            ..cached.span.start + cached.lines_before + cached.lines.len();
+        match expected_block_disclosures(
+            view.editor(),
+            indexed,
+            &render,
+            view.current_joined_parse(indexed),
+            view.document_find_current_match(),
+            view.disclosure_policy(),
+        ) {
+            None => log("expected_block_disclosures=none (unknown)".to_owned()),
+            Some(expected) => {
+                log(format!(
+                    "expected_block_disclosures len={} actual_lines={}",
+                    expected.len(),
+                    cached.lines.len()
+                ));
+                for (index, (line, disclosure)) in expected.iter().enumerate() {
+                    let actual = cached.lines.get(index);
+                    log(format!(
+                        "disclosure[{index}] expected_line={line} expected={} actual_line_id={} actual={}",
+                        probe_opt_range(*disclosure),
+                        actual.map_or_else(|| "none".to_owned(), |l| l.line_id.to_string()),
+                        actual.map_or_else(|| "none".to_owned(), |l| probe_opt_range(l.disclosure)),
+                    ));
+                }
+            }
+        }
+        let plan = view.diagram_plan_for(indexed);
+        let diagram_matches = diagram_plan_matches(&cached, plan.as_ref());
+        log(format!(
+            "diagram_plan_present={} diagram_plan_matches={diagram_matches}",
+            plan.is_some()
+        ));
+        let all = reusable && matches && covers && disclosures_current && diagram_matches;
+        log(format!(
+            "mirrored_and={all} (observation on clones, not the real cached_block result)"
+        ));
+    }
+
+    /// Calls the real `cached_block` once and records what it returned and what
+    /// the returned presentation targets, against the link text and
+    /// destination the current source requires.
+    #[allow(clippy::too_many_arguments)]
+    fn bare_url_probe_cached_block(
+        view: &mut EditorView,
+        fixture: &str,
+        stage: &str,
+        indexed: &IndexedBlock,
+        span: &Range<usize>,
+        url: &str,
+        needle: &str,
+        skip: usize,
+        len: usize,
+    ) {
+        let now = view.editor().document().full_text();
+        let expected = now
+            .find(needle)
+            .map(|start| SourceRange::new(start + skip, start + skip + len));
+        let Some((visual, reused)) = view.cached_block(indexed, span) else {
+            probe_log(fixture, stage, "cached_block=none");
+            return;
+        };
+        probe_log(
+            fixture,
+            stage,
+            &format!(
+                "cached_block reused={reused} id={} range={} revision={} confidence={:?} kind={:?} span={}..{} lines_before={} lines={}",
+                visual.id.0,
+                probe_range(visual.source_range),
+                visual.revision.0,
+                visual.confidence,
+                visual.kind,
+                visual.span.start,
+                visual.span.end,
+                visual.lines_before,
+                visual.lines.len(),
+            ),
+        );
+        let expected_text = expected.and_then(|range| now.get(range.start.0..range.end.0));
+        let mut targets = Vec::new();
+        let mut colored = false;
+        for line in &visual.lines {
+            let runs = line
+                .style_runs
+                .iter()
+                .filter(|run| run.kind == StyleKind::Link)
+                .map(|run| {
+                    let (start, end) = (run.visual_range.start.0, run.visual_range.end.0);
+                    let text = line.visual_text.get(start..end);
+                    colored |= text.is_some() && text == expected_text;
+                    format!("[visual={start}..{end} text={text:?}]")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            for link in &line.links {
+                targets.push((link.destination.to_string(), link.source_range));
+            }
+            probe_log(
+                fixture,
+                stage,
+                &format!(
+                    "cached_block line line_id={} source_range={} visual_text={:?} link_style_runs={}",
+                    line.line_id,
+                    probe_range(line.source_range),
+                    line.visual_text,
+                    if runs.is_empty() { "none" } else { runs.as_str() },
+                ),
+            );
+        }
+        let target_list = targets
+            .iter()
+            .map(|(destination, range)| format!("[range={} destination={destination}]", probe_range(*range)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let target_ok = expected.is_some_and(|range| {
+            targets.len() == 1 && targets[0].0 == url && targets[0].1 == range
+        });
+        probe_log(
+            fixture,
+            stage,
+            &format!(
+                "cached_block targets={} expected_range={} expected_destination={url} target_matches_expected={target_ok} link_style_covers_expected_text={colored}",
+                if target_list.is_empty() { "none" } else { target_list.as_str() },
+                probe_opt_range(expected),
+            ),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_bare_url_cache_probe(
+        cx: &mut gpui::TestAppContext,
+        fixture: &str,
+        text: &str,
+        url: &str,
+        needle: &str,
+        skip: usize,
+        len: usize,
+    ) {
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(4)))
+                .unwrap();
+            // Warm the URL block explicitly, as the original test does.
+            bare_url_snapshot(view, "see");
+            let (first, colored, reused) = bare_url_snapshot(view, "see");
+            probe_log(
+                fixture,
+                "warm",
+                &format!(
+                    "snapshot targets={:?} colored={colored} reused={reused}",
+                    first
+                        .iter()
+                        .map(|(destination, range)| (destination.clone(), probe_range(*range)))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            let (indexed, span) = bare_url_probe_locate(view);
+            bare_url_probe_state(view, fixture, "warm", &indexed, &span);
+            bare_url_probe_gates(view, fixture, "warm", &indexed, &span);
+
+            view.dispatch(EditorCommand::Insert("🙂"), cx);
+
+            let stage = "after_insert_before_cached_block";
+            let (indexed, span) = bare_url_probe_locate(view);
+            bare_url_probe_state(view, fixture, stage, &indexed, &span);
+            bare_url_probe_gates(view, fixture, stage, &indexed, &span);
+
+            let stage = "after_cached_block";
+            bare_url_probe_cached_block(view, fixture, stage, &indexed, &span, url, needle, skip, len);
+            bare_url_probe_state(view, fixture, stage, &indexed, &span);
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let stage = "after_background_publish";
+            let (indexed, span) = bare_url_probe_locate(view);
+            bare_url_probe_state(view, fixture, stage, &indexed, &span);
+            bare_url_probe_gates(view, fixture, stage, &indexed, &span);
+            bare_url_probe_cached_block(view, fixture, stage, &indexed, &span, url, needle, skip, len);
+            bare_url_probe_state(view, fixture, stage, &indexed, &span);
+        });
+    }
+
+    /// Issue #673 diagnostic: records where a cached bare URL / inline link
+    /// presentation stops being reused after an unrelated multi-byte insertion.
+    /// A measurement only; finishing is not an acceptance result.
+    #[gpui::test]
+    fn bare_url_cache_prefix_observation(cx: &mut gpui::TestAppContext) {
+        let url = "https://keep.example/k";
+        run_bare_url_cache_probe(
+            cx,
+            "A_bare_url",
+            "head\n\nsee https://keep.example/k tail\n",
+            url,
+            url,
+            0,
+            url.len(),
+        );
+        run_bare_url_cache_probe(
+            cx,
+            "B_inline_link",
+            "head\n\nsee [keep](https://keep.example/k) tail\n",
+            url,
+            "[keep]",
+            1,
+            "keep".len(),
+        );
+    }
+
     /// Issue #673: the click contract of Issue #502 / #603 on a bare URL. The
     /// URL's own glyphs open it for the OS modifier (Command on macOS, Ctrl
     /// elsewhere) or an unmodified reading-mode click, and the glyph after it
