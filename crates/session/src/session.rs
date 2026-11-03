@@ -660,7 +660,7 @@ impl DocumentSession {
         let armed = self.armed_rewrite.take();
         let rewritten = armed
             .as_ref()
-            .and_then(|plan| self.editor.rewritten_document(plan));
+            .and_then(|plan| self.editor.rewritten_document(&**plan));
         // A plan that cannot be applied is not carried at all, so the saved
         // text and the live document never disagree about it.
         self.in_flight_rewrite = armed.filter(|_| rewritten.is_some());
@@ -709,7 +709,7 @@ impl DocumentSession {
                 let unchanged = self.revision() == ticket.revision;
                 // The bytes on disk are the rewritten text; the live document
                 // (with any edit made meanwhile) and its history follow now.
-                let followed = rewrite.is_none_or(|plan| self.editor.apply_rewrite(&plan).is_ok());
+                let followed = rewrite.is_none_or(|plan| self.editor.apply_rewrite(&*plan).is_ok());
                 if unchanged && followed {
                     self.saved_revision = self.revision();
                     SaveOutcome::Saved
