@@ -16,7 +16,7 @@ macOS / Windows のクリップボード実画像1枚を、文書隣接の自動
 | 単一snapshotとdispatcher、非同期job、鮮度照合、記録付き置換、Save As連携 | `crates/ui/src/view/image_paste.rs` |
 | 本文Pasteの入口（snapshotを一度だけ読む） | `crates/ui/src/actions.rs` の `Paste` |
 | 無名draftの有効base（`target_directory`）を一箇所で接続 | `EditorView::document_base_directory` / `document_resource_resolver`（描画も同じ resolver） |
-| platformのクリップボード読取 | `vendor/gpui-pre-macos/src/pasteboard.rs`、`vendor/gpui-pre-windows/src/clipboard.rs`（各 `HANE-PATCH.md`） |
+| platformのクリップボード読取（公開`read_rich_clipboard`と既存GPUI読取） | `vendor/gpui-pre-macos/src/pasteboard.rs`、`vendor/gpui-pre-windows/src/clipboard.rs`（各 `HANE-PATCH.md`） |
 
 ## 有限の上限（`clipboard_image.rs`、境界テストあり）
 
@@ -49,10 +49,34 @@ decode・PNG変換・ファイルI/Oはすべて background executor で行い�
 - 保存先のない単独無題だけ既存の初回保存ダイアログを開く。キャンセル・失敗では画像を作らず本文・選択を保つ。保存が完了し、本文・選択が変わっていなければ貼り付けを再開する。
 - 別directoryへのSave Asは、本文が参照する生成画像を新しい `images/` へ先にコピーする。同名で内容が同一なら再利用、内容が違えば別名にして参照を更新する。コピーに失敗したときは保存せず、作成済みのコピーを削除し、元の本文・画像・未保存状態を保つ。コピー中に本文が変わった場合も保存を中止する。元画像は削除しない。
 
+## platformの狭い公開snapshot（`read_rich_clipboard`）
+
+`crates/ui/Cargo.toml` にtarget別の直接依存（`gpui-pre-macos` / `gpui-pre-windows`）を足し、両platform crateのrootから同じ形の公開APIを使う。GPUI core全体はvendor化せず、`Platform` traitと`ClipboardItem`の形も変えない。GPUIの`read_from_clipboard`・find pasteboard・ファイルパスコピーは従来のまま。
+
+- `read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError>`。`Ok(None)`は本当の空だけ。
+- `RichClipboardSnapshot { item, html, images }`。`item`は本文とファイルパス、`images`は独立したOS項目ごとの`Result<Image, RichClipboardError>`。`html`は#596用の予約欄で、今回は読まず常に`None`（HTML変換は追加していない）。画像を得るために再度clipboardを読まない。
+- `RichClipboardError`は`Busy`・`ChangedDuringRead`・`InvalidFormat`・`TooLarge`。bounded retryは識別を潰さず、最終失敗をそのまま返す。
+- macOS: `changeCount`の前後が同じ世代だけ返し、3回変化し続けたら`ChangedDuringRead`。`pasteboardItems`の各項目から優先形式（PNG→TIFF→…→SVG）を1つ選び、同じ項目の別形式は1枚にまとめ、別項目は別の要素にする。パス・本文・画像が併存しても画像を取り落とさない。項目が報告されないpasteboardは1項目として扱う。
+- Windows: 1つの`ClipboardGuard`内で全形式を読む（世代は変わり得ず`ChangedDuringRead`は出ない）。開けなければ`Busy`。**OS制約**: Windowsクリップボードは単一のデータオブジェクトで独立した複数画像を区別できないため、`images`は最大1要素（PNG→JFIF/GIF→CF_DIB→その他）。別形式は1枚にまとめる。
+- 画像形式が宣言されているのにデータが取れない・空・不正DIBは`InvalidFormat`、64 MiB超は`TooLarge`（コピー前に判定）。他の形式で読めるときはそちらを使い、読める形式が無いときだけエラーにする。デコード失敗はUI側のjobで通知する。
+
+UI（`image_paste.rs`）はこのsnapshotを共通dispatcherに渡す。
+
+| clipboardの状態 | 本文Pasteの結果 |
+| --- | --- |
+| 実画像1枚（別形式は1枚に集約） | 画像を保存して参照を挿入 |
+| 独立した実画像が複数 | 保存前に件数と1枚ずつの貼り付けを案内、本文・選択・履歴・ファイル不変。先頭だけの採用や合成はしない |
+| 画像が`Busy`以外の理由で取り込めない（`InvalidFormat`/`TooLarge`） | 理由を通知、本文不変。同じ世代のtextへfallbackしない |
+| 読取自体が失敗（`Busy`/`ChangedDuringRead`） | 理由を通知、本文不変。空として扱わない |
+| 本当に空 | 何もしない |
+| 画像なし（SVGだけ含む） | 従来のtext貼り付け |
+| パス・本文・画像が併存 | 本文だけが実画像を優先し、パス文字列は貼らない |
+
+GPUIの`ClipboardItem`（Linuxと単体テスト）は項目の独立性を表せないため、画像entry 1つを1項目として数える。この経路は`Option`しか返さないので空と失敗は区別できない（Linuxにnative実装は無い）。UI単体テストはGPUIのテストclipboardを使い、native成功は実OSで確認する。
+
 ## 既知の制約（要確認）
 
-- GPUIの `read_from_clipboard` は `Option` を返すため、Busy / ChangedDuringRead をUI側で「空」と区別できない。macOSは `changeCount` の前後比較で最大3回再読込し、Windowsは `OpenClipboard` を最大5回再試行するが、最終的に失敗した場合は空として扱われる。区別は #596 の `read_rich_clipboard` / `RichClipboardError` 公開APIの導入で解消する想定で、本PRでは導入していない。
-- macOSで複数のpasteboard itemを区別する公開APIは使っていない。同一世代の本文と画像表現を1つのitemにまとめる。
+- Windowsでは独立した複数画像をOSが区別できないため、複数画像の案内は主にmacOSの複数pasteboard itemで起きる。
 - Save As で参照を更新する必要があるのは、保存対象がアクティブなタブのときだけ。非アクティブなタブの名前付き保存で参照の改名が必要な場合は保存せずに案内する。
 
 ## 未実施の検証（passとして扱わない）
@@ -60,7 +84,7 @@ decode・PNG変換・ファイルI/Oはすべて background executor で行い�
 この作業環境ではビルド・テスト・clippyを実行していない。Commanderが別途、current headで確認する。
 
 - `cargo test --workspace --all-features --locked` と `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`、通常feature/Releaseのbuild。
-- vendor変更のtest: `cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml --features runtime_shaders,font-kit,test-support --lib pasteboard`、`cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib`。
+- vendor変更のtest: `cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml --features runtime_shaders,font-kit,test-support --lib pasteboard`（`hane_clipboard_*`を含む）、`cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_clipboard`。世代変化（`ChangedDuringRead`）とWindowsの`Busy`は決定的に再現できずtestしていない。実OSで確認する。
 - macOS / Windows実機のスクリーンショット・画像アプリからの貼り付け、日本語IME、検索/設定/renameの通常paste、連続貼付、閉じる/切替、書込不可先、文書+imagesを一緒に移動して開く。
 - 変更前後の大文書応答性（同じRelease/fixtureの入力・scroll・RSS/処理時間）。
 - current-head CI と CodeRabbit の manual full review。

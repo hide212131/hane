@@ -67,8 +67,84 @@ fn get_clipboard_data(format: u32) -> Option<LockedGlobal> {
     LockedGlobal::lock(global)
 }
 
+/// Hane: the largest single image representation taken from the clipboard
+/// (64 MiB, the same bound the editor applies to an input image).
+const HANE_MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hane: why a rich clipboard read could not produce its content. Kept
+/// identical in shape to the macOS crate's type so the editor handles both
+/// the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RichClipboardError {
+    /// The clipboard could not be opened after the bounded retries.
+    Busy,
+    /// The clipboard changed while it was read (never produced on Windows: one
+    /// `ClipboardGuard` holds the clipboard for the whole read).
+    ChangedDuringRead,
+    /// A representation is present but its data is missing or invalid.
+    InvalidFormat,
+    /// A representation exceeds the size bound.
+    TooLarge,
+}
+
+impl std::fmt::Display for RichClipboardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Busy => "the clipboard is busy",
+            Self::ChangedDuringRead => "the clipboard changed while it was read",
+            Self::InvalidFormat => "the clipboard data is not valid",
+            Self::TooLarge => "the clipboard data is too large",
+        })
+    }
+}
+
+impl std::error::Error for RichClipboardError {}
+
+/// Hane: everything of one clipboard read, in one value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RichClipboardSnapshot {
+    /// The plain text and the file paths.
+    pub item: ClipboardItem,
+    /// Reserved for the HTML representation (Issue #596); not read yet.
+    pub html: Option<String>,
+    /// At most one entry on Windows: the clipboard is a single data object, so
+    /// the OS cannot tell independent images apart. The formats of that object
+    /// collapse to the preferred one (PNG, then JFIF/GIF, then CF_DIB). An
+    /// unreadable image is an `Err`, never silently dropped.
+    pub images: Vec<Result<Image, RichClipboardError>>,
+}
+
+/// Hane: reads the clipboard once inside one `ClipboardGuard`. `Ok(None)` is a
+/// really empty clipboard; failing to open it is `Err(Busy)`.
+pub fn read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError> {
+    let _clip = ClipboardGuard::open()?;
+    let read = read_formats();
+    if read.entries.is_empty() && read.image.is_none() {
+        log_unsupported_clipboard_formats();
+        return Ok(None);
+    }
+    Ok(Some(RichClipboardSnapshot {
+        item: ClipboardItem {
+            entries: read.entries,
+        },
+        html: None,
+        images: read.image.into_iter().collect(),
+    }))
+}
+
+/// Hane: an image data length the editor can accept.
+fn check_image_length(length: usize) -> Result<(), RichClipboardError> {
+    if length == 0 {
+        Err(RichClipboardError::InvalidFormat)
+    } else if length > HANE_MAX_IMAGE_BYTES {
+        Err(RichClipboardError::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn write_to_clipboard(item: ClipboardItem) {
-    let Some(_clip) = ClipboardGuard::open() else {
+    let Ok(_clip) = ClipboardGuard::open() else {
         return;
     };
 
@@ -90,16 +166,38 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 }
 
 pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
-    let _clip = ClipboardGuard::open()?;
+    let _clip = ClipboardGuard::open().ok()?;
 
+    let ClipboardRead { mut entries, image } = read_formats();
+    if let Some(Ok(image)) = image {
+        entries.push(ClipboardEntry::Image(image));
+    }
+
+    if entries.is_empty() {
+        log_unsupported_clipboard_formats();
+        return None;
+    }
+    Some(ClipboardItem { entries })
+}
+
+/// Hane: what one pass over the clipboard formats found.
+struct ClipboardRead {
+    entries: Vec<ClipboardEntry>,
+    image: Option<Result<Image, RichClipboardError>>,
+}
+
+/// Hane: reads every representation of the one clipboard generation. The
+/// caller holds the `ClipboardGuard`, so nothing can change in between. One
+/// image is kept: PNG (the only representation that carries alpha losslessly)
+/// beats the other formats, and CF_DIB (no alpha) is the last resort. A
+/// representation that cannot be read only becomes an error when no other
+/// representation of the image could be.
+fn read_formats() -> ClipboardRead {
     let mut entries = Vec::new();
     let mut have_text = false;
     let mut have_files = false;
-    // Hane: every representation of the one clipboard generation is read
-    // inside this single `ClipboardGuard`, and one image is kept: PNG (the
-    // only representation that carries alpha losslessly) beats the other
-    // formats, and CF_DIB (no alpha) is the last resort.
-    let mut best_image: Option<(u8, ClipboardEntry)> = None;
+    let mut best_image: Option<(u8, Image)> = None;
+    let mut image_failure: Option<RichClipboardError> = None;
 
     let count = unsafe { CountClipboardFormats() };
     let mut format = 0;
@@ -116,9 +214,11 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
             if best_image
                 .as_ref()
                 .is_none_or(|(best, _)| priority > *best)
-                && let Some(entry) = read_image(format)
             {
-                best_image = Some((priority, entry));
+                match read_image_checked(format) {
+                    Ok(image) => best_image = Some((priority, image)),
+                    Err(error) => image_failure = image_failure.or(Some(error)),
+                }
             }
         } else if !have_files && format == CF_HDROP.0 as u32 {
             if let Some(entry) = read_files() {
@@ -127,15 +227,11 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
             }
         }
     }
-    if let Some((_, entry)) = best_image {
-        entries.push(entry);
-    }
-
-    if entries.is_empty() {
-        log_unsupported_clipboard_formats();
-        return None;
-    }
-    Some(ClipboardItem { entries })
+    let image = match best_image {
+        Some((_, image)) => Some(Ok(image)),
+        None => image_failure.map(Err),
+    };
+    ClipboardRead { entries, image }
 }
 
 pub(crate) fn with_file_names<F>(hdrop: HDROP, mut f: F)
@@ -266,20 +362,29 @@ fn read_clipboard_metadata(text: &str) -> Option<String> {
     get_clipboard_string(*CLIPBOARD_METADATA_FORMAT)
 }
 
-fn read_image(format: u32) -> Option<ClipboardEntry> {
-    let locked = get_clipboard_data(format)?;
+/// Hane: one image representation, bounded before it is copied. A format that
+/// is announced but whose data cannot be locked, is empty or is not a valid DIB
+/// is `InvalidFormat`, and an oversized one is `TooLarge`.
+fn read_image_checked(format: u32) -> Result<Image, RichClipboardError> {
+    let locked = get_clipboard_data(format).ok_or(RichClipboardError::InvalidFormat)?;
+    check_image_length(locked.as_bytes().len())?;
     let (bytes, image_format) = if format == CF_DIB.0 as u32 {
-        (convert_dib_to_bmp(locked.as_bytes())?, ImageFormat::Bmp)
+        (
+            convert_dib_to_bmp(locked.as_bytes()).ok_or(RichClipboardError::InvalidFormat)?,
+            ImageFormat::Bmp,
+        )
     } else {
-        let image_format = *IMAGE_FORMATS_MAP.get(&format)?;
+        let image_format = *IMAGE_FORMATS_MAP
+            .get(&format)
+            .ok_or(RichClipboardError::InvalidFormat)?;
         (locked.as_bytes().to_vec(), image_format)
     };
     let id = hash(&bytes);
-    Some(ClipboardEntry::Image(Image {
+    Ok(Image {
         format: image_format,
         bytes,
         id,
-    }))
+    })
 }
 
 fn read_files() -> Option<ClipboardEntry> {
@@ -362,19 +467,20 @@ struct ClipboardGuard;
 
 impl ClipboardGuard {
     /// Another process may hold the clipboard for a moment while it publishes
-    /// its data; retry a bounded number of times before giving up.
-    fn open() -> Option<Self> {
+    /// its data; retry a bounded number of times before giving up. The final
+    /// failure is `Busy`, which callers must not treat as an empty clipboard.
+    fn open() -> Result<Self, RichClipboardError> {
         const ATTEMPTS: u32 = 5;
         for attempt in 1..=ATTEMPTS {
             match unsafe { OpenClipboard(None) } {
-                Ok(()) => return Some(Self),
+                Ok(()) => return Ok(Self),
                 Err(e) if attempt == ATTEMPTS => {
                     log::error!("Failed to open clipboard: {e}");
                 }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
-        None
+        Err(RichClipboardError::Busy)
     }
 }
 
@@ -414,5 +520,39 @@ impl LockedGlobal {
 impl Drop for LockedGlobal {
     fn drop(&mut self) {
         unsafe { GlobalUnlock(self.global).ok() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hane_clipboard_image_length_bounds() {
+        assert_eq!(check_image_length(0), Err(RichClipboardError::InvalidFormat));
+        assert_eq!(check_image_length(1), Ok(()));
+        assert_eq!(check_image_length(HANE_MAX_IMAGE_BYTES), Ok(()));
+        assert_eq!(
+            check_image_length(HANE_MAX_IMAGE_BYTES + 1),
+            Err(RichClipboardError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn hane_clipboard_format_priority_prefers_alpha_png_then_dib_then_svg() {
+        let png = image_format_priority(*CLIPBOARD_PNG_FORMAT);
+        let jpeg = image_format_priority(*CLIPBOARD_JPG_FORMAT);
+        let gif = image_format_priority(*CLIPBOARD_GIF_FORMAT);
+        let dib = image_format_priority(CF_DIB.0 as u32);
+        let svg = image_format_priority(*CLIPBOARD_SVG_FORMAT);
+        assert!(png > jpeg && png > gif);
+        assert!(jpeg > dib && gif > dib);
+        assert!(dib > svg);
+    }
+
+    #[test]
+    fn hane_clipboard_truncated_dib_is_not_a_bitmap() {
+        assert!(convert_dib_to_bmp(&[0u8; 10]).is_none());
+        assert!(convert_dib_to_bmp(&[0u8; 40]).is_some());
     }
 }

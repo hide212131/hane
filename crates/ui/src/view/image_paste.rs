@@ -30,33 +30,141 @@ pub(crate) struct ClipboardRaster {
     bytes: Vec<u8>,
 }
 
+/// Why the clipboard could not be read into something to paste. Mirrors the
+/// error of the platform crates' rich clipboard read, so a busy, changing or
+/// invalid clipboard is never mistaken for an empty one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(test, target_os = "macos", windows)), allow(dead_code))]
+pub(crate) enum ClipboardReadError {
+    Busy,
+    ChangedDuringRead,
+    InvalidFormat,
+    TooLarge,
+}
+
+impl ClipboardReadError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Busy => {
+                "クリップボードを他のアプリが使用中で読み取れません。少し待ってからもう一度貼り付けてください"
+            }
+            Self::ChangedDuringRead => {
+                "読み取り中にクリップボードが変更されました。もう一度貼り付けてください"
+            }
+            Self::InvalidFormat => "クリップボードの画像データが正しくありません",
+            Self::TooLarge => "クリップボードの画像が大きすぎます",
+        }
+    }
+}
+
+/// What the clipboard offers as an image. One OS item is one image however
+/// many formats it carries; independent OS items are never merged or cut down
+/// to the first one.
+#[derive(Debug, Default)]
+enum ClipboardImages {
+    /// No raster image (an SVG alone is not one).
+    #[default]
+    Empty,
+    One(Arc<ClipboardRaster>),
+    /// This many independent images; none can be chosen for the user.
+    Several(usize),
+    /// The one image could not be read.
+    Unreadable(ClipboardReadError),
+}
+
+/// The platform-neutral form of one native clipboard read: the text and file
+/// paths, and one entry per independent image item.
+#[cfg_attr(not(any(test, target_os = "macos", windows)), allow(dead_code))]
+pub(crate) struct NativeRead {
+    item: ClipboardItem,
+    images: Vec<Result<gpui::Image, ClipboardReadError>>,
+}
+
 /// Everything one Paste needs from the OS clipboard, read in a single call so
 /// the text and the image always come from the same clipboard generation.
 #[derive(Debug, Default)]
 pub(crate) struct ClipboardSnapshot {
     text: Option<String>,
-    raster: Option<Arc<ClipboardRaster>>,
+    images: ClipboardImages,
+    /// The whole read failed; there is nothing to paste and nothing to fall
+    /// back to.
+    read_error: Option<ClipboardReadError>,
 }
 
 impl ClipboardSnapshot {
-    pub(crate) fn from_item(item: &ClipboardItem) -> Self {
-        let raster = item.entries().iter().find_map(|entry| match entry {
-            gpui::ClipboardEntry::Image(source) => {
-                clip::source_format(source.format).map(|format| {
-                    Arc::new(ClipboardRaster {
+    fn from_images(
+        text: Option<String>,
+        images: Vec<Result<gpui::Image, ClipboardReadError>>,
+    ) -> Self {
+        let mut candidates: Vec<Result<Arc<ClipboardRaster>, ClipboardReadError>> = images
+            .into_iter()
+            .filter_map(|image| match image {
+                Ok(source) => clip::source_format(source.format).map(|format| {
+                    Ok(Arc::new(ClipboardRaster {
                         format,
-                        bytes: source.bytes.clone(),
-                    })
-                })
-            }
-            _ => None,
-        });
+                        bytes: source.bytes,
+                    }))
+                }),
+                Err(error) => Some(Err(error)),
+            })
+            .collect();
+        let images = match candidates.len() {
+            0 => ClipboardImages::Empty,
+            1 => match candidates.remove(0) {
+                Ok(raster) => ClipboardImages::One(raster),
+                Err(error) => ClipboardImages::Unreadable(error),
+            },
+            count => ClipboardImages::Several(count),
+        };
         Self {
-            text: item.text(),
-            raster,
+            text,
+            images,
+            read_error: None,
         }
     }
 
+    /// A GPUI `ClipboardItem` cannot say which images are alternative formats
+    /// of one OS item, so each of its image entries counts as its own item.
+    /// The native reads below collapse the formats of one item beforehand.
+    pub(crate) fn from_item(item: &ClipboardItem) -> Self {
+        let images = item
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                gpui::ClipboardEntry::Image(source) => Some(Ok(gpui::Image {
+                    format: source.format,
+                    bytes: source.bytes.clone(),
+                    id: source.id,
+                })),
+                _ => None,
+            })
+            .collect();
+        Self::from_images(item.text(), images)
+    }
+
+    /// The outcome of a native rich read: `Ok(None)` is a really empty
+    /// clipboard, every failure keeps its identity.
+    #[cfg_attr(not(any(test, target_os = "macos", windows)), allow(dead_code))]
+    pub(crate) fn from_native(read: Result<Option<NativeRead>, ClipboardReadError>) -> Self {
+        match read {
+            Ok(Some(read)) => Self::from_images(read.item.text(), read.images),
+            Ok(None) => Self::default(),
+            Err(error) => Self {
+                read_error: Some(error),
+                ..Self::default()
+            },
+        }
+    }
+
+    /// macOS and Windows: the patched platform crate's single snapshot.
+    #[cfg(all(not(test), any(target_os = "macos", windows)))]
+    pub(crate) fn read(_cx: &gpui::App) -> Self {
+        Self::from_native(native::read())
+    }
+
+    /// Other targets, and the GPUI test clipboard, which only has the
+    /// `Option` of GPUI's own read (an empty and a failed read look alike).
+    #[cfg(not(all(not(test), any(target_os = "macos", windows))))]
     pub(crate) fn read(cx: &gpui::App) -> Self {
         cx.read_from_clipboard()
             .map(|item| Self::from_item(&item))
@@ -69,7 +177,40 @@ impl ClipboardSnapshot {
 
     /// Whether a body Paste would do something with this snapshot.
     pub(crate) fn has_paste_content(&self) -> bool {
-        self.raster.is_some() || self.text.as_deref().is_some_and(|text| !text.is_empty())
+        !matches!(self.images, ClipboardImages::Empty)
+            || self.text.as_deref().is_some_and(|text| !text.is_empty())
+    }
+}
+
+#[cfg(all(not(test), any(target_os = "macos", windows)))]
+mod native {
+    use super::{ClipboardReadError, NativeRead};
+    #[cfg(target_os = "macos")]
+    use gpui_macos as platform;
+    #[cfg(windows)]
+    use gpui_windows as platform;
+
+    use platform::RichClipboardError as Native;
+
+    fn error(error: Native) -> ClipboardReadError {
+        match error {
+            Native::Busy => ClipboardReadError::Busy,
+            Native::ChangedDuringRead => ClipboardReadError::ChangedDuringRead,
+            Native::InvalidFormat => ClipboardReadError::InvalidFormat,
+            Native::TooLarge => ClipboardReadError::TooLarge,
+        }
+    }
+
+    pub(super) fn read() -> Result<Option<NativeRead>, ClipboardReadError> {
+        let snapshot = platform::read_rich_clipboard().map_err(error)?;
+        Ok(snapshot.map(|snapshot| NativeRead {
+            item: snapshot.item,
+            images: snapshot
+                .images
+                .into_iter()
+                .map(|image| image.map_err(error))
+                .collect(),
+        }))
     }
 }
 
@@ -149,12 +290,39 @@ impl EditorView {
 
     /// The dispatcher of a body Paste: a real image first, otherwise the text.
     /// An image that cannot be saved never falls back to its text companion.
+    /// A clipboard that could not be read, or whose image cannot be taken in,
+    /// is explained and leaves the selection, the history and the files alone.
     pub(crate) fn paste_into_body(&mut self, snapshot: ClipboardSnapshot, cx: &mut Context<Self>) {
-        if let Some(raster) = snapshot.raster {
-            self.paste_clipboard_image(raster, cx);
-        } else if let Some(text) = snapshot.text {
-            self.dispatch(EditorCommand::Insert(&text), cx);
+        if let Some(error) = snapshot.read_error {
+            self.refuse_clipboard_paste("貼り付けられませんでした", error.reason(), cx);
+            return;
         }
+        match snapshot.images {
+            ClipboardImages::One(raster) => self.paste_clipboard_image(raster, cx),
+            ClipboardImages::Several(count) => {
+                let reason = format!(
+                    "クリップボードに独立した画像が{count}件あります。画像は1枚ずつコピーして貼り付けてください"
+                );
+                self.refuse_clipboard_paste("画像を貼り付けられませんでした", &reason, cx);
+            }
+            ClipboardImages::Unreadable(error) => {
+                self.refuse_clipboard_paste("画像を貼り付けられませんでした", error.reason(), cx);
+            }
+            ClipboardImages::Empty => {
+                if let Some(text) = snapshot.text {
+                    self.dispatch(EditorCommand::Insert(&text), cx);
+                }
+            }
+        }
+    }
+
+    fn refuse_clipboard_paste(&mut self, what: &str, reason: &str, cx: &mut Context<Self>) {
+        // A read-only body ignores a Paste without a word, as it always did.
+        if !self.body_editable() || self.external_comparison_blocks_body() {
+            return;
+        }
+        self.status = Some(format!("{what}: {reason}"));
+        cx.notify();
     }
 
     fn paste_clipboard_image(&mut self, raster: Arc<ClipboardRaster>, cx: &mut Context<Self>) {
@@ -1157,9 +1325,216 @@ mod tests {
     fn the_snapshot_prefers_a_raster_and_keeps_the_text() {
         let snapshot = ClipboardSnapshot::from_item(&image_item(Some("t"), png(1, 1, [0; 4])));
         assert_eq!(snapshot.text(), Some("t"));
-        assert!(snapshot.raster.is_some());
+        assert!(matches!(snapshot.images, ClipboardImages::One(_)));
         assert!(snapshot.has_paste_content());
         let empty = ClipboardSnapshot::from_item(&ClipboardItem::new_string(String::new()));
         assert!(!empty.has_paste_content());
+    }
+
+    fn image_of(bytes: Vec<u8>, format: gpui::ImageFormat) -> gpui::Image {
+        let id = gpui::hash(&bytes);
+        gpui::Image { format, bytes, id }
+    }
+
+    fn native_read(
+        text: Option<&str>,
+        with_paths: bool,
+        images: Vec<Result<gpui::Image, ClipboardReadError>>,
+    ) -> NativeRead {
+        let mut entries = Vec::new();
+        if with_paths {
+            entries.push(gpui::ClipboardEntry::ExternalPaths(
+                gpui::ExternalPaths::default(),
+            ));
+        }
+        if let Some(text) = text {
+            entries.push(gpui::ClipboardEntry::String(gpui::ClipboardString::new(
+                text.to_owned(),
+            )));
+        }
+        NativeRead {
+            item: ClipboardItem { entries },
+            images,
+        }
+    }
+
+    fn paste_native(
+        view: &TestView,
+        cx: &mut TestCx,
+        read: Result<Option<NativeRead>, ClipboardReadError>,
+    ) {
+        view.update(cx, |view, cx| {
+            view.paste_into_body(ClipboardSnapshot::from_native(read), cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // A failed or busy clipboard is not an empty one: it is explained, the
+    // body, the selection and the files stay as they were, and no text is
+    // pasted in its place.
+    #[gpui::test]
+    fn a_failed_clipboard_read_is_reported_and_changes_nothing(cx: &mut gpui::TestAppContext) {
+        for (error, reason) in [
+            (ClipboardReadError::Busy, "使用中"),
+            (ClipboardReadError::ChangedDuringRead, "変更されました"),
+            (ClipboardReadError::InvalidFormat, "正しくありません"),
+            (ClipboardReadError::TooLarge, "大きすぎ"),
+        ] {
+            let root = temp_root("read-error");
+            let (view, cx) = open_file_view(cx, &root, "keep this\n");
+            select(&view, cx, 0, 4);
+            paste_native(&view, cx, Err(error));
+            assert_eq!(text_of(&view, cx), "keep this\n", "{error:?}");
+            assert!(status_of(&view, cx).unwrap().contains(reason), "{error:?}");
+            let selection = view.read_with(cx, |view, _| view.editor().selection());
+            assert_eq!(selection.range(), SourceRange::new(0, 4));
+            assert!(!root.join("images").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn a_really_empty_clipboard_does_nothing_and_says_nothing(cx: &mut gpui::TestAppContext) {
+        let root = temp_root("really-empty");
+        let (view, cx) = open_file_view(cx, &root, "keep\n");
+        select(&view, cx, 0, 4);
+        let before = status_of(&view, cx);
+        paste_native(&view, cx, Ok(None));
+        assert_eq!(text_of(&view, cx), "keep\n");
+        assert_eq!(status_of(&view, cx), before);
+        assert!(!root.join("images").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // An image the platform could not take in is explained; the text beside
+    // it is not pasted instead.
+    #[gpui::test]
+    fn an_unreadable_image_never_falls_back_to_its_text(cx: &mut gpui::TestAppContext) {
+        for (error, reason) in [
+            (ClipboardReadError::InvalidFormat, "正しくありません"),
+            (ClipboardReadError::TooLarge, "大きすぎ"),
+        ] {
+            let root = temp_root("unreadable");
+            let (view, cx) = open_file_view(cx, &root, "keep this\n");
+            select(&view, cx, 0, 4);
+            paste_native(
+                &view,
+                cx,
+                Ok(Some(native_read(Some("fallback text"), false, vec![Err(error)]))),
+            );
+            assert_eq!(text_of(&view, cx), "keep this\n", "{error:?}");
+            assert!(status_of(&view, cx).unwrap().contains(reason), "{error:?}");
+            let selection = view.read_with(cx, |view, _| view.editor().selection());
+            assert_eq!(selection.range(), SourceRange::new(0, 4));
+            assert!(!root.join("images").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    // Independent images are not cut down to the first one nor merged: the
+    // paste is refused before any file exists.
+    #[gpui::test]
+    fn several_independent_images_are_refused_with_the_body_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("several");
+        let (view, cx) = open_file_view(cx, &root, "keep\n");
+        select(&view, cx, 4, 4);
+        let first = image_of(png(1, 1, [1, 1, 1, 255]), gpui::ImageFormat::Png);
+        let second = image_of(png(2, 2, [2, 2, 2, 255]), gpui::ImageFormat::Png);
+        paste_native(
+            &view,
+            cx,
+            Ok(Some(native_read(Some("text"), false, vec![Ok(first), Ok(second)]))),
+        );
+        assert_eq!(text_of(&view, cx), "keep\n");
+        assert!(status_of(&view, cx).unwrap().contains("2件"));
+        assert!(!root.join("images").exists());
+
+        // The same through a GPUI item with two image entries.
+        let mut item = image_item(None, png(1, 1, [1, 1, 1, 255]));
+        item.entries.push(gpui::ClipboardEntry::Image(image_of(
+            png(2, 2, [2, 2, 2, 255]),
+            gpui::ImageFormat::Png,
+        )));
+        view.update(cx, |view, cx| {
+            view.paste_into_body(ClipboardSnapshot::from_item(&item), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), "keep\n");
+        assert!(!root.join("images").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // One image item (the platform already picked its preferred format) beside
+    // an SVG-only item and the file paths and plain text of the same
+    // generation: the real image is pasted, and only the body prefers it.
+    #[gpui::test]
+    fn paths_plain_and_an_image_paste_the_image_and_keep_the_others_out(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("paths-plain-image");
+        let (view, cx) = open_file_view(cx, &root, "hello\n");
+        select(&view, cx, 6, 6);
+        let image = image_of(png(2, 1, [3, 4, 5, 255]), gpui::ImageFormat::Png);
+        let svg = image_of(b"<svg/>".to_vec(), gpui::ImageFormat::Svg);
+        let read = native_read(Some("/a/b.png"), true, vec![Ok(image), Ok(svg)]);
+        paste_native(&view, cx, Ok(Some(read)));
+        let text = text_of(&view, cx);
+        let name = reference_in(&text);
+        assert_eq!(text, format!("hello\n\n![画像](images/{name})\n"));
+        assert!(!text.contains("/a/b.png"));
+        assert_eq!(pasted_files(&root).len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_snapshot_keeps_the_text_of_a_paths_and_plain_clipboard_without_an_image() {
+        let read = native_read(Some("/a/b.txt"), true, Vec::new());
+        let snapshot = ClipboardSnapshot::from_native(Ok(Some(read)));
+        assert!(matches!(snapshot.images, ClipboardImages::Empty));
+        assert_eq!(snapshot.text(), Some("/a/b.txt"));
+        assert!(snapshot.read_error.is_none());
+    }
+
+    #[test]
+    fn the_snapshot_tells_an_empty_clipboard_from_a_failed_read() {
+        let empty = ClipboardSnapshot::from_native(Ok(None));
+        assert!(!empty.has_paste_content());
+        assert!(empty.read_error.is_none());
+        for error in [
+            ClipboardReadError::Busy,
+            ClipboardReadError::ChangedDuringRead,
+        ] {
+            let failed = ClipboardSnapshot::from_native(Err(error));
+            assert_eq!(failed.read_error, Some(error));
+            assert!(failed.text().is_none());
+        }
+    }
+
+    #[test]
+    fn the_snapshot_counts_independent_raster_items_and_ignores_svg() {
+        let png_image = || image_of(png(1, 1, [0; 4]), gpui::ImageFormat::Png);
+        let svg = || image_of(b"<svg/>".to_vec(), gpui::ImageFormat::Svg);
+        let of = |images| {
+            ClipboardSnapshot::from_native(Ok(Some(native_read(None, false, images))))
+        };
+        assert!(matches!(of(vec![Ok(svg())]).images, ClipboardImages::Empty));
+        assert!(matches!(
+            of(vec![Ok(png_image()), Ok(svg())]).images,
+            ClipboardImages::One(_)
+        ));
+        assert!(matches!(
+            of(vec![Ok(png_image()), Ok(png_image()), Ok(png_image())]).images,
+            ClipboardImages::Several(3)
+        ));
+        assert!(matches!(
+            of(vec![Err(ClipboardReadError::TooLarge)]).images,
+            ClipboardImages::Unreadable(ClipboardReadError::TooLarge)
+        ));
+        assert!(matches!(
+            of(vec![Ok(png_image()), Err(ClipboardReadError::InvalidFormat)]).images,
+            ClipboardImages::Several(2)
+        ));
     }
 }
