@@ -3,8 +3,8 @@
 //! range and destination — through the formal block projections, not a
 //! re-implementation of them.
 
-use hane_document::{LineId, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
-use hane_markdown::BlockIndex;
+use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
+use hane_markdown::{BlockIndex, NodeKind, parse_document};
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockKind, BlockLine, BlockWindow, StyleKind, VisualBlock, VisualLine, block_line_span,
@@ -611,14 +611,57 @@ fn projection_creators_keep_text_origin_only_for_bare_urls() {
             );
         }
     }
+    // The angle autolink is not an external target: only the inline links and
+    // the bare URL carry metadata, and only the bare URL has a text origin.
     let expected = vec![
         ("https://a.example".to_owned(), false),
         ("https://m.example/".to_owned(), false),
-        ("https://auto.example".to_owned(), false),
         ("https://bare.example".to_owned(), true),
     ];
     assert_eq!(table_origins, expected);
     assert_eq!(list_origins, expected);
+
+    // The autolink's syntax stays a Link node in the tree, with no external
+    // metadata, and is not misclassified as a bare target.
+    let auto = "<https://auto.example>";
+    let auto_start = source.find(auto).expect("autolink in fixture");
+    let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+    assert!(
+        parsed
+            .tree
+            .iter()
+            .any(|(_, node)| node.kind == NodeKind::Link
+                && node.source_range == SourceRange::new(auto_start, auto_start + auto.len())),
+        "the autolink keeps its Link node"
+    );
+    assert!(
+        parsed
+            .links
+            .iter()
+            .all(|link| &*link.destination != "https://auto.example"),
+        "the autolink has no external metadata"
+    );
+
+    let alone = parse_document(Revision(1), SourceRange::new(0, auto.len()), auto);
+    assert!(alone.links.is_empty());
+    let link_nodes = alone
+        .tree
+        .iter()
+        .filter(|(_, node)| node.kind == NodeKind::Link)
+        .collect::<Vec<_>>();
+    assert_eq!(link_nodes.len(), 1);
+    assert_eq!(link_nodes[0].1.source_range, SourceRange::new(0, 22));
+    let alone_index = BlockIndex::build(Revision(1), auto);
+    for block in alone_index.blocks() {
+        if let Some(projection) = alone_index.list_projection(&block) {
+            assert!(
+                projection
+                    .links_in(SourceRange::new(0, auto.len()))
+                    .all(|link| !link.is_bare_url && &*link.destination != "https://auto.example"),
+                "the autolink is neither a target nor a bare URL"
+            );
+        }
+    }
 }
 
 const LABEL: &str = "https://label.example";
