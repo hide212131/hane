@@ -471,7 +471,7 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
 }
 
 /// Height of the shared update panel above the footer.
-pub(super) const UPDATE_PANEL_HEIGHT: f32 = 76.0;
+pub(super) const UPDATE_PANEL_HEIGHT: f32 = 96.0;
 
 /// The dedicated footer entry, derived from the service snapshot only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1360,8 +1360,16 @@ impl EditorView {
                         .child(model.title),
                 )
                 .children(model.detail.map(|detail| {
+                    // Wraps instead of eliding: the detail carries the reason
+                    // and next step. The panel keeps its fixed height, and
+                    // the buttons below stay in place.
                     div()
-                        .truncate()
+                        .id("update-panel-detail")
+                        .debug_selector(|| "update-panel-detail".to_owned())
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_normal()
                         .text_color(rgb(self.theme.quote_foreground))
                         .child(detail)
                 }))
@@ -2749,6 +2757,53 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("update-panel").is_none());
         assert!(cx.debug_bounds("footer-update").is_none());
+    }
+
+    #[gpui::test]
+    fn the_single_footer_keeps_the_update_entry_inside_the_footer(cx: &mut gpui::TestAppContext) {
+        let controller = WakeController::new(available_snapshot());
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+        });
+        for width in [260.0, 220.0] {
+            cx.simulate_resize(gpui::size(px(width), px(400.0)));
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            let footer = cx.debug_bounds("editor-footer").expect("footer renders");
+            let update = cx.debug_bounds("footer-update").expect("update entry renders");
+            assert!(cx.debug_bounds("footer-single-entry").is_some(), "{width}: Single layout");
+            assert!(update.size.width > px(0.0), "{width}");
+            assert!(update.left() >= footer.left(), "{width}: {update:?} in {footer:?}");
+            assert!(update.right() <= footer.right(), "{width}: {update:?} in {footer:?}");
+            assert!(update.top() >= footer.top(), "{width}");
+            assert!(update.bottom() <= footer.bottom(), "{width}");
+        }
+    }
+
+    #[gpui::test]
+    fn the_panel_shows_its_detail_inside_the_fixed_height_panel(cx: &mut gpui::TestAppContext) {
+        let mut failed = snapshot(AppUpdatePhase::Failed);
+        failed.error_code = Some("hash_mismatch".to_owned());
+        failed.error_stage = Some("download".to_owned());
+        let controller = WakeController::new(failed);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+            view.toggle_update_panel(cx);
+        });
+        cx.simulate_resize(gpui::size(px(360.0), px(500.0)));
+        cx.run_until_parked();
+        let panel = cx.debug_bounds("update-panel").expect("panel is open");
+        let detail = cx.debug_bounds("update-panel-detail").expect("detail renders");
+        assert_eq!(panel.size.height, px(UPDATE_PANEL_HEIGHT));
+        assert!(detail.size.height > px(0.0));
+        assert!(detail.left() >= panel.left() && detail.right() <= panel.right());
+        assert!(detail.top() >= panel.top() && detail.bottom() <= panel.bottom());
     }
 
     fn open_general_settings(

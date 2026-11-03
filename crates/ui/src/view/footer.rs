@@ -621,7 +621,11 @@ impl EditorView {
             left.push(
                 div()
                     .debug_selector(|| "footer-single-entry".to_owned())
-                    .flex_none()
+                    // The entry gives way before the update button does, so
+                    // the button stays whole and operable at a narrow width.
+                    .flex_shrink()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .child(
                         Button::new("footer-single-entry-button")
                             .label(format!("{warning_mark}{} · 状態と操作", display.label(true)))
@@ -811,6 +815,7 @@ impl EditorView {
                 )
                 .into_any_element();
             if layout == FooterLayout::Single {
+                // Keeps its own width (`flex_none`); the entry before it shrinks.
                 left.push(button);
             } else {
                 right.insert(0, button);

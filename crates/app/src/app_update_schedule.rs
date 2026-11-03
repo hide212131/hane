@@ -154,10 +154,20 @@ impl AutoSchedule {
                 self.failures = self.failures.saturating_add(1);
                 self.retry_not_before = Some(now + backoff_after(self.failures));
             }
-            CheckHealth::Cancelled => {}
+            CheckHealth::Cancelled => {
+                // A stale, already elapsed backoff must not make the next
+                // automatic check due right after the cancel.
+                if self.retry_not_before.is_some_and(|until| now >= until) {
+                    self.retry_not_before = None;
+                }
+            }
         }
         if self.armed {
-            self.due = Some(self.retry_not_before.unwrap_or(now + CHECK_INTERVAL));
+            self.due = Some(match (health, self.retry_not_before) {
+                (CheckHealth::Cancelled, Some(until)) => until.max(now + CHECK_INTERVAL),
+                (_, Some(until)) => until,
+                (_, None) => now + CHECK_INTERVAL,
+            });
         }
     }
 
@@ -448,6 +458,20 @@ mod tests {
         schedule.finished(SECOND, CheckHealth::Cancelled);
         assert!(schedule.manual_allowed(SECOND));
         assert_eq!(schedule.auto_origin(SECOND + HOUR), Some(CheckOrigin::Periodic));
+    }
+
+    #[test]
+    fn a_cancel_after_an_elapsed_backoff_waits_a_full_interval() {
+        let mut schedule = AutoSchedule::default();
+        schedule.arm(Duration::ZERO);
+        schedule.started(CheckOrigin::Startup);
+        schedule.finished(SECOND, CheckHealth::Failure);
+        let later = SECOND + HOUR * 3;
+        schedule.started(CheckOrigin::Manual);
+        schedule.finished(later, CheckHealth::Cancelled);
+        assert_eq!(schedule.auto_origin(later), None);
+        assert_eq!(schedule.auto_origin(later + HOUR - SECOND), None);
+        assert_eq!(schedule.auto_origin(later + HOUR), Some(CheckOrigin::Periodic));
     }
 
     #[test]

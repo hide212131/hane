@@ -187,6 +187,9 @@ struct State {
     stage: Stage,
     restoring: bool,
     restore_started: bool,
+    /// The started restore ran to its end. A restore the runner refused never
+    /// settles, so no automatic check starts beside it.
+    restore_settled: bool,
     recheck: Option<Recheck>,
     /// The one-time startup notice has been decided (shown or ruled out).
     startup_decided: bool,
@@ -468,6 +471,7 @@ impl AppUpdateService {
                     stage,
                     restoring: false,
                     restore_started: false,
+                    restore_settled: false,
                     recheck: None,
                     startup_decided: false,
                     startup_announce: None,
@@ -809,6 +813,9 @@ impl Inner {
             if state.restoring || state.recheck.is_some() {
                 return false;
             }
+            if auto && state.restore_started && !state.restore_settled {
+                return false;
+            }
             let origin = {
                 let sched = self.sched_lock();
                 if auto {
@@ -908,10 +915,17 @@ impl Inner {
                 // cancelled or superseded check never reaches the diagnostics.
                 self.diag
                     .note("check", error.code.as_str(), &error.detail, None);
+                let stale = matches!(
+                    error.code,
+                    ErrorCode::CatalogExpired | ErrorCode::SequenceRegression
+                );
                 match known {
                     // A failed re-check is never "up to date" and never
-                    // removes a candidate that is still valid to download.
-                    Some(old) if old.candidate.is_applicable() => Stage::Available(old),
+                    // removes a candidate that is still valid to download. An
+                    // expired or regressed catalog is not valid any more.
+                    Some(old) if !stale && old.candidate.is_applicable() => {
+                        Stage::Available(old)
+                    }
                     _ => Stage::Failed {
                         code: error.code,
                         stage: "check",
@@ -947,6 +961,27 @@ impl Inner {
             seen,
             expected_tag,
         }
+    }
+
+    /// Verifies the stored catalog again against the current clock and floor.
+    fn reverify_offer(&self, offer: &Offer) -> Result<(), UpdateError> {
+        let target = self.config.target.ok_or_else(|| {
+            UpdateError::new(ErrorCode::TargetUnsupported, "no update distribution")
+        })?;
+        let seen = self.load_floor()?;
+        let tag = offer.candidate.catalog().tag.clone();
+        let candidate = verify_catalog(
+            &offer.catalog,
+            &offer.signature,
+            &self.verify_context(target, seen.as_ref(), Some(tag.as_str())),
+        )?;
+        if candidate.candidate_id() != offer.id() || !candidate.is_applicable() {
+            return Err(UpdateError::new(
+                ErrorCode::NotApplicable,
+                "the candidate is no longer applicable",
+            ));
+        }
+        Ok(())
     }
 
     fn check_latest(&self, cancel: &CancelToken) -> Result<CheckOutcome, UpdateError> {
@@ -1147,6 +1182,9 @@ impl Inner {
         let entry = offer.candidate.target_entry();
         let tag = &offer.candidate.catalog().tag;
         *step = "write_download";
+        // A candidate kept beside a failed re-check is verified again now, so
+        // an expired catalog or a raised floor is refused before any work.
+        self.reverify_offer(offer)?;
         self.ensure_lease()?;
         create_private_dir(work)?;
         durable_write(&work.join(CATALOG_FILE), &offer.catalog)?;
@@ -1383,7 +1421,8 @@ impl Inner {
         {
             let mut state = self.lock();
             state.restoring = false;
-            let idle = matches!(state.stage, Stage::Idle);
+            state.restore_settled = true;
+            let idle =matches!(state.stage, Stage::Idle);
             if let (true, Some((offer, dir, lease))) = (idle, found) {
                 *self
                     .candidate_lease
