@@ -152,6 +152,29 @@ fn assert_colored_and_targeted(line: &VisualLine, source: &str, url: &str) {
     assert!(!targets[0].contains(SourceOffset(range.end.0)));
 }
 
+/// Index of the one row whose targets point at `url`. Every other row (blank
+/// or not) must carry no link target at all, so an extra link is not missed.
+fn url_line_index(block: &VisualBlock, url: &str) -> usize {
+    let rows = block
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.links.iter().any(|link| &*link.destination == url))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "exactly one row targets {url}: {rows:?}");
+    for (index, line) in block.lines.iter().enumerate() {
+        if index != rows[0] {
+            assert!(
+                line.links.is_empty(),
+                "row {index} must not carry link targets: {:?}",
+                line.links
+            );
+        }
+    }
+    rows[0]
+}
+
 /// An edit in the block in front moves a presented bare URL by `rebase`: the
 /// target range, destination and the glyph-to-source mapping follow the new
 /// UTF-8 offsets and agree with presenting the edited source from scratch.
@@ -177,8 +200,7 @@ fn rebase_after_a_multibyte_edit_in_front_keeps_targets_and_glyphs_aligned() {
 
     let expected = range_of(&now, url);
     assert_eq!(expected.start.0, range_of(&source, url).start.0 + "🙂".len());
-    assert_eq!(block.lines.len(), 1);
-    let line = &block.lines[0];
+    let line = &block.lines[url_line_index(&block, url)];
     assert_eq!(line.links.len(), 1);
     assert_eq!(&*line.links[0].destination, url);
     assert_eq!(line.links[0].source_range, expected);
@@ -187,7 +209,7 @@ fn rebase_after_a_multibyte_edit_in_front_keeps_targets_and_glyphs_aligned() {
     // The rebased presentation equals presenting the edited source again.
     let fresh = present(&now).remove(1);
     assert_eq!(
-        fresh.lines[0]
+        fresh.lines[url_line_index(&fresh, url)]
             .links
             .iter()
             .map(|link| (link.destination.to_string(), link.source_range))
