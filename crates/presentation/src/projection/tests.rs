@@ -500,6 +500,8 @@ fn cached_hundred_thousand_line_quote_projects_only_viewport_markers() {
         parsed: &joined.parsed,
         projection: &joined.projection,
         list_projection: None,
+        source: &joined.joined_source,
+        local_bare: LocalBareLinks::Trusted,
     };
     // The caret is off-screen inside the strong span. Prefix ownership and
     // both distant delimiters still use the same complete snapshot.
@@ -1337,6 +1339,8 @@ fn large_ordered_list_viewport_labels_reuse_one_shared_parse_at_middle_and_tail(
         parsed: &joined.parsed,
         projection: &joined.projection,
         list_projection: None,
+        source: &joined.joined_source,
+        local_bare: LocalBareLinks::Trusted,
     };
     let middle = ITEMS / 2;
     for &index in &[

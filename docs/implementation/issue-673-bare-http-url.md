@@ -82,6 +82,17 @@ Jevにcurrent code・Issue契約・一次仕様・候補を渡し、`local_scann
 
 cache回帰はFormalとProvisionalを分ける。正式index公開後の安定IDでは無関係編集による実cache再利用と正しい範囲移動・destination・Link色を確認する。正式index未公開時は既存local_block_indexがsource開始offset由来のProvisional IDを返し、前方編集でIDが変わり得るため、cache missからの正当な再presentでも正しいmetadataを必ず確認する。背景正式publish後の同じ結果と成立条件下の再利用、VisualBlock rebaseのsource/glyph整合も確認する。あらゆるProvisional編集で常に再利用する製品最適化は本Issueの要件ではない。根拠はPR #676の観測コメント6611976739とJev判断6612034997。Issueの鮮度・原文保持・操作stateの受入条件は弱めない。
 
+### 正式context優先と未確定の保留（PR #676 review thread 4459540104 の確定契約）
+
+Jevは`authoritative_positive_and_negative`（confidence 0.99）を選択した。この節は意味判断の記録であり、実装・検証成功の証拠ではない。上記の原文保持・操作state・除外の受入条件は弱めない。
+
+- 正式にリンクあり・正式にリンク対象なし・context未確定を区別する。current な文書全体の正式metadataがeligibility/destinationの正本である。`BlockIndex::list_projection`は、Formalで現在のblockには、リンク・list・quoteが一つもなくても空のprojectionを返し、「正式に対象なし」を表す。`None`はstale/Provisionalの「未確定」であり、「対象なし」と同一視しない。新しいURL scanner/indexは作らない。
+- 正式projectionがあるblockでは、presentationのlink targetは正式projectionの範囲・destinationだけで決める。局所Textの裸targetは、正式なreference/既存Link・code・HTMLの判定を上書き・先取りしない。reference定義が別blockにあるlabel URLは、正式destinationだけをtargetにし（source範囲はlabelのText、`uses_reference=true`）、裸URLのtargetは作らない。窓外から始まるcode span・Markdown label・inline HTMLも、正式negativeに従い裸targetにしない。
+- 正式projectionが無い間は、局所parseの裸URLを次のとおり扱う。standalone presenter（`present_markdown`等）は完全入力として従来どおり全て有効。blockを局所parseが全体として読めている場合は、`[`と`]`に挟まれた裸URL（別blockのreference定義でtextになり得るもの）だけ保留する。窓がblockの一部しか読んでいない場合（>256KiBのviewport-only、行予算超過等）は、背景の確定contextが公開されるまで全ての裸URLを保留する。保留中はtargetもLink色も出さず、全ての裸URLを永久に無効にはしない。
+- 背景の正式indexが公開されるとcached presentationが破棄され、正式projectionで再presentされて、正しい裸URLのtarget・Link色・glyph対応が戻る。
+- reference定義の追加・削除で既存Textのeligibility/destinationが変わり得る編集では、cached presentationを古いまま公開しない。reference linkを含むblockに加え、`[`と`]`に挟まれた裸URLを含むblock（一部だけ提示したblockも含む）は、編集後に再presentする。その他の通常の裸URLは従来どおりrebaseでき、無関係な前方UTF-8編集での実cache再利用を保つ。
+- UIでURLを再parseしない。click/modifier/hit-test/`open_url`経路とWindows #670/#674の入力・backendは変更しない。table種別（URL labelの色判定）・scannerのraw_len前進・html_ownersの検索は別root causeであり、この修正の対象外。
+
 GUIは両OSで編集（macOS Command / Windows Ctrl）、閲覧（無修飾mouse-up）を確認する。編集通常クリックは選択、閲覧の4論理px未満は開く、以上はドラッグ選択、MouseMoveなしreleaseも既存契約を維持する。開くだけでcaret/selection/bytes/revision/Undo/Redoを変えないことをstateテストと前後観測で確認する。ブラウザの実到達URL・対象head/base・binary・PID/path・隔離state・mode・入力と結果を記録し、起動要求だけを到達成功にしない。
 
 Windows GUIは許可済み既存Windowsチャットから直接操作し、Mac経由VMを使わない。GUI操作前にhane-gui-test skillと共有GUIの利用状況を確認する。失敗時は `docs/gui-test-recovery.md` に従い復旧し、unknownをpassにしない。自分の検証アプリだけを終了確認後に片付ける。

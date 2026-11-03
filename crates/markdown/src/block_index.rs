@@ -690,26 +690,22 @@ fn build_list_projections(
                 container_markers[container_start..container_end].to_vec();
             let block_quotes = std::mem::take(&mut quotes_by_block[block]);
             let block_links = std::mem::take(&mut links_by_block[block]);
-            if block_items.is_empty()
-                && rows.is_empty()
-                && block_quotes.is_empty()
-                && block_links.is_empty()
-            {
-                None
-            } else {
-                Some(ListProjection::new(
-                    block_items,
-                    block_prefixes,
-                    block_lists,
-                    block_quotes,
-                    rows,
-                    ListProjectionMarkers {
-                        fence_markers: block_fence_markers,
-                        container_markers: block_container_markers,
-                    },
-                    block_links,
-                ))
-            }
+            // Every formal block keeps its projection, even when it holds no
+            // list, quote or link. An empty projection is the formal statement
+            // that the whole-document parse found nothing openable here, which
+            // a missing projection (an unconfirmed or stale block) cannot say.
+            Some(ListProjection::new(
+                block_items,
+                block_prefixes,
+                block_lists,
+                block_quotes,
+                rows,
+                ListProjectionMarkers {
+                    fence_markers: block_fence_markers,
+                    container_markers: block_container_markers,
+                },
+                block_links,
+            ))
         })
         .collect()
 }
@@ -1003,8 +999,10 @@ impl BlockIndex {
         self.block(self.ordinal_at(offset)?)
     }
 
-    /// Document-wide list context for a block from the last formal parse.
-    /// Provisional or stale block values never receive a projection.
+    /// Document-wide list and link context for a block from the last formal
+    /// parse. Provisional or stale block values never receive a projection, so
+    /// `None` means "not confirmed", while a projection without links means the
+    /// formal parse found no openable link in the block.
     pub fn list_projection(&self, block: &IndexedBlock) -> Option<&ListProjection> {
         let current = self.block(block.ordinal)?;
         (current.id == block.id
@@ -1981,12 +1979,16 @@ mod tests {
     }
 
     #[test]
-    fn top_level_fenced_code_does_not_build_a_list_projection() {
+    fn top_level_fenced_code_has_an_empty_formal_projection() {
         let source = "````rust\ncode\n````";
         let index = BlockIndex::build(Revision(1), source);
         let block = index.block(0).expect("top-level code block");
         assert_eq!(block.kind, NodeKind::CodeBlock);
-        assert!(index.list_projection(&block).is_none());
+        let projection = index
+            .list_projection(&block)
+            .expect("a formal block states that it has no list or link");
+        assert!(projection.items.is_empty());
+        assert_eq!(projection.links_in(block.source_range).count(), 0);
     }
 
     #[test]

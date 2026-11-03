@@ -66,6 +66,80 @@ fn present(source: &str) -> Vec<VisualBlock> {
         .collect()
 }
 
+/// Presents block `ordinal` of `source`. `only_line` limits both the lines read
+/// and the lines drawn to that one document line (a viewport-only window, with
+/// no joined parse); `formal` hands the published index's projections to the
+/// presenter, and `false` leaves them out as an unconfirmed block has none.
+fn present_window(
+    source: &str,
+    ordinal: usize,
+    only_line: Option<usize>,
+    formal: bool,
+) -> VisualBlock {
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let block = index.block(ordinal).expect("block");
+    let span = block_line_span(&buffer, &block).expect("block spans lines");
+    let read = only_line.map_or(span.clone(), |line| line..line + 1);
+    let ranges = read
+        .clone()
+        .map(|line| buffer.line_range(LineId(line)).expect("line in range"))
+        .collect::<Vec<_>>();
+    let texts = ranges
+        .iter()
+        .map(|range| buffer.text(*range).expect("line text"))
+        .collect::<Vec<_>>();
+    let lines = read
+        .clone()
+        .zip(&ranges)
+        .zip(&texts)
+        .map(|((line, range), text)| BlockLine {
+            line,
+            range: *range,
+            text,
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    let list_projection = if formal {
+        index.list_projection(&block)
+    } else {
+        None
+    };
+    let table_projection = if formal {
+        index.table_projection(&block)
+    } else {
+        None
+    };
+    present_block_with_table_projection(
+        &block,
+        buffer.revision(),
+        &BlockWindow {
+            trailing_blank_lines: trailing_blank_lines(&buffer, &span),
+            render: read,
+            span,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
+            joined: None,
+            block_disclosure: None,
+        },
+        LINE_HEIGHT,
+        list_projection,
+        table_projection,
+    )
+}
+
+fn targets(block: &VisualBlock) -> Vec<(String, SourceRange, bool)> {
+    block
+        .lines
+        .iter()
+        .flat_map(|line| &line.links)
+        .map(|link| (link.destination.to_string(), link.source_range, link.uses_reference))
+        .collect()
+}
+
 fn range_of(source: &str, needle: &str) -> SourceRange {
     let start = source.find(needle).expect("needle in source");
     SourceRange::new(start, start + needle.len())
@@ -406,4 +480,169 @@ fn table_row_keeps_one_target_each_for_markdown_and_bare_links() {
         row.style_runs
     );
     assert_eq!(link_runs(row).len(), 2, "only the two bare URLs are colored");
+}
+
+const LABEL: &str = "https://label.example";
+const DEST: &str = "https://dest.example";
+
+/// A reference label that is a URL, with its definition in another block: the
+/// formal destination is the only target and the label is not a bare URL.
+#[test]
+fn reference_label_url_targets_only_the_formal_destination() {
+    let source = format!("[{LABEL}][r]\n\nother\n\n[r]: {DEST}\n");
+    let label = range_of(&source, LABEL);
+    let block = present_window(&source, 0, None, true);
+    assert_eq!(targets(&block), [(DEST.to_owned(), label, true)]);
+    let line = &block.lines[0];
+    let visual = line.visual_text.find(LABEL).expect("label is visible");
+    assert_eq!(
+        link_runs(line)
+            .iter()
+            .filter(|run| **run == (visual, visual + LABEL.len()))
+            .count(),
+        1,
+        "the label is colored once, over exactly its text: {:?}",
+        line.style_runs
+    );
+
+    // Defined right after the paragraph, the same label resolves the same way.
+    let near = format!("[{LABEL}][r]\n\n[r]: {DEST}\n");
+    let block = present_window(&near, 0, None, true);
+    assert_eq!(
+        targets(&block),
+        [(DEST.to_owned(), range_of(&near, LABEL), true)]
+    );
+
+    // Alongside an inline link and an autolink the label keeps its own target.
+    let mixed = format!(
+        "[a](https://inline.example) <https://auto.example> [{LABEL}][r]\n\n[r]: {DEST}\n"
+    );
+    let block = present_window(&mixed, 0, None, true);
+    let destinations = targets(&block)
+        .into_iter()
+        .map(|(destination, _, _)| destination)
+        .collect::<Vec<_>>();
+    assert!(destinations.contains(&"https://inline.example".to_owned()));
+    assert!(destinations.contains(&DEST.to_owned()));
+    assert!(
+        !destinations.contains(&LABEL.to_owned()),
+        "the label is never a bare URL: {destinations:?}"
+    );
+}
+
+/// Without a formal projection the same block is unconfirmed: the label is held
+/// back rather than shown as a bare URL, while an ordinary bare URL in a block
+/// the local parse reads whole is not.
+#[test]
+fn unconfirmed_block_holds_back_only_what_a_definition_could_change() {
+    let source = format!("[{LABEL}][r]\n\nother\n\n[r]: {DEST}\n");
+    let block = present_window(&source, 0, None, false);
+    assert!(
+        targets(&block).is_empty(),
+        "a bracketed URL is not a target before the formal parse confirms it: {:?}",
+        targets(&block)
+    );
+
+    let plain = "see https://plain.example/a here\n\nother\n";
+    let block = present_window(plain, 0, None, false);
+    assert_eq!(
+        targets(&block),
+        [(
+            "https://plain.example/a".to_owned(),
+            range_of(plain, "https://plain.example/a"),
+            false
+        )]
+    );
+}
+
+/// A block larger than the synchronous join budget is presented from one line:
+/// the window cannot see the code span, label or inline HTML that opened
+/// outside it. Formally those lines carry no bare target; unconfirmed they carry
+/// none either; a true bare URL of the same size shows once confirmed.
+#[test]
+fn viewport_only_window_never_turns_outside_syntax_into_a_bare_url() {
+    let prefix = "x".repeat(300_000);
+    let cases = [
+        (
+            "code span",
+            format!("`{prefix}\nhttps://inside.example\nend`\n"),
+            "https://inside.example",
+            None,
+        ),
+        (
+            "markdown label",
+            format!("[{prefix}\nhttps://label.example\nend](https://dest.example)\n"),
+            "https://label.example",
+            Some("https://dest.example"),
+        ),
+        (
+            "inline html",
+            format!("<span>{prefix}\nhttps://outside.example\nend</span>\n"),
+            "https://outside.example",
+            None,
+        ),
+    ];
+    for (name, source, url, formal_destination) in cases {
+        let formal = present_window(&source, 0, Some(1), true);
+        let found = targets(&formal);
+        match formal_destination {
+            None => assert!(found.is_empty(), "{name}: formal has no target: {found:?}"),
+            Some(destination) => {
+                assert_eq!(found.len(), 1, "{name}: {found:?}");
+                assert_eq!(found[0].0, destination, "{name}");
+                assert!(!found[0].2, "{name}: an inline destination");
+            }
+        }
+        assert!(
+            found.iter().all(|(destination, _, _)| destination != url),
+            "{name}: the line's own text is not a bare URL: {found:?}"
+        );
+        assert!(
+            link_runs(&formal.lines[0]).len() <= usize::from(formal_destination.is_some()),
+            "{name}: no Link color for text that is not a target: {:?}",
+            formal.lines[0].style_runs
+        );
+
+        let unconfirmed = present_window(&source, 0, Some(1), false);
+        assert!(
+            targets(&unconfirmed).is_empty(),
+            "{name}: a viewport-only window cannot confirm a bare URL: {:?}",
+            targets(&unconfirmed)
+        );
+    }
+
+    let real = format!("{prefix}\nhttps://real.example/x\nend\n");
+    let confirmed = present_window(&real, 0, Some(1), true);
+    assert_eq!(
+        targets(&confirmed),
+        [(
+            "https://real.example/x".to_owned(),
+            range_of(&real, "https://real.example/x"),
+            false
+        )]
+    );
+    let line = &confirmed.lines[0];
+    let visual = line.visual_text.find("https://real.example/x").expect("url");
+    assert!(link_runs(line).contains(&(visual, visual + "https://real.example/x".len())));
+    assert!(targets(&present_window(&real, 0, Some(1), false)).is_empty());
+}
+
+/// Adding the definition in another block moves the target from the bare label
+/// to the formal destination, and removing it moves it back, whichever way the
+/// document is presented from scratch.
+#[test]
+fn definition_added_and_removed_in_another_block_changes_the_target_both_ways() {
+    let without = format!("[{LABEL}][r]\n\nother\n");
+    let with = format!("{without}\n[r]: {DEST}\n");
+    let label = range_of(&without, LABEL);
+    for _ in 0..2 {
+        assert_eq!(
+            targets(&present_window(&without, 0, None, true)),
+            [(LABEL.to_owned(), label, false)]
+        );
+        assert_eq!(
+            targets(&present_window(&with, 0, None, true)),
+            [(DEST.to_owned(), label, true)]
+        );
+    }
 }

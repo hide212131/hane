@@ -624,9 +624,14 @@ pub fn present_markdown_with_disclosure(
         line_height,
         disclosure,
         None,
+        LocalBareLinks::Trusted,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "line presentation keeps the existing public inputs plus list context and bare-link trust"
+)]
 fn present_markdown_with_list_projection(
     line_id: u64,
     revision: Revision,
@@ -635,6 +640,7 @@ fn present_markdown_with_list_projection(
     line_height: f32,
     disclosure: Option<SourceRange>,
     list_projection: Option<&ListProjection>,
+    local_bare: LocalBareLinks,
 ) -> VisualLine {
     if source.is_empty() {
         let mut block = present_plain(line_id, revision, range, source);
@@ -654,8 +660,33 @@ fn present_markdown_with_list_projection(
             parsed: &parsed,
             projection: &projection,
             list_projection,
+            source,
+            local_bare,
         },
     )
+}
+
+/// How far the bare URLs of a local parse may be trusted when no formal
+/// document-wide link metadata describes the block.
+///
+/// The formal projection is the authority on which source ranges are links and
+/// where they lead: it has seen the whole document, so it knows reference
+/// definitions on other blocks and code or HTML that starts outside a window.
+/// A local parse only guesses. With a formal projection this is not consulted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalBareLinks {
+    /// The parse is the complete input the caller handed in, as for a
+    /// standalone presenter: every bare URL it found is real.
+    Trusted,
+    /// The parse covers the whole block but nothing confirmed it against the
+    /// document. A bare URL that sits between `[` and `]` could still be the
+    /// text of a reference link whose definition is in another block, so it is
+    /// held back; every other bare URL is decided by the block's own syntax.
+    UnlessBracketed,
+    /// The parse sees only part of the block, so code, HTML or a link label
+    /// that opened outside it cannot be excluded: every bare URL is held back
+    /// until the formal projection confirms it.
+    Withheld,
 }
 
 /// A parse [`present_markdown_from_parse`] projects one physical line from.
@@ -664,6 +695,45 @@ struct SharedParse<'a> {
     parsed: &'a MarkdownParse,
     projection: &'a ProjectionIndex,
     list_projection: Option<&'a ListProjection>,
+    /// The text `parsed` was built from, starting at `parsed.source_range`.
+    source: &'a str,
+    local_bare: LocalBareLinks,
+}
+
+/// Whether a link the local parse found may be shown while no formal
+/// projection confirms it. Only a bare URL (a `Text`-owned target with no
+/// reference) is ever held back; Markdown links keep their own syntax.
+fn local_bare_link_is_trusted(shared: &SharedParse<'_>, link: &hane_markdown::LinkParse) -> bool {
+    if shared.local_bare == LocalBareLinks::Trusted {
+        return true;
+    }
+    let is_bare = !link.uses_reference
+        && shared
+            .parsed
+            .tree
+            .node(link.node)
+            .is_some_and(|node| node.kind == NodeKind::Text);
+    if !is_bare {
+        return true;
+    }
+    match shared.local_bare {
+        LocalBareLinks::Trusted => true,
+        LocalBareLinks::Withheld => false,
+        LocalBareLinks::UnlessBracketed => {
+            let base = shared.parsed.source_range.start.0;
+            let (Some(start), Some(end)) = (
+                link.text_range.start.0.checked_sub(base),
+                link.text_range.end.0.checked_sub(base),
+            ) else {
+                return false;
+            };
+            let (Some(before), Some(after)) = (shared.source.get(..start), shared.source.get(end..))
+            else {
+                return false;
+            };
+            !(before.contains('[') && after.contains(']'))
+        }
+    }
 }
 
 /// Presents one physical line from an already-parsed tree instead of parsing
@@ -1195,8 +1265,28 @@ fn present_markdown_from_parse(
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
     // Openable links carry the parser's destination with the part of their text
     // on this physical line; the UI matches a click's source offset against it.
-    let mut links = if formal_code_block == Some(true) {
+    let links = if formal_code_block == Some(true) {
         Vec::new()
+    } else if let Some(projection) = shared.list_projection {
+        // The formal projection resolved every link against the whole
+        // document, so it alone says what is a link here and where it leads:
+        // a reference definition on another block, code, HTML or a label that
+        // starts outside this parse. A local guess never adds to or overrides
+        // it, and an empty projection is the formal "nothing to open".
+        projection
+            .links_in(range)
+            .filter_map(|link| {
+                let clipped = SourceRange {
+                    start: link.text_range.start.max(range.start),
+                    end: link.text_range.end.min(range.end),
+                };
+                (clipped.start < clipped.end).then(|| LinkTarget {
+                    source_range: clipped,
+                    destination: link.destination.clone(),
+                    uses_reference: link.uses_reference,
+                })
+            })
+            .collect::<Vec<_>>()
     } else {
         links_intersecting(&parsed.links, range)
             .iter()
@@ -1209,6 +1299,7 @@ fn present_markdown_from_parse(
                     .is_some_and(|node| node.kind == NodeKind::Text)
                     || nodes.iter().any(|id| **id == link.node)
             })
+            .filter(|link| local_bare_link_is_trusted(shared, link))
             .filter_map(|link| {
                 let clipped = SourceRange {
                     start: link.text_range.start.max(range.start),
@@ -1222,31 +1313,6 @@ fn present_markdown_from_parse(
             })
             .collect::<Vec<_>>()
     };
-    // A line parsed on its own cannot see a reference definition on another
-    // line. The formal projection resolved every link against the whole
-    // document, so restore the ones the local parse could not.
-    if formal_code_block != Some(true)
-        && let Some(projection) = shared.list_projection
-    {
-        for link in projection.links_in(range) {
-            let clipped = SourceRange {
-                start: link.text_range.start.max(range.start),
-                end: link.text_range.end.min(range.end),
-            };
-            if clipped.start < clipped.end
-                && !links
-                    .iter()
-                    .any(|existing| existing.source_range.intersects(clipped))
-            {
-                links.push(LinkTarget {
-                    source_range: clipped,
-                    destination: link.destination.clone(),
-                    uses_reference: link.uses_reference,
-                });
-            }
-        }
-        links.sort_by_key(|link| (link.source_range.start, link.source_range.end));
-    }
     // A bare URL has no Markdown Link node, so no style run came from the
     // tree. Give every target the link style unless an existing one covers it.
     let mut added_link_style = false;
@@ -2215,6 +2281,7 @@ pub fn present_polished_line(
         disclosure,
         context,
         None,
+        LocalBareLinks::Trusted,
         None,
         false,
         &[],
@@ -2279,6 +2346,7 @@ fn present_polished_line_with_fence(
     disclosure: Option<SourceRange>,
     context: LineContext,
     list_projection: Option<&ListProjection>,
+    local_bare: LocalBareLinks,
     fence_role: Option<FenceLine>,
     table_header: bool,
     table_alignments: &[TableAlignment],
@@ -2327,6 +2395,7 @@ fn present_polished_line_with_fence(
             line_height,
             disclosure,
             list_projection,
+            local_bare,
         )
     };
     block.context = context;

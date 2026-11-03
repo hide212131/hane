@@ -4985,6 +4985,11 @@ impl EditorView {
                         .iter()
                         .any(|line| line.links.iter().any(|link| link.uses_reference))
                         && !deltas.is_empty())
+                    // A bare URL between `[` and `]` may be the text of a
+                    // reference link once a definition elsewhere appears, so
+                    // such a block is presented again as well. Any other bare
+                    // URL is decided by its own block and keeps rebasing.
+                    && !(cached.has_reference_sensitive_bare_link() && !deltas.is_empty())
                     && cached.rebase(&deltas, revision)
                     // The rows describe the same text at shifted offsets, so
                     // they move with the block rather than being rebuilt.
@@ -7042,6 +7047,101 @@ mod tests {
             assert!(reused, "a warmed formal block is reused at the same revision");
             assert!(colored);
             assert_eq!(again, expected);
+        });
+    }
+
+    /// Issue #673: a URL that is the text of a reference link whose definition
+    /// is in another block is never a bare target. Before the formal index is
+    /// published the label is held back; once published only the formal
+    /// destination is a target.
+    #[gpui::test]
+    fn reference_label_url_waits_for_the_formal_destination_on_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let label = "https://label.example";
+        let destination = "https://dest.example";
+        let text = format!("[{label}][r]\n\nother\n\n[r]: {destination}\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        view.update(cx, |view, _| {
+            assert!(view.current_index().is_none(), "nothing is formal yet");
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert!(targets.is_empty(), "held back, not bare: {targets:?}");
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let (_, confidence) = bare_url_block_identity(view, "label");
+            assert_eq!(confidence, hane_markdown::Confidence::Formal);
+            let start = text.find(label).unwrap();
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(
+                targets,
+                [(
+                    destination.to_owned(),
+                    SourceRange::new(start, start + label.len())
+                )]
+            );
+        });
+    }
+
+    /// Issue #673: completing a definition in another block and deleting it
+    /// again moves the label's target from the bare URL to the formal
+    /// destination and back, with no stale target in between: a presentation
+    /// the edit may have changed is presented again, and while the formal index
+    /// is behind it holds the label back.
+    #[gpui::test]
+    fn reference_definition_edit_in_another_block_never_leaves_a_stale_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let label = "https://label.example";
+        let destination = "https://dest.example";
+        let text = format!("[{label}][r]\n\nother\n");
+        let definition = format!("\n[r]: {destination}\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let start = text.find(label).unwrap();
+        let label_range = SourceRange::new(start, start + label.len());
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.current_index().is_some());
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(targets, [(label.to_owned(), label_range)]);
+
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.dispatch(EditorCommand::Insert(&definition), cx);
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert!(
+                targets.is_empty(),
+                "no stale bare target right after the definition: {targets:?}"
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(targets, [(destination.to_owned(), label_range)]);
+
+            for _ in definition.chars() {
+                view.dispatch(EditorCommand::Backspace, cx);
+            }
+            assert_eq!(view.editor().document().full_text(), text);
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert!(
+                targets.is_empty(),
+                "no stale destination right after the definition is removed: {targets:?}"
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(targets, [(label.to_owned(), label_range)]);
         });
     }
 
