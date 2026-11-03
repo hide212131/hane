@@ -5,7 +5,7 @@
 - 実装用branch: `codex/issue-670-external-link-browser`
 - 関連: #502 / PR #503、#603 / PR #604、#614 / #615、#598、#629 / PR #630
 
-このcommitは文書だけの準備で、製品コード・テストは変更しない。ビルド、テスト、GUI再現は未実施。利用者の「両OS・両モードで開かない」は報告であり、このSHA上の再現確認ではない。バージョン、Markdown例、編集時の修飾キー使用は照会中。回答未取得はIssue本文と引継ぎに残す。
+このcommitは文書だけの準備で、製品コード・テストは変更しない。ビルド、テスト、GUI再現は未実施。利用者は初回報告を「WindowsのCtrl＋クリックのみ」に訂正し、Markdown形式のリンクでも開かないと回答した。macOS・閲覧通常クリックの不達報告は撤回されており、両OS×両モードは回帰確認の範囲として扱う。このSHA上のGUI再現確認ではない。Windowsのバージョン・配布形態、具体的なMarkdown原文・既定ブラウザは未取得。追加要望の裸URL自動リンクは #673 と別PRに分離し、本PRへ混ぜない。
 
 ## current mainで読解した既存経路
 
@@ -47,3 +47,5 @@ Windows GUIは利用者が許可した既存WindowsチャットからWindows上�
 調査時open PRとin-progress runはゼロ。#297/RF0全体の完了は不要で、受入済みのクリックとOS起動経路を使える。#598の相対リンク、#614/#615のcursor、#567のview分割など、着手時に同じ責務を変える作業を再確認する。共有checkoutの `crates/ui/src/view.rs` に既存の未commit変更があるため、受付では `/tmp/hane-url-link-intake-20261104` の独立cloneを使った。共有変更をcheckout/reset/stashで上書きしない。
 
 Jev: 公開済みfactsのみでprovider `typesafe`、要求model `jev-latest`、応答model `jev-1.14.0` を使用。新規bug契約の分離は `create_bug`（confidence 0.98）、文書準備は `prepare`（0.88）を選択。実行ログは受付チャットにあり、意味判断は実機再現や受入の証拠ではない。
+
+利用者の訂正後、Jevは公開コードの既存契約から既存起動不達と裸URL新対応を `split`（confidence 0.98）と判断。受付は #670 と #673 を別Issue/PRに分離した。
