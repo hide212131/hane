@@ -346,6 +346,36 @@ pub fn present_block_with_table_projection(
                     })
                 })
                 .collect::<Vec<_>>();
+            // The table presenter has no Markdown Link node for a bare URL, so
+            // give those targets (destination equal to the source text) the
+            // link color here.
+            for link in &missing {
+                let text_start = link.source_range.start.0.saturating_sub(line.range.start.0);
+                let text_end = link.source_range.end.0.saturating_sub(line.range.start.0);
+                if line.text.get(text_start..text_end) != Some(&*link.destination) {
+                    continue;
+                }
+                if let (Some(start), Some(end)) = (
+                    presented
+                        .source_map
+                        .source_to_visual(link.source_range.start, Bias::After),
+                    presented
+                        .source_map
+                        .source_to_visual(link.source_range.end, Bias::Before),
+                ) && start.visual_offset.0 < end.visual_offset.0
+                {
+                    presented.style_runs.push(StyleRun {
+                        visual_range: VisualRange::new(
+                            start.visual_offset.0,
+                            end.visual_offset.0,
+                        ),
+                        kind: StyleKind::Link,
+                    });
+                }
+            }
+            presented
+                .style_runs
+                .sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
             presented.links.extend(missing);
             presented
                 .links

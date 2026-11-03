@@ -598,6 +598,37 @@ fn external_link_target_carries_destination_and_absolute_text_range() {
 }
 
 #[test]
+fn bare_url_gets_link_target_and_link_style_without_a_link_node() {
+    let source = "参照 https://example.com/a。次 [d](https://d.example/)";
+    let start = 10;
+    let line = present_markdown(
+        1,
+        Revision(1),
+        SourceRange::new(start, start + source.len()),
+        source,
+        26.0,
+    );
+    assert_eq!(line.links.len(), 2);
+    let url = "https://example.com/a";
+    let url_start = start + source.find(url).expect("url");
+    let target = &line.links[0];
+    assert_eq!(&*target.destination, url);
+    assert_eq!(
+        target.source_range,
+        SourceRange::new(url_start, url_start + url.len())
+    );
+    assert!(!target.uses_reference);
+    assert!(!target.contains(SourceOffset(url_start + url.len())));
+    let visual_start = line.visual_text.find(url).expect("visual url");
+    assert!(line.style_runs.iter().any(|run| {
+        run.kind == StyleKind::Link
+            && run.visual_range.start.0 == visual_start
+            && run.visual_range.end.0 == visual_start + url.len()
+    }));
+    assert_eq!(&*line.links[1].destination, "https://d.example/");
+}
+
+#[test]
 fn heading_reference_link_keeps_destination_defined_on_another_line() {
     let source = "# [docs][ref]\n\n[ref]: https://example.com\n";
     let index = BlockIndex::build(Revision(1), source);

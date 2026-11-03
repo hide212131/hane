@@ -1200,7 +1200,15 @@ fn present_markdown_from_parse(
     } else {
         links_intersecting(&parsed.links, range)
             .iter()
-            .filter(|link| nodes.iter().any(|id| **id == link.node))
+            // A bare URL is owned by a plain `Text` node, which the block /
+            // delimiter index does not hold; its range already intersects.
+            .filter(|link| {
+                parsed
+                    .tree
+                    .node(link.node)
+                    .is_some_and(|node| node.kind == NodeKind::Text)
+                    || nodes.iter().any(|id| **id == link.node)
+            })
             .filter_map(|link| {
                 let clipped = SourceRange {
                     start: link.text_range.start.max(range.start),
@@ -1238,6 +1246,34 @@ fn present_markdown_from_parse(
             }
         }
         links.sort_by_key(|link| (link.source_range.start, link.source_range.end));
+    }
+    // A bare URL has no Markdown Link node, so no style run came from the
+    // tree. Give every target the link style unless an existing one covers it.
+    let mut added_link_style = false;
+    for link in &links {
+        let (Some(start), Some(end)) = (
+            source_map.source_to_visual(link.source_range.start, Bias::After),
+            source_map.source_to_visual(link.source_range.end, Bias::Before),
+        ) else {
+            continue;
+        };
+        let (start, end) = (start.visual_offset.0, end.visual_offset.0);
+        if start < end
+            && !style_runs.iter().any(|run| {
+                run.kind == StyleKind::Link
+                    && run.visual_range.start.0 <= start
+                    && end <= run.visual_range.end.0
+            })
+        {
+            style_runs.push(StyleRun {
+                visual_range: VisualRange::new(start, end),
+                kind: StyleKind::Link,
+            });
+            added_link_style = true;
+        }
+    }
+    if added_link_style {
+        style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
     }
     let (quote_marker_visual_ranges, quote_marker_source_ranges) =
         quote_marker_ranges(markers_on_line, &source_map.segments);
