@@ -2415,12 +2415,16 @@ impl EditorView {
         }
         let instance = pending.instance;
         let draft_store = self.draft_store.clone();
+        // Ordered at request time, not when the background task gets to run:
+        // text journalled for an edit made in the meantime carries a larger
+        // number and must survive this removal.
+        let sequence = hane_session::next_draft_snapshot_sequence();
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     draft_store
-                        .remove(&root, draft_id)
+                        .remove_ordered(&root, draft_id, sequence)
                         .map_err(|error| error.to_string())
                 })
                 .await;
@@ -17162,6 +17166,90 @@ mod tests {
         });
         assert!(markdown_files(&fx.root).is_empty(), "no note file was created");
         assert!(recovered_texts(&fx.root).is_empty());
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_edit_and_flush_while_the_discard_removal_runs_keep_the_latest_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-edit-then-flush", "approved body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+            // Edited after the approval, then the window closes before the
+            // removal reports back.
+            view.editor_mut().insert_text(" newer").unwrap();
+            view.after_input(cx);
+            view.flush_pending_drafts();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the tab is kept");
+            assert_eq!(session.editor().document().full_text(), "approved body newer");
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["approved body newer".to_owned()]
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_unedited_approved_discard_is_not_written_back_by_a_flush_and_stays_gone(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-flush-unedited", "approved body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            view.flush_pending_drafts();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_none());
+            view.flush_pending_drafts();
+        });
+        assert!(recovered_texts(&fx.root).is_empty());
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_during_an_h1_create_keeps_the_tab_when_the_draft_removal_fails_afterwards(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) =
+            draft_discard_view(cx, "discard-h1-create-remove-fails", "# Titled note\nbody");
+        fx.store.script(ScriptedRemove::Fail);
+        view.update(cx, |view, cx| {
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            discard_via_confirm(view, fx.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(fx.id).is_some(),
+                "a draft that could not be removed keeps its tab"
+            );
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("破棄できませんでした")),
+                "the failure must be visible"
+            );
+        });
 
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
