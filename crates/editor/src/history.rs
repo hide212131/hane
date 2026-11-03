@@ -1,5 +1,6 @@
 use crate::Selection;
-use hane_document::{BufferError, EditSummary, RopeBuffer, SourceRange, TextBuffer};
+use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 const GROUP_TIMEOUT: Duration = Duration::from_millis(750);
@@ -206,5 +207,193 @@ impl History {
 
     pub(crate) fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+
+    /// The same history with every state the document went through (and will
+    /// go through on redo) mapped by `plan`, so Undo and Redo land on the
+    /// rewritten form of each state. `current` is the document text now.
+    /// `None` means the history could not be followed; nothing is changed.
+    pub(crate) fn rewritten(&self, current: &str, plan: &RewritePlan) -> Option<Self> {
+        let now = RewriteState::of(current.to_owned(), plan)?;
+        let mut undo = Vec::with_capacity(self.undo.len());
+        let mut after = now.clone();
+        for entry in self.undo.iter().rev() {
+            let before = RewriteState::of(entry.reverted(&after.text)?, plan)?;
+            undo.push(entry.rebuilt(&before, &after));
+            after = before;
+        }
+        undo.reverse();
+        let mut redo = Vec::with_capacity(self.redo.len());
+        let mut before = now;
+        for entry in self.redo.iter().rev() {
+            let after = RewriteState::of(entry.applied(&before.text)?, plan)?;
+            redo.push(entry.rebuilt(&before, &after));
+            before = after;
+        }
+        redo.reverse();
+        Some(Self {
+            undo,
+            redo,
+            can_merge_last: false,
+        })
+    }
+}
+
+/// One non-overlapping source replacement of a rewrite.
+pub type TextEdit = (Range<usize>, String);
+
+/// Decides, for a whole document text, the replacements that rewrite it. It
+/// is evaluated on every state of the history, so it must depend on the text
+/// alone.
+pub type RewritePlan = dyn Fn(&str) -> Vec<TextEdit> + Send + Sync;
+
+/// Sorts `edits` and checks that they are ordered, disjoint and on character
+/// boundaries of `text`.
+pub(crate) fn checked_edits(text: &str, mut edits: Vec<TextEdit>) -> Option<Vec<TextEdit>> {
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut end = 0;
+    for (range, _) in &edits {
+        if range.start < end
+            || range.start > range.end
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            return None;
+        }
+        end = range.end;
+    }
+    Some(edits)
+}
+
+fn apply_edits(text: &str, edits: &[TextEdit]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (range, replacement) in edits {
+        out.push_str(&text[last..range.start]);
+        out.push_str(replacement);
+        last = range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Where `offset` of the old text lands in the rewritten text. An offset
+/// inside a replaced range moves to the end of its replacement.
+pub(crate) fn map_offset(edits: &[TextEdit], offset: usize) -> usize {
+    let (mut grown, mut shrunk) = (0usize, 0usize);
+    for (range, replacement) in edits {
+        if range.end <= offset {
+            grown += replacement.len();
+            shrunk += range.len();
+        } else {
+            if range.start < offset {
+                return range.start + grown - shrunk + replacement.len();
+            }
+            break;
+        }
+    }
+    offset + grown - shrunk
+}
+
+pub(crate) fn map_selection(edits: &[TextEdit], selection: Selection) -> Selection {
+    Selection {
+        anchor: SourceOffset(map_offset(edits, selection.anchor.0)),
+        active: SourceOffset(map_offset(edits, selection.active.0)),
+    }
+}
+
+/// A document text of the history, the rewrite planned for it and the result.
+#[derive(Clone)]
+struct RewriteState {
+    text: String,
+    edits: Vec<TextEdit>,
+    rewritten: String,
+}
+
+impl RewriteState {
+    fn of(text: String, plan: &RewritePlan) -> Option<Self> {
+        let edits = checked_edits(&text, plan(&text))?;
+        let rewritten = apply_edits(&text, &edits);
+        Some(Self {
+            text,
+            edits,
+            rewritten,
+        })
+    }
+}
+
+fn splice(text: &str, start: usize, len: usize, with: &str) -> Option<String> {
+    let end = start.checked_add(len)?;
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() - len + with.len());
+    out.push_str(&text[..start]);
+    out.push_str(with);
+    out.push_str(&text[end..]);
+    Some(out)
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map_or(a.len().min(b.len()), |((index, _), _)| index)
+}
+
+fn common_suffix_len(a: &str, b: &str) -> usize {
+    a.chars()
+        .rev()
+        .zip(b.chars().rev())
+        .take_while(|(x, y)| x == y)
+        .map(|(x, _)| x.len_utf8())
+        .sum()
+}
+
+impl HistoryEntry {
+    fn reverted(&self, after: &str) -> Option<String> {
+        splice(after, self.start, self.inserted.len(), &self.deleted)
+    }
+
+    fn applied(&self, before: &str) -> Option<String> {
+        splice(before, self.start, self.deleted.len(), &self.inserted)
+    }
+
+    /// This entry between the rewritten `before` and `after` states. The
+    /// entry keeps its own shape (so a typing group stays what it was) when
+    /// it still describes the rewritten change; otherwise the change is
+    /// re-derived from the two rewritten texts.
+    fn rebuilt(&self, before: &RewriteState, after: &RewriteState) -> Self {
+        let start = map_offset(&before.edits, self.start);
+        let deleted_end = start + self.deleted.len();
+        let inserted_end = start + self.inserted.len();
+        let verbatim = before.rewritten.get(start..deleted_end) == Some(self.deleted.as_str())
+            && after.rewritten.get(start..inserted_end) == Some(self.inserted.as_str())
+            && before.rewritten.get(..start) == after.rewritten.get(..start)
+            && before.rewritten.get(deleted_end..) == after.rewritten.get(inserted_end..)
+            && before.rewritten.get(..start).is_some();
+        let (start, deleted, inserted) = if verbatim {
+            (start, self.deleted.clone(), self.inserted.clone())
+        } else {
+            let prefix = common_prefix_len(&before.rewritten, &after.rewritten);
+            let suffix = common_suffix_len(
+                &before.rewritten[prefix..],
+                &after.rewritten[prefix..],
+            );
+            (
+                prefix,
+                before.rewritten[prefix..before.rewritten.len() - suffix].to_owned(),
+                after.rewritten[prefix..after.rewritten.len() - suffix].to_owned(),
+            )
+        };
+        Self {
+            start,
+            deleted,
+            inserted,
+            selection_before: map_selection(&before.edits, self.selection_before),
+            selection_after: map_selection(&after.edits, self.selection_after),
+            kind: self.kind,
+            last_edit_at: self.last_edit_at,
+        }
     }
 }

@@ -924,17 +924,28 @@ impl EditorView {
             // of this function would otherwise clear for it. Dropped
             // silently, the same as any other result that no longer
             // belongs to anything open.
+            self.settle_save_as_copies(id, instance, path, false, cx);
             self.sync_external_open_guard();
             return;
         }
+        let revision_before = self.sessions.get(id).map(DocumentSession::revision);
         let Some(outcome) = self
             .sessions
             .get_mut(id)
             .map(|session| session.finish_save(ticket, result))
         else {
+            self.settle_save_as_copies(id, instance, path, false, cx);
             self.sync_external_open_guard();
             return;
         };
+        let landed = matches!(outcome, SaveOutcome::Saved | SaveOutcome::SavedStale);
+        // Images a Save As copied for this write stay only if it landed.
+        self.settle_save_as_copies(id, instance, path, landed, cx);
+        // A Save As that renamed copied images rewrote the document (and its
+        // history) as part of this result.
+        if landed && self.sessions.get(id).map(DocumentSession::revision) != revision_before {
+            self.refresh_after_save_rewrite(id, cx);
+        }
         // Issue #411: a tab's "save and close" request must only ever close
         // on this specific write landing (`SaveOutcome::Saved`). Any other
         // outcome drops the request below rather than leaving it armed,

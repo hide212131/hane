@@ -5,8 +5,9 @@ use crate::service::{
     observe_disk,
 };
 use hane_document::{Revision, RopeBuffer, SourceOffset, TextBuffer};
-use hane_editor::{Editor, Selection};
+use hane_editor::{Editor, RewritePlan, Selection};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Stable identifier for one open document. Survives renames and reloads, so a
 /// filer or tab strip can address a session without holding a path.
@@ -353,6 +354,11 @@ pub struct DocumentSession {
     /// The path the running write targets, which differs from the session's
     /// current file for a first save or a Save As until the write lands.
     in_flight_target: Option<PathBuf>,
+    /// A rewrite the next write is to carry: that write saves the document as
+    /// the plan rewrites it, and the live document follows only if it lands.
+    armed_rewrite: Option<Arc<RewritePlan>>,
+    /// The rewrite of the running write, applied by its own result only.
+    in_flight_rewrite: Option<Arc<RewritePlan>>,
     save_sequence: u64,
     pending_save: Option<SaveIntent>,
     view: SessionViewState,
@@ -401,6 +407,8 @@ impl DocumentSession {
             autosave_generation: 0,
             in_flight: None,
             in_flight_target: None,
+            armed_rewrite: None,
+            in_flight_rewrite: None,
             save_sequence: 0,
             pending_save: None,
             view: SessionViewState::default(),
@@ -620,6 +628,25 @@ impl DocumentSession {
         SaveDecision::Write(self.start_write(path, guard))
     }
 
+    /// Arms `plan` for the next write, which will save the document as the
+    /// plan rewrites it. The live document is rewritten (history included)
+    /// only when that write lands, so a write that fails or is superseded
+    /// leaves text, selection, history and dirty state as they were. Refused
+    /// while a write is running: such a request would be queued and could not
+    /// carry the plan.
+    pub fn arm_save_rewrite(&mut self, plan: Arc<RewritePlan>) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        self.armed_rewrite = Some(plan);
+        true
+    }
+
+    /// Drops an armed rewrite that no write took. `true` means it was unused.
+    pub fn disarm_save_rewrite(&mut self) -> bool {
+        self.armed_rewrite.take().is_some()
+    }
+
     /// Takes the save slot and snapshots the document for one write.
     fn start_write(&mut self, path: PathBuf, guard: OverwriteGuard) -> SaveJob {
         self.save_sequence = self.save_sequence.wrapping_add(1);
@@ -630,9 +657,16 @@ impl DocumentSession {
         };
         self.in_flight = Some(ticket);
         self.in_flight_target = Some(path.clone());
+        let armed = self.armed_rewrite.take();
+        let rewritten = armed
+            .as_ref()
+            .and_then(|plan| self.editor.rewritten_document(plan));
+        // A plan that cannot be applied is not carried at all, so the saved
+        // text and the live document never disagree about it.
+        self.in_flight_rewrite = armed.filter(|_| rewritten.is_some());
         SaveJob {
             path,
-            document: self.editor.document().clone(),
+            document: rewritten.unwrap_or_else(|| self.editor.document().clone()),
             guard,
             ticket,
         }
@@ -660,6 +694,7 @@ impl DocumentSession {
         }
         self.in_flight = None;
         self.in_flight_target = None;
+        let rewrite = self.in_flight_rewrite.take();
         match result {
             Ok(saved) => {
                 self.file.set_identity(saved.identity, saved.stamp);
@@ -671,8 +706,12 @@ impl DocumentSession {
                     self.external = ExternalState::InSync;
                     self.live_approval = None;
                 }
-                if self.revision() == ticket.revision {
-                    self.saved_revision = ticket.revision;
+                let unchanged = self.revision() == ticket.revision;
+                // The bytes on disk are the rewritten text; the live document
+                // (with any edit made meanwhile) and its history follow now.
+                let followed = rewrite.is_none_or(|plan| self.editor.apply_rewrite(&plan).is_ok());
+                if unchanged && followed {
+                    self.saved_revision = self.revision();
                     SaveOutcome::Saved
                 } else {
                     // The snapshot is on disk but the document moved on; the

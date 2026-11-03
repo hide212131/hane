@@ -244,6 +244,34 @@ pub(super) struct ImagePasteState {
     /// older job can neither overwrite nor clear a newer job's message.
     latest_job: u64,
     pending_save: Option<PendingImagePaste>,
+    /// Copies a running Save As created, by the document that asked for it.
+    /// Dropped (and the copies removed unless something refers to them) when
+    /// that exact write does not land.
+    save_as_copies: std::collections::HashMap<SessionId, SaveAsCopies>,
+}
+
+/// The images a running Save As created in the target directory.
+struct SaveAsCopies {
+    instance: DocumentInstance,
+    path: PathBuf,
+    created: Vec<PathBuf>,
+}
+
+/// The rewrite that points the references of renamed images at their new
+/// names. It reads the text alone, so the same plan serves the saved text,
+/// the live document and every state of its edit history.
+fn rename_plan(renamed: Vec<(String, String)>) -> Arc<hane_editor::RewritePlan> {
+    Arc::new(move |text: &str| {
+        clip::generated_references(text)
+            .into_iter()
+            .filter_map(|reference| {
+                renamed
+                    .iter()
+                    .find(|(old, _)| *old == reference.file_name)
+                    .map(|(_, new)| (reference.name_range, new.clone()))
+            })
+            .collect()
+    })
 }
 
 /// The saved file and size of a finished background job.
@@ -630,7 +658,7 @@ impl EditorView {
     ) {
         let Some((ticket, names)) = self.plan_generated_image_copy(id, &path, close_after_save)
         else {
-            self.write_save_as(id, path, close_after_save, cx);
+            self.write_save_as(id, path, close_after_save, None, cx);
             return;
         };
         let from = ticket.from.clone();
@@ -682,19 +710,109 @@ impl EditorView {
         ))
     }
 
+    /// Starts the Save As write. With a `rewrite`, that one write saves the
+    /// text as rewritten and the document follows only when it lands. `false`
+    /// means no write was started and nothing was changed.
     fn write_save_as(
         &mut self,
         id: SessionId,
         path: PathBuf,
         close_after_save: bool,
+        rewrite: Option<Arc<hane_editor::RewritePlan>>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        let carries_rewrite = rewrite.is_some();
+        if let Some(plan) = rewrite {
+            let armed = self
+                .sessions
+                .get_mut(id)
+                .is_some_and(|session| session.arm_save_rewrite(plan));
+            if !armed {
+                return false;
+            }
+        }
         if close_after_save && let Some(instance) = self.document_instance(id) {
             // Armed against the instance as of this specific write, so only
             // this user-chosen write's own landing can close the tab.
             self.tab_close_after_save.insert(id, instance);
         }
         self.save_session(id, SaveIntent::To(path), cx);
+        if carries_rewrite
+            && self
+                .sessions
+                .get_mut(id)
+                .is_some_and(DocumentSession::disarm_save_rewrite)
+        {
+            // No write took the rewrite (a folder move blocked the save).
+            self.tab_close_after_save.remove(&id);
+            return false;
+        }
+        true
+    }
+
+    /// Whether a document that is saved in, or being saved to, `directory`
+    /// refers to the generated image `name`.
+    fn generated_copy_in_use(&self, directory: &Path, name: &str) -> bool {
+        let same_directory = |other: &Path| {
+            other == directory
+                || matches!(
+                    (other.canonicalize(), directory.canonicalize()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        };
+        self.sessions.sessions().any(|session| {
+            (session.file().directory().is_some_and(same_directory)
+                || session.writes_under_folder(directory))
+                && clip::generated_references(&session.editor().document().full_text())
+                    .iter()
+                    .any(|reference| reference.file_name == name)
+        })
+    }
+
+    /// Removes copies a Save As created and nothing refers to. A copy another
+    /// save has since published (reusing the identical file) stays.
+    fn discard_unreferenced_copies(
+        &self,
+        directory: &Path,
+        created: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        for path in created {
+            let in_use = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| self.generated_copy_in_use(directory, name));
+            if !in_use {
+                self.discard_unpublished_image(path, cx);
+            }
+        }
+    }
+
+    /// Called with the result of every write of `id`. The copies a Save As
+    /// created are kept only when that exact write (document instance and
+    /// target) landed; otherwise they were never published.
+    pub(super) fn settle_save_as_copies(
+        &mut self,
+        id: SessionId,
+        instance: Option<DocumentInstance>,
+        path: &Path,
+        landed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let owned = self
+            .image_paste
+            .save_as_copies
+            .get(&id)
+            .is_some_and(|copies| Some(copies.instance) == instance && copies.path == path);
+        if !owned {
+            return;
+        }
+        let Some(copies) = self.image_paste.save_as_copies.remove(&id) else {
+            return;
+        };
+        if !landed && let Some(directory) = copies.path.parent() {
+            self.discard_unreferenced_copies(directory, copies.created, cx);
+        }
     }
 
     fn finish_save_as_copy(
@@ -724,10 +842,9 @@ impl EditorView {
                 return;
             }
         };
+        let destination = ticket.path.parent().map(Path::to_path_buf).unwrap_or_default();
         let abandon = |view: &mut Self, message: &str, cx: &mut Context<Self>| {
-            for path in &copied.created {
-                view.discard_unpublished_image(path.clone(), cx);
-            }
+            view.discard_unreferenced_copies(&destination, copied.created.clone(), cx);
             if same_instance {
                 view.status = Some(message.to_owned());
             }
@@ -741,55 +858,58 @@ impl EditorView {
             );
             return;
         }
-        if !copied.renamed.is_empty() && !self.rewrite_copied_references(&ticket, &copied.renamed, cx)
+        let copies_made = !copied.created.is_empty() || !copied.renamed.is_empty();
+        // A write already running would queue this one behind it, and the
+        // queued request can carry neither the rewrite nor the ownership of
+        // the copies. Nothing is lost by saving again once it has landed.
+        if copies_made
+            && self
+                .sessions
+                .get(ticket.id)
+                .is_some_and(DocumentSession::save_in_flight)
         {
             abandon(
                 self,
-                "画像の参照を更新できなかったため、保存しませんでした",
+                "別の保存が実行中のため、保存を中止しました。完了後にもう一度保存してください",
                 cx,
             );
             return;
         }
-        self.write_save_as(ticket.id, ticket.path, ticket.close_after_save, cx);
+        // The text is not edited here: the write saves it with the references
+        // pointed at the copies, and the document (history included) follows
+        // when that write lands.
+        let rewrite = (!copied.renamed.is_empty()).then(|| rename_plan(copied.renamed.clone()));
+        let started = self.write_save_as(
+            ticket.id,
+            ticket.path.clone(),
+            ticket.close_after_save,
+            rewrite,
+            cx,
+        );
+        if !started {
+            abandon(self, "保存を開始できなかったため、保存しませんでした", cx);
+            return;
+        }
+        if !copied.created.is_empty() {
+            self.image_paste.save_as_copies.insert(
+                ticket.id,
+                SaveAsCopies {
+                    instance: ticket.instance,
+                    path: ticket.path,
+                    created: copied.created.clone(),
+                },
+            );
+        }
     }
 
-    /// Points the references whose image had to be renamed in the new
-    /// directory at the new names, as recorded replacements. Only the active
-    /// document can be edited here; `false` means nothing may be saved.
-    fn rewrite_copied_references(
-        &mut self,
-        ticket: &SaveAsCopyTicket,
-        renamed: &[(String, String)],
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.sessions.active_id() != ticket.id || !self.body_editable() {
-            return false;
+    /// The document of `id` was rewritten by the Save As write that just
+    /// landed; a view of it shows the new text.
+    pub(super) fn refresh_after_save_rewrite(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.sessions.active_id() == id {
+            self.after_input(cx);
         }
-        let text = self.editor().document().full_text();
-        let edits: Vec<(Range<usize>, String)> = clip::generated_references(&text)
-            .into_iter()
-            .filter_map(|reference| {
-                renamed
-                    .iter()
-                    .find(|(old, _)| *old == reference.file_name)
-                    .map(|(_, new)| (reference.name_range, new.clone()))
-            })
-            .collect();
-        // From the end of the document so earlier ranges stay valid.
-        for (range, name) in edits.into_iter().rev() {
-            let caret = Selection::caret(SourceOffset(range.start + name.len()));
-            let replaced = self.editor_mut().replace_range_recorded(
-                SourceRange::new(range.start, range.end),
-                &name,
-                caret,
-            );
-            if replaced.is_err() {
-                return false;
-            }
-        }
-        self.after_input(cx);
-        true
     }
+
 }
 
 #[cfg(test)]
@@ -1319,6 +1439,225 @@ mod tests {
         assert!(!to.join("note.md").exists());
         assert!(!to.join("images").join(name).exists(), "the new copy is removed");
         assert!(from.join("images").join(name).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    const NAME_ONE: &str = "hane-paste-1-0123abcd.png";
+    const NAME_TWO: &str = "hane-paste-2-4567ef01.png";
+
+    fn edit_view(view: &TestView, cx: &mut TestCx, command: EditorCommand<'static>) {
+        view.update(cx, |view, cx| {
+            view.editor_mut().dispatch(command).unwrap();
+            view.after_input(cx);
+        });
+    }
+
+    /// Every reference of `text` names an image of `directory` holding the
+    /// bytes of the image that reference started as.
+    fn assert_references_resolve(text: &str, directory: &Path, expected: &[&[u8]]) {
+        let names: Vec<String> = clip::generated_references(text)
+            .into_iter()
+            .map(|reference| reference.file_name)
+            .collect();
+        assert_eq!(names.len(), expected.len(), "{text:?}");
+        for (name, bytes) in names.iter().zip(expected) {
+            assert_eq!(
+                std::fs::read(directory.join("images").join(name)).unwrap(),
+                *bytes,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_failed_body_write_after_the_copy_keeps_the_document_and_removes_the_copies(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-write-fail");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"mine").unwrap();
+        std::fs::write(to.join("images").join(NAME_ONE), b"someone else's").unwrap();
+        // The copy succeeds; writing the body onto a directory cannot.
+        std::fs::create_dir(to.join("note.md")).unwrap();
+        let body = format!("![画像](images/{NAME_ONE})\n");
+        let (view, cx) = open_file_view(cx, &from, &body);
+        select(&view, cx, 0, 0);
+        edit_view(&view, cx, EditorCommand::Insert("x"));
+        let edited = text_of(&view, cx);
+        let selection = view.read_with(cx, |view, _| view.editor().selection());
+        let (revision, instance) = view.read_with(cx, |view, _| {
+            (
+                view.sessions.active().revision(),
+                view.document_instance(view.sessions.active_id()),
+            )
+        });
+        save_as(&view, cx, to.join("note.md"));
+        assert_eq!(text_of(&view, cx), edited);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), selection);
+            assert_eq!(view.sessions.active().revision(), revision);
+            assert_eq!(view.document_instance(view.sessions.active_id()), instance);
+            assert!(view.sessions.active().is_dirty());
+            assert!(view.sessions.active().path().is_some_and(|path| path.starts_with(&from)));
+        });
+        assert_eq!(
+            pasted_files(&to),
+            vec![to.join("images").join(NAME_ONE)],
+            "the copy nothing refers to is removed"
+        );
+        assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"mine");
+        // The history is still the user's own.
+        edit_view(&view, cx, EditorCommand::Undo);
+        assert_eq!(text_of(&view, cx), body);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn conflicting_images_stay_correct_through_undo_and_redo_after_save_as(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-history");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"one").unwrap();
+        std::fs::write(from.join("images").join(NAME_TWO), b"two").unwrap();
+        std::fs::write(to.join("images").join(NAME_ONE), b"other-1").unwrap();
+        std::fs::write(to.join("images").join(NAME_TWO), b"other-2").unwrap();
+        let body = format!(
+            "前\n\n![画像](images/{NAME_ONE})\n\n![画像](images/{NAME_TWO})\n\n後\n"
+        );
+        let (view, cx) = open_file_view(cx, &from, &body);
+        select(&view, cx, 0, 0);
+        edit_view(&view, cx, EditorCommand::Insert("あ"));
+        let end = body.len() + "あ".len();
+        select(&view, cx, end, end);
+        edit_view(&view, cx, EditorCommand::Insert("い"));
+        let expected: [&[u8]; 2] = [b"one", b"two"];
+
+        save_as(&view, cx, to.join("note.md"));
+
+        let saved = std::fs::read_to_string(to.join("note.md")).unwrap();
+        assert_eq!(text_of(&view, cx), saved);
+        assert!(saved.starts_with('あ') && saved.ends_with("い"));
+        assert_references_resolve(&saved, &to, &expected);
+        assert!(!saved.contains(NAME_ONE) && !saved.contains(NAME_TWO));
+        assert!(!view.read_with(cx, |view, _| view.sessions.active().is_dirty()));
+        let mut states = vec![saved];
+        for _ in 0..2 {
+            edit_view(&view, cx, EditorCommand::Undo);
+            states.push(text_of(&view, cx));
+        }
+        for _ in 0..2 {
+            edit_view(&view, cx, EditorCommand::Redo);
+            states.push(text_of(&view, cx));
+        }
+        assert!(view.read_with(cx, |view, _| !view.editor().can_redo()));
+        assert!(states[1].ends_with("後\n") && states[2].starts_with('前'));
+        for state in &states {
+            assert_references_resolve(state, &to, &expected);
+        }
+        assert_eq!(states[0], states[4]);
+        assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"other-1");
+        assert_eq!(std::fs::read(to.join("images").join(NAME_TWO)).unwrap(), b"other-2");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"one");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_TWO)).unwrap(), b"two");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_background_tab_save_as_rewrites_only_its_own_document(cx: &mut gpui::TestAppContext) {
+        let root = temp_root("save-as-background");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"mine").unwrap();
+        std::fs::write(to.join("images").join(NAME_ONE), b"someone else's").unwrap();
+        let (view, cx) = open_file_view(cx, &from, &format!("![画像](images/{NAME_ONE})\n"));
+        let background = view.read_with(cx, |view, _| view.sessions.active_id());
+        view.update(cx, |view, cx| {
+            view.sessions.open_untitled("other\n", "Other");
+            view.on_document_replaced();
+            cx.notify();
+        });
+        select(&view, cx, 2, 2);
+        let selection = view.read_with(cx, |view, _| view.editor().selection());
+
+        view.update(cx, |view, cx| {
+            view.save_as_to(background, to.join("note.md"), false, cx);
+        });
+        cx.run_until_parked();
+
+        let saved = std::fs::read_to_string(to.join("note.md")).unwrap();
+        assert_references_resolve(&saved, &to, &[b"mine"]);
+        view.read_with(cx, |view, _| {
+            let document = view.sessions.get(background).unwrap();
+            assert_eq!(document.editor().document().full_text(), saved);
+            assert!(!document.is_dirty());
+            assert_ne!(view.sessions.active_id(), background);
+            assert_eq!(view.editor().document().full_text(), "other\n");
+            assert_eq!(view.editor().selection(), selection);
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_save_already_running_abandons_the_save_as_and_its_copies(cx: &mut gpui::TestAppContext) {
+        let root = temp_root("save-as-busy");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"mine").unwrap();
+        std::fs::write(to.join("images").join(NAME_ONE), b"someone else's").unwrap();
+        let body = format!("![画像](images/{NAME_ONE})\n");
+        let (view, cx) = open_file_view(cx, &from, &body);
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            // This write is never completed, so it keeps the save slot.
+            let decision = view
+                .sessions
+                .active_mut()
+                .request_save(hane_session::SaveIntent::Current);
+            assert!(matches!(decision, hane_session::SaveDecision::Write(_)));
+            view.save_as_to(id, to.join("note.md"), false, cx);
+        });
+        cx.run_until_parked();
+        assert!(!to.join("note.md").exists());
+        assert_eq!(pasted_files(&to), vec![to.join("images").join(NAME_ONE)]);
+        assert_eq!(text_of(&view, cx), body);
+        assert!(status_of(&view, cx).unwrap().contains("別の保存"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_abandoned_save_as_keeps_a_copy_another_document_refers_to(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-shared-copy");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"png").unwrap();
+        std::fs::write(to.join("other.md"), format!("![x](images/{NAME_ONE})\n")).unwrap();
+        let other = OsFileService.load(&to.join("other.md")).unwrap();
+        let (view, cx) = open_file_view(cx, &from, &format!("![画像](images/{NAME_ONE})\n"));
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.save_as_to(id, to.join("note.md"), false, cx);
+            // The document changes during the copy, so the Save As is
+            // abandoned; the other document in the target directory is open.
+            view.editor_mut().insert_text("x").unwrap();
+            view.after_input(cx);
+            view.sessions.apply_open(None, other);
+            view.on_document_replaced();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!to.join("note.md").exists());
+        assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"png");
         std::fs::remove_dir_all(root).unwrap();
     }
 

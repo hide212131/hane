@@ -44,7 +44,8 @@ pub use selection::Selection;
 
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_metrics::RollingWindow;
-use history::{EditKind, History};
+pub use history::{RewritePlan, TextEdit};
+use history::{EditKind, History, checked_edits, map_selection};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -346,6 +347,48 @@ impl Editor {
         );
         self.record_model_update(received, InputMeasurementKind::Command);
         Ok(summary)
+    }
+
+    /// A copy of the current document with `plan` applied, without touching
+    /// the editor. `None` when the plan is not a valid set of replacements.
+    pub fn rewritten_document(&self, plan: &RewritePlan) -> Option<RopeBuffer> {
+        let text = self.document.full_text();
+        let edits = checked_edits(&text, plan(&text))?;
+        let mut document = self.document.clone();
+        for (range, replacement) in edits.iter().rev() {
+            document
+                .edit(SourceRange::new(range.start, range.end), replacement)
+                .ok()?;
+        }
+        Some(document)
+    }
+
+    /// Rewrites the document by `plan` and carries the whole edit history
+    /// along: every state Undo and Redo reach is the rewritten form of the
+    /// state it was, with its selections moved accordingly, so no step goes
+    /// back to the text as it was before the rewrite. The rewrite is not an
+    /// edit of its own and adds no history entry. The editor stays unaware
+    /// of what the plan means. An invalid plan changes nothing.
+    pub fn apply_rewrite(&mut self, plan: &RewritePlan) -> Result<(), BufferError> {
+        self.history.break_group();
+        self.commit_composition();
+        let text = self.document.full_text();
+        let Some(edits) = checked_edits(&text, plan(&text)) else {
+            return Ok(());
+        };
+        let history = self.history.rewritten(&text, plan);
+        let selection = map_selection(&edits, self.selection);
+        for (range, replacement) in edits.iter().rev() {
+            self.document
+                .edit(SourceRange::new(range.start, range.end), replacement)?;
+        }
+        // A history that cannot be followed (it never is for one this editor
+        // recorded) is dropped rather than left pointing at the old text.
+        self.history = history.unwrap_or_default();
+        self.selection = selection;
+        self.preferred_grapheme_column = None;
+        self.preferred_visual_x = None;
+        Ok(())
     }
 
     pub(crate) fn record_model_update(&mut self, received_at: Instant, kind: InputMeasurementKind) {
