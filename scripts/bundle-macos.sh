@@ -1,6 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 
+# The standard (no argument) path builds the product package. The explicit
+# validation option builds the isolated update validation candidate
+# (Issue #510): both binaries carry the validation-feed feature and the bundle
+# uses the fixed validation identifier that verify_validation_macos_zip accepts.
+bundle_id="io.github.hide212131.hane"
+validation_feed=0
+case "$#:${1:-}" in
+  0:) ;;
+  1:--validation-feed)
+    validation_feed=1
+    bundle_id="io.github.hide212131.hane.validation"
+    ;;
+  *)
+    echo "Usage: $0 [--validation-feed]" >&2
+    exit 2
+    ;;
+esac
+
 workspace="$(cd "$(dirname "$0")/.." && pwd)"
 icon_source="$workspace/assets/app-icon.svg"
 target_dir="${CARGO_TARGET_DIR:-target}"
@@ -59,7 +77,12 @@ fi
 updater_protocol=1
 # hane-updater/build.rs embeds the same commit; both binaries are built here.
 export HANE_SOURCE_SHA="$source_sha"
-cargo build --release --locked -p hane -p hane-updater
+if [[ "$validation_feed" == 1 ]]; then
+  cargo build --release --locked -p hane -p hane-updater \
+    --features hane/validation-feed,hane-updater/validation-feed
+else
+  cargo build --release --locked -p hane -p hane-updater
+fi
 
 # The helper must report the identity the bundle claims. Release builds repeat
 # this check on the extracted ZIP.
@@ -159,6 +182,9 @@ PLIST
 
 # Update identity read by hane-update (crates/update/src/macos_apply.rs).
 update_plist="$bundle/Contents/Info.plist"
+if [[ "$validation_feed" == 1 ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$update_plist"
+fi
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $version" "$update_plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $version" "$update_plist"
 /usr/libexec/PlistBuddy -c "Add :HaneSourceCommit string $source_sha" "$update_plist"
@@ -236,7 +262,7 @@ if [[ "$(plist_value CFBundleDocumentTypes:0:LSHandlerRank)" != "Alternate" ]]; 
 fi
 
 for pair in \
-  "CFBundleIdentifier:io.github.hide212131.hane" \
+  "CFBundleIdentifier:$bundle_id" \
   "CFBundleShortVersionString:$version" \
   "CFBundleVersion:$version" \
   "HaneSourceCommit:$source_sha" \
@@ -295,7 +321,10 @@ fi
 # copy (a byte-identical copy of the installed helper) keeps.
 for binary in "$bundle/Contents/MacOS/hane" "$bundle/Contents/Helpers/hane-updater"; do
   /usr/bin/codesign --verify --strict "$binary"
-  if ! /usr/bin/codesign -dvvv "$binary" 2>&1 | grep -q '^CDHash='; then
+  # Read the whole output before matching: `grep -q` closing the pipe early
+  # makes codesign die with SIGPIPE, which pipefail reports as a failure.
+  signature_details="$(/usr/bin/codesign -dvvv "$binary" 2>&1)"
+  if ! grep -q '^CDHash=' <<<"$signature_details"; then
     echo "$binary must carry a code directory hash for the Keychain access list" >&2
     exit 1
   fi

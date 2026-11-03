@@ -36,21 +36,30 @@ NOW = dt.datetime(2026, 10, 19, tzinfo=dt.timezone.utc)
 LATER = NOW + dt.timedelta(days=1)
 
 
-def identity(version=VERSION, target=rc.WINDOWS_TARGET, source=SHA, protocol=1) -> bytes:
+def identity(version=VERSION, target=rc.WINDOWS_TARGET, source=SHA, protocol=1, profile="") -> bytes:
+    field = f";profile={profile}" if profile else ""
     return (f"hane-updater-identity-v1;version={version};target={target};"
-            f"source={source};protocol={protocol};end").encode()
+            f"source={source};protocol={protocol}{field};end").encode()
 
 
-def pe(version=VERSION, source=SHA, target=rc.WINDOWS_TARGET) -> bytes:
-    return b"MZ\x90\x00" + b"\0" * 32 + identity(version, target, source) + b"\0" * 32
+def pe(version=VERSION, source=SHA, target=rc.WINDOWS_TARGET, profile="") -> bytes:
+    return b"MZ\x90\x00" + b"\0" * 32 + identity(version, target, source, profile=profile) + b"\0" * 32
 
 
-def macho(version=VERSION, source=SHA, signed=True) -> bytes:
-    """A 64-bit Mach-O header with (by default) an LC_CODE_SIGNATURE load command."""
+def app_pe(version=VERSION, profile="") -> bytes:
+    """A Windows app image; only the validation-feed build embeds a profile record."""
+    record = f"hane-app-profile-v1;version={version};profile={profile};end".encode() if profile else b""
+    return b"MZ\x90\x00" + b"\0" * 32 + record + b"\0" * 32
+
+
+def macho(version=VERSION, source=SHA, signed=True, profile="", app_profile="") -> bytes:
+    """A 64-bit Mach-O header with (by default) an LC_CODE_SIGNATURE load command.
+    `profile` sets the helper identity profile; `app_profile` embeds the app profile record."""
+    record = f"hane-app-profile-v1;version={version};profile={app_profile};end".encode() if app_profile else b""
     command = (0x1D).to_bytes(4, "little") + (16).to_bytes(4, "little") + b"\0" * 8 if signed else b""
     header = (b"\xcf\xfa\xed\xfe" + b"\0" * 12 + (1 if signed else 0).to_bytes(4, "little")
               + len(command).to_bytes(4, "little") + b"\0" * 8)
-    return header + command + identity(version, rc.MACOS_TARGET, source) + b"\0" * 32
+    return header + command + identity(version, rc.MACOS_TARGET, source, profile=profile) + record + b"\0" * 32
 
 
 def manifest(version=VERSION, dll_version=None, executable="hane.exe") -> str:
@@ -103,11 +112,13 @@ class Fixture:
         return rc.make_signature_file(domain, raw, key_id, self.seed)
 
     def windows_files(self, *, version=VERSION, source=SHA, dll_version=None, manifest_version=None,
-                      signed_msix=True, helper=None) -> dict:
+                      signed_msix=True, helper=None, profile="", app_profile=None) -> dict:
+        """`profile` labels both binaries; `app_profile` overrides the app alone."""
         dll_version = dll_version or version
+        app_profile = profile if app_profile is None else app_profile
         return {
-            "hane.exe": pe(version, source),
-            "hane-updater.exe": helper if helper is not None else pe(version, source),
+            "hane.exe": app_pe(version, app_profile),
+            "hane-updater.exe": helper if helper is not None else pe(version, source, profile=profile),
             "Hane.ShellIntegration.msix": msix(manifest_version or version, dll_version, signed_msix),
             "Hane.ShellIntegration.cer": b"-----CERT-----",
             "Trust-HaneShellCertificate.ps1": b"# trust",
@@ -142,7 +153,7 @@ class Fixture:
     def macos_zip(self, path: Path, *, version=VERSION, source=SHA, plist_updates=None, drop=(), extra=(),
                   helper=None, bundle_id=rc.MACOS_BUNDLE_ID, code_resources=True, tweak=None, tamper=None,
                   inventory=True, signer=None, app_binary=None, legacy_inventory=False,
-                  sidecar_version=None, sidecar_source=None) -> Path:
+                  sidecar_version=None, sidecar_source=None, profile="", app_profile=None) -> Path:
         """Layout 2 fixture. The app is sealed (CodeResources present, Mach-Os signed); this is
         structural only and says nothing about a real Apple signature. The Ed25519 inventory is
         the sidecar `Hane.app.update/<version>-<source>/`, never inside the app."""
@@ -161,8 +172,11 @@ class Fixture:
         app = rc.MACOS_APP
         entries = {
             f"{app}/Contents/Info.plist": (plistlib.dumps(info), 0o644),
-            f"{app}/Contents/MacOS/hane": (app_binary if app_binary is not None else macho(version, source), 0o755),
-            f"{app}/Contents/Helpers/hane-updater": (helper if helper is not None else macho(version, source), 0o755),
+            f"{app}/Contents/MacOS/hane": (
+                app_binary if app_binary is not None else macho(
+                    version, source, app_profile=profile if app_profile is None else app_profile), 0o755),
+            f"{app}/Contents/Helpers/hane-updater": (
+                helper if helper is not None else macho(version, source, profile=profile), 0o755),
             f"{app}/Contents/Resources/Hane.icns": (b"icns", 0o644),
             f"{rc.MACOS_ROOT}/README.md": (b"readme", 0o644),
         }
@@ -521,6 +535,141 @@ class MacosZipTests(TempCase):
         # The seal is inventoried like every other file of the app.
         self.assertIn(rc.MACOS_CODE_RESOURCES_REL, [f["path"] for f in document["files"]])
         self.assertEqual(document["layout_revision"], 2)
+
+    def test_validation_macos_zip_requires_the_validation_profile_on_app_and_helper(self):
+        validation = rc.PROFILE_VALIDATION_FEED
+        bundle = rc.VALIDATION_MACOS_BUNDLE_ID
+        kwargs = dict(version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        cases = {
+            "std-app": dict(profile=validation, app_profile=""),
+            "std-helper": dict(profile="", app_profile=validation),
+            "both-std": dict(profile="", app_profile=""),
+        }
+        for name, options in cases.items():
+            path = self.fx.macos_zip(self.tmp / f"{name}.zip", bundle_id=bundle, **options)
+            with self.subTest(name), self.assertRaisesRegex(ReleaseError, "build profile"):
+                rc.verify_validation_macos_zip(path, **kwargs)
+        both = self.fx.macos_zip(self.tmp / "both-validation.zip", bundle_id=bundle, profile=validation)
+        facts = rc.verify_validation_macos_zip(both, **kwargs)
+        self.assertEqual(facts["bundle_id"], bundle)
+
+    def test_product_macos_zip_requires_the_standard_profile_on_app_and_helper(self):
+        validation = rc.PROFILE_VALIDATION_FEED
+        kwargs = dict(version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        for name, options in {"app": dict(profile="", app_profile=validation),
+                              "helper": dict(profile=validation, app_profile="")}.items():
+            path = self.fx.macos_zip(self.tmp / f"product-{name}.zip", **options)
+            with self.subTest(name), self.assertRaisesRegex(ReleaseError, "build profile"):
+                rc.verify_macos_zip(path, **kwargs)
+        rc.verify_macos_zip(self.fx.macos_zip(self.tmp / "product-ok.zip"), **kwargs)
+
+    def test_the_validation_identity_is_accepted_only_by_the_validation_verifier(self):
+        validation = self.fx.macos_zip(self.tmp / "validation.zip", bundle_id=rc.VALIDATION_MACOS_BUNDLE_ID,
+                                       profile=rc.PROFILE_VALIDATION_FEED)
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            self.verify(validation)
+        facts = rc.verify_validation_macos_zip(validation, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        self.assertEqual(facts["bundle_id"], rc.VALIDATION_MACOS_BUNDLE_ID)
+        product = self.fx.macos_zip(self.tmp / "product.zip")
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            rc.verify_validation_macos_zip(product, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        other = self.fx.macos_zip(self.tmp / "other-id.zip", bundle_id="com.example.fake")
+        with self.assertRaisesRegex(ReleaseError, "CFBundleIdentifier"):
+            rc.verify_validation_macos_zip(other, version=VERSION, source_sha=SHA, trust=self.fx.trust)
+
+    def test_catalog_build_and_release_verify_share_the_explicit_validation_selection(self):
+        validation = self.fx.macos_zip(self.tmp / "validation.zip", bundle_id=rc.VALIDATION_MACOS_BUNDLE_ID,
+                                       profile=rc.PROFILE_VALIDATION_FEED)
+        product = self.fx.macos_zip(self.tmp / "product.zip")
+        windows = self.fx.windows_zip(self.tmp / "w.zip")
+        validation_windows = self.fx.windows_zip(self.tmp / "vw.zip", profile=rc.PROFILE_VALIDATION_FEED)
+
+        def assets(name: str, macos: Path, windows: Path = windows) -> Path:
+            directory = self.tmp / name
+            directory.mkdir()
+            (directory / rc.WINDOWS_ASSET).write_bytes(windows.read_bytes())
+            (directory / rc.MACOS_ASSET).write_bytes(macos.read_bytes())
+            return directory
+
+        def seal(directory: Path, **kwargs) -> None:
+            raw = rc.build_catalog(directory, tag=TAG, source_sha=SHA, sequence=1, trust=self.fx.trust,
+                                   published=NOW, **kwargs)
+            (directory / rc.CATALOG_NAME).write_bytes(raw)
+            (directory / rc.SIGNATURE_NAME).write_bytes(self.fx.sign(rc.CATALOG_DOMAIN, raw))
+
+        # The standard path accepts production and refuses the validation identity.
+        production_dir = assets("production", product)
+        seal(production_dir)
+        self.fx.verify(production_dir)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            self.fx.verify(production_dir, validation_feed=True)
+        validation_dir = assets("validation", validation, validation_windows)
+        with self.assertRaisesRegex(ReleaseError, "build profile|CFBundleIdentifier"):
+            seal(validation_dir)
+
+        # The explicit validation path accepts it in both build and verify, and only there.
+        seal(validation_dir, validation_feed=True)
+        catalog = self.fx.verify(validation_dir, validation_feed=True)
+        self.assertEqual(catalog["targets"][rc.MACOS_TARGET]["bundle_id"], rc.VALIDATION_MACOS_BUNDLE_ID)
+        with self.assertRaisesRegex(ReleaseError, "build profile|CFBundleIdentifier"):
+            self.fx.verify(validation_dir)
+
+        # A standard Windows ZIP must not pass as the validation package, even
+        # next to a valid validation macOS bundle (Issue #510).
+        mixed_dir = assets("mixed", validation)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            seal(mixed_dir, validation_feed=True)
+
+    def test_the_windows_build_profile_is_identified_by_the_helper_identity(self):
+        standard = self.fx.windows_zip(self.tmp / "standard.zip")
+        validation = self.fx.windows_zip(self.tmp / "validation-w.zip", profile=rc.PROFILE_VALIDATION_FEED)
+        kwargs = dict(version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        # Production accepts the standard ZIP and refuses the validation one.
+        rc.verify_windows_zip(standard, **kwargs)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(validation, **kwargs)
+        # The validation catalog accepts only the validation-feed ZIP.
+        rc.verify_windows_zip(validation, validation_feed=True, **kwargs)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(standard, validation_feed=True, **kwargs)
+        # The recorded profile matches what the identity record carries.
+        self.assertEqual(rc.read_identity_record(pe(profile=rc.PROFILE_VALIDATION_FEED))[4],
+                         rc.PROFILE_VALIDATION_FEED)
+        self.assertEqual(rc.read_identity_record(pe())[4], rc.PROFILE_STANDARD)
+        # An unknown profile is never accepted as the validation profile.
+        other = self.fx.windows_zip(self.tmp / "other-w.zip", profile="other-feed")
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(other, validation_feed=True, **kwargs)
+
+    def test_a_mixed_app_and_helper_profile_is_rejected_in_both_directions(self):
+        kwargs = dict(version=VERSION, source_sha=SHA, trust=self.fx.trust)
+        validation = rc.PROFILE_VALIDATION_FEED
+        # Standard app + validation updater.
+        standard_app = self.fx.windows_zip(self.tmp / "std-app.zip", profile=validation, app_profile="")
+        with self.assertRaisesRegex(ReleaseError, "hane.exe build profile"):
+            rc.verify_windows_zip(standard_app, validation_feed=True, **kwargs)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(standard_app, **kwargs)
+        # Validation app + standard updater.
+        standard_helper = self.fx.windows_zip(self.tmp / "std-helper.zip", profile="", app_profile=validation)
+        with self.assertRaisesRegex(ReleaseError, "hane-updater.exe build profile"):
+            rc.verify_windows_zip(standard_helper, validation_feed=True, **kwargs)
+        with self.assertRaisesRegex(ReleaseError, "hane.exe build profile"):
+            rc.verify_windows_zip(standard_helper, **kwargs)
+        # A fully standard ZIP is refused by the validation catalog, a fully
+        # validation ZIP by the production catalog.
+        standard = self.fx.windows_zip(self.tmp / "std-both.zip")
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(standard, validation_feed=True, **kwargs)
+        both = self.fx.windows_zip(self.tmp / "val-both.zip", profile=validation)
+        with self.assertRaisesRegex(ReleaseError, "build profile"):
+            rc.verify_windows_zip(both, **kwargs)
+        rc.verify_windows_zip(both, validation_feed=True, **kwargs)
+        # The app record must belong to the package version.
+        stale = self.fx.windows_zip(self.tmp / "stale-app.zip", profile=validation,
+                                    extra={"hane.exe": app_pe("0.1.0", validation)})
+        with self.assertRaisesRegex(ReleaseError, "hane.exe build profile record"):
+            rc.verify_windows_zip(stale, validation_feed=True, **kwargs)
 
     def test_an_unsealed_bundle_is_rejected(self):
         with self.assertRaisesRegex(ReleaseError, "CodeResources"):

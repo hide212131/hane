@@ -8,6 +8,10 @@ license.workspace = true
 default = []
 timing-probe = []
 instrument = ["timing-probe"]
+# Isolated update validation build (Issue #510): it must never change the
+# per-user Explorer registration of the standard Hane. Enabled only through the
+# app crate's `validation-feed` feature.
+validation-feed = []
 
 [dependencies]
 merman.workspace = true

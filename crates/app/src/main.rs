@@ -267,6 +267,17 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
         Err(_) => None,
     };
     let updates_root = state.root().join("updates").join(install_id.as_str());
+    // The standard build always uses the fixed GitHub HTTPS transport. Only the
+    // opt-in `validation-feed` build swaps in the loopback fixture transport;
+    // signature, archive and apply checks below are unchanged.
+    #[cfg(not(feature = "validation-feed"))]
+    let transport: Arc<dyn hane_update::download::Transport> =
+        Arc::new(https_transport::LazyHttpsTransport::new(Arc::new(network_context)));
+    #[cfg(feature = "validation-feed")]
+    let transport: Arc<dyn hane_update::download::Transport> = {
+        let _ = &network_context;
+        Arc::new(https_transport::validation_feed::ValidationFeedTransport::from_environment())
+    };
     let service = Arc::new(app_update::AppUpdateService::new(
         app_update::UpdateServiceConfig {
             current_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -280,7 +291,7 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
             receipts_dir,
             legacy_seen,
         },
-        Arc::new(https_transport::LazyHttpsTransport::new(Arc::new(network_context))),
+        transport,
         Arc::new(SystemClock::new()),
     ));
     // Only a supported placement can hand a Ready update to the helper, and
@@ -339,6 +350,20 @@ mod legacy_seen_path_tests {
     }
 }
 
+const AI_CREDENTIAL_SERVICE: &str = "com.hide212131.hane.ai";
+const VALIDATION_AI_CREDENTIAL_SERVICE: &str = "com.hide212131.hane.ai.validation";
+
+/// The OS credential-store service name for AI credentials. The isolated
+/// update-validation build uses its own namespace so it never reads, writes or
+/// deletes the user's regular credentials.
+const fn ai_credential_service(validation_feed: bool) -> &'static str {
+    if validation_feed {
+        VALIDATION_AI_CREDENTIAL_SERVICE
+    } else {
+        AI_CREDENTIAL_SERVICE
+    }
+}
+
 fn start_ai_service() -> Option<AiService> {
     let state = FileStateStore::from_environment().ok()?;
     let explicit_override = std::env::var_os(EXPLICIT_OVERRIDE_ENV_VAR);
@@ -361,7 +386,9 @@ fn start_ai_service() -> Option<AiService> {
             app_data_root: state.root().to_path_buf(),
             binary_path,
             binary_resolution_error,
-            credential_store: Arc::new(OsCredentialStore::new("com.hide212131.hane.ai")),
+            credential_store: Arc::new(OsCredentialStore::new(ai_credential_service(cfg!(
+                feature = "validation-feed"
+            )))),
             browser_opener: Arc::new(SystemBrowserOpener),
             shell_env_format: ShellEnvironmentPolicyFormat::Filters,
         },
@@ -544,6 +571,14 @@ fn hand_off_to_next_process(path: &std::path::Path) {
 
 #[cfg(target_os = "windows")]
 fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
+    // The isolated validation build shares the standard Hane's HKCU keys, so it
+    // refuses both flags instead of registering or removing them.
+    if !hane_ui::context_menu::registration_change_allowed()
+        && (flag == "--register-context-menu" || flag == "--unregister-context-menu")
+    {
+        eprintln!("検証用ビルドでは通常版のExplorer右クリック登録を変更できません。");
+        std::process::exit(2);
+    }
     if flag == "--register-context-menu" {
         let exe = std::env::current_exe().expect("resolve current exe path");
         hane_ui::context_menu::register(&exe).expect("register Explorer context menu");
@@ -558,7 +593,28 @@ fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
     }
 }
 
+/// Profile record that `scripts/release_catalog.py` reads back from the built
+/// executable. Only the isolated `validation-feed` build carries it; a standard
+/// build embeds nothing. It is consulted at startup so the bytes stay in the
+/// final binary because they are used.
+#[cfg(feature = "validation-feed")]
+const APP_PROFILE_RECORD: &str = concat!(
+    "hane-app-profile-v1;version=",
+    env!("CARGO_PKG_VERSION"),
+    ";profile=validation-feed;end"
+);
+
 fn main() {
+    // The isolated validation build never falls back to the per-user default
+    // state: from here on every state-root resolution requires a pinned or
+    // explicit absolute `HANE_STATE_DIR`.
+    #[cfg(feature = "validation-feed")]
+    {
+        if !std::hint::black_box(APP_PROFILE_RECORD).starts_with("hane-app-profile-v1;") {
+            std::process::exit(70);
+        }
+        hane_session::require_explicit_state_root();
+    }
     // First of all, before the AI service, state stores, any window or open
     // request: settle a pending update transaction or stop. The guard is the
     // shared runtime lease and lives until the process ends.
@@ -595,6 +651,14 @@ fn main() {
         }
         update_gate::Entry::Stop(code) => std::process::exit(code),
     };
+
+    // Fail closed before any store, service or window when the isolated root
+    // is missing or invalid.
+    #[cfg(feature = "validation-feed")]
+    if FileStateStore::from_environment().is_err() {
+        eprintln!("Hane validation build requires an absolute HANE_STATE_DIR.");
+        std::process::exit(78);
+    }
 
     #[cfg(target_os = "windows")]
     if let Some(flag) = std::env::args_os().nth(1)
@@ -1045,6 +1109,38 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod ai_credential_service_tests {
+    use super::ai_credential_service;
+
+    #[test]
+    fn the_regular_build_keeps_the_existing_service_name() {
+        assert_eq!(ai_credential_service(false), "com.hide212131.hane.ai");
+    }
+
+    #[test]
+    fn the_validation_build_uses_a_separate_service_name() {
+        assert_eq!(
+            ai_credential_service(true),
+            "com.hide212131.hane.ai.validation"
+        );
+        assert_ne!(ai_credential_service(true), ai_credential_service(false));
+    }
+
+    #[test]
+    fn the_build_configuration_selects_the_matching_service() {
+        let expected = if cfg!(feature = "validation-feed") {
+            "com.hide212131.hane.ai.validation"
+        } else {
+            "com.hide212131.hane.ai"
+        };
+        assert_eq!(
+            ai_credential_service(cfg!(feature = "validation-feed")),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]

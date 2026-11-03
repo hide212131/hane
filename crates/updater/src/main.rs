@@ -18,6 +18,7 @@ const IDENTITY: &str = concat!(
     env!("HANE_UPDATER_SOURCE_SHA"),
     ";protocol=",
     env!("HANE_UPDATER_PROTOCOL"),
+    env!("HANE_UPDATER_PROFILE_FIELD"),
     ";end"
 );
 
@@ -76,8 +77,13 @@ mod tests {
         assert!(IDENTITY.contains(concat!(";version=", env!("CARGO_PKG_VERSION"), ";")));
         assert!(IDENTITY.contains(";target="));
         assert!(IDENTITY.contains(";source="));
+        let profile = if cfg!(feature = "validation-feed") {
+            ";profile=validation-feed"
+        } else {
+            ""
+        };
         assert!(IDENTITY.ends_with(&format!(
-            ";protocol={};end",
+            ";protocol={}{profile};end",
             hane_update::model::UPDATER_PROTOCOL
         )));
     }

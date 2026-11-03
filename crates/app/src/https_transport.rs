@@ -10,6 +10,12 @@
 //! interrupt; it runs on a single helper thread that the request stops waiting
 //! for at the deadline, and no second lookup starts while it is still running.
 
+// The opt-in `validation-feed` build replaces this transport with the loopback
+// fixture (see `main.rs`), so the standard implementation below is unused
+// there. It is still compiled, and covered by the unit tests, in every build;
+// the allowance is limited to this module and to that one feature.
+#![cfg_attr(all(feature = "validation-feed", not(test)), allow(dead_code))]
+
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +30,11 @@ use hane_update::download::{
 };
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+
+/// Loopback-only transport of the opt-in update validation build. It does not
+/// exist in a standard build.
+#[cfg(feature = "validation-feed")]
+pub(crate) mod validation_feed;
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_LINE_BYTES: usize = 1024;

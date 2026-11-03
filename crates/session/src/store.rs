@@ -7,6 +7,8 @@ use hane_network::{
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 const RECENT_LIMIT: usize = 10;
@@ -579,13 +581,50 @@ pub fn pin_state_root(root: PathBuf) -> bool {
     PINNED_ROOT.set(root).is_ok()
 }
 
-fn state_directory() -> io::Result<PathBuf> {
-    if let Some(root) = PINNED_ROOT.get() {
-        return Ok(root.clone());
+static EXPLICIT_ROOT_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+/// Makes every later state-root resolution of this process fail closed unless a
+/// root was pinned or `HANE_STATE_DIR` names an absolute directory. The
+/// isolated `validation-feed` build calls this first, so it can never read or
+/// write the per-user default state.
+pub fn require_explicit_state_root() {
+    EXPLICIT_ROOT_REQUIRED.store(true, Ordering::SeqCst);
+}
+
+fn resolve_state_root(
+    pinned: Option<PathBuf>,
+    env: Option<OsString>,
+    require_explicit: bool,
+) -> io::Result<PathBuf> {
+    if let Some(root) = pinned {
+        return Ok(root);
     }
-    if let Some(path) = std::env::var_os("HANE_STATE_DIR") {
+    if require_explicit {
+        return match env {
+            Some(path) if !path.is_empty() && Path::new(&path).is_absolute() => {
+                Ok(PathBuf::from(path))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an isolated absolute HANE_STATE_DIR is required",
+            )),
+        };
+    }
+    if let Some(path) = env {
         return Ok(PathBuf::from(path));
     }
+    platform_default_directory()
+}
+
+fn state_directory() -> io::Result<PathBuf> {
+    resolve_state_root(
+        PINNED_ROOT.get().cloned(),
+        std::env::var_os("HANE_STATE_DIR"),
+        EXPLICIT_ROOT_REQUIRED.load(Ordering::SeqCst),
+    )
+}
+
+fn platform_default_directory() -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var_os("HOME")
@@ -641,6 +680,46 @@ fn unescape_line(line: &str) -> String {
 mod tests {
     use super::*;
     use crate::service::temporary_directory;
+
+    #[test]
+    fn explicit_root_required_fails_closed_without_valid_env() {
+        for env in [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("relative/state")),
+        ] {
+            assert!(resolve_state_root(None, env, true).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_root_required_uses_only_the_isolated_root() {
+        let root = std::env::temp_dir().join("hane-validation-root");
+        let resolved =
+            resolve_state_root(None, Some(root.clone().into_os_string()), true).expect("root");
+        assert_eq!(resolved, root);
+        let pinned = std::env::temp_dir().join("hane-pinned-root");
+        let resolved = resolve_state_root(
+            Some(pinned.clone()),
+            Some(root.into_os_string()),
+            true,
+        )
+        .expect("pinned");
+        assert_eq!(resolved, pinned);
+    }
+
+    #[test]
+    fn ordinary_resolution_is_unchanged_without_the_requirement() {
+        let relative = OsString::from("relative/state");
+        assert_eq!(
+            resolve_state_root(None, Some(relative), false).expect("env"),
+            PathBuf::from("relative/state")
+        );
+        assert_eq!(
+            resolve_state_root(None, None, false).ok(),
+            platform_default_directory().ok()
+        );
+    }
 
     #[test]
     fn recent_files_are_deduplicated_and_bounded() {

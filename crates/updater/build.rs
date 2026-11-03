@@ -35,4 +35,14 @@ fn main() {
     println!("cargo:rustc-env=HANE_UPDATER_SOURCE_SHA={source}");
     println!("cargo:rustc-env=HANE_UPDATER_TARGET={target}");
     println!("cargo:rustc-env=HANE_UPDATER_PROTOCOL={UPDATER_PROTOCOL}");
+
+    // The isolated `validation-feed` build (Issue #510) labels its helper so the
+    // release verifier can tell it from a standard build. Standard builds add
+    // nothing, which keeps their identity record unchanged.
+    let profile = if env::var_os("CARGO_FEATURE_VALIDATION_FEED").is_some() {
+        ";profile=validation-feed"
+    } else {
+        ""
+    };
+    println!("cargo:rustc-env=HANE_UPDATER_PROFILE_FIELD={profile}");
 }

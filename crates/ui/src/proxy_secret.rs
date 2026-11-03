@@ -71,13 +71,131 @@ fn decode(secret: &str) -> Result<BasicCredentials, CredentialError> {
     Ok(credentials)
 }
 
+/// The OS service that holds the proxy credentials. The isolated
+/// `validation-feed` build (Issue #510) uses its own service so it can never
+/// read, replace or delete the credentials of the standard Hane.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code, reason = "only the native backends select a service")
+)]
+const fn proxy_credential_service(validation_feed: bool) -> &'static str {
+    if validation_feed {
+        "hane.network.proxy.validation-feed"
+    } else {
+        hane_network::PROXY_CREDENTIAL_SERVICE
+    }
+}
+
+/// A failure of the underlying secret backend. `NoEntry` is the only case that
+/// carries meaning; every other failure is opaque.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code, reason = "only the native backends use a secret backend")
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendError {
+    NoEntry,
+    Failed,
+}
+
+/// Raw access to an OS secret store, addressed by service and account. It is
+/// the seam that lets tests check the service choice without touching the
+/// native keyring.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code, reason = "only the native backends use a secret backend")
+)]
+trait SecretBackend {
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), BackendError>;
+    fn get(&self, service: &str, account: &str) -> Result<String, BackendError>;
+    fn delete(&self, service: &str, account: &str) -> Result<(), BackendError>;
+}
+
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code, reason = "only the native backends use a secret backend")
+)]
+fn put_in<B: SecretBackend>(
+    backend: &B,
+    service: &str,
+    reference: &CredentialRef,
+    credentials: &BasicCredentials,
+) -> Result<(), SecretStoreError> {
+    let secret = encode(credentials)?;
+    backend
+        .set(service, reference.as_str(), &secret)
+        .map_err(|_| SecretStoreError)
+}
+
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code, reason = "only the native backends use a secret backend")
+)]
+fn delete_in<B: SecretBackend>(
+    backend: &B,
+    service: &str,
+    reference: &CredentialRef,
+) -> Result<(), SecretStoreError> {
+    match backend.delete(service, reference.as_str()) {
+        Ok(()) | Err(BackendError::NoEntry) => Ok(()),
+        Err(BackendError::Failed) => Err(SecretStoreError),
+    }
+}
+
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code, reason = "only the native backends use a secret backend")
+)]
+fn load_from<B: SecretBackend>(
+    backend: &B,
+    service: &str,
+    reference: &CredentialRef,
+) -> Result<BasicCredentials, CredentialError> {
+    match backend.get(service, reference.as_str()) {
+        Ok(secret) => decode(&secret),
+        Err(BackendError::NoEntry) => Err(CredentialError::NotFound),
+        Err(BackendError::Failed) => Err(CredentialError::Unavailable),
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native {
     use super::*;
-    use hane_network::PROXY_CREDENTIAL_SERVICE;
 
-    fn entry(reference: &CredentialRef) -> Option<keyring::Entry> {
-        keyring::Entry::new(PROXY_CREDENTIAL_SERVICE, reference.as_str()).ok()
+    const SERVICE: &str = proxy_credential_service(cfg!(feature = "validation-feed"));
+
+    struct Keyring;
+
+    impl Keyring {
+        fn entry(service: &str, account: &str) -> Result<keyring::Entry, BackendError> {
+            keyring::Entry::new(service, account).map_err(|_| BackendError::Failed)
+        }
+    }
+
+    impl SecretBackend for Keyring {
+        fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), BackendError> {
+            Self::entry(service, account)?
+                .set_password(secret)
+                .map_err(|_| BackendError::Failed)
+        }
+
+        fn get(&self, service: &str, account: &str) -> Result<String, BackendError> {
+            Self::entry(service, account)?
+                .get_password()
+                .map_err(|error| match error {
+                    keyring::Error::NoEntry => BackendError::NoEntry,
+                    _ => BackendError::Failed,
+                })
+        }
+
+        fn delete(&self, service: &str, account: &str) -> Result<(), BackendError> {
+            Self::entry(service, account)?
+                .delete_password()
+                .map_err(|error| match error {
+                    keyring::Error::NoEntry => BackendError::NoEntry,
+                    _ => BackendError::Failed,
+                })
+        }
     }
 
     impl ProxySecretWriter for OsProxyCredentialStore {
@@ -86,29 +204,17 @@ mod native {
             reference: &CredentialRef,
             credentials: &BasicCredentials,
         ) -> Result<(), SecretStoreError> {
-            let secret = encode(credentials)?;
-            entry(reference)
-                .ok_or(SecretStoreError)?
-                .set_password(&secret)
-                .map_err(|_| SecretStoreError)
+            put_in(&Keyring, SERVICE, reference, credentials)
         }
 
         fn delete(&self, reference: &CredentialRef) -> Result<(), SecretStoreError> {
-            match entry(reference).ok_or(SecretStoreError)?.delete_password() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(_) => Err(SecretStoreError),
-            }
+            delete_in(&Keyring, SERVICE, reference)
         }
     }
 
     impl CredentialStore for OsProxyCredentialStore {
         fn load(&self, reference: &CredentialRef) -> Result<BasicCredentials, CredentialError> {
-            let entry = entry(reference).ok_or(CredentialError::Unavailable)?;
-            match entry.get_password() {
-                Ok(secret) => decode(&secret),
-                Err(keyring::Error::NoEntry) => Err(CredentialError::NotFound),
-                Err(_) => Err(CredentialError::Unavailable),
-            }
+            load_from(&Keyring, SERVICE, reference)
         }
     }
 }
@@ -159,6 +265,95 @@ mod tests {
         assert_eq!(decode("no-separator"), Err(CredentialError::Invalid));
         assert_eq!(decode(":only-password"), Err(CredentialError::Invalid));
         assert_eq!(decode("user:pa\nss"), Err(CredentialError::Invalid));
+    }
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeBackend {
+        entries: Mutex<HashMap<(String, String), String>>,
+    }
+
+    impl SecretBackend for FakeBackend {
+        fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), BackendError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert((service.into(), account.into()), secret.into());
+            Ok(())
+        }
+
+        fn get(&self, service: &str, account: &str) -> Result<String, BackendError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(&(service.to_string(), account.to_string()))
+                .cloned()
+                .ok_or(BackendError::NoEntry)
+        }
+
+        fn delete(&self, service: &str, account: &str) -> Result<(), BackendError> {
+            self.entries
+                .lock()
+                .unwrap()
+                .remove(&(service.to_string(), account.to_string()))
+                .map(|_| ())
+                .ok_or(BackendError::NoEntry)
+        }
+    }
+
+    #[test]
+    fn validation_and_standard_builds_select_different_services() {
+        assert_eq!(proxy_credential_service(false), "hane.network.proxy");
+        assert_eq!(
+            proxy_credential_service(true),
+            "hane.network.proxy.validation-feed"
+        );
+        assert_ne!(proxy_credential_service(false), proxy_credential_service(true));
+    }
+
+    #[test]
+    fn validation_service_never_reads_replaces_or_deletes_standard_credentials() {
+        let backend = FakeBackend::default();
+        let reference = CredentialRef::new("proxy-1").unwrap();
+        let standard = proxy_credential_service(false);
+        let validation = proxy_credential_service(true);
+        let normal_credentials = BasicCredentials::new("normal", "secret");
+        let test_credentials = BasicCredentials::new("validation", "other");
+
+        put_in(&backend, standard, &reference, &normal_credentials).unwrap();
+
+        // The validation service cannot see the standard entry.
+        assert_eq!(
+            load_from(&backend, validation, &reference),
+            Err(CredentialError::NotFound)
+        );
+
+        // Saving and loading in the validation service leaves the standard entry.
+        put_in(&backend, validation, &reference, &test_credentials).unwrap();
+        assert_eq!(
+            load_from(&backend, validation, &reference).unwrap(),
+            test_credentials
+        );
+        assert_eq!(
+            load_from(&backend, standard, &reference).unwrap(),
+            normal_credentials
+        );
+
+        // Deleting in the validation service leaves the standard entry.
+        delete_in(&backend, validation, &reference).unwrap();
+        assert_eq!(
+            load_from(&backend, validation, &reference),
+            Err(CredentialError::NotFound)
+        );
+        assert_eq!(
+            load_from(&backend, standard, &reference).unwrap(),
+            normal_credentials
+        );
+
+        // Deleting an absent entry is not an error.
+        delete_in(&backend, validation, &reference).unwrap();
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
