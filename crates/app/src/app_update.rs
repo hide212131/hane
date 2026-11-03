@@ -2882,18 +2882,24 @@ mod tests {
         fixture.script_check();
         fixture.script_archive();
         fixture.check_now();
-        // The receipts location can no longer be created once the archive is
-        // verified; the update itself and the log stay writable.
+        // The receipts location is unusable from here on; the update itself
+        // and the log stay writable. The download operation re-verifies the
+        // offer before fetching anything (`reverify_offer`), which reads the
+        // sequence floor from this same location, so the failure now surfaces
+        // in the download operation's `write_download` stage rather than at
+        // the later `save_history` step. It is still a persistence failure of
+        // the download, never a failed check.
         fs::write(fixture.dir.path().join("receipts"), b"not a directory").unwrap();
         fixture.service.download(&fixture.candidate_id());
         run_queued(&fixture.queue);
         let snapshot = fixture.service.snapshot();
         assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
-        assert_eq!(snapshot.error_stage.as_deref(), Some("save_history"));
+        assert_eq!(snapshot.error_stage.as_deref(), Some("write_download"));
+        assert_ne!(snapshot.error_stage.as_deref(), Some("check"));
         assert_ne!(snapshot.error_code.as_deref(), Some("not_found"));
         assert!(!fixture.updates_root().join("candidates").exists());
         let report = fixture.service.diagnostics_text();
-        assert!(report.contains("stage=save_history"), "{report}");
+        assert!(report.contains("stage=write_download"), "{report}");
         assert!(!report.contains("stage=check"), "{report}");
         assert!(report.contains("os_kind="), "the OS error kind must be kept: {report}");
         assert!(report.contains("candidate=0.27.0"), "{report}");
