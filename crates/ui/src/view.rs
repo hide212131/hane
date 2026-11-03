@@ -6899,8 +6899,10 @@ mod tests {
             view.editor_mut()
                 .set_selection(Selection::caret(SourceOffset(4)))
                 .unwrap();
-            let (first, colored, reused) = bare_url_snapshot(view, "see");
-            assert!(!reused);
+            // The fixture has already rendered, so the cache may be warm
+            // already; warm it explicitly instead of assuming it is cold.
+            bare_url_snapshot(view, "see");
+            let (first, colored, _) = bare_url_snapshot(view, "see");
             assert!(colored);
             assert_eq!(first, [bare_url_target(text, url)]);
 
