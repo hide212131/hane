@@ -2104,7 +2104,8 @@ impl EditorView {
     /// is actually looking at right now rather than one tied to a specific
     /// render.
     pub(crate) fn dismiss_tab_close_confirm(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.tab_close_confirm.take().is_some() {
+        if let Some(confirm) = self.tab_close_confirm.take() {
+            self.resume_writers_after_discard_settled(confirm.id, confirm.instance, false, cx);
             cx.notify();
             true
         } else {
@@ -2127,6 +2128,7 @@ impl EditorView {
             return false;
         }
         self.tab_close_confirm = None;
+        self.resume_writers_after_discard_settled(confirm.id, confirm.instance, false, cx);
         cx.notify();
         true
     }
@@ -2408,6 +2410,15 @@ impl EditorView {
         if edited {
             self.tab_discard_pending.remove(&id);
             self.reconfirm_tab_close(id, cx);
+            // The old approval is void. Unless the new question for this
+            // document is on screen (its Cancel resumes), the writers it
+            // held off are evaluated now, without waiting for another edit.
+            if !self
+                .tab_close_confirm
+                .is_some_and(|confirm| confirm.id == id)
+            {
+                self.resume_writers_after_discard_settled(id, pending.instance, false, cx);
+            }
             return;
         }
         if busy {
@@ -2425,6 +2436,7 @@ impl EditorView {
         };
         let Some(root) = root else {
             self.tab_discard_pending.remove(&id);
+            self.resume_writers_after_discard_settled(id, pending.instance, true, cx);
             self.status = Some("作業フォルダーを特定できないため破棄できません".to_owned());
             cx.notify();
             return;
@@ -2516,17 +2528,24 @@ impl EditorView {
                 self.work_folder_drafts.insert(id, draft);
                 self.content_search_workspace_changed(cx);
                 self.journal_draft_now(id, cx);
-                // The approval is over and the document stays: hand back what
-                // the discard held off. Done before the status below so the
-                // visible error is not hidden by a resumed write.
-                if !edited && !reconfirming {
-                    self.resume_writers_after_discard_settled(id, instance, cx);
+                let failed = other.is_err();
+                if edited && !failed {
+                    self.reconfirm_tab_close(id, cx);
+                }
+                // The approval is over and the document stays. While a
+                // question for this document is on screen its answer decides
+                // (Cancel hands the writers back); otherwise hand back what
+                // the discard held off now. Done before the status below so
+                // the visible error is not hidden by a resumed write.
+                let confirming = self
+                    .tab_close_confirm
+                    .is_some_and(|confirm| confirm.id == id);
+                if !confirming {
+                    self.resume_writers_after_discard_settled(id, instance, failed, cx);
                 }
                 if let Err(error) = other {
                     self.status = Some(format!("破棄できませんでした: {error}"));
-                } else if edited {
-                    self.reconfirm_tab_close(id, cx);
-                } else if busy && !reconfirming && !pending.superseded {
+                } else if !edited && busy && !reconfirming && !pending.superseded {
                     self.status = Some(
                         "保存処理が始まったため破棄を中止しました。もう一度操作してください"
                             .to_owned(),
@@ -2543,10 +2562,17 @@ impl EditorView {
     /// usual owner, so the existing protections (autosave setting, IME,
     /// ticket freshness, in-flight slot) still decide. Nothing runs while an
     /// approval for the document is still active.
+    ///
+    /// `removal_failed` marks the end caused by a draft removal that failed:
+    /// the draft is the document's only protection then, and a first-time H1
+    /// create would retire it with a best-effort delete that hides the
+    /// failure. That one writer waits for the next edit; everything else
+    /// goes back to its owner.
     fn resume_writers_after_discard_settled(
         &mut self,
         id: SessionId,
         instance: DocumentInstance,
+        removal_failed: bool,
         cx: &mut Context<Self>,
     ) {
         if self.tab_discard_pending.contains_key(&id)
@@ -2567,7 +2593,9 @@ impl EditorView {
             // Re-arms only when autosave is on and the text is unsaved.
             self.schedule_autosave(cx);
         }
-        self.retry_title_sync(id, cx);
+        if !(removal_failed && self.work_folder_drafts.contains_key(&id)) {
+            self.retry_title_sync(id, cx);
+        }
     }
 
     /// Asks again for a document whose approval no longer matches its text.
@@ -17382,8 +17410,216 @@ mod tests {
                 "the failure must be visible"
             );
         });
+        // The resumed writers must not turn the protected draft into a file
+        // (which would retire its tracking and hide the failure).
+        assert!(
+            markdown_files(&fx.root).is_empty(),
+            "no note file is created behind the failed removal"
+        );
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["# Titled note\nbody".to_owned()],
+            "the journal still protects the text"
+        );
 
         std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_title_sync_held_by_a_discard_approval_runs_once_the_question_is_cancelled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) =
+            draft_discard_view(cx, "discard-title-sync-cancelled", "# Titled note\nbody");
+        view.update(cx, |view, cx| {
+            // A running write keeps the approval waiting.
+            view.title_sync_in_flight.insert(fx.id);
+            discard_via_confirm(view, fx.id, cx);
+            assert!(view.tab_discard_pending.contains_key(&fx.id));
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            // The title-sync timer fires while the approval is active.
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            view.title_sync_in_flight.remove(&fx.id);
+            // A new question voids the approval.
+            view.request_tab_close(fx.id, cx);
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        cx.run_until_parked();
+        assert!(
+            markdown_files(&fx.root).is_empty(),
+            "nothing runs while the new question is still on screen"
+        );
+
+        view.update(cx, |view, cx| assert!(view.dismiss_tab_close_confirm(cx)));
+        cx.run_until_parked();
+
+        let files = markdown_files(&fx.root);
+        assert_eq!(files.len(), 1, "the held title sync ran once after Cancel");
+        assert_eq!(
+            std::fs::read_to_string(&files[0]).unwrap(),
+            "# Titled note\nbody"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_queued_save_held_by_a_discard_starts_once_when_the_draft_removal_fails(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-queued-save-fails", "plain body");
+        fx.store.script(ScriptedRemove::Fail);
+        let first = fx.root.join("first.md");
+        let second = fx.root.join("second.md");
+        view.update(cx, |view, cx| {
+            view.save_session(fx.id, SaveIntent::To(first.clone()), cx);
+            view.save_session(fx.id, SaveIntent::To(second.clone()), cx);
+            discard_via_confirm(view, fx.id, cx);
+            assert!(view.tab_discard_pending.contains_key(&fx.id));
+        });
+        assert!(!second.exists(), "nothing queued starts during the approval");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_some(), "the tab is kept");
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "plain body");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "plain body",
+            "the queued save the user already asked for ran after the failure"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_queued_save_held_by_a_successful_discard_never_starts(cx: &mut gpui::TestAppContext) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-queued-save-succeeds", "plain body");
+        let first = fx.root.join("first.md");
+        let second = fx.root.join("second.md");
+        view.update(cx, |view, cx| {
+            view.save_session(fx.id, SaveIntent::To(first.clone()), cx);
+            view.save_session(fx.id, SaveIntent::To(second.clone()), cx);
+            discard_via_confirm(view, fx.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_none(), "the approved tab closed");
+        });
+        assert!(first.exists(), "the write already accepted is not rolled back");
+        assert!(!second.exists(), "a discard starts no new save");
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    fn escape_the_question(view: &mut EditorView, cx: &mut Context<EditorView>) {
+        assert!(view.dismiss_tab_close_confirm(cx));
+    }
+
+    fn click_cancel_on_the_question(view: &mut EditorView, cx: &mut Context<EditorView>) {
+        let confirm = view.tab_close_confirm.expect("question on screen");
+        assert!(view.dismiss_tab_close_confirm_if(confirm, cx));
+    }
+
+    /// An approval held back by a running write, an edit that its autosave
+    /// timer could not act on while the approval was active, then a new
+    /// question that is cancelled.
+    fn edit_during_held_discard_then_cancel(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        autosave: bool,
+        cancel: fn(&mut EditorView, &mut Context<EditorView>),
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, label);
+        view.update(cx, |view, cx| {
+            view.settings.autosave = autosave;
+            view.title_sync_in_flight.insert(id);
+            discard_via_confirm(view, id, cx);
+            assert!(view.tab_discard_pending.contains_key(&id));
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(800));
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before",
+            "the autosave timer is suppressed while the approval is active"
+        );
+
+        view.update(cx, |view, cx| {
+            view.title_sync_in_flight.remove(&id);
+            view.resolve_pending_tab_discard(id, cx);
+            assert!(view.tab_discard_pending.is_empty());
+            assert_eq!(
+                view.tab_close_confirm.map(|confirm| confirm.id),
+                Some(id),
+                "the edited text is asked about again"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before",
+            "nothing is written while the new question is on screen"
+        );
+
+        view.update(cx, |view, cx| cancel(view, cx));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(800));
+        cx.run_until_parked();
+
+        let expected = if autosave { "before after more" } else { "before" };
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some(), "Cancel keeps the tab");
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_on_the_reconfirmation_autosaves_the_edit_the_discard_held_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        edit_during_held_discard_then_cancel(
+            cx,
+            "discard-held-autosave-escape",
+            true,
+            escape_the_question,
+        );
+    }
+
+    #[gpui::test]
+    fn cancel_or_backdrop_on_the_reconfirmation_autosaves_the_edit_the_discard_held_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        edit_during_held_discard_then_cancel(
+            cx,
+            "discard-held-autosave-cancel",
+            true,
+            click_cancel_on_the_question,
+        );
+    }
+
+    #[gpui::test]
+    fn cancelling_the_reconfirmation_does_not_autosave_when_autosave_is_off(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        edit_during_held_discard_then_cancel(
+            cx,
+            "discard-held-autosave-off",
+            false,
+            escape_the_question,
+        );
     }
 
     #[gpui::test]
