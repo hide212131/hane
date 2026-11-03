@@ -17571,7 +17571,7 @@ mod tests {
             "nothing is written while the new question is on screen"
         );
 
-        view.update(cx, |view, cx| cancel(view, cx));
+        view.update(cx, cancel);
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(800));
         cx.run_until_parked();
