@@ -342,20 +342,24 @@ pub fn present_block_with_table_projection(
                             .links
                             .iter()
                             .any(|existing| existing.source_range.intersects(clipped)))
-                    .then(|| crate::LinkTarget {
-                        source_range: clipped,
-                        destination: link.destination.clone(),
-                        uses_reference: link.uses_reference,
+                    .then(|| {
+                        (
+                            crate::LinkTarget {
+                                source_range: clipped,
+                                destination: link.destination.clone(),
+                                uses_reference: link.uses_reference,
+                            },
+                            link.is_bare_url,
+                        )
                     })
                 })
                 .collect::<Vec<_>>();
             // The table presenter has no Markdown Link node for a bare URL, so
-            // give those targets (destination equal to the source text) the
-            // link color here.
-            for link in &missing {
-                let text_start = link.source_range.start.0.saturating_sub(line.range.start.0);
-                let text_end = link.source_range.end.0.saturating_sub(line.range.start.0);
-                if line.text.get(text_start..text_end) != Some(&*link.destination) {
+            // give the targets the formal parser owns as bare URLs the link
+            // color here. The origin comes from the projection, never from
+            // comparing the source text with the destination.
+            for (link, is_bare_url) in &missing {
+                if !*is_bare_url {
                     continue;
                 }
                 if let (Some(start), Some(end)) = (
@@ -379,7 +383,9 @@ pub fn present_block_with_table_projection(
             presented
                 .style_runs
                 .sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
-            presented.links.extend(missing);
+            presented
+                .links
+                .extend(missing.into_iter().map(|(target, _)| target));
             presented
                 .links
                 .sort_by_key(|link| (link.source_range.start, link.source_range.end));

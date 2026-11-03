@@ -482,6 +482,119 @@ fn table_row_keeps_one_target_each_for_markdown_and_bare_links() {
     assert_eq!(link_runs(row).len(), 2, "only the two bare URLs are colored");
 }
 
+fn table_body_row(blocks: &[VisualBlock]) -> &VisualLine {
+    blocks
+        .iter()
+        .flat_map(|block| &block.lines)
+        .filter(|line| line.kind == BlockKind::TableRow)
+        .last()
+        .expect("table body row")
+}
+
+/// Issue #673: a table cell's Link color follows the formal parser's origin
+/// (a real `Text` owner), never a source-equals-destination string guess.
+#[test]
+fn table_link_color_follows_formal_origin_not_label_text() {
+    let source = "| h | k |\n| --- | --- |\n| [https://a.example](https://a.example) [m](https://m.example/) | https://bare.example |\n";
+    let blocks = present(source);
+    let row = table_body_row(&blocks);
+    // Markdown links: raw text and targets kept, no Link color.
+    let bare = "https://bare.example";
+    let visual = row.visual_text.rfind(bare).expect("bare url visible");
+    assert_eq!(link_runs(row), [(visual, visual + bare.len())]);
+    let destinations = row
+        .links
+        .iter()
+        .map(|link| link.destination.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        destinations,
+        ["https://a.example", "https://m.example/", bare]
+    );
+    let bare_range = SourceRange::new(
+        source.rfind(bare).unwrap(),
+        source.rfind(bare).unwrap() + bare.len(),
+    );
+    assert_eq!(row.links[2].source_range, bare_range);
+    assert!(row.links.iter().all(|link| !link.uses_reference));
+    for pair in row.links.windows(2) {
+        assert!(pair[0].source_range.end <= pair[1].source_range.start);
+    }
+    // The first label is the text of the first Markdown link, not the raw
+    // destination in parentheses.
+    let label = range_of(source, "https://a.example");
+    assert_eq!(row.links[0].source_range, label);
+    assert!(!row.links[0].contains(SourceOffset(label.end.0)));
+}
+
+#[test]
+fn table_same_url_in_markdown_label_and_bare_cell_colors_only_the_bare() {
+    let url = "https://same.example";
+    let source =
+        format!("| h | k |\n| --- | --- |\n| [{url}]({url}) | {url} |\n");
+    let blocks = present(&source);
+    let row = table_body_row(&blocks);
+    let visual = row.visual_text.rfind(url).expect("bare url visible");
+    assert_eq!(link_runs(row), [(visual, visual + url.len())]);
+    assert_eq!(row.links.len(), 2);
+    assert_eq!(row.links[1].source_range.start.0, source.rfind(url).unwrap());
+}
+
+#[test]
+fn table_reference_label_is_not_colored_and_keeps_the_formal_destination() {
+    let source = format!(
+        "| h | k |\n| --- | --- |\n| [{LABEL}][r] | https://bare.example |\n\n[r]: {DEST}\n"
+    );
+    let blocks = present(&source);
+    let row = table_body_row(&blocks);
+    let reference = row
+        .links
+        .iter()
+        .find(|link| &*link.destination == DEST)
+        .expect("reference target");
+    assert!(reference.uses_reference);
+    assert_eq!(reference.source_range, range_of(&source, LABEL));
+    let bare = "https://bare.example";
+    let visual = row.visual_text.rfind(bare).expect("bare url visible");
+    assert_eq!(link_runs(row), [(visual, visual + bare.len())]);
+}
+
+#[test]
+fn projection_creators_keep_text_origin_only_for_bare_urls() {
+    let source = "| h | k |\n| --- | --- |\n| [https://a.example](https://a.example) [m](https://m.example/) <https://auto.example> | https://bare.example |\n";
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let whole = SourceRange::new(0, source.len());
+    let mut table_origins = Vec::new();
+    let mut list_origins = Vec::new();
+    for block in index.blocks() {
+        if let Some(table) = index.table_projection(&block) {
+            for row in table.rows.iter() {
+                table_origins.extend(
+                    row.links
+                        .iter()
+                        .map(|link| (link.destination.to_string(), link.is_bare_url)),
+                );
+            }
+        }
+        if let Some(projection) = index.list_projection(&block) {
+            list_origins.extend(
+                projection
+                    .links_in(whole)
+                    .map(|link| (link.destination.to_string(), link.is_bare_url)),
+            );
+        }
+    }
+    let expected = vec![
+        ("https://a.example".to_owned(), false),
+        ("https://m.example/".to_owned(), false),
+        ("https://auto.example".to_owned(), false),
+        ("https://bare.example".to_owned(), true),
+    ];
+    assert_eq!(table_origins, expected);
+    assert_eq!(list_origins, expected);
+}
+
 const LABEL: &str = "https://label.example";
 const DEST: &str = "https://dest.example";
 

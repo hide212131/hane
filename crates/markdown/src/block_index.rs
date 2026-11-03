@@ -109,6 +109,9 @@ pub struct TableProjectionLink {
     pub text_range: SourceRange,
     pub destination: Arc<str>,
     pub uses_reference: bool,
+    /// Whether the formal parser owns this link as a scheme-qualified URL
+    /// written directly in a `Text` node, rather than a Markdown link.
+    pub is_bare_url: bool,
 }
 
 /// One physical table row retained by the formal source projection.
@@ -645,6 +648,7 @@ fn build_list_projections(
                 text_range: link.text_range,
                 destination: link.destination.clone(),
                 uses_reference: link.uses_reference,
+                is_bare_url: link_is_bare_url(parsed, link),
             });
         }
     }
@@ -708,6 +712,15 @@ fn build_list_projections(
             ))
         })
         .collect()
+}
+
+/// A formal bare URL is owned by a real `Text` node; every Markdown link
+/// (inline, reference, autolink) is owned by its `Link` node.
+fn link_is_bare_url(parsed: &MarkdownParse, link: &crate::LinkParse) -> bool {
+    parsed
+        .tree
+        .node(link.node)
+        .is_some_and(|node| node.kind == NodeKind::Text)
 }
 
 fn build_table_projections(
@@ -786,6 +799,7 @@ fn build_table_projections(
                             text_range: link.text_range,
                             destination: link.destination.clone(),
                             uses_reference: link.uses_reference,
+                            is_bare_url: link_is_bare_url(parsed, link),
                         })
                         .collect::<Vec<_>>()
                         .into();
