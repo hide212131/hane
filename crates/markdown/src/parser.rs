@@ -430,15 +430,13 @@ fn scan_bare_urls(source: &str, slice_start: usize, slice: &str) -> Vec<(usize, 
             .is_some_and(|prev| {
                 prev.is_ascii_alphanumeric() || matches!(prev, '+' | '-' | '.' | '@')
             });
-        if blocked {
-            index += raw_len.max(1);
-            continue;
-        }
+        // Resume after the trimmed candidate, not the raw one, so a scheme that
+        // follows an unmatched closing bracket is still scanned.
         let candidate = trim_bare_url(&rest[..raw_len]);
-        if is_valid_bare_url(candidate) {
+        if !blocked && is_valid_bare_url(candidate) {
             found.push((index, candidate.len()));
         }
-        index += raw_len.max(1);
+        index += candidate.len().max(1);
     }
     found
 }

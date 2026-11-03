@@ -121,6 +121,63 @@ fn ranges_are_absolute_utf8_and_match_the_destination() {
 }
 
 #[test]
+fn scan_resumes_after_the_trimmed_candidate() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "https://a.example),https://b.example",
+            &["https://a.example", "https://b.example"],
+        ),
+        ("me@https://a.example),https://b.example", &["https://b.example"]),
+        (
+            "日本語 https://a.example),https://b.example/path?q=1&x=2#end。",
+            &["https://a.example", "https://b.example/path?q=1&x=2#end"],
+        ),
+        (
+            "https://a.example),https://b.example),https://c.example",
+            &["https://a.example", "https://b.example", "https://c.example"],
+        ),
+        (
+            "me@https://a.example),HTTPS://b.example/path",
+            &["HTTPS://b.example/path"],
+        ),
+        (
+            "me@https://a.example plain https://b.example",
+            &["https://b.example"],
+        ),
+        (
+            "https://a.example/(ok) https://b.example",
+            &["https://a.example/(ok)", "https://b.example"],
+        ),
+    ];
+    for (source, expected) in cases {
+        for offset in [0, 1_000] {
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(offset, offset + source.len()),
+                source,
+            );
+            let destinations: Vec<&str> = parsed
+                .links
+                .iter()
+                .map(|link| &*link.destination)
+                .collect();
+            assert_eq!(&destinations, expected, "{source:?} @{offset}");
+            let mut previous_end = 0;
+            for link in &parsed.links {
+                let start = link.text_range.start.0 - offset;
+                let end = link.text_range.end.0 - offset;
+                assert_eq!(&source[start..end], &*link.destination, "{source:?}");
+                assert!(!link.uses_reference);
+                let node = parsed.tree.node(link.node).expect("owner node");
+                assert_eq!(node.kind, NodeKind::Text);
+                assert!(previous_end <= start, "{source:?}");
+                previous_end = end;
+            }
+        }
+    }
+}
+
+#[test]
 fn local_slice_offsets_stay_document_absolute() {
     let slice_source = "see https://example.com/x now";
     let offset = 1_000;
