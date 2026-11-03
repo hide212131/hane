@@ -20801,6 +20801,40 @@ mod tests {
         let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
         cx.run_until_parked();
 
+        // A fresh view starts from a quick, non-table-aware index, so the
+        // table metadata and its link style runs only exist once the Formal
+        // index is published. Publish it and its heights synchronously instead
+        // of depending on the background reparse job's timing.
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.block_index.source(),
+                Some(IndexSource::Formal),
+                "the table-aware Formal index must be published"
+            );
+            assert!(
+                view.current_index().is_some(),
+                "the Formal index must match the current document revision"
+            );
+        });
+
         let link = cx
             .debug_bounds("table-cell-link-2-1-0")
             .expect("the bare URL cell must be painted with the link style");
