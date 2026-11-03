@@ -193,6 +193,7 @@ impl EditorView {
             editor_context_menu_activation: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
+            tab_discard_pending: HashMap::new(),
             save_problems: HashMap::new(),
             external_comparison: None,
             settings_store_error: None,

@@ -10,7 +10,7 @@
 
 use hane_session::testing::MemoryFileService;
 use hane_session::{
-    CloseDecision, DocumentSession, FileEvent, FileEventOutcome, FileService, OpenDecision,
+    CloseDecision, DiscardOutcome, DocumentSession, FileEvent, FileEventOutcome, FileService, OpenDecision,
     OpenPolicy, OverwriteGuard, SaveDecision, SaveIntent, SaveJob, SaveOutcome, SessionId,
     SessionSet, UnsavedChanges, run_save_job,
 };
@@ -593,6 +593,60 @@ fn closing_refuses_to_drop_unsaved_work_and_never_empties_the_window() {
     assert_eq!(sessions.close(first, "Untitled"), CloseDecision::Close);
     assert_eq!(sessions.len(), 1, "the window always shows a document");
     assert_eq!(sessions.active().path(), None);
+}
+
+#[test]
+fn discarding_removes_only_the_approved_dirty_document_and_leaves_the_file_alone() {
+    let service = service_with(&[("/notes/a.md", "a\n"), ("/notes/b.md", "b\n")]);
+    let mut sessions = opened(&service, "/notes/a.md");
+    let first = sessions.active_id();
+    type_into(sessions.active_mut(), "unsaved");
+    let generation = sessions.get(first).unwrap().generation();
+    let second = sessions.apply_open(None, service.load(Path::new("/notes/b.md")).unwrap());
+    type_into(sessions.get_mut(second).unwrap(), "other edits");
+
+    // The ordinary close guard is unchanged.
+    assert_eq!(
+        sessions.close(first, "Untitled"),
+        CloseDecision::Reject(UnsavedChanges)
+    );
+    // A stale approval discards nothing.
+    assert_eq!(
+        sessions.discard(first, generation.wrapping_add(1), "Untitled"),
+        DiscardOutcome::Stale
+    );
+    assert!(sessions.get(first).is_some());
+
+    assert_eq!(
+        sessions.discard(first, generation, "Untitled"),
+        DiscardOutcome::Discarded
+    );
+    assert!(sessions.get(first).is_none());
+    assert!(sessions.get(second).unwrap().is_dirty(), "other tabs keep their edits");
+    assert!(
+        service.load(Path::new("/notes/a.md")).is_ok(),
+        "the file on disk is untouched"
+    );
+    assert_eq!(
+        sessions.discard(first, generation, "Untitled"),
+        DiscardOutcome::Stale,
+        "a second click for the same id finds nothing"
+    );
+}
+
+#[test]
+fn discarding_the_last_document_leaves_a_fresh_blank_one() {
+    let mut sessions = SessionSet::with_untitled("", "Untitled");
+    let only = sessions.active_id();
+    type_into(sessions.active_mut(), "draft text");
+    let generation = sessions.active().generation();
+    assert_eq!(
+        sessions.discard(only, generation, "Untitled"),
+        DiscardOutcome::Discarded
+    );
+    assert_eq!(sessions.len(), 1);
+    assert_ne!(sessions.active_id(), only);
+    assert!(!sessions.active().is_dirty());
 }
 
 #[test]

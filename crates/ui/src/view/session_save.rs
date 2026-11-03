@@ -28,6 +28,7 @@ impl EditorView {
             let (should_save, composing) = view
                 .read_with(cx, |view, _| {
                     let current = view.document_instance(id) == instance
+                        && !view.tab_discard_pending.contains_key(&id)
                         && view.sessions.active_id() == id
                         && view
                             .sessions
@@ -266,6 +267,11 @@ impl EditorView {
             self.title_sync_deferred.insert(id);
             return;
         }
+        if self.tab_discard_pending.contains_key(&id) {
+            // The user chose to throw this document away; no new file may be
+            // created or renamed on its behalf.
+            return;
+        }
         if self.title_sync_in_flight.contains(&id) {
             // Another probe or write for this session is already running; the
             // next edit re-arms this timer, so nothing is lost by skipping.
@@ -396,6 +402,13 @@ impl EditorView {
                     return;
                 }
                 view.title_sync_in_flight.remove(&id);
+                // An approved discard must not be raced by the file this
+                // probe was about to create: drop the create and let the
+                // discard proceed instead.
+                if view.tab_discard_pending.contains_key(&id) {
+                    view.resolve_pending_tab_discard(id, cx);
+                    return;
+                }
                 // A session that no longer exists (closed in the meantime)
                 // defers the same as one that reports
                 // `should_defer_h1_create`; `retry_title_sync` picks this
@@ -605,6 +618,7 @@ impl EditorView {
             }
         }
         self.resolve_pending_tab_close(id, cx);
+        self.resolve_pending_tab_discard(id, cx);
         // Publish the exact state from every session before returning, so a
         // request arriving before the next render does not read a stale value.
         self.sync_external_open_guard();
@@ -1024,6 +1038,7 @@ impl EditorView {
         } else {
             self.tab_close_after_save.remove(&id);
         }
+        self.resolve_pending_tab_discard(id, cx);
         // Recompute from every session after the pending-save chain settled, so
         // the next external request sees the exact state without waiting for a
         // render; other sessions' dirty / saving state keeps it raised.
