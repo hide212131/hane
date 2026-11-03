@@ -230,7 +230,7 @@ impl EditorView {
     /// out so the approved text is not written back.
     fn drafts_to_flush(&self) -> Vec<(&SessionId, &WorkFolderDraft)> {
         let mut drafts: Vec<_> = self.work_folder_drafts.iter().collect();
-        for (id, pending) in &self.tab_discard_pending {
+        for id in self.tab_discard_pending.keys() {
             if self.work_folder_drafts.contains_key(id) {
                 continue;
             }
