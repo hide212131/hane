@@ -4,7 +4,22 @@ This directory vendors the crates.io package `gpui-pre-windows 0.3.6`, a
 snapshot of Zed `bcf6582ce3500df93a8a39366640173e6786cea6`. The downloaded crate
 SHA-256 is `27662e65bfcf4445d2cccfad91f1570ec07f4b1b5de98400a9f207fd19c464cf`.
 The Apache-2.0 license is retained in `LICENSE-APACHE`. Hane changes only
-`src/events.rs`, `src/vsync.rs`, and `src/dispatcher.rs`.
+`src/events.rs`, `src/vsync.rs`, `src/dispatcher.rs`, and `src/clipboard.rs`.
+
+## Prefer PNG and retry a busy clipboard (Issue #591)
+
+`read_from_clipboard` already reads text and image formats inside one
+`ClipboardGuard`. It used to keep whichever image format was enumerated first, so
+a CF_DIB (no alpha) could win over a `PNG` representation that keeps
+transparency. It now keeps one image by priority: `PNG`, then `JFIF`/`GIF`, then
+`CF_DIB`, then the rest. `ClipboardGuard::open` retries `OpenClipboard` up to
+five times, 10 ms apart, because another process may hold the clipboard briefly;
+the final failure is still reported as no clipboard content, since GPUI's
+`Option` return type cannot express "busy" (that distinction belongs to the #596
+rich snapshot API).
+
+A real Windows 11 screenshot paste (Snipping Tool, Print Screen) and an image
+copied from an image app need a Hane GUI check on the final PR head.
 
 ## Refresh the caret's input-mode badge
 

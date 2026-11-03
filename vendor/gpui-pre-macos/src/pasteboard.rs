@@ -12,12 +12,24 @@ use cocoa::{
 };
 use objc::{msg_send, rc::StrongPtr, runtime::Object, sel, sel_impl};
 use smallvec::SmallVec;
-use strum::IntoEnumIterator as _;
 
 use crate::ns_string;
 use gpui::{
     ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
 };
+
+/// Raster formats first (PNG carries alpha), SVG last: it is not a raster image.
+const HANE_IMAGE_FORMAT_PRIORITY: [ImageFormat; 9] = [
+    ImageFormat::Png,
+    ImageFormat::Tiff,
+    ImageFormat::Jpeg,
+    ImageFormat::Gif,
+    ImageFormat::Bmp,
+    ImageFormat::Webp,
+    ImageFormat::Ico,
+    ImageFormat::Pnm,
+    ImageFormat::Svg,
+];
 
 pub struct Pasteboard {
     inner: StrongPtr,
@@ -49,7 +61,24 @@ impl Pasteboard {
         }
     }
 
+    /// Hane: reads one pasteboard generation. The item is only returned when
+    /// `changeCount` is the same before and after the read, so text and image
+    /// representations always come from the same generation. A generation that
+    /// keeps changing is reported as "nothing" after a bounded number of tries.
     pub fn read(&self) -> Option<ClipboardItem> {
+        const ATTEMPTS: usize = 3;
+        for _ in 0..ATTEMPTS {
+            let before: isize = unsafe { msg_send![*self.inner, changeCount] };
+            let item = self.read_generation();
+            let after: isize = unsafe { msg_send![*self.inner, changeCount] };
+            if before == after {
+                return item;
+            }
+        }
+        None
+    }
+
+    fn read_generation(&self) -> Option<ClipboardItem> {
         unsafe {
             // Check for file paths first
             let filenames = NSPasteboard::propertyListForType(*self.inner, NSFilenamesPboardType);
@@ -73,18 +102,21 @@ impl Pasteboard {
                 }
             }
 
-            // Next, check for a plain string.
+            // Next, the plain string and, from the same generation, one image
+            // (Hane: a text + image clipboard keeps both so the editor can
+            // prefer the image without reading the pasteboard a second time).
+            let mut entries = Vec::new();
             if let Some(string_entry) = self.read_string_from_pasteboard() {
-                return Some(ClipboardItem {
-                    entries: vec![string_entry],
-                });
+                entries.push(string_entry);
             }
-
-            // Finally, try the various supported image types.
-            for format in ImageFormat::iter() {
+            for format in HANE_IMAGE_FORMAT_PRIORITY {
                 if let Some(item) = self.read_image(format) {
-                    return Some(item);
+                    entries.extend(item.entries);
+                    break;
                 }
+            }
+            if !entries.is_empty() {
+                return Some(ClipboardItem { entries });
             }
         }
 
@@ -533,6 +565,39 @@ mod tests {
                 assert_eq!(img.bytes, png_bytes);
             }
             other => panic!("expected Image, got {:?}", other),
+        }
+    }
+
+    // Hane: a clipboard holding both a string and an image returns both from
+    // one generation, so the editor never has to read the pasteboard twice.
+    #[test]
+    fn hane_read_keeps_text_and_image_of_one_generation() {
+        let pasteboard = Pasteboard::unique();
+        let png_bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
+
+        unsafe {
+            let ns_png_type = NSPasteboardTypePNG;
+            let types_array = NSArray::arrayWithObjects(nil, &[NSPasteboardTypeString, ns_png_type]);
+            pasteboard.inner.declareTypes_owner(types_array, nil);
+            let text = NSData::dataWithBytes_length_(nil, b"cell".as_ptr() as *const c_void, 4);
+            pasteboard.inner.setData_forType(text, NSPasteboardTypeString);
+            let data = NSData::dataWithBytes_length_(
+                nil,
+                png_bytes.as_ptr() as *const c_void,
+                png_bytes.len() as u64,
+            );
+            pasteboard.inner.setData_forType(data, ns_png_type);
+        }
+
+        let item = pasteboard.read().expect("should read text and image");
+        assert_eq!(item.entries.len(), 2);
+        match (&item.entries[0], &item.entries[1]) {
+            (ClipboardEntry::String(text), ClipboardEntry::Image(image)) => {
+                assert_eq!(text.text(), "cell");
+                assert_eq!(image.format, ImageFormat::Png);
+                assert_eq!(image.bytes, png_bytes);
+            }
+            other => panic!("expected String then Image, got {:?}", other),
         }
     }
 }

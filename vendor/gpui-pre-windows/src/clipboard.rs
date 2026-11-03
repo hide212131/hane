@@ -94,8 +94,12 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
 
     let mut entries = Vec::new();
     let mut have_text = false;
-    let mut have_image = false;
     let mut have_files = false;
+    // Hane: every representation of the one clipboard generation is read
+    // inside this single `ClipboardGuard`, and one image is kept: PNG (the
+    // only representation that carries alpha losslessly) beats the other
+    // formats, and CF_DIB (no alpha) is the last resort.
+    let mut best_image: Option<(u8, ClipboardEntry)> = None;
 
     let count = unsafe { CountClipboardFormats() };
     let mut format = 0;
@@ -107,10 +111,14 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
                 entries.push(entry);
                 have_text = true;
             }
-        } else if !have_image && is_image_format(format) {
-            if let Some(entry) = read_image(format) {
-                entries.push(entry);
-                have_image = true;
+        } else if is_image_format(format) {
+            let priority = image_format_priority(format);
+            if best_image
+                .as_ref()
+                .is_none_or(|(best, _)| priority > *best)
+                && let Some(entry) = read_image(format)
+            {
+                best_image = Some((priority, entry));
             }
         } else if !have_files && format == CF_HDROP.0 as u32 {
             if let Some(entry) = read_files() {
@@ -118,6 +126,9 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
                 have_files = true;
             }
         }
+    }
+    if let Some((_, entry)) = best_image {
+        entries.push(entry);
     }
 
     if entries.is_empty() {
@@ -175,6 +186,19 @@ fn get_clipboard_string(format: u32) -> Option<String> {
 
 fn is_image_format(format: u32) -> bool {
     IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32
+}
+
+/// Higher wins. SVG is never preferred over a raster representation.
+fn image_format_priority(format: u32) -> u8 {
+    if format == *CLIPBOARD_PNG_FORMAT {
+        4
+    } else if format == *CLIPBOARD_JPG_FORMAT || format == *CLIPBOARD_GIF_FORMAT {
+        3
+    } else if format == CF_DIB.0 as u32 {
+        2
+    } else {
+        1
+    }
 }
 
 fn write_string(item: &ClipboardString) -> Result<()> {
@@ -337,14 +361,20 @@ fn gpui_to_image_format(value: ImageFormat) -> Option<image::ImageFormat> {
 struct ClipboardGuard;
 
 impl ClipboardGuard {
+    /// Another process may hold the clipboard for a moment while it publishes
+    /// its data; retry a bounded number of times before giving up.
     fn open() -> Option<Self> {
-        match unsafe { OpenClipboard(None) } {
-            Ok(()) => Some(Self),
-            Err(e) => {
-                log::error!("Failed to open clipboard: {e}");
-                None
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            match unsafe { OpenClipboard(None) } {
+                Ok(()) => return Some(Self),
+                Err(e) if attempt == ATTEMPTS => {
+                    log::error!("Failed to open clipboard: {e}");
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
+        None
     }
 }
 

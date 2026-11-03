@@ -3258,6 +3258,7 @@ dependencies = [
  "hane-network",
  "hane-presentation",
  "hane-session",
+ "image",
  "keyring",
  "merman",
  "objc",

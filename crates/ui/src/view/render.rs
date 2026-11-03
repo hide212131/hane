@@ -473,9 +473,10 @@ impl EditorView {
             // window-to-content y conversion below account for this row's
             // height via `document_find_reserved_height` (Issue #413).
             .children(self.document_find_bar(cx));
-        // Relative image destinations resolve against the session's own file,
-        // never against the directory the process happens to run in.
-        let resolver = self.sessions.active().resource_resolver();
+        // Relative image destinations resolve against the session's own file
+        // (or an unnamed work-folder note's draft directory), never against
+        // the directory the process happens to run in.
+        let resolver = self.document_resource_resolver();
         let editor = self.sessions.active().editor();
         let editor_scrollbar = self.editor_scrollbar(self.scrollable_content_height(), cx);
         let main_column = main_column.child(

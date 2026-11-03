@@ -30,6 +30,9 @@ gpui.workspace = true
 gpui-component.workspace = true
 gpui-kit-assets.workspace = true
 unicode-segmentation.workspace = true
+# Clipboard image paste (Issue #591): decode the OS image and re-encode PNG. The
+# version and feature set are already in the lockfile through GPUI.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif", "webp"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

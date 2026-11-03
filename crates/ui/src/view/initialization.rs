@@ -221,6 +221,7 @@ impl EditorView {
             title_sync_in_flight: HashSet::new(),
             title_sync_scheduled: HashMap::new(),
             title_sync_deferred: HashSet::new(),
+            image_paste: ImagePasteState::default(),
             loading_paths: HashSet::new(),
             latest_open_target: None,
             pending_restore: VecDeque::new(),

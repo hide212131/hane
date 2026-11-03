@@ -104,9 +104,10 @@ impl EditorView {
         let session = self.sessions.active();
         let revision = session.revision();
         let selection = session.editor().selection();
-        let clipboard_text = cx.read_from_clipboard().and_then(|item| item.text());
-        let has_clipboard_text = clipboard_text.as_deref().is_some_and(|text| !text.is_empty());
-        let link_url = clipboard_text.as_deref().and_then(clipboard_http_url);
+        // One read: a clipboard that holds only an image still enables Paste.
+        let snapshot = ClipboardSnapshot::read(cx);
+        let has_clipboard_text = snapshot.has_paste_content();
+        let link_url = snapshot.text().and_then(clipboard_http_url);
         let link_available = self.body_editable()
             && self.editor().ime().is_none()
             && link_url

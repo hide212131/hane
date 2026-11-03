@@ -3,7 +3,23 @@
 crates.io の `gpui-pre-macos 0.3.6`（Zed `bcf6582ce3500df93a8a39366640173e6786cea6`）を同梱する。
 配布 crate の SHA-256 は `951d17e41a72067ad2d35c60e08a62e8ad7fa9400b41c802e26cfb459f6c05da`。
 Apache-2.0 ライセンスは `LICENSE-APACHE` に保持する。Hane 固有の製品コード変更は
-`src/text_system.rs` と `src/platform.rs` に限る。GPUI の他プラットフォーム実装は変更しない。
+`src/text_system.rs`、`src/platform.rs`、`src/pasteboard.rs` に限る。GPUI の他プラットフォーム実装は変更しない。
+
+## クリップボードの本文と画像を同一世代で読む（Issue #591）
+
+`Pasteboard::read` は、ファイルパスがない場合に本文と画像表現（PNG 優先、SVG は最後）を
+一つの `ClipboardItem` にまとめる。従来は本文があると画像を返さなかったため、
+本文と画像が混在するクリップボードで画像を優先できなかった。読み取りの前後で
+`changeCount` を比較し、世代が変わった場合は最大 3 回までやり直す。それでも変化し続ける
+場合は `None` を返す（GPUI の `Option` では「空」と区別できない。区別は #596 の rich snapshot
+公開 API で扱う）。ファイルパス・本文のみ・画像のみの既存の戻り値は変えない。
+
+```sh
+cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml \
+  --features runtime_shaders,font-kit,test-support --lib pasteboard
+```
+
+実際のスクリーンショットや画像アプリからの貼り付けは、Hane GUI で macOS 実機確認が必要。
 
 ## 日本語の合成斜体
 
