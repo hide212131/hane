@@ -17837,6 +17837,75 @@ mod tests {
         (instance, draft_id)
     }
 
+    /// A superseded approval no longer covers the text even with the same
+    /// revision: reconfirm during the removal, cancel, then flush before the
+    /// removal result is accepted. The real journal must hold the body again
+    /// without any UI callback, and a stale removal ordered earlier must not
+    /// delete it.
+    #[gpui::test]
+    fn flush_after_a_superseded_discard_restores_the_unedited_draft_to_the_real_journal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-superseded-flush", "keep me");
+        OsDraftStore
+            .write_snapshot(
+                &fx.root,
+                fx.draft_id,
+                &fx.root,
+                "keep me",
+                hane_session::next_draft_snapshot_sequence(),
+            )
+            .unwrap();
+        // Requested after the journalled snapshot, before the later flush.
+        let removal_sequence = hane_session::next_draft_snapshot_sequence();
+        view.update(cx, |view, cx| {
+            view.draft_store = Arc::new(OsDraftStore);
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            hold_discard_removal(view, fx.id, draft);
+            // The removal already reached the journal before the flush.
+            OsDraftStore
+                .remove_ordered(&fx.root, fx.draft_id, removal_sequence)
+                .unwrap();
+            view.request_tab_close(fx.id, cx);
+            assert!(view.tab_discard_pending[&fx.id].superseded);
+            // Cancel / Escape: the removal result is still outstanding.
+            view.tab_close_confirm = None;
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+            // No edit, no finish_tab_discard_removal: only the exit flush.
+            view.flush_pending_drafts();
+        });
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["keep me".to_owned()],
+            "the superseded draft is back in the durable journal"
+        );
+        // A removal requested before the flush runs late and must not win.
+        OsDraftStore
+            .remove_ordered(&fx.root, fx.draft_id, removal_sequence)
+            .unwrap();
+        assert_eq!(recovered_texts(&fx.root), vec!["keep me".to_owned()]);
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// The approval is still valid and the text unedited: the flush must not
+    /// write the approved-for-removal draft back.
+    #[gpui::test]
+    fn flush_does_not_restore_an_unedited_draft_with_a_valid_discard_approval(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-valid-flush", "bye");
+        view.update(cx, |view, _| {
+            view.draft_store = Arc::new(OsDraftStore);
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            hold_discard_removal(view, fx.id, draft);
+            view.flush_pending_drafts();
+        });
+        assert!(recovered_texts(&fx.root).is_empty());
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     #[gpui::test]
     fn save_and_close_without_a_path_waits_for_a_running_draft_removal_and_keeps_its_failure(
         cx: &mut gpui::TestAppContext,

@@ -198,8 +198,11 @@ impl EditorView {
     }
 
     /// A draft whose approved discard is still removing its journal entry,
-    /// but whose document was edited after the approval: that text was never
-    /// approved for removal. Same document instance and a moved revision.
+    /// but whose approval no longer covers the text: the document was edited
+    /// after the approval (moved revision), or a newer confirmation replaced
+    /// the approval (`superseded`, whatever the revision). Same document
+    /// instance only. This is the single criterion for "must be kept" shared
+    /// by the debounce reclaim and every flush.
     fn edited_discarding_draft(&self, id: SessionId) -> Option<&WorkFolderDraft> {
         let pending = self.tab_discard_pending.get(&id)?;
         let draft = pending.removing.as_ref()?;
@@ -207,7 +210,7 @@ impl EditorView {
             return None;
         }
         let session = self.sessions.get(id)?;
-        (session.revision() != pending.revision).then_some(draft)
+        (pending.superseded || session.revision() != pending.revision).then_some(draft)
     }
 
     /// Takes an edited draft back out of a running discard removal, so the
