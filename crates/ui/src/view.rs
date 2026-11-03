@@ -17266,6 +17266,75 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_new_document_still_writes_its_h1_file_while_the_old_discard_callback_is_outstanding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-switch-new-writer-old", "old body");
+        let new_root = draft_test_root("discard-switch-new-writer-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let new_text = "# New title\nnew body";
+
+        // The old document's discard removal has not reported back when the
+        // work folder is switched and the reused id gets a new document.
+        let (old_instance, old_draft_id) = view.update(cx, |view, cx| {
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            let held = hold_discard_removal(view, fx.id, draft);
+            view.reset_for_work_folder_switch(cx);
+            view.work_folder = Some(OsWorkFolderScanner.scan(&new_root).unwrap());
+            assert_eq!(view.sessions.active_id(), fx.id, "the id is reused");
+            view.editor_mut().insert_text(new_text).unwrap();
+            view.after_input(cx);
+            held
+        });
+
+        // The regular H1 naming path (not a direct save) creates the file.
+        view.update(cx, |view, cx| {
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            assert!(
+                view.title_sync_in_flight.contains(&fx.id),
+                "the new document's H1 create is not suppressed by the old pending"
+            );
+        });
+        cx.run_until_parked();
+
+        let created = markdown_files(&new_root);
+        assert_eq!(created.len(), 1, "the new document's file is created");
+        assert_eq!(std::fs::read_to_string(&created[0]).unwrap(), new_text);
+        assert!(
+            markdown_files(&fx.root).is_empty(),
+            "nothing is written into the old workspace"
+        );
+
+        // The old callback finally reports back; the new file and document
+        // are left as they were.
+        view.update(cx, |view, cx| {
+            view.finish_tab_discard_removal(fx.id, old_instance, old_draft_id, Ok(()), cx);
+            view.finish_tab_discard_removal(
+                fx.id,
+                old_instance,
+                old_draft_id,
+                Err("late failure".to_owned()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&created[0]).unwrap(), new_text);
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the new document stays open");
+            assert_eq!(session.path(), Some(created[0].as_path()));
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    #[gpui::test]
     fn discard_waits_for_a_running_save_then_closes_without_rolling_the_write_back(
         cx: &mut gpui::TestAppContext,
     ) {
