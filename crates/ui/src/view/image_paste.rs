@@ -126,6 +126,7 @@ impl ClipboardSnapshot {
     /// A GPUI `ClipboardItem` cannot say which images are alternative formats
     /// of one OS item, so each of its image entries counts as its own item.
     /// The native reads below collapse the formats of one item beforehand.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     pub(crate) fn from_item(item: &ClipboardItem) -> Self {
         let images = item
             .entries()
