@@ -482,13 +482,39 @@ fn table_row_keeps_one_target_each_for_markdown_and_bare_links() {
     assert_eq!(link_runs(row).len(), 2, "only the two bare URLs are colored");
 }
 
-fn table_body_row(blocks: &[VisualBlock]) -> &VisualLine {
-    blocks
+/// Selects the single-body-row fixture's body row by its source range (the
+/// third source line), never by position among `TableRow` lines: a trailing
+/// reference-definition display row is also a `TableRow`. Exactly one line must
+/// start inside the body row, and no other table line may carry a link target.
+fn table_body_row<'a>(blocks: &'a [VisualBlock], source: &str) -> &'a VisualLine {
+    let body_start: usize = source.split_inclusive('\n').take(2).map(str::len).sum();
+    let table_lines = blocks
         .iter()
         .flat_map(|block| &block.lines)
         .filter(|line| line.kind == BlockKind::TableRow)
-        .last()
-        .expect("table body row")
+        .collect::<Vec<_>>();
+    let selected = table_lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            line.source_range.start.0 <= body_start && body_start < line.source_range.end.0
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected.len(),
+        1,
+        "exactly one table body row at {body_start}"
+    );
+    let row = selected[0];
+    for other in table_lines.iter().filter(|line| !std::ptr::eq(**line, row)) {
+        assert!(
+            other.links.is_empty(),
+            "non-body table line {:?} has no link targets: {:?}",
+            other.source_range,
+            other.links
+        );
+    }
+    row
 }
 
 /// Issue #673: a table cell's Link color follows the formal parser's origin
@@ -497,7 +523,7 @@ fn table_body_row(blocks: &[VisualBlock]) -> &VisualLine {
 fn table_link_color_follows_formal_origin_not_label_text() {
     let source = "| h | k |\n| --- | --- |\n| [https://a.example](https://a.example) [m](https://m.example/) | https://bare.example |\n";
     let blocks = present(source);
-    let row = table_body_row(&blocks);
+    let row = table_body_row(&blocks, source);
     // Markdown links: raw text and targets kept, no Link color.
     let bare = "https://bare.example";
     let visual = row.visual_text.rfind(bare).expect("bare url visible");
@@ -533,7 +559,7 @@ fn table_same_url_in_markdown_label_and_bare_cell_colors_only_the_bare() {
     let source =
         format!("| h | k |\n| --- | --- |\n| [{url}]({url}) | {url} |\n");
     let blocks = present(&source);
-    let row = table_body_row(&blocks);
+    let row = table_body_row(&blocks, &source);
     let visual = row.visual_text.rfind(url).expect("bare url visible");
     assert_eq!(link_runs(row), [(visual, visual + url.len())]);
     assert_eq!(row.links.len(), 2);
@@ -546,7 +572,7 @@ fn table_reference_label_is_not_colored_and_keeps_the_formal_destination() {
         "| h | k |\n| --- | --- |\n| [{LABEL}][r] | https://bare.example |\n\n[r]: {DEST}\n"
     );
     let blocks = present(&source);
-    let row = table_body_row(&blocks);
+    let row = table_body_row(&blocks, &source);
     let reference = row
         .links
         .iter()
