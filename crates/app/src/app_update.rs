@@ -2880,26 +2880,56 @@ mod tests {
     fn a_write_failure_after_the_download_is_not_reported_as_a_failed_check() {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.script_check();
-        fixture.script_archive();
         fixture.check_now();
-        // The receipts location is unusable from here on; the update itself
-        // and the log stay writable. The download operation re-verifies the
-        // offer before fetching anything (`reverify_offer`), which reads the
-        // sequence floor from this same location, so the failure now surfaces
-        // in the download operation's `write_download` stage rather than at
-        // the later `save_history` step. It is still a persistence failure of
-        // the download, never a failed check.
-        fs::write(fixture.dir.path().join("receipts"), b"not a directory").unwrap();
+        // The receipts location is made unusable exactly once, when the
+        // archive is requested. By then the download operation has passed its
+        // offer re-verification (`reverify_offer`, which reads the sequence
+        // floor from this location), so the failure cannot occur earlier and
+        // does not depend on how an OS opens a path below a broken parent. The
+        // archive is then served and verified; only the later history write
+        // (`save_history`) hits the persistence failure.
+        let receipts = fixture.dir.path().join("receipts");
+        let broken = receipts.clone();
+        let zip = fixture.release.zip.clone();
+        fixture.transport.push(
+            &asset_url(&fixture.tag, ARCHIVE_NAME),
+            Scripted::Custom(Box::new(move || {
+                fs::write(&broken, b"not a directory").unwrap();
+                match Scripted::body(200, zip) {
+                    Scripted::Respond(response) => Ok(response),
+                    _ => unreachable!("a body response"),
+                }
+            })),
+        );
         fixture.service.download(&fixture.candidate_id());
         run_queued(&fixture.queue);
+        let archive_url = asset_url(&fixture.tag, ARCHIVE_NAME);
+        assert!(
+            fixture
+                .transport
+                .requests()
+                .iter()
+                .any(|request| request.url == archive_url),
+            "the archive must have been requested before the failure"
+        );
+        assert!(receipts.is_file(), "the receipts location was broken by the archive request");
         let snapshot = fixture.service.snapshot();
         assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
-        assert_eq!(snapshot.error_stage.as_deref(), Some("write_download"));
+        assert_eq!(snapshot.error_stage.as_deref(), Some("save_history"));
         assert_ne!(snapshot.error_stage.as_deref(), Some("check"));
         assert_ne!(snapshot.error_code.as_deref(), Some("not_found"));
         assert!(!fixture.updates_root().join("candidates").exists());
+        assert!(
+            fixture
+                .service
+                .inner
+                .work_dir()
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_none()),
+            "the private work directory must be cleaned"
+        );
         let report = fixture.service.diagnostics_text();
-        assert!(report.contains("stage=write_download"), "{report}");
+        assert!(report.contains("stage=save_history"), "{report}");
         assert!(!report.contains("stage=check"), "{report}");
         assert!(report.contains("os_kind="), "the OS error kind must be kept: {report}");
         assert!(report.contains("candidate=0.27.0"), "{report}");
