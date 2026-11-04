@@ -736,6 +736,10 @@ impl EditorView {
             // this user-chosen write's own landing can close the tab.
             self.tab_close_after_save.insert(id, instance);
         }
+        let slot_was_busy = self
+            .sessions
+            .get(id)
+            .is_some_and(DocumentSession::save_in_flight);
         self.save_session(id, SaveIntent::To(path), cx);
         if carries_rewrite
             && self
@@ -744,6 +748,18 @@ impl EditorView {
                 .is_some_and(DocumentSession::disarm_save_rewrite)
         {
             // No write took the rewrite (a folder move blocked the save).
+            self.tab_close_after_save.remove(&id);
+            return false;
+        }
+        // Without a rewrite there is nothing to disarm, so a write that was
+        // requested on a free save slot has started only when the slot is now
+        // taken. A busy slot is not evidence about this request.
+        if !slot_was_busy
+            && !self
+                .sessions
+                .get(id)
+                .is_some_and(DocumentSession::save_in_flight)
+        {
             self.tab_close_after_save.remove(&id);
             return false;
         }
@@ -1469,6 +1485,40 @@ mod tests {
         assert_eq!(std::fs::read(to.join("images").join(name)).unwrap(), b"someone else's");
         assert_eq!(std::fs::read(to.join("images").join(&new_name)).unwrap(), b"mine");
         assert_eq!(text_of(&view, cx), saved);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_save_as_blocked_by_a_folder_move_without_a_rewrite_removes_its_own_copy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-blocked-no-rewrite");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        let name = "hane-paste-1-0123abcd.png";
+        std::fs::write(from.join("images").join(name), b"png-bytes").unwrap();
+        // An unrelated image in the destination is not ours to remove.
+        std::fs::write(to.join("images").join("other.png"), b"other").unwrap();
+        let body = format!("![画像](images/{name})\n");
+        let (view, cx) = open_file_view(cx, &from, &body);
+        view.update(cx, |view, _| {
+            view.folder_trash_in_flight = Some(to.clone());
+        });
+        save_as(&view, cx, to.join("note.md"));
+        assert!(!to.join("note.md").exists(), "no document is written");
+        assert!(!to.join("images").join(name).exists(), "the unpublished copy is removed");
+        assert!(from.join("images").join(name).is_file(), "the original image is kept");
+        assert_eq!(
+            std::fs::read(to.join("images").join("other.png")).unwrap(),
+            b"other"
+        );
+        assert_eq!(text_of(&view, cx), body);
+        view.read_with(cx, |view, _| {
+            assert!(view.image_paste.save_as_copies.is_empty());
+            assert!(view.tab_close_after_save.is_empty());
+            assert!(!view.sessions.active().save_in_flight());
+        });
         std::fs::remove_dir_all(root).unwrap();
     }
 
