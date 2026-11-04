@@ -2541,6 +2541,41 @@ impl EditorView {
         let reconfirming = self
             .tab_close_confirm
             .is_some_and(|confirm| confirm.id == id);
+        if edited && session.path().is_some() {
+            // The document earned a path while the removal ran, so its draft
+            // was retired (`retire_work_folder_draft`). The old approval is
+            // void, and the draft must not be registered or journaled again:
+            // the saved file is the document's copy now. A failed removal only
+            // leaves a leftover file, so it is retried best-effort.
+            let dirty = session.is_dirty();
+            let root = self
+                .work_folder
+                .as_ref()
+                .map(|folder| folder.root().to_path_buf());
+            if result.is_err()
+                && let Some(root) = root
+            {
+                let draft_store = self.draft_store.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = draft_store.remove(&root, draft.draft_id);
+                    })
+                    .detach();
+            }
+            self.rescue_journal_requests.remove(&id);
+            self.content_search_workspace_changed(cx);
+            if dirty {
+                self.reconfirm_tab_close(id, cx);
+            }
+            let confirming = self
+                .tab_close_confirm
+                .is_some_and(|confirm| confirm.id == id);
+            if !confirming {
+                self.resume_writers_after_discard_settled(id, instance, false, cx);
+            }
+            cx.notify();
+            return;
+        }
         match result {
             Ok(()) if !edited && !reconfirming && !busy && !pending.superseded => {
                 self.tab_discard_pending.insert(

@@ -210,6 +210,12 @@ impl EditorView {
             return None;
         }
         let session = self.sessions.get(id)?;
+        // A document that earned a path has retired its draft (Save As or the
+        // H1 first write): the journal entry is no longer its recovery copy,
+        // so a removal still running must neither be reclaimed nor flushed.
+        if session.path().is_some() {
+            return None;
+        }
         (pending.superseded || session.revision() != pending.revision).then_some(draft)
     }
 
