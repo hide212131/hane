@@ -1569,6 +1569,67 @@ mod tests {
     }
 
     #[gpui::test]
+    fn save_as_leaves_code_examples_untouched_next_to_a_conflicting_real_image(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-examples");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"one").unwrap();
+        std::fs::write(to.join("images").join(NAME_ONE), b"other-1").unwrap();
+        let fenced = format!("```md\n![例](images/{NAME_ONE})\n```\n");
+        let inline = format!("`![例](images/{NAME_ONE})`\n");
+        let body = format!("前\n\n{fenced}\n{inline}\n![画像](images/{NAME_ONE})\n\n後\n");
+        let (view, cx) = open_file_view(cx, &from, &body);
+        select(&view, cx, 0, 0);
+        edit_view(&view, cx, EditorCommand::Insert("あ"));
+        let expected: [&[u8]; 1] = [b"one"];
+        let assert_examples_intact = |text: &str| {
+            assert!(text.contains(&fenced), "{text:?}");
+            assert!(text.contains(&inline), "{text:?}");
+            assert_references_resolve(text, &to, &expected);
+        };
+
+        save_as(&view, cx, to.join("note.md"));
+
+        let saved = std::fs::read_to_string(to.join("note.md")).unwrap();
+        assert_eq!(text_of(&view, cx), saved);
+        assert_examples_intact(&saved);
+        let new_name = reference_in(&saved);
+        assert_ne!(new_name, NAME_ONE);
+        assert!(saved.ends_with(&format!("![画像](images/{new_name})\n\n後\n")));
+        edit_view(&view, cx, EditorCommand::Undo);
+        let undone = text_of(&view, cx);
+        edit_view(&view, cx, EditorCommand::Redo);
+        let redone = text_of(&view, cx);
+        for state in [&saved, &undone, &redone] {
+            assert_examples_intact(state);
+        }
+        assert_eq!(saved, redone);
+        assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"other-1");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"one");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_document_with_only_code_examples_is_saved_as_is_without_copies(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-only-examples");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"one").unwrap();
+        let body = format!("```\n![例](images/{NAME_ONE})\n```\n\n`![例](images/{NAME_ONE})`\n");
+        let (view, cx) = open_file_view(cx, &from, &body);
+        save_as(&view, cx, to.join("note.md"));
+        assert_eq!(std::fs::read_to_string(to.join("note.md")).unwrap(), body);
+        assert!(!to.join("images").exists(), "no needless copy");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn a_background_tab_save_as_rewrites_only_its_own_document(cx: &mut gpui::TestAppContext) {
         let root = temp_root("save-as-background");
         let (from, to) = (root.join("a"), root.join("b"));

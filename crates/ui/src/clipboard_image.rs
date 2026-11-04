@@ -345,26 +345,45 @@ pub(crate) struct GeneratedReference {
     pub(crate) name_range: Range<usize>,
 }
 
-/// Every `](images/<generated name>)` in `text`, in document order.
+/// Every Markdown image `![..](images/<generated name>)` in `text`, in document
+/// order. Which text is an image comes from the Markdown parser, so code
+/// blocks, inline code, escaped text and plain links are never references.
 pub(crate) fn generated_references(text: &str) -> Vec<GeneratedReference> {
     const OPENER: &str = "](images/";
+    if !text.contains(OPENER) {
+        return Vec::new();
+    }
+    let parsed = hane_markdown::parse_document(
+        hane_document::Revision(0),
+        hane_document::SourceRange::new(0, text.len()),
+        text,
+    );
     let mut found = Vec::new();
-    for (index, _) in text.match_indices(OPENER) {
-        let start = index + OPENER.len();
-        let tail = &text[start..];
-        // A generated name is short; never scan far for the closing paren.
-        let window = &tail.as_bytes()[..tail.len().min(96)];
-        let Some(close) = window.iter().position(|&byte| byte == b')') else {
+    for (_, node) in parsed.tree.iter() {
+        if node.kind != hane_markdown::NodeKind::Image {
+            continue;
+        }
+        let (image_start, image_end) = (node.source_range.start.0, node.source_range.end.0);
+        let Some(source) = text.get(image_start..image_end) else {
             continue;
         };
-        let candidate = &tail[..close];
+        // The destination is the last `](images/` of the image, and the name
+        // must be followed by the closing paren that ends the image.
+        let Some(index) = source.rfind(OPENER) else {
+            continue;
+        };
+        let name_start = index + OPENER.len();
+        let Some(candidate) = source[name_start..].strip_suffix(')') else {
+            continue;
+        };
         if is_generated_file_name(candidate) {
             found.push(GeneratedReference {
                 file_name: candidate.to_owned(),
-                name_range: start..start + close,
+                name_range: image_start + name_start..image_start + name_start + candidate.len(),
             });
         }
     }
+    found.sort_by_key(|reference| reference.name_range.start);
     found
 }
 
@@ -698,6 +717,46 @@ mod tests {
             names,
             ["hane-paste-1-0123abcd.png", "hane-paste-22-89abcdef.png"]
         );
+        for reference in &found {
+            assert_eq!(&text[reference.name_range.clone()], reference.file_name);
+        }
+    }
+
+    #[test]
+    fn generated_references_ignore_code_and_escaped_examples() {
+        let name = "hane-paste-1-0123abcd.png";
+        let image = format!("![x](images/{name})");
+        let link = format!("[x](images/{name})");
+        let escaped = format!("\\![x](images/{name})");
+        for example in [
+            format!("```\n{image}\n```\n"),
+            format!("````md\n```\n{image}\n```\n````\n"),
+            format!("~~~\n{image}\n~~~\n"),
+            // An unclosed fence swallows the rest of the document.
+            format!("```\n{image}\n"),
+            format!("    {image}\n"),
+            format!("`{image}`\n"),
+            format!("``a ` {image} ``\n"),
+            format!("{link}\n"),
+            format!("{escaped}\n"),
+        ] {
+            assert!(generated_references(&example).is_empty(), "{example:?}");
+        }
+    }
+
+    #[test]
+    fn generated_references_keep_real_images_next_to_examples() {
+        let first = "hane-paste-1-0123abcd.png";
+        let second = "hane-paste-2-89abcdef.png";
+        let text = format!(
+            "日本語 `![e](images/{first})` 後\n\n```\n![e](images/{first})\n```\n\n\
+             ![日本](images/{first})\n\n``x`![e](images/{second})`` ![語](images/{second})\n"
+        );
+        let found = generated_references(&text);
+        let names: Vec<&str> = found.iter().map(|r| r.file_name.as_str()).collect();
+        assert_eq!(names, [first, second]);
+        let real_first = text.rfind(&format!("](images/{first})")).unwrap() + "](images/".len();
+        assert_eq!(found[0].name_range, real_first..real_first + first.len());
         for reference in &found {
             assert_eq!(&text[reference.name_range.clone()], reference.file_name);
         }
