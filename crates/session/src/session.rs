@@ -5,7 +5,7 @@ use crate::service::{
     observe_disk,
 };
 use hane_document::{Revision, RopeBuffer, SourceOffset, TextBuffer};
-use hane_editor::{Editor, RewritePlan, Selection};
+use hane_editor::{Editor, PreparedRewrite, RewritePlan, Selection};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -338,6 +338,14 @@ pub enum ReloadVerifyOutcome {
     Unverifiable { reason: String },
 }
 
+/// A rewrite a write carries: the plan, and the work already done for it.
+/// `prepared` is used only while the editor is still the state it was
+/// prepared from; otherwise the plan is evaluated again where it is needed.
+struct ArmedRewrite {
+    plan: Arc<RewritePlan>,
+    prepared: Option<PreparedRewrite>,
+}
+
 /// One open document: its editor, the file it came from, and everything about
 /// persistence that is not I/O. Holds no window, no renderer, and no executor,
 /// so every rule below is testable without a UI.
@@ -356,9 +364,9 @@ pub struct DocumentSession {
     in_flight_target: Option<PathBuf>,
     /// A rewrite the next write is to carry: that write saves the document as
     /// the plan rewrites it, and the live document follows only if it lands.
-    armed_rewrite: Option<Arc<RewritePlan>>,
+    armed_rewrite: Option<ArmedRewrite>,
     /// The rewrite of the running write, applied by its own result only.
-    in_flight_rewrite: Option<Arc<RewritePlan>>,
+    in_flight_rewrite: Option<ArmedRewrite>,
     save_sequence: u64,
     pending_save: Option<SaveIntent>,
     view: SessionViewState,
@@ -635,11 +643,35 @@ impl DocumentSession {
     /// while a write is running: such a request would be queued and could not
     /// carry the plan.
     pub fn arm_save_rewrite(&mut self, plan: Arc<RewritePlan>) -> bool {
+        self.arm_prepared_save_rewrite(plan, None)
+    }
+
+    /// [`Self::arm_save_rewrite`] with the work prepared off-thread from this
+    /// session's [`Editor::rewrite_snapshot`]. The write and the landing use
+    /// it only while the editor has not moved on from that snapshot, and
+    /// otherwise evaluate `plan` themselves, so a stale `prepared` is harmless.
+    pub fn arm_prepared_save_rewrite(
+        &mut self,
+        plan: Arc<RewritePlan>,
+        prepared: Option<PreparedRewrite>,
+    ) -> bool {
         if self.in_flight.is_some() {
             return false;
         }
-        self.armed_rewrite = Some(plan);
+        self.armed_rewrite = Some(ArmedRewrite { plan, prepared });
         true
+    }
+
+    /// Makes the live document follow a rewrite whose bytes reached the disk.
+    fn follow_rewrite(&mut self, armed: ArmedRewrite) -> bool {
+        if let Some(prepared) = armed.prepared {
+            match self.editor.apply_prepared_rewrite(prepared) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => return false,
+            }
+        }
+        self.editor.apply_rewrite(&*armed.plan).is_ok()
     }
 
     /// Drops an armed rewrite that no write took. `true` means it was unused.
@@ -658,9 +690,13 @@ impl DocumentSession {
         self.in_flight = Some(ticket);
         self.in_flight_target = Some(path.clone());
         let armed = self.armed_rewrite.take();
-        let rewritten = armed
-            .as_ref()
-            .and_then(|plan| self.editor.rewritten_document(&**plan));
+        let rewritten = armed.as_ref().and_then(|armed| match &armed.prepared {
+            Some(prepared) => self
+                .editor
+                .prepared_rewrite_document(prepared)
+                .or_else(|| self.editor.rewritten_document(&*armed.plan)),
+            None => self.editor.rewritten_document(&*armed.plan),
+        });
         // A plan that cannot be applied is not carried at all, so the saved
         // text and the live document never disagree about it.
         self.in_flight_rewrite = armed.filter(|_| rewritten.is_some());
@@ -709,7 +745,7 @@ impl DocumentSession {
                 let unchanged = self.revision() == ticket.revision;
                 // The bytes on disk are the rewritten text; the live document
                 // (with any edit made meanwhile) and its history follow now.
-                let followed = rewrite.is_none_or(|plan| self.editor.apply_rewrite(&*plan).is_ok());
+                let followed = rewrite.is_none_or(|armed| self.follow_rewrite(armed));
                 if unchanged && followed {
                     self.saved_revision = self.revision();
                     SaveOutcome::Saved

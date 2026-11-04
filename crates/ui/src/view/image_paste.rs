@@ -718,15 +718,15 @@ impl EditorView {
         id: SessionId,
         path: PathBuf,
         close_after_save: bool,
-        rewrite: Option<Arc<hane_editor::RewritePlan>>,
+        rewrite: Option<(Arc<hane_editor::RewritePlan>, Option<hane_editor::PreparedRewrite>)>,
         cx: &mut Context<Self>,
     ) -> bool {
         let carries_rewrite = rewrite.is_some();
-        if let Some(plan) = rewrite {
+        if let Some((plan, prepared)) = rewrite {
             let armed = self
                 .sessions
                 .get_mut(id)
-                .is_some_and(|session| session.arm_save_rewrite(plan));
+                .is_some_and(|session| session.arm_prepared_save_rewrite(plan, prepared));
             if !armed {
                 return false;
             }
@@ -842,17 +842,91 @@ impl EditorView {
                 return;
             }
         };
-        let destination = ticket.path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let abandon = |view: &mut Self, message: &str, cx: &mut Context<Self>| {
-            view.discard_unreferenced_copies(&destination, copied.created.clone(), cx);
-            if same_instance {
-                view.status = Some(message.to_owned());
-            }
-            cx.notify();
-        };
         if !current {
-            abandon(
-                self,
+            self.abandon_save_as_copy(
+                &ticket,
+                &copied,
+                same_instance,
+                "保存前に文書が変更されたため、保存を中止しました。もう一度保存してください",
+                cx,
+            );
+            return;
+        }
+        if copied.renamed.is_empty() {
+            self.begin_save_as_write(ticket, copied, None, cx);
+            return;
+        }
+        // Working out how every state of the edit history reads with the
+        // references renamed costs document size times history depth, so it is
+        // prepared in the background from a snapshot and only applied here,
+        // while the document still is that snapshot. Anything edited in the
+        // meantime is caught by the checks `begin_save_as_write` repeats.
+        let plan = rename_plan(copied.renamed.clone());
+        let snapshot = self
+            .sessions
+            .get(ticket.id)
+            .and_then(|session| session.editor().rewrite_snapshot());
+        let Some(snapshot) = snapshot else {
+            // An open IME composition is not in a snapshot: the write
+            // evaluates the plan itself.
+            self.begin_save_as_write(ticket, copied, Some((plan, None)), cx);
+            return;
+        };
+        self.status = Some("保存を準備しています…".to_owned());
+        cx.spawn(async move |view, cx| {
+            let background_plan = Arc::clone(&plan);
+            let prepared = cx
+                .background_executor()
+                .spawn(async move { snapshot.prepare(&*background_plan) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.begin_save_as_write(ticket, copied, Some((plan, prepared)), cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Gives up a Save As whose copies were made: the copies nothing refers to
+    /// are removed and the reason is shown for the document that asked.
+    fn abandon_save_as_copy(
+        &mut self,
+        ticket: &SaveAsCopyTicket,
+        copied: &clip::CopiedImages,
+        same_instance: bool,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let destination = ticket.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        self.discard_unreferenced_copies(&destination, copied.created.clone(), cx);
+        if same_instance {
+            self.status = Some(message.to_owned());
+        }
+        cx.notify();
+    }
+
+    /// Starts the write of a Save As whose images are copied. Everything that
+    /// could have changed while the copy and the preparation ran in the
+    /// background is checked again here, against the ticket.
+    fn begin_save_as_write(
+        &mut self,
+        ticket: SaveAsCopyTicket,
+        copied: clip::CopiedImages,
+        rewrite: Option<(Arc<hane_editor::RewritePlan>, Option<hane_editor::PreparedRewrite>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let same_instance = self.document_instance(ticket.id) == Some(ticket.instance);
+        let current = same_instance
+            && self
+                .sessions
+                .get(ticket.id)
+                .is_some_and(|session| session.revision() == ticket.revision)
+            && self.document_base_directory(ticket.id).as_deref() == Some(ticket.from.as_path());
+        if !current {
+            self.abandon_save_as_copy(
+                &ticket,
+                &copied,
+                same_instance,
                 "保存前に文書が変更されたため、保存を中止しました。もう一度保存してください",
                 cx,
             );
@@ -868,8 +942,10 @@ impl EditorView {
                 .get(ticket.id)
                 .is_some_and(DocumentSession::save_in_flight)
         {
-            abandon(
-                self,
+            self.abandon_save_as_copy(
+                &ticket,
+                &copied,
+                same_instance,
                 "別の保存が実行中のため、保存を中止しました。完了後にもう一度保存してください",
                 cx,
             );
@@ -878,7 +954,6 @@ impl EditorView {
         // The text is not edited here: the write saves it with the references
         // pointed at the copies, and the document (history included) follows
         // when that write lands.
-        let rewrite = (!copied.renamed.is_empty()).then(|| rename_plan(copied.renamed.clone()));
         let started = self.write_save_as(
             ticket.id,
             ticket.path.clone(),
@@ -887,7 +962,13 @@ impl EditorView {
             cx,
         );
         if !started {
-            abandon(self, "保存を開始できなかったため、保存しませんでした", cx);
+            self.abandon_save_as_copy(
+                &ticket,
+                &copied,
+                same_instance,
+                "保存を開始できなかったため、保存しませんでした",
+                cx,
+            );
             return;
         }
         if !copied.created.is_empty() {

@@ -110,7 +110,7 @@ impl HistoryEntry {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct History {
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
@@ -118,6 +118,11 @@ pub(crate) struct History {
 }
 
 impl History {
+    /// How many entries Undo and Redo hold; a cheap fingerprint of the shape.
+    pub(crate) fn depth(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
+    }
+
     pub(crate) fn break_group(&mut self) {
         self.can_merge_last = false;
     }

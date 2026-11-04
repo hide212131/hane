@@ -78,6 +78,8 @@ GPUIの`ClipboardItem`（Linuxと単体テスト）は項目の独立性を表�
 
 - Windowsでは独立した複数画像をOSが区別できないため、複数画像の案内は主にmacOSの複数pasteboard itemで起きる。
 - Save As の参照更新は文書ごとの保存transactionとして扱い、アクティブ/背景タブを区別しない。コピー完了後も生きているエディタ本文は変更せず、`DocumentSession::arm_save_rewrite` で次の1回の書き込みだけが「参照を更新した本文」を保存する。書き込みが成功して受理されたときだけ、同じ更新（`RewritePlan`）を生きている本文・選択・Undo/Redo履歴の全状態に適用する（履歴への追加編集は積まず、履歴の全消去もしない）。履歴の各stateは更新後のstateへ写し、元の編集単位を保てる場合は保つ。
+- 履歴の各stateへ `RewritePlan` を評価する計算は文書サイズ×Undo/Redo件数の全文parse/String再構築になるため、UI同期経路では行わない。コピー完了後に `Editor::rewrite_snapshot`（rope複製と履歴の複製だけ）を取り、背景スレッドで `RewriteSnapshot::prepare` が本文・全履歴stateの更新結果（`PreparedRewrite`）を作る。`begin_save_as_write` はticket（DocumentInstance/SessionId/revision/base）を再確認してから `arm_prepared_save_rewrite` で渡す。書き込み開始と受理は `Editor::rewrite_is_current`（document revision・履歴の件数・IME未開始が準備時と一致）の間だけ準備結果を使い、`Editor::apply_prepared_rewrite` は置換範囲の適用と履歴の差し替えだけでplanを評価しない。書き込み中の追加編集・Undo/Redo・IME開始で一致しなくなった場合は、従来の `apply_rewrite`（その時点の本文と履歴を評価）へ戻るため追加入力は失われないが、そのときだけ同期の全評価コストがかかる。準備中に文書が変わった場合は既存の「保存前に文書が変更された」中止経路でコピーを片付ける。
+- 回帰検出は `crates/session/tests/save_as_rewrite_prepared.rs`。plan呼び出し回数のカウンタで、準備済みの開始・受理がplanを一度も評価しないことと、通常経路と本文・選択・Undo/Redoの全stateが一致することを確認する（実時間には依存しない）。
 - 書き込みが失敗・競合・取り消し・古い結果になったときは本文・選択・履歴・dirty状態を一切変えず、そのSave Asが作成したコピーのうち他の文書が参照していないものだけを削除する。書き込み中の追加入力は保存結果に含まれず（`SavedStale`）、本文へ同じ更新を適用したうえで未保存のまま残る。別の保存が実行中のときは、コピーの所有権と更新を運べないためSave Asを中止して再実行を案内する。
 
 ## 未実施の検証（passとして扱わない）
