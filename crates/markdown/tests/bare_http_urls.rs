@@ -178,6 +178,34 @@ fn scan_resumes_after_the_trimmed_candidate() {
 }
 
 #[test]
+fn repeated_unmatched_closers_keep_every_url_and_range() {
+    let cases: &[(&str, &str)] = &[
+        ("https://a)", "https://a"),
+        ("https://a]", "https://a"),
+        ("https://a}", "https://a"),
+        ("https://a/(b))", "https://a/(b)"),
+    ];
+    for (unit, expected) in cases {
+        let count = 500;
+        let source = unit.repeat(count);
+        let parsed = parse(&source);
+        assert_eq!(parsed.links.len(), count, "{unit:?}");
+        for (index, link) in parsed.links.iter().enumerate() {
+            let start = index * unit.len();
+            assert_eq!(link.text_range.start.0, start, "{unit:?} #{index}");
+            assert_eq!(link.text_range.end.0, start + expected.len(), "{unit:?} #{index}");
+            assert_eq!(&*link.destination, *expected);
+        }
+    }
+
+    // A blocked prefix still skips only its own candidate, then resumes.
+    let source = format!("me@{}", "https://a)".repeat(100));
+    let parsed = parse(&source);
+    assert_eq!(parsed.links.len(), 99);
+    assert_eq!(parsed.links[0].text_range.start.0, 3 + "https://a)".len());
+}
+
+#[test]
 fn local_slice_offsets_stay_document_absolute() {
     let slice_source = "see https://example.com/x now";
     let offset = 1_000;

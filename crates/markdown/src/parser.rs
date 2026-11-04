@@ -402,6 +402,36 @@ fn trim_bare_url(candidate: &str) -> &str {
     }
 }
 
+/// Length of the raw candidate at the start of `rest`, decided in one forward
+/// pass: it ends at the first terminator or the first unmatched closing
+/// bracket, which is exactly where `trim_bare_url` would cut. Scanning past
+/// that point would only be discarded and made the scan quadratic.
+fn bare_url_extent(rest: &str) -> usize {
+    let mut depth = [0usize; 3];
+    for (offset, ch) in rest.char_indices() {
+        if is_url_terminator(ch) {
+            return offset;
+        }
+        let (kind, opens) = match ch {
+            '(' => (0, true),
+            ')' => (0, false),
+            '[' => (1, true),
+            ']' => (1, false),
+            '{' => (2, true),
+            '}' => (2, false),
+            _ => continue,
+        };
+        if opens {
+            depth[kind] += 1;
+        } else if depth[kind] == 0 {
+            return offset;
+        } else {
+            depth[kind] -= 1;
+        }
+    }
+    rest.len()
+}
+
 /// `(offset, len)` of each bare URL in `slice`, where `slice` starts at
 /// `slice_start` in `source` so the character before the slice stays visible.
 fn scan_bare_urls(source: &str, slice_start: usize, slice: &str) -> Vec<(usize, usize)> {
@@ -423,7 +453,7 @@ fn scan_bare_urls(source: &str, slice_start: usize, slice: &str) -> Vec<(usize, 
             index += 1;
             continue;
         }
-        let raw_len = rest.find(is_url_terminator).unwrap_or(rest.len());
+        let raw_len = bare_url_extent(rest);
         let blocked = source[..slice_start + index]
             .chars()
             .next_back()
@@ -502,5 +532,27 @@ pub fn parse_document(
         list_structural_prefixes,
         code_padding,
         line_break_padding,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bare_url_extent;
+
+    #[test]
+    fn extent_stops_at_the_first_unmatched_closing_bracket() {
+        let long_suffix = "x".repeat(10_000);
+        for (closer, expected) in [(')', 9), (']', 9), ('}', 9)] {
+            let rest = format!("https://a{closer}{long_suffix}");
+            assert_eq!(bare_url_extent(&rest), expected, "{closer}");
+        }
+    }
+
+    #[test]
+    fn extent_keeps_balanced_brackets_and_stops_at_terminators() {
+        assert_eq!(bare_url_extent("https://a/(b)[c]{d} e"), 19);
+        assert_eq!(bare_url_extent("https://a/(b)) tail"), 13);
+        assert_eq!(bare_url_extent("https://a/(b"), 12);
+        assert_eq!(bare_url_extent("https://a。https://b"), 9);
     }
 }
