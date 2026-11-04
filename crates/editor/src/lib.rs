@@ -527,7 +527,7 @@ impl Editor {
             Some(rewritten) => self
                 .history
                 .rebased(now, &prepared.source_ids, rewritten, plan),
-            None => self.history.rewritten_from(now),
+            None => self.history.rewritten_from(now, plan),
         };
         self.adopt_rewrite(&edits, history)
     }

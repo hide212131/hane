@@ -234,7 +234,7 @@ impl History {
     /// `None` means the history could not be followed; nothing is changed.
     pub(crate) fn rewritten(&self, current: &str, plan: &RewritePlan) -> Option<Self> {
         let now = RewriteState::of(current.to_owned(), plan)?;
-        self.rewritten_from(now)
+        self.rewritten_from(now, plan)
     }
 
     /// The identities of every step in time order: Undo oldest first, then
@@ -248,7 +248,7 @@ impl History {
     }
 
     /// [`Self::rewritten`] for a current state that is already worked out.
-    pub(crate) fn rewritten_from(&self, now: RewriteState) -> Option<Self> {
+    pub(crate) fn rewritten_from(&self, now: RewriteState, plan: &RewritePlan) -> Option<Self> {
         let mut undo = Vec::with_capacity(self.undo.len());
         let mut after = now.clone();
         for entry in self.undo.iter().rev() {
