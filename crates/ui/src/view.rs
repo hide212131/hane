@@ -17948,6 +17948,87 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    /// Approved discard whose removal is still running, then an edit that
+    /// reclaims the draft, then a real Save As that completes before the old
+    /// removal result arrives. The saved file is the document's copy: the late
+    /// result must not register the draft or journal it again, and neither
+    /// flush may bring a recovery draft back. Another draft stays recoverable.
+    #[gpui::test]
+    fn a_late_discard_removal_after_save_as_does_not_revive_the_retired_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-saveas-late-removal", "body");
+        let other_draft = DraftId::generate();
+        OsDraftStore
+            .write_snapshot(
+                &fx.root,
+                other_draft,
+                &fx.root,
+                "other draft",
+                hane_session::next_draft_snapshot_sequence(),
+            )
+            .unwrap();
+        let saved = fx.root.join("saved.md");
+        // Requested at approval time, before the edit below.
+        let removal_sequence = hane_session::next_draft_snapshot_sequence();
+        let (instance, draft_id) = view.update(cx, |view, cx| {
+            view.draft_store = Arc::new(OsDraftStore);
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            let held = hold_discard_removal(view, fx.id, draft);
+            // Edited after the approval: the draft is taken back and journaled.
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+            view.reclaim_edited_discarding_draft(fx.id);
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            view.flush_pending_drafts();
+            held
+        });
+        assert!(recovered_texts(&fx.root).contains(&"body more".to_owned()));
+
+        // The ordinary Save As path gives the document its path while the
+        // old removal is still outstanding.
+        view.update(cx, |view, cx| {
+            view.save_session(fx.id, SaveIntent::To(saved.clone()), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "body more");
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).unwrap().path().is_some());
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+        });
+
+        // The old removal now reports back, and flushes run before and after.
+        view.update(cx, |view, cx| {
+            view.flush_pending_drafts();
+            assert_eq!(view.flush_pending_drafts_checked(), Ok(0));
+            OsDraftStore
+                .remove_ordered(&fx.root, draft_id, removal_sequence)
+                .unwrap();
+            view.finish_tab_discard_removal(fx.id, instance, draft_id, Ok(()), cx);
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+            assert!(!view.rescue_journal_requests.contains_key(&fx.id));
+            assert!(!view.tab_discard_pending.contains_key(&fx.id));
+            assert!(view.tab_close_confirm.is_none(), "no needless reconfirm");
+            view.flush_pending_drafts();
+            assert_eq!(view.flush_pending_drafts_checked(), Ok(0));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the saved tab stays");
+            assert!(!session.is_dirty());
+            assert_eq!(session.editor().document().full_text(), "body more");
+        });
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "body more");
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["other draft".to_owned()],
+            "only the unrelated draft remains in the real journal"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     #[gpui::test]
     fn save_and_close_without_a_path_waits_for_a_running_draft_removal_and_keeps_its_failure(
         cx: &mut gpui::TestAppContext,
