@@ -71,6 +71,9 @@ pub struct AppUpdateSnapshot {
     /// restore found a prepared one). The view shows the notice at most once
     /// per process.
     pub startup_announce: Option<String>,
+    /// Whole seconds left of a failure backoff during which a manual check is
+    /// refused. `None` when a check can be started now.
+    pub retry_wait_secs: Option<u64>,
 }
 
 impl AppUpdateSnapshot {
@@ -89,6 +92,7 @@ impl AppUpdateSnapshot {
             restart_supported: false,
             checking: false,
             startup_announce: None,
+            retry_wait_secs: None,
         }
     }
 
@@ -377,6 +381,12 @@ fn unavailable_text(code: &str) -> Option<&'static str> {
     }
 }
 
+/// The wait until a manual retry is accepted again, rounded up to a minute.
+fn retry_wait_text(secs: u64) -> String {
+    let minutes = secs.div_ceil(60).max(1);
+    format!("再試行できるのは約{minutes}分後です。")
+}
+
 fn format_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     format!("{:.1} MiB", bytes as f64 / MIB)
@@ -454,11 +464,20 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             let text = stage
                 .and_then(|stage| stage_failure_text(stage, code))
                 .unwrap_or_else(|| failure_text(code));
-            model.detail = Some(match stage {
+            let mut detail = match stage {
                 Some(stage) => format!("{text} (診断コード: {code}, 段階: {stage})"),
                 None => format!("{text} (診断コード: {code})"),
-            });
-            model.actions.push((CardAction::Check, "再試行"));
+            };
+            // During the backoff a press is refused by the service, so no
+            // retry button is offered; the wait is stated instead.
+            match snapshot.retry_wait_secs {
+                Some(secs) => {
+                    detail.push(' ');
+                    detail.push_str(&retry_wait_text(secs));
+                }
+                None => model.actions.push((CardAction::Check, "再試行")),
+            }
+            model.detail = Some(detail);
         }
         AppUpdatePhase::Unavailable => {
             model.detail = Some(match unavailable_text(code) {
@@ -619,13 +638,20 @@ pub(crate) fn panel_model(
                 .as_deref()
                 .and_then(|stage| stage_failure_text(stage, code))
                 .unwrap_or_else(|| failure_text(code));
+            let mut actions = Vec::new();
+            let mut detail = text.to_owned();
+            match snapshot.retry_wait_secs {
+                Some(secs) => {
+                    detail.push(' ');
+                    detail.push_str(&retry_wait_text(secs));
+                }
+                None => actions.push((PanelAction::Card(CardAction::Check), "再試行")),
+            }
+            actions.push(close("閉じる"));
             PanelModel {
                 title: "更新を完了できませんでした".to_owned(),
-                detail: Some(text.to_owned()),
-                actions: vec![
-                    (PanelAction::Card(CardAction::Check), "再試行"),
-                    close("閉じる"),
-                ],
+                detail: Some(detail),
+                actions,
             }
         }
         _ => PanelModel {
@@ -2166,6 +2192,31 @@ mod tests {
         let model = card_model(&input);
         assert!(model.detail.as_deref().unwrap().contains("signature_invalid"));
         assert_eq!(labels(&model), ["再試行"]);
+    }
+
+    #[test]
+    fn during_the_backoff_no_retry_is_offered_and_the_wait_is_stated() {
+        let mut input = snapshot(AppUpdatePhase::Failed);
+        input.error_code = Some("rate_limited".to_owned());
+        input.error_stage = Some("check".to_owned());
+        input.retry_wait_secs = Some(61);
+
+        let card = card_model(&input);
+        assert!(labels(&card).is_empty(), "{:?}", card.actions);
+        assert!(card.detail.as_deref().unwrap().contains("約2分後"), "{:?}", card.detail);
+
+        let panel = panel_model(&input, None, false);
+        assert!(!panel.actions.iter().any(|(action, _)| matches!(action, PanelAction::Card(_))));
+        assert!(panel.actions.contains(&(PanelAction::Close, "閉じる")));
+        assert!(panel.detail.as_deref().unwrap().contains("約2分後"), "{:?}", panel.detail);
+
+        input.retry_wait_secs = None;
+        assert_eq!(labels(&card_model(&input)), ["再試行"]);
+        assert!(
+            panel_model(&input, None, false)
+                .actions
+                .contains(&(PanelAction::Card(CardAction::Check), "再試行"))
+        );
     }
 
     #[test]

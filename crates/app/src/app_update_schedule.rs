@@ -133,6 +133,13 @@ impl AutoSchedule {
         self.retry_not_before.is_none_or(|until| now >= until)
     }
 
+    /// How long a manual check is still refused; `None` when it is allowed.
+    pub(crate) fn manual_wait(&self, now: Duration) -> Option<Duration> {
+        self.retry_not_before
+            .and_then(|until| until.checked_sub(now))
+            .filter(|wait| !wait.is_zero())
+    }
+
     /// A check started. No further automatic check is due until it finishes.
     pub(crate) fn started(&mut self, origin: CheckOrigin) {
         self.due = None;
@@ -425,6 +432,21 @@ mod tests {
         schedule.finished(now + HOUR, CheckHealth::Failure);
         assert!(!schedule.manual_allowed(now + HOUR * 3 - SECOND));
         assert!(schedule.manual_allowed(now + HOUR * 3));
+    }
+
+    #[test]
+    fn the_manual_wait_matches_the_manual_allowed_boundary() {
+        let mut schedule = AutoSchedule::default();
+        schedule.arm(Duration::ZERO);
+        let now = Duration::from_secs(40);
+        assert_eq!(schedule.manual_wait(now), None);
+        schedule.started(CheckOrigin::Startup);
+        schedule.finished(now, CheckHealth::Failure);
+        assert_eq!(schedule.manual_wait(now), Some(HOUR));
+        assert_eq!(schedule.manual_wait(now + HOUR - SECOND), Some(SECOND));
+        assert!(!schedule.manual_allowed(now + HOUR - SECOND));
+        assert_eq!(schedule.manual_wait(now + HOUR), None);
+        assert!(schedule.manual_allowed(now + HOUR));
     }
 
     #[test]

@@ -1065,7 +1065,7 @@ impl Inner {
         let work = self
             .work_dir()
             .join(format!("{op}-{}", offer.id().as_str()));
-        let mut step = "write_download";
+        let mut step = "check";
         let outcome = self.download_into(op, offer, cancel, received, &work, &mut step);
         let version = offer.candidate.version().to_string();
 
@@ -1181,10 +1181,12 @@ impl Inner {
     ) -> Result<(), UpdateError> {
         let entry = offer.candidate.target_entry();
         let tag = &offer.candidate.catalog().tag;
-        *step = "write_download";
         // A candidate kept beside a failed re-check is verified again now, so
         // an expired catalog or a raised floor is refused before any work.
+        // That is still verification, not preparing the save location.
+        *step = "check";
         self.reverify_offer(offer)?;
+        *step = "write_download";
         self.ensure_lease()?;
         create_private_dir(work)?;
         durable_write(&work.join(CATALOG_FILE), &offer.catalog)?;
@@ -1704,6 +1706,10 @@ impl Inner {
         snapshot.startup_announce = state.startup_announce.clone();
         snapshot.restart_supported = self.restart_supported();
         snapshot.diagnostics_available = self.diag.has_records();
+        snapshot.retry_wait_secs = self.sched_lock().manual_wait(self.mono.now()).map(|wait| {
+            // Round up so the last partial second is never shown as "now".
+            wait.as_secs() + u64::from(wait.subsec_nanos() > 0)
+        });
         let describe = |snapshot: &mut AppUpdateSnapshot, offer: &Offer| {
             snapshot.candidate_id = Some(offer.id().as_str().to_owned());
             snapshot.candidate_version = Some(offer.candidate.version().to_string());
@@ -2936,6 +2942,26 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_offer_reverification_is_reported_as_a_check_not_a_write() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.check_now();
+        // The sequence floor is read from the receipts location while the
+        // offer is verified again; breaking it fails that step before any
+        // local work directory is prepared.
+        fs::write(fixture.dir.path().join("receipts"), b"not a directory").unwrap();
+        fixture.service.download(&fixture.candidate_id());
+        run_queued(&fixture.queue);
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
+        assert_eq!(snapshot.error_stage.as_deref(), Some("check"));
+        assert_ne!(snapshot.error_stage.as_deref(), Some("write_download"));
+        let report = fixture.service.diagnostics_text();
+        assert!(report.contains("stage=check"), "{report}");
+        assert!(!report.contains("stage=write_download"), "{report}");
+    }
+
+    #[test]
     fn a_candidate_that_cannot_be_moved_keeps_its_cause() {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.script_check();
@@ -3624,6 +3650,15 @@ mod tests {
         assert_eq!(service.snapshot().phase, AppUpdatePhase::Failed);
         assert!(wake.try_wait());
         assert!(!service.inner.sched_lock().manual_allowed(mono.now()));
+        // The snapshot states the refusal and the remaining wait; it clears
+        // exactly when a manual check is accepted again.
+        let wait = service.snapshot().retry_wait_secs.expect("backoff is shown");
+        assert!(wait > 0 && wait <= 3600, "{wait}");
+        mono.advance(secs(wait - 1));
+        assert!(service.snapshot().retry_wait_secs.is_some());
+        mono.advance(secs(1));
+        assert!(service.inner.sched_lock().manual_allowed(mono.now()));
+        assert_eq!(service.snapshot().retry_wait_secs, None);
     }
 
     #[test]
