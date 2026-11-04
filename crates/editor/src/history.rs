@@ -1,9 +1,17 @@
 use crate::Selection;
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const GROUP_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// An identity for the content of one history entry. Process-wide so that an
+/// entry a rewrite builds can never be mistaken for one of any other history.
+fn fresh_entry_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Matches RopeBuffer's source line endings (see its `line_mirror` docs):
 /// LF, CRLF and a bare CR all end a line. A CRLF's `\r` is always followed by
@@ -23,6 +31,9 @@ pub(crate) enum EditKind {
 
 #[derive(Clone, Debug)]
 struct HistoryEntry {
+    /// Changes whenever the entry's content does (it is merged into, or
+    /// rebuilt by a rewrite), so equal ids mean an identical step.
+    id: u64,
     start: usize,
     deleted: String,
     inserted: String,
@@ -42,6 +53,7 @@ impl HistoryEntry {
         now: Instant,
     ) -> Self {
         Self {
+            id: fresh_entry_id(),
             start: summary.range_before.start.0,
             deleted: summary.inverse.replacement.clone(),
             inserted: inserted.to_owned(),
@@ -92,6 +104,7 @@ impl HistoryEntry {
         }
         self.selection_after = next.selection_after;
         self.last_edit_at = next.last_edit_at;
+        self.id = fresh_entry_id();
         true
     }
 
@@ -166,6 +179,7 @@ impl History {
         kind: EditKind,
     ) {
         self.undo.push(HistoryEntry {
+            id: fresh_entry_id(),
             start,
             deleted,
             inserted,
@@ -220,6 +234,21 @@ impl History {
     /// `None` means the history could not be followed; nothing is changed.
     pub(crate) fn rewritten(&self, current: &str, plan: &RewritePlan) -> Option<Self> {
         let now = RewriteState::of(current.to_owned(), plan)?;
+        self.rewritten_from(now)
+    }
+
+    /// The identities of every step in time order: Undo oldest first, then
+    /// Redo in the order it would be redone.
+    pub(crate) fn timeline_ids(&self) -> Vec<u64> {
+        self.undo
+            .iter()
+            .chain(self.redo.iter().rev())
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// [`Self::rewritten`] for a current state that is already worked out.
+    pub(crate) fn rewritten_from(&self, now: RewriteState) -> Option<Self> {
         let mut undo = Vec::with_capacity(self.undo.len());
         let mut after = now.clone();
         for entry in self.undo.iter().rev() {
@@ -238,6 +267,72 @@ impl History {
         redo.reverse();
         Some(Self {
             undo,
+            redo,
+            can_merge_last: false,
+        })
+    }
+
+    /// This history rewritten by taking `rewritten` (the rewrite of an older
+    /// history whose steps had `source_ids`) as far as the two still agree,
+    /// and working out only the steps that came after. The steps in common
+    /// are not evaluated again, so the plan runs once per state the editor
+    /// gained or lost since, not once per state of the whole history.
+    ///
+    /// `now` is the rewrite state of the current document text. `None` means
+    /// the history could not be followed.
+    pub(crate) fn rebased(
+        &self,
+        mut now: RewriteState,
+        source_ids: &[u64],
+        rewritten: Self,
+        plan: &RewritePlan,
+    ) -> Option<Self> {
+        let entries: Vec<&HistoryEntry> = self.undo.iter().chain(self.redo.iter().rev()).collect();
+        let n = entries.len();
+        let cursor = self.undo.len();
+        let shared = entries
+            .iter()
+            .zip(source_ids)
+            .take_while(|(entry, id)| entry.id == **id)
+            .count();
+        let mut timeline = rewritten.undo;
+        timeline.extend(rewritten.redo.into_iter().rev());
+        if timeline.len() != source_ids.len() {
+            return None;
+        }
+        timeline.truncate(shared);
+        if shared < n {
+            // Texts of the states from the earlier of the cursor and the
+            // first new step, found by walking the steps from the current text.
+            let low = cursor.min(shared);
+            let mut texts = vec![String::new(); n + 1 - low];
+            texts[cursor - low] = std::mem::take(&mut now.text);
+            for i in cursor..n {
+                let next = entries[i].applied(&texts[i - low])?;
+                texts[i + 1 - low] = next;
+            }
+            for i in (low..cursor).rev() {
+                let previous = entries[i].reverted(&texts[i + 1 - low])?;
+                texts[i - low] = previous;
+            }
+            let mut now = Some(now);
+            let mut states = Vec::with_capacity(n + 1 - shared);
+            for i in shared..=n {
+                let state = if i == cursor {
+                    now.take()?
+                } else {
+                    RewriteState::of(std::mem::take(&mut texts[i - low]), plan)?
+                };
+                states.push(state);
+            }
+            for i in shared..n {
+                timeline.push(entries[i].rebuilt(&states[i - shared], &states[i + 1 - shared]));
+            }
+        }
+        let mut redo = timeline.split_off(cursor);
+        redo.reverse();
+        Some(Self {
+            undo: timeline,
             redo,
             can_merge_last: false,
         })
@@ -309,14 +404,14 @@ pub(crate) fn map_selection(edits: &[TextEdit], selection: Selection) -> Selecti
 
 /// A document text of the history, the rewrite planned for it and the result.
 #[derive(Clone)]
-struct RewriteState {
+pub(crate) struct RewriteState {
     text: String,
-    edits: Vec<TextEdit>,
+    pub(crate) edits: Vec<TextEdit>,
     rewritten: String,
 }
 
 impl RewriteState {
-    fn of(text: String, plan: &RewritePlan) -> Option<Self> {
+    pub(crate) fn of(text: String, plan: &RewritePlan) -> Option<Self> {
         let edits = checked_edits(&text, plan(&text))?;
         let rewritten = apply_edits(&text, &edits);
         Some(Self {
@@ -392,6 +487,7 @@ impl HistoryEntry {
             )
         };
         Self {
+            id: fresh_entry_id(),
             start,
             deleted,
             inserted,

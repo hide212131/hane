@@ -664,14 +664,15 @@ impl DocumentSession {
 
     /// Makes the live document follow a rewrite whose bytes reached the disk.
     fn follow_rewrite(&mut self, armed: ArmedRewrite) -> bool {
-        if let Some(prepared) = armed.prepared {
-            match self.editor.apply_prepared_rewrite(prepared) {
-                Ok(true) => return true,
-                Ok(false) => {}
-                Err(_) => return false,
-            }
+        match armed.prepared {
+            // Exact while the editor is the prepared state; otherwise only
+            // what changed since is evaluated, never the whole history.
+            Some(prepared) => self
+                .editor
+                .follow_prepared_rewrite(prepared, &*armed.plan)
+                .is_ok(),
+            None => self.editor.apply_rewrite(&*armed.plan).is_ok(),
         }
-        self.editor.apply_rewrite(&*armed.plan).is_ok()
     }
 
     /// Drops an armed rewrite that no write took. `true` means it was unused.

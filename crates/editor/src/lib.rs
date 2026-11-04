@@ -45,7 +45,7 @@ pub use selection::Selection;
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_metrics::RollingWindow;
 pub use history::{RewritePlan, TextEdit};
-use history::{EditKind, History, checked_edits, map_selection};
+use history::{EditKind, History, RewriteState, checked_edits, map_selection};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -159,6 +159,7 @@ impl RewriteSnapshot {
         Some(PreparedRewrite {
             revision: self.document.revision(),
             depth: self.history.depth(),
+            source_ids: self.history.timeline_ids(),
             edits,
             document,
             history,
@@ -172,6 +173,9 @@ impl RewriteSnapshot {
 pub struct PreparedRewrite {
     revision: hane_document::Revision,
     depth: (usize, usize),
+    /// The identities of the history steps it was prepared from, so a later
+    /// editor can tell how much of that history it still shares.
+    source_ids: Vec<u64>,
     edits: Vec<TextEdit>,
     document: RopeBuffer,
     history: Option<History>,
@@ -493,6 +497,39 @@ impl Editor {
         self.history.break_group();
         self.adopt_rewrite(&prepared.edits, prepared.history)?;
         Ok(true)
+    }
+
+    /// Makes the editor follow `plan`, using `prepared` as far as it still
+    /// describes this editor. While it is exact this is
+    /// [`Editor::apply_prepared_rewrite`]. When the editor moved on (typing,
+    /// Undo/Redo or a composition since the preparation), the history steps
+    /// it still shares with the preparation are taken as prepared and the plan
+    /// is evaluated only on the current text and on the states of the steps
+    /// gained since: the work follows what changed, not the document size
+    /// times the whole history depth that [`Editor::apply_rewrite`] costs.
+    /// An invalid plan changes nothing.
+    pub fn follow_prepared_rewrite(
+        &mut self,
+        prepared: PreparedRewrite,
+        plan: &RewritePlan,
+    ) -> Result<(), BufferError> {
+        if self.rewrite_is_current(&prepared) {
+            self.history.break_group();
+            return self.adopt_rewrite(&prepared.edits, prepared.history);
+        }
+        self.history.break_group();
+        self.commit_composition();
+        let Some(now) = RewriteState::of(self.document.full_text(), plan) else {
+            return Ok(());
+        };
+        let edits = now.edits.clone();
+        let history = match prepared.history {
+            Some(rewritten) => self
+                .history
+                .rebased(now, &prepared.source_ids, rewritten, plan),
+            None => self.history.rewritten_from(now),
+        };
+        self.adopt_rewrite(&edits, history)
     }
 
     pub(crate) fn record_model_update(&mut self, received_at: Instant, kind: InputMeasurementKind) {
