@@ -334,7 +334,7 @@ sys.exit(int(Path(kind+'.exit').read_text()))
         calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
         self.assertEqual([c[0] for c in calls], ["test", "clippy"] * 4)
 
-    def install_gh(self, data):
+    def install_gh(self, data, failure_endpoint=None, failure_stderr=None):
         directory = self.root / "api"; directory.mkdir(exist_ok=True)
         mapping = {}
         for i, (endpoint, value) in enumerate(data.items()):
@@ -347,7 +347,11 @@ sys.exit(int(Path(kind+'.exit').read_text()))
 import json,sys
 from pathlib import Path
 mapping=json.loads(Path({str(mapfile)!r}).read_text())
-sys.stdout.buffer.write(Path(mapping[sys.argv[-1]]).read_bytes())
+endpoint=sys.argv[-1]
+if endpoint == {failure_endpoint!r}:
+    sys.stderr.write({failure_stderr!r})
+    sys.exit(1)
+sys.stdout.buffer.write(Path(mapping[endpoint]).read_bytes())
 '''); gh.chmod(0o755)
 
     def test_cli_producer_report_source_validation_and_worker_read_staging(self):
@@ -391,6 +395,31 @@ sys.stdout.buffer.write(Path(mapping[sys.argv[-1]]).read_bytes())
         done = self.workflow_run('Collect verification feedback from GitHub job logs', env=env)
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse((self.root / 'verification-feedback').exists())
+
+    def test_collector_identifies_failed_source_api_without_echoing_gh_stderr(self):
+        self.capture(101, 0)
+        endpoints = (
+            (PREFIX + "/actions/runs/12/attempts/2/jobs?per_page=100", "attempt jobs list", "HTTP 403",
+             "gh: Resource not accessible by integration (HTTP 403) Authorization: Bearer secret-sentinel"),
+            (PREFIX + "/actions/jobs/14/logs", "verifier job logs", "HTTP 404",
+             "gh: Not Found (HTTP 404) response secret-sentinel"),
+            (PREFIX + "/actions/jobs/14/logs", "verifier job logs", "HTTP status unavailable",
+             "gh: Could not resolve host: secret-sentinel.invalid"),
+        )
+        env = {**self.env, "REPOSITORY": REPO, "PR_NUMBER": "1", "RUN_ID": "12", "RUN_ATTEMPT": "2",
+               "WORKFLOW_SHA": MAIN, "COMMENT_ID": "10", "ACTOR": "owner", "SOURCE_HANDOFF": handoff(),
+               "FINAL_SHA": H1, "BASE_REF": "main", "BASE_SHA": MAIN,
+               "TESTS_OUTCOME": "failure", "LINT_OUTCOME": "success"}
+        for index, (endpoint, operation, expected, stderr) in enumerate(endpoints):
+            with self.subTest(operation=operation, expected=expected):
+                self.install_gh(api_data(logs=self.logs), failure_endpoint=endpoint, failure_stderr=stderr)
+                failed_env = {**env, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"]}
+                done = self.workflow_run("Collect verification feedback from GitHub job logs", env=failed_env)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn(operation, done.stderr)
+                self.assertIn(expected, done.stderr)
+                self.assertNotIn("secret-sentinel", done.stdout + done.stderr)
+                self.assertFalse((self.root / "verification-feedback").exists())
 
     def test_actual_finalizer_scope_rejects_protected_change_even_with_feedback(self):
         text = (SCRIPTS.parent / 'workflows/claude-fix.yml').read_text()
