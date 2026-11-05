@@ -958,12 +958,12 @@ mod tests {
         fs::write(from.join("images").join(&exact), b"12345678").unwrap();
         fs::write(from.join("images").join(&over), b"123456789").unwrap();
 
-        let (result, outcome) = copy_with_limit(&from, &to, &[exact.clone()], 8);
+        let (result, outcome) = copy_with_limit(&from, &to, std::slice::from_ref(&exact), 8);
         assert!(result.is_ok());
         assert_eq!(outcome.created.len(), 1);
         assert_eq!(fs::read(to.join("images").join(&exact)).unwrap(), b"12345678");
 
-        let (result, _) = copy_with_limit(&from, &to, &[over.clone()], 8);
+        let (result, _) = copy_with_limit(&from, &to, std::slice::from_ref(&over), 8);
         assert!(matches!(result, Err(ImagePasteError::TooLarge(_))));
         assert!(!to.join("images").join(&over).exists());
         assert!(from.join("images").join(&over).is_file());
@@ -982,7 +982,7 @@ mod tests {
         fs::write(from.join("images").join(&name), b"1234").unwrap();
         fs::write(to.join("images").join(&name), b"12345678").unwrap();
 
-        let (result, outcome) = copy_with_limit(&from, &to, &[name.clone()], 4);
+        let (result, outcome) = copy_with_limit(&from, &to, std::slice::from_ref(&name), 4);
         assert!(result.is_ok());
         assert_eq!(fs::read(to.join("images").join(&name)).unwrap(), b"12345678");
         assert_eq!(
