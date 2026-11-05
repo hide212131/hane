@@ -2911,10 +2911,25 @@ mod tests {
         assert!(offset.y < px(0.0), "the detail scrolled: {offset:?}");
         assert_eq!(offset.y, -max.y, "the scroll reaches the end of the detail");
 
-        // The panel itself, its title and its buttons did not move.
+        // The panel itself did not move, and the blocked Ready contract still
+        // offers the way back to editing next to the scrolled detail.
         let after = cx.debug_bounds("update-panel").expect("panel stays open");
         assert_eq!(after, panel);
-        assert!(cx.debug_bounds("update-panel-action-0").is_some());
+        let mut ready = snapshot(AppUpdatePhase::Ready);
+        ready.restart_supported = true;
+        let message = view.read_with(cx, |view, _| view.restart_message.clone());
+        let model = panel_model(&ready, message.as_deref(), false);
+        let version = ready.candidate_version.as_deref().unwrap_or("?");
+        assert_eq!(model.title, format!("更新の準備ができました ({version})"));
+        assert_eq!(model.detail, message);
+        assert!(
+            model
+                .actions
+                .iter()
+                .any(|(action, label)| *action == PanelAction::Close && *label == "編集に戻る"),
+            "the blocked Ready panel keeps its close action: {:?}",
+            model.actions.iter().map(|(_, label)| *label).collect::<Vec<_>>()
+        );
     }
 
     fn open_general_settings(
