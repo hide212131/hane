@@ -177,6 +177,21 @@ impl Editor {
             ime.original_text,
             &text[current.end.0..]
         );
+        // The marked text is absent from `base`, so a replacement that lives
+        // inside it only shows up on the live text. Such a rewrite cannot be
+        // carried around the composition; refuse it so it waits for the end.
+        if let Some(live) = checked_edits(&text, plan(&text)) {
+            let touches_marked = live.iter().any(|(range, _)| {
+                if range.start == range.end {
+                    range.start >= current.start.0 && range.start <= current.end.0
+                } else {
+                    range.start < current.end.0 && range.end > current.start.0
+                }
+            });
+            if touches_marked && !current.is_empty() {
+                return Err(BufferError::InvalidRange { range: current });
+            }
+        }
         let Some(edits) = checked_edits(&base, plan(&base)) else {
             return Ok(());
         };
