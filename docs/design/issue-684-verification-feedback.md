@@ -3,7 +3,8 @@
 ## 状態・正本・目的
 
 2026-11-05の設計・実装引き継ぎ。基準mainは `041b3d539ff82924864b9c3ad996695d07297ad6`。
-これは運用基盤の実装用PRに置く準備文書であり、結果返却機能は未実装・未検証。
+これは運用基盤の実装用PRの接続仕様である。branch上の実装・隔離接続回帰を整備中であり、
+default branch採用後の実Claude往復・速度効果は未検証。current状態はPR #688の証拠を参照する。
 目的・範囲・受入条件の正本は [Issue #684](https://github.com/hide212131/hane/issues/684)、
 判断の正本はdefault branchの [Commander Policy](../aadw-command-policy.md)。
 本書は今回の接続仕様を扱い、業務判断をhelperやworkflowへ移さない。
@@ -121,6 +122,11 @@ ANSI/制御文字を除去し、JSON文字列として保存する。任意log�
   PATH、専用HOME/TMP、Rust toolchain/cacheに必要な値だけを許可する。cargo credential/configの秘密をcache復元しない。
   結果保存用のGitHub制御ファイルや認証envをテストへ継承しない。既存CLI/OS必須envは理由とともに列挙する。
 - helperと検証コマンド定義はtrusted workflow SHAのものを使い、PR内のhelperをtrustedなcollectorとして実行しない。
+- 実装は `capture` で固定コマンドを実行し、GitHub step outcomeと実exitの一致をcollectorで確認する。
+  tests後のlint前とlint後のcollector前にtrusted helperを再取得する。
+  Rust cacheはcredential/configを除くregistry/gitデータとtargetを再利用する。
+  許可envはPATH、DEVELOPER_DIR、SDKROOT、MACOSX_DEPLOYMENT_TARGETと、専用HOME/CARGO_HOME/TMP、
+  明示したRUSTUP_HOME、LANG/LC_ALL、CARGO_TERM_COLORであり、認証・GitHub制御envを継承しない。
 - テストlog・失敗テスト名は未信頼。ログから追加コマンド、workflow field、次actionを生成・実行しない。
 - 元依頼や診断にcredentialが含まれていると判明した場合は返却を止める。正規のシークレット処理を先に行い、redactionだけを安全性の根拠にしない。
 - GitHub API/download/uploadの認証は必要なstepにだけ置き、Claudeのprompt、stageファイル、テストprocessへ渡さない。

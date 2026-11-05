@@ -59,10 +59,29 @@ class WiringTests(unittest.TestCase):
     def test_all_new_contract_tests_are_in_regular_ci(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         for path in ('.github/tests/test_aadw_action_contract.py',
+                     '.github/tests/test_aadw_verification_feedback.py',
                      '.github/tests/test_aadw_prevention_wiring.py',
                      '.github/tests/test_claude_model_verification.py',
                      'scripts/tests/test_aadw_gui_observation.py'):
             self.assertIn('python3 ' + path, text)
+
+    def test_feedback_preserves_boundaries_and_is_staged_before_worker(self):
+        text = (ROOT / '.github/workflows/claude-fix.yml').read_text()
+        verify = text.split('\n  verify:', 1)[1]
+        self.assertNotIn('contents: write', verify)
+        self.assertNotIn('issues: write', verify)
+        self.assertIn('capture tests', verify)
+        self.assertIn('capture lint', verify)
+        self.assertIn('TESTS_OUTCOME: ${{ steps.tests.outcome }}', verify)
+        self.assertIn('LINT_OUTCOME: ${{ steps.lint.outcome }}', verify)
+        self.assertLess(verify.index('Collect verification feedback'), verify.index('Require both tests and lint'))
+        self.assertLess(text.index('aadw_action_contract.py request'), text.index('aadw_verification_feedback.py fetch'))
+        self.assertLess(text.index('Stage exact verification feedback'), text.index('Run bounded repository change with Claude Code'))
+        self.assertIn('--expected "$RUNNER_TEMP/feedback-expected.json"', text)
+        self.assertIn('--add-dir feedback', text)
+        self.assertIn('Read,Edit,Write,Glob,Grep', text)
+        self.assertIn('Claude worker attempted to modify trusted authority or workflow path', text)
+        self.assertNotIn('workflow_dispatch:', text)
 
     def test_existing_reversal_contract_checks_no_old_coast_before_55ms(self):
         # Keep the existing producer contract: no old coast in the first

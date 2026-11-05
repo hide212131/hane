@@ -5,7 +5,8 @@
 - 対象: [Issue #684](https://github.com/hide212131/hane/issues/684)、親 [#683](https://github.com/hide212131/hane/issues/683)。
 - 基準main: `041b3d539ff82924864b9c3ad996695d07297ad6`。
 - 詳細設計: [`docs/design/issue-684-verification-feedback.md`](../design/issue-684-verification-feedback.md)。
-- 文書だけの実装用Draft PR。運用基盤のコード・testsは未実装、新経路・速度効果は未検証。
+- 運用基盤の実装用PR #688。branch上でコードと契約・隔離接続回帰を実装する。
+  current-head CI/review・default branch採用後の実経路・速度効果は、PRの最新証拠を参照する。
 - 利用者の選好は「シンプルで速いと予想される方」。同一会話維持を必須にしない。
 - 共有worktreeの既存 `crates/ui/src/view.rs` 変更は対象外。専用checkoutから作業する。
 
@@ -83,3 +84,21 @@ report成功だけでreview/GUI/mergeを起動しない。required evidenceの�
 `existing_restart`、具体化の次actionとして `prepare_design` を取得した。
 local Claude未認証の新事実に対し、既存Policy内の運用基盤担当による着手を選ぶ `infra_operator` を取得した。
 判断は実装成功や速度測定の証拠ではない。
+
+## branch実装時の隔離検証記録（2026-11-05）
+
+指定7コマンドはすべて成功。`test_aadw_verification_feedback.py` 19件、action contract 20件、
+prevention wiring 9件、patch resume 12件、model verification 10件、usage-limit fallback 9件、
+合計79件のunittestに加え、Rust CI path filterの既存検査が成功した。
+
+新testはAPI応答fixtureとローカル実processを使う。workflowから抽出したtests/lint/collect/stageの
+実shell本文を実行し、失敗exitの保存→report→出所照合→prepare時hashとの照合→Read可能なstageを確認した。
+source GitHub APIはfixtureであり、本番ActionsやClaude起動を実施した証拠にはしない。
+model/finalizer/collector/upload欠落、run/attempt違い、stale/paused/fork、artifact失効/重複、
+不正JSON/archive、結果欠落、step outcome不一致、認証sentinelの非継承を確認した。
+既存finalizerの保護パス判定の実shell本文も隔離Git treeで実行し、feedback付きの禁止変更を拒否した。
+
+別の小さいRust workspaceでは、固定した実 `cargo test --workspace --all-features --locked` に
+`assert_eq!(2 + 2, 5)` の意図した失敗を含めて終了101を保存し、続く実Clippyの終了0を保存した。
+この検証はHane製品のworkspace回帰、GitHub実runの出所検証、実Claudeの修正往復を代替しない。
+YAML parse、workflow shell構文、差分検査も成功。current-head CI/reviewの最新状態はPR #688を正本とする。
