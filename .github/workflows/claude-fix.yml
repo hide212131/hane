@@ -885,6 +885,11 @@ jobs:
   verify:
     name: Verify exact worker result without write credentials
     needs: [prepare, finalize]
+    outputs:
+      base_ref: ${{ steps.context.outputs.base_ref }}
+      base_sha: ${{ steps.context.outputs.base_sha }}
+      tests_outcome: ${{ steps.tests.outcome }}
+      lint_outcome: ${{ steps.lint.outcome }}
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
@@ -929,17 +934,13 @@ jobs:
           path: trusted-feedback
           persist-credentials: false
 
-      - name: Prepare bounded verification result directory
-        run: mkdir "$RUNNER_TEMP/verification-results"
-
       - name: Run workspace regression tests
         id: tests
         continue-on-error: true
         run: |
           # Fixed command: cargo test --workspace --all-features --locked
           python3 trusted-feedback/.github/scripts/aadw_verification_feedback.py capture tests \
-            --directory "$GITHUB_WORKSPACE" --runtime "$RUNNER_TEMP/verification-runtime" \
-            --output "$RUNNER_TEMP/verification-results/tests.json"
+            --directory "$GITHUB_WORKSPACE" --runtime "$RUNNER_TEMP/verification-runtime"
 
       - name: Reacquire trusted verification collector before lint
         id: lint_collector
@@ -957,50 +958,7 @@ jobs:
         run: |
           # Fixed command: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           python3 trusted-feedback/.github/scripts/aadw_verification_feedback.py capture lint \
-            --directory "$GITHUB_WORKSPACE" --runtime "$RUNNER_TEMP/verification-runtime" \
-            --output "$RUNNER_TEMP/verification-results/lint.json"
-
-      - name: Reacquire trusted verification collector after tests
-        id: result_collector
-        if: ${{ !cancelled() }}
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: trusted-feedback
-          persist-credentials: false
-
-      - name: Collect verification feedback
-        id: feedback_collect
-        if: ${{ !cancelled() && steps.result_collector.outcome == 'success' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          WORKFLOW_SHA: ${{ github.workflow_sha }}
-          COMMENT_ID: ${{ github.event.comment.id }}
-          ACTOR: ${{ github.event.comment.user.login }}
-          SOURCE_HANDOFF: ${{ github.event.comment.body }}
-          FINAL_SHA: ${{ needs.finalize.outputs.final_sha }}
-          BASE_REF: ${{ steps.context.outputs.base_ref }}
-          BASE_SHA: ${{ steps.context.outputs.base_sha }}
-          TESTS_OUTCOME: ${{ steps.tests.outcome }}
-          LINT_OUTCOME: ${{ steps.lint.outcome }}
-        run: |
-          python3 trusted-feedback/.github/scripts/aadw_verification_feedback.py collect \
-            --results "$RUNNER_TEMP/verification-results" --output "$RUNNER_TEMP/verification-feedback"
-
-      - name: Upload verification feedback
-        if: ${{ !cancelled() && steps.context.outcome == 'success' && steps.feedback_collect.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: aadw-verification-feedback-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/verification-feedback/report.json
-            ${{ runner.temp }}/verification-feedback/source-request.txt
-          if-no-files-found: error
-          retention-days: 1
+            --directory "$GITHUB_WORKSPACE" --runtime "$RUNNER_TEMP/verification-runtime"
 
       - name: Require both tests and lint
         if: ${{ !cancelled() }}
@@ -1012,3 +970,52 @@ jobs:
         run: |
           printf 'head=%s tests=%s lint=%s\n' "$FINAL_SHA" "$TEST_RESULT" "$LINT_RESULT" >> "$GITHUB_STEP_SUMMARY"
           test "$TEST_RESULT" = success && test "$LINT_RESULT" = success
+
+  feedback:
+    name: Collect verification feedback from completed verifier logs
+    needs: [prepare, finalize, verify]
+    if: ${{ always() && !cancelled() && needs.verify.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out trusted feedback collector
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Collect verification feedback from GitHub job logs
+        id: feedback_collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          SOURCE_HANDOFF: ${{ github.event.comment.body }}
+          FINAL_SHA: ${{ needs.finalize.outputs.final_sha }}
+          BASE_REF: ${{ needs.verify.outputs.base_ref }}
+          BASE_SHA: ${{ needs.verify.outputs.base_sha }}
+          TESTS_OUTCOME: ${{ needs.verify.outputs.tests_outcome }}
+          LINT_OUTCOME: ${{ needs.verify.outputs.lint_outcome }}
+        run: |
+          python3 .github/scripts/aadw_verification_feedback.py collect \
+            --output "$RUNNER_TEMP/verification-feedback"
+
+      - name: Upload verification feedback
+        if: ${{ steps.feedback_collect.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aadw-verification-feedback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/verification-feedback/report.json
+            ${{ runner.temp }}/verification-feedback/source-request.txt
+          if-no-files-found: error
+          retention-days: 1

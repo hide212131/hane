@@ -27,7 +27,7 @@ local CLIは存在するが `loggedIn=false` を確認済みであり、ログ�
 
 ## 今回実装するもの
 
-1. 既存verifyの固定workspace tests/Clippyについて、実exit・outcome・診断・SHA/出所をreportにする。
+1. 既存verifyの固定workspace tests/Clippyについて、実exit・outcome・診断・SHA/出所をreportにする。完了済みverify jobのActions logsを、別runner上のread-only collectorが取得する。
    テスト失敗後もlintを一度実行し、最後の合否を保持する。
 2. 既存handoffへoptionalな `AADW_FEEDBACK_RUN_ID` / `AADW_FEEDBACK_RUN_ATTEMPT` を接続する。
    出所・attempt・H0/H1・PR・model確認・finalizer・重複依頼guardを検査する。
@@ -91,8 +91,9 @@ local Claude未認証の新事実に対し、既存Policy内の運用基盤担�
 prevention wiring 9件、patch resume 12件、model verification 10件、usage-limit fallback 9件、
 合計79件のunittestに加え、Rust CI path filterの既存検査が成功した。
 
-新testはAPI応答fixtureとローカル実processを使う。workflowから抽出したtests/lint/collect/stageの
-実shell本文を実行し、失敗exitの保存→report→出所照合→prepare時hashとの照合→Read可能なstageを確認した。
+新testはAPI応答fixtureとローカル実processを使う。workflowから抽出したtests/lint/collector/stageの
+実shell本文を実行し、失敗exitのログ記録→別job collectorによるlog読取→report→出所照合→prepare時hashとの照合→Read可能なstageを確認した。
+PR由来processが書けるローカルJSONを偽造しても、collectorがGitHub job logから再構成するreportへ反映されないことも確認した。
 source GitHub APIはfixtureであり、本番ActionsやClaude起動を実施した証拠にはしない。
 model/finalizer/collector/upload欠落、run/attempt違い、stale/paused/fork、artifact失効/重複、
 不正JSON/archive、結果欠落、step outcome不一致、認証sentinelの非継承を確認した。

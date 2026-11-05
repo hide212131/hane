@@ -1,5 +1,6 @@
 """Real process -> report -> GitHub source fixtures -> bounded worker staging."""
 import copy
+import base64
 import importlib.util
 import io
 import json
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 import warnings
 import zipfile
 
@@ -64,7 +66,15 @@ def request():
                 feedback={"run_id": 12, "run_attempt": 2})
 
 
-def api_data(raw=None):
+def capture_log(kind, code):
+    token = uuid.uuid4().hex
+    data = json.dumps(result(kind, code), separators=(",", ":"), ensure_ascii=False).encode()
+    encoded = base64.b64encode(data).decode()
+    return (f"::stop-commands::{token}\nfixture diagnostic\n::{token}::\n"
+            f"AADW_CAPTURE_RESULT:{token}:{encoded}\n").encode()
+
+
+def api_data(raw=None, logs=None, test_conclusion="success", lint_conclusion="success"):
     def step(name, conclusion="success"):
         return dict(name=name, status="completed", conclusion=conclusion)
     jobs = [dict(id=i, name=name, status="completed", conclusion="success", steps=[])
@@ -72,10 +82,13 @@ def api_data(raw=None):
     jobs[1]["steps"] = [step("Confirm Claude used Sonnet 5.5")]
     jobs[2]["steps"] = [step("Revalidate exact remote head and push through trusted finalizer")]
     jobs.append(dict(id=14, name=feedback.VERIFY_JOB, status="completed", conclusion="failure", steps=[
-        step(name) for name in ("Verify current result context", "Check out exact worker result",
-                               "Run workspace regression tests", "Run lint even when regression tests fail",
-                               "Collect verification feedback", "Upload verification feedback")
-    ] + [step("Require both tests and lint", "failure")]))
+        step("Verify current result context"), step("Check out exact worker result"),
+        step("Run workspace regression tests", test_conclusion),
+        step("Run lint even when regression tests fail", lint_conclusion),
+        step("Require both tests and lint", "failure")]))
+    jobs.append(dict(id=15, name=feedback.FEEDBACK_JOB, status="completed", conclusion="success", steps=[
+        step("Check out trusted feedback collector"), step("Collect verification feedback from GitHub job logs"),
+        step("Upload verification feedback")]))
     return {
         PREFIX + "/pulls/1": dict(number=1, state="open", body="", labels=[],
                                   head=dict(sha=H1, repo=dict(full_name=REPO)), base=dict(ref="main")),
@@ -83,6 +96,7 @@ def api_data(raw=None):
                     event="issue_comment", path=feedback.WORKFLOW, repository=dict(full_name=REPO),
                     head_repository=dict(full_name=REPO), head_sha=MAIN, actor=dict(login="owner")),
         PREFIX + "/actions/runs/12/attempts/2/jobs?per_page=100": [{"jobs": jobs[:2]}, {"jobs": jobs[2:]}],
+        PREFIX + "/actions/jobs/14/logs": logs or capture_log("tests", 101) + capture_log("lint", 0),
         PREFIX + "/actions/runs/12/artifacts?per_page=100": [{"artifacts": []}, {"artifacts": [
             dict(id=15, name="aadw-verification-feedback-12-2", expired=False, workflow_run=dict(id=12))]}],
         PREFIX + "/actions/artifacts/15/zip": raw or archive(),
@@ -113,6 +127,11 @@ class SourceTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 self.consume(api_data(archive(r)))
 
+    def test_report_outcome_must_match_github_recorded_step_outcome(self):
+        r = report(); r["tests"] = result("tests", 0)
+        with self.assertRaisesRegex(ValueError, "captured exit disagrees with immutable GitHub step outcome"):
+            self.consume(api_data(archive(r)))
+
     def test_stale_closed_paused_and_foreign_pr(self):
         for change in ({"state": "closed"}, {"body": "<!-- AADW_PAUSED -->"},
                        {"labels": [{"name": "aadw:paused"}]},
@@ -139,7 +158,7 @@ class SourceTests(unittest.TestCase):
 
     def test_missing_model_collector_upload_aggregate_or_lint_cannot_resume(self):
         for name in ("Confirm Claude used Sonnet 5.5", "Revalidate exact remote head and push through trusted finalizer",
-                     "Collect verification feedback", "Upload verification feedback",
+                     "Collect verification feedback from GitHub job logs", "Upload verification feedback",
                      "Require both tests and lint", "Run lint even when regression tests fail"):
             data = api_data()
             for page in data[PREFIX + "/actions/runs/12/attempts/2/jobs?per_page=100"]:
@@ -250,7 +269,7 @@ class ProcessIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name); self.bin = self.root / "bin"; self.bin.mkdir()
-        self.results = self.root / "verification-results"; self.results.mkdir()
+        self.logs = b""
         (self.root / 'trusted-feedback').symlink_to(SCRIPTS.parents[1], target_is_directory=True)
         (self.root / '.github').symlink_to(SCRIPTS.parent, target_is_directory=True)
         # Closed cargo argv is kept. A local executable provides deterministic process exits.
@@ -293,20 +312,23 @@ sys.exit(int(Path(kind+'.exit').read_text()))
 
     def capture(self, tests, lint):
         (self.root / "test.exit").write_text(str(tests)); (self.root / "clippy.exit").write_text(str(lint))
-        codes = []
+        codes, logs = [], b""
         for kind in ("tests", "lint"):
             name = 'Run workspace regression tests' if kind == 'tests' else 'Run lint even when regression tests fail'
             done = self.workflow_run(name)
             self.assertNotIn("sentinel-", done.stdout + done.stderr)
             codes.append(done.returncode)
+            logs += done.stdout.encode()
+        self.logs = logs
         return codes
 
     def test_four_real_exit_combinations_lint_runs_after_test_failure(self):
         for tests, lint in ((101, 0), (0, 1), (101, 1), (0, 0)):
             with self.subTest(tests=tests, lint=lint):
                 self.assertEqual(self.capture(tests, lint), [tests, lint])
-                r = feedback.make_report(metadata(), handoff().encode(),
-                    {k: feedback.decode(feedback.read(self.results / (k + ".json"))) for k in ("tests", "lint")})
+                test_result = feedback.result_from_job_log(self.logs, "tests", "failure" if tests else "success")
+                lint_result = feedback.result_from_job_log(self.logs, "lint", "failure" if lint else "success")
+                r = feedback.make_report(metadata(), handoff().encode(), {"tests": test_result, "lint": lint_result})
                 self.assertEqual(r["tests"]["exit_code"], tests); self.assertEqual(r["lint"]["exit_code"], lint)
                 self.assertNotIn("sentinel-", json.dumps(r))
         calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
@@ -330,15 +352,18 @@ sys.stdout.buffer.write(Path(mapping[sys.argv[-1]]).read_bytes())
 
     def test_cli_producer_report_source_validation_and_worker_read_staging(self):
         self.assertEqual(self.capture(101, 0), [101, 0])
-        data = api_data(); self.install_gh(data)
+        data = api_data(logs=self.logs); self.install_gh(data)
         env = {**self.env, "REPOSITORY": REPO, "PR_NUMBER": "1", "RUN_ID": "12", "RUN_ATTEMPT": "2",
                "WORKFLOW_SHA": MAIN, "COMMENT_ID": "10", "ACTOR": "owner", "SOURCE_HANDOFF": handoff(),
-               "FINAL_SHA": H1, "BASE_REF": "main", "BASE_SHA": MAIN, "TESTS_OUTCOME": "failure", "LINT_OUTCOME": "success"}
+               "FINAL_SHA": H1, "BASE_REF": "main", "BASE_SHA": MAIN,
+               "TESTS_OUTCOME": "failure", "LINT_OUTCOME": "success"}
         produced = self.root / 'verification-feedback'
-        done = self.workflow_run('Collect verification feedback', env=env)
+        forged = self.root / 'verification-results'; forged.mkdir()
+        (forged / 'tests.json').write_text(json.dumps(result("tests", 0)))
+        done = self.workflow_run('Collect verification feedback from GitHub job logs', env=env)
         self.assertEqual(done.returncode, 0, done.stderr)
         raw = archive(feedback.decode(feedback.read(produced / "report.json")), (produced / "source-request.txt").read_bytes())
-        self.install_gh(api_data(raw))
+        self.install_gh(api_data(raw, logs=self.logs))
         reqfile = self.root / "request.json"; reqfile.write_text(json.dumps(request()))
         expected = self.root / "identity.json"
         done = self.cli("fetch", "--request", reqfile, "--output", expected)
@@ -355,20 +380,17 @@ sys.stdout.buffer.write(Path(mapping[sys.argv[-1]]).read_bytes())
         done = self.cli("fetch", "--request", reqfile, "--expected", expected, "--output", self.root / "bad.json", "--stage", self.root / "must-not-stage")
         self.assertNotEqual(done.returncode, 0); self.assertFalse((self.root / "must-not-stage").exists())
 
-    def test_collector_refuses_step_outcome_mismatch_and_missing_results_are_unavailable(self):
+    def test_collector_refuses_mutable_result_that_disagrees_with_github_step_outcome(self):
         self.capture(101, 0)
-        results = {k: feedback.decode(feedback.read(self.results / (k + ".json"))) for k in ("tests", "lint")}
-        r = feedback.make_report(metadata(), handoff().encode(), {"tests": results["tests"]})
-        self.assertEqual(r["capture_status"], "unavailable")
-        self.assertIsNone(r["lint"]["exit_code"])
-        self.install_gh(api_data())
+        self.install_gh(api_data(logs=self.logs, test_conclusion="success"))
         env = {**self.env, "REPOSITORY": REPO, "PR_NUMBER": "1", "RUN_ID": "12", "RUN_ATTEMPT": "2",
                "WORKFLOW_SHA": MAIN, "COMMENT_ID": "10", "ACTOR": "owner", "SOURCE_HANDOFF": handoff(),
-               "FINAL_SHA": H1, "BASE_REF": "main", "BASE_SHA": MAIN, "TESTS_OUTCOME": "success", "LINT_OUTCOME": "success"}
+               "FINAL_SHA": H1, "BASE_REF": "main", "BASE_SHA": MAIN,
+               "TESTS_OUTCOME": "success", "LINT_OUTCOME": "success"}
         dest = self.root / 'mismatch-output'
-        done = self.cli('collect', '--results', self.results, '--output', dest, env=env)
+        done = self.workflow_run('Collect verification feedback from GitHub job logs', env=env)
         self.assertNotEqual(done.returncode, 0)
-        self.assertFalse(dest.exists())
+        self.assertFalse((self.root / 'verification-feedback').exists())
 
     def test_actual_finalizer_scope_rejects_protected_change_even_with_feedback(self):
         text = (SCRIPTS.parent / 'workflows/claude-fix.yml').read_text()

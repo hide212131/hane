@@ -77,10 +77,11 @@ tests不合格でもlintを一度実行し、最後の集約判定は両方が�
 既存runではテストstepがAPI上successでも最後の集約判定がfailureとなっており、
 Actionsの表示だけからテスト成功を再構成できないことを確認した。
 
-report生成は `finalize` 成功後の既存verifyに置く。取消以外の失敗時にも返却を試みる。
-checkout/起動/収集失敗では `unavailable` を返すかartifactなしで停止し、passの既定値を使わない。
+固定検証は `finalize` 成功後の既存verifyで行い、結果のreport化はverify完了後の独立したread-only collector jobで行う。
+collectorは完了済みverify jobのGitHub Actions logからtrusted helperの結果行を取得し、PR由来processが触れられるrunner上のファイルをreportの正本にしない。
+検証stepのGitHub conclusionとcapture記録を照合する。checkout/起動/ログ取得/収集失敗ではartifactなしで停止し、passの既定値を使わない。
 timeout/cancelで返せなかったreportは、consumerが欠落として拒否する。
-reportのuploadやcollector自体の失敗もverifyの不合格とし、tests/lint成功で隠さない。
+reportのuploadやcollector自体の失敗もworkflowの不合格とし、tests/lint成功で隠さない。
 
 artifact名は `aadw-verification-feedback-<run_id>-<run_attempt>`、retentionは既存patchと同じ1日。
 期限切れ時は通常の新しい観測を取得する。期限切れを無視した復元や古い結果の横流しをしない。
@@ -122,8 +123,9 @@ ANSI/制御文字を除去し、JSON文字列として保存する。任意log�
   PATH、専用HOME/TMP、Rust toolchain/cacheに必要な値だけを許可する。cargo credential/configの秘密をcache復元しない。
   結果保存用のGitHub制御ファイルや認証envをテストへ継承しない。既存CLI/OS必須envは理由とともに列挙する。
 - helperと検証コマンド定義はtrusted workflow SHAのものを使い、PR内のhelperをtrustedなcollectorとして実行しない。
-- 実装は `capture` で固定コマンドを実行し、GitHub step outcomeと実exitの一致をcollectorで確認する。
-  tests後のlint前とlint後のcollector前にtrusted helperを再取得する。
+- 実装は `capture` で固定コマンドを実行し、PR由来processのstdoutが閉じた後にnonce付き結果行を出す。
+  verify完了後の別jobがGitHub Actions logから結果行を読み、GitHub step outcomeと実exitを照合してreportを作る。
+  verify runner上の一時JSONはconsumerへ渡さず、reportの正本にしない。tests後のlint前にはtrusted helperを再取得する。
   Rust cacheはcredential/configを除くregistry/gitデータとtargetを再利用する。
   許可envはPATH、DEVELOPER_DIR、SDKROOT、MACOSX_DEPLOYMENT_TARGETと、専用HOME/CARGO_HOME/TMP、
   明示したRUSTUP_HOME、LANG/LC_ALL、CARGO_TERM_COLORであり、認証・GitHub制御envを継承しない。
