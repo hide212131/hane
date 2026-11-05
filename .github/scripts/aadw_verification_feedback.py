@@ -229,12 +229,16 @@ def validate_report(report, source):
     return report
 
 
-def gh_api(endpoint, *, pages=False, binary=False):
+def gh_api(endpoint, *, pages=False, binary=False, operation="source API"):
     cmd = ["gh", "api"]
     if pages:
         cmd += ["--paginate", "--slurp"]
     result = subprocess.run(cmd + [endpoint], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    require(result.returncode == 0, "GitHub source could not be read")
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        status = re.search(r"\bHTTP(?:/[0-9.]+)?\s+([1-5][0-9]{2})\b", stderr, re.IGNORECASE)
+        detail = f"HTTP {status.group(1)}" if status else f"HTTP status unavailable; gh exit {result.returncode}"
+        raise ValueError(f"GitHub source could not be read: {operation} ({detail})")
     require(len(result.stdout) <= 16 * 1024 * 1024, "oversized GitHub source")
     return result.stdout if binary else decode(result.stdout, 16 * 1024 * 1024)
 
@@ -389,7 +393,8 @@ def main():
         parsed = parse_request(source.decode())
         repo = e["REPOSITORY"]
         run_id, attempt = int(e["RUN_ID"]), int(e["RUN_ATTEMPT"])
-        pages = gh_api(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100", pages=True)
+        pages = gh_api(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+                       pages=True, operation="attempt jobs list")
         verification = one_job([j for p in pages for j in p["jobs"]], VERIFY_JOB)
         require(verification.get("status") == "completed" and verification.get("conclusion") == "failure",
                 "verification job did not finish with a failure")
@@ -400,7 +405,8 @@ def main():
                     "source_target_sha": parsed["target_sha"], "root_cause": parsed["root_cause"],
                     "verified_sha": e["FINAL_SHA"], "base_ref": e["BASE_REF"], "base_sha": e["BASE_SHA"]}
         results = {}
-        log_bytes = gh_api(f"repos/{repo}/actions/jobs/{verification['id']}/logs", binary=True)
+        log_bytes = gh_api(f"repos/{repo}/actions/jobs/{verification['id']}/logs",
+                           binary=True, operation="verifier job logs")
         for kind, step_name in (("tests", "Run workspace regression tests"),
                                 ("lint", "Run lint even when regression tests fail")):
             matches = [s for s in verification.get("steps", []) if s.get("name") == step_name]
