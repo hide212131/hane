@@ -14,6 +14,23 @@ MARKERS = {"implement": "AADW_COMMANDER_HANDOFF_V3", "diagnose": "AADW_DIAGNOSTI
 IMPLEMENT_MARKER_PREFIX = "AADW_COMMANDER_HANDOFF_"
 
 
+def parse_feedback(body: str, action: str, category: str) -> dict | None:
+    names = ("AADW_FEEDBACK_RUN_ID", "AADW_FEEDBACK_RUN_ATTEMPT")
+    if not any(line.startswith("AADW_FEEDBACK_") for line in body.splitlines()):
+        return None
+    if any(line.startswith("AADW_FEEDBACK_") and not line.startswith(tuple(n + ":" for n in names))
+           for line in body.splitlines()):
+        raise ValueError("unknown feedback field")
+    values = [field(body, name) for name in names]
+    if any(not re.fullmatch(r"[1-9][0-9]{0,19}", value) for value in values):
+        raise ValueError("feedback source must use positive run/attempt identifiers")
+    if action != "implement" or category not in {"product", "test"}:
+        raise ValueError("feedback requires an evidenced product/test implementation request")
+    if any(line.startswith(("AADW_CHECKPOINT_", "AADW_PATCH_SOURCE_")) for line in body.splitlines()):
+        raise ValueError("feedback cannot reapply a checkpoint or completed patch")
+    return dict(zip(("run_id", "run_attempt"), map(int, values)))
+
+
 def field(body: str, name: str) -> str:
     values = [line[len(name) + 1:].strip() for line in body.splitlines() if line.startswith(name + ":")]
     if len(values) != 1 or not values[0]:
@@ -48,8 +65,12 @@ def parse_request(body: str) -> dict:
     evidence = field(body, "AADW_EVIDENCE")
     if len(evidence) > 2048 or not evidence.startswith("https://github.com/"):
         raise ValueError("evidence must reference GitHub facts")
-    return {"action": action, "target_sha": head, "failure_class": category,
-            "root_cause": root, "evidence": evidence}
+    result = {"action": action, "target_sha": head, "failure_class": category,
+              "root_cause": root, "evidence": evidence}
+    feedback = parse_feedback(body, action, category)
+    if feedback is not None:
+        result["feedback"] = feedback
+    return result
 
 
 def validate_source_handoff(body: str, target_sha: str) -> dict:

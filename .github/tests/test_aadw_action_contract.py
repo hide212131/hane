@@ -23,6 +23,27 @@ def pr():
 
 
 class RequestTests(unittest.TestCase):
+    def test_feedback_pair_is_optional_and_does_not_change_duplicate_identity(self):
+        body = request() + "AADW_FEEDBACK_RUN_ID: 12\nAADW_FEEDBACK_RUN_ATTEMPT: 2\n"
+        self.assertEqual(self.validate(body)["feedback"], {"run_id": 12, "run_attempt": 2})
+        with self.assertRaisesRegex(ValueError, "duplicate exact-head"):
+            self.validate(body, history=[{"id": 1, "user": {"login": "owner"}, "body": request()}])
+
+    def test_malformed_or_incompatible_feedback_is_rejected(self):
+        pair = "AADW_FEEDBACK_RUN_ID: 12\nAADW_FEEDBACK_RUN_ATTEMPT: 2\n"
+        invalid = ["AADW_FEEDBACK_RUN_ID: 12\n", "AADW_FEEDBACK_RUN_ATTEMPT: 2\n",
+                   pair + "AADW_FEEDBACK_RUN_ID: 12\n", pair.replace("12", "0"),
+                   pair.replace("12", "-1"), pair.replace("12", "1; echo bad"),
+                   pair + "AADW_FEEDBACK_OTHER: 1\n",
+                   pair + "AADW_CHECKPOINT_RUN_ID: 10\n",
+                   pair + "AADW_PATCH_SOURCE_RUN_ID: 10\n"]
+        for suffix in invalid:
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                self.validate(request() + suffix)
+        for action, category in (("implement", "initial"), ("diagnose", "unknown")):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                self.validate(request(action, category) + pair)
+
     def validate(self, body=None, target=None, history=None):
         return contract.validate_request(body or request(), target or pr(), "o/r", history or [], "owner", 100)
 

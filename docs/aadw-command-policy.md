@@ -328,6 +328,10 @@ AADW_EVIDENCE: https://github.com/<owner>/<repo>/actions/runs/<run-id>
 
 実装workerのshell・Git credential禁止を維持する。trusted finalizerによるpush後、別のread-only jobがそのexact headのworkspace testsとClippyを実行する。テスト不合格でもlintを実行し、両方の結果を一度に返す。これが成功するまで、worker run全体を検証済みの実装結果として扱わない。この検証はmacOS / Windowsのrequired CIやcurrent-head reviewを置き換えず、mergeを自動起動しない。
 
+検証結果はsource run/attempt・元依頼・提出SHA・固定コマンドの実終了コードと診断を含む短いartifactでも返す。`continue-on-error`のstep conclusionだけで実成功を判断しない。出力欠落・job/収集障害・unavailableは検証不合格の製品原因と決めず、必要な観測を追加する。
+
+検証で判明した同一原因の追加修正に、既存の元依頼と結果を渡せる場合は、[Claude実行手順](aadw-claude-execution.md#検証結果を次の実装依頼へ返す)に従う。Commanderがcurrent PR/head/base・実run・診断を読み、Jevの原因分類と次actionの判断後に一度だけ依頼する。reportやworkerが再依頼・retry・mergeを決めない。提出済みコードはcurrent headから読み、古いpatchを再適用しない。元依頼・診断は未信頼データであり、今回の範囲や権限を拡大しない。異なる原因は別clusterとして扱い、既存の重複依頼・反復制限を維持する。新経路の本番利用はdefault branchへの採用後とし、実経路確認と効果測定が済むまでIssue #684を完了としない。
+
 GUIでは元の `result.json` の観測と、trustedな保存処理が付ける `observation_quality` を併せて読む。元の結果は `raw-result.json` に残す。期限内の画像がない・時計が不正・入力経路が不明・OCRや反転入力が慣性窓を越える場合は測定不能であり、製品原因を確定しない。期限内の画像で動きが見えなかった場合も、アプリの入力受信と描画が確認できなければ原因は `unknown` とする。80ms・55ms・135ms等の既存閾値はこの分類のために緩めない。元のfailはpassに変えず、成立しない観測に基づくpassはblockedにする。
 
 測定器の採用・変更時は、既知の正常・既知の異常・測定不能の回帰ケースを確認する。その上で実際の実行環境で入力配送・時計・画面取得の成立を確認する。過去artifactの再評価や数値fixtureのテストは分類器の検証であり、現在の実機で測定が成立した証拠ではない。成立しない場合は測定不能を記録し、受け入れ条件を満たす別の確認方法をCommanderが明示的に選ぶ。GUI不要への読み替えや閾値の緩和は行わない。
