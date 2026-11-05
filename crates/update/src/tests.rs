@@ -1631,7 +1631,7 @@ fn make_stage_junction(link: &Path, target: &Path) -> bool {
 #[cfg(windows)]
 #[test]
 fn failed_extraction_cleanup_never_deletes_outside_the_stage() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let fixture = fixture(default_payload(NEW_VERSION));
     let sandbox = Sandbox::new();
@@ -1660,14 +1660,21 @@ fn failed_extraction_cleanup_never_deletes_outside_the_stage() {
 
     let stage_dir = sandbox.stage();
     let stop = Arc::new(AtomicBool::new(false));
+    // Renames the attacker really won, and junctions it really created.
+    let renames = Arc::new(AtomicUsize::new(0));
+    let junctions = Arc::new(AtomicUsize::new(0));
     let attacker = {
         let (stop, stage_dir, outside) = (stop.clone(), stage_dir.clone(), outside.clone());
+        let (renames, junctions) = (renames.clone(), junctions.clone());
         std::thread::spawn(move || {
             let target = stage_dir.join("shell-integration");
             let moved = stage_dir.parent().unwrap().join("moved-away");
             while !stop.load(Ordering::Relaxed) {
                 if target.is_dir() && fs::rename(&target, &moved).is_ok() {
-                    let _ = make_stage_junction(&target, &outside);
+                    renames.fetch_add(1, Ordering::SeqCst);
+                    if make_stage_junction(&target, &outside) {
+                        junctions.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 std::thread::yield_now();
             }
@@ -1676,13 +1683,38 @@ fn failed_extraction_cleanup_never_deletes_outside_the_stage() {
     let result = crate::archive::extract_archive_held(&mut cursor, &inspected, &stage_dir);
     stop.store(true, Ordering::Relaxed);
     attacker.join().unwrap();
+    let (renames, junctions) = (
+        renames.load(Ordering::SeqCst),
+        junctions.load(Ordering::SeqCst),
+    );
 
-    assert_eq!(code(result.map(drop)), ErrorCode::HashMismatch);
-    assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+    // The safety properties hold on every failure path, so check them first.
+    assert_eq!(
+        fs::read(&sentinel).unwrap(),
+        b"sentinel",
+        "the outside sentinel was modified (attacker renames={renames}, junctions={junctions})"
+    );
+    assert!(sentinel.exists(), "the outside file was deleted");
     assert!(
         !stage_dir.join("shell-integration").exists(),
-        "the failed extraction must be cleaned up completely"
+        "the failed extraction must be cleaned up completely \
+         (attacker renames={renames}, junctions={junctions})"
     );
+
+    // The intended outcome is the hash mismatch. An earlier I/O failure is
+    // accepted only when the attacker really swapped the directory in the
+    // way, which makes the extraction fail closed before the hash check.
+    let err = result
+        .map(drop)
+        .expect_err("a failed hash check must not extract successfully");
+    match err.code {
+        ErrorCode::HashMismatch => {}
+        ErrorCode::Io if renames > 0 => {}
+        other => panic!(
+            "unexpected extraction error {other:?}: {err} \
+             (attacker renames={renames}, junctions={junctions})"
+        ),
+    }
 }
 
 fn mac_generation() -> String {
