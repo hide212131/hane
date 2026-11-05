@@ -198,6 +198,9 @@ fn read_formats() -> ClipboardRead {
     let mut have_files = false;
     let mut best_image: Option<(u8, Image)> = None;
     let mut image_failure: Option<RichClipboardError> = None;
+    // An SVG is not a raster image: it never decides the image failure, and a
+    // readable one never hides a raster failure.
+    let mut svg_image: Option<Image> = None;
 
     let count = unsafe { CountClipboardFormats() };
     let mut format = 0;
@@ -208,6 +211,10 @@ fn read_formats() -> ClipboardRead {
             if let Some(entry) = read_string() {
                 entries.push(entry);
                 have_text = true;
+            }
+        } else if is_svg_format(format) {
+            if svg_image.is_none() {
+                svg_image = read_image_checked(format).ok();
             }
         } else if is_image_format(format) {
             let priority = image_format_priority(format);
@@ -229,7 +236,10 @@ fn read_formats() -> ClipboardRead {
     }
     let image = match best_image {
         Some((_, image)) => Some(Ok(image)),
-        None => image_failure.map(Err),
+        None => match image_failure {
+            Some(error) => Some(Err(error)),
+            None => svg_image.map(Ok),
+        },
     };
     ClipboardRead { entries, image }
 }
@@ -282,6 +292,11 @@ fn get_clipboard_string(format: u32) -> Option<String> {
 
 fn is_image_format(format: u32) -> bool {
     IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32
+}
+
+/// Hane: the SVG representation, whose read failure is not an image failure.
+fn is_svg_format(format: u32) -> bool {
+    IMAGE_FORMATS_MAP.get(&format) == Some(&ImageFormat::Svg)
 }
 
 /// Higher wins. SVG is never preferred over a raster representation.

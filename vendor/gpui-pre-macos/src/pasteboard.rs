@@ -128,10 +128,18 @@ unsafe fn hane_best_image(owner: id) -> Option<Result<Image, RichClipboardError>
             let data: id = msg_send![owner, dataForType: ut_type.inner_mut()];
             match hane_image_bytes(data) {
                 Ok(bytes) => {
+                    // A readable SVG never hides a raster failure.
+                    if format == ImageFormat::Svg && failure.is_some() {
+                        break;
+                    }
                     let id = hash(&bytes);
                     return Some(Ok(Image { format, bytes, id }));
                 }
-                Err(error) => failure = failure.or(Some(error)),
+                // An unreadable SVG is not an image failure.
+                Err(error) if format != ImageFormat::Svg => {
+                    failure = failure.or(Some(error));
+                }
+                Err(_) => {}
             }
         }
         failure.map(Err)
