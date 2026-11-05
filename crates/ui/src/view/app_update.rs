@@ -1387,14 +1387,17 @@ impl EditorView {
                 )
                 .children(model.detail.map(|detail| {
                     // Wraps instead of eliding: the detail carries the reason
-                    // and next step. The panel keeps its fixed height, and
-                    // the buttons below stay in place.
+                    // and next step. The panel keeps its fixed height, the
+                    // buttons below stay in place, and a long detail scrolls
+                    // inside its own area so its end stays reachable.
                     div()
                         .id("update-panel-detail")
                         .debug_selector(|| "update-panel-detail".to_owned())
                         .flex_1()
                         .min_h(px(0.0))
-                        .overflow_hidden()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.update_detail_scroll)
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                         .whitespace_normal()
                         .text_color(rgb(self.theme.quote_foreground))
                         .child(detail)
@@ -2855,6 +2858,63 @@ mod tests {
         assert!(detail.size.height > px(0.0));
         assert!(detail.left() >= panel.left() && detail.right() <= panel.right());
         assert!(detail.top() >= panel.top() && detail.bottom() <= panel.bottom());
+    }
+
+    #[gpui::test]
+    fn a_long_restart_message_can_be_scrolled_to_its_end_in_the_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut ready = snapshot(AppUpdatePhase::Ready);
+        ready.restart_supported = true;
+        let controller = WakeController::new(ready);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+            view.toggle_update_panel(cx);
+            let reasons: Vec<String> = (1..=12)
+                .map(|n| format!("保存されていない文書{n}があるため再起動できません。"))
+                .collect();
+            view.restart_message = Some(format!("{} 末尾の理由。", reasons.join(" ")));
+        });
+        cx.simulate_resize(gpui::size(px(360.0), px(500.0)));
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        let panel = cx.debug_bounds("update-panel").expect("panel is open");
+        let detail = cx.debug_bounds("update-panel-detail").expect("detail renders");
+        assert_eq!(panel.size.height, px(UPDATE_PANEL_HEIGHT));
+        let max = view.read_with(cx, |view, _| view.update_detail_scroll.max_offset());
+        assert!(max.y > px(0.0), "the long detail overflows its area: {max:?}");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.update_detail_scroll.offset().y),
+            px(0.0)
+        );
+
+        // Wheel scrolling over the detail reaches the end of the text.
+        for _ in 0..40 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: detail.center(),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-60.0))),
+                modifiers: gpui::Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+        let (offset, max) = view.read_with(cx, |view, _| {
+            (
+                view.update_detail_scroll.offset(),
+                view.update_detail_scroll.max_offset(),
+            )
+        });
+        assert!(offset.y < px(0.0), "the detail scrolled: {offset:?}");
+        assert_eq!(offset.y, -max.y, "the scroll reaches the end of the detail");
+
+        // The panel itself, its title and its buttons did not move.
+        let after = cx.debug_bounds("update-panel").expect("panel stays open");
+        assert_eq!(after, panel);
+        assert!(cx.debug_bounds("update-panel-action-0").is_some());
     }
 
     fn open_general_settings(

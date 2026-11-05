@@ -160,6 +160,7 @@ impl EditorView {
             ai_lifecycle: None,
             restart_in_progress: false,
             restart_message: None,
+            update_detail_scroll: ScrollHandle::new(),
             update_completed: None,
             explorer_migration_failed: None,
             file_context_menu_state: FileContextMenuState::NotChecked,

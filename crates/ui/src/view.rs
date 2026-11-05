@@ -855,6 +855,9 @@ pub struct EditorView {
     restart_in_progress: bool,
     /// Why the last restart attempt did not proceed, shown on the card.
     restart_message: Option<String>,
+    /// Scroll position of the update panel's detail, so a long reason stays
+    /// readable to its end inside the fixed-height panel.
+    update_detail_scroll: ScrollHandle,
     /// Version of the update this process was started for, shown once after
     /// the helper's durable commit.
     update_completed: Option<String>,
