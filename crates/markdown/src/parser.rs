@@ -214,7 +214,7 @@ fn build_tree(
             }
         }
     }
-    let links = pending_links
+    let mut links: Vec<LinkParse> = pending_links
         .into_iter()
         .filter_map(|(node, destination, uses_reference)| {
             let children = &nodes[node.0].children;
@@ -228,7 +228,254 @@ fn build_tree(
             })
         })
         .collect();
+    // Bare URLs never overlap an existing link (Link and Image descendants are
+    // excluded), so a start-ordered merge keeps `links` sorted and disjoint.
+    let bare = bare_http_links(&nodes, source, source_range.start.0);
+    if !bare.is_empty() {
+        links.extend(bare);
+        links.sort_by_key(|link| link.text_range.start);
+    }
     (MarkdownTree { nodes }, codes, tables, links)
+}
+
+/// The nearest block that owns the inline node at `index`.
+fn inline_owner(nodes: &[MarkdownNode], index: usize) -> usize {
+    let mut current = index;
+    while let Some(parent) = nodes[current].parent {
+        if nodes[parent.0].kind.is_block() {
+            return parent.0;
+        }
+        current = parent.0;
+    }
+    MarkdownTree::ROOT.0
+}
+
+/// Finds scheme-qualified HTTP(S) URLs written directly in body text.
+///
+/// Only `Text` leaves of the formal parse are scanned, over their raw source
+/// slice. Consecutive gapless `Text` siblings form one run so entity or escape
+/// events cannot split a URL. Code, HTML, links (autolinks included), images
+/// and their descendants are skipped; a block holding inline HTML is skipped as
+/// a whole. A match is owned by the `Text` node containing its first byte and
+/// keeps its original source bytes as the destination.
+fn bare_http_links(nodes: &[MarkdownNode], source: &str, base: usize) -> Vec<LinkParse> {
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for index in 1..nodes.len() {
+        let node = &nodes[index];
+        if node.kind != NodeKind::Text {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(run)
+                if run.last().is_some_and(|last| {
+                    *last + 1 == index
+                        && nodes[*last].parent == node.parent
+                        && nodes[*last].source_range.end == node.source_range.start
+                }) =>
+            {
+                run.push(index);
+            }
+            _ => runs.push(vec![index]),
+        }
+    }
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let mut html_owners: Vec<usize> = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if matches!(node.kind, NodeKind::Html | NodeKind::InlineHtml) {
+            html_owners.push(inline_owner(nodes, index));
+        }
+    }
+    let mut links = Vec::new();
+    for run in runs {
+        let first = run[0];
+        let mut excluded = false;
+        let mut current = first;
+        while let Some(parent) = nodes[current].parent {
+            if matches!(
+                nodes[parent.0].kind,
+                NodeKind::Link | NodeKind::Image | NodeKind::CodeBlock | NodeKind::HtmlBlock
+            ) {
+                excluded = true;
+                break;
+            }
+            current = parent.0;
+        }
+        if excluded || html_owners.contains(&inline_owner(nodes, first)) {
+            continue;
+        }
+        let (Some(run_start), Some(run_end)) = (
+            nodes[first].source_range.start.0.checked_sub(base),
+            nodes[run[run.len() - 1]]
+                .source_range
+                .end
+                .0
+                .checked_sub(base),
+        ) else {
+            continue;
+        };
+        let Some(slice) = source.get(run_start..run_end) else {
+            continue;
+        };
+        for (offset, len) in scan_bare_urls(source, run_start, slice) {
+            let start = run_start + offset;
+            let owner = run.partition_point(|id| nodes[*id].source_range.end.0 <= base + start);
+            let Some(owner) = run.get(owner) else {
+                continue;
+            };
+            links.push(LinkParse {
+                node: NodeId(*owner),
+                text_range: SourceRange::new(base + start, base + start + len),
+                destination: Arc::from(&slice[offset..offset + len]),
+                uses_reference: false,
+            });
+        }
+    }
+    links
+}
+
+fn is_url_terminator(ch: char) -> bool {
+    ch.is_whitespace()
+        || ch.is_control()
+        || matches!(
+            ch,
+            '<' | '>'
+                | '\''
+                | '"'
+                | '`'
+                | '\\'
+                | '。'
+                | '、'
+                | '！'
+                | '？'
+                | '：'
+                | '；'
+                | '（'
+                | '）'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '【'
+                | '】'
+                | '〈'
+                | '〉'
+                | '《'
+                | '》'
+        )
+}
+
+/// Drops what is not part of the URL from a raw candidate: everything from the
+/// first unmatched closing bracket, then trailing punctuation and unmatched
+/// opening brackets until stable. Matched `()` `[]` `{}` are kept.
+fn trim_bare_url(candidate: &str) -> &str {
+    let mut depth = [0usize; 3];
+    let mut cut = candidate.len();
+    for (offset, ch) in candidate.char_indices() {
+        let (kind, opens) = match ch {
+            '(' => (0, true),
+            ')' => (0, false),
+            '[' => (1, true),
+            ']' => (1, false),
+            '{' => (2, true),
+            '}' => (2, false),
+            _ => continue,
+        };
+        if opens {
+            depth[kind] += 1;
+        } else if depth[kind] == 0 {
+            cut = offset;
+            break;
+        } else {
+            depth[kind] -= 1;
+        }
+    }
+    let mut trimmed = &candidate[..cut];
+    loop {
+        let next = trimmed.trim_end_matches(['.', ',', ':', ';', '!', '?', '*', '_', '~']);
+        let next = next.strip_suffix(['(', '[', '{']).unwrap_or(next);
+        if next.len() == trimmed.len() {
+            return trimmed;
+        }
+        trimmed = next;
+    }
+}
+
+/// Length of the raw candidate at the start of `rest`, decided in one forward
+/// pass: it ends at the first terminator or the first unmatched closing
+/// bracket, which is exactly where `trim_bare_url` would cut. Scanning past
+/// that point would only be discarded and made the scan quadratic.
+fn bare_url_extent(rest: &str) -> usize {
+    let mut depth = [0usize; 3];
+    for (offset, ch) in rest.char_indices() {
+        if is_url_terminator(ch) {
+            return offset;
+        }
+        let (kind, opens) = match ch {
+            '(' => (0, true),
+            ')' => (0, false),
+            '[' => (1, true),
+            ']' => (1, false),
+            '{' => (2, true),
+            '}' => (2, false),
+            _ => continue,
+        };
+        if opens {
+            depth[kind] += 1;
+        } else if depth[kind] == 0 {
+            return offset;
+        } else {
+            depth[kind] -= 1;
+        }
+    }
+    rest.len()
+}
+
+/// `(offset, len)` of each bare URL in `slice`, where `slice` starts at
+/// `slice_start` in `source` so the character before the slice stays visible.
+fn scan_bare_urls(source: &str, slice_start: usize, slice: &str) -> Vec<(usize, usize)> {
+    let bytes = slice.as_bytes();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !matches!(bytes[index], b'h' | b'H') {
+            index += 1;
+            continue;
+        }
+        let rest = &slice[index..];
+        let scheme_len = ["https://", "http://"].iter().find_map(|scheme| {
+            rest.get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                .then_some(scheme.len())
+        });
+        if scheme_len.is_none() {
+            index += 1;
+            continue;
+        }
+        let raw_len = bare_url_extent(rest);
+        let blocked = source[..slice_start + index]
+            .chars()
+            .next_back()
+            .is_some_and(|prev| {
+                prev.is_ascii_alphanumeric() || matches!(prev, '+' | '-' | '.' | '@')
+            });
+        // Resume after the trimmed candidate, not the raw one, so a scheme that
+        // follows an unmatched closing bracket is still scanned.
+        let candidate = trim_bare_url(&rest[..raw_len]);
+        if !blocked && is_valid_bare_url(candidate) {
+            found.push((index, candidate.len()));
+        }
+        index += candidate.len().max(1);
+    }
+    found
+}
+
+fn is_valid_bare_url(candidate: &str) -> bool {
+    is_external_http_url(candidate)
+        && url::Url::parse(candidate).is_ok_and(|parsed| {
+            matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some()
+        })
 }
 
 /// True for an absolute `http://` or `https://` URL with a host and no
@@ -285,5 +532,27 @@ pub fn parse_document(
         list_structural_prefixes,
         code_padding,
         line_break_padding,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bare_url_extent;
+
+    #[test]
+    fn extent_stops_at_the_first_unmatched_closing_bracket() {
+        let long_suffix = "x".repeat(10_000);
+        for (closer, expected) in [(')', 9), (']', 9), ('}', 9)] {
+            let rest = format!("https://a{closer}{long_suffix}");
+            assert_eq!(bare_url_extent(&rest), expected, "{closer}");
+        }
+    }
+
+    #[test]
+    fn extent_keeps_balanced_brackets_and_stops_at_terminators() {
+        assert_eq!(bare_url_extent("https://a/(b)[c]{d} e"), 19);
+        assert_eq!(bare_url_extent("https://a/(b)) tail"), 13);
+        assert_eq!(bare_url_extent("https://a/(b"), 12);
+        assert_eq!(bare_url_extent("https://a。https://b"), 9);
     }
 }

@@ -500,6 +500,8 @@ fn cached_hundred_thousand_line_quote_projects_only_viewport_markers() {
         parsed: &joined.parsed,
         projection: &joined.projection,
         list_projection: None,
+        source: &joined.joined_source,
+        local_bare: LocalBareLinks::Trusted,
     };
     // The caret is off-screen inside the strong span. Prefix ownership and
     // both distant delimiters still use the same complete snapshot.
@@ -595,6 +597,37 @@ fn external_link_target_carries_destination_and_absolute_text_range() {
     assert_eq!(target.source_range, SourceRange::new(14, 18));
     assert!(target.contains(SourceOffset(14)));
     assert!(!target.contains(SourceOffset(18)));
+}
+
+#[test]
+fn bare_url_gets_link_target_and_link_style_without_a_link_node() {
+    let source = "参照 https://example.com/a。次 [d](https://d.example/)";
+    let start = 10;
+    let line = present_markdown(
+        1,
+        Revision(1),
+        SourceRange::new(start, start + source.len()),
+        source,
+        26.0,
+    );
+    assert_eq!(line.links.len(), 2);
+    let url = "https://example.com/a";
+    let url_start = start + source.find(url).expect("url");
+    let target = &line.links[0];
+    assert_eq!(&*target.destination, url);
+    assert_eq!(
+        target.source_range,
+        SourceRange::new(url_start, url_start + url.len())
+    );
+    assert!(!target.uses_reference);
+    assert!(!target.contains(SourceOffset(url_start + url.len())));
+    let visual_start = line.visual_text.find(url).expect("visual url");
+    assert!(line.style_runs.iter().any(|run| {
+        run.kind == StyleKind::Link
+            && run.visual_range.start.0 == visual_start
+            && run.visual_range.end.0 == visual_start + url.len()
+    }));
+    assert_eq!(&*line.links[1].destination, "https://d.example/");
 }
 
 #[test]
@@ -1306,6 +1339,8 @@ fn large_ordered_list_viewport_labels_reuse_one_shared_parse_at_middle_and_tail(
         parsed: &joined.parsed,
         projection: &joined.projection,
         list_projection: None,
+        source: &joined.joined_source,
+        local_bare: LocalBareLinks::Trusted,
     };
     let middle = ITEMS / 2;
     for &index in &[
