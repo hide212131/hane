@@ -13,7 +13,7 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -409,6 +409,16 @@ pub(crate) fn copy_generated_images(
     names: &[String],
     next_name: &mut dyn FnMut() -> String,
 ) -> Result<CopiedImages, ImagePasteError> {
+    copy_generated_images_within(from_base, to_base, names, next_name, MAX_OUTPUT_BYTES)
+}
+
+fn copy_generated_images_within(
+    from_base: &Path,
+    to_base: &Path,
+    names: &[String],
+    next_name: &mut dyn FnMut() -> String,
+    limit: usize,
+) -> Result<CopiedImages, ImagePasteError> {
     let mut outcome = CopiedImages {
         renamed: Vec::new(),
         created: Vec::new(),
@@ -416,7 +426,7 @@ pub(crate) fn copy_generated_images(
     if from_base == to_base || names.is_empty() {
         return Ok(outcome);
     }
-    let result = copy_each(from_base, to_base, names, next_name, &mut outcome);
+    let result = copy_each(from_base, to_base, names, next_name, &mut outcome, limit);
     if let Err(error) = result {
         for path in outcome.created.drain(..) {
             let _ = fs::remove_file(path);
@@ -426,12 +436,22 @@ pub(crate) fn copy_generated_images(
     Ok(outcome)
 }
 
+/// Reads at most `limit + 1` bytes, so a result longer than `limit` shows the
+/// file exceeds it without ever reading the rest.
+fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn copy_each(
     from_base: &Path,
     to_base: &Path,
     names: &[String],
     next_name: &mut dyn FnMut() -> String,
     outcome: &mut CopiedImages,
+    limit: usize,
 ) -> Result<(), ImagePasteError> {
     let source_directory = from_base.join(IMAGES_DIRECTORY);
     let mut destination_directory: Option<PathBuf> = None;
@@ -447,14 +467,19 @@ fn copy_each(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(ImagePasteError::io("元の画像を確認できません", error)),
         };
-        if length > MAX_OUTPUT_BYTES as u64 {
+        if length > limit as u64 {
             return Err(ImagePasteError::TooLarge("コピーする画像のサイズ"));
         }
-        let bytes = match fs::read(&source) {
+        // The metadata only rejects early; the read itself is bounded because
+        // the file may have grown since.
+        let bytes = match read_bounded(&source, limit) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(ImagePasteError::io("元の画像を読み取れません", error)),
         };
+        if bytes.len() > limit {
+            return Err(ImagePasteError::TooLarge("コピーする画像のサイズ"));
+        }
         let directory = match &destination_directory {
             Some(directory) => directory.clone(),
             None => {
@@ -466,7 +491,11 @@ fn copy_each(
         // An occupied name is reused only when it already holds the same
         // bytes; otherwise the original name is tried first and then fresh
         // ones, always through the exclusive create.
-        if fs::read(directory.join(name)).is_ok_and(|existing| existing == bytes) {
+        // The comparison read is bounded too: an existing file over the limit
+        // is never the same content and is left untouched.
+        if read_bounded(&directory.join(name), limit)
+            .is_ok_and(|existing| existing.len() <= limit && existing == bytes)
+        {
             continue;
         }
         let mut first = Some(name.clone());
@@ -888,6 +917,110 @@ mod tests {
         assert!(result.is_err());
         assert!(!to.join("images").join(&first).exists());
         assert!(from.join("images").join(&first).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_bounded_read_stops_one_byte_past_the_limit() {
+        let root = temp_root("bounded-read");
+        let path = root.join("file");
+        fs::write(&path, b"abcdefgh").unwrap();
+        assert_eq!(read_bounded(&path, 8).unwrap(), b"abcdefgh");
+        assert_eq!(read_bounded(&path, 7).unwrap(), b"abcdefgh");
+        assert_eq!(read_bounded(&path, 4).unwrap(), b"abcde");
+        assert_eq!(read_bounded(&path, 0).unwrap(), b"a");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn copy_with_limit(
+        from: &Path,
+        to: &Path,
+        names: &[String],
+        limit: usize,
+    ) -> (Result<(), ImagePasteError>, CopiedImages) {
+        let mut outcome = CopiedImages {
+            renamed: Vec::new(),
+            created: Vec::new(),
+        };
+        let mut fresh = || "hane-paste-9-00000009.png".to_owned();
+        let result = copy_each(from, to, names, &mut fresh, &mut outcome, limit);
+        (result, outcome)
+    }
+
+    #[test]
+    fn a_source_at_the_limit_is_copied_and_one_byte_over_is_too_large() {
+        let root = temp_root("copy-limit");
+        let (from, to) = (root.join("a"), root.join("b"));
+        fs::create_dir_all(from.join("images")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        let exact = "hane-paste-1-00000001.png".to_owned();
+        let over = "hane-paste-2-00000002.png".to_owned();
+        fs::write(from.join("images").join(&exact), b"12345678").unwrap();
+        fs::write(from.join("images").join(&over), b"123456789").unwrap();
+
+        let (result, outcome) = copy_with_limit(&from, &to, &[exact.clone()], 8);
+        assert!(result.is_ok());
+        assert_eq!(outcome.created.len(), 1);
+        assert_eq!(fs::read(to.join("images").join(&exact)).unwrap(), b"12345678");
+
+        let (result, _) = copy_with_limit(&from, &to, &[over.clone()], 8);
+        assert!(matches!(result, Err(ImagePasteError::TooLarge(_))));
+        assert!(!to.join("images").join(&over).exists());
+        assert!(from.join("images").join(&over).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_existing_destination_over_the_limit_is_never_reused_or_changed() {
+        let root = temp_root("copy-limit-existing");
+        let (from, to) = (root.join("a"), root.join("b"));
+        fs::create_dir_all(from.join("images")).unwrap();
+        fs::create_dir_all(to.join("images")).unwrap();
+        let name = "hane-paste-1-00000001.png".to_owned();
+        // The destination starts with the source bytes but is longer than the
+        // limit, so it must not count as identical.
+        fs::write(from.join("images").join(&name), b"1234").unwrap();
+        fs::write(to.join("images").join(&name), b"12345678").unwrap();
+
+        let (result, outcome) = copy_with_limit(&from, &to, &[name.clone()], 4);
+        assert!(result.is_ok());
+        assert_eq!(fs::read(to.join("images").join(&name)).unwrap(), b"12345678");
+        assert_eq!(
+            outcome.renamed,
+            [(name.clone(), "hane-paste-9-00000009.png".to_owned())]
+        );
+        assert_eq!(
+            fs::read(to.join("images").join("hane-paste-9-00000009.png")).unwrap(),
+            b"1234"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_source_fails_the_copy_and_removes_only_what_it_created() {
+        let root = temp_root("copy-limit-cleanup");
+        let (from, to) = (root.join("a"), root.join("b"));
+        fs::create_dir_all(from.join("images")).unwrap();
+        fs::create_dir_all(to.join("images")).unwrap();
+        let first = "hane-paste-1-00000001.png".to_owned();
+        let big = "hane-paste-2-00000002.png".to_owned();
+        let kept = "hane-paste-3-00000003.png".to_owned();
+        fs::write(from.join("images").join(&first), b"one").unwrap();
+        fs::write(from.join("images").join(&big), b"too large").unwrap();
+        fs::write(to.join("images").join(&kept), b"existing").unwrap();
+
+        let result = copy_generated_images_within(
+            &from,
+            &to,
+            &[first.clone(), big.clone()],
+            &mut generated_file_name,
+            4,
+        );
+        assert!(matches!(result, Err(ImagePasteError::TooLarge(_))));
+        assert!(!to.join("images").join(&first).exists());
+        assert!(!to.join("images").join(&big).exists());
+        assert_eq!(fs::read(to.join("images").join(&kept)).unwrap(), b"existing");
+        assert_eq!(fs::read(from.join("images").join(&big)).unwrap(), b"too large");
         fs::remove_dir_all(root).unwrap();
     }
 
