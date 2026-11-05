@@ -421,7 +421,36 @@ impl EditorView {
                     })
                 })
                 .await;
-            let _ = view.update(cx, |view, cx| view.finish_image_paste(ticket, shape, outcome, cx));
+            // The outcome stays reachable from this task until the view has
+            // taken it, so a view released before delivery (the update closure
+            // is then dropped unrun) still lets this job remove its own file.
+            let slot = Arc::new(std::sync::Mutex::new(Some(outcome)));
+            let delivered = view.update(cx, {
+                let slot = Arc::clone(&slot);
+                move |view, cx| {
+                    let outcome = slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(outcome) = outcome {
+                        view.finish_image_paste(ticket, shape, outcome, cx);
+                    }
+                }
+            });
+            if delivered.is_err() {
+                let undelivered = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(Ok(pasted)) = undelivered {
+                    let path = pasted.saved.path;
+                    cx.background_executor()
+                        .spawn(async move {
+                            let _ = std::fs::remove_file(path);
+                        })
+                        .await;
+                }
+            }
         })
         .detach();
         cx.notify();
@@ -1333,6 +1362,51 @@ mod tests {
         assert_eq!(text_of(&view, cx), "body!\n");
         assert!(pasted_files(&root).is_empty(), "the unpublished file is removed");
         assert!(status_of(&view, cx).unwrap().contains("中止"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_view_released_before_delivery_still_removes_only_its_own_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("view-released");
+        let (view, cx) = open_file_view(cx, &root, "body\n");
+        let other = root.join("images").join("unrelated.png");
+        std::fs::create_dir_all(root.join("images")).unwrap();
+        std::fs::write(&other, b"keep me").unwrap();
+        select(&view, cx, 4, 4);
+        cx.write_to_clipboard(image_item(None, png(1, 1, [0, 0, 0, 255])));
+        paste_without_waiting(&view, cx);
+        // The background save has not run yet; release the view before its
+        // result can be delivered.
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        cx.run_until_parked();
+        assert_eq!(pasted_files(&root), vec![other.clone()]);
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_published_image_survives_the_view_release(cx: &mut gpui::TestAppContext) {
+        let root = temp_root("published-release");
+        let (view, cx) = open_file_view(cx, &root, "body\n");
+        let other = root.join("images").join("unrelated.png");
+        std::fs::create_dir_all(root.join("images")).unwrap();
+        std::fs::write(&other, b"keep me").unwrap();
+        select(&view, cx, 4, 4);
+        cx.write_to_clipboard(image_item(None, png(1, 1, [0, 0, 0, 255])));
+        paste_without_waiting(&view, cx);
+        cx.run_until_parked();
+        assert_eq!(pasted_files(&root).len(), 2);
+        cx.simulate_keystrokes("secondary-z");
+        cx.run_until_parked();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        cx.run_until_parked();
+        let files = pasted_files(&root);
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.contains(&other));
         std::fs::remove_dir_all(root).unwrap();
     }
 
