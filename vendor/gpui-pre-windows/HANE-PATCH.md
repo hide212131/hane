@@ -41,6 +41,10 @@ here because the open guard prevents any change during the read.
 - `html` is reserved for #596 and is `None` for now. No HTML decoding or write
   API was added.
 - GPUI's `read_from_clipboard`/`write_to_clipboard` keep their behavior.
+- `convert_dib_to_bmp` adds the 12-byte external RGB masks to `bfOffBits` only
+  for a 40-byte `BITMAPINFOHEADER` with `BI_BITFIELDS`; the masks of
+  `BITMAPV4HEADER`/`BITMAPV5HEADER` are inside the header. A header size below
+  40 or a pixel offset beyond the input is rejected as an invalid DIB.
 
 ```powershell
 cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_clipboard

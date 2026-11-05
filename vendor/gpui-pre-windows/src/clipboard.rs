@@ -404,6 +404,9 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     }
 
     let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?);
+    if header_size < 40 || header_size as usize > dib.len() {
+        return None;
+    }
     let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
     let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
 
@@ -413,15 +416,24 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
             1u32 << bit_count
         } else {
             colors_used
-        }) * 4
-    } else if compression == 3 {
-        12 // BI_BITFIELDS
+        })
+        .checked_mul(4)?
+    } else if compression == 3 && header_size == 40 {
+        // BI_BITFIELDS: BITMAPINFOHEADER の RGB masks だけがヘッダー外に続く。
+        // V4 / V5 の masks はヘッダー内に含まれるため加算しない。
+        12
     } else {
         0
     };
 
-    let pixel_offset = 14 + header_size + color_table_size;
-    let file_size = 14 + dib.len() as u32;
+    let pixel_offset = 14u32
+        .checked_add(header_size)?
+        .checked_add(color_table_size)?;
+    // 画素開始位置が入力の外なら、途中切れの DIB として拒否する。
+    if pixel_offset as usize - 14 > dib.len() {
+        return None;
+    }
+    let file_size = 14u32.checked_add(u32::try_from(dib.len()).ok()?)?;
 
     let mut bmp = Vec::with_capacity(file_size as usize);
     bmp.extend_from_slice(b"BM");
@@ -553,6 +565,86 @@ mod tests {
     #[test]
     fn hane_clipboard_truncated_dib_is_not_a_bitmap() {
         assert!(convert_dib_to_bmp(&[0u8; 10]).is_none());
-        assert!(convert_dib_to_bmp(&[0u8; 40]).is_some());
+        // header_size が不正、または画素開始位置が入力外のものは拒否する。
+        assert!(convert_dib_to_bmp(&[0u8; 40]).is_none());
+        let mut palette_header = [0u8; 40];
+        palette_header[0..4].copy_from_slice(&40u32.to_le_bytes());
+        palette_header[14..16].copy_from_slice(&8u16.to_le_bytes());
+        assert!(convert_dib_to_bmp(&palette_header).is_none());
+    }
+
+    const MASK_R: u32 = 0x00FF_0000;
+    const MASK_G: u32 = 0x0000_FF00;
+    const MASK_B: u32 = 0x0000_00FF;
+    const MASK_A: u32 = 0xFF00_0000;
+
+    /// 2x1, 32bpp, BI_BITFIELDS の DIB を作る。`header_size` は 40 / 108 / 124。
+    fn bitfields_dib(header_size: u32) -> Vec<u8> {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&header_size.to_le_bytes());
+        dib.extend_from_slice(&2i32.to_le_bytes()); // width
+        dib.extend_from_slice(&1i32.to_le_bytes()); // height
+        dib.extend_from_slice(&1u16.to_le_bytes()); // planes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // bit count
+        dib.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+        dib.extend_from_slice(&8u32.to_le_bytes()); // image size
+        dib.extend_from_slice(&[0u8; 16]); // ppm x/y, colors used/important
+        assert_eq!(dib.len(), 40);
+        if header_size == 40 {
+            // ヘッダー外の RGB masks
+            for mask in [MASK_R, MASK_G, MASK_B] {
+                dib.extend_from_slice(&mask.to_le_bytes());
+            }
+        } else {
+            // V4 / V5: ヘッダー内の RGBA masks
+            for mask in [MASK_R, MASK_G, MASK_B, MASK_A] {
+                dib.extend_from_slice(&mask.to_le_bytes());
+            }
+            dib.resize(header_size as usize, 0);
+        }
+        // BGRA 画素 2 つ: (R,G,B,A) = (0x10,0x20,0x30,0x80), (0xA0,0xB0,0xC0,0xFF)
+        dib.extend_from_slice(&[0x30, 0x20, 0x10, 0x80]);
+        dib.extend_from_slice(&[0xC0, 0xB0, 0xA0, 0xFF]);
+        dib
+    }
+
+    fn decode_bmp(bmp: &[u8]) -> image::RgbaImage {
+        image::load_from_memory_with_format(bmp, image::ImageFormat::Bmp)
+            .expect("BMP decodes")
+            .to_rgba8()
+    }
+
+    #[test]
+    fn hane_clipboard_dib_info_header_bitfields_masks_are_outside_header() {
+        let dib = bitfields_dib(40);
+        let bmp = convert_dib_to_bmp(&dib).expect("converts");
+        assert_eq!(u32::from_le_bytes(bmp[10..14].try_into().unwrap()), 66);
+        let img = decode_bmp(&bmp);
+        assert_eq!((img.width(), img.height()), (2, 1));
+        assert_eq!(img.get_pixel(0, 0).0[..3], [0x10, 0x20, 0x30]);
+        assert_eq!(img.get_pixel(1, 0).0[..3], [0xA0, 0xB0, 0xC0]);
+    }
+
+    #[test]
+    fn hane_clipboard_dib_v4_v5_bitfields_masks_are_inside_header() {
+        for (header_size, expected_offset) in [(108u32, 122u32), (124, 138)] {
+            let dib = bitfields_dib(header_size);
+            let bmp = convert_dib_to_bmp(&dib).expect("converts");
+            assert_eq!(
+                u32::from_le_bytes(bmp[10..14].try_into().unwrap()),
+                expected_offset
+            );
+            let img = decode_bmp(&bmp);
+            assert_eq!((img.width(), img.height()), (2, 1));
+            assert_eq!(img.get_pixel(0, 0).0, [0x10, 0x20, 0x30, 0x80]);
+            assert_eq!(img.get_pixel(1, 0).0, [0xA0, 0xB0, 0xC0, 0xFF]);
+        }
+    }
+
+    #[test]
+    fn hane_clipboard_dib_header_larger_than_input_is_rejected() {
+        let mut dib = bitfields_dib(108);
+        dib.truncate(60);
+        assert!(convert_dib_to_bmp(&dib).is_none());
     }
 }
