@@ -2655,17 +2655,34 @@ mod tests {
         });
 
         let calls = log.lock().unwrap().clone();
+        let restart_message = view.read_with(cx, |view, _| view.restart_message.clone());
         assert!(
             !calls.contains(&"authorize"),
-            "the helper must not be released while a document is unhandled: {calls:?}"
+            "the helper must not be released while a document is unhandled: calls={calls:?} restart_message={restart_message:?}"
         );
-        assert!(calls.contains(&"abort"));
-        assert!(calls.contains(&"resume_ai"));
+        assert!(
+            calls.contains(&"abort"),
+            "abort was not recorded: calls={calls:?} restart_message={restart_message:?}"
+        );
+        assert!(
+            calls.contains(&"resume_ai"),
+            "resume_ai was not recorded: calls={calls:?} restart_message={restart_message:?}"
+        );
         view.read_with(cx, |view, _| {
-            assert!(!view.restart_freeze_active(), "the user can retry");
-            assert!(!view.restart_in_progress);
+            assert!(
+                !view.restart_freeze_active(),
+                "the user can retry: calls={calls:?} restart_message={restart_message:?}"
+            );
+            assert!(
+                !view.restart_in_progress,
+                "restart must not remain in progress: calls={calls:?} restart_message={restart_message:?}"
+            );
         });
-        assert_eq!(inbox.len(), 1, "the document is still waiting, not lost");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "the document is still waiting, not lost: calls={calls:?} restart_message={restart_message:?}"
+        );
 
         // Once the freeze is gone the waiting document opens in this process.
         let accepted = view.update(cx, |view, cx| {
