@@ -217,13 +217,16 @@ GitHub取得には既存gh/API処理を利用する。意味判断は追加し�
 基準mainの通常finalizerはこれらを拒否する。PR #526だけのU2例外は転用しない。
 通常workerに本PRの実装を投稿して拒否させる試行や、self-modifyingな例外追加をしない。
 
-PR担当は権限を持つ運用基盤担当として着手する。Claudeを編集担当に使う場合は、
-専用のローカルClaude Code、モデル `claude-sonnet-5-5`、編集用toolsだけで対象allowlistを渡す。
-GitHub/Jev認証と提出権限は渡さず、Git管理情報のない対象treeを編集データとして使う。
-実行・差分検査・commit/pushは運用基盤担当が開始時/提出直前のexact headを確認して行う。
-ローカルClaude CLI 2.1.296の存在は確認済みだが、認証とSonnet 5.5の実接続は未確認。
-着手時に既存認証で確認し、利用不能ならその事実を報告する。別モデル・Codex実装fallbackへ自動変更しない。
-Commanderによる製品コード変更は本PRに含めない。
+PR担当は権限を持つ運用基盤担当として、§6の基盤コード・契約test・手順を直接変更・検証・提出できる。
+根拠は現行 [Claude実行手順の運用基盤節](../aadw-claude-execution.md#運用基盤そのものを変更する場合) と
+[Hane skill](../../.agents/skills/hane-issue-workflow/SKILL.md)。通常の製品実装をCommanderが代行する許可ではない。
+開始時/提出直前のexact headを確認し、Rust製品コードには触れない。
+
+Claudeの補助編集は任意とし、認証済みの専用経路が利用できる場合だけ使う。
+その場合も `claude-sonnet-5-5`、編集用tools、対象allowlist、Git管理情報のない編集データを使い、
+GitHub/Jev認証と提出権限を渡さない。local CLI 2.1.296は存在するが、2026-11-05の
+`claude auth status --json` は `loggedIn=false` だった。ログインを本PRの着手条件にしない。
+通常の製品実装のモデル/入口や、利用上限時だけのCodex fallbackは変更しない。
 
 ## 8. 検証・採用・完了の区別
 

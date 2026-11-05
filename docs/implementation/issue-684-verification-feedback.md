@@ -17,11 +17,12 @@ current main、PR head/base、Issue本文、同じ責務のPR/run、default bran
 現行finalizerは `.github/` とPolicyを拒否するため、その入口では実装を提出できない。
 U2専用PR #526の例外を転用せず、通常workerの制限を緩めない。
 
-権限を持つ運用基盤担当が詳細設計§7の経路で着手する。
-Claudeを使う場合はローカルClaude Code Sonnet 5.5を編集専用toolsで起動し、GitHub/Jev認証とshell/提出権限を渡さない。
-既存のlocal CLIの存在は確認済み。接続認証・実モデル・隔離と許可パスは開始時に確認する。
-実行・差分確認・commit/pushは運用基盤担当がexpected-headを確認して実施する。
-モデル不達を別モデルやCodex実装fallbackで隠さない。
+権限を持つPR担当が詳細設計§7の運用基盤担当として、限定した基盤コード・契約test・文書を直接変更できる。
+製品コード変更は禁止のまま。実行・差分確認・commit/pushは担当がexpected-headを確認して実施する。
+Claudeの補助編集は認証済み専用経路を利用できる場合だけの任意とする。
+利用する場合もSonnet 5.5と編集専用toolsに限定し、GitHub/Jev認証とshell/提出権限を渡さない。
+local CLIは存在するが `loggedIn=false` を確認済みであり、ログインを着手条件にしない。
+通常の製品実装のClaude接続やCodex fallbackの条件は変更しない。
 
 ## 今回実装するもの
 
@@ -80,4 +81,5 @@ report成功だけでreview/GUI/mergeを起動しない。required evidenceの�
 
 設計方針の選択にはJev（provider `typesafe`、要求 `jev-latest`、応答 `jev-1.14.0`）を使用し、
 `existing_restart`、具体化の次actionとして `prepare_design` を取得した。
+local Claude未認証の新事実に対し、既存Policy内の運用基盤担当による着手を選ぶ `infra_operator` を取得した。
 判断は実装成功や速度測定の証拠ではない。
