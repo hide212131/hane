@@ -580,10 +580,26 @@ impl EditorView {
         if session.editor().selection() != ticket.selection {
             return Err("選択範囲が変わりました");
         }
-        if self.document_base_directory(ticket.id).as_deref() != Some(ticket.base.as_path())
-            || self.work_folder_drafts.get(&ticket.id).map(|draft| draft.draft_id) != ticket.draft
-        {
+        if self.document_base_directory(ticket.id).as_deref() != Some(ticket.base.as_path()) {
             return Err("保存先が変わりました");
+        }
+        let current_draft = self.work_folder_drafts.get(&ticket.id).map(|draft| draft.draft_id);
+        if current_draft != ticket.draft {
+            // The one accepted change is a draft's first save into the very
+            // directory it was going to be created in: the draft entry is
+            // retired and the document now has its own file there. The base
+            // check above already pins that directory; the file itself must
+            // be what provides it, so a vanished draft never passes.
+            let first_saved_in_place = ticket.draft.is_some()
+                && current_draft.is_none()
+                && self
+                    .sessions
+                    .get(ticket.id)
+                    .and_then(|session| session.file().directory())
+                    == Some(ticket.base.as_path());
+            if !first_saved_in_place {
+                return Err("保存先が変わりました");
+            }
         }
         Ok(())
     }
@@ -1532,6 +1548,48 @@ mod tests {
         assert_eq!(text, format!("![画像](images/{name})\n"));
         assert_eq!(pasted_files(&target).len(), 1);
         assert!(!root.join("images").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_draft_first_saved_into_its_target_directory_keeps_the_pasted_image(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("draft-first-save");
+        let target = root.join("folder");
+        std::fs::create_dir_all(&target).unwrap();
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, _| {
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: target.clone(),
+                },
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| window.focus(&view.focus_handle, cx));
+        });
+        cx.write_to_clipboard(image_item(None, png(2, 2, [5, 5, 5, 255])));
+        paste_without_waiting(&view, cx);
+        // The first save lands in the same directory before the paste result
+        // is delivered; the save retires the draft entry.
+        save_as(&view, cx, target.join("note.md"));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.work_folder_drafts.is_empty());
+        });
+        let saved = std::fs::read_to_string(target.join("note.md")).unwrap();
+        let name = reference_in(&text_of(&view, cx));
+        assert!(text_of(&view, cx).contains(&format!("images/{name}")));
+        assert!(target.join("images").join(&name).is_file());
+        assert_eq!(pasted_files(&target).len(), 1);
+        let _ = saved;
         std::fs::remove_dir_all(root).unwrap();
     }
 
