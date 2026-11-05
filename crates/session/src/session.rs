@@ -664,7 +664,7 @@ impl DocumentSession {
 
     /// Makes the live document follow a rewrite whose bytes reached the disk.
     fn follow_rewrite(&mut self, armed: ArmedRewrite) -> bool {
-        match armed.prepared {
+        let followed = match armed.prepared {
             // Exact while the editor is the prepared state; otherwise only
             // what changed since is evaluated, never the whole history.
             Some(prepared) => self
@@ -672,7 +672,13 @@ impl DocumentSession {
                 .follow_prepared_rewrite(prepared, &*armed.plan)
                 .is_ok(),
             None => self.editor.apply_rewrite(&*armed.plan).is_ok(),
+        };
+        if !followed && self.editor.is_composing() {
+            // The rewrite touches the composed text, which must not change
+            // under the IME. It waits for the composition to end.
+            self.editor.defer_rewrite(armed.plan);
         }
+        followed
     }
 
     /// Drops an armed rewrite that no write took. `true` means it was unused.

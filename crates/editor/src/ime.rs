@@ -147,6 +147,7 @@ impl Editor {
             );
         }
         self.record_model_update(received, InputMeasurementKind::ImeCommit);
+        self.run_deferred_rewrites();
         Ok(summary)
     }
 
@@ -234,9 +235,16 @@ impl Editor {
             self.selection,
             crate::history::EditKind::Ime,
         );
+        self.run_deferred_rewrites();
     }
 
     pub fn cancel_composition(&mut self) -> Result<ImeCancelOutcome, BufferError> {
+        let outcome = self.cancel_composition_inner();
+        self.run_deferred_rewrites();
+        outcome
+    }
+
+    fn cancel_composition_inner(&mut self) -> Result<ImeCancelOutcome, BufferError> {
         let Some(ime) = self.ime.take() else {
             return Ok(ImeCancelOutcome::Inactive);
         };

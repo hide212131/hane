@@ -199,6 +199,12 @@ type DuringWrite = fn(&mut DocumentSession);
 /// in the same document, selection and history. Returns how often the
 /// prepared landing evaluated the plan.
 fn land_after(steps: usize, during: DuringWrite) -> usize {
+    land_after_settled(steps, during, |_| {})
+}
+
+/// [`land_after`], with `settle` applied to both sessions once the write has
+/// landed (for example ending a composition that held the rewrite back).
+fn land_after_settled(steps: usize, during: DuringWrite, settle: DuringWrite) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
 
     let plain_service = MemoryFileService::new();
@@ -221,6 +227,8 @@ fn land_after(steps: usize, during: DuringWrite) -> usize {
     calls.store(0, Ordering::SeqCst);
     let outcome = land(&service, &mut session, job);
     let evaluated = calls.load(Ordering::SeqCst);
+    settle(&mut session);
+    settle(&mut plain);
 
     assert_eq!(
         std::mem::discriminant(&outcome),
@@ -279,19 +287,75 @@ fn several_edits_undo_and_a_composition_during_the_write_follow_exactly() {
         });
         assert!(evaluated <= 8, "{steps} steps: the plan ran {evaluated} times");
 
-        let composing = land_after(steps, |session| {
-            let end = session.editor().document().len_bytes().0;
-            session
-                .editor_mut()
-                .set_selection(Selection::caret(SourceOffset(end)))
-                .unwrap();
-            session
-                .editor_mut()
-                .replace_and_mark_text(None, "かな![](old.png)", None)
-                .unwrap();
-            session.note_edit();
+        let composing = land_after_settled(steps, compose_old_reference, |session| {
+            session.editor_mut().commit_composition();
         });
         assert!(composing <= 4, "{steps} steps: the plan ran {composing} times");
+    }
+}
+
+fn compose_old_reference(session: &mut DocumentSession) {
+    let end = session.editor().document().len_bytes().0;
+    session
+        .editor_mut()
+        .set_selection(Selection::caret(SourceOffset(end)))
+        .unwrap();
+    session
+        .editor_mut()
+        .replace_and_mark_text(None, "かな![](old.png)", None)
+        .unwrap();
+    session.note_edit();
+}
+
+/// Lands a Save As whose write was interrupted by a composition holding the
+/// old reference; returns the session with the composition still open.
+fn landed_with_open_composition(service: &MemoryFileService) -> DocumentSession {
+    let mut session = with_long_history(service, 6);
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(session.arm_save_rewrite(counting_plan(&calls)));
+    let job = write_job(&mut session);
+    compose_old_reference(&mut session);
+    assert!(matches!(land(service, &mut session, job), SaveOutcome::SavedStale));
+    session
+}
+
+#[test]
+fn a_composition_holds_the_rewrite_back_until_it_is_committed() {
+    let service = MemoryFileService::new();
+    let mut session = landed_with_open_composition(&service);
+    // The marked text is not touched while the composition is open, and it can
+    // still be extended in place.
+    assert!(text(&session).ends_with("かな![](old.png)"));
+    session
+        .editor_mut()
+        .replace_and_mark_text(None, "かな![](old.png)あ", None)
+        .unwrap();
+    assert!(text(&session).ends_with("かな![](old.png)あ"));
+    session.editor_mut().commit_text(None, "かな![](old.png)あ").unwrap();
+    let expected_tail = format!("かな![]({NEW})あ");
+    assert!(text(&session).ends_with(&expected_tail), "{:?}", text(&session));
+    assert!(!text(&session).contains(OLD));
+    assert_eq!(text(&session).matches("かな").count(), 1);
+    assert!(session.is_dirty());
+    // The next input lands after the committed text, once.
+    session.editor_mut().insert_text("次").unwrap();
+    session.note_edit();
+    assert!(text(&session).ends_with(&format!("{expected_tail}次")));
+    for state in undo_all(&mut session).iter().chain(&redo_all(&mut session)) {
+        assert!(!state.contains(OLD), "{state:?}");
+    }
+}
+
+#[test]
+fn a_cancelled_composition_leaves_the_document_rewritten_without_it() {
+    let service = MemoryFileService::new();
+    let mut session = landed_with_open_composition(&service);
+    session.editor_mut().cancel_composition().unwrap();
+    assert!(!text(&session).contains("かな"));
+    assert!(!text(&session).contains(OLD));
+    assert!(session.is_dirty());
+    for state in undo_all(&mut session).iter().chain(&redo_all(&mut session)) {
+        assert!(!state.contains(OLD), "{state:?}");
     }
 }
 

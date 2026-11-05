@@ -46,6 +46,7 @@ use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRa
 use hane_metrics::RollingWindow;
 pub use history::{RewritePlan, TextEdit};
 use history::{EditKind, History, RewriteState, checked_edits, map_selection};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -132,6 +133,9 @@ pub struct Editor {
     next_input_sequence: u64,
     pending_measurements: RollingWindow<InputMeasurement>,
     history: History,
+    /// Rewrites that touched the composed region and so wait for the
+    /// composition to end; see [`Editor::defer_rewrite`].
+    deferred_rewrites: Vec<Arc<RewritePlan>>,
 }
 
 /// The document and history a rewrite is prepared from; see
@@ -193,6 +197,7 @@ impl Editor {
             next_input_sequence: 1,
             pending_measurements: RollingWindow::new(2_048),
             history: History::default(),
+            deferred_rewrites: Vec::new(),
         }
     }
 
@@ -433,6 +438,33 @@ impl Editor {
         };
         let history = self.history.rewritten(&text, plan);
         self.adopt_rewrite(&edits, history)
+    }
+
+    /// Whether an IME composition is open.
+    pub fn is_composing(&self) -> bool {
+        self.ime.is_some()
+    }
+
+    /// Holds `plan` back until the open composition ends (commit, cancel or
+    /// forced commit), then applies it to the settled text and history. For a
+    /// rewrite that touches the composed region, which cannot be carried
+    /// around the marked text. Without an open composition it applies at once.
+    pub fn defer_rewrite(&mut self, plan: Arc<RewritePlan>) {
+        if self.ime.is_some() {
+            self.deferred_rewrites.push(plan);
+        } else {
+            let _ = self.apply_rewrite(&*plan);
+        }
+    }
+
+    /// Applies the rewrites held back during a composition, now that it ended.
+    pub(crate) fn run_deferred_rewrites(&mut self) {
+        if self.ime.is_some() {
+            return;
+        }
+        for plan in std::mem::take(&mut self.deferred_rewrites) {
+            let _ = self.apply_rewrite(&*plan);
+        }
     }
 
     /// Writes the already planned `edits` into the document and takes `history`
