@@ -1703,13 +1703,16 @@ fn failed_extraction_cleanup_never_deletes_outside_the_stage() {
 
     // The intended outcome is the hash mismatch. An earlier I/O failure is
     // accepted only when the attacker really swapped the directory in the
-    // way, which makes the extraction fail closed before the hash check.
+    // way, which makes the extraction fail closed before the hash check. A
+    // pinned open that finds a junction reports `InstallModified`, accepted
+    // only when the attacker really created a junction.
     let err = result
         .map(drop)
         .expect_err("a failed hash check must not extract successfully");
     match err.code {
         ErrorCode::HashMismatch => {}
         ErrorCode::Io if renames > 0 => {}
+        ErrorCode::InstallModified if junctions > 0 => {}
         other => panic!(
             "unexpected extraction error {other:?}: {err} \
              (attacker renames={renames}, junctions={junctions})"
