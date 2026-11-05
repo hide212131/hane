@@ -1,4 +1,5 @@
-use crate::{Editor, InputMeasurementKind, Selection};
+use crate::history::{TextEdit, checked_edits, map_offset, map_selection};
+use crate::{Editor, InputMeasurementKind, RewritePlan, Selection};
 use hane_document::{
     Anchor, Bias, BufferError, EditSummary, Revision, SourceOffset, SourceRange, TextBuffer,
     TransactionId,
@@ -147,6 +148,78 @@ impl Editor {
         }
         self.record_model_update(received, InputMeasurementKind::ImeCommit);
         Ok(summary)
+    }
+
+    /// Rewrites the document by `plan` while an IME composition stays open.
+    /// The plan is evaluated on the text the history holds (the document with
+    /// the original text in place of the marked text), and the replacements
+    /// are carried to the live document around the marked range. The
+    /// composition, its anchors and its pending Undo entry move with the text,
+    /// so later marked-text updates, commit and cancel land at the right
+    /// place without being forced to commit.
+    ///
+    /// A replacement that touches the composed region cannot be carried
+    /// safely; then nothing is changed and an error is returned so the caller
+    /// treats the rewrite as not followed.
+    pub(crate) fn rewrite_with_composition(
+        &mut self,
+        plan: &RewritePlan,
+    ) -> Result<(), BufferError> {
+        let Some(ime) = self.ime.clone() else {
+            return Ok(());
+        };
+        let current = ime.current_range;
+        let text = self.document.full_text();
+        let base = format!(
+            "{}{}{}",
+            &text[..current.start.0],
+            ime.original_text,
+            &text[current.end.0..]
+        );
+        let Some(edits) = checked_edits(&base, plan(&base)) else {
+            return Ok(());
+        };
+        let start = current.start.0;
+        let original_len = ime.original_text.len();
+        let original_end = start + original_len;
+        let marked_len = current.end.0 - start;
+        let mut doc_edits: Vec<TextEdit> = Vec::with_capacity(edits.len());
+        for (range, replacement) in &edits {
+            let empty = range.start == range.end;
+            // An insertion exactly at either edge of the composed region has
+            // no safe side, so it is refused like an overlap.
+            let before =
+                range.end <= start && !(empty && original_len == 0 && range.start == start);
+            let after = range.start >= original_end && !(empty && range.start == original_end);
+            let shifted = if before {
+                range.clone()
+            } else if after {
+                range.start + marked_len - original_len..range.end + marked_len - original_len
+            } else {
+                return Err(BufferError::InvalidRange { range: current });
+            };
+            doc_edits.push((shifted, replacement.clone()));
+        }
+        let history = self.history.rewritten(&base, plan);
+        self.adopt_rewrite(&doc_edits, history)?;
+
+        let new_start = map_offset(&doc_edits, current.start.0);
+        let new_current = SourceRange::new(new_start, new_start + marked_len);
+        let original_range = SourceRange::new(new_start, new_start + original_len);
+        let start_anchor = self.document.anchor(new_current.start, Bias::Before)?;
+        let end_anchor = self.document.anchor(new_current.end, Bias::After)?;
+        let revision = self.document.revision();
+        if let Some(ime) = &mut self.ime {
+            ime.current_range = new_current;
+            ime.marked_range = new_current;
+            ime.original_range = original_range;
+            ime.original_selection = map_selection(&edits, ime.original_selection);
+            ime.start_anchor = start_anchor;
+            ime.end_anchor = end_anchor;
+            ime.base_revision = revision;
+            ime.expected_revision = revision;
+        }
+        Ok(())
     }
 
     pub fn commit_composition(&mut self) {

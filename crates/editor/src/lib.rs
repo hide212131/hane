@@ -424,7 +424,9 @@ impl Editor {
     /// for an editor that moved on since.
     pub fn apply_rewrite(&mut self, plan: &RewritePlan) -> Result<(), BufferError> {
         self.history.break_group();
-        self.commit_composition();
+        if self.ime.is_some() {
+            return self.rewrite_with_composition(plan);
+        }
         let text = self.document.full_text();
         let Some(edits) = checked_edits(&text, plan(&text)) else {
             return Ok(());
@@ -518,7 +520,9 @@ impl Editor {
             return self.adopt_rewrite(&prepared.edits, prepared.history);
         }
         self.history.break_group();
-        self.commit_composition();
+        if self.ime.is_some() {
+            return self.rewrite_with_composition(plan);
+        }
         let Some(now) = RewriteState::of(self.document.full_text(), plan) else {
             return Ok(());
         };
