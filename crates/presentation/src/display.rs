@@ -1,5 +1,5 @@
 use crate::{SourceMap, Visibility, VisualOffset, VisualRange};
-use hane_document::{Revision, RevisionDelta, SourceOffset, SourceRange};
+use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
 use hane_markdown::{BlockId, Confidence, IndexedBlock, NodeKind, TableAlignment, TableProjection};
 use std::ops::Range;
 use std::sync::Arc;
@@ -670,6 +670,59 @@ impl VisualBlock {
             && self.source_range == block.source_range
             && self.confidence == block.confidence
             && self.kind == block_display_kind(block.kind)
+    }
+
+    /// True when a bare URL target of this presentation could change meaning
+    /// if a reference definition elsewhere in the document is added or removed.
+    ///
+    /// A URL written directly in text only becomes the text of a reference
+    /// link when it sits between `[` and `]`, so a bare target with no such
+    /// brackets around it never depends on another block. A presentation that
+    /// shows only part of its block cannot see the brackets that open or close
+    /// outside it and is treated as dependent. The caller uses this to present
+    /// such a block again, instead of rebasing it, when an edit elsewhere may
+    /// have touched a definition.
+    pub fn has_reference_sensitive_bare_link(&self) -> bool {
+        let partial = self.lines_before > 0 || self.lines_after > 0;
+        for (index, line) in self.lines.iter().enumerate() {
+            for link in line.links.iter().filter(|link| !link.uses_reference) {
+                let (Some(start), Some(end)) = (
+                    line.source_map
+                        .source_to_visual(link.source_range.start, Bias::After),
+                    line.source_map
+                        .source_to_visual(link.source_range.end, Bias::Before),
+                ) else {
+                    continue;
+                };
+                let (start, end) = (start.visual_offset.0, end.visual_offset.0);
+                let (Some(text), Some(before), Some(after)) = (
+                    line.visual_text.get(start..end),
+                    line.visual_text.get(..start),
+                    line.visual_text.get(end..),
+                ) else {
+                    continue;
+                };
+                // A Markdown link's own text is not the destination itself.
+                if text != &*link.destination {
+                    continue;
+                }
+                if partial {
+                    return true;
+                }
+                let opens = before.contains('[')
+                    || self.lines[..index]
+                        .iter()
+                        .any(|earlier| earlier.visual_text.contains('['));
+                let closes = after.contains(']')
+                    || self.lines[index + 1..]
+                        .iter()
+                        .any(|later| later.visual_text.contains(']'));
+                if opens && closes {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// True when the presented run already covers `lines`, so a cached block can

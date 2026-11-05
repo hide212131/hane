@@ -137,15 +137,19 @@ pub struct TableParse {
     pub alignments: Arc<[TableAlignment]>,
 }
 
-/// An openable Markdown link: an inline or reference link whose destination is
-/// an absolute HTTP(S) URL. Only these are kept, so a consumer never has to
-/// re-judge the scheme; images, relative paths, `file:` and other schemes never
-/// appear here.
+/// An openable link: an inline or reference Markdown link whose destination is
+/// an absolute HTTP(S) URL, or a scheme-qualified HTTP(S) URL written directly
+/// in body text. Only these are kept, so a consumer never has to re-judge the
+/// scheme; images, relative paths, `file:` and other schemes never appear here.
+/// Entries are in source order and never overlap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkParse {
+    /// The Markdown `Link` node, or for a bare URL (`uses_reference == false`
+    /// and `destination` equal to the source text) the real `Text` node that
+    /// contains the first byte of the URL.
     pub node: NodeId,
     /// Source range of the link text (first to last child), excluding the
-    /// brackets and the destination part.
+    /// brackets and the destination part. For a bare URL, the URL itself.
     pub text_range: SourceRange,
     pub destination: Arc<str>,
     /// Whether the destination comes from a link reference definition (full,

@@ -1186,9 +1186,17 @@ fn table_row_element(
                 let fragment_matches = clip_visual_ranges(&cell_matches, fragment_range.clone());
                 let fragment_current_match =
                     clip_visual_range(cell_current_match.as_ref(), fragment_range.clone());
+                // Only a stretch the formal projection marked as a link needs the
+                // per-segment path; everything else keeps the single-text fast path.
+                let fragment_has_link = line.style_runs.iter().any(|run| {
+                    run.kind.display().link_color
+                        && run.visual_range.start.0 < fragment_range.end
+                        && fragment_range.start < run.visual_range.end.0
+                });
                 if fragment_selected.is_none()
                     && fragment_marked.is_none()
                     && fragment_matches.is_empty()
+                    && !fragment_has_link
                 {
                     let text = line.visual_text[fragment_range].to_owned();
                     let text_element = div()
@@ -1273,6 +1281,15 @@ fn table_row_element(
                             })
                             .when(segment.display.monospace, |element| {
                                 element.font_family("ui-monospace")
+                            })
+                            .when(segment.display.link_color, |element| {
+                                let selector = format!(
+                                    "table-cell-link-{}-{}-{}",
+                                    line.line_id, cell_layout.column, fragment_index
+                                );
+                                element
+                                    .text_color(rgb(theme.link_foreground))
+                                    .debug_selector(move || selector.clone())
                             })
                             .child(line.visual_text[segment.visual_range].to_owned())
                     })
