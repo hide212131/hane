@@ -2946,19 +2946,54 @@ mod tests {
         let fixture = fixture("0.26.0", "0.27.0", 5);
         fixture.script_check();
         fixture.check_now();
-        // The sequence floor is read from the receipts location while the
-        // offer is verified again; breaking it fails that step before any
-        // local work directory is prepared.
-        fs::write(fixture.dir.path().join("receipts"), b"not a directory").unwrap();
+        assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+        // A higher, well-formed sequence floor is recorded after the check.
+        // The refusal does not depend on how an OS opens a broken path: the
+        // retained candidate is simply below the floor.
+        write_floor(&fixture.dir.path().join("receipts").join("seen-catalog.json"), 6, 'e');
+        let offer = match &fixture.service.inner.lock().stage {
+            Stage::Available(offer) => Arc::clone(offer),
+            _ => panic!("the checked candidate must be retained as Available"),
+        };
+        // Independently of the download operation, the re-verification itself
+        // is refused with the expected code.
+        let refusal = fixture.service.inner.reverify_offer(&offer).unwrap_err();
+        assert_eq!(refusal.code, ErrorCode::SequenceRegression);
+
+        let requests_before = fixture.requests();
         fixture.service.download(&fixture.candidate_id());
         run_queued(&fixture.queue);
         let snapshot = fixture.service.snapshot();
         assert_eq!(snapshot.phase, AppUpdatePhase::Failed);
         assert_eq!(snapshot.error_stage.as_deref(), Some("check"));
+        assert_eq!(snapshot.error_code.as_deref(), Some("sequence_regression"));
         assert_ne!(snapshot.error_stage.as_deref(), Some("write_download"));
+        assert_ne!(snapshot.error_stage.as_deref(), Some("download"));
         let report = fixture.service.diagnostics_text();
         assert!(report.contains("stage=check"), "{report}");
+        assert!(report.contains("code=sequence_regression"), "{report}");
         assert!(!report.contains("stage=write_download"), "{report}");
+        assert!(!report.contains("stage=download"), "{report}");
+        // No network or archive request started, nothing was published and
+        // the private work directory holds no leftovers.
+        assert_eq!(fixture.requests(), requests_before);
+        assert!(
+            !fixture
+                .transport
+                .requests()
+                .iter()
+                .any(|request| request.url == asset_url(&fixture.tag, ARCHIVE_NAME)),
+            "the archive must not be requested"
+        );
+        assert!(!fixture.updates_root().join("candidates").exists());
+        let leftovers = fixture
+            .service
+            .inner
+            .work_dir()
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        assert!(!leftovers, "the private work directory must hold no leftovers");
     }
 
     #[test]
