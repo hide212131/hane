@@ -4985,6 +4985,11 @@ impl EditorView {
                         .iter()
                         .any(|line| line.links.iter().any(|link| link.uses_reference))
                         && !deltas.is_empty())
+                    // A bare URL between `[` and `]` may be the text of a
+                    // reference link once a definition elsewhere appears, so
+                    // such a block is presented again as well. Any other bare
+                    // URL is decided by its own block and keeps rebasing.
+                    && !(cached.has_reference_sensitive_bare_link() && !deltas.is_empty())
                     && cached.rebase(&deltas, revision)
                     // The rows describe the same text at shifted offsets, so
                     // they move with the block rather than being rebuilt.
@@ -6762,6 +6767,721 @@ mod tests {
                     .iter()
                     .flat_map(|line| &line.links)
                     .any(|link| &*link.destination == DESTINATION)
+            );
+        });
+    }
+
+    /// Issue #673: the link targets one block presents right now, through the
+    /// same `cached_block` path the render loop uses. Returns each target's
+    /// destination and source range, whether every target is drawn with the
+    /// Link style over exactly its text, and whether the cache was reused.
+    fn bare_url_snapshot(
+        view: &mut EditorView,
+        probe: &str,
+    ) -> (Vec<(String, SourceRange)>, bool, bool) {
+        let text = view.editor().document().full_text();
+        let at = SourceOffset(text.find(probe).expect("probe text"));
+        let indexed = view.block_at_offset(at).expect("block");
+        let span = block_line_span(view.editor().document(), &indexed).expect("span");
+        let (visual, reused) = view.cached_block(&indexed, &span).expect("presented");
+        let mut targets = Vec::new();
+        let mut all_colored = true;
+        for line in &visual.lines {
+            for link in &line.links {
+                targets.push((link.destination.to_string(), link.source_range));
+                let len = link.destination.len();
+                let colored = line.visual_text.find(&*link.destination).is_some_and(|start| {
+                    line.style_runs.iter().any(|run| {
+                        run.kind == hane_presentation::StyleKind::Link
+                            && run.visual_range.start.0 == start
+                            && run.visual_range.end.0 == start + len
+                    })
+                });
+                all_colored &= colored;
+            }
+        }
+        (targets, all_colored, reused)
+    }
+
+    /// The `(destination, range)` pair a bare URL must present in `text`.
+    fn bare_url_target(text: &str, url: &str) -> (String, SourceRange) {
+        let start = text.find(url).expect("url in text");
+        (url.to_owned(), SourceRange::new(start, start + url.len()))
+    }
+
+    /// The links the published formal index holds for the block of `probe`.
+    fn formal_bare_url_links(view: &EditorView, probe: &str) -> Vec<(String, SourceRange)> {
+        let text = view.editor().document().full_text();
+        let block = view
+            .block_at_offset(SourceOffset(text.find(probe).expect("probe text")))
+            .expect("block");
+        let index = view
+            .current_index()
+            .expect("the formal index describes the current revision");
+        index
+            .list_projection(&block)
+            .map(|projection| {
+                projection
+                    .links_in(block.source_range)
+                    .map(|link| (link.destination.to_string(), link.text_range))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #673: typing a bare URL, deleting its destination and typing it
+    /// again must leave no target for text that is no longer a URL, and the
+    /// background parse must agree with what the input path presented.
+    #[gpui::test]
+    fn bare_url_typing_deleting_and_retyping_never_keeps_a_stale_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "intro https://\n\nother https://keep.example/k tail\n";
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, text, false);
+        let typed = "example.com/a";
+        let retyped = "example.org/b";
+        let keep = "https://keep.example/k";
+        view.update(cx, |view, cx| {
+            let caret = SourceOffset(text.find("https://").unwrap() + "https://".len());
+            view.editor_mut()
+                .set_selection(Selection::caret(caret))
+                .unwrap();
+            let (targets, _, _) = bare_url_snapshot(view, "intro");
+            assert!(targets.is_empty(), "an unfinished https:// is not a link");
+
+            view.dispatch(EditorCommand::Insert(typed), cx);
+            let now = view.editor().document().full_text();
+            let url = format!("https://{typed}");
+            let (targets, colored, _) = bare_url_snapshot(view, "intro");
+            assert_eq!(targets, [bare_url_target(&now, &url)]);
+            assert!(colored, "the completed URL is drawn as a link");
+            let (other, _, _) = bare_url_snapshot(view, "other");
+            assert_eq!(other, [bare_url_target(&now, keep)]);
+
+            for _ in typed.chars() {
+                view.dispatch(EditorCommand::Backspace, cx);
+            }
+            assert_eq!(view.editor().document().full_text(), text);
+            let (targets, _, _) = bare_url_snapshot(view, "intro");
+            assert!(targets.is_empty(), "no stale target after deleting: {targets:?}");
+
+            view.dispatch(EditorCommand::Insert(retyped), cx);
+            let now = view.editor().document().full_text();
+            let url = format!("https://{retyped}");
+            let (targets, colored, _) = bare_url_snapshot(view, "intro");
+            assert_eq!(targets, [bare_url_target(&now, &url)]);
+            assert!(colored);
+        });
+
+        // Let the background formal parse publish and present again.
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let now = view.editor().document().full_text();
+            let url = format!("https://{retyped}");
+            let expected = vec![bare_url_target(&now, &url)];
+            let (targets, colored, _) = bare_url_snapshot(view, "intro");
+            assert_eq!(targets, expected);
+            assert!(colored);
+            assert_eq!(formal_bare_url_links(view, "intro"), expected);
+            let (other, _, _) = bare_url_snapshot(view, "other");
+            assert_eq!(other, [bare_url_target(&now, keep)]);
+            assert_eq!(
+                formal_bare_url_links(view, "other"),
+                [bare_url_target(&now, keep)]
+            );
+        });
+    }
+
+    /// The id and confidence the index currently gives the block of `probe`.
+    fn bare_url_block_identity(
+        view: &EditorView,
+        probe: &str,
+    ) -> (BlockId, hane_markdown::Confidence) {
+        let text = view.editor().document().full_text();
+        let block = view
+            .block_at_offset(SourceOffset(text.find(probe).expect("probe text")))
+            .expect("block");
+        (block.id, block.confidence)
+    }
+
+    /// Issue #673: with a published formal index the block ids are stable, so an
+    /// edit in another block keeps a bare URL's cached presentation but moves
+    /// its offsets; an edit inside the URL replaces it.
+    #[gpui::test]
+    fn unrelated_edit_moves_and_reuses_a_bare_url_presentation(cx: &mut gpui::TestAppContext) {
+        let text = "head\n\nsee https://keep.example/k tail\n";
+        let url = "https://keep.example/k";
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, text, false);
+        // Publish the background formal index first; the cache is not
+        // assumed cold and the Formal state is asserted, not assumed.
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(
+                view.current_index().is_some(),
+                "the formal index describes the current revision"
+            );
+            let (formal_id, confidence) = bare_url_block_identity(view, "see");
+            assert_eq!(confidence, hane_markdown::Confidence::Formal);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(4)))
+                .unwrap();
+            // Warm the cache explicitly.
+            bare_url_snapshot(view, "see");
+            let (first, colored, _) = bare_url_snapshot(view, "see");
+            assert!(colored);
+            assert_eq!(first, [bare_url_target(text, url)]);
+
+            // A multi-byte insertion in front shifts the URL by four bytes.
+            view.dispatch(EditorCommand::Insert("🙂"), cx);
+            let now = view.editor().document().full_text();
+            let (id, confidence) = bare_url_block_identity(view, "see");
+            assert_eq!(confidence, hane_markdown::Confidence::Formal);
+            assert_eq!(id, formal_id, "a formal block id is stable across the edit");
+            let (moved, colored, reused) = bare_url_snapshot(view, "see");
+            assert!(reused, "an unrelated block keeps its cached presentation");
+            assert!(colored, "the color moves with the target");
+            assert_eq!(moved, [bare_url_target(&now, url)]);
+            assert_eq!(moved[0].1.start.0, first[0].1.start.0 + "🙂".len());
+
+            view.dispatch(EditorCommand::Backspace, cx);
+            let (back, colored, reused) = bare_url_snapshot(view, "see");
+            assert!(reused);
+            assert!(colored);
+            assert_eq!(back, first);
+
+            // Editing the URL itself changes its destination and range.
+            let url_end = SourceOffset(text.find(" tail").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(url_end))
+                .unwrap();
+            view.dispatch(EditorCommand::Insert("x"), cx);
+            let now = view.editor().document().full_text();
+            // The view may already have presented the edited block, so
+            // `reused` is not a freshness proxy: the metadata is checked.
+            let (edited, colored, _) = bare_url_snapshot(view, "see");
+            assert!(colored);
+            assert_eq!(edited, [bare_url_target(&now, "https://keep.example/kx")]);
+            assert!(
+                edited.iter().all(|(destination, _)| destination != url),
+                "no stale destination after editing the URL: {edited:?}"
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let now = view.editor().document().full_text();
+            let expected = vec![bare_url_target(&now, "https://keep.example/kx")];
+            let (targets, colored, _) = bare_url_snapshot(view, "see");
+            assert_eq!(targets, expected);
+            assert!(colored);
+            assert_eq!(formal_bare_url_links(view, "see"), expected);
+        });
+    }
+
+    /// Issue #673: before the background formal index is published the block
+    /// ids are provisional and derive from the block's start offset, so an
+    /// edit in front changes the id and the cached presentation is not found.
+    /// The block is then presented again and must carry the new targets; the
+    /// published formal index gives the same metadata and, once warmed, reuse.
+    #[gpui::test]
+    fn provisional_bare_url_prefix_edit_rebuilds_fresh_targets_until_formal_publish(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "head\n\nsee https://keep.example/k tail\n";
+        let url = "https://keep.example/k";
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            assert!(
+                view.current_index().is_none(),
+                "the background formal index is not published yet"
+            );
+            let (old_id, confidence) = bare_url_block_identity(view, "see");
+            assert_eq!(confidence, hane_markdown::Confidence::Provisional);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(4)))
+                .unwrap();
+            bare_url_snapshot(view, "see");
+            let (first, colored, _) = bare_url_snapshot(view, "see");
+            assert!(colored);
+            assert_eq!(first, [bare_url_target(text, url)]);
+
+            view.dispatch(EditorCommand::Insert("🙂"), cx);
+            assert!(
+                view.current_index().is_none(),
+                "the formal index is still not published after the edit"
+            );
+            let now = view.editor().document().full_text();
+            let (new_id, confidence) = bare_url_block_identity(view, "see");
+            assert_eq!(confidence, hane_markdown::Confidence::Provisional);
+            assert_ne!(new_id, old_id, "a provisional id follows the start offset");
+            assert!(
+                !view.block_cache.contains_key(&new_id),
+                "the new id has no cache entry to reuse"
+            );
+            let (moved, colored, reused) = bare_url_snapshot(view, "see");
+            assert!(!reused, "a new provisional id is presented again");
+            assert!(colored, "the color follows the new target");
+            assert_eq!(moved, [bare_url_target(&now, url)]);
+            assert_eq!(moved[0].1.start.0, first[0].1.start.0 + "🙂".len());
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert!(view.current_index().is_some());
+            let (_, confidence) = bare_url_block_identity(view, "see");
+            assert_eq!(confidence, hane_markdown::Confidence::Formal);
+            let now = view.editor().document().full_text();
+            let expected = vec![bare_url_target(&now, url)];
+            let (targets, colored, _) = bare_url_snapshot(view, "see");
+            assert_eq!(targets, expected);
+            assert!(colored);
+            assert_eq!(formal_bare_url_links(view, "see"), expected);
+
+            // Warmed explicitly, the same revision is reused with the same
+            // metadata.
+            let (again, colored, reused) = bare_url_snapshot(view, "see");
+            assert!(reused, "a warmed formal block is reused at the same revision");
+            assert!(colored);
+            assert_eq!(again, expected);
+        });
+    }
+
+    /// Issue #673: a URL that is the text of a reference link whose definition
+    /// is in another block is never a bare target. Before the formal index is
+    /// published the label is held back; once published only the formal
+    /// destination is a target.
+    #[gpui::test]
+    fn reference_label_url_waits_for_the_formal_destination_on_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let label = "https://label.example";
+        let destination = "https://dest.example";
+        let text = format!("[{label}][r]\n\nother\n\n[r]: {destination}\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        view.update(cx, |view, _| {
+            assert!(view.current_index().is_none(), "nothing is formal yet");
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert!(targets.is_empty(), "held back, not bare: {targets:?}");
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let (_, confidence) = bare_url_block_identity(view, "label");
+            assert_eq!(confidence, hane_markdown::Confidence::Formal);
+            let start = text.find(label).unwrap();
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(
+                targets,
+                [(
+                    destination.to_owned(),
+                    SourceRange::new(start, start + label.len())
+                )]
+            );
+        });
+    }
+
+    /// Issue #673: completing a definition in another block and deleting it
+    /// again moves the label's target from the bare URL to the formal
+    /// destination and back, with no stale target in between: a presentation
+    /// the edit may have changed is presented again, and while the formal index
+    /// is behind it holds the label back.
+    #[gpui::test]
+    fn reference_definition_edit_in_another_block_never_leaves_a_stale_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let label = "https://label.example";
+        let destination = "https://dest.example";
+        let text = format!("[{label}][r]\n\nother\n");
+        let definition = format!("\n[r]: {destination}\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let start = text.find(label).unwrap();
+        let label_range = SourceRange::new(start, start + label.len());
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.current_index().is_some());
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(targets, [(label.to_owned(), label_range)]);
+
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.dispatch(EditorCommand::Insert(&definition), cx);
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert!(
+                targets.is_empty(),
+                "no stale bare target right after the definition: {targets:?}"
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(targets, [(destination.to_owned(), label_range)]);
+
+            for _ in definition.chars() {
+                view.dispatch(EditorCommand::Backspace, cx);
+            }
+            assert_eq!(view.editor().document().full_text(), text);
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert!(
+                targets.is_empty(),
+                "no stale destination right after the definition is removed: {targets:?}"
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let (targets, _, _) = bare_url_snapshot(view, "label");
+            assert_eq!(targets, [(label.to_owned(), label_range)]);
+        });
+    }
+
+    /// Issue #673: the click contract of Issue #502 / #603 on a bare URL. The
+    /// URL's own glyphs open it for the OS modifier (Command on macOS, Ctrl
+    /// elsewhere) or an unmodified reading-mode click, and the glyph after it
+    /// does not. Opening changes neither caret, selection, bytes, revision nor
+    /// the Undo / Redo history; every other click is ordinary selection editing.
+    #[gpui::test]
+    fn bare_url_click_follows_the_modifier_contract_and_leaves_editor_state_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const URL: &str = "https://example.com/a?q=1#x";
+        let original = format!("see {URL}, end\n");
+        let with_bang = format!("{original}!");
+        let inside_url = SourceOffset(original.find(URL).unwrap() + 1);
+        let command = gpui::Modifiers {
+            platform: true,
+            ..gpui::Modifiers::none()
+        };
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..gpui::Modifiers::none()
+        };
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..gpui::Modifiers::none()
+        };
+        let command_shift = gpui::Modifiers {
+            shift: true,
+            ..command
+        };
+        let none = gpui::Modifiers::none();
+        // Columns are 8px glyph cells counted from the URL's first glyph.
+        let columns = URL.chars().count() as f32;
+        let inside = 1.25;
+        let last_glyph_right_half = columns - 0.25;
+        let comma_left_half = columns + 0.25;
+        let comma_right_half = columns + 0.75;
+        // The right half of the space before the URL: its nearest caret is the
+        // URL's first byte, but the glyph under the pointer is the space.
+        let space_before_right_half = -0.5;
+        // (modifiers, macos, column, opens when editing, opens when reading)
+        let cases = [
+            (command, true, inside, true, true),
+            (ctrl, false, inside, true, true),
+            (ctrl, true, inside, false, false),
+            (command, false, inside, false, false),
+            (none, true, inside, false, true),
+            (none, false, inside, false, true),
+            (shift, true, inside, false, false),
+            (command_shift, true, inside, false, false),
+            (command, true, last_glyph_right_half, true, true),
+            (ctrl, false, last_glyph_right_half, true, true),
+            (none, true, last_glyph_right_half, false, true),
+            (command, true, comma_left_half, false, false),
+            (ctrl, false, comma_right_half, false, false),
+            (none, true, comma_right_half, false, false),
+            (command, true, space_before_right_half, false, false),
+            (ctrl, false, space_before_right_half, false, false),
+            (none, true, space_before_right_half, false, false),
+        ];
+
+        for undone in [false, true] {
+            for (modifiers, macos, column, opens_editing, opens_reading) in cases {
+                for reading in [false, true] {
+                    let opens = if reading { opens_reading } else { opens_editing };
+                    let view = gpui::AppContext::new(cx, |cx| {
+                        EditorView::new(original.as_str(), "Untitled", cx)
+                    });
+                    view.update(cx, |view, cx| {
+                        let end = SourceOffset(view.editor().document().len_bytes().0);
+                        view.editor_mut()
+                            .set_selection(Selection::caret(end))
+                            .unwrap();
+                        view.dispatch(EditorCommand::Insert("!"), cx);
+                        if undone {
+                            view.dispatch(EditorCommand::Undo, cx);
+                        }
+                        let end = SourceOffset(view.editor().document().len_bytes().0);
+                        view.editor_mut()
+                            .set_selection(Selection::caret(end))
+                            .unwrap();
+
+                        let indexed = view.block_at_offset(inside_url).unwrap();
+                        let span = block_line_span(view.editor().document(), &indexed).unwrap();
+                        let (visual, _) = view.cached_block(&indexed, &span).unwrap();
+                        view.line_owners.clear();
+                        for (at, line) in visual.lines.iter().enumerate() {
+                            view.line_owners
+                                .insert(line.line_id as usize, (visual.id, at));
+                        }
+                        let presented_at = visual
+                            .lines
+                            .iter()
+                            .position(|line| line.links.iter().any(|link| link.contains(inside_url)))
+                            .expect("the presentation records the bare URL target");
+                        let presented = &visual.lines[presented_at];
+                        let line = presented.line_id as usize;
+                        let url_column = presented
+                            .visual_text
+                            .find(URL)
+                            .map(|byte| presented.visual_text[..byte].chars().count())
+                            .expect("the URL is presented");
+
+                        let shaper = FixedAdvanceShaper::new(8.0);
+                        let layout = layout_block(&visual, 800.0, &shaper);
+                        let fragment = layout
+                            .lines
+                            .iter()
+                            .find(|row| row.line == presented_at)
+                            .map(|row| row.line_visual_range.clone())
+                            .expect("the URL line has a laid-out row");
+                        let block_id = visual.id;
+                        view.block_cache.insert(block_id, visual.clone());
+                        view.layout_cache.insert(
+                            block_id,
+                            LayoutCacheEntry {
+                                layout,
+                                font_revision: view.layout_font_revision,
+                            },
+                        );
+                        let x = (url_column as f32 + column) * 8.0;
+                        let hit = view
+                            .row_hit_at_point(line, fragment, x, 1.0, &shaper)
+                            .expect("the click resolves on the URL row");
+                        let offset = hit.offset;
+
+                        let text_before = view.editor().document().full_text();
+                        let selection_before = view.editor().selection();
+                        let revision_before = view.editor().document().revision();
+                        let can_undo_before = view.editor().can_undo();
+                        let can_redo_before = view.editor().can_redo();
+
+                        if reading {
+                            view.editor_mode = EditorMode::Reading;
+                        }
+                        let outcome = view.apply_row_click(line, hit, &modifiers, macos, cx);
+
+                        let context = format!(
+                            "modifiers {modifiers:?} macos {macos} column {column} reading {reading} undone {undone}"
+                        );
+                        assert_eq!(view.editor().document().full_text(), text_before);
+                        assert_eq!(view.editor().document().revision(), revision_before);
+                        if opens {
+                            assert_eq!(outcome, RowClick::OpenLink(URL.into()), "{context}");
+                            assert_eq!(view.editor().selection(), selection_before);
+                            assert_eq!(view.editor().can_undo(), can_undo_before);
+                            assert_eq!(view.editor().can_redo(), can_redo_before);
+
+                            // Back in editing mode the earlier edit still undoes
+                            // and redoes exactly as it would have without the click.
+                            view.editor_mode = EditorMode::Editing;
+                            let (first, second) = if undone {
+                                (EditorCommand::Redo, EditorCommand::Undo)
+                            } else {
+                                (EditorCommand::Undo, EditorCommand::Redo)
+                            };
+                            let (after_first, after_second) = if undone {
+                                (with_bang.as_str(), original.as_str())
+                            } else {
+                                (original.as_str(), with_bang.as_str())
+                            };
+                            view.dispatch(first, cx);
+                            assert_eq!(view.editor().document().full_text(), after_first);
+                            view.dispatch(second, cx);
+                            assert_eq!(view.editor().document().full_text(), after_second);
+                        } else {
+                            assert_eq!(outcome, RowClick::Edit, "{context}");
+                            let expected = if modifiers.shift {
+                                Selection {
+                                    anchor: selection_before.anchor,
+                                    active: offset,
+                                }
+                            } else {
+                                Selection::caret(offset)
+                            };
+                            assert_eq!(view.editor().selection(), expected, "{context}");
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Issue #673: through real mouse dispatch in reading mode, a bare URL
+    /// opens only on a mouse-up within the 4 logical px click distance. A
+    /// MouseMove (or a release) at or past it is a selection drag instead.
+    #[gpui::test]
+    fn reading_bare_url_press_opens_on_mouse_up_and_drags_select_through_dispatch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const URL: &str = "https://example.com/a";
+        let text = "see https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Visual text equals the source: offset 6 is inside the URL, 26 is "e"
+        // of "end" past it.
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        let (far_point, dragged_to) = row_click(&view, cx, "row-0-0", 0, 0, 26);
+        let (text_before, revision_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+            )
+        });
+        let moved = |dx: f32| point(down_point.x + px(dx), down_point.y);
+        assert!(cx.opened_url().is_none());
+
+        // Moving past the threshold selects and never opens.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(far_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(far_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        let selection_after_drag = Selection {
+            anchor: pressed,
+            active: dragged_to,
+        };
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert_eq!(view.editor().selection(), selection_after_drag);
+        });
+
+        // A release exactly at the threshold with no MouseMove is a drag too.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(
+            moved(LINK_PRESS_DRAG_THRESHOLD),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert_eq!(view.editor().selection().anchor, pressed);
+        });
+
+        // A short click is held at mouse-down and opened at mouse-up.
+        view.update(cx, |view, _| {
+            view.editor_mut()
+                .set_selection(Selection::caret(pressed))
+                .unwrap();
+        });
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| assert!(view.pending_reading_link.is_some()));
+        cx.simulate_mouse_up(
+            moved(LINK_PRESS_DRAG_THRESHOLD - 0.5),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        // The test platform records the URL handed to `open_url`; it does not
+        // show that an OS browser was reached.
+        assert_eq!(cx.opened_url().as_deref(), Some(URL));
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection(), Selection::caret(pressed));
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert!(!view.editor().can_undo());
+            assert!(!view.editor().can_redo());
+        });
+    }
+
+    /// Issue #673: through real mouse dispatch in editing mode, only the OS
+    /// modifier (Command on macOS, Ctrl elsewhere) opens a bare URL. A plain
+    /// or Shift click edits the selection and opens nothing.
+    #[gpui::test]
+    fn editing_bare_url_modifier_click_opens_without_touching_editor_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const URL: &str = "https://example.com/a";
+        let text = "see https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let (url_point, inside) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        let (word_point, word) = row_click(&view, cx, "row-0-0", 0, 0, 26);
+
+        // The recorded URL cannot be reset, so the clicks that must not open
+        // come first.
+        cx.simulate_mouse_down(url_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(url_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(inside));
+        });
+
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..gpui::Modifiers::none()
+        };
+        cx.simulate_mouse_down(word_point, MouseButton::Left, shift);
+        cx.simulate_mouse_up(word_point, MouseButton::Left, shift);
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor: inside,
+                    active: word,
+                }
+            );
+        });
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.dispatch(EditorCommand::Insert("!"), cx);
+            view.dispatch(EditorCommand::Undo, cx);
+        });
+        cx.run_until_parked();
+        let (text_before, revision_before, selection_before) = view.read_with(cx, |view, _| {
+            assert!(view.editor().can_redo());
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.editor().selection(),
+            )
+        });
+
+        cx.simulate_mouse_down(url_point, MouseButton::Left, secondary_scroll_modifiers());
+        cx.simulate_mouse_up(url_point, MouseButton::Left, secondary_scroll_modifiers());
+        // The test platform records the URL handed to `open_url`; it does not
+        // show that an OS browser was reached.
+        assert_eq!(cx.opened_url().as_deref(), Some(URL));
+        view.update(cx, |view, cx| {
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert_eq!(view.editor().selection(), selection_before);
+            assert!(view.editor().can_redo());
+            view.dispatch(EditorCommand::Redo, cx);
+            assert_eq!(
+                view.editor().document().full_text(),
+                format!("{text_before}!")
             );
         });
     }
@@ -20065,6 +20785,68 @@ mod tests {
                 "table columns overlap: {origins:?}"
             );
         }
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        drop(view);
+    }
+
+    /// Issue #673: the table renderer must paint a bare URL cell through the
+    /// link-styled element, without extending it to the adjacent Markdown label
+    /// cell. The selector exists only on elements that receive `link_foreground`.
+    #[gpui::test]
+    fn table_bare_url_cell_is_painted_with_link_style_only(cx: &mut gpui::TestAppContext) {
+        let text = "| 既存 | 裸URL |\n| --- | --- |\n| [Markdown](https://example.com/?hane=673-table-existing) | https://example.com/?hane=673-table-bare |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        cx.run_until_parked();
+
+        // A fresh view starts from a quick, non-table-aware index, so the
+        // table metadata and its link style runs only exist once the Formal
+        // index is published. Publish it and its heights synchronously instead
+        // of depending on the background reparse job's timing.
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.block_index.source(),
+                Some(IndexSource::Formal),
+                "the table-aware Formal index must be published"
+            );
+            assert!(
+                view.current_index().is_some(),
+                "the Formal index must match the current document revision"
+            );
+        });
+
+        let link = cx
+            .debug_bounds("table-cell-link-2-1-0")
+            .expect("the bare URL cell must be painted with the link style");
+        assert!(link.size.width > px(0.0));
+        assert!(
+            cx.debug_bounds("table-cell-link-2-0-0").is_none(),
+            "the Markdown label cell must not gain the link style"
+        );
+        assert!(
+            cx.debug_bounds("table-cell-link-0-1-0").is_none(),
+            "the header cell must not gain the link style"
+        );
 
         if let Some(root) = root {
             std::fs::remove_dir_all(root).unwrap();
