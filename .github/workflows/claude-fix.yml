@@ -942,6 +942,7 @@ jobs:
             --output "$RUNNER_TEMP/verification-results/tests.json"
 
       - name: Reacquire trusted verification collector before lint
+        id: lint_collector
         if: ${{ !cancelled() }}
         uses: actions/checkout@v6
         with:
@@ -951,7 +952,7 @@ jobs:
 
       - name: Run lint even when regression tests fail
         id: lint
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.lint_collector.outcome == 'success' }}
         continue-on-error: true
         run: |
           # Fixed command: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -960,6 +961,7 @@ jobs:
             --output "$RUNNER_TEMP/verification-results/lint.json"
 
       - name: Reacquire trusted verification collector after tests
+        id: result_collector
         if: ${{ !cancelled() }}
         uses: actions/checkout@v6
         with:
@@ -968,7 +970,8 @@ jobs:
           persist-credentials: false
 
       - name: Collect verification feedback
-        if: ${{ !cancelled() }}
+        id: feedback_collect
+        if: ${{ !cancelled() && steps.result_collector.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -989,7 +992,7 @@ jobs:
             --results "$RUNNER_TEMP/verification-results" --output "$RUNNER_TEMP/verification-feedback"
 
       - name: Upload verification feedback
-        if: ${{ !cancelled() && steps.context.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.context.outcome == 'success' && steps.feedback_collect.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: aadw-verification-feedback-${{ github.run_id }}-${{ github.run_attempt }}
