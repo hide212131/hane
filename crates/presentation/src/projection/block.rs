@@ -269,6 +269,7 @@ pub fn present_block_with_table_projection(
         })
         .flatten()
         .and_then(|line| fence_delimiter(line.text).map(|delimiter| (line.line, delimiter)));
+    let local_bare = local_bare_links(block, window);
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for run in disclosure_runs(block.kind, window) {
         if run_uses_shared_parse(run.len(), window.joined) {
@@ -280,6 +281,7 @@ pub fn present_block_with_table_projection(
                 window.joined,
                 window.block_disclosure,
                 list_projection,
+                local_bare,
                 &mut lines,
             );
             continue;
@@ -309,6 +311,7 @@ pub fn present_block_with_table_projection(
             line.disclosure,
             line_context,
             list_projection,
+            local_bare,
             fence_role,
             table_header,
             &table_alignments,
@@ -339,14 +342,50 @@ pub fn present_block_with_table_projection(
                             .links
                             .iter()
                             .any(|existing| existing.source_range.intersects(clipped)))
-                    .then(|| crate::LinkTarget {
-                        source_range: clipped,
-                        destination: link.destination.clone(),
-                        uses_reference: link.uses_reference,
+                    .then(|| {
+                        (
+                            crate::LinkTarget {
+                                source_range: clipped,
+                                destination: link.destination.clone(),
+                                uses_reference: link.uses_reference,
+                            },
+                            link.is_bare_url,
+                        )
                     })
                 })
                 .collect::<Vec<_>>();
-            presented.links.extend(missing);
+            // The table presenter has no Markdown Link node for a bare URL, so
+            // give the targets the formal parser owns as bare URLs the link
+            // color here. The origin comes from the projection, never from
+            // comparing the source text with the destination.
+            for (link, is_bare_url) in &missing {
+                if !*is_bare_url {
+                    continue;
+                }
+                if let (Some(start), Some(end)) = (
+                    presented
+                        .source_map
+                        .source_to_visual(link.source_range.start, Bias::After),
+                    presented
+                        .source_map
+                        .source_to_visual(link.source_range.end, Bias::Before),
+                ) && start.visual_offset.0 < end.visual_offset.0
+                {
+                    presented.style_runs.push(StyleRun {
+                        visual_range: VisualRange::new(
+                            start.visual_offset.0,
+                            end.visual_offset.0,
+                        ),
+                        kind: StyleKind::Link,
+                    });
+                }
+            }
+            presented
+                .style_runs
+                .sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
+            presented
+                .links
+                .extend(missing.into_iter().map(|(target, _)| target));
             presented
                 .links
                 .sort_by_key(|link| (link.source_range.start, link.source_range.end));
@@ -622,8 +661,37 @@ fn present_joined_run(
         joined,
         block_disclosure,
         None,
+        LocalBareLinks::Trusted,
         out,
     );
+}
+
+/// How far the bare URLs a local parse finds may be trusted for `block` when no
+/// formal projection confirms them (see [`LocalBareLinks`]). A parse that reads
+/// the whole block — a cached whole-span [`JoinedParse`], or every line of a
+/// joinable block (or of a one-line block) — decides the block's own syntax
+/// itself. A window that reaches only part of the block cannot rule out code,
+/// HTML or a link label that begins outside it.
+fn local_bare_links(block: &IndexedBlock, window: &BlockWindow<'_>) -> LocalBareLinks {
+    if window.joined.is_some() {
+        return LocalBareLinks::UnlessBracketed;
+    }
+    let (Some(first), Some(last)) = (window.lines.first(), window.lines.last()) else {
+        return LocalBareLinks::Withheld;
+    };
+    // The blank run closing the block is not part of its syntax.
+    let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
+    if first.line > window.span.start || last.line + 1 < content_end {
+        return LocalBareLinks::Withheld;
+    }
+    let content_lines = content_end.saturating_sub(window.span.start);
+    // A block that is not parsed as one run is parsed a line at a time, which
+    // only sees its whole syntax when it has a single content line.
+    if block_is_joinable(block.kind) || content_lines <= 1 {
+        LocalBareLinks::UnlessBracketed
+    } else {
+        LocalBareLinks::Withheld
+    }
 }
 
 #[allow(
@@ -638,6 +706,7 @@ fn present_joined_run_with_list_projection(
     joined: Option<&JoinedParse>,
     block_disclosure: Option<SourceRange>,
     list_projection: Option<&ListProjection>,
+    local_bare: LocalBareLinks,
     out: &mut Vec<VisualLine>,
 ) {
     let computed;
@@ -652,6 +721,8 @@ fn present_joined_run_with_list_projection(
         parsed: &joined.parsed,
         projection: &joined.projection,
         list_projection,
+        source: &joined.joined_source,
+        local_bare,
     };
     // A single active disclosure (caret, selection or IME) may touch a shared
     // construct whose markers live on different physical lines; `marker_is_disclosed`

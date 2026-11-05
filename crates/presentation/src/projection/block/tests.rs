@@ -668,6 +668,7 @@ fn code_fence_disclosure_only_expands_the_touched_fence_marker() {
         Some(&joined),
         Some(SourceRange::new(code_start, code_start + 4)),
         Some(projection),
+        LocalBareLinks::Trusted,
         &mut presented,
     );
 
