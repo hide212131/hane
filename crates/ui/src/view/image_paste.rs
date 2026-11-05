@@ -448,7 +448,13 @@ impl EditorView {
                     }
                 })
             };
-            let (Some(first), Some(last)) = (ordinal_for(range.start), ordinal_for(range.end))
+            // 選択は終端を含まないため、非空選択では最後に選択されたbyteの属するブロックまで検査する。
+            let last_offset = if range.end.0 > range.start.0 {
+                SourceOffset(range.end.0 - 1)
+            } else {
+                range.end
+            };
+            let (Some(first), Some(last)) = (ordinal_for(range.start), ordinal_for(last_offset))
             else {
                 return Err(NOT_PARAGRAPH.to_owned());
             };
@@ -1253,6 +1259,36 @@ mod tests {
             assert!(status_of(&view, cx).unwrap().contains("段落"), "offset {offset}");
         }
         assert!(!root.join("images").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_selection_ending_at_the_next_heading_start_does_not_include_the_heading(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("exclusive-end");
+        let original = "text\n\n# Heading\n";
+        let (view, cx) = open_file_view(cx, &root, original);
+        select(&view, cx, 0, 6);
+        cx.write_to_clipboard(image_item(None, png(1, 1, [0, 0, 0, 255])));
+        cx.simulate_keystrokes("secondary-v");
+        cx.run_until_parked();
+        let text = text_of(&view, cx);
+        let name = reference_in(&text);
+        assert!(text.starts_with(&format!("![画像](images/{name})")), "{text:?}");
+        assert!(text.ends_with("\n\n# Heading\n"), "{text:?}");
+        assert!(!text.contains("text"), "{text:?}");
+        cx.simulate_keystrokes("secondary-z");
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), original);
+
+        // 見出しの最初のbyteまで実際に選択している場合は引き続き拒否する。
+        select(&view, cx, 0, 7);
+        cx.write_to_clipboard(image_item(None, png(1, 1, [0, 0, 0, 255])));
+        cx.simulate_keystrokes("secondary-v");
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), original);
+        assert!(status_of(&view, cx).unwrap().contains("段落"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
