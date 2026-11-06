@@ -34,6 +34,7 @@ pub use view::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
     ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, NetworkSettingsApplier, PreparedUpdate, RestartBlocker, RestartObservation,
     RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
+    UpdateWakeReceiver, UpdateWakeSender, update_wake_channel,
 };
 
 /// Tracks the settings component setup once per GPUI application.

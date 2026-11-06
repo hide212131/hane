@@ -8,7 +8,7 @@
 
 調査基準: main `4f11a6675381838a33653ba0fb0ad62b364f34c9`（2026-10-26）。実装開始時にはcurrent main、対象Issue、関連PRと実行中runを再確認する。
 
-2026-10-28の追加設計: [Issue #649](https://github.com/hide212131/hane/issues/649)の[更新通知設計](application-update-notifications.md)は、本体更新metadataだけを起動後・使用中1時間ごとに確認する。下記P10の起動時無通信にはこの確認だけを例外として追加する。自動確認も既存のnetwork snapshotを通し、AI/runtime/Skillsや設定の表示・保存を新しい通信トリガーにしない。通知機能の製品実装は未実施。
+2026-10-28の追加設計: [Issue #649](https://github.com/hide212131/hane/issues/649)の[更新通知設計](application-update-notifications.md)は、本体更新metadataだけを起動後・使用中1時間ごとに確認する。下記P10の起動時無通信にはこの確認だけを例外として追加する。自動確認も既存のnetwork snapshotを通し、AI/runtime/Skillsや設定の表示・保存を新しい通信トリガーにしない。製品実装はIssue #649のPRで追加した（GUI・実署名二版・負荷比較の検証は未了）。
 
 ## 2. 現在の通信経路
 

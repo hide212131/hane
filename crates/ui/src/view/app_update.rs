@@ -63,6 +63,17 @@ pub struct AppUpdateSnapshot {
     /// policy is configured and the install is at a supported placement. Only
     /// then is "再起動して更新" offered; `false` keeps the card fail-closed.
     pub restart_supported: bool,
+    /// A periodic re-check runs while a known candidate is still `Available`.
+    /// The candidate stays valid and clickable meanwhile.
+    pub checking: bool,
+    /// The candidate the one-time startup notice is about: set once by the
+    /// service when the first automatic check found an update (or the local
+    /// restore found a prepared one). The view shows the notice at most once
+    /// per process.
+    pub startup_announce: Option<String>,
+    /// Whole seconds left of a failure backoff during which a manual check is
+    /// refused. `None` when a check can be started now.
+    pub retry_wait_secs: Option<u64>,
 }
 
 impl AppUpdateSnapshot {
@@ -79,12 +90,16 @@ impl AppUpdateSnapshot {
             diagnostics_available: false,
             restoring: false,
             restart_supported: false,
+            checking: false,
+            startup_announce: None,
+            retry_wait_secs: None,
         }
     }
 
     /// True while background work is running, so the UI keeps refreshing.
     pub fn is_busy(&self) -> bool {
         self.restoring
+            || self.checking
             || matches!(
                 self.phase,
                 AppUpdatePhase::Checking
@@ -93,6 +108,51 @@ impl AppUpdateSnapshot {
                     | AppUpdatePhase::Discarding
             )
     }
+
+    /// Only a transfer shows a changing byte count that no change wake
+    /// reports, so only it needs the short refresh loop.
+    pub fn needs_progress_poll(&self) -> bool {
+        matches!(
+            self.phase,
+            AppUpdatePhase::Downloading | AppUpdatePhase::Verifying
+        )
+    }
+}
+
+/// Sender half of a state-change wake. A wake only says "read the snapshot
+/// again"; it carries no state. The channel holds one pending wake, so a burst
+/// of changes merges into a single re-read.
+#[derive(Clone, Debug)]
+pub struct UpdateWakeSender(async_channel::Sender<()>);
+
+impl UpdateWakeSender {
+    /// Queues a wake. `false` when the receiver is gone and this sender should
+    /// be dropped. An already pending wake counts as delivered.
+    pub fn wake(&self) -> bool {
+        !matches!(self.0.try_send(()), Err(async_channel::TrySendError::Closed(_)))
+    }
+}
+
+/// Receiver half of a state-change wake. One per subscriber; never shared.
+#[derive(Debug)]
+pub struct UpdateWakeReceiver(async_channel::Receiver<()>);
+
+impl UpdateWakeReceiver {
+    /// Waits for the next wake. `false` once every sender is gone.
+    pub async fn wait(&self) -> bool {
+        self.0.recv().await.is_ok()
+    }
+
+    /// Takes a pending wake without waiting. `true` if there was one.
+    pub fn try_wait(&self) -> bool {
+        self.0.try_recv().is_ok()
+    }
+}
+
+/// A fresh wake channel with room for one pending wake.
+pub fn update_wake_channel() -> (UpdateWakeSender, UpdateWakeReceiver) {
+    let (sender, receiver) = async_channel::bounded(1);
+    (UpdateWakeSender(sender), UpdateWakeReceiver(receiver))
 }
 
 /// The app-owned update service as the view sees it. Every method returns
@@ -112,6 +172,12 @@ pub trait AppUpdateController: Send + Sync {
     /// Re-validates a prepared update left by an earlier run, locally only.
     /// Idempotent; never communicates.
     fn restore_local(&self);
+    /// Subscribes to visible state changes. Each call returns its own receiver;
+    /// a wake means "read `snapshot` again". `None` when the service has no
+    /// change notification.
+    fn subscribe(&self) -> Option<UpdateWakeReceiver> {
+        None
+    }
     /// The local diagnostics text for the settings card (copy). It reads local
     /// records only: no request, no change. `None` when there is none.
     fn diagnostics_text(&self) -> Option<String> {
@@ -315,6 +381,12 @@ fn unavailable_text(code: &str) -> Option<&'static str> {
     }
 }
 
+/// The wait until a manual retry is accepted again, rounded up to a minute.
+fn retry_wait_text(secs: u64) -> String {
+    let minutes = secs.div_ceil(60).max(1);
+    format!("再試行できるのは約{minutes}分後です。")
+}
+
 fn format_bytes(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     format!("{:.1} MiB", bytes as f64 / MIB)
@@ -392,11 +464,20 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
             let text = stage
                 .and_then(|stage| stage_failure_text(stage, code))
                 .unwrap_or_else(|| failure_text(code));
-            model.detail = Some(match stage {
+            let mut detail = match stage {
                 Some(stage) => format!("{text} (診断コード: {code}, 段階: {stage})"),
                 None => format!("{text} (診断コード: {code})"),
-            });
-            model.actions.push((CardAction::Check, "再試行"));
+            };
+            // During the backoff a press is refused by the service, so no
+            // retry button is offered; the wait is stated instead.
+            match snapshot.retry_wait_secs {
+                Some(secs) => {
+                    detail.push(' ');
+                    detail.push_str(&retry_wait_text(secs));
+                }
+                None => model.actions.push((CardAction::Check, "再試行")),
+            }
+            model.detail = Some(detail);
         }
         AppUpdatePhase::Unavailable => {
             model.detail = Some(match unavailable_text(code) {
@@ -406,6 +487,179 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
         }
     }
     model
+}
+
+/// Height of the shared update panel above the footer.
+pub(super) const UPDATE_PANEL_HEIGHT: f32 = 96.0;
+
+/// The dedicated footer entry, derived from the service snapshot only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UpdateEntry {
+    Available,
+    Preparing,
+    Ready,
+}
+
+impl UpdateEntry {
+    /// The button text. The short form is used where the row is narrow.
+    pub(crate) fn label(self, short: bool) -> &'static str {
+        match (self, short) {
+            (Self::Available, false) => "↑ 更新できます",
+            (Self::Available, true) => "↑ 更新",
+            (Self::Preparing, false) => "更新を準備中…",
+            (Self::Preparing, true) => "準備中",
+            (Self::Ready, false) => "再起動して更新",
+            (Self::Ready, true) => "↻ 更新",
+        }
+    }
+
+    /// Full wording for the tooltip and the accessible description.
+    pub(crate) fn tooltip(self, version: Option<&str>) -> String {
+        match (self, version) {
+            (Self::Available, Some(version)) => format!("更新できます（Hane {version}）"),
+            (Self::Available, None) => "更新できます".to_owned(),
+            (Self::Preparing, _) => "更新を準備中です。クリックで進捗を表示".to_owned(),
+            (Self::Ready, Some(version)) => format!("再起動して更新（Hane {version}）"),
+            (Self::Ready, None) => "再起動して更新".to_owned(),
+        }
+    }
+}
+
+/// Which footer entry the service state calls for. A Ready update that this
+/// install cannot apply offers none, like the settings card.
+pub(crate) fn update_entry(snapshot: &AppUpdateSnapshot) -> Option<UpdateEntry> {
+    if snapshot.restoring {
+        return None;
+    }
+    match snapshot.phase {
+        AppUpdatePhase::Available => Some(UpdateEntry::Available),
+        AppUpdatePhase::Downloading | AppUpdatePhase::Verifying => Some(UpdateEntry::Preparing),
+        AppUpdatePhase::Ready if snapshot.restart_supported => Some(UpdateEntry::Ready),
+        _ => None,
+    }
+}
+
+/// An open panel stays while there is an entry or a result the user started
+/// (a running check, a failure) still to read.
+fn update_panel_stays_open(snapshot: &AppUpdateSnapshot) -> bool {
+    update_entry(snapshot).is_some()
+        || snapshot.restoring
+        || matches!(
+            snapshot.phase,
+            AppUpdatePhase::Checking | AppUpdatePhase::Failed
+        )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PanelAction {
+    /// An action the settings card also offers, sent to the same controller.
+    Card(CardAction),
+    /// Hides the panel; the footer entry stays.
+    Close,
+}
+
+/// What the shared update panel shows for one snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PanelModel {
+    pub title: String,
+    pub detail: Option<String>,
+    pub actions: Vec<(PanelAction, &'static str)>,
+}
+
+/// Maps a snapshot to the panel text and buttons. Download is bound to the
+/// candidate the snapshot shows, and the restart button is a separate
+/// explicit action from the download.
+pub(crate) fn panel_model(
+    snapshot: &AppUpdateSnapshot,
+    restart_message: Option<&str>,
+    restarting: bool,
+) -> PanelModel {
+    let version = snapshot.candidate_version.as_deref().unwrap_or("?");
+    let card = card_model(snapshot);
+    let close = |label: &'static str| (PanelAction::Close, label);
+    if snapshot.restoring {
+        return PanelModel {
+            title: "アプリの更新".to_owned(),
+            detail: card.detail,
+            actions: vec![close("閉じる")],
+        };
+    }
+    match snapshot.phase {
+        AppUpdatePhase::Available => {
+            let mut actions = Vec::new();
+            if let Some(id) = snapshot.candidate_id.clone() {
+                actions.push((PanelAction::Card(CardAction::Download(id)), "更新"));
+            }
+            actions.push(close("あとで"));
+            PanelModel {
+                title: format!("Hane {version} に更新しますか？"),
+                detail: Some(
+                    "ダウンロードして検証します。再起動は別の操作で行います。".to_owned(),
+                ),
+                actions,
+            }
+        }
+        AppUpdatePhase::Downloading | AppUpdatePhase::Verifying => PanelModel {
+            title: "更新を準備しています".to_owned(),
+            detail: card.detail,
+            actions: vec![
+                (PanelAction::Card(CardAction::Cancel), "キャンセル"),
+                close("閉じる"),
+            ],
+        },
+        AppUpdatePhase::Ready => {
+            let mut actions = Vec::new();
+            if snapshot.restart_supported && !restarting {
+                actions.push((PanelAction::Card(CardAction::Restart), "再起動して更新"));
+            }
+            let blocked = restart_message.is_some();
+            actions.push(close(if blocked { "編集に戻る" } else { "あとで" }));
+            PanelModel {
+                title: format!("更新の準備ができました ({version})"),
+                detail: Some(restart_message.map_or_else(
+                    || "再起動すると更新を適用します。開いている文書は保存してください。".to_owned(),
+                    str::to_owned,
+                )),
+                actions,
+            }
+        }
+        AppUpdatePhase::Checking => PanelModel {
+            title: "更新を確認しています".to_owned(),
+            detail: None,
+            actions: vec![
+                (PanelAction::Card(CardAction::Cancel), "キャンセル"),
+                close("閉じる"),
+            ],
+        },
+        AppUpdatePhase::Failed => {
+            let code = snapshot.error_code.as_deref().unwrap_or("unknown");
+            let text = snapshot
+                .error_stage
+                .as_deref()
+                .and_then(|stage| stage_failure_text(stage, code))
+                .unwrap_or_else(|| failure_text(code));
+            let mut actions = Vec::new();
+            let mut detail = text.to_owned();
+            match snapshot.retry_wait_secs {
+                Some(secs) => {
+                    detail.push(' ');
+                    detail.push_str(&retry_wait_text(secs));
+                }
+                None => actions.push((PanelAction::Card(CardAction::Check), "再試行")),
+            }
+            actions.push(close("閉じる"));
+            PanelModel {
+                title: "更新を完了できませんでした".to_owned(),
+                detail: Some(detail),
+                actions,
+            }
+        }
+        _ => PanelModel {
+            title: "アプリの更新".to_owned(),
+            detail: card.detail,
+            actions: vec![close("閉じる")],
+        },
+    }
 }
 
 /// Why the app cannot be restarted for an update right now. Reporting a
@@ -754,9 +1008,102 @@ impl EditorView {
     }
 
     /// Installs the app-owned update service handle. Attaching sends no
-    /// request; the service only communicates after an explicit button press.
+    /// request. The service reads metadata after a button press or by its own
+    /// automatic schedule (Issue #649), and fetches an archive only after the
+    /// user accepts that candidate.
     pub fn attach_app_update(&mut self, controller: Option<Arc<dyn AppUpdateController>>) {
         self.app_update = controller;
+        // A replaced service ends the old subscription with its task.
+        self.app_update_wake_task = None;
+        self.update_panel_open = false;
+    }
+
+    /// Connects the window to the service's change notifications and starts
+    /// the local re-validation of a prepared update. The subscription is made
+    /// first and the snapshot read right after, so a change between the two is
+    /// not lost. No request is sent and nothing polls while the service waits:
+    /// the task sleeps until the service wakes it, and it holds only a weak
+    /// handle to this view.
+    pub fn watch_app_update(&mut self, cx: &mut Context<Self>) {
+        self.app_update_wake_task = None;
+        let Some(controller) = self.app_update.clone() else {
+            return;
+        };
+        if let Some(receiver) = controller.subscribe() {
+            self.app_update_wake_task = Some(cx.spawn(async move |view, cx| {
+                while receiver.wait().await {
+                    let alive = view.update(cx, |view, cx| view.sync_app_update_snapshot(cx));
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        self.restore_app_update_local(cx);
+        self.sync_app_update_snapshot(cx);
+    }
+
+    /// Reads the snapshot after a wake. The one-time startup notice is opened
+    /// here without taking focus; a panel whose state no longer has anything
+    /// to show closes itself. Only a running transfer starts the short
+    /// progress refresh.
+    fn sync_app_update_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(controller) = self.app_update.clone() else {
+            return;
+        };
+        let snapshot = controller.snapshot();
+        if snapshot.needs_progress_poll() {
+            self.poll_app_update(cx);
+        }
+        if !self.update_startup_announced
+            && snapshot.startup_announce.is_some()
+            && snapshot.startup_announce == snapshot.candidate_id
+            && update_entry(&snapshot).is_some()
+        {
+            self.update_startup_announced = true;
+            self.update_panel_open = true;
+        }
+        if self.update_panel_open && !update_panel_stays_open(&snapshot) {
+            self.update_panel_open = false;
+        }
+        cx.notify();
+    }
+
+    /// True while a composition of the editor, the sidebar filter or an inline
+    /// rename is unconfirmed; update operations wait for it.
+    pub(super) fn update_ime_active(&self) -> bool {
+        self.sessions
+            .sessions()
+            .any(|session| session.editor().ime().is_some())
+            || self.sidebar_filter_has_composition()
+            || self.inline_rename_has_composition()
+    }
+
+    /// The footer entry for the current service state, if any.
+    pub(super) fn update_entry_state(&self) -> Option<UpdateEntry> {
+        update_entry(&self.app_update.as_ref()?.snapshot())
+    }
+
+    /// Height the open panel takes from the document viewport.
+    pub(super) fn update_panel_reserved_height(&self) -> f32 {
+        if self.update_panel_open && self.app_update.is_some() {
+            UPDATE_PANEL_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
+    /// Footer entry click: opens or closes the shared panel. Nothing starts.
+    pub(super) fn toggle_update_panel(&mut self, cx: &mut Context<Self>) {
+        self.update_panel_open = !self.update_panel_open;
+        cx.notify();
+    }
+
+    /// Hides the panel. A running download is not cancelled and the footer
+    /// entry stays.
+    fn close_update_panel(&mut self, cx: &mut Context<Self>) {
+        self.update_panel_open = false;
+        cx.notify();
     }
 
     /// Re-validates a prepared update from an earlier run (local files only)
@@ -964,6 +1311,98 @@ impl EditorView {
                         .child("アプリの更新"),
                 )
                 .child(card)
+                .into_any_element(),
+        )
+    }
+
+    /// The small update panel above the footer. The startup notice and the
+    /// footer entry open this same panel; it needs no settings screen. It never
+    /// takes focus on its own, and its operations wait while a composition is
+    /// unconfirmed. `None` while closed.
+    pub(super) fn update_panel_element(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.update_panel_open {
+            return None;
+        }
+        let controller = self.app_update.as_ref()?;
+        let snapshot = controller.snapshot();
+        let model = panel_model(
+            &snapshot,
+            self.restart_message.as_deref(),
+            self.restart_in_progress,
+        );
+        let ime_active = self.update_ime_active();
+        let buttons: Vec<Button> = model
+            .actions
+            .into_iter()
+            .enumerate()
+            .map(|(index, (action, label))| {
+                let view = cx.entity();
+                let is_close = action == PanelAction::Close;
+                Button::new(format!("update-panel-action-{index}"))
+                    .label(label)
+                    .xsmall()
+                    .ghost()
+                    .disabled(ime_active && !is_close)
+                    .on_click(move |_, window, app| {
+                        let action = action.clone();
+                        view.update(app, |view, cx| match action {
+                            PanelAction::Card(action) => view.run_app_update_action(action, cx),
+                            PanelAction::Close => {
+                                view.close_update_panel(cx);
+                                // Hand the focus back only when nothing else
+                                // owns it or is composing.
+                                if !view.update_ime_active()
+                                    && view.footer_menu_returns_focus_to_body()
+                                {
+                                    window.focus(&view.focus_handle, cx);
+                                }
+                            }
+                        });
+                    })
+            })
+            .collect();
+        Some(
+            div()
+                .id("update-panel")
+                .debug_selector(|| "update-panel".to_owned())
+                .h(px(UPDATE_PANEL_HEIGHT))
+                .w_full()
+                .flex_none()
+                .px_2()
+                .py(px(6.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .overflow_hidden()
+                .border_t_1()
+                .border_color(rgb(self.theme.sidebar_active_background))
+                .bg(rgb(self.theme.code_background))
+                .text_color(rgb(self.theme.foreground))
+                .text_size(px(12.0))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .truncate()
+                        .child(model.title),
+                )
+                .children(model.detail.map(|detail| {
+                    // Wraps instead of eliding: the detail carries the reason
+                    // and next step. The panel keeps its fixed height, the
+                    // buttons below stay in place, and a long detail scrolls
+                    // inside its own area so its end stays reachable.
+                    div()
+                        .id("update-panel-detail")
+                        .debug_selector(|| "update-panel-detail".to_owned())
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.update_detail_scroll)
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .whitespace_normal()
+                        .text_color(rgb(self.theme.quote_foreground))
+                        .child(detail)
+                }))
+                .child(div().flex().flex_row().gap_2().children(buttons))
                 .into_any_element(),
         )
     }
@@ -1759,6 +2198,31 @@ mod tests {
     }
 
     #[test]
+    fn during_the_backoff_no_retry_is_offered_and_the_wait_is_stated() {
+        let mut input = snapshot(AppUpdatePhase::Failed);
+        input.error_code = Some("rate_limited".to_owned());
+        input.error_stage = Some("check".to_owned());
+        input.retry_wait_secs = Some(61);
+
+        let card = card_model(&input);
+        assert!(labels(&card).is_empty(), "{:?}", card.actions);
+        assert!(card.detail.as_deref().unwrap().contains("約2分後"), "{:?}", card.detail);
+
+        let panel = panel_model(&input, None, false);
+        assert!(!panel.actions.iter().any(|(action, _)| matches!(action, PanelAction::Card(_))));
+        assert!(panel.actions.contains(&(PanelAction::Close, "閉じる")));
+        assert!(panel.detail.as_deref().unwrap().contains("約2分後"), "{:?}", panel.detail);
+
+        input.retry_wait_secs = None;
+        assert_eq!(labels(&card_model(&input)), ["再試行"]);
+        assert!(
+            panel_model(&input, None, false)
+                .actions
+                .contains(&(PanelAction::Card(CardAction::Check), "再試行"))
+        );
+    }
+
+    #[test]
     fn download_stage_integrity_and_limit_failures_explain_the_download() {
         for code in [
             "hash_mismatch",
@@ -2082,6 +2546,390 @@ mod tests {
         fn diagnostics_text(&self) -> Option<String> {
             self.diagnostics.clone()
         }
+    }
+
+    // ------------------------------- startup notice and panel (Issue #649)
+
+    /// A controller that can wake its subscriber, like the real service.
+    struct WakeController {
+        snapshot: Mutex<AppUpdateSnapshot>,
+        sender: Mutex<Option<UpdateWakeSender>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl WakeController {
+        fn new(snapshot: AppUpdateSnapshot) -> Arc<Self> {
+            Arc::new(Self {
+                snapshot: Mutex::new(snapshot),
+                sender: Mutex::new(None),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn set(&self, snapshot: AppUpdateSnapshot) {
+            *self.snapshot.lock().unwrap() = snapshot;
+            if let Some(sender) = self.sender.lock().unwrap().as_ref() {
+                sender.wake();
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl AppUpdateController for WakeController {
+        fn snapshot(&self) -> AppUpdateSnapshot {
+            self.snapshot.lock().unwrap().clone()
+        }
+        fn check(&self) {
+            self.calls.lock().unwrap().push("check".to_owned());
+        }
+        fn download(&self, candidate_id: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("download:{candidate_id}"));
+        }
+        fn cancel(&self) {
+            self.calls.lock().unwrap().push("cancel".to_owned());
+        }
+        fn discard_ready(&self) {
+            self.calls.lock().unwrap().push("discard".to_owned());
+        }
+        fn restore_local(&self) {
+            self.calls.lock().unwrap().push("restore".to_owned());
+        }
+        fn subscribe(&self) -> Option<UpdateWakeReceiver> {
+            let (sender, receiver) = update_wake_channel();
+            *self.sender.lock().unwrap() = Some(sender);
+            Some(receiver)
+        }
+    }
+
+    fn available_snapshot() -> AppUpdateSnapshot {
+        AppUpdateSnapshot {
+            phase: AppUpdatePhase::Available,
+            candidate_id: Some("cand".to_owned()),
+            candidate_version: Some("0.27.0".to_owned()),
+            restart_supported: true,
+            ..AppUpdateSnapshot::idle("0.26.0")
+        }
+    }
+
+    #[test]
+    fn the_footer_entry_follows_the_service_state_only() {
+        let idle = AppUpdateSnapshot::idle("0.26.0");
+        assert_eq!(update_entry(&idle), None);
+        for phase in [
+            AppUpdatePhase::Checking,
+            AppUpdatePhase::UpToDate,
+            AppUpdatePhase::Failed,
+            AppUpdatePhase::Unavailable,
+            AppUpdatePhase::Discarding,
+        ] {
+            assert_eq!(update_entry(&snapshot(phase)), None, "{phase:?}");
+        }
+        assert_eq!(
+            update_entry(&snapshot(AppUpdatePhase::Available)),
+            Some(UpdateEntry::Available)
+        );
+        for phase in [AppUpdatePhase::Downloading, AppUpdatePhase::Verifying] {
+            assert_eq!(update_entry(&snapshot(phase)), Some(UpdateEntry::Preparing));
+        }
+        let mut ready = snapshot(AppUpdatePhase::Ready);
+        assert_eq!(update_entry(&ready), None, "an update this install cannot apply has no entry");
+        ready.restart_supported = true;
+        assert_eq!(update_entry(&ready), Some(UpdateEntry::Ready));
+        ready.restoring = true;
+        assert_eq!(update_entry(&ready), None);
+    }
+
+    #[test]
+    fn the_panel_binds_the_download_to_the_shown_candidate_and_keeps_restart_separate() {
+        let available = panel_model(&available_snapshot(), None, false);
+        assert!(available.title.contains("0.27.0"));
+        assert_eq!(
+            available.actions,
+            vec![
+                (PanelAction::Card(CardAction::Download("cand".to_owned())), "更新"),
+                (PanelAction::Close, "あとで"),
+            ]
+        );
+
+        let mut ready = available_snapshot();
+        ready.phase = AppUpdatePhase::Ready;
+        let ready_model = panel_model(&ready, None, false);
+        assert!(
+            ready_model
+                .actions
+                .iter()
+                .all(|(action, _)| !matches!(action, PanelAction::Card(CardAction::Download(_)))),
+            "the restart step never starts a download"
+        );
+        assert!(
+            ready_model
+                .actions
+                .contains(&(PanelAction::Card(CardAction::Restart), "再起動して更新"))
+        );
+        let restarting = panel_model(&ready, None, true);
+        assert!(
+            restarting
+                .actions
+                .iter()
+                .all(|(action, _)| *action != PanelAction::Card(CardAction::Restart))
+        );
+        let blocked = panel_model(&ready, Some("未保存の文書があります。"), false);
+        assert_eq!(blocked.detail.as_deref(), Some("未保存の文書があります。"));
+        assert_eq!(blocked.actions.last(), Some(&(PanelAction::Close, "編集に戻る")));
+        assert!(
+            blocked
+                .actions
+                .contains(&(PanelAction::Card(CardAction::Restart), "再起動して更新")),
+            "the Ready candidate and its restart stay available after a block"
+        );
+
+        let mut downloading = available_snapshot();
+        downloading.phase = AppUpdatePhase::Downloading;
+        let model = panel_model(&downloading, None, false);
+        assert!(model.actions.contains(&(PanelAction::Card(CardAction::Cancel), "キャンセル")));
+
+        let mut failed = snapshot(AppUpdatePhase::Failed);
+        failed.error_code = Some("hash_mismatch".to_owned());
+        failed.error_stage = Some("download".to_owned());
+        let model = panel_model(&failed, None, false);
+        let detail = model.detail.unwrap();
+        assert!(!detail.contains("hash_mismatch"), "no code in the normal wording: {detail}");
+        assert!(model.actions.contains(&(PanelAction::Card(CardAction::Check), "再試行")));
+    }
+
+    #[test]
+    fn only_a_transfer_needs_the_progress_poll_and_a_recheck_counts_as_busy() {
+        assert!(snapshot(AppUpdatePhase::Downloading).needs_progress_poll());
+        assert!(snapshot(AppUpdatePhase::Verifying).needs_progress_poll());
+        for phase in [
+            AppUpdatePhase::Idle,
+            AppUpdatePhase::Checking,
+            AppUpdatePhase::UpToDate,
+            AppUpdatePhase::Available,
+            AppUpdatePhase::Ready,
+            AppUpdatePhase::Failed,
+        ] {
+            assert!(!snapshot(phase).needs_progress_poll(), "{phase:?}");
+        }
+        let mut rechecking = snapshot(AppUpdatePhase::Available);
+        assert!(!rechecking.is_busy());
+        rechecking.checking = true;
+        assert!(rechecking.is_busy());
+    }
+
+    #[test]
+    fn wakes_merge_and_close_with_their_receiver() {
+        let (sender, receiver) = update_wake_channel();
+        assert!(sender.wake());
+        assert!(sender.wake(), "a pending wake already covers this one");
+        assert!(receiver.try_wait());
+        assert!(!receiver.try_wait());
+        drop(receiver);
+        assert!(!sender.wake(), "a closed receiver tells the sender to forget it");
+    }
+
+    #[gpui::test]
+    fn the_startup_notice_opens_the_panel_once_without_starting_anything(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let controller = WakeController::new(AppUpdateSnapshot::idle("0.26.0"));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-panel").is_none());
+        assert!(cx.debug_bounds("footer-update").is_none());
+
+        let mut found = available_snapshot();
+        found.startup_announce = found.candidate_id.clone();
+        controller.set(found.clone());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-panel").is_some(), "announced without a click");
+        assert!(cx.debug_bounds("footer-update").is_some());
+
+        view.update(cx, |view, cx| view.close_update_panel(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-panel").is_none());
+        assert!(cx.debug_bounds("footer-update").is_some(), "\"later\" keeps the entry");
+
+        // A later wake (an hourly discovery, a new version) never re-opens it.
+        let mut newer = found.clone();
+        newer.candidate_id = Some("newer".to_owned());
+        newer.candidate_version = Some("0.28.0".to_owned());
+        newer.startup_announce = None;
+        controller.set(newer);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-panel").is_none());
+        controller.set(found);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-panel").is_none());
+
+        assert!(
+            controller.calls().iter().all(|call| call == "restore"),
+            "the notice starts no download or check: {:?}",
+            controller.calls()
+        );
+    }
+
+    #[gpui::test]
+    fn the_footer_entry_opens_the_panel_and_the_panel_closes_with_its_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let controller = WakeController::new(available_snapshot());
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("footer-update").is_some());
+        assert!(cx.debug_bounds("update-panel").is_none(), "no notice without a startup find");
+
+        view.update(cx, |view, cx| view.toggle_update_panel(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-panel").is_some());
+        assert!(controller.calls().iter().all(|call| call == "restore"));
+
+        // The panel's own action reaches the controller with the shown candidate.
+        view.update(cx, |view, cx| {
+            view.run_app_update_action(CardAction::Download("cand".to_owned()), cx);
+        });
+        assert!(controller.calls().contains(&"download:cand".to_owned()));
+
+        // Leaving every state that has an entry or a result removes the panel.
+        controller.set(AppUpdateSnapshot::idle("0.26.0"));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("update-panel").is_none());
+        assert!(cx.debug_bounds("footer-update").is_none());
+    }
+
+    #[gpui::test]
+    fn the_single_footer_keeps_the_update_entry_inside_the_footer(cx: &mut gpui::TestAppContext) {
+        let controller = WakeController::new(available_snapshot());
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+        });
+        for width in [260.0, 220.0] {
+            cx.simulate_resize(gpui::size(px(width), px(400.0)));
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            let footer = cx.debug_bounds("editor-footer").expect("footer renders");
+            let update = cx.debug_bounds("footer-update").expect("update entry renders");
+            assert!(cx.debug_bounds("footer-single-entry").is_some(), "{width}: Single layout");
+            assert!(update.size.width > px(0.0), "{width}");
+            assert!(update.left() >= footer.left(), "{width}: {update:?} in {footer:?}");
+            assert!(update.right() <= footer.right(), "{width}: {update:?} in {footer:?}");
+            assert!(update.top() >= footer.top(), "{width}");
+            assert!(update.bottom() <= footer.bottom(), "{width}");
+        }
+    }
+
+    #[gpui::test]
+    fn the_panel_shows_its_detail_inside_the_fixed_height_panel(cx: &mut gpui::TestAppContext) {
+        let mut failed = snapshot(AppUpdatePhase::Failed);
+        failed.error_code = Some("hash_mismatch".to_owned());
+        failed.error_stage = Some("download".to_owned());
+        let controller = WakeController::new(failed);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+            view.toggle_update_panel(cx);
+        });
+        cx.simulate_resize(gpui::size(px(360.0), px(500.0)));
+        cx.run_until_parked();
+        let panel = cx.debug_bounds("update-panel").expect("panel is open");
+        let detail = cx.debug_bounds("update-panel-detail").expect("detail renders");
+        assert_eq!(panel.size.height, px(UPDATE_PANEL_HEIGHT));
+        assert!(detail.size.height > px(0.0));
+        assert!(detail.left() >= panel.left() && detail.right() <= panel.right());
+        assert!(detail.top() >= panel.top() && detail.bottom() <= panel.bottom());
+    }
+
+    #[gpui::test]
+    fn a_long_restart_message_can_be_scrolled_to_its_end_in_the_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut ready = snapshot(AppUpdatePhase::Ready);
+        ready.restart_supported = true;
+        let controller = WakeController::new(ready);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            view.watch_app_update(cx);
+            view.toggle_update_panel(cx);
+            let reasons: Vec<String> = (1..=12)
+                .map(|n| format!("保存されていない文書{n}があるため再起動できません。"))
+                .collect();
+            view.restart_message = Some(format!("{} 末尾の理由。", reasons.join(" ")));
+        });
+        cx.simulate_resize(gpui::size(px(360.0), px(500.0)));
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        let panel = cx.debug_bounds("update-panel").expect("panel is open");
+        let detail = cx.debug_bounds("update-panel-detail").expect("detail renders");
+        assert_eq!(panel.size.height, px(UPDATE_PANEL_HEIGHT));
+        let max = view.read_with(cx, |view, _| view.update_detail_scroll.max_offset());
+        assert!(max.y > px(0.0), "the long detail overflows its area: {max:?}");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.update_detail_scroll.offset().y),
+            px(0.0)
+        );
+
+        // Wheel scrolling over the detail reaches the end of the text.
+        for _ in 0..40 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: detail.center(),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-60.0))),
+                modifiers: gpui::Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+        let (offset, max) = view.read_with(cx, |view, _| {
+            (
+                view.update_detail_scroll.offset(),
+                view.update_detail_scroll.max_offset(),
+            )
+        });
+        assert!(offset.y < px(0.0), "the detail scrolled: {offset:?}");
+        assert_eq!(offset.y, -max.y, "the scroll reaches the end of the detail");
+
+        // The panel itself did not move, and the blocked Ready contract still
+        // offers the way back to editing next to the scrolled detail.
+        let after = cx.debug_bounds("update-panel").expect("panel stays open");
+        assert_eq!(after, panel);
+        let mut ready = snapshot(AppUpdatePhase::Ready);
+        ready.restart_supported = true;
+        let message = view.read_with(cx, |view, _| view.restart_message.clone());
+        let model = panel_model(&ready, message.as_deref(), false);
+        let version = ready.candidate_version.as_deref().unwrap_or("?");
+        assert_eq!(model.title, format!("更新の準備ができました ({version})"));
+        assert_eq!(model.detail, message);
+        assert!(
+            model
+                .actions
+                .iter()
+                .any(|(action, label)| *action == PanelAction::Close && *label == "編集に戻る"),
+            "the blocked Ready panel keeps its close action: {:?}",
+            model.actions.iter().map(|(_, label)| *label).collect::<Vec<_>>()
+        );
     }
 
     fn open_general_settings(
