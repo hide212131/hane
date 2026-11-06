@@ -73,7 +73,7 @@ use hane_presentation::{
     table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use hane_session::{
-    CalendarDate, CloseDecision, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
+    CalendarDate, CloseDecision, DateBadgeRange, DiscardOutcome, DocumentSession, DraftId, DraftStore, FileEvent,
     FileEventOutcome, FileService, LoadedFile, OpenDecision, OpenPolicy, OsDraftStore,
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
@@ -650,6 +650,30 @@ struct SidebarContextMenu {
 struct TabCloseConfirm {
     id: SessionId,
     instance: DocumentInstance,
+    /// The text revision the question was asked about. A discard approval is
+    /// only valid while the document still has exactly this text.
+    revision: Revision,
+    /// Distinguishes this question from a later one asked for the same
+    /// document and revision (cancel, then close again), so a click from the
+    /// earlier render cannot approve the newer question.
+    epoch: u64,
+}
+
+/// The user's explicit "discard without saving" approval for one document
+/// instance. It is bound to the text revision that was approved: an edit
+/// after the approval invalidates it and the user is asked again.
+#[derive(Clone, Debug)]
+struct PendingTabDiscard {
+    instance: DocumentInstance,
+    revision: Revision,
+    /// The document's recovery draft, taken out of `work_folder_drafts` while
+    /// its journal entry is being removed so no timer or flush can rewrite
+    /// it. `Some` also means the removal is running in the background.
+    removing: Option<WorkFolderDraft>,
+    /// A newer confirmation for the same document was requested while the
+    /// removal was running. The approval belongs to the earlier dialog, so
+    /// its completion must not close the tab whatever the user answers next.
+    superseded: bool,
 }
 
 /// How the native Save As dialog `prompt_save_as_for_close` opens resolved,
@@ -880,6 +904,10 @@ pub struct EditorView {
     /// session it belongs to gets a real path or closes.
     draft_store: Arc<dyn DraftStore>,
     work_folder_drafts: HashMap<SessionId, WorkFolderDraft>,
+    /// The newest rescue journal write per document (`journal_draft_now`):
+    /// document instance, draft and snapshot sequence. A result that does not
+    /// match is stale and is not shown.
+    rescue_journal_requests: HashMap<SessionId, (DocumentInstance, DraftId, u64)>,
     /// The folder the sidebar currently has selected, used as the target
     /// directory for the next "new note" or "new folder". `None` means the
     /// work folder root. This is independent of what the sidebar shows
@@ -951,12 +979,18 @@ pub struct EditorView {
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
+    /// Counter stamped into every new `TabCloseConfirm`.
+    tab_close_confirm_epoch: u64,
     /// Sessions with a "save, then close" request in flight, keyed to the
     /// document instance the request was made against. An instance mismatch
     /// when a write completes means the document was replaced meanwhile —
     /// in place, or by a work-folder switch — so the close is treated as
     /// canceled rather than applied to a different document.
     tab_close_after_save: HashMap<SessionId, DocumentInstance>,
+    /// Explicit "discard without saving" approvals that have not closed their
+    /// tab yet, either waiting for a write to land or for the recovery draft
+    /// removal to finish.
+    tab_discard_pending: HashMap<SessionId, PendingTabDiscard>,
     /// The latest save problem of each document, for the footer. Display-only
     /// and never persisted: each record names the document instance it was
     /// raised for, so a record that outlives its document is never shown, and
@@ -2018,7 +2052,24 @@ impl EditorView {
                     generation: session.generation(),
                     workspace: self.work_folder_generation,
                 };
-                self.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+                // A new question replaces an earlier discard approval: that
+                // approval must not be continued by whatever the user
+                // answers (or cancels) this time.
+                match self.tab_discard_pending.get_mut(&id) {
+                    Some(pending) if pending.removing.is_some() => pending.superseded = true,
+                    Some(_) => {
+                        self.tab_discard_pending.remove(&id);
+                    }
+                    None => {}
+                }
+                let revision = session.revision();
+                self.tab_close_confirm_epoch = self.tab_close_confirm_epoch.wrapping_add(1);
+                self.tab_close_confirm = Some(TabCloseConfirm {
+                    id,
+                    instance,
+                    revision,
+                    epoch: self.tab_close_confirm_epoch,
+                });
                 cx.notify();
             }
         }
@@ -2057,7 +2108,8 @@ impl EditorView {
     /// is actually looking at right now rather than one tied to a specific
     /// render.
     pub(crate) fn dismiss_tab_close_confirm(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.tab_close_confirm.take().is_some() {
+        if let Some(confirm) = self.tab_close_confirm.take() {
+            self.resume_writers_after_discard_settled(confirm.id, confirm.instance, false, cx);
             cx.notify();
             true
         } else {
@@ -2080,6 +2132,7 @@ impl EditorView {
             return false;
         }
         self.tab_close_confirm = None;
+        self.resume_writers_after_discard_settled(confirm.id, confirm.instance, false, cx);
         cx.notify();
         true
     }
@@ -2119,6 +2172,15 @@ impl EditorView {
         }
         let id = requested.id;
         if self.document_instance(id) != Some(requested.instance) {
+            return;
+        }
+        if self.discard_removal_running(id) {
+            // An earlier approval's draft removal still owns this document.
+            // Its result must be accepted before any save-and-close can
+            // remove the tab, so this answer is not taken yet; the question
+            // stays on screen.
+            self.status = Some("破棄の処理中です。完了後にもう一度操作してください".to_owned());
+            cx.notify();
             return;
         }
         self.tab_close_confirm = None;
@@ -2266,7 +2328,10 @@ impl EditorView {
             self.tab_close_after_save.remove(&id);
             return;
         }
-        if session.save_in_flight() {
+        if session.save_in_flight() || self.discard_removal_running(id) {
+            // While a discard's draft removal is running, its completion owns
+            // the outcome; the request stays armed and is re-checked by the
+            // next write completion.
             return;
         }
         self.tab_close_after_save.remove(&id);
@@ -2275,15 +2340,442 @@ impl EditorView {
         }
     }
 
+    /// Whether an approved discard's background draft removal is still
+    /// running for `id`. The tab must not leave the set meanwhile, or the
+    /// removal's result (notably a failure) would have no owner left.
+    fn discard_removal_running(&self, id: SessionId) -> bool {
+        self.tab_discard_pending
+            .get(&id)
+            .is_some_and(|pending| pending.removing.is_some())
+    }
+
     /// Closes a tab that is already known to have nothing to lose. The last
     /// remaining tab is replaced with a blank untitled document by
     /// `SessionSet::close` rather than leaving the window with none.
     fn close_tab_now(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.discard_removal_running(id) {
+            return;
+        }
         let was_active = self.sessions.active_id() == id;
         if matches!(self.sessions.close(id, "Untitled"), CloseDecision::Reject(_)) {
             return;
         }
+        self.after_tab_removed(id, was_active, cx);
+    }
+
+    /// The "保存せずに破棄" answer: throws away the unsaved edits of
+    /// exactly the confirmed document and closes its tab. Nothing is written
+    /// to disk and the document is never marked saved. The approval is bound
+    /// to the confirmation snapshot, the document instance and the text
+    /// revision shown; see `resolve_pending_tab_discard` for what happens
+    /// while a write is still running.
+    fn confirm_discard_tab(&mut self, requested: TabCloseConfirm, cx: &mut Context<Self>) {
+        if self.tab_close_confirm != Some(requested) {
+            return;
+        }
+        let id = requested.id;
+        if self.document_instance(id) != Some(requested.instance) {
+            return;
+        }
+        if self.tab_discard_pending.get(&id).is_some_and(|pending| {
+            pending.removing.is_some() && pending.instance == requested.instance
+        }) {
+            // The earlier approval's draft removal is still running; its
+            // completion decides first, so this answer is not taken yet.
+            self.status = Some("破棄の処理中です。完了後にもう一度操作してください".to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let revision = session.revision();
+        if revision != requested.revision {
+            // The text changed after the question was asked, so the click
+            // approves content the user was never asked about. Ask again
+            // about the current text instead of discarding it.
+            self.tab_close_confirm = None;
+            self.reconfirm_tab_close(id, cx);
+            return;
+        }
+        self.tab_close_confirm = None;
         self.tab_close_after_save.remove(&id);
+        self.tab_discard_pending.insert(
+            id,
+            PendingTabDiscard {
+                instance: requested.instance,
+                revision,
+                removing: None,
+                superseded: false,
+            },
+        );
+        self.resolve_pending_tab_discard(id, cx);
+        cx.notify();
+    }
+
+    /// Advances an approved discard as far as it can safely go. Re-run after
+    /// every write or rename completion for the session. The approval is
+    /// dropped when the document instance changed, and turned back into a
+    /// fresh confirmation when the text was edited after it was given.
+    fn resolve_pending_tab_discard(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(pending) = self.tab_discard_pending.get(&id).cloned() else {
+            return;
+        };
+        if pending.removing.is_some() {
+            // The background draft removal reports back by itself.
+            return;
+        }
+        if self.document_instance(id) != Some(pending.instance) {
+            self.tab_discard_pending.remove(&id);
+            return;
+        }
+        let Some(session) = self.sessions.get(id) else {
+            self.tab_discard_pending.remove(&id);
+            return;
+        };
+        let edited = session.revision() != pending.revision;
+        let busy = session.save_in_flight() || self.title_sync_in_flight.contains(&id);
+        if edited {
+            self.tab_discard_pending.remove(&id);
+            self.reconfirm_tab_close(id, cx);
+            // The old approval is void. Unless the new question for this
+            // document is on screen (its Cancel resumes), the writers it
+            // held off are evaluated now, without waiting for another edit.
+            if !self
+                .tab_close_confirm
+                .is_some_and(|confirm| confirm.id == id)
+            {
+                self.resume_writers_after_discard_settled(id, pending.instance, false, cx);
+            }
+            return;
+        }
+        if busy {
+            self.status = Some("保存処理の完了を待ってから破棄します".to_owned());
+            cx.notify();
+            return;
+        }
+        let root = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf());
+        let Some(draft) = self.work_folder_drafts.get(&id).cloned() else {
+            self.discard_tab_now(id, cx);
+            return;
+        };
+        let Some(root) = root else {
+            self.tab_discard_pending.remove(&id);
+            self.resume_writers_after_discard_settled(id, pending.instance, true, cx);
+            self.status = Some("作業フォルダーを特定できないため破棄できません".to_owned());
+            cx.notify();
+            return;
+        };
+        // Taken out of the live map so no debounce timer or quit flush can
+        // write a newer snapshot after the removal below.
+        self.work_folder_drafts.remove(&id);
+        self.content_search_workspace_changed(cx);
+        let draft_id = draft.draft_id;
+        if let Some(entry) = self.tab_discard_pending.get_mut(&id) {
+            entry.removing = Some(draft);
+        }
+        let instance = pending.instance;
+        let draft_store = self.draft_store.clone();
+        // Ordered at request time, not when the background task gets to run:
+        // text journalled for an edit made in the meantime carries a larger
+        // number and must survive this removal.
+        let sequence = hane_session::next_draft_snapshot_sequence();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    draft_store
+                        .remove_ordered(&root, draft_id, sequence)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_tab_discard_removal(id, instance, draft_id, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Completion of the background draft removal for an approved discard.
+    /// Closes the tab only when the removal succeeded and nothing changed
+    /// meanwhile; otherwise the draft is journaled again from the live text
+    /// so no content is left unprotected.
+    fn finish_tab_discard_removal(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        draft_id: DraftId,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let matches_pending = self.tab_discard_pending.get(&id).is_some_and(|pending| {
+            pending.instance == instance
+                && pending
+                    .removing
+                    .as_ref()
+                    .is_some_and(|draft| draft.draft_id == draft_id)
+        });
+        if !matches_pending {
+            return;
+        }
+        let Some(pending) = self.tab_discard_pending.remove(&id) else {
+            return;
+        };
+        let Some(draft) = pending.removing else {
+            return;
+        };
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        if self.document_instance(id) != Some(instance) {
+            // Replaced or switched away: the draft entry belonged to the old
+            // document and is not this id's any more.
+            return;
+        }
+        let edited = session.revision() != pending.revision;
+        let busy = session.save_in_flight() || self.title_sync_in_flight.contains(&id);
+        let reconfirming = self
+            .tab_close_confirm
+            .is_some_and(|confirm| confirm.id == id);
+        if edited && session.path().is_some() {
+            // The document earned a path while the removal ran, so its draft
+            // was retired (`retire_work_folder_draft`). The old approval is
+            // void, and the draft must not be registered or journaled again:
+            // the saved file is the document's copy now. A failed removal only
+            // leaves a leftover file, so it is retried best-effort.
+            let dirty = session.is_dirty();
+            let root = self
+                .work_folder
+                .as_ref()
+                .map(|folder| folder.root().to_path_buf());
+            if result.is_err()
+                && let Some(root) = root
+            {
+                let draft_store = self.draft_store.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = draft_store.remove(&root, draft.draft_id);
+                    })
+                    .detach();
+            }
+            self.rescue_journal_requests.remove(&id);
+            self.content_search_workspace_changed(cx);
+            if dirty {
+                self.reconfirm_tab_close(id, cx);
+            }
+            let confirming = self
+                .tab_close_confirm
+                .is_some_and(|confirm| confirm.id == id);
+            if !confirming {
+                self.resume_writers_after_discard_settled(id, instance, false, cx);
+            }
+            cx.notify();
+            return;
+        }
+        match result {
+            Ok(()) if !edited && !reconfirming && !busy && !pending.superseded => {
+                self.tab_discard_pending.insert(
+                    id,
+                    PendingTabDiscard {
+                        removing: None,
+                        ..pending
+                    },
+                );
+                self.discard_tab_now(id, cx);
+            }
+            other => {
+                self.work_folder_drafts.insert(id, draft);
+                self.content_search_workspace_changed(cx);
+                self.journal_draft_now(id, cx);
+                let failed = other.is_err();
+                if edited && !failed {
+                    self.reconfirm_tab_close(id, cx);
+                }
+                // The approval is over and the document stays. While a
+                // question for this document is on screen its answer decides
+                // (Cancel hands the writers back); otherwise hand back what
+                // the discard held off now. Done before the status below so
+                // the visible error is not hidden by a resumed write.
+                let confirming = self
+                    .tab_close_confirm
+                    .is_some_and(|confirm| confirm.id == id);
+                if !confirming {
+                    self.resume_writers_after_discard_settled(id, instance, failed, cx);
+                }
+                if let Err(error) = other {
+                    self.status = Some(format!("破棄できませんでした: {error}"));
+                } else if !edited && busy && !reconfirming && !pending.superseded {
+                    self.status = Some(
+                        "保存処理が始まったため破棄を中止しました。もう一度操作してください"
+                            .to_owned(),
+                    );
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Re-evaluates the ordinary writers that an approved discard held off
+    /// (a queued save, the autosave timer, the H1 title sync) once the
+    /// approval ended without closing the tab. Each goes back through its
+    /// usual owner, so the existing protections (autosave setting, IME,
+    /// ticket freshness, in-flight slot) still decide. Nothing runs while an
+    /// approval for the document is still active.
+    ///
+    /// `removal_failed` marks the end caused by a draft removal that failed:
+    /// the draft is the document's only protection then, and a first-time H1
+    /// create would retire it with a best-effort delete that hides the
+    /// failure. That one writer waits for the next edit; everything else
+    /// goes back to its owner.
+    fn resume_writers_after_discard_settled(
+        &mut self,
+        id: SessionId,
+        instance: DocumentInstance,
+        removal_failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_discard_pending.contains_key(&id)
+            || self.document_instance(id) != Some(instance)
+        {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(id) else {
+            return;
+        };
+        // A write still in flight drains the queue itself when it lands.
+        if !session.save_in_flight()
+            && let Some(pending) = session.take_pending_save()
+        {
+            self.save_session(id, pending, cx);
+        }
+        if self.sessions.active_id() == id {
+            // Re-arms only when autosave is on and the text is unsaved.
+            self.schedule_autosave(cx);
+        }
+        if !(removal_failed && self.work_folder_drafts.contains_key(&id)) {
+            self.retry_title_sync(id, cx);
+        }
+    }
+
+    /// Asks again for a document whose approval no longer matches its text.
+    fn reconfirm_tab_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.tab_close_confirm.is_some() {
+            return;
+        }
+        self.status = Some("編集されたため、もう一度確認してください".to_owned());
+        self.request_tab_close(id, cx);
+    }
+
+    /// Writes the live text of a draft-backed session to its recovery journal
+    /// right away, in the background, ordered by the shared snapshot sequence.
+    fn journal_draft_now(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(draft) = self.work_folder_drafts.get(&id).cloned() else {
+            return;
+        };
+        let Some(root) = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let Some(instance) = self.document_instance(id) else {
+            return;
+        };
+        let text = session.editor().document().full_text();
+        let sequence = hane_session::next_draft_snapshot_sequence();
+        let draft_id = draft.draft_id;
+        // The newest request per document decides whether a result is still
+        // current; an older one that lands later is ignored.
+        self.rescue_journal_requests
+            .insert(id, (instance, draft_id, sequence));
+        let draft_store = self.draft_store.clone();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    draft_store
+                        .write_snapshot(&root, draft_id, &draft.target_directory, &text, sequence)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_rescue_journal(id, (instance, draft_id, sequence), result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Accepts the result of `journal_draft_now`. A failure is shown only
+    /// while it is still the newest journal request of the same document
+    /// instance and draft; a replaced document, another workspace, a removed
+    /// draft or a later request makes the result stale and it is dropped. A
+    /// success never touches the status, so other save errors stay visible.
+    fn finish_rescue_journal(
+        &mut self,
+        id: SessionId,
+        request: (DocumentInstance, DraftId, u64),
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rescue_journal_requests.get(&id) != Some(&request) {
+            return;
+        }
+        self.rescue_journal_requests.remove(&id);
+        let (instance, draft_id, _) = request;
+        let Err(error) = result else {
+            return;
+        };
+        if self.document_instance(id) != Some(instance)
+            || self
+                .work_folder_drafts
+                .get(&id)
+                .is_none_or(|draft| draft.draft_id != draft_id)
+        {
+            return;
+        }
+        self.status = Some(format!(
+            "破棄を中止しましたが、回復用の下書きを保存できませんでした: {error}"
+        ));
+        cx.notify();
+    }
+
+    /// Removes the approved session from the set. Only reached once nothing
+    /// is writing to it and its draft (if any) is already gone.
+    fn discard_tab_now(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(pending) = self.tab_discard_pending.remove(&id) else {
+            return;
+        };
+        if self.document_instance(id) != Some(pending.instance) {
+            return;
+        }
+        let was_active = self.sessions.active_id() == id;
+        match self
+            .sessions
+            .discard(id, pending.instance.generation, "Untitled")
+        {
+            DiscardOutcome::Discarded => self.after_tab_removed(id, was_active, cx),
+            DiscardOutcome::Busy => {
+                self.tab_discard_pending.insert(id, pending);
+                self.status = Some("保存処理の完了を待ってから破棄します".to_owned());
+                cx.notify();
+            }
+            DiscardOutcome::Stale => {}
+        }
+    }
+
+    /// Bookkeeping shared by every way a tab leaves the set.
+    fn after_tab_removed(&mut self, id: SessionId, was_active: bool, cx: &mut Context<Self>) {
+        self.tab_close_after_save.remove(&id);
+        self.tab_discard_pending.remove(&id);
+        self.rescue_journal_requests.remove(&id);
         self.save_problems.remove(&id);
         if self
             .tab_close_confirm
@@ -3209,6 +3701,13 @@ impl EditorView {
         self.editor_context_menu = None;
         self.tab_close_confirm = None;
         self.tab_close_after_save.clear();
+        // A discard still waiting on its draft removal belongs to the old
+        // document; the new sessions reuse its id, so left in place it would
+        // keep suppressing the new document's autosave and title sync.
+        // `finish_tab_discard_removal` finds no matching pending afterwards
+        // and ignores the old callback's result.
+        self.tab_discard_pending.clear();
+        self.rescue_journal_requests.clear();
         self.save_problems.clear();
         self.external_comparison = None;
         // Any background read still in flight for the old folder (or for
@@ -5810,6 +6309,13 @@ impl EditorView {
             cx,
             move |view, _, _, cx| view.confirm_save_and_close_tab(snapshot, cx),
         );
+        let discard = self.file_tab_context_menu_item(
+            "tab-close-confirm-discard",
+            "保存せずに破棄",
+            true,
+            cx,
+            move |view, _, _, cx| view.confirm_discard_tab(snapshot, cx),
+        );
         div()
             .id("tab-close-confirm-overlay")
             .debug_selector(|| "tab-close-confirm-overlay".to_owned())
@@ -5843,6 +6349,7 @@ impl EditorView {
                         h_flex()
                             .gap_2()
                             .child(cancel)
+                            .child(discard)
                             .child(save_and_close),
                     ),
             )
@@ -16649,6 +17156,1846 @@ mod tests {
         });
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_tab_closes_only_the_confirmed_dirty_file_and_keeps_the_disk_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("confirm-discard-file");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            (id, view.tab_close_confirm.expect("confirm armed"))
+        });
+        view.update(cx, |view, cx| {
+            view.confirm_discard_tab(confirm, cx);
+            // A repeated click finds no live confirmation.
+            view.confirm_discard_tab(confirm, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_none(), "the approved tab closed");
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(!view.sessions.active().is_dirty());
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_tab_ignores_a_stale_snapshot_after_the_document_was_replaced(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("confirm-discard-stale");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let (id, confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+                fingerprint: None,
+            });
+            (id, confirm)
+        });
+        view.update(cx, |view, cx| view.confirm_discard_tab(confirm, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(id).is_some(),
+                "a stale approval must not close the replacement document"
+            );
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_tab_after_an_edit_reconfirms_instead_of_discarding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, "confirm-discard-edited");
+
+        let old = view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            let old = view.tab_close_confirm.expect("confirm armed");
+            // An edit lands (e.g. an async replace-all finishing) while the
+            // question is showing.
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+            old
+        });
+        view.update(cx, |view, cx| view.confirm_discard_tab(old, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some(), "the edited tab is kept");
+            assert!(view.tab_discard_pending.is_empty());
+            let renewed = view.tab_close_confirm.expect("asked again");
+            assert_ne!(renewed, old);
+            assert_eq!(
+                renewed.revision,
+                view.sessions.get(id).unwrap().revision(),
+                "the new question is about the current text"
+            );
+        });
+
+        // A stale click from the old render still does nothing; only the new
+        // question's own choice closes the tab.
+        view.update(cx, |view, cx| view.confirm_discard_tab(old, cx));
+        view.read_with(cx, |view, _| assert!(view.sessions.get(id).is_some()));
+        view.update(cx, |view, cx| {
+            let renewed = view.tab_close_confirm.expect("still asked");
+            view.confirm_discard_tab(renewed, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.sessions.get(id).is_none()));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_tab_ignores_a_click_from_a_cancelled_confirmation_at_the_same_revision(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, "confirm-discard-epoch");
+
+        let old = view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            let old = view.tab_close_confirm.expect("confirm armed");
+            assert!(view.dismiss_tab_close_confirm(cx));
+            view.request_tab_close(id, cx);
+            old
+        });
+        view.update(cx, |view, cx| view.confirm_discard_tab(old, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some(), "the old render's click is stale");
+            assert!(view.tab_close_confirm.is_some(), "the new question stays open");
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    // ---- Issue #672: the discard lifecycle, driven through real events and an
+    // injectable draft store. ----
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum ScriptedRemove {
+        #[default]
+        Succeed,
+        /// Fails before anything is deleted.
+        Fail,
+        /// Deletes the journal entry, then still reports a failure.
+        FailAfterDeleting,
+    }
+
+    /// A `DraftStore` over the real journal whose `remove` outcome is chosen
+    /// by the test. Writes and recovery are the real ones, so what survives is
+    /// observed on disk the way a restart would see it.
+    #[derive(Default)]
+    struct ScriptedDraftStore {
+        inner: OsDraftStore,
+        remove_mode: std::sync::Mutex<ScriptedRemove>,
+        removes: std::sync::atomic::AtomicUsize,
+        fail_snapshots: std::sync::atomic::AtomicBool,
+    }
+
+    impl ScriptedDraftStore {
+        /// Makes every later snapshot write fail without touching the disk.
+        fn fail_snapshots(&self, fail: bool) {
+            self.fail_snapshots
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn script(&self, mode: ScriptedRemove) {
+            *self.remove_mode.lock().unwrap() = mode;
+        }
+
+        fn removes(&self) -> usize {
+            self.removes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DraftStore for ScriptedDraftStore {
+        fn write(
+            &self,
+            root: &Path,
+            id: DraftId,
+            target_directory: &Path,
+            text: &str,
+        ) -> std::io::Result<()> {
+            self.inner.write(root, id, target_directory, text)
+        }
+
+        fn write_snapshot(
+            &self,
+            root: &Path,
+            id: DraftId,
+            target_directory: &Path,
+            text: &str,
+            sequence: u64,
+        ) -> std::io::Result<()> {
+            if self.fail_snapshots.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("journal write denied"));
+            }
+            self.inner
+                .write_snapshot(root, id, target_directory, text, sequence)
+        }
+
+        fn remove(&self, root: &Path, id: DraftId) -> std::io::Result<()> {
+            self.removes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mode = *self.remove_mode.lock().unwrap();
+            match mode {
+                ScriptedRemove::Succeed => self.inner.remove(root, id),
+                ScriptedRemove::Fail => Err(std::io::Error::other("remove denied")),
+                ScriptedRemove::FailAfterDeleting => {
+                    self.inner.remove(root, id)?;
+                    Err(std::io::Error::other("remove denied after deleting"))
+                }
+            }
+        }
+
+        fn recover(&self, root: &Path) -> std::io::Result<RecoveredDrafts> {
+            self.inner.recover(root)
+        }
+    }
+
+    struct DraftDiscardFixture {
+        root: PathBuf,
+        store: Arc<ScriptedDraftStore>,
+        id: SessionId,
+        draft_id: DraftId,
+    }
+
+    /// A work folder whose active, unnamed note holds `text` and is already
+    /// journaled through the scripted store.
+    fn draft_discard_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        label: &str,
+        text: &str,
+    ) -> (
+        gpui::Entity<EditorView>,
+        &'a mut gpui::VisualTestContext,
+        DraftDiscardFixture,
+    ) {
+        let root = draft_test_root(label);
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let store = Arc::new(ScriptedDraftStore::default());
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let draft_id = DraftId::generate();
+        let id = view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.draft_store = store.clone();
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id,
+                    target_directory: root.clone(),
+                },
+            );
+            view.editor_mut().insert_text(text).unwrap();
+            view.after_input(cx);
+            view.flush_pending_drafts();
+            id
+        });
+        cx.run_until_parked();
+        (
+            view,
+            cx,
+            DraftDiscardFixture {
+                root,
+                store,
+                id,
+                draft_id,
+            },
+        )
+    }
+
+    /// Asks to close `id` and immediately answers "保存せずに破棄" with the
+    /// snapshot the button would have captured.
+    fn discard_via_confirm(
+        view: &mut EditorView,
+        id: SessionId,
+        cx: &mut Context<EditorView>,
+    ) -> TabCloseConfirm {
+        view.request_tab_close(id, cx);
+        let confirm = view.tab_close_confirm.expect("confirm armed");
+        view.confirm_discard_tab(confirm, cx);
+        confirm
+    }
+
+    #[gpui::test]
+    fn rescue_journal_failure_after_aborted_discard_is_shown_and_keeps_the_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fixture) = draft_discard_view(cx, "rescue-journal-failure", "keep me");
+        fixture.store.script(ScriptedRemove::FailAfterDeleting);
+        fixture.store.fail_snapshots(true);
+
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fixture.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fixture.id).expect("the tab stays");
+            assert_eq!(session.editor().document().full_text(), "keep me");
+            assert_eq!(
+                view.work_folder_drafts
+                    .get(&fixture.id)
+                    .map(|draft| draft.draft_id),
+                Some(fixture.draft_id)
+            );
+            let status = view.status.as_deref().unwrap_or_default();
+            assert!(
+                status.contains("回復用の下書きを保存できませんでした")
+                    && status.contains("journal write denied"),
+                "unexpected status: {status}"
+            );
+        });
+        std::fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn stale_rescue_journal_failure_does_not_reach_another_instance_or_newer_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fixture) = draft_discard_view(cx, "rescue-journal-stale", "keep me");
+        view.update(cx, |view, cx| {
+            view.journal_draft_now(fixture.id, cx);
+            let (instance, draft_id, sequence) = *view
+                .rescue_journal_requests
+                .get(&fixture.id)
+                .expect("request recorded");
+            // An older request that lands after a newer one.
+            view.finish_rescue_journal(
+                fixture.id,
+                (instance, draft_id, sequence.wrapping_sub(1)),
+                Err("old failure".to_owned()),
+                cx,
+            );
+            assert_eq!(view.status, None);
+            // The same request from another workspace instance.
+            let other = DocumentInstance {
+                workspace: instance.workspace.wrapping_add(1),
+                ..instance
+            };
+            view.finish_rescue_journal(
+                fixture.id,
+                (other, draft_id, sequence),
+                Err("other workspace".to_owned()),
+                cx,
+            );
+            assert_eq!(view.status, None);
+            // A success never replaces another error.
+            view.status = Some("other error".to_owned());
+            view.finish_rescue_journal(fixture.id, (instance, draft_id, sequence), Ok(()), cx);
+            assert_eq!(view.status.as_deref(), Some("other error"));
+            // After success the request is settled; a late failure is stale.
+            view.finish_rescue_journal(
+                fixture.id,
+                (instance, draft_id, sequence),
+                Err("late failure".to_owned()),
+                cx,
+            );
+            assert_eq!(view.status.as_deref(), Some("other error"));
+        });
+        cx.run_until_parked();
+        std::fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    fn recovered_texts(root: &Path) -> Vec<String> {
+        OsDraftStore
+            .recover(root)
+            .unwrap()
+            .drafts
+            .into_iter()
+            .map(|draft| draft.text)
+            .collect()
+    }
+
+    fn markdown_files(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .collect()
+    }
+
+    /// One real file, loaded through the service, with an unsaved edit.
+    fn dirty_file_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        label: &str,
+    ) -> (
+        gpui::Entity<EditorView>,
+        &'a mut gpui::VisualTestContext,
+        PathBuf,
+        SessionId,
+    ) {
+        let root = draft_test_root(label);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            id
+        });
+        (view, cx, path, id)
+    }
+
+    #[gpui::test]
+    fn discard_button_click_closes_only_the_non_active_dirty_tab_and_keeps_the_others(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("discard-click-non-active");
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, text) in [("a.md", "alpha"), ("b.md", "bravo"), ("c.md", "charlie")] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let first = OsFileService.load(&root.join("a.md")).unwrap();
+        let second = OsFileService.load(&root.join("b.md")).unwrap();
+        let third = OsFileService.load(&root.join("c.md")).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(first);
+            sessions.apply_open(None, second);
+            sessions.apply_open(None, third);
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+        let ids: Vec<SessionId> = view.read_with(cx, |view, _| {
+            view.sessions().map(DocumentSession::id).collect()
+        });
+        let (a_id, c_id) = (ids[0], ids[2]);
+
+        view.update(cx, |view, cx| {
+            view.activate_file_tab(a_id, cx);
+            view.editor_mut().insert_text(" unsaved").unwrap();
+            view.after_input(cx);
+            // The active tab owns history, a selection and a redo entry that
+            // closing another tab must leave alone.
+            view.activate_file_tab(c_id, cx);
+            view.editor_mut().insert_text("X").unwrap();
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(2)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let state = |view: &EditorView| {
+            (
+                view.editor().document().full_text(),
+                view.editor().selection(),
+                view.editor().can_undo(),
+                view.editor().can_redo(),
+                view.scroll_y,
+            )
+        };
+        let before = view.read_with(cx, |view, _| state(view));
+        assert!(before.3, "the active tab has a redo entry to preserve");
+
+        let tab = cx.debug_bounds("file-tab-first").expect("first tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tab_close_confirm.map(|confirm| confirm.id), Some(a_id));
+        });
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard button rendered");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(a_id).is_none(), "the confirmed tab closed");
+            assert_eq!(view.sessions.len(), 2);
+            assert_eq!(view.sessions.active_id(), c_id);
+            assert!(view.tab_close_confirm.is_none());
+            assert!(view.tab_discard_pending.is_empty());
+            assert_eq!(state(view), before, "the other tab's state is untouched");
+        });
+        assert_eq!(std::fs::read_to_string(root.join("a.md")).unwrap(), "alpha");
+        assert_eq!(std::fs::read_to_string(root.join("b.md")).unwrap(), "bravo");
+        assert_eq!(std::fs::read_to_string(root.join("c.md")).unwrap(), "charlie");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_button_is_reachable_from_the_tab_context_menu_close(cx: &mut gpui::TestAppContext) {
+        let (view, cx, first, second) = two_clean_path_tabs(cx);
+        view.update(cx, |view, cx| {
+            view.activate_file_tab(first, cx);
+            view.editor_mut().insert_text("edit").unwrap();
+            view.after_input(cx);
+            view.activate_file_tab(second, cx);
+        });
+        cx.run_until_parked();
+
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let item = cx
+            .debug_bounds("file-tab-context-close")
+            .expect("close item rendered");
+        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tab_close_confirm.map(|confirm| confirm.id), Some(first));
+        });
+
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard button rendered");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(first).is_none());
+            assert_eq!(view.sessions.active_id(), second);
+            assert_eq!(
+                view.sessions
+                    .get(second)
+                    .unwrap()
+                    .editor()
+                    .document()
+                    .full_text(),
+                "second\n"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn discard_button_is_reachable_from_the_close_shortcut(cx: &mut gpui::TestAppContext) {
+        let (view, cx, first, second) = two_clean_path_tabs(cx);
+        bind_keys_and_focus_body(cx);
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("edit").unwrap();
+            view.after_input(cx);
+        });
+        cx.simulate_keystrokes(close_tab_key());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tab_close_confirm.map(|confirm| confirm.id), Some(second));
+        });
+
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard button rendered");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(second).is_none());
+            assert_eq!(view.sessions.len(), 1);
+            assert_eq!(view.sessions.active_id(), first);
+            assert!(view.tab_close_confirm.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn discard_button_on_the_last_untitled_tab_leaves_a_new_empty_untitled_without_save_as(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+        let old_id = view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("never saved").unwrap();
+            view.after_input(cx);
+            view.sessions.active_id()
+        });
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard button rendered");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.len(), 1);
+            assert_ne!(view.sessions.active_id(), old_id, "a new document id");
+            assert!(view.sessions.active().path().is_none());
+            assert!(!view.sessions.active().is_dirty());
+            assert_eq!(view.editor().document().full_text(), "");
+            assert_eq!(view.save_as_dialogs_open, 0, "no Save As was opened");
+            assert!(view.tab_close_after_save.is_empty());
+            assert!(view.tab_discard_pending.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn escape_and_background_click_dismiss_the_confirm_without_discarding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, _first, second) = two_clean_path_tabs(cx);
+        bind_keys_and_focus_body(cx);
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("edit").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(second, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(view.sessions.get(second).is_some_and(DocumentSession::is_dirty));
+        });
+
+        view.update(cx, |view, cx| view.request_tab_close(second, cx));
+        cx.run_until_parked();
+        let overlay = cx
+            .debug_bounds("tab-close-confirm-overlay")
+            .expect("overlay rendered");
+        cx.simulate_click(
+            point(overlay.origin.x + px(4.0), overlay.origin.y + px(4.0)),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(view.sessions.get(second).is_some_and(DocumentSession::is_dirty));
+        });
+    }
+
+    #[gpui::test]
+    fn discard_removes_only_the_confirmed_draft_and_it_stays_gone(cx: &mut gpui::TestAppContext) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-only-target", "unsaved draft body");
+        let other = view.update(cx, |view, cx| {
+            let other = view
+                .sessions
+                .open_untitled("other draft body", "Untitled");
+            view.work_folder_drafts.insert(
+                other,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: fx.root.clone(),
+                },
+            );
+            view.flush_pending_drafts();
+            view.activate_file_tab(fx.id, cx);
+            other
+        });
+        cx.run_until_parked();
+        assert_eq!(recovered_texts(&fx.root).len(), 2);
+        // A snapshot taken before the removal, as a late writer would hold.
+        let stale_sequence = hane_session::next_draft_snapshot_sequence();
+
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            // The quit flush runs while the removal is still pending.
+            view.flush_pending_drafts();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_none());
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.work_folder_drafts.contains_key(&other));
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        // Every late writer for the removed draft: the stale snapshot, the
+        // debounce timers and another flush.
+        OsDraftStore
+            .write_snapshot(&fx.root, fx.draft_id, &fx.root, "stale", stale_sequence)
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(900));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| view.flush_pending_drafts());
+
+        let texts = recovered_texts(&fx.root);
+        assert_eq!(texts.len(), 1, "only the other draft is restorable");
+        assert!(texts[0].contains("other draft body"));
+        assert_eq!(fx.store.removes(), 1);
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_keeps_the_tab_and_content_when_the_draft_removal_fails_and_can_be_retried(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-remove-fails", "unsaved draft body");
+        fx.store.script(ScriptedRemove::Fail);
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the tab is kept");
+            assert!(session.is_dirty());
+            assert_eq!(session.editor().document().full_text(), "unsaved draft body");
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("破棄できませんでした")),
+                "the failure must be visible"
+            );
+        });
+        assert_eq!(recovered_texts(&fx.root), vec!["unsaved draft body".to_owned()]);
+
+        // Draft journaling resumes for the surviving document.
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(900));
+        cx.run_until_parked();
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["unsaved draft body more".to_owned()]
+        );
+
+        // Retrying once the store works closes it and leaves nothing behind.
+        fx.store.script(ScriptedRemove::Succeed);
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_none());
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        assert!(recovered_texts(&fx.root).is_empty());
+        assert_eq!(fx.store.removes(), 2);
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_after_a_partial_removal_failure_journals_the_live_text_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-partial-failure", "unsaved draft body");
+        fx.store.script(ScriptedRemove::FailAfterDeleting);
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_some(), "the tab is kept");
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["unsaved draft body".to_owned()],
+            "the entry deleted by the failed removal must be written again"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_edit_while_the_draft_removal_runs_asks_again_instead_of_closing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-edit-during-removal", "draft body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            assert!(
+                !view.work_folder_drafts.contains_key(&fx.id),
+                "no timer or flush may journal the draft while it is being removed"
+            );
+            view.editor_mut().insert_text(" late").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the edited tab stays open");
+            assert_eq!(session.editor().document().full_text(), "draft body late");
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+            assert_eq!(
+                view.tab_close_confirm.map(|confirm| confirm.id),
+                Some(fx.id),
+                "the changed text is asked about again"
+            );
+        });
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["draft body late".to_owned()],
+            "the edit made during the removal is journaled"
+        );
+
+        // Answering the new question with Cancel keeps everything.
+        view.update(cx, |view, cx| {
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            assert!(view.dismiss_tab_close_confirm_if(confirm, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.sessions.get(fx.id).is_some()));
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_new_confirmation_during_the_draft_removal_does_not_continue_the_old_approval(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-reconfirm-during-removal", "draft body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            // Asked again while the removal is still running.
+            view.request_tab_close(fx.id, cx);
+            let second = view.tab_close_confirm.expect("second confirm");
+            // Answering discard must not stack another approval on the
+            // running one.
+            view.confirm_discard_tab(second, cx);
+            assert_eq!(view.tab_close_confirm, Some(second));
+            // The user cancels the new question.
+            assert!(view.dismiss_tab_close_confirm(cx));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view
+                .sessions
+                .get(fx.id)
+                .expect("a canceled question must not be answered by the old approval");
+            assert_eq!(session.editor().document().full_text(), "draft body");
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(view.tab_close_confirm.is_none());
+        });
+        assert_eq!(recovered_texts(&fx.root), vec!["draft body".to_owned()]);
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_document_replaced_during_the_draft_removal_is_not_closed(cx: &mut gpui::TestAppContext) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-replace-during-removal", "draft body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+                fingerprint: None,
+            });
+            view.on_document_replaced();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view
+                .sessions
+                .get(fx.id)
+                .expect("the replacement document must stay open");
+            assert_eq!(session.editor().document().full_text(), "replaced");
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_workspace_switch_during_the_draft_removal_does_not_close_the_reused_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-workspace-during-removal", "draft body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            view.on_document_replaced();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(fx.id).is_some(),
+                "an id of a later workspace must not be closed by the earlier approval"
+            );
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_workspace_switch_drops_the_old_pending_discard_and_ignores_its_late_result(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-workspace-switch-pending", "draft body");
+        let (old_instance, old_draft_id) = view.update(cx, |view, cx| {
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            let held = hold_discard_removal(view, fx.id, draft);
+            view.reset_for_work_folder_switch(cx);
+            held
+        });
+
+        view.update(cx, |view, cx| {
+            assert!(
+                view.tab_discard_pending.is_empty(),
+                "the old document's pending discard must not outlive the switch"
+            );
+            let new_instance = view.document_instance(fx.id).expect("reused id");
+            assert_ne!(new_instance, old_instance);
+
+            // A new document with the same id gets its own pending discard.
+            let new_draft = WorkFolderDraft {
+                draft_id: DraftId::generate(),
+                target_directory: fx.root.clone(),
+            };
+            let new_draft_id = new_draft.draft_id;
+            let (held_instance, _) = hold_discard_removal(view, fx.id, new_draft);
+            assert_eq!(held_instance, new_instance);
+
+            // The old callback reports back (Ok, then Err): neither touches
+            // the new document, its pending state, or the visible status.
+            let status_before = view.status.clone();
+            view.finish_tab_discard_removal(fx.id, old_instance, old_draft_id, Ok(()), cx);
+            view.finish_tab_discard_removal(
+                fx.id,
+                old_instance,
+                old_draft_id,
+                Err("late failure".to_owned()),
+                cx,
+            );
+            assert!(view.sessions.get(fx.id).is_some());
+            assert_eq!(view.status, status_before);
+            assert!(
+                view.tab_discard_pending
+                    .get(&fx.id)
+                    .is_some_and(|pending| pending
+                        .removing
+                        .as_ref()
+                        .is_some_and(|draft| draft.draft_id == new_draft_id)),
+                "the new pending discard keeps its owner"
+            );
+        });
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn the_new_document_still_writes_its_h1_file_while_the_old_discard_callback_is_outstanding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-switch-new-writer-old", "old body");
+        let new_root = draft_test_root("discard-switch-new-writer-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let new_text = "# New title\nnew body";
+
+        // The old document's discard removal has not reported back when the
+        // work folder is switched and the reused id gets a new document.
+        let (old_instance, old_draft_id) = view.update(cx, |view, cx| {
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            let held = hold_discard_removal(view, fx.id, draft);
+            view.reset_for_work_folder_switch(cx);
+            view.work_folder = Some(OsWorkFolderScanner.scan(&new_root).unwrap());
+            assert_eq!(view.sessions.active_id(), fx.id, "the id is reused");
+            view.editor_mut().insert_text(new_text).unwrap();
+            view.after_input(cx);
+            held
+        });
+
+        // The regular H1 naming path (not a direct save) creates the file.
+        view.update(cx, |view, cx| {
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            assert!(
+                view.title_sync_in_flight.contains(&fx.id),
+                "the new document's H1 create is not suppressed by the old pending"
+            );
+        });
+        cx.run_until_parked();
+
+        let created = markdown_files(&new_root);
+        assert_eq!(created.len(), 1, "the new document's file is created");
+        assert_eq!(std::fs::read_to_string(&created[0]).unwrap(), new_text);
+        assert!(
+            markdown_files(&fx.root).is_empty(),
+            "nothing is written into the old workspace"
+        );
+
+        // The old callback finally reports back; the new file and document
+        // are left as they were.
+        view.update(cx, |view, cx| {
+            view.finish_tab_discard_removal(fx.id, old_instance, old_draft_id, Ok(()), cx);
+            view.finish_tab_discard_removal(
+                fx.id,
+                old_instance,
+                old_draft_id,
+                Err("late failure".to_owned()),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(&created[0]).unwrap(), new_text);
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the new document stays open");
+            assert_eq!(session.path(), Some(created[0].as_path()));
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_waits_for_a_running_save_then_closes_without_rolling_the_write_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, "discard-during-save");
+        view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.save_session(id, SaveIntent::Current, cx);
+            assert!(view.sessions.get(id).unwrap().save_in_flight());
+            view.confirm_discard_tab(confirm, cx);
+            assert!(
+                view.tab_discard_pending.contains_key(&id),
+                "the approval waits for the running write"
+            );
+            assert!(view.sessions.get(id).is_some());
+        });
+        cx.run_until_parked();
+
+        // The accepted write is not undone; the tab then closes.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before after");
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_none());
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(view.sessions.active().path().is_none());
+        });
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_edit_after_the_discard_approval_during_a_save_asks_again_and_writes_nothing_more(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, "discard-edit-during-save");
+        view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.save_session(id, SaveIntent::Current, cx);
+            view.confirm_discard_tab(confirm, cx);
+            // Lands before the running write is ever polled.
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before after",
+            "text added after the approval must not be saved"
+        );
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(id).expect("the edited tab stays open");
+            assert!(session.is_dirty());
+            assert!(!session.save_in_flight());
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(view.tab_close_after_save.is_empty());
+            assert_eq!(
+                view.tab_close_confirm.map(|confirm| confirm.id),
+                Some(id),
+                "the changed text is asked about again, not discarded"
+            );
+        });
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_proceeds_after_a_failed_save_without_touching_the_disk(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("discard-save-fails");
+        std::fs::create_dir_all(&root).unwrap();
+        // A plain file where the parent folder should be makes the write fail
+        // on every platform.
+        let blocking_file = root.join("missing-dir");
+        std::fs::write(&blocking_file, "blocking").unwrap();
+        let missing_path = blocking_file.join("note.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("before"),
+                    identity: hane_session::FileIdentity::lexical(missing_path),
+                    stamp: None,
+                    fingerprint: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.save_session(id, SaveIntent::Current, cx);
+            view.confirm_discard_tab(confirm, cx);
+            id
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_none(), "the approved tab closed");
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(view.footer_warnings().is_empty());
+        });
+        assert_eq!(std::fs::read_to_string(&blocking_file).unwrap(), "blocking");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_waits_for_an_h1_create_and_creates_no_file(cx: &mut gpui::TestAppContext) {
+        let (view, cx, fx) =
+            draft_discard_view(cx, "discard-during-h1-create", "# Titled note\nbody");
+        view.update(cx, |view, cx| {
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            assert!(
+                view.title_sync_in_flight.contains(&fx.id),
+                "the H1 create is running"
+            );
+            discard_via_confirm(view, fx.id, cx);
+            assert!(
+                view.tab_discard_pending
+                    .get(&fx.id)
+                    .is_some_and(|pending| pending.removing.is_none()),
+                "the approval waits for the create instead of removing the draft"
+            );
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_none());
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        assert!(markdown_files(&fx.root).is_empty(), "no note file was created");
+        assert!(recovered_texts(&fx.root).is_empty());
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_edit_and_flush_while_the_discard_removal_runs_keep_the_latest_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-edit-then-flush", "approved body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+            // Edited after the approval, then the window closes before the
+            // removal reports back.
+            view.editor_mut().insert_text(" newer").unwrap();
+            view.after_input(cx);
+            view.flush_pending_drafts();
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the tab is kept");
+            assert_eq!(session.editor().document().full_text(), "approved body newer");
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["approved body newer".to_owned()]
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_unedited_approved_discard_is_not_written_back_by_a_flush_and_stays_gone(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-flush-unedited", "approved body");
+        view.update(cx, |view, cx| {
+            discard_via_confirm(view, fx.id, cx);
+            view.flush_pending_drafts();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_none());
+            view.flush_pending_drafts();
+        });
+        assert!(recovered_texts(&fx.root).is_empty());
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_during_an_h1_create_keeps_the_tab_when_the_draft_removal_fails_afterwards(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) =
+            draft_discard_view(cx, "discard-h1-create-remove-fails", "# Titled note\nbody");
+        fx.store.script(ScriptedRemove::Fail);
+        view.update(cx, |view, cx| {
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            discard_via_confirm(view, fx.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(fx.id).is_some(),
+                "a draft that could not be removed keeps its tab"
+            );
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("破棄できませんでした")),
+                "the failure must be visible"
+            );
+        });
+        // The resumed writers must not turn the protected draft into a file
+        // (which would retire its tracking and hide the failure).
+        assert!(
+            markdown_files(&fx.root).is_empty(),
+            "no note file is created behind the failed removal"
+        );
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["# Titled note\nbody".to_owned()],
+            "the journal still protects the text"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_title_sync_held_by_a_discard_approval_runs_once_the_question_is_cancelled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) =
+            draft_discard_view(cx, "discard-title-sync-cancelled", "# Titled note\nbody");
+        view.update(cx, |view, cx| {
+            // A running write keeps the approval waiting.
+            view.title_sync_in_flight.insert(fx.id);
+            discard_via_confirm(view, fx.id, cx);
+            assert!(view.tab_discard_pending.contains_key(&fx.id));
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            // The title-sync timer fires while the approval is active.
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            view.title_sync_in_flight.remove(&fx.id);
+            // A new question voids the approval.
+            view.request_tab_close(fx.id, cx);
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        cx.run_until_parked();
+        assert!(
+            markdown_files(&fx.root).is_empty(),
+            "nothing runs while the new question is still on screen"
+        );
+
+        view.update(cx, |view, cx| assert!(view.dismiss_tab_close_confirm(cx)));
+        cx.run_until_parked();
+
+        let files = markdown_files(&fx.root);
+        assert_eq!(files.len(), 1, "the held title sync ran once after Cancel");
+        assert_eq!(
+            std::fs::read_to_string(&files[0]).unwrap(),
+            "# Titled note\nbody"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_queued_save_held_by_a_discard_starts_once_when_the_draft_removal_fails(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-queued-save-fails", "plain body");
+        fx.store.script(ScriptedRemove::Fail);
+        let first = fx.root.join("first.md");
+        let second = fx.root.join("second.md");
+        view.update(cx, |view, cx| {
+            view.save_session(fx.id, SaveIntent::To(first.clone()), cx);
+            view.save_session(fx.id, SaveIntent::To(second.clone()), cx);
+            discard_via_confirm(view, fx.id, cx);
+            assert!(view.tab_discard_pending.contains_key(&fx.id));
+        });
+        assert!(!second.exists(), "nothing queued starts during the approval");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_some(), "the tab is kept");
+            assert!(view.tab_discard_pending.is_empty());
+        });
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "plain body");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "plain body",
+            "the queued save the user already asked for ran after the failure"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_queued_save_held_by_a_successful_discard_never_starts(cx: &mut gpui::TestAppContext) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-queued-save-succeeds", "plain body");
+        let first = fx.root.join("first.md");
+        let second = fx.root.join("second.md");
+        view.update(cx, |view, cx| {
+            view.save_session(fx.id, SaveIntent::To(first.clone()), cx);
+            view.save_session(fx.id, SaveIntent::To(second.clone()), cx);
+            discard_via_confirm(view, fx.id, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_none(), "the approved tab closed");
+        });
+        assert!(first.exists(), "the write already accepted is not rolled back");
+        assert!(!second.exists(), "a discard starts no new save");
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// Puts `id` into the state of an approved discard whose draft removal is
+    /// still running (the background task has not reported back yet), and
+    /// returns the pieces `finish_tab_discard_removal` is later called with.
+    fn hold_discard_removal(
+        view: &mut EditorView,
+        id: SessionId,
+        draft: WorkFolderDraft,
+    ) -> (DocumentInstance, DraftId) {
+        let instance = view.document_instance(id).expect("document instance");
+        let revision = view.sessions.get(id).unwrap().revision();
+        let draft_id = draft.draft_id;
+        view.tab_discard_pending.insert(
+            id,
+            PendingTabDiscard {
+                instance,
+                revision,
+                removing: Some(draft),
+                superseded: false,
+            },
+        );
+        (instance, draft_id)
+    }
+
+    /// A superseded approval no longer covers the text even with the same
+    /// revision: reconfirm during the removal, cancel, then flush before the
+    /// removal result is accepted. The real journal must hold the body again
+    /// without any UI callback, and a stale removal ordered earlier must not
+    /// delete it.
+    #[gpui::test]
+    fn flush_after_a_superseded_discard_restores_the_unedited_draft_to_the_real_journal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-superseded-flush", "keep me");
+        OsDraftStore
+            .write_snapshot(
+                &fx.root,
+                fx.draft_id,
+                &fx.root,
+                "keep me",
+                hane_session::next_draft_snapshot_sequence(),
+            )
+            .unwrap();
+        // Requested after the journalled snapshot, before the later flush.
+        let removal_sequence = hane_session::next_draft_snapshot_sequence();
+        view.update(cx, |view, cx| {
+            view.draft_store = Arc::new(OsDraftStore);
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            hold_discard_removal(view, fx.id, draft);
+            // The removal already reached the journal before the flush.
+            OsDraftStore
+                .remove_ordered(&fx.root, fx.draft_id, removal_sequence)
+                .unwrap();
+            view.request_tab_close(fx.id, cx);
+            assert!(view.tab_discard_pending[&fx.id].superseded);
+            // Cancel / Escape: the removal result is still outstanding.
+            view.tab_close_confirm = None;
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+            // No edit, no finish_tab_discard_removal: only the exit flush.
+            view.flush_pending_drafts();
+        });
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["keep me".to_owned()],
+            "the superseded draft is back in the durable journal"
+        );
+        // A removal requested before the flush runs late and must not win.
+        OsDraftStore
+            .remove_ordered(&fx.root, fx.draft_id, removal_sequence)
+            .unwrap();
+        assert_eq!(recovered_texts(&fx.root), vec!["keep me".to_owned()]);
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// The approval is still valid and the text unedited: the flush must not
+    /// write the approved-for-removal draft back.
+    #[gpui::test]
+    fn flush_does_not_restore_an_unedited_draft_with_a_valid_discard_approval(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-valid-flush", "bye");
+        // Requested after the helper's journalled snapshot, before the flush.
+        let removal_sequence = hane_session::next_draft_snapshot_sequence();
+        view.update(cx, |view, _| {
+            view.draft_store = Arc::new(OsDraftStore);
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            hold_discard_removal(view, fx.id, draft);
+            // The approved removal already reached the journal before the flush.
+            OsDraftStore
+                .remove_ordered(&fx.root, fx.draft_id, removal_sequence)
+                .unwrap();
+            assert!(recovered_texts(&fx.root).is_empty());
+            view.flush_pending_drafts();
+        });
+        assert!(recovered_texts(&fx.root).is_empty());
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// Approved discard whose removal is still running, then an edit that
+    /// reclaims the draft, then a real Save As that completes before the old
+    /// removal result arrives. The saved file is the document's copy: the late
+    /// result must not register the draft or journal it again, and neither
+    /// flush may bring a recovery draft back. Another draft stays recoverable.
+    #[gpui::test]
+    fn a_late_discard_removal_after_save_as_does_not_revive_the_retired_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-saveas-late-removal", "body");
+        let other_draft = DraftId::generate();
+        OsDraftStore
+            .write_snapshot(
+                &fx.root,
+                other_draft,
+                &fx.root,
+                "other draft",
+                hane_session::next_draft_snapshot_sequence(),
+            )
+            .unwrap();
+        let saved = fx.root.join("saved.md");
+        // Requested at approval time, before the edit below.
+        let removal_sequence = hane_session::next_draft_snapshot_sequence();
+        let (instance, draft_id) = view.update(cx, |view, cx| {
+            view.draft_store = Arc::new(OsDraftStore);
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            let held = hold_discard_removal(view, fx.id, draft);
+            // Edited after the approval: the draft is taken back and journaled.
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+            view.reclaim_edited_discarding_draft(fx.id);
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            view.flush_pending_drafts();
+            held
+        });
+        assert!(recovered_texts(&fx.root).contains(&"body more".to_owned()));
+
+        // The ordinary Save As path gives the document its path while the
+        // old removal is still outstanding.
+        view.update(cx, |view, cx| {
+            view.save_session(fx.id, SaveIntent::To(saved.clone()), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "body more");
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).unwrap().path().is_some());
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+        });
+
+        // The old removal now reports back, and flushes run before and after.
+        view.update(cx, |view, cx| {
+            view.flush_pending_drafts();
+            assert_eq!(view.flush_pending_drafts_checked(), Ok(0));
+            OsDraftStore
+                .remove_ordered(&fx.root, draft_id, removal_sequence)
+                .unwrap();
+            view.finish_tab_discard_removal(fx.id, instance, draft_id, Ok(()), cx);
+            assert!(!view.work_folder_drafts.contains_key(&fx.id));
+            assert!(!view.rescue_journal_requests.contains_key(&fx.id));
+            assert!(!view.tab_discard_pending.contains_key(&fx.id));
+            assert!(view.tab_close_confirm.is_none(), "no needless reconfirm");
+            view.flush_pending_drafts();
+            assert_eq!(view.flush_pending_drafts_checked(), Ok(0));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(fx.id).expect("the saved tab stays");
+            assert!(!session.is_dirty());
+            assert_eq!(session.editor().document().full_text(), "body more");
+        });
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "body more");
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["other draft".to_owned()],
+            "only the unrelated draft remains in the real journal"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn save_and_close_without_a_path_waits_for_a_running_draft_removal_and_keeps_its_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-held-save-close-untitled", "body");
+        let (instance, draft_id) = view.update(cx, |view, _| {
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            hold_discard_removal(view, fx.id, draft)
+        });
+        view.update(cx, |view, cx| {
+            // A new question while the removal runs, answered "save and close".
+            view.request_tab_close(fx.id, cx);
+            let confirm = view.tab_close_confirm.expect("question on screen");
+            view.confirm_save_and_close_tab(confirm, cx);
+            assert!(view.sessions.get(fx.id).is_some(), "the tab is not closed");
+            assert!(
+                view.tab_discard_pending
+                    .get(&fx.id)
+                    .is_some_and(|pending| pending.removing.is_some()),
+                "the removal's result keeps its owner"
+            );
+            assert_eq!(view.save_as_dialogs_open, 0, "no Save As is started");
+            assert!(view.tab_close_confirm.is_some(), "the question stays");
+        });
+
+        view.update(cx, |view, cx| {
+            view.finish_tab_discard_removal(
+                fx.id,
+                instance,
+                draft_id,
+                Err("remove denied".to_owned()),
+                cx,
+            );
+            assert!(view.sessions.get(fx.id).is_some(), "the failed discard keeps the tab");
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("破棄できませんでした")),
+                "the failure must be visible"
+            );
+            // The flush path journals the live document again, not a closed one.
+            view.flush_pending_drafts();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            recovered_texts(&fx.root),
+            vec!["body".to_owned()],
+            "the open document is still protected by exactly one journal entry"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    #[gpui::test]
+    fn save_and_close_with_a_path_does_not_close_during_a_running_draft_removal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, "discard-held-save-close-path");
+        let root = path.parent().unwrap().to_path_buf();
+        let draft = WorkFolderDraft {
+            draft_id: DraftId::generate(),
+            target_directory: root.clone(),
+        };
+        let (instance, draft_id) = view.update(cx, |view, _| hold_discard_removal(view, id, draft));
+        view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("question on screen");
+            view.confirm_save_and_close_tab(confirm, cx);
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "no close request is armed behind the running removal"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        view.update(cx, |view, cx| {
+            assert!(view.sessions.get(id).is_some());
+            view.finish_tab_discard_removal(id, instance, draft_id, Err("denied".to_owned()), cx);
+            assert!(view.sessions.get(id).is_some(), "the failure keeps the tab");
+            assert!(view.work_folder_drafts.contains_key(&id));
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("破棄できませんでした"))
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_armed_save_and_close_does_not_close_while_a_draft_removal_runs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) = draft_discard_view(cx, "discard-held-armed-close", "body");
+        view.update(cx, |view, cx| {
+            let draft = view.work_folder_drafts.remove(&fx.id).unwrap();
+            let (instance, _) = hold_discard_removal(view, fx.id, draft);
+            view.tab_close_after_save.insert(fx.id, instance);
+            view.resolve_pending_tab_close(fx.id, cx);
+            assert!(view.sessions.get(fx.id).is_some());
+            assert_eq!(view.tab_close_after_save.get(&fx.id), Some(&instance));
+        });
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    fn escape_the_question(view: &mut EditorView, cx: &mut Context<EditorView>) {
+        assert!(view.dismiss_tab_close_confirm(cx));
+    }
+
+    fn click_cancel_on_the_question(view: &mut EditorView, cx: &mut Context<EditorView>) {
+        let confirm = view.tab_close_confirm.expect("question on screen");
+        assert!(view.dismiss_tab_close_confirm_if(confirm, cx));
+    }
+
+    /// An approval held back by a running write, an edit that its autosave
+    /// timer could not act on while the approval was active, then a new
+    /// question that is cancelled.
+    fn edit_during_held_discard_then_cancel(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        autosave: bool,
+        cancel: fn(&mut EditorView, &mut Context<EditorView>),
+    ) {
+        let (view, cx, path, id) = dirty_file_view(cx, label);
+        view.update(cx, |view, cx| {
+            view.settings.autosave = autosave;
+            view.title_sync_in_flight.insert(id);
+            discard_via_confirm(view, id, cx);
+            assert!(view.tab_discard_pending.contains_key(&id));
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(800));
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before",
+            "the autosave timer is suppressed while the approval is active"
+        );
+
+        view.update(cx, |view, cx| {
+            view.title_sync_in_flight.remove(&id);
+            view.resolve_pending_tab_discard(id, cx);
+            assert!(view.tab_discard_pending.is_empty());
+            assert_eq!(
+                view.tab_close_confirm.map(|confirm| confirm.id),
+                Some(id),
+                "the edited text is asked about again"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before",
+            "nothing is written while the new question is on screen"
+        );
+
+        view.update(cx, cancel);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(800));
+        cx.run_until_parked();
+
+        let expected = if autosave { "before after more" } else { "before" };
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some(), "Cancel keeps the tab");
+            assert!(view.tab_discard_pending.is_empty());
+        });
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_on_the_reconfirmation_autosaves_the_edit_the_discard_held_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        edit_during_held_discard_then_cancel(
+            cx,
+            "discard-held-autosave-escape",
+            true,
+            escape_the_question,
+        );
+    }
+
+    #[gpui::test]
+    fn cancel_or_backdrop_on_the_reconfirmation_autosaves_the_edit_the_discard_held_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        edit_during_held_discard_then_cancel(
+            cx,
+            "discard-held-autosave-cancel",
+            true,
+            click_cancel_on_the_question,
+        );
+    }
+
+    #[gpui::test]
+    fn cancelling_the_reconfirmation_does_not_autosave_when_autosave_is_off(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        edit_during_held_discard_then_cancel(
+            cx,
+            "discard-held-autosave-off",
+            false,
+            escape_the_question,
+        );
+    }
+
+    #[gpui::test]
+    fn an_edit_after_the_discard_approval_during_an_h1_create_asks_again_and_creates_no_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, fx) =
+            draft_discard_view(cx, "discard-edit-during-h1-create", "# Titled note\nbody");
+        view.update(cx, |view, cx| {
+            let (generation, revision) = {
+                let session = view.sessions.get(fx.id).unwrap();
+                (session.generation(), session.revision())
+            };
+            view.run_title_sync_for_test(fx.id, generation, revision, cx);
+            discard_via_confirm(view, fx.id, cx);
+            view.editor_mut().insert_text(" more").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(fx.id).is_some_and(DocumentSession::is_dirty));
+            assert!(view.work_folder_drafts.contains_key(&fx.id));
+            assert!(view.tab_discard_pending.is_empty());
+            assert_eq!(
+                view.tab_close_confirm.map(|confirm| confirm.id),
+                Some(fx.id),
+                "the changed text is asked about again"
+            );
+        });
+        assert!(
+            markdown_files(&fx.root).is_empty(),
+            "the stale create must not write the text that was approved for discard"
+        );
+
+        std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
     // AADW Commander review follow-up on PR #416: the Save-and-close and

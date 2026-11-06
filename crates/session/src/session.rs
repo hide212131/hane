@@ -146,6 +146,17 @@ pub enum CloseDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnsavedChanges;
 
+/// How `SessionSet::discard` answered an explicit "close without saving".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscardOutcome {
+    /// The approved document was removed.
+    Discarded,
+    /// The id is gone or now names another document generation.
+    Stale,
+    /// A write for the document is still in flight; retry once it lands.
+    Busy,
+}
+
 /// Binds one background check of the disk to the document it was started for.
 /// A result is applied only while every field still describes the session, so
 /// a slow read can never act on a replaced document, a renamed path, or a
@@ -1422,18 +1433,47 @@ impl SessionSet {
         if let CloseDecision::Reject(unsaved) = session.close_decision() {
             return CloseDecision::Reject(unsaved);
         }
+        self.remove_session(id, label.into());
+        CloseDecision::Close
+    }
+
+    /// Closes exactly one session the user explicitly agreed to throw away,
+    /// unsaved edits included. This is the only way past `close`'s dirty
+    /// guard: it names the document generation the approval was given for, so
+    /// a replaced document, a vanished id or a write still in flight is
+    /// refused instead of discarding something the user never approved. The
+    /// session is never marked saved and nothing is written to disk.
+    pub fn discard(
+        &mut self,
+        id: SessionId,
+        approved_generation: u64,
+        label: impl Into<String>,
+    ) -> DiscardOutcome {
+        let Some(session) = self.get(id) else {
+            return DiscardOutcome::Stale;
+        };
+        if session.generation() != approved_generation {
+            return DiscardOutcome::Stale;
+        }
+        if session.save_in_flight() {
+            return DiscardOutcome::Busy;
+        }
+        self.remove_session(id, label.into());
+        DiscardOutcome::Discarded
+    }
+
+    fn remove_session(&mut self, id: SessionId, label: String) {
         if self.sessions.len() == 1 {
             let replacement = SessionId(self.next_id);
             self.next_id = self.next_id.wrapping_add(1);
             self.sessions = vec![DocumentSession::untitled(replacement, "", label)];
             self.active = replacement;
-            return CloseDecision::Close;
+            return;
         }
         self.sessions.retain(|session| session.id() != id);
         if self.active == id {
             self.active = self.sessions[0].id();
         }
-        CloseDecision::Close
     }
 
     /// Routes a filer event to every session that is looking at the file.

@@ -28,6 +28,7 @@ impl EditorView {
             let (should_save, composing) = view
                 .read_with(cx, |view, _| {
                     let current = view.document_instance(id) == instance
+                        && !view.tab_discard_pending.contains_key(&id)
                         && view.sessions.active_id() == id
                         && view
                             .sessions
@@ -63,6 +64,7 @@ impl EditorView {
     /// draft is revisited and edited again.
     pub(super) fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
         let id = self.sessions.active_id();
+        self.reclaim_edited_discarding_draft(id);
         let Some(draft_id) = self.work_folder_drafts.get(&id).map(|draft| draft.draft_id) else {
             return;
         };
@@ -138,13 +140,10 @@ impl EditorView {
     /// this an unnamed note's last few keystrokes would only survive a crash
     /// (recovered from whatever the debounce last wrote), not a clean exit.
     pub fn flush_pending_drafts(&self) {
-        if self.work_folder_drafts.is_empty() {
-            return;
-        }
         let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
             return;
         };
-        for (&id, draft) in &self.work_folder_drafts {
+        for (&id, draft) in self.drafts_to_flush() {
             let Some(session) = self.sessions.get(id) else {
                 continue;
             };
@@ -165,7 +164,8 @@ impl EditorView {
     /// ignored. `Ok` carries the number of drafts written. The ordinary quit
     /// path keeps using the best-effort method above.
     pub(super) fn flush_pending_drafts_checked(&self) -> Result<usize, Vec<String>> {
-        if self.work_folder_drafts.is_empty() {
+        let drafts = self.drafts_to_flush();
+        if drafts.is_empty() {
             return Ok(0);
         }
         let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
@@ -173,7 +173,7 @@ impl EditorView {
         };
         let mut written = 0;
         let mut failures = Vec::new();
-        for (&id, draft) in &self.work_folder_drafts {
+        for (&id, draft) in drafts {
             let Some(session) = self.sessions.get(id) else {
                 continue;
             };
@@ -195,6 +195,59 @@ impl EditorView {
         } else {
             Err(failures)
         }
+    }
+
+    /// A draft whose approved discard is still removing its journal entry,
+    /// but whose approval no longer covers the text: the document was edited
+    /// after the approval (moved revision), or a newer confirmation replaced
+    /// the approval (`superseded`, whatever the revision). Same document
+    /// instance only. This is the single criterion for "must be kept" shared
+    /// by the debounce reclaim and every flush.
+    fn edited_discarding_draft(&self, id: SessionId) -> Option<&WorkFolderDraft> {
+        let pending = self.tab_discard_pending.get(&id)?;
+        let draft = pending.removing.as_ref()?;
+        if self.document_instance(id) != Some(pending.instance) {
+            return None;
+        }
+        let session = self.sessions.get(id)?;
+        // A document that earned a path has retired its draft (Save As or the
+        // H1 first write): the journal entry is no longer its recovery copy,
+        // so a removal still running must neither be reclaimed nor flushed.
+        if session.path().is_some() {
+            return None;
+        }
+        (pending.superseded || session.revision() != pending.revision).then_some(draft)
+    }
+
+    /// Takes an edited draft back out of a running discard removal, so the
+    /// debounce timer and flushes journal it again like any live draft. The
+    /// removal was requested earlier and is ordered before the new snapshots,
+    /// so it cannot delete them; its completion sees the edit and keeps the
+    /// tab.
+    pub(super) fn reclaim_edited_discarding_draft(&mut self, id: SessionId) {
+        if self.work_folder_drafts.contains_key(&id) {
+            return;
+        }
+        if let Some(draft) = self.edited_discarding_draft(id).cloned() {
+            self.work_folder_drafts.insert(id, draft);
+        }
+    }
+
+    /// Every draft a flush must write: the live ones, plus edited drafts still
+    /// held by a running discard removal (their latest text is unapproved).
+    /// A draft whose discard was approved and not edited is deliberately left
+    /// out so the approved text is not written back.
+    fn drafts_to_flush(&self) -> Vec<(&SessionId, &WorkFolderDraft)> {
+        let mut drafts: Vec<_> = self.work_folder_drafts.iter().collect();
+        for id in self.tab_discard_pending.keys() {
+            if self.work_folder_drafts.contains_key(id) {
+                continue;
+            }
+            if let Some(draft) = self.edited_discarding_draft(*id) {
+                drafts.push((id, draft));
+            }
+        }
+        drafts
     }
 
     /// Issue #6: arms the debounce timer that keeps a work-folder note's
@@ -264,6 +317,11 @@ impl EditorView {
             .is_some_and(|rename| rename.pending)
         {
             self.title_sync_deferred.insert(id);
+            return;
+        }
+        if self.tab_discard_pending.contains_key(&id) {
+            // The user chose to throw this document away; no new file may be
+            // created or renamed on its behalf.
             return;
         }
         if self.title_sync_in_flight.contains(&id) {
@@ -396,6 +454,13 @@ impl EditorView {
                     return;
                 }
                 view.title_sync_in_flight.remove(&id);
+                // An approved discard must not be raced by the file this
+                // probe was about to create: drop the create and let the
+                // discard proceed instead.
+                if view.tab_discard_pending.contains_key(&id) {
+                    view.resolve_pending_tab_discard(id, cx);
+                    return;
+                }
                 // A session that no longer exists (closed in the meantime)
                 // defers the same as one that reports
                 // `should_defer_h1_create`; `retry_title_sync` picks this
@@ -600,9 +665,19 @@ impl EditorView {
         // whichever path the session actually ended up at.
         if let Some(session) = self.sessions.get_mut(id) {
             session.finish_rename(ticket);
-            if let Some(pending) = session.take_pending_save() {
-                self.save_session(id, pending, cx);
-            }
+        }
+        // An approved discard is settled before any queued write starts: a
+        // save queued behind this rename must not put text the user chose to
+        // throw away onto disk. An edit made after the approval turns it back
+        // into a question, which leaves the queued save free to run.
+        self.resolve_pending_tab_discard(id, cx);
+        if !self.tab_discard_pending.contains_key(&id)
+            && let Some(pending) = self
+                .sessions
+                .get_mut(id)
+                .and_then(DocumentSession::take_pending_save)
+        {
+            self.save_session(id, pending, cx);
         }
         self.resolve_pending_tab_close(id, cx);
         // Publish the exact state from every session before returning, so a
@@ -616,6 +691,20 @@ impl EditorView {
     /// journal entry is removed on a background thread; a failure here just
     /// leaves a harmless leftover file, never lost content.
     fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        // An approved, unedited discard owns the draft's removal: its result
+        // decides whether the tab may close, so it must not be settled here by
+        // a best-effort delete whose failure nobody sees. An edited approval
+        // is dropped by the resolution that follows and retires as usual.
+        let discard_owns_draft = self.tab_discard_pending.get(&id).is_some_and(|pending| {
+            self.document_instance(id) == Some(pending.instance)
+                && self
+                    .sessions
+                    .get(id)
+                    .is_some_and(|session| session.revision() == pending.revision)
+        });
+        if discard_owns_draft {
+            return;
+        }
         let Some(draft) = self.work_folder_drafts.remove(&id) else {
             return;
         };
@@ -685,7 +774,7 @@ impl EditorView {
     /// rather than waiting on the next keystroke to re-arm the debounce —
     /// which may never come, if the H1 edit that wanted the rename was the
     /// document's last edit before the autosave it lost the race to.
-    fn retry_title_sync(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    pub(super) fn retry_title_sync(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
@@ -1012,10 +1101,15 @@ impl EditorView {
                 self.title_sync_pending.remove(&id);
             }
         }
-        if let Some(pending) = self
-            .sessions
-            .get_mut(id)
-            .and_then(DocumentSession::take_pending_save)
+        // Settled before any queued write starts, as in `finish_title_rename`:
+        // a save queued behind this one must not write text an approved
+        // discard is about to throw away.
+        self.resolve_pending_tab_discard(id, cx);
+        if !self.tab_discard_pending.contains_key(&id)
+            && let Some(pending) = self
+                .sessions
+                .get_mut(id)
+                .and_then(DocumentSession::take_pending_save)
         {
             self.save_session(id, pending, cx);
         }
