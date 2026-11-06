@@ -30,18 +30,26 @@ gpui.workspace = true
 gpui-component.workspace = true
 gpui-kit-assets.workspace = true
 unicode-segmentation.workspace = true
+# Clipboard image paste (Issue #591): decode the OS image and re-encode PNG. The
+# version and feature set are already in the lockfile through GPUI.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif", "webp"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"
+# Narrow public rich-clipboard read of the patched platform crate (Issue #591):
+# one snapshot that tells busy / changed / invalid apart from an empty clipboard.
+gpui_macos = { package = "gpui-pre-macos", version = "=0.3.6", default-features = false }
 # OS secret store for the manual proxy Basic credentials (service
 # `hane.network.proxy`). No other target gets a backend.
 keyring = "2"
 
 [target.'cfg(windows)'.dependencies]
 keyring = "2"
+# Narrow public rich-clipboard read of the patched platform crate (Issue #591).
+gpui_windows = { package = "gpui-pre-windows", version = "=0.3.6", default-features = false }
 windows ={ version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_Marshal", "Win32_System_Com_StructuredStorage", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # `#[implement]` の展開が crate ルートの `windows_core` を参照するため直接依存にする。
 # `windows` 0.61 が使う windows-core 0.61.x と型互換にそろえる。

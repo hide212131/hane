@@ -1,5 +1,5 @@
-use crate::view::EditorView;
 use crate::view::input_routing::InputTarget;
+use crate::view::{ClipboardSnapshot, EditorView};
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
 use hane_editor::{EditorCommand, ForwardStop};
 use hane_markdown::ListEditIntent;
@@ -749,16 +749,21 @@ command_actions! {
     },
     Paste ("secondary-v") => paste |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            match view.input_target() {
-                InputTarget::SidebarFilter => {
-                    view.replace_sidebar_filter_text(None, &text, cx);
+        // One read of the clipboard: the body prefers a real image of this same
+        // snapshot, every other input takes its text exactly as before.
+        let snapshot = ClipboardSnapshot::read(cx);
+        match view.input_target() {
+            InputTarget::SidebarFilter => {
+                if let Some(text) = snapshot.text() {
+                    view.replace_sidebar_filter_text(None, text, cx);
                 }
-                InputTarget::InlineRename => {
-                    view.replace_inline_rename_text(None, &text, cx);
-                }
-                InputTarget::Body => view.dispatch(EditorCommand::Insert(&text), cx),
             }
+            InputTarget::InlineRename => {
+                if let Some(text) = snapshot.text() {
+                    view.replace_inline_rename_text(None, text, cx);
+                }
+            }
+            InputTarget::Body => view.paste_into_body(snapshot, cx),
         }
     },
     CancelComposition ("escape") => cancel_composition |view, window, cx| {

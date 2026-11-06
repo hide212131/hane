@@ -1665,23 +1665,61 @@ fn failed_extraction_cleanup_never_deletes_outside_the_stage() {
         std::thread::spawn(move || {
             let target = stage_dir.join("shell-integration");
             let moved = stage_dir.parent().unwrap().join("moved-away");
+            // (renames that succeeded, junctions that were created)
+            let (mut renamed, mut junctioned) = (0usize, 0usize);
             while !stop.load(Ordering::Relaxed) {
                 if target.is_dir() && fs::rename(&target, &moved).is_ok() {
-                    let _ = make_stage_junction(&target, &outside);
+                    renamed += 1;
+                    if make_stage_junction(&target, &outside) {
+                        junctioned += 1;
+                    }
                 }
                 std::thread::yield_now();
             }
+            (renamed, junctioned)
         })
     };
     let result = crate::archive::extract_archive_held(&mut cursor, &inspected, &stage_dir);
     stop.store(true, Ordering::Relaxed);
-    attacker.join().unwrap();
+    let (renamed, junctioned) = attacker.join().unwrap();
 
-    assert_eq!(code(result.map(drop)), ErrorCode::HashMismatch);
-    assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+    // The security assertions run on every permitted path, before the error
+    // classification below can fail.
+    let sentinel_after = fs::read(&sentinel);
+    let leftover = stage_dir.join("shell-integration").exists();
+
+    let err = match result {
+        Ok(_) => panic!(
+            "extraction must fail (attacker renamed {renamed}, junctioned {junctioned})"
+        ),
+        Err(err) => err,
+    };
+    // HashMismatch is the intended negative. Io is accepted only when the
+    // attacker actually won a rename before the hash check was reached, so the
+    // extraction failed closed on the swapped directory; any other error, or
+    // an Io without attacker interference, is unexpected.
+    match err.code {
+        ErrorCode::HashMismatch => {}
+        ErrorCode::Io => assert!(
+            renamed > 0,
+            "Io without attacker interference: {err} (renamed {renamed}, junctioned {junctioned})"
+        ),
+        other => panic!(
+            "unexpected error {other:?}: {err} (renamed {renamed}, junctioned {junctioned})"
+        ),
+    }
+    assert_eq!(
+        sentinel_after.unwrap(),
+        b"sentinel",
+        "{err} (renamed {renamed}, junctioned {junctioned})"
+    );
     assert!(
-        !stage_dir.join("shell-integration").exists(),
-        "the failed extraction must be cleaned up completely"
+        sentinel.exists(),
+        "the outside file must not be deleted: {err} (renamed {renamed}, junctioned {junctioned})"
+    );
+    assert!(
+        !leftover,
+        "the failed extraction must be cleaned up completely: {err} (renamed {renamed}, junctioned {junctioned})"
     );
 }
 

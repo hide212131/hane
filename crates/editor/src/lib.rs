@@ -44,7 +44,9 @@ pub use selection::Selection;
 
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_metrics::RollingWindow;
-use history::{EditKind, History};
+pub use history::{RewritePlan, TextEdit};
+use history::{EditKind, History, RewriteState, checked_edits, map_selection};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -131,6 +133,56 @@ pub struct Editor {
     next_input_sequence: u64,
     pending_measurements: RollingWindow<InputMeasurement>,
     history: History,
+    /// Rewrites that touched the composed region and so wait for the
+    /// composition to end; see [`Editor::defer_rewrite`].
+    deferred_rewrites: Vec<Arc<RewritePlan>>,
+}
+
+/// The document and history a rewrite is prepared from; see
+/// [`Editor::rewrite_snapshot`].
+pub struct RewriteSnapshot {
+    document: RopeBuffer,
+    history: History,
+}
+
+impl RewriteSnapshot {
+    /// Evaluates `plan` on the document and on every state of the history.
+    /// This is the heavy part of a rewrite and touches no editor, so it can
+    /// run on any thread. `None` when the plan is not a valid set of
+    /// replacements for the document.
+    pub fn prepare(&self, plan: &RewritePlan) -> Option<PreparedRewrite> {
+        let text = self.document.full_text();
+        let edits = checked_edits(&text, plan(&text))?;
+        let mut document = self.document.clone();
+        for (range, replacement) in edits.iter().rev() {
+            document
+                .edit(SourceRange::new(range.start, range.end), replacement)
+                .ok()?;
+        }
+        let history = self.history.rewritten(&text, plan);
+        Some(PreparedRewrite {
+            revision: self.document.revision(),
+            depth: self.history.depth(),
+            source_ids: self.history.timeline_ids(),
+            edits,
+            document,
+            history,
+        })
+    }
+}
+
+/// A rewrite worked out ahead of time for one exact editor state. It is only
+/// applied while the editor still is that state; see
+/// [`Editor::rewrite_is_current`].
+pub struct PreparedRewrite {
+    revision: hane_document::Revision,
+    depth: (usize, usize),
+    /// The identities of the history steps it was prepared from, so a later
+    /// editor can tell how much of that history it still shares.
+    source_ids: Vec<u64>,
+    edits: Vec<TextEdit>,
+    document: RopeBuffer,
+    history: Option<History>,
 }
 
 impl Editor {
@@ -145,6 +197,7 @@ impl Editor {
             next_input_sequence: 1,
             pending_measurements: RollingWindow::new(2_048),
             history: History::default(),
+            deferred_rewrites: Vec::new(),
         }
     }
 
@@ -346,6 +399,173 @@ impl Editor {
         );
         self.record_model_update(received, InputMeasurementKind::Command);
         Ok(summary)
+    }
+
+    /// A copy of the current document with `plan` applied, without touching
+    /// the editor. `None` when the plan is not a valid set of replacements.
+    pub fn rewritten_document(&self, plan: &RewritePlan) -> Option<RopeBuffer> {
+        let text = self.document.full_text();
+        let edits = checked_edits(&text, plan(&text))?;
+        let mut document = self.document.clone();
+        for (range, replacement) in edits.iter().rev() {
+            document
+                .edit(SourceRange::new(range.start, range.end), replacement)
+                .ok()?;
+        }
+        Some(document)
+    }
+
+    /// Rewrites the document by `plan` and carries the whole edit history
+    /// along: every state Undo and Redo reach is the rewritten form of the
+    /// state it was, with its selections moved accordingly, so no step goes
+    /// back to the text as it was before the rewrite. The rewrite is not an
+    /// edit of its own and adds no history entry. The editor stays unaware
+    /// of what the plan means. An invalid plan changes nothing.
+    ///
+    /// This evaluates `plan` on the text and on every state of the history
+    /// (document size times history depth), so a caller on an interactive
+    /// path prepares with [`Editor::rewrite_snapshot`] off-thread and applies
+    /// with [`Editor::apply_prepared_rewrite`], keeping this as the fallback
+    /// for an editor that moved on since.
+    pub fn apply_rewrite(&mut self, plan: &RewritePlan) -> Result<(), BufferError> {
+        self.history.break_group();
+        if self.ime.is_some() {
+            return self.rewrite_with_composition(plan);
+        }
+        let text = self.document.full_text();
+        let Some(edits) = checked_edits(&text, plan(&text)) else {
+            return Ok(());
+        };
+        let history = self.history.rewritten(&text, plan);
+        self.adopt_rewrite(&edits, history)
+    }
+
+    /// Whether an IME composition is open.
+    pub fn is_composing(&self) -> bool {
+        self.ime.is_some()
+    }
+
+    /// Holds `plan` back until the open composition ends (commit, cancel or
+    /// forced commit), then applies it to the settled text and history. For a
+    /// rewrite that touches the composed region, which cannot be carried
+    /// around the marked text. Without an open composition it applies at once.
+    pub fn defer_rewrite(&mut self, plan: Arc<RewritePlan>) {
+        if self.ime.is_some() {
+            self.deferred_rewrites.push(plan);
+        } else {
+            let _ = self.apply_rewrite(&*plan);
+        }
+    }
+
+    /// Applies the rewrites held back during a composition, now that it ended.
+    pub(crate) fn run_deferred_rewrites(&mut self) {
+        if self.ime.is_some() {
+            return;
+        }
+        for plan in std::mem::take(&mut self.deferred_rewrites) {
+            let _ = self.apply_rewrite(&*plan);
+        }
+    }
+
+    /// Writes the already planned `edits` into the document and takes `history`
+    /// as the rewritten history. A history that cannot be followed (it never
+    /// is for one this editor recorded) is dropped rather than left pointing
+    /// at the old text.
+    fn adopt_rewrite(
+        &mut self,
+        edits: &[TextEdit],
+        history: Option<History>,
+    ) -> Result<(), BufferError> {
+        let selection = map_selection(edits, self.selection);
+        for (range, replacement) in edits.iter().rev() {
+            self.document
+                .edit(SourceRange::new(range.start, range.end), replacement)?;
+        }
+        self.history = history.unwrap_or_default();
+        self.selection = selection;
+        self.preferred_grapheme_column = None;
+        self.preferred_visual_x = None;
+        Ok(())
+    }
+
+    /// The state a rewrite is prepared from: a cheap copy (the document is a
+    /// persistent rope) that can be moved to another thread. `None` while an
+    /// IME composition is open, whose pending history entry is not in it.
+    pub fn rewrite_snapshot(&self) -> Option<RewriteSnapshot> {
+        if self.ime.is_some() {
+            return None;
+        }
+        Some(RewriteSnapshot {
+            document: self.document.clone(),
+            history: self.history.clone(),
+        })
+    }
+
+    /// Whether `prepared` still describes this editor exactly: same document
+    /// revision, same history shape and no composition open. Selection is not
+    /// part of it; it is mapped when the rewrite is applied.
+    pub fn rewrite_is_current(&self, prepared: &PreparedRewrite) -> bool {
+        self.ime.is_none()
+            && self.document.revision() == prepared.revision
+            && self.history.depth() == prepared.depth
+    }
+
+    /// The document as the prepared rewrite makes it.
+    pub fn prepared_rewrite_document(&self, prepared: &PreparedRewrite) -> Option<RopeBuffer> {
+        self.rewrite_is_current(prepared)
+            .then(|| prepared.document.clone())
+    }
+
+    /// Applies a rewrite prepared by [`RewriteSnapshot::prepare`] without
+    /// evaluating the plan: the cost is the number of replacements plus the
+    /// size of the history, not the document size times the history depth.
+    /// `Ok(false)` means the editor is not what the rewrite was prepared from
+    /// and nothing was changed; the caller falls back to [`Editor::apply_rewrite`].
+    pub fn apply_prepared_rewrite(
+        &mut self,
+        prepared: PreparedRewrite,
+    ) -> Result<bool, BufferError> {
+        if !self.rewrite_is_current(&prepared) {
+            return Ok(false);
+        }
+        self.history.break_group();
+        self.adopt_rewrite(&prepared.edits, prepared.history)?;
+        Ok(true)
+    }
+
+    /// Makes the editor follow `plan`, using `prepared` as far as it still
+    /// describes this editor. While it is exact this is
+    /// [`Editor::apply_prepared_rewrite`]. When the editor moved on (typing,
+    /// Undo/Redo or a composition since the preparation), the history steps
+    /// it still shares with the preparation are taken as prepared and the plan
+    /// is evaluated only on the current text and on the states of the steps
+    /// gained since: the work follows what changed, not the document size
+    /// times the whole history depth that [`Editor::apply_rewrite`] costs.
+    /// An invalid plan changes nothing.
+    pub fn follow_prepared_rewrite(
+        &mut self,
+        prepared: PreparedRewrite,
+        plan: &RewritePlan,
+    ) -> Result<(), BufferError> {
+        if self.rewrite_is_current(&prepared) {
+            self.history.break_group();
+            return self.adopt_rewrite(&prepared.edits, prepared.history);
+        }
+        self.history.break_group();
+        if self.ime.is_some() {
+            return self.rewrite_with_composition(plan);
+        }
+        let Some(now) = RewriteState::of(self.document.full_text(), plan) else {
+            return Ok(());
+        };
+        let edits = now.edits.clone();
+        let history = match prepared.history {
+            Some(rewritten) => self
+                .history
+                .rebased(now, &prepared.source_ids, rewritten, plan),
+            None => self.history.rewritten_from(now, plan),
+        };
+        self.adopt_rewrite(&edits, history)
     }
 
     pub(crate) fn record_model_update(&mut self, received_at: Instant, kind: InputMeasurementKind) {

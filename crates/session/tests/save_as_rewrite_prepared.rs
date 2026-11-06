@@ -1,0 +1,394 @@
+//! Issue #591: the history rewrite of a Save As is prepared off the UI thread
+//! from a snapshot and only applied when the write lands. Applying it must not
+//! evaluate the plan again (that is the document size times history depth cost
+//! this split removes), must give exactly what evaluating the plan gives, and
+//! must fall back to evaluating it when the editor moved on.
+
+use hane_document::{SourceOffset, TextBuffer};
+use hane_editor::{EditorCommand, RewritePlan, Selection};
+use hane_session::testing::MemoryFileService;
+use hane_session::{
+    DocumentSession, FileService, SaveDecision, SaveIntent, SaveJob, SaveOutcome, SessionId,
+    run_save_job,
+};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const PATH: &str = "/notes/a.md";
+const TARGET: &str = "/other/b.md";
+const OLD: &str = "old.png";
+const NEW: &str = "renamed-longer.png";
+
+fn opened(service: &MemoryFileService, contents: &str) -> DocumentSession {
+    service.write_externally(PATH, contents);
+    DocumentSession::from_loaded(SessionId(0), service.load(Path::new(PATH)).unwrap())
+}
+
+fn counting_plan(calls: &Arc<AtomicUsize>) -> Arc<RewritePlan> {
+    let calls = Arc::clone(calls);
+    Arc::new(move |text: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        text.match_indices(OLD)
+            .map(|(start, _)| (start..start + OLD.len(), NEW.to_owned()))
+            .collect()
+    })
+}
+
+fn text(session: &DocumentSession) -> String {
+    session.editor().document().full_text()
+}
+
+fn type_at_end(session: &mut DocumentSession, typed: &str) {
+    let end = session.editor().document().len_bytes().0;
+    session
+        .editor_mut()
+        .set_selection(Selection::caret(SourceOffset(end)))
+        .unwrap();
+    session.editor_mut().insert_text(typed).unwrap();
+    session.note_edit();
+}
+
+/// A document whose history holds several separate steps, some of them
+/// creating references, with the last two undone (so Redo is not empty).
+fn with_history(service: &MemoryFileService) -> DocumentSession {
+    let mut session = opened(service, "前![](old.png)\n");
+    for step in ["a\n", "![](old.png)\n", "いろは\n", "b![](old.png)\n"] {
+        type_at_end(&mut session, step);
+    }
+    session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+    session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+    session
+}
+
+fn undo_all(session: &mut DocumentSession) -> Vec<String> {
+    let mut states = Vec::new();
+    while session.editor().can_undo() {
+        session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+        states.push(text(session));
+    }
+    states
+}
+
+fn redo_all(session: &mut DocumentSession) -> Vec<String> {
+    let mut states = Vec::new();
+    while session.editor().can_redo() {
+        session.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+        states.push(text(session));
+    }
+    states
+}
+
+fn write_job(session: &mut DocumentSession) -> SaveJob {
+    let SaveDecision::Write(job) = session.request_save(SaveIntent::To(TARGET.into())) else {
+        panic!("expected an accepted write");
+    };
+    job
+}
+
+fn land(service: &MemoryFileService, session: &mut DocumentSession, job: SaveJob) -> SaveOutcome {
+    let result = run_save_job(service, &job.path, &job.document, job.guard);
+    session.finish_save(job.ticket, result)
+}
+
+#[test]
+fn applying_a_prepared_rewrite_never_evaluates_the_plan_and_matches_the_plain_one() {
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let plain_service = MemoryFileService::new();
+    let mut plain = with_history(&plain_service);
+    assert!(plain.arm_save_rewrite(counting_plan(&calls)));
+    let job = write_job(&mut plain);
+    assert!(matches!(land(&plain_service, &mut plain, job), SaveOutcome::Saved));
+    assert!(calls.load(Ordering::SeqCst) > 0, "the plain path evaluates it");
+
+    let service = MemoryFileService::new();
+    let mut session = with_history(&service);
+    let plan = counting_plan(&calls);
+    let snapshot = session.editor().rewrite_snapshot().unwrap();
+    let prepared = snapshot.prepare(&*plan);
+    assert!(prepared.is_some());
+    calls.store(0, Ordering::SeqCst);
+    assert!(session.arm_prepared_save_rewrite(plan, prepared));
+    let job = write_job(&mut session);
+    assert_eq!(job.document.full_text(), text(&session).replace(OLD, NEW));
+    assert!(matches!(land(&service, &mut session, job), SaveOutcome::Saved));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "starting and landing a prepared rewrite does not evaluate the plan"
+    );
+
+    assert_eq!(text(&session), text(&plain));
+    assert_eq!(session.editor().selection(), plain.editor().selection());
+    assert_eq!(undo_all(&mut session), undo_all(&mut plain));
+    assert_eq!(redo_all(&mut session), redo_all(&mut plain));
+    assert!(!text(&session).contains(OLD));
+}
+
+#[test]
+fn a_rewrite_prepared_for_an_older_state_is_not_used_after_an_edit() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = MemoryFileService::new();
+    let mut session = with_history(&service);
+    let plan = counting_plan(&calls);
+    let prepared = session.editor().rewrite_snapshot().unwrap().prepare(&*plan);
+    // The document moves on between the preparation and the write.
+    type_at_end(&mut session, "新![](old.png)");
+    assert!(session.arm_prepared_save_rewrite(Arc::clone(&plan), prepared));
+    let before = text(&session);
+    let job = write_job(&mut session);
+    assert_eq!(job.document.full_text(), before.replace(OLD, NEW));
+    assert!(matches!(land(&service, &mut session, job), SaveOutcome::Saved));
+    assert_eq!(text(&session), before.replace(OLD, NEW));
+    for state in undo_all(&mut session).iter().chain(&redo_all(&mut session)) {
+        assert!(!state.contains(OLD), "{state:?}");
+    }
+}
+
+#[test]
+fn an_edit_made_while_a_prepared_write_runs_still_follows_and_stays_unsaved() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = MemoryFileService::new();
+    let mut session = with_history(&service);
+    let plan = counting_plan(&calls);
+    let prepared = session.editor().rewrite_snapshot().unwrap().prepare(&*plan);
+    assert!(session.arm_prepared_save_rewrite(plan, prepared));
+    let before = text(&session);
+    let job = write_job(&mut session);
+    type_at_end(&mut session, "書込中![](old.png)");
+    let outcome = land(&service, &mut session, job);
+    assert!(matches!(outcome, SaveOutcome::SavedStale));
+    assert_eq!(
+        service.contents(TARGET).as_deref(),
+        Some(before.replace(OLD, NEW).as_str())
+    );
+    assert_eq!(
+        text(&session),
+        format!("{}書込中![]({NEW})", before.replace(OLD, NEW))
+    );
+    assert!(session.is_dirty());
+    for state in undo_all(&mut session).iter().chain(&redo_all(&mut session)) {
+        assert!(!state.contains(OLD), "{state:?}");
+    }
+}
+
+/// A long history (`steps` separate steps, a third of them undone again) in
+/// which every other step creates a reference.
+fn with_long_history(service: &MemoryFileService, steps: usize) -> DocumentSession {
+    let mut session = opened(service, "前![](old.png)\n");
+    for step in 0..steps {
+        let typed = if step % 2 == 0 {
+            format!("段落{step}\n")
+        } else {
+            format!("![](old.png)い{step}\n")
+        };
+        type_at_end(&mut session, &typed);
+    }
+    for _ in 0..steps / 3 {
+        session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+    }
+    session
+}
+
+/// What the user does to the live document while the write runs.
+type DuringWrite = fn(&mut DocumentSession);
+
+/// Runs one prepared Save As whose write is interrupted by `during`, and the
+/// same sequence with the plan evaluated by the landing itself. Both must end
+/// in the same document, selection and history. Returns how often the
+/// prepared landing evaluated the plan.
+fn land_after(steps: usize, during: DuringWrite) -> usize {
+    land_after_settled(steps, during, |_| {})
+}
+
+/// [`land_after`], with `settle` applied to both sessions once the write has
+/// landed (for example ending a composition that held the rewrite back).
+fn land_after_settled(steps: usize, during: DuringWrite, settle: DuringWrite) -> usize {
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let plain_service = MemoryFileService::new();
+    let mut plain = with_long_history(&plain_service, steps);
+    assert!(plain.arm_save_rewrite(counting_plan(&calls)));
+    let plain_job = write_job(&mut plain);
+    during(&mut plain);
+    let plain_text = text(&plain);
+    let plain_outcome = land(&plain_service, &mut plain, plain_job);
+
+    let service = MemoryFileService::new();
+    let mut session = with_long_history(&service, steps);
+    let plan = counting_plan(&calls);
+    let prepared = session.editor().rewrite_snapshot().unwrap().prepare(&*plan);
+    assert!(prepared.is_some());
+    assert!(session.arm_prepared_save_rewrite(plan, prepared));
+    let job = write_job(&mut session);
+    during(&mut session);
+    assert_eq!(text(&session), plain_text);
+    calls.store(0, Ordering::SeqCst);
+    let outcome = land(&service, &mut session, job);
+    let evaluated = calls.load(Ordering::SeqCst);
+    settle(&mut session);
+    settle(&mut plain);
+
+    assert_eq!(
+        std::mem::discriminant(&outcome),
+        std::mem::discriminant(&plain_outcome)
+    );
+    assert!(matches!(outcome, SaveOutcome::SavedStale));
+    assert!(session.is_dirty());
+    assert_eq!(service.contents(TARGET), plain_service.contents(TARGET));
+    assert_eq!(text(&session), text(&plain));
+    assert!(!text(&session).contains(OLD));
+    assert_eq!(session.editor().selection(), plain.editor().selection());
+    assert_eq!(session.editor().can_undo(), plain.editor().can_undo());
+    assert_eq!(session.editor().can_redo(), plain.editor().can_redo());
+    assert_eq!(undo_all(&mut session), undo_all(&mut plain));
+    assert_eq!(redo_all(&mut session), redo_all(&mut plain));
+    evaluated
+}
+
+#[test]
+fn typing_during_the_write_evaluates_the_plan_only_for_what_was_added() {
+    for steps in [6, 60] {
+        let evaluated = land_after(steps, |session| type_at_end(session, "書込中![](old.png)"));
+        assert!(
+            evaluated <= 2,
+            "{steps} steps: the plan ran {evaluated} times for one new step"
+        );
+    }
+}
+
+#[test]
+fn undo_and_redo_during_the_write_evaluate_the_plan_for_the_text_only() {
+    for steps in [6, 60] {
+        let undone = land_after(steps, |session| {
+            session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            session.note_edit();
+        });
+        assert_eq!(undone, 1, "{steps} steps: Undo");
+        let redone = land_after(steps, |session| {
+            session.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+            session.note_edit();
+        });
+        assert_eq!(redone, 1, "{steps} steps: Redo");
+    }
+}
+
+#[test]
+fn several_edits_undo_and_a_composition_during_the_write_follow_exactly() {
+    for steps in [6, 60] {
+        let evaluated = land_after(steps, |session| {
+            type_at_end(session, "一![](old.png)");
+            type_at_end(session, "二\n");
+            session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            session.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            type_at_end(session, "三![](old.png)");
+        });
+        assert!(evaluated <= 8, "{steps} steps: the plan ran {evaluated} times");
+
+        let composing = land_after_settled(steps, compose_old_reference, |session| {
+            session.editor_mut().commit_composition();
+        });
+        assert!(composing <= 4, "{steps} steps: the plan ran {composing} times");
+    }
+}
+
+fn compose_old_reference(session: &mut DocumentSession) {
+    let end = session.editor().document().len_bytes().0;
+    session
+        .editor_mut()
+        .set_selection(Selection::caret(SourceOffset(end)))
+        .unwrap();
+    session
+        .editor_mut()
+        .replace_and_mark_text(None, "かな![](old.png)", None)
+        .unwrap();
+    session.note_edit();
+}
+
+/// Lands a Save As whose write was interrupted by a composition holding the
+/// old reference; returns the session with the composition still open.
+fn landed_with_open_composition(service: &MemoryFileService) -> DocumentSession {
+    let mut session = with_long_history(service, 6);
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(session.arm_save_rewrite(counting_plan(&calls)));
+    let job = write_job(&mut session);
+    compose_old_reference(&mut session);
+    assert!(matches!(land(service, &mut session, job), SaveOutcome::SavedStale));
+    session
+}
+
+#[test]
+fn a_composition_holds_the_rewrite_back_until_it_is_committed() {
+    let service = MemoryFileService::new();
+    let mut session = landed_with_open_composition(&service);
+    // The marked text is not touched while the composition is open, and it can
+    // still be extended in place.
+    assert!(text(&session).ends_with("かな![](old.png)"));
+    session
+        .editor_mut()
+        .replace_and_mark_text(None, "かな![](old.png)あ", None)
+        .unwrap();
+    assert!(text(&session).ends_with("かな![](old.png)あ"));
+    session.editor_mut().commit_text(None, "かな![](old.png)あ").unwrap();
+    let expected_tail = format!("かな![]({NEW})あ");
+    assert!(text(&session).ends_with(&expected_tail), "{:?}", text(&session));
+    assert!(!text(&session).contains(OLD));
+    assert_eq!(text(&session).matches("かな").count(), 1);
+    assert!(session.is_dirty());
+    // The next input lands after the committed text, once.
+    session.editor_mut().insert_text("次").unwrap();
+    session.note_edit();
+    assert!(text(&session).ends_with(&format!("{expected_tail}次")));
+    for state in undo_all(&mut session).iter().chain(&redo_all(&mut session)) {
+        assert!(!state.contains(OLD), "{state:?}");
+    }
+}
+
+#[test]
+fn a_cancelled_composition_leaves_the_document_rewritten_without_it() {
+    let service = MemoryFileService::new();
+    let mut session = landed_with_open_composition(&service);
+    session.editor_mut().cancel_composition().unwrap();
+    assert!(!text(&session).contains("かな"));
+    assert!(!text(&session).contains(OLD));
+    assert!(session.is_dirty());
+    for state in undo_all(&mut session).iter().chain(&redo_all(&mut session)) {
+        assert!(!state.contains(OLD), "{state:?}");
+    }
+}
+
+#[test]
+fn a_prepared_rewrite_followed_late_is_not_evaluated_per_history_step() {
+    let evaluated_short = land_after(6, |session| type_at_end(session, "x"));
+    let evaluated_long = land_after(90, |session| type_at_end(session, "x"));
+    assert_eq!(
+        evaluated_short, evaluated_long,
+        "the work does not grow with the history"
+    );
+}
+
+#[test]
+fn an_open_composition_has_no_snapshot_and_a_composition_opened_later_is_stale() {
+    let service = MemoryFileService::new();
+    let mut session = with_history(&service);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let plan = counting_plan(&calls);
+    let prepared = session.editor().rewrite_snapshot().unwrap().prepare(&*plan).unwrap();
+    assert!(session.editor().rewrite_is_current(&prepared));
+    let end = session.editor().document().len_bytes().0;
+    session
+        .editor_mut()
+        .set_selection(Selection::caret(SourceOffset(end)))
+        .unwrap();
+    session
+        .editor_mut()
+        .replace_and_mark_text(None, "かな", None)
+        .unwrap();
+    assert!(session.editor().rewrite_snapshot().is_none());
+    assert!(
+        !session.editor().rewrite_is_current(&prepared),
+        "the pending composition entry is not in the prepared history"
+    );
+}
