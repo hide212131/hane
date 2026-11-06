@@ -351,7 +351,11 @@ endpoint=sys.argv[-1]
 if endpoint == {failure_endpoint!r}:
     sys.stderr.write({failure_stderr!r})
     sys.exit(1)
-sys.stdout.buffer.write(Path(mapping[endpoint]).read_bytes())
+body=Path(mapping[endpoint]).read_bytes()
+if b"\\x1b" in body and "--allow-escape-sequences" not in sys.argv:
+    sys.stderr.write("the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway")
+    sys.exit(1)
+sys.stdout.buffer.write(body)
 '''); gh.chmod(0o755)
 
     def test_cli_producer_report_source_validation_and_worker_read_staging(self):
@@ -420,6 +424,21 @@ sys.stdout.buffer.write(Path(mapping[endpoint]).read_bytes())
                 self.assertIn(expected, done.stderr)
                 self.assertNotIn("secret-sentinel", done.stdout + done.stderr)
                 self.assertFalse((self.root / "verification-feedback").exists())
+
+    def test_collector_reads_ansi_job_logs_and_returns_clean_excerpt(self):
+        self.capture(101, 0)
+        ansi_logs = b"\x1b[31mred\x1b[0m\n" + self.logs
+        self.install_gh(api_data(logs=ansi_logs))
+        env = {**self.env, "REPOSITORY": REPO, "PR_NUMBER": "1", "RUN_ID": "12", "RUN_ATTEMPT": "2",
+               "WORKFLOW_SHA": MAIN, "COMMENT_ID": "10", "ACTOR": "owner", "SOURCE_HANDOFF": handoff(),
+               "FINAL_SHA": H1, "BASE_REF": "main", "BASE_SHA": MAIN,
+               "TESTS_OUTCOME": "failure", "LINT_OUTCOME": "success",
+               "PATH": str(self.bin) + os.pathsep + os.environ["PATH"]}
+        done = self.workflow_run("Collect verification feedback from GitHub job logs", env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        report = (self.root / "verification-feedback" / "report.json").read_text()
+        self.assertNotIn("\\u001b", report)
+        self.assertNotIn("\x1b", report)
 
     def test_actual_finalizer_scope_rejects_protected_change_even_with_feedback(self):
         text = (SCRIPTS.parent / 'workflows/claude-fix.yml').read_text()

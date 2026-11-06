@@ -233,6 +233,9 @@ def gh_api(endpoint, *, pages=False, binary=False, operation="source API"):
     cmd = ["gh", "api"]
     if pages:
         cmd += ["--paginate", "--slurp"]
+    if binary:
+        # job logはANSI制御文字を含み得る。ghの既定拒否を外してraw bytesを捕捉し、返却前に除去する。
+        cmd.append("--allow-escape-sequences")
     result = subprocess.run(cmd + [endpoint], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace")
