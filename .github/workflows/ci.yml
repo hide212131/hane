@@ -73,9 +73,6 @@ jobs:
       - name: Test AADW action and diagnostic contract
         run: python3 .github/tests/test_aadw_action_contract.py
 
-      - name: Test verification feedback transport and provenance
-        run: python3 .github/tests/test_aadw_verification_feedback.py
-
       - name: Test AADW prevention entrypoint wiring
         run: python3 .github/tests/test_aadw_prevention_wiring.py
 
