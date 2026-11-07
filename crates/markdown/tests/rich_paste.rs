@@ -134,6 +134,17 @@ fn href_keeps_semicolonless_legacy_references_before_equals_or_alphanumerics() {
 }
 
 #[test]
+fn deeply_nested_spans_inside_a_link_keep_the_destination() {
+    let depth = 60;
+    let html = format!(
+        r#"<a href="https://example.com/x">{}深い{}</a>"#,
+        "<span>".repeat(depth),
+        "</span>".repeat(depth)
+    );
+    assert_eq!(md(&html), "[深い](https://example.com/x)");
+}
+
+#[test]
 fn a_link_around_blocks_keeps_the_link_on_each_block() {
     assert_eq!(
         md(r#"<a href="https://example.com/"><div>カード</div></a>"#),

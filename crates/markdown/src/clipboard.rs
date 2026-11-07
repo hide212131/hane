@@ -13,6 +13,7 @@
 //! destinations and code are escaped separately.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use url::Url;
 
@@ -707,7 +708,8 @@ struct Fmt {
     strong: bool,
     emphasis: bool,
     strike: bool,
-    link: Option<String>,
+    /// Shared so inheriting through nested elements never copies the URL.
+    link: Option<Arc<str>>,
 }
 
 impl Fmt {
@@ -1183,7 +1185,10 @@ impl Renderer<'_> {
             "s" | "del" | "strike" => fmt.with(Mark::Strike),
             "a" if fmt.link.is_none() => {
                 let mut next = fmt.clone();
-                next.link = element.attr("href").and_then(safe_http_destination);
+                next.link = element
+                    .attr("href")
+                    .and_then(safe_http_destination)
+                    .map(Arc::from);
                 next
             }
             _ => fmt.clone(),
@@ -1429,11 +1434,14 @@ impl Renderer<'_> {
                 let destination = if fmt.link.is_some() {
                     None
                 } else {
-                    element.attr("href").and_then(safe_http_destination)
+                    element
+                        .attr("href")
+                        .and_then(safe_http_destination)
+                        .map(Arc::<str>::from)
                 };
                 if let Some(destination) = destination {
                     let mut inner_fmt = fmt.clone();
-                    inner_fmt.link = Some(destination.clone());
+                    inner_fmt.link = Some(Arc::clone(&destination));
                     let mut inner = String::new();
                     self.inline_children(index, &inner_fmt, &mut inner)?;
                     out.push_str(&wrap_link(&inner, &destination));
@@ -1684,5 +1692,23 @@ impl Renderer<'_> {
         }
         self.charge(item.len().saturating_sub(body.len()))?;
         Ok(item)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherited_fmt_shares_the_link_destination() {
+        let link: Arc<str> = Arc::from("https://example.com/");
+        let fmt = Fmt {
+            link: Some(Arc::clone(&link)),
+            ..Fmt::default()
+        };
+        let inherited = fmt.with(Mark::Strong).with(Mark::Emphasis).clone();
+        let shared = inherited.link.as_ref().expect("link is inherited");
+        assert!(Arc::ptr_eq(shared, &link));
+        assert!(inherited.strong && inherited.emphasis);
     }
 }
