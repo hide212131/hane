@@ -75,6 +75,8 @@ PR の議論で結論が変わった場合は、内容に応じて Issue、ADR�
 
 current state と履歴を混同しない。設計時点の「未実装」「未検証」などの記録はその時点の事実として保持できるが、現在の実装・検証状態は current Issue / PR / GitHub evidence から確認する。
 
+進行中の head SHA、CI / review / GUI の結果と残条件は、PR 本文・コメントから対象 run / artifact を参照して更新する。これらの進捗だけに repository 内の引き継ぎ文書を追従させる commit や worker 依頼は行わない。準備文書は作成時点の記録として残し、現在状態への入口は PR とする。要求・採用設計・恒久的な操作手順そのものの誤りや変更は、その正本を repository 内で訂正する。進捗更新の回避を理由に、必要な仕様訂正を省略しない。
+
 ### 2.6 one action at a time
 
 一度の判断で複数 action を自動連鎖させない。
@@ -281,10 +283,13 @@ merge は expected head SHA を指定して行う。expected head は concurrent
 
 - 一つの cluster に対して一つの coherent な fix と回帰テストをまとめる。レビューコメントやテストケースごとに条件分岐・commit・push を分割しない。
 - push 前に、変更範囲に対応する最小の local test / lint と差分検査を実行できる実装経路では、それを完了する。関連する修正をまとめて確認できるまで、次の head を作らない。
-- trusted worker が sandbox のため test / build / lint を実行できず、trusted finalizer だけが push する既存経路では、sandbox を緩めてこの責務を worker に移さない。その場合は current-head CI を push 後の最初の検証とし、CI が成功するまで local validation 済み、review / GUI validation 済み、または次の修正へ進める状態とは扱わない。CI failure は current head の evidence として読み、必要ならその root-cause cluster を修正する。
+- 製品変更の local validation は Clippy や build だけで済ませず、対象機能を実行する focused regression test を含める。変換処理なら生成結果を製品の parser で再解析し、本文・構造・書式の保持、日本語 / UTF-8、escape、隣接要素や空入力など変更に関係する境界を確認する。既存の対象テストを先に使い、修正した一例だけでなく同じ cluster の直接関係する回帰をまとめて実行する。実際に対象テストが実行されたことを件数・結果で確認し、0 tests を成功の根拠にしない。
+- trusted worker が sandbox のため test / build / lint を実行できず、trusted finalizer だけが push する既存経路では、sandbox を緩めてこの責務を worker に移さない。Commander が既存の権限分離された隔離 checkout で検証できる場合は、finalizer 後の exact head に対する focused test / lint を、通常 CI の依頼・承認や最終レビューより先に行う。自動開始する CI を待機させる新しい仕組みは追加しない。local 検証を安全に実行できない場合は current-head CI を push 後の最初の検証とし、その成功まで local validation 済み、review / GUI validation 済み、または次の修正へ進める状態とは扱わない。local / CI failure は current head の evidence として読み、必要ならその root-cause cluster を修正する。いずれの経路も §4.7 の exact-head verifier と required CI を免除しない。
 - 高コスト検証を始める前に current target branch の進展を観測し、candidate への影響を判断する。変更領域が重なる、merge result が変わる、または evidence が base-sensitive なら統合ポイントとして base sync を行う。無関係な進展なら candidate を維持し、base-independent と判断した根拠を残す。
 - base sync が必要な場合は product-fix worker による再実装ではなく、target branch commit を ancestry に取り込む Git 操作として行う。同期後は compare で `behind = 0` を確認し、古い base-sensitive evidence を再利用しない。
 - CI、review、GUI validation など所要時間の大きい action は、実行経路に応じた最初の検証（local validation または trusted worker 経路の current-head CI）を通過した安定候補 head に対して選ぶ。検証中に target branch が進んでも、それだけで candidate や evidence を破棄しない。進展内容と evidence の base sensitivity を再評価し、影響がある場合だけ sync / 再検証する。
+- 最終 manual full review を依頼する前に、既に分かっている finding / 失敗を一度に整理する。未分類の finding、未解消の回帰、修正予定の blocker cluster が残る head を最終候補にしない。独立した cluster は別の修正単位のまま、各 action 後に current facts を読み直して修正と focused validation を進める。既知の修正が収束し、その head の required CI が成功してから §4.2 の最終 full review を依頼する。各 cluster の修正直後に full review を挟んで次の既知 blocker へ進む反復は行わない。自動 incremental review は観測できるが、この最終 review の代わりにしない。
+- 最終 review で新しい blocker が見つかった場合は根拠を確認して修正し、新しい head で必要な検証と最終 review を取り直す。follow-up と判断済みの独立改善まで指摘ゼロにするために candidate を変更せず、同じ head / context に新しい事実がないまま完了済み full review を再依頼しない。
 - 並行開発そのものを抑止しない。Commander が作業順を選べる場合は conflict の可能性が低い Issue を並行させ、同じファイル・同じ責務を大きく変更する PR 同士は可能な範囲で同時進行を避ける。
 - 同じ cluster が一度の fix 後も再現する場合、局所的な条件追加を続けず、presentation と index、計算値と実測値、同期処理と background 処理など共有される不変条件を再設計し、境界をまたぐ回帰テストを追加する。
 

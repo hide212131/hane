@@ -24,6 +24,8 @@ Commanderは、current main、対象Issueの本文と受入条件、採用済み
 
 GitHub connectorを使う場合は、branch作成→文書の作成・commit→Draft PR作成の既存操作を使う。ローカルGitを使う場合も同じ内容に限り、実装準備のための新しいworkflowや常駐実行器は作らない。
 
+準備後のhead・CI・review・GUIの進捗は、[Commander Policy §2.5](aadw-command-policy.md#25-issue--pr--adr--詳細設計の正本を分ける)に従ってPR本文・コメントへ記録する。現在状態だけを引き継ぎ文書へ書き直すために、文書commitやClaude依頼を追加しない。
+
 ## 3. Claudeへ一回だけ依頼する
 
 投稿直前にPRのcurrent headを取り直す。default branch上の `claude-fix.yml` と `aadw_action_contract.py` が以下の契約を受け付けることを確認する。branch上だけの設定変更は、コメント起動workflowの反映完了ではない。
@@ -59,6 +61,8 @@ workerの使用可能な道具は `Read,Edit,Write,Glob,Grep` であり、GitHub
 
 既存コードの修正では `AADW_FAILURE_CLASS` を、観測に対応する `product` または `test` にする。同じ原因には同じ `AADW_ROOT_CAUSE` を使い、原因を区別できるGitHub上の観測を `AADW_EVIDENCE` に指定する。再送を通すために原因IDやURLだけを付け替えない。
 
+製品変更の依頼の受入条件には、対象機能を実行するテストのパス・名前（新規なら追加予定のもの）と、必要な回帰の入力・期待結果を含める。Commanderが実行するfocused testのコマンドも示し、Clippyだけを動作確認にしない。変換処理では製品parserによる再解析と文字・書式の保持を確認する例を渡す。テストの選定・境界・修正のまとめ方は[Commander Policy §4.6](aadw-command-policy.md#46-修正の収束と高コスト検証)を正とし、この記載はworkerへのshell・test実行許可ではない。
+
 ## 4. 投稿後に実行結果を確認する
 
 コメント投稿成功はClaude起動成功ではない。Commanderは、投稿コメント、対象PR、対象SHAに対応する `AADW Claude Fix` のrunを確認する。
@@ -66,6 +70,8 @@ workerの使用可能な道具は `Read,Edit,Write,Glob,Grep` であり、GitHub
 `prepare`が成功して初めて依頼が受理されたと扱う。`skipped`なら未開始であり、Issueへ投稿していないか、必要な行が正しいか、default branchの契約が反映済みかを確認する。`prepare`の失敗なら権限、head移動、closed/paused、fork、重複依頼などの具体的な理由を読む。原因を確かめず同じコメントを再送しない。
 
 workerが成功した後も、実行結果が示すsession modelとmodel usage、patchの生成、trusted finalizerのpush、変更後のexact head、`verify`とrequired CIを別々に確認する。Sonnet 5.5の実行確認に失敗した場合はpatchをpushせず、利用上限fallbackにも流さない。workerはshellやGit認証情報を持たず、pushと検証はworkflow側が行う。空patch、検証失敗、モデル不一致、取得できない結果を完了としない。
+
+Commanderが安全にlocal検証できる場合は、finalizer後のheadと一致する隔離checkoutで、依頼時に示したfocused testとlintを先に実行する。対象SHA・コマンド・実行件数・結果はPR本文またはコメントに残す。実行不能なら理由と未実施を記録して既存のcurrent-head検証へ進み、local成功とは扱わない。実行順序と最終候補の条件はCommander Policy §4.6に従い、既知blockerの修正が残る間は最終full reviewを依頼しない。
 
 モデル指定は `claude-sonnet-5-5` を使用する。runで確認できた実行モデルと設定上の指定を区別し、実行モデルが取得できない場合は「設定確認のみ」と記録する。Sonnet 5.5が使えない場合に、旧モデルへ黙って切り替えない。
 
