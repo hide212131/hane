@@ -382,8 +382,8 @@ fn parse(html: &str, limits: &HtmlLimits) -> Result<Vec<Node>, HtmlImportError> 
     while i < bytes.len() {
         if bytes[i] == b'<' {
             let rest = &html[i..];
-            if rest.starts_with("<!--") {
-                i = match rest[4..].find("-->") {
+            if let Some(comment) = rest.strip_prefix("<!--") {
+                i = match comment.find("-->") {
                     Some(at) => i + 4 + at + 3,
                     None => bytes.len(),
                 };
