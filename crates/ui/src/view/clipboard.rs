@@ -605,6 +605,39 @@ mod tests {
         assert_eq!(status_of(&view, cx).as_deref(), Some(PASTE_STALE_MESSAGE));
     }
 
+    /// Leaving the tab a conversion started on invalidates it, even when the
+    /// user comes back to the same session, instance, revision and selection.
+    #[gpui::test]
+    fn a_tab_round_trip_drops_a_running_conversion(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "ab\n");
+        select(&view, cx, forward(0, 2));
+        set_clipboard(cx, "");
+        set_test_snapshot(Some("<b>x</b>"), false, None);
+        let first = view.read_with(cx, |view, _| view.sessions.active_id());
+        let second = view.update(cx, |view, _| {
+            let second = view.sessions.open_untitled("other\n", "Other");
+            // Whether or not opening activates it, start on the first one.
+            assert!(view.sessions.activate(first));
+            second
+        });
+        paste(&view, cx, PasteMode::Rich);
+        view.read_with(cx, |view, _| assert!(view.clipboard_job.is_some()));
+        view.update(cx, |view, cx| {
+            assert!(view.activate_session(second, cx));
+            assert!(view.activate_session(first, cx));
+        });
+        view.read_with(cx, |view, _| {
+            assert!(view.clipboard_job.is_none());
+            assert_eq!(view.status, None);
+        });
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), "ab\n");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), forward(0, 2));
+            assert_eq!(view.status, None);
+        });
+    }
+
     /// Copy and Cut invalidate a running conversion too.
     #[gpui::test]
     fn copy_invalidates_a_running_conversion(cx: &mut gpui::TestAppContext) {

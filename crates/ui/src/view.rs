@@ -2497,6 +2497,11 @@ impl EditorView {
 
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        // A running Paste conversion belongs to the document it started on. A
+        // round trip A -> B -> A restores the same session, instance, revision
+        // and selection, so the freshness check cannot tell it apart (Issue
+        // #596 section 6).
+        self.invalidate_clipboard_job();
         // The selection AI popup's captured range/revision/instance belong to
         // the document that was active when it opened; switching tabs, a
         // work-folder reopen, or an in-place reload all replace that document
