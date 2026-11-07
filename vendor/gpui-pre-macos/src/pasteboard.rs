@@ -34,6 +34,8 @@ const HANE_IMAGE_FORMAT_PRIORITY: [ImageFormat; 9] = [
 /// Hane: the largest single image representation taken from the pasteboard
 /// (64 MiB, the same bound the editor applies to an input image).
 const HANE_MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Largest HTML representation read from the pasteboard (UTF-8 bytes).
+pub const MAX_RICH_HTML_BYTES: usize = 8 * 1024 * 1024;
 
 /// Hane: why a rich clipboard read could not produce its content. Kept
 /// identical in shape to the Windows crate's type so the editor handles both
@@ -68,16 +70,17 @@ impl std::error::Error for RichClipboardError {}
 pub struct RichClipboardSnapshot {
     /// The plain text and the file paths of the generation.
     pub item: ClipboardItem,
-    /// Reserved for the HTML representation (Issue #596); not read yet.
+    /// The UTF-8 HTML fragment from the same pasteboard generation.
     pub html: Option<String>,
+    /// Why the HTML was unusable, while other representations remain available.
+    pub html_problem: Option<RichClipboardError>,
     /// One entry per independent pasteboard item that carries an image. The
     /// formats of the same item collapse to the preferred one; separate items
     /// stay separate. An unreadable image is an `Err`, never silently dropped.
     pub images: Vec<Result<Image, RichClipboardError>>,
 }
 
-/// Hane: reads the general pasteboard once. `Ok(None)` is a really empty
-/// pasteboard; every failure is an `Err`.
+/// Reads the general pasteboard (Hane Issue #596). Call on the main thread.
 pub fn read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError> {
     Pasteboard::general().read_rich()
 }
@@ -221,12 +224,17 @@ impl Pasteboard {
                 entries.push(string_entry);
             }
             let images = self.read_independent_images();
-            if entries.is_empty() && images.is_empty() {
+            let (html, html_problem) = match self.read_html() {
+                Ok(html) => (html, None),
+                Err(problem) => (None, Some(problem)),
+            };
+            if entries.is_empty() && images.is_empty() && html.is_none() && html_problem.is_none() {
                 return None;
             }
             Some(RichClipboardSnapshot {
                 item: ClipboardItem { entries },
-                html: None,
+                html,
+                html_problem,
                 images,
             })
         }
@@ -259,6 +267,49 @@ impl Pasteboard {
         }
     }
 
+    unsafe fn read_html(&self) -> Result<Option<String>, RichClipboardError> {
+        unsafe {
+            let pasteboard_types: id = self.inner.types();
+            let html_type: id = ns_string("public.html");
+            if !msg_send![pasteboard_types, containsObject: html_type] {
+                return Ok(None);
+            }
+            let Some(bytes) = self.limited_data_for_type(html_type, MAX_RICH_HTML_BYTES)? else {
+                return Ok(None);
+            };
+            let html = String::from_utf8(bytes).map_err(|_| RichClipboardError::InvalidFormat)?;
+            Ok(Some(
+                html.strip_prefix('\u{feff}')
+                    .map(str::to_owned)
+                    .unwrap_or(html),
+            ))
+        }
+    }
+
+    /// The native length is checked before the data is copied into Rust memory.
+    unsafe fn limited_data_for_type(
+        &self,
+        kind: id,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, RichClipboardError> {
+        unsafe {
+            let data = self.inner.dataForType(kind);
+            if data == nil {
+                return Ok(None);
+            }
+            let length = data.length() as usize;
+            if length > max_bytes {
+                return Err(RichClipboardError::TooLarge);
+            }
+            if length == 0 || data.bytes().is_null() {
+                return Ok(Some(Vec::new()));
+            }
+            Ok(Some(
+                slice::from_raw_parts(data.bytes() as *const u8, length).to_vec(),
+            ))
+        }
+    }
+
     unsafe fn read_paths(&self) -> Option<ClipboardEntry> {
         unsafe {
             let filenames = NSPasteboard::propertyListForType(*self.inner, NSFilenamesPboardType);
@@ -276,7 +327,6 @@ impl Pasteboard {
             None
         }
     }
-
     fn read_generation(&self) -> Option<ClipboardItem> {
         unsafe {
             // Check for file paths first
@@ -717,6 +767,103 @@ mod tests {
             }
             other => panic!("expected String, got {:?}", other),
         }
+    }
+
+    unsafe fn hane_clipboard_publish(pasteboard: &Pasteboard, entries: &[(id, &[u8])]) {
+        unsafe {
+            let types: Vec<id> = entries.iter().map(|(kind, _)| *kind).collect();
+            let types_array = NSArray::arrayWithObjects(nil, &types);
+            pasteboard.inner.declareTypes_owner(types_array, nil);
+            for (kind, bytes) in entries {
+                let data = NSData::dataWithBytes_length_(
+                    nil,
+                    bytes.as_ptr() as *const c_void,
+                    bytes.len() as u64,
+                );
+                pasteboard.inner.setData_forType(data, *kind);
+            }
+        }
+    }
+
+    #[test]
+    fn hane_clipboard_reads_plain_and_html_from_one_generation() {
+        let pasteboard = Pasteboard::unique();
+        unsafe {
+            let html_type = ns_string("public.html");
+            hane_clipboard_publish(
+                &pasteboard,
+                &[
+                    (NSPasteboardTypeString, "リンク".as_bytes()),
+                    (html_type, "<p><a href=\"https://example.com/\">リンク</a></p>".as_bytes()),
+                ],
+            );
+        }
+        let snapshot = pasteboard.read_rich().unwrap().expect("snapshot");
+        assert_eq!(snapshot.item.text().as_deref(), Some("リンク"));
+        assert_eq!(
+            snapshot.html.as_deref(),
+            Some("<p><a href=\"https://example.com/\">リンク</a></p>")
+        );
+        assert_eq!(snapshot.html_problem, None);
+    }
+
+    #[test]
+    fn hane_clipboard_reads_html_only() {
+        let pasteboard = Pasteboard::unique();
+        assert!(pasteboard.read_rich().unwrap().is_none());
+        unsafe {
+            let html_type = ns_string("public.html");
+            hane_clipboard_publish(&pasteboard, &[(html_type, "<b>x</b>".as_bytes())]);
+        }
+        let snapshot = pasteboard.read_rich().unwrap().expect("snapshot");
+        assert!(snapshot.item.entries.is_empty());
+        assert_eq!(snapshot.html.as_deref(), Some("<b>x</b>"));
+    }
+
+    #[test]
+    fn hane_clipboard_keeps_plain_when_html_is_invalid_or_too_large() {
+        let pasteboard = Pasteboard::unique();
+        unsafe {
+            let html_type = ns_string("public.html");
+            hane_clipboard_publish(
+                &pasteboard,
+                &[
+                    (NSPasteboardTypeString, b"plain".as_slice()),
+                    (html_type, [0xff_u8, 0xfe, 0x00, 0x80].as_slice()),
+                ],
+            );
+        }
+        let snapshot = pasteboard.read_rich().unwrap().expect("snapshot");
+        assert_eq!(snapshot.item.text().as_deref(), Some("plain"));
+        assert_eq!(snapshot.html, None);
+        assert_eq!(snapshot.html_problem, Some(RichClipboardError::InvalidFormat));
+
+        let pasteboard = Pasteboard::unique();
+        let big = vec![b'a'; MAX_RICH_HTML_BYTES + 1];
+        unsafe {
+            let html_type = ns_string("public.html");
+            hane_clipboard_publish(
+                &pasteboard,
+                &[
+                    (NSPasteboardTypeString, b"plain".as_slice()),
+                    (html_type, big.as_slice()),
+                ],
+            );
+        }
+        let snapshot = pasteboard.read_rich().unwrap().expect("snapshot");
+        assert_eq!(snapshot.item.text().as_deref(), Some("plain"));
+        assert_eq!(snapshot.html, None);
+        assert_eq!(snapshot.html_problem, Some(RichClipboardError::TooLarge));
+    }
+
+    #[test]
+    fn hane_clipboard_plain_only_has_no_html() {
+        let pasteboard = Pasteboard::unique();
+        pasteboard.write(ClipboardItem::new_string("<p>not html</p>".to_string()));
+        let snapshot = pasteboard.read_rich().unwrap().expect("snapshot");
+        assert_eq!(snapshot.item.text().as_deref(), Some("<p>not html</p>"));
+        assert_eq!(snapshot.html, None);
+        assert_eq!(snapshot.html_problem, None);
     }
 
     #[test]

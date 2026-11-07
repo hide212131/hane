@@ -28,6 +28,8 @@ static CLIPBOARD_HASH_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal text hash")));
 static CLIPBOARD_METADATA_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal metadata")));
+static CLIPBOARD_HTML_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("HTML Format")));
 static CLIPBOARD_SVG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("image/svg+xml")));
 static CLIPBOARD_GIF_FORMAT: LazyLock<u32> =
@@ -100,38 +102,6 @@ impl std::fmt::Display for RichClipboardError {
 
 impl std::error::Error for RichClipboardError {}
 
-/// Hane: everything of one clipboard read, in one value.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RichClipboardSnapshot {
-    /// The plain text and the file paths.
-    pub item: ClipboardItem,
-    /// Reserved for the HTML representation (Issue #596); not read yet.
-    pub html: Option<String>,
-    /// At most one entry on Windows: the clipboard is a single data object, so
-    /// the OS cannot tell independent images apart. The formats of that object
-    /// collapse to the preferred one (PNG, then JFIF/GIF, then CF_DIB). An
-    /// unreadable image is an `Err`, never silently dropped.
-    pub images: Vec<Result<Image, RichClipboardError>>,
-}
-
-/// Hane: reads the clipboard once inside one `ClipboardGuard`. `Ok(None)` is a
-/// really empty clipboard; failing to open it is `Err(Busy)`.
-pub fn read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError> {
-    let _clip = ClipboardGuard::open()?;
-    let read = read_formats();
-    if read.entries.is_empty() && read.image.is_none() {
-        log_unsupported_clipboard_formats();
-        return Ok(None);
-    }
-    Ok(Some(RichClipboardSnapshot {
-        item: ClipboardItem {
-            entries: read.entries,
-        },
-        html: None,
-        images: read.image.into_iter().collect(),
-    }))
-}
-
 /// Hane: an image data length the editor can accept.
 fn check_image_length(length: usize) -> Result<(), RichClipboardError> {
     if length == 0 {
@@ -167,8 +137,9 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 
 pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
     let _clip = ClipboardGuard::open().ok()?;
-
-    let ClipboardRead { mut entries, image } = read_formats();
+    let ClipboardRead {
+        mut entries, image, ..
+    } = read_formats(false);
     if let Some(Ok(image)) = image {
         entries.push(ClipboardEntry::Image(image));
     }
@@ -184,6 +155,8 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
 struct ClipboardRead {
     entries: Vec<ClipboardEntry>,
     image: Option<Result<Image, RichClipboardError>>,
+    html: Option<String>,
+    html_problem: Option<RichClipboardError>,
 }
 
 /// Hane: reads every representation of the one clipboard generation. The
@@ -192,12 +165,15 @@ struct ClipboardRead {
 /// beats the other formats, and CF_DIB (no alpha) is the last resort. A
 /// representation that cannot be read only becomes an error when no other
 /// representation of the image could be.
-fn read_formats() -> ClipboardRead {
+fn read_formats(include_html: bool) -> ClipboardRead {
     let mut entries = Vec::new();
     let mut have_text = false;
     let mut have_files = false;
     let mut best_image: Option<(u8, Image)> = None;
     let mut image_failure: Option<RichClipboardError> = None;
+    let mut html = None;
+    let mut html_problem = None;
+    let mut have_html = false;
     // An SVG is not a raster image: it never decides the image failure, and a
     // readable one never hides a raster failure.
     let mut svg_image: Option<Image> = None;
@@ -211,6 +187,12 @@ fn read_formats() -> ClipboardRead {
             if let Some(entry) = read_string() {
                 entries.push(entry);
                 have_text = true;
+            }
+        } else if include_html && !have_html && format == *CLIPBOARD_HTML_FORMAT {
+            have_html = true;
+            match read_html_fragment() {
+                Ok(fragment) => html = Some(fragment),
+                Err(problem) => html_problem = Some(problem),
             }
         } else if is_svg_format(format) {
             if svg_image.is_none() {
@@ -241,7 +223,147 @@ fn read_formats() -> ClipboardRead {
             None => svg_image.map(Ok),
         },
     };
-    ClipboardRead { entries, image }
+    ClipboardRead {
+        entries,
+        image,
+        html,
+        html_problem,
+    }
+}
+
+/// Largest HTML fragment read from the clipboard (UTF-8 bytes).
+pub const MAX_RICH_HTML_BYTES: usize = 8 * 1024 * 1024;
+
+/// Extra allocation allowed around the fragment for the CF_HTML header and
+/// context before the whole clipboard block is refused as too large.
+const CF_HTML_OVERHEAD_BYTES: usize = 64 * 1024;
+
+/// Representations read under one clipboard lock (Hane Issue #596). HTML is the
+/// UTF-8 fragment without the CF_HTML header. When it is unusable it is `None`
+/// and `html_problem` says why while `item` keeps the plain text, images and
+/// files of the same read.
+#[derive(Clone, Debug)]
+pub struct RichClipboardSnapshot {
+    pub item: ClipboardItem,
+    pub html: Option<String>,
+    pub html_problem: Option<RichClipboardError>,
+    /// At most one entry on Windows: the clipboard is a single data object, so
+    /// the OS cannot tell independent images apart.
+    pub images: Vec<Result<Image, RichClipboardError>>,
+}
+
+/// Reads plain text, HTML, images and files while holding the clipboard once.
+pub fn read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError> {
+    let _clip = ClipboardGuard::open().ok_or(RichClipboardError::Busy)?;
+    let read = read_formats(true);
+    let has_image = read.image.is_some();
+    if read.entries.is_empty()
+        && !has_image
+        && read.html.is_none()
+        && read.html_problem.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(RichClipboardSnapshot {
+        item: ClipboardItem {
+            entries: read.entries,
+        },
+        html: read.html,
+        html_problem: read.html_problem,
+        images: read.image.into_iter().collect(),
+    }))
+}
+
+fn read_html_fragment() -> Result<String, RichClipboardError> {
+    let locked = get_clipboard_data(*CLIPBOARD_HTML_FORMAT).ok_or(RichClipboardError::InvalidFormat)?;
+    // The native length is checked before anything is copied.
+    if locked.size > MAX_RICH_HTML_BYTES + CF_HTML_OVERHEAD_BYTES {
+        return Err(RichClipboardError::TooLarge);
+    }
+    let fragment = parse_cf_html(locked.as_bytes())?;
+    if fragment.len() > MAX_RICH_HTML_BYTES {
+        return Err(RichClipboardError::TooLarge);
+    }
+    Ok(fragment.to_owned())
+}
+
+fn parse_cf_offset(value: &[u8]) -> Result<i64, RichClipboardError> {
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .ok_or(RichClipboardError::InvalidFormat)
+}
+
+/// Extracts the fragment from a CF_HTML block. The header is ASCII and its
+/// offsets are UTF-8 *byte* offsets into the whole block; `0 <= StartFragment
+/// <= EndFragment <= length` and a valid UTF-8 range are required. A broken
+/// offset is never rescued by searching for the fragment markers.
+fn parse_cf_html(bytes: &[u8]) -> Result<&str, RichClipboardError> {
+    const HEADER_SCAN_LIMIT: usize = 4096;
+
+    let length = bytes.len() as i64;
+    let mut start_html = None;
+    let mut end_html = None;
+    let mut start_fragment = None;
+    let mut end_fragment = None;
+    let mut position = 0;
+    while position < bytes.len() && position < HEADER_SCAN_LIMIT {
+        let line_end = bytes[position..]
+            .iter()
+            .position(|&byte| byte == b'\r' || byte == b'\n')
+            .map_or(bytes.len(), |at| position + at);
+        let line = &bytes[position..line_end];
+        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+            break;
+        };
+        let key = &line[..colon];
+        if key.is_empty() || !key.iter().all(u8::is_ascii_alphabetic) {
+            break;
+        }
+        match key {
+            b"StartHTML" => start_html = Some(parse_cf_offset(&line[colon + 1..])?),
+            b"EndHTML" => end_html = Some(parse_cf_offset(&line[colon + 1..])?),
+            b"StartFragment" => start_fragment = Some(parse_cf_offset(&line[colon + 1..])?),
+            b"EndFragment" => end_fragment = Some(parse_cf_offset(&line[colon + 1..])?),
+            _ => {}
+        }
+        position = line_end;
+        if bytes.get(position) == Some(&b'\r') && bytes.get(position + 1) == Some(&b'\n') {
+            position += 2;
+        } else if position < bytes.len() {
+            position += 1;
+        }
+        // The header ends with the fragment offsets; never read fragment
+        // content as header lines.
+        if start_fragment.is_some() && end_fragment.is_some() {
+            break;
+        }
+    }
+    if start_html.is_some_and(|offset| offset < -1) || end_html.is_some_and(|offset| offset < -1) {
+        return Err(RichClipboardError::InvalidFormat);
+    }
+
+    let (Some(start), Some(end)) = (start_fragment, end_fragment) else {
+        return Err(RichClipboardError::InvalidFormat);
+    };
+    if start < 0 || end < start || end > length || (start as usize) < position {
+        return Err(RichClipboardError::InvalidFormat);
+    }
+    // The context, when present, must contain the fragment.
+    if let Some(context_start) = start_html
+        && context_start >= 0
+        && context_start > start
+    {
+        return Err(RichClipboardError::InvalidFormat);
+    }
+    if let Some(context_end) = end_html
+        && context_end >= 0
+        && (context_end < end || context_end > length)
+    {
+        return Err(RichClipboardError::InvalidFormat);
+    }
+    std::str::from_utf8(&bytes[start as usize..end as usize])
+        .map_err(|_| RichClipboardError::InvalidFormat)
 }
 
 pub(crate) fn with_file_names<F>(hdrop: HDROP, mut f: F)
@@ -516,6 +638,112 @@ impl Drop for ClipboardGuard {
         if let Err(e) = unsafe { CloseClipboard() } {
             log::error!("Failed to close clipboard: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A CF_HTML block like the ones browsers publish: byte offsets, CRLF
+    /// header, and a trailing NUL inside the allocation.
+    fn cf_html(fragment: &str) -> Vec<u8> {
+        let header = |sh: usize, eh: usize, sf: usize, ef: usize| {
+            format!(
+                "Version:0.9\r\nStartHTML:{sh:010}\r\nEndHTML:{eh:010}\r\nStartFragment:{sf:010}\r\nEndFragment:{ef:010}\r\n"
+            )
+        };
+        let prefix = "<html><body>\r\n<!--StartFragment-->";
+        let suffix = "<!--EndFragment-->\r\n</body></html>";
+        let start_html = header(0, 0, 0, 0).len();
+        let start_fragment = start_html + prefix.len();
+        let end_fragment = start_fragment + fragment.len();
+        let end_html = end_fragment + suffix.len();
+        let mut out = header(start_html, end_html, start_fragment, end_fragment).into_bytes();
+        out.extend_from_slice(prefix.as_bytes());
+        out.extend_from_slice(fragment.as_bytes());
+        out.extend_from_slice(suffix.as_bytes());
+        out.push(0);
+        out
+    }
+
+    #[test]
+    fn hane_clipboard_cf_html_offsets_are_utf8_bytes() {
+        let fragment = "<p>日本語 <a href=\"https://example.com/\">リンク</a> 👨‍👩‍👧</p>";
+        let block = cf_html(fragment);
+        assert_eq!(parse_cf_html(&block), Ok(fragment));
+        // The character count is not the byte count.
+        assert_ne!(fragment.chars().count(), fragment.len());
+    }
+
+    #[test]
+    fn hane_clipboard_cf_html_accepts_lf_headers_and_missing_context() {
+        let fragment = "<b>x</b>";
+        let text = format!(
+            "Version:1.0\nStartHTML:-1\nEndHTML:-1\nStartFragment:0000000084\nEndFragment:{:010}\n{fragment}",
+            84 + fragment.len()
+        );
+        let header_len = text.len() - fragment.len();
+        assert_eq!(header_len, 84, "the fixture's own offsets must be exact");
+        assert_eq!(parse_cf_html(text.as_bytes()), Ok(fragment));
+    }
+
+    #[test]
+    fn hane_clipboard_cf_html_rejects_bad_offsets_without_searching_markers() {
+        let fragment = "<p>日本</p>";
+        let good = String::from_utf8(cf_html(fragment)).unwrap();
+        let end = good.len();
+        let replace = |from: &str, to: String| good.replacen(from, &to, 1).into_bytes();
+
+        let sf = good.find("<p>日本</p>").unwrap();
+        let ef = sf + fragment.len();
+        let sf_text = format!("StartFragment:{sf:010}");
+        let ef_text = format!("EndFragment:{ef:010}");
+
+        // End past the allocation.
+        let bytes = replace(&ef_text, format!("EndFragment:{:010}", end + 10));
+        assert_eq!(parse_cf_html(&bytes), Err(RichClipboardError::InvalidFormat));
+        // Start after end.
+        let bytes = replace(&sf_text, format!("StartFragment:{:010}", ef + 1));
+        assert_eq!(parse_cf_html(&bytes), Err(RichClipboardError::InvalidFormat));
+        // Start inside the header.
+        let bytes = replace(&sf_text, format!("StartFragment:{:010}", 3));
+        assert_eq!(parse_cf_html(&bytes), Err(RichClipboardError::InvalidFormat));
+        // A negative fragment offset.
+        let bytes = replace(&sf_text, "StartFragment:-000001".to_owned());
+        assert_eq!(parse_cf_html(&bytes), Err(RichClipboardError::InvalidFormat));
+        // The range cuts a multi-byte character.
+        let bytes = replace(&sf_text, format!("StartFragment:{:010}", sf + 4));
+        assert_eq!(parse_cf_html(&bytes), Err(RichClipboardError::InvalidFormat));
+        // The context does not contain the fragment.
+        let bytes = replace("EndHTML:", "EndHTML:9".to_owned());
+        assert!(parse_cf_html(&bytes).is_err());
+        // A missing header.
+        assert_eq!(
+            parse_cf_html(b"<p>no header</p>"),
+            Err(RichClipboardError::InvalidFormat)
+        );
+        assert_eq!(parse_cf_html(b""), Err(RichClipboardError::InvalidFormat));
+    }
+
+    #[test]
+    fn hane_clipboard_cf_html_rejects_html_offsets_below_minus_one() {
+        let good = String::from_utf8(cf_html("<b>x</b>")).unwrap();
+        let start = good.find("StartHTML:").unwrap() + "StartHTML:".len();
+        let mut broken = good.clone();
+        broken.replace_range(start..start + 10, "-000000002");
+        assert_eq!(
+            parse_cf_html(broken.as_bytes()),
+            Err(RichClipboardError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn hane_clipboard_cf_html_header_scan_stops_at_the_fragment_offsets() {
+        // A fragment whose first line looks like a header line is still content.
+        let fragment = "Note:x\r\n<b>y</b>";
+        let block = cf_html(fragment);
+        assert_eq!(parse_cf_html(&block), Ok(fragment));
     }
 }
 

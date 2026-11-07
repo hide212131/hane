@@ -55,7 +55,9 @@ pub(crate) use window::*;
 #[cfg(feature = "font-kit")]
 pub(crate) use text_system::*;
 
-pub use pasteboard::{RichClipboardError, RichClipboardSnapshot, read_rich_clipboard};
+pub use pasteboard::{
+    MAX_RICH_HTML_BYTES, RichClipboardError, RichClipboardSnapshot, read_rich_clipboard,
+};
 pub use platform::MacPlatform;
 
 trait BoolExt {

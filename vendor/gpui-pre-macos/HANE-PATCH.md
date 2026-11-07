@@ -80,3 +80,25 @@ cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml \
 
 上流で同等の修正が入ったと判断してパッチを外す場合も、実字形テストと GUI の
 日本語 IME 検証を通してから削除する。移植前の経緯は `vendor/gpui/HANE-PATCH.md` を参照。
+
+## リッチテキスト貼り付け用のクリップボード読取り（Issue #596）
+
+`src/pasteboard.rs` に `read_rich_clipboard()` / `RichClipboardSnapshot` /
+`RichClipboardError` を追加し、`src/gpui_macos.rs` から公開する。`Platform` trait と
+`ClipboardItem` の形は変えず、既存の `Pasteboard::read` と plain text・find pasteboard・
+ファイルパスの経路も変えない。
+
+- 同じ pasteboard 世代から plain text、`public.html`、既存の画像、ファイルパスを読む。
+  `changeCount` を読取り前後で比較し、異なれば `ChangedDuringRead` を返して異世代の
+  plain と HTML を結合しない。HTML だけの pasteboard も `item` が空のスナップショットとして返す。
+- HTML は UTF-8 のみ。Rust へ複製する前に native の長さを 8 MiB 上限と比較する。UTF-8 として
+  不正な場合は `InvalidFormat`、上限超過は `TooLarge` を `html_problem` に入れ、`html` は
+  `None` にして同じ世代の plain 等は残す。
+- HTML の解析や Markdown 判定は行わない。読取り専用で、書式付き書き込み（export）は含まない。
+
+```sh
+cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml \
+  --features runtime_shaders,font-kit,test-support --lib hane_clipboard
+```
+
+上流が同等の公開 API を提供した場合はそちらへ置き換えてこの節を外す。

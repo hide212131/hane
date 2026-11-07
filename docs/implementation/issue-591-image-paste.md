@@ -49,18 +49,18 @@ decode・PNG変換・ファイルI/Oはすべて background executor で行い�
 - 保存先のない単独無題だけ既存の初回保存ダイアログを開く。キャンセル・失敗では画像を作らず本文・選択を保つ。保存が完了し、本文・選択が変わっていなければ貼り付けを再開する。
 - 別directoryへのSave Asは、本文が参照する生成画像を新しい `images/` へ先にコピーする。同名で内容が同一なら再利用、内容が違えば別名にして参照を更新する。コピーに失敗したときは保存せず、作成済みのコピーを削除し、元の本文・画像・未保存状態を保つ。コピー中に本文が変わった場合も保存を中止する。元画像は削除しない。コピー元と同名保存先の比較読みはどちらも `MAX_OUTPUT_BYTES + 1` バイトまでに制限する（metadataは早期拒否のみ）。コピー元が実読取で上限を超えたら`TooLarge`とし、上限を超える既存の保存先ファイルは同一内容として再利用せず、変更・削除もせずに別名で保存する。
 
-## platformの狭い公開snapshot（`read_rich_clipboard`）
+## platformの共有公開snapshot（`read_rich_clipboard`）
 
 `crates/ui/Cargo.toml` にtarget別の直接依存（`gpui-pre-macos` / `gpui-pre-windows`）を足し、両platform crateのrootから同じ形の公開APIを使う。GPUI core全体はvendor化せず、`Platform` traitと`ClipboardItem`の形も変えない。GPUIの`read_from_clipboard`・find pasteboard・ファイルパスコピーは従来のまま。
 
 - `read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError>`。`Ok(None)`は本当の空だけ。
-- `RichClipboardSnapshot { item, html, images }`。`item`は本文とファイルパス、`images`は独立したOS項目ごとの`Result<Image, RichClipboardError>`。`html`は#596用の予約欄で、今回は読まず常に`None`（HTML変換は追加していない）。画像を得るために再度clipboardを読まない。
+- `RichClipboardSnapshot { item, html, html_problem, images }`。`item`は本文とファイルパス、`images`は独立したOS項目ごとの`Result<Image, RichClipboardError>`。HTMLは#596の同世代snapshotから取得し、無効・上限超過は`html_problem`へ分けて本文/画像を保つ。画像・HTMLを得るために再度clipboardを読まない。
 - `RichClipboardError`は`Busy`・`ChangedDuringRead`・`InvalidFormat`・`TooLarge`。bounded retryは識別を潰さず、最終失敗をそのまま返す。
 - macOS: `changeCount`の前後が同じ世代だけ返し、3回変化し続けたら`ChangedDuringRead`。`pasteboardItems`の各項目から優先形式（PNG→TIFF→…→SVG）を1つ選び、同じ項目の別形式は1枚にまとめ、別項目は別の要素にする。パス・本文・画像が併存しても画像を取り落とさない。項目が報告されないpasteboardは1項目として扱う。
 - Windows: 1つの`ClipboardGuard`内で全形式を読む（世代は変わり得ず`ChangedDuringRead`は出ない）。開けなければ`Busy`。**OS制約**: Windowsクリップボードは単一のデータオブジェクトで独立した複数画像を区別できないため、`images`は最大1要素（PNG→JFIF/GIF→CF_DIB→その他）。別形式は1枚にまとめる。
-- 画像形式が宣言されているのにデータが取れない・空・不正DIBは`InvalidFormat`、64 MiB超は`TooLarge`（コピー前に判定）。他の形式で読めるときはそちらを使い、読める形式が無いときだけエラーにする。デコード失敗はUI側のjobで通知する。
+- HTMLは8 MiBを上限に読み、WindowsはCF_HTMLのUTF-8 byte offsetを検証する。画像形式が宣言されているのにデータが取れない・空・不正DIBは`InvalidFormat`、64 MiB超は`TooLarge`（コピー前に判定）。他の形式で読めるときはそちらを使い、読める形式が無いときだけ画像エラーにする。HTMLの問題は同世代のplainへのfallback判定に使い、画像エラーはUI側で本文を変更せず通知する。
 
-UI（`image_paste.rs`）はこのsnapshotを共通dispatcherに渡す。
+UIはこのsnapshotを共通Paste dispatcherへ渡す。通常Pasteは実画像を優先し、画像がなければ#596のHTML→Markdown/plain fallbackを行う。「プレーンテキストとして貼り付け」は画像を使わず、plainまたはHTMLから抽出した可視テキストを使う。
 
 | clipboardの状態 | 本文Pasteの結果 |
 | --- | --- |

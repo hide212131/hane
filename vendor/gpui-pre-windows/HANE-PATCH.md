@@ -128,3 +128,31 @@ surely as a missing dispatch would.
 ```powershell
 cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_input_mode_notification
 ```
+
+## Rich clipboard read with CF_HTML (Issue #596)
+
+`src/clipboard.rs` adds `read_rich_clipboard()`, `RichClipboardSnapshot` and
+`RichClipboardError`, re-exported from `src/gpui_windows.rs`. The `Platform`
+trait, `ClipboardItem` and the existing plain text / image / file read and
+write paths are unchanged.
+
+- One `ClipboardGuard` covers the whole read, so plain text (`CF_UNICODETEXT`),
+  the registered `HTML Format`, images and files come from one clipboard
+  state. A clipboard that cannot be opened is `Busy`, which is different from
+  an empty clipboard (`Ok(None)`). HTML-only clipboards are returned with an
+  empty `item`.
+- The CF_HTML header is ASCII and its offsets are UTF-8 byte offsets into the
+  whole block. CR, LF and CRLF headers and leading zeros are accepted.
+  `0 <= StartFragment <= EndFragment <= length`, a fragment that starts at or
+  after the end of the header, a fragment on UTF-8 boundaries, and (when
+  present, i.e. not `-1`) a context that contains the fragment are required.
+  A bad offset is never rescued by searching for the fragment markers.
+- The native block length is checked against the 8 MiB limit (plus header
+  overhead) before the fragment is copied. Unusable HTML sets `html_problem`
+  (`InvalidFormat` / `TooLarge`) and `html` is `None`, while the other
+  representations of the same read are kept.
+- Reading only: no HTML parsing and no formatted write (export).
+
+```powershell
+cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_clipboard
+```

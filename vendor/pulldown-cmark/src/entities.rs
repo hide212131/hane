@@ -2150,7 +2150,7 @@ const ENTITIES: [(&[u8], &str); 2125] = [
     (b"zwnj", "\u{200C}"),
 ];
 
-pub(crate) fn get_entity(bytes: &[u8]) -> Option<&'static str> {
+pub fn get_entity(bytes: &[u8]) -> Option<&'static str> {
     ENTITIES
         .binary_search_by_key(&bytes, |&(key, _value)| key)
         .ok()

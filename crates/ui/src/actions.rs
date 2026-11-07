@@ -1,5 +1,6 @@
+use crate::clipboard::PasteMode;
+use crate::view::EditorView;
 use crate::view::input_routing::InputTarget;
-use crate::view::{ClipboardSnapshot, EditorView};
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
 use hane_editor::{EditorCommand, ForwardStop};
 use hane_markdown::ListEditIntent;
@@ -38,6 +39,33 @@ fn keys_claimed_elsewhere(view: &EditorView) -> bool {
         || view.content_search_results_focused()
         || view.document_find_input_is_focused()
         || view.ai_selection_blocks_editor_keys()
+}
+
+/// Paste and PastePlainText share this entry (Issue #596). The body gets the
+/// clipboard snapshot path; the sidebar filter and the inline rename keep their
+/// existing plain-text paste, whatever `mode` is.
+fn paste_with_mode(
+    view: &mut EditorView,
+    mode: PasteMode,
+    window: &mut Window,
+    cx: &mut Context<EditorView>,
+) {
+    if keys_claimed_elsewhere(view) {
+        return;
+    }
+    match view.input_target() {
+        InputTarget::Body => view.paste_into_body(mode, window, cx),
+        InputTarget::SidebarFilter => {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                view.replace_sidebar_filter_text(None, &text, cx);
+            }
+        }
+        InputTarget::InlineRename => {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                view.replace_inline_rename_text(None, &text, cx);
+            }
+        }
+    }
 }
 
 /// `command_actions!` leaves an action's key empty when each platform binds it
@@ -716,6 +744,10 @@ command_actions! {
     },
     Copy ("secondary-c") => copy |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
+        if matches!(view.input_target(), InputTarget::Body) {
+            // A newer Copy supersedes a running Paste conversion.
+            view.invalidate_clipboard_job();
+        }
         let text = match view.input_target() {
             InputTarget::SidebarFilter => view.selected_sidebar_filter_text(),
             InputTarget::InlineRename => view.selected_inline_rename_text(),
@@ -728,6 +760,10 @@ command_actions! {
     Cut ("secondary-x") => cut |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
         let target = view.input_target();
+        if matches!(target, InputTarget::Body) {
+            // A newer Cut supersedes a running Paste conversion.
+            view.invalidate_clipboard_job();
+        }
         // A read-only body must not even reach the clipboard: Cut would write
         // the selection out before the delete is refused.
         if matches!(target, InputTarget::Body) && !view.body_editable() {
@@ -747,24 +783,14 @@ command_actions! {
             }
         }
     },
-    Paste ("secondary-v") => paste |view, _window, cx| {
-        if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() { return; }
-        // One read of the clipboard: the body prefers a real image of this same
-        // snapshot, every other input takes its text exactly as before.
-        let snapshot = ClipboardSnapshot::read(cx);
-        match view.input_target() {
-            InputTarget::SidebarFilter => {
-                if let Some(text) = snapshot.text() {
-                    view.replace_sidebar_filter_text(None, text, cx);
-                }
-            }
-            InputTarget::InlineRename => {
-                if let Some(text) = snapshot.text() {
-                    view.replace_inline_rename_text(None, text, cx);
-                }
-            }
-            InputTarget::Body => view.paste_into_body(snapshot, cx),
-        }
+    // Ctrl/Cmd+V. Only the document body takes the rich path (external HTML
+    // becomes Markdown); the short inputs always paste the plain text.
+    Paste ("secondary-v") => paste |view, window, cx| {
+        paste_with_mode(view, PasteMode::Rich, window, cx);
+    },
+    // Ctrl/Cmd+Shift+V: the plain text as provided, never converted.
+    PastePlainText ("secondary-shift-v") => paste_plain_text |view, window, cx| {
+        paste_with_mode(view, PasteMode::PlainText, window, cx);
     },
     CancelComposition ("escape") => cancel_composition |view, window, cx| {
         if view.settings_open() {

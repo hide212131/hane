@@ -1,10 +1,8 @@
 //! Clipboard image paste (Issue #591), the GPUI side.
 //!
-//! One body Paste reads the OS clipboard **once** into a [`ClipboardSnapshot`]
-//! and this module's dispatcher chooses between its image and its text, so no
-//! caller re-reads the clipboard or re-implements the priority. A real raster
-//! image wins for the document body; everything else (search, settings, rename
-//! fields, a clipboard without an image) keeps the text behavior.
+//! The body Paste path reads one [`ClipboardSnapshot`] containing plain text,
+//! HTML and images from the same clipboard generation. A real raster image wins
+//! for rich Paste; text and HTML are handled by the shared paste dispatcher.
 //!
 //! An image paste is a background job. At request time it captures the session,
 //! document instance (including the workspace epoch), revision, selection, the
@@ -43,7 +41,7 @@ pub(crate) enum ClipboardReadError {
 }
 
 impl ClipboardReadError {
-    fn reason(self) -> &'static str {
+    pub(super) fn reason(self) -> &'static str {
         match self {
             Self::Busy => {
                 "クリップボードを他のアプリが使用中で読み取れません。少し待ってからもう一度貼り付けてください"
@@ -77,18 +75,22 @@ enum ClipboardImages {
 #[cfg_attr(not(any(test, target_os = "macos", windows)), allow(dead_code))]
 pub(crate) struct NativeRead {
     item: ClipboardItem,
+    html: Option<String>,
+    html_problem: bool,
     images: Vec<Result<gpui::Image, ClipboardReadError>>,
 }
 
 /// Everything one Paste needs from the OS clipboard, read in a single call so
-/// the text and the image always come from the same clipboard generation.
+/// text, HTML and images always come from the same clipboard generation.
 #[derive(Debug, Default)]
 pub(crate) struct ClipboardSnapshot {
-    text: Option<String>,
+    pub(super) text: Option<String>,
+    pub(super) html: Option<String>,
+    pub(super) html_problem: bool,
     images: ClipboardImages,
     /// The whole read failed; there is nothing to paste and nothing to fall
     /// back to.
-    read_error: Option<ClipboardReadError>,
+    pub(super) read_error: Option<ClipboardReadError>,
 }
 
 impl ClipboardSnapshot {
@@ -118,6 +120,8 @@ impl ClipboardSnapshot {
         };
         Self {
             text,
+            html: None,
+            html_problem: false,
             images,
             read_error: None,
         }
@@ -148,7 +152,12 @@ impl ClipboardSnapshot {
     #[cfg_attr(not(any(test, target_os = "macos", windows)), allow(dead_code))]
     pub(crate) fn from_native(read: Result<Option<NativeRead>, ClipboardReadError>) -> Self {
         match read {
-            Ok(Some(read)) => Self::from_images(read.item.text(), read.images),
+            Ok(Some(read)) => {
+                let mut snapshot = Self::from_images(read.item.text(), read.images);
+                snapshot.html = read.html;
+                snapshot.html_problem = read.html_problem;
+                snapshot
+            }
             Ok(None) => Self::default(),
             Err(error) => Self {
                 read_error: Some(error),
@@ -167,9 +176,28 @@ impl ClipboardSnapshot {
     /// `Option` of GPUI's own read (an empty and a failed read look alike).
     #[cfg(not(all(not(test), any(target_os = "macos", windows))))]
     pub(crate) fn read(cx: &gpui::App) -> Self {
-        cx.read_from_clipboard()
-            .map(|item| Self::from_item(&item))
-            .unwrap_or_default()
+        let item = cx.read_from_clipboard();
+        #[cfg(test)]
+        let html = crate::clipboard::test_html_snapshot();
+        #[cfg(not(test))]
+        let html = Ok((None, false));
+        match html {
+            Ok((html, html_problem)) => {
+                let mut snapshot = item.as_ref().map_or_else(Self::default, Self::from_item);
+                snapshot.html = html;
+                snapshot.html_problem = html_problem;
+                snapshot
+            }
+            Err(error) => Self {
+                read_error: Some(match error {
+                    crate::clipboard::SnapshotError::Busy => ClipboardReadError::Busy,
+                    crate::clipboard::SnapshotError::ChangedDuringRead => {
+                        ClipboardReadError::ChangedDuringRead
+                    }
+                }),
+                ..Self::default()
+            },
+        }
     }
 
     pub(crate) fn text(&self) -> Option<&str> {
@@ -180,6 +208,7 @@ impl ClipboardSnapshot {
     pub(crate) fn has_paste_content(&self) -> bool {
         !matches!(self.images, ClipboardImages::Empty)
             || self.text.as_deref().is_some_and(|text| !text.is_empty())
+            || self.html.is_some()
     }
 }
 
@@ -206,6 +235,8 @@ mod native {
         let snapshot = platform::read_rich_clipboard().map_err(error)?;
         Ok(snapshot.map(|snapshot| NativeRead {
             item: snapshot.item,
+            html: snapshot.html,
+            html_problem: snapshot.html_problem.is_some(),
             images: snapshot
                 .images
                 .into_iter()
@@ -224,6 +255,7 @@ struct ImagePasteTicket {
     selection: Selection,
     base: PathBuf,
     draft: Option<DraftId>,
+    clipboard_generation: u64,
     job: u64,
 }
 
@@ -317,17 +349,20 @@ impl EditorView {
         )
     }
 
-    /// The dispatcher of a body Paste: a real image first, otherwise the text.
-    /// An image that cannot be saved never falls back to its text companion.
-    /// A clipboard that could not be read, or whose image cannot be taken in,
-    /// is explained and leaves the selection, the history and the files alone.
-    pub(crate) fn paste_into_body(&mut self, snapshot: ClipboardSnapshot, cx: &mut Context<Self>) {
+    /// Handles the image part of a shared clipboard snapshot for rich Paste.
+    /// Returns true when the snapshot has an image or a read failure, so text
+    /// handling cannot silently replace the selection after an image failure.
+    pub(super) fn paste_image_from_snapshot(
+        &mut self,
+        snapshot: &ClipboardSnapshot,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if let Some(error) = snapshot.read_error {
             self.refuse_clipboard_paste("貼り付けられませんでした", error.reason(), cx);
-            return;
+            return true;
         }
-        match snapshot.images {
-            ClipboardImages::One(raster) => self.paste_clipboard_image(raster, cx),
+        match &snapshot.images {
+            ClipboardImages::One(raster) => self.paste_clipboard_image(Arc::clone(raster), cx),
             ClipboardImages::Several(count) => {
                 let reason = format!(
                     "クリップボードに独立した画像が{count}件あります。画像は1枚ずつコピーして貼り付けてください"
@@ -337,12 +372,9 @@ impl EditorView {
             ClipboardImages::Unreadable(error) => {
                 self.refuse_clipboard_paste("画像を貼り付けられませんでした", error.reason(), cx);
             }
-            ClipboardImages::Empty => {
-                if let Some(text) = snapshot.text {
-                    self.dispatch(EditorCommand::Insert(&text), cx);
-                }
-            }
+            ClipboardImages::Empty => return false,
         }
+        true
     }
 
     fn refuse_clipboard_paste(&mut self, what: &str, reason: &str, cx: &mut Context<Self>) {
@@ -403,6 +435,7 @@ impl EditorView {
             selection,
             base,
             draft: self.work_folder_drafts.get(&id).map(|draft| draft.draft_id),
+            clipboard_generation: self.clipboard_generation,
             job: self.image_paste.latest_job,
         };
         self.status = Some("画像を保存しています…".to_owned());
@@ -553,6 +586,9 @@ impl EditorView {
     /// Why a finished paste may no longer be applied, or `Ok` when every
     /// captured fact still holds.
     fn image_paste_is_current(&self, ticket: &ImagePasteTicket) -> Result<(), &'static str> {
+        if self.clipboard_generation != ticket.clipboard_generation {
+            return Err("別のクリップボード操作が始まりました");
+        }
         if self.document_instance(ticket.id) != Some(ticket.instance) {
             return Err("文書が閉じられたか入れ替わりました");
         }
@@ -1111,6 +1147,7 @@ mod tests {
         directory: &Path,
         body: &str,
     ) -> (TestView, &'a mut TestCx) {
+        crate::clipboard::set_test_snapshot(None, false, None);
         cx.update(crate::actions::register_key_bindings);
         std::fs::create_dir_all(directory).unwrap();
         let path = directory.join("note.md");
@@ -1179,6 +1216,7 @@ mod tests {
         let (view, cx) = open_file_view(cx, &directory, "hello\n");
         select(&view, cx, 6, 6);
         cx.write_to_clipboard(image_item(Some("cell text"), png(3, 2, [9, 8, 7, 0])));
+        crate::clipboard::set_test_snapshot(Some("<b>cell html</b>"), false, None);
         cx.simulate_keystrokes("secondary-v");
         cx.run_until_parked();
 
@@ -1186,6 +1224,7 @@ mod tests {
         let name = reference_in(&text);
         assert_eq!(text, format!("hello\n\n![画像](images/{name})\n"));
         assert!(!text.contains("cell text"));
+        assert!(!text.contains("cell html"));
         let files = pasted_files(&directory);
         assert_eq!(files.len(), 1);
         let decoded = image::open(&files[0]).unwrap().to_rgba8();
@@ -1357,7 +1396,7 @@ mod tests {
     fn paste_without_waiting(view: &TestView, cx: &mut TestCx) {
         view.update(cx, |view, cx| {
             let snapshot = ClipboardSnapshot::read(cx);
-            view.paste_into_body(snapshot, cx);
+            view.paste_image_from_snapshot(&snapshot, cx);
         });
     }
 
@@ -2054,6 +2093,8 @@ mod tests {
         }
         NativeRead {
             item: ClipboardItem { entries },
+            html: None,
+            html_problem: false,
             images,
         }
     }
@@ -2064,7 +2105,8 @@ mod tests {
         read: Result<Option<NativeRead>, ClipboardReadError>,
     ) {
         view.update(cx, |view, cx| {
-            view.paste_into_body(ClipboardSnapshot::from_native(read), cx);
+            let snapshot = ClipboardSnapshot::from_native(read);
+            view.paste_image_from_snapshot(&snapshot, cx);
         });
         cx.run_until_parked();
     }
@@ -2158,7 +2200,8 @@ mod tests {
             gpui::ImageFormat::Png,
         )));
         view.update(cx, |view, cx| {
-            view.paste_into_body(ClipboardSnapshot::from_item(&item), cx);
+            let snapshot = ClipboardSnapshot::from_item(&item);
+            view.paste_image_from_snapshot(&snapshot, cx);
         });
         cx.run_until_parked();
         assert_eq!(text_of(&view, cx), "keep\n");
