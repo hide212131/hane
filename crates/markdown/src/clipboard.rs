@@ -12,6 +12,8 @@
 //! (CommonMark plus the enabled GFM extensions): text, link labels, link
 //! destinations and code are escaped separately.
 
+use std::borrow::Cow;
+
 use url::Url;
 
 /// Maximum accepted HTML size in UTF-8 bytes.
@@ -545,7 +547,7 @@ fn decode_entities(text: &str, in_attribute: bool) -> String {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
         if let Some((decoded, used)) = decode_entity(rest, in_attribute) {
-            out.push(decoded);
+            out.push_str(&decoded);
             rest = &rest[used..];
         } else {
             out.push('&');
@@ -557,11 +559,11 @@ fn decode_entities(text: &str, in_attribute: bool) -> String {
 }
 
 /// Decodes one entity at the start of `text` (which begins with `&`). Returns
-/// the character and the number of bytes consumed. Numeric references accept a
-/// missing `;`, as do the legacy named references HTML allows without one; the
-/// scan only advances over consumed characters, so a run of bare `&` stays
-/// linear.
-fn decode_entity(text: &str, in_attribute: bool) -> Option<(char, usize)> {
+/// the decoded text (named references can expand to several code points) and
+/// the number of bytes consumed. Numeric references accept a missing `;`, as do
+/// the legacy named references HTML allows without one; the scan only advances
+/// over consumed characters, so a run of bare `&` stays linear.
+fn decode_entity(text: &str, in_attribute: bool) -> Option<(Cow<'static, str>, usize)> {
     let bytes = text.as_bytes();
     if bytes.get(1) == Some(&b'#') {
         let (hex, start) = match bytes.get(2) {
@@ -607,7 +609,7 @@ fn decode_entity(text: &str, in_attribute: bool) -> Option<(char, usize)> {
         } else {
             end
         };
-        return Some((decoded, used));
+        return Some((Cow::Owned(decoded.to_string()), used));
     }
     let name_len = bytes[1..]
         .iter()
@@ -621,7 +623,7 @@ fn decode_entity(text: &str, in_attribute: bool) -> Option<(char, usize)> {
     if bytes.get(name_len + 1) == Some(&b';')
         && let Some(decoded) = named_entity(name)
     {
-        return Some((decoded, name_len + 2));
+        return Some((Cow::Borrowed(decoded), name_len + 2));
     }
     const LEGACY: [&str; 7] = ["amp", "quot", "nbsp", "copy", "reg", "lt", "gt"];
     LEGACY
@@ -636,7 +638,9 @@ fn decode_entity(text: &str, in_attribute: bool) -> Option<(char, usize)> {
                     Some(b'=') | Some(b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
                 )
         })
-        .and_then(|legacy| named_entity(legacy).map(|ch| (ch, legacy.len() + 1)))
+        .and_then(|legacy| {
+            named_entity(legacy).map(|text| (Cow::Borrowed(text), legacy.len() + 1))
+        })
 }
 
 /// Maps a numeric character reference to a character: NUL, surrogates and
@@ -658,47 +662,11 @@ fn numeric_reference(value: u32) -> char {
     }
 }
 
-fn named_entity(name: &str) -> Option<char> {
-    Some(match name {
-        "amp" => '&',
-        "lt" => '<',
-        "gt" => '>',
-        "quot" => '"',
-        "apos" => '\'',
-        "nbsp" => '\u{a0}',
-        "ensp" => '\u{2002}',
-        "emsp" => '\u{2003}',
-        "thinsp" => '\u{2009}',
-        "copy" => '\u{a9}',
-        "reg" => '\u{ae}',
-        "trade" => '\u{2122}',
-        "hellip" => '\u{2026}',
-        "mdash" => '\u{2014}',
-        "ndash" => '\u{2013}',
-        "lsquo" => '\u{2018}',
-        "rsquo" => '\u{2019}',
-        "ldquo" => '\u{201c}',
-        "rdquo" => '\u{201d}',
-        "laquo" => '\u{ab}',
-        "raquo" => '\u{bb}',
-        "bull" => '\u{2022}',
-        "middot" => '\u{b7}',
-        "times" => '\u{d7}',
-        "divide" => '\u{f7}',
-        "yen" => '\u{a5}',
-        "euro" => '\u{20ac}',
-        "pound" => '\u{a3}',
-        "cent" => '\u{a2}',
-        "sect" => '\u{a7}',
-        "deg" => '\u{b0}',
-        "plusmn" => '\u{b1}',
-        "para" => '\u{b6}',
-        "larr" => '\u{2190}',
-        "rarr" => '\u{2192}',
-        "uarr" => '\u{2191}',
-        "darr" => '\u{2193}',
-        _ => return None,
-    })
+/// Looks a name (without `&` and `;`) up in the complete HTML5 named character
+/// reference table shared with the Markdown parser; some names expand to more
+/// than one code point.
+fn named_entity(name: &str) -> Option<&'static str> {
+    pulldown_cmark::get_entity(name.as_bytes())
 }
 
 // ---------------------------------------------------------------------------

@@ -438,6 +438,20 @@ fn character_references_follow_html_rules() {
     assert_eq!(md("<p>&unknown; &</p>"), "\\&unknown; &");
 }
 
+#[test]
+fn named_references_use_the_complete_html5_table() {
+    assert_eq!(md("<p>caf&eacute;</p>"), "café");
+    assert_eq!(html_to_plain_text("<p>caf&eacute;</p>").as_deref(), Ok("café"));
+    // Names that expand to several code points.
+    assert_eq!(md("<p>&NotEqualTilde;</p>"), "\u{2242}\u{338}");
+    assert_eq!(html_to_plain_text("<p>&NotEqualTilde;</p>").as_deref(), Ok("\u{2242}\u{338}"));
+    // Attribute rules for legacy references are unchanged.
+    assert_eq!(
+        md(r#"<a href="https://x.example/?a=1&regionId=5&copy=2">x</a>"#),
+        "[x](https://x.example/?a=1&regionId=5&copy=2)"
+    );
+}
+
 /// Delimiter flanking: adjacent runs of one mark must not leave a literal
 /// delimiter, and punctuation-only runs between words must stay emphasised.
 #[test]
