@@ -254,7 +254,7 @@ pub struct RichClipboardSnapshot {
 
 /// Reads plain text, HTML, images and files while holding the clipboard once.
 pub fn read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError> {
-    let _clip = ClipboardGuard::open().ok_or(RichClipboardError::Busy)?;
+    let _clip = ClipboardGuard::open()?;
     let read = read_formats(true);
     let has_image = read.image.is_some();
     if read.entries.is_empty()
