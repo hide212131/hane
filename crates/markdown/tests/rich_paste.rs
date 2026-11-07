@@ -42,6 +42,20 @@ fn marked_texts(markdown: &str, wanted: NodeKind) -> Vec<String> {
     .collect()
 }
 
+/// A literal `|` in body text must be escaped so a following delimiter-looking
+/// line cannot turn the pasted text into a GFM table header.
+#[test]
+fn body_pipes_are_escaped_and_never_form_a_table() {
+    let markdown = md("<p>a | b<br>--- | ---</p>");
+    assert_eq!(count_kind(&markdown, NodeKind::Table), 0);
+    assert!(markdown.contains("a \\| b"), "{markdown:?}");
+    assert!(markdown.contains("--- \\| ---"), "{markdown:?}");
+
+    let markdown = md("<p>a | b</p><p>--- | ---</p>");
+    assert_eq!(count_kind(&markdown, NodeKind::Table), 0);
+    assert_eq!(markdown, "a \\| b\n\n--- \\| ---");
+}
+
 /// The user's required condition: ordinary text and several links in one
 /// paragraph keep every label, destination and the surrounding sentences.
 #[test]
