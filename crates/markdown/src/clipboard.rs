@@ -110,6 +110,8 @@ enum Kind {
 struct Node {
     kind: Kind,
     parent: usize,
+    /// Index of this node in its parent's `children`.
+    position: usize,
     children: Vec<usize>,
 }
 
@@ -274,6 +276,7 @@ impl<'l> Builder<'l> {
             nodes: vec![Node {
                 kind: Kind::Root,
                 parent: 0,
+                position: 0,
                 children: Vec::new(),
             }],
             stack: Vec::new(),
@@ -298,9 +301,11 @@ impl<'l> Builder<'l> {
         }
         let parent = self.current();
         let index = self.nodes.len();
+        let position = self.nodes[parent].children.len();
         self.nodes.push(Node {
             kind,
             parent,
+            position,
             children: Vec::new(),
         });
         self.nodes[parent].children.push(index);
@@ -861,65 +866,40 @@ fn is_edge_space(ch: char) -> bool {
 
 /// Wraps `inner` in a delimiter pair, keeping leading and trailing whitespace
 /// (and hard-break markers) outside so the delimiters stay flanking. An empty
-/// or whitespace-only `inner` gets no delimiters. Leading and trailing
-/// punctuation or symbols (e.g. `「`, `。`), which CommonMark does not flank next
-/// to a word, are moved outside the delimiters. Content without any
-/// alphanumeric character is left unmarked rather than emitting inline HTML.
-fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
+/// or whitespace-only `inner` gets no delimiters. Punctuation and symbols at
+/// the edges of `inner` stay inside the delimiters. CommonMark only lets a
+/// delimiter next to punctuation open (close) when the character before
+/// (after) the run is whitespace, punctuation or the edge of the text, which
+/// the caller reports through `open_ok` / `close_ok`. When that does not hold
+/// the formatting cannot be written safely, so the text is returned unmarked
+/// rather than moving punctuation out of the span or emitting inline HTML.
+fn wrap_delimited(inner: &str, open: &str, close: &str, open_ok: bool, close_ok: bool) -> String {
     let core = inner.trim_matches(is_edge_space);
     if core.is_empty() {
         return inner.to_owned();
     }
     let lead = &inner[..inner.len() - inner.trim_start_matches(is_edge_space).len()];
     let trail = &inner[inner.trim_end_matches(is_edge_space).len()..];
-    let unicode_edge = |ch: char| !ch.is_ascii() && !ch.is_alphanumeric();
-    // ASCII punctuation from literal text breaks flanking next to a word too.
-    // Characters that open or close nested Markdown constructs (code spans,
-    // nested marks, links, inline HTML) are not literal text, so they stay.
-    // A `)` only closes a nested link when the text holds an unescaped `](`;
-    // literal text escapes `]`, so a bare trailing `)` is plain punctuation.
-    let has_link = core
-        .match_indices("](")
-        .any(|(at, _)| !core[..at].ends_with('\\'));
-    let structural = |ch: char| match ch {
-        ')' => has_link,
-        _ => matches!(ch, '`' | '*' | '~' | '[' | '>' | '<'),
+    // A nested run of the same delimiter character joins ours into one run,
+    // so the character that decides flanking is the one after it.
+    let delimiter = open.chars().next().unwrap_or('*');
+    let first = core.trim_start_matches(delimiter).chars().next();
+    let last = core.trim_end_matches(delimiter).chars().next_back();
+    let (Some(first), Some(last)) = (first, last) else {
+        return inner.to_owned();
     };
-    let ascii_edge = |ch: char, escaped: bool| {
-        ch.is_ascii_punctuation() && (escaped || !structural(ch))
-    };
-    // Punctuated edges are moved outside the delimiters so the remaining
-    // content starts and ends with a flanking character. Hane never renders
-    // inline HTML as emphasis, so no HTML tag is used as a fallback.
-    let mut start = 0;
-    let mut end = core.len();
-    while let Some(ch) = core[start..end].chars().next() {
-        if ch == '\\' {
-            let escaped_len = core[start + 1..end].chars().next().map_or(0, char::len_utf8);
-            start += 1 + escaped_len;
-        } else if unicode_edge(ch) || ascii_edge(ch, false) {
-            start += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    while let Some(ch) = core[start..end].chars().next_back() {
-        // Slice by the last character's UTF-8 length, never by a raw byte offset.
-        let before = end - ch.len_utf8();
-        let escaped = ch.is_ascii_punctuation() && core[start..before].ends_with('\\');
-        if unicode_edge(ch) || ascii_edge(ch, escaped) {
-            end = if escaped { before - 1 } else { before };
-        } else {
-            break;
-        }
-    }
-    let rest = &core[start..end];
-    if !rest.chars().any(char::is_alphanumeric) {
-        // Nothing can carry the emphasis; keep the text as it is.
+    let open_ok = open_ok || !lead.is_empty();
+    let close_ok = close_ok || !trail.is_empty();
+    if (is_flank_punctuation(first) && !open_ok) || (is_flank_punctuation(last) && !close_ok) {
         return inner.to_owned();
     }
-    let (head, tail) = (&core[..start], &core[end..]);
-    format!("{lead}{head}{open}{rest}{close}{tail}{trail}")
+    format!("{lead}{open}{core}{close}{trail}")
+}
+
+/// Whether CommonMark flanking treats `ch` as punctuation (ASCII punctuation,
+/// and Unicode punctuation or symbols).
+fn is_flank_punctuation(ch: char) -> bool {
+    ch.is_ascii_punctuation() || (!ch.is_ascii() && !ch.is_alphanumeric() && !ch.is_whitespace())
 }
 
 fn wrap_link(inner: &str, destination: &str) -> String {
@@ -933,15 +913,19 @@ fn wrap_link(inner: &str, destination: &str) -> String {
 }
 
 fn apply_marks(text: &str, fmt: &Fmt) -> String {
+    // The text is a whole run, so both of its sides are the edge of a block.
     let mut out = text.to_owned();
     if fmt.strike {
-        out = wrap_delimited(&out, Mark::Strike.delimiter(), Mark::Strike.delimiter());
+        let delimiter = Mark::Strike.delimiter();
+        out = wrap_delimited(&out, delimiter, delimiter, true, true);
     }
     if fmt.emphasis {
-        out = wrap_delimited(&out, Mark::Emphasis.delimiter(), Mark::Emphasis.delimiter());
+        let delimiter = Mark::Emphasis.delimiter();
+        out = wrap_delimited(&out, delimiter, delimiter, true, true);
     }
     if fmt.strong {
-        out = wrap_delimited(&out, Mark::Strong.delimiter(), Mark::Strong.delimiter());
+        let delimiter = Mark::Strong.delimiter();
+        out = wrap_delimited(&out, delimiter, delimiter, true, true);
     }
     if let Some(destination) = &fmt.link {
         out = wrap_link(&out, destination);
@@ -1333,8 +1317,11 @@ impl Renderer<'_> {
         let mut inner = String::new();
         self.inline_children(index, &inner_fmt, &mut inner)?;
         let delimiter = mark.delimiter();
-        let wrapped = wrap_delimited(&inner, delimiter, delimiter);
-        let tail = wrapped.strip_prefix(delimiter);
+        let open_ok = self.neighbor_allows_delimiter(index, false);
+        let close_ok = self.neighbor_allows_delimiter(index, true);
+        let wrapped = wrap_delimited(&inner, delimiter, delimiter, open_ok, close_ok);
+        let marked = wrapped.len() != inner.len();
+        let tail = wrapped.strip_prefix(delimiter).filter(|_| marked);
         // Directly adjacent runs of one mark would put two delimiters side by
         // side, so they are joined into a single run instead.
         let merged = match tail {
@@ -1352,10 +1339,93 @@ impl Renderer<'_> {
         if !merged {
             out.push_str(&wrapped);
         }
-        if wrapped.ends_with(delimiter) {
+        if marked && wrapped.ends_with(delimiter) {
             self.last_mark = Some((mark, out.len()));
         }
         Ok(())
+    }
+
+    /// The first visible character of node `index` read from its start (or
+    /// from its end when `forward` is false), or `None` when it shows nothing.
+    fn edge_char(&self, index: usize, forward: bool) -> Option<char> {
+        let tree = self.tree;
+        let pick = |text: &str| {
+            if forward {
+                text.chars().next()
+            } else {
+                text.chars().next_back()
+            }
+        };
+        match &tree[index].kind {
+            Kind::Text(text) => pick(text),
+            Kind::Root => None,
+            Kind::Element(element) => {
+                let tag = element.tag.as_str();
+                if is_dropped(tag) {
+                    return None;
+                }
+                match tag {
+                    "br" => Some(' '),
+                    "img" => element.attr("alt").and_then(pick),
+                    "code" | "kbd" | "samp" | "tt" if !self.plain => Some('`'),
+                    _ if is_block(tag) => Some(' '),
+                    _ => {
+                        let children = &tree[index].children;
+                        if forward {
+                            children.iter().find_map(|&child| self.edge_char(child, true))
+                        } else {
+                            children
+                                .iter()
+                                .rev()
+                                .find_map(|&child| self.edge_char(child, false))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the character just before (`forward` false) or after element
+    /// `index` is whitespace, punctuation or the edge of its block, which is
+    /// what a delimiter next to punctuation needs to be read as a delimiter.
+    fn neighbor_allows_delimiter(&self, index: usize, forward: bool) -> bool {
+        let tree = self.tree;
+        let mut current = index;
+        loop {
+            let node = &tree[current];
+            let siblings = &tree[node.parent].children;
+            let found = if forward {
+                siblings[node.position + 1..]
+                    .iter()
+                    .find_map(|&sibling| self.edge_char(sibling, true))
+            } else {
+                siblings[..node.position]
+                    .iter()
+                    .rev()
+                    .find_map(|&sibling| self.edge_char(sibling, false))
+            };
+            if let Some(ch) = found {
+                return ch.is_whitespace() || is_flank_punctuation(ch);
+            }
+            match &tree[node.parent].kind {
+                Kind::Root | Kind::Text(_) => return true,
+                Kind::Element(parent) => {
+                    let tag = parent.tag.as_str();
+                    // Block edges, and the delimiters or brackets that a
+                    // mark or link around us writes, are punctuation or a
+                    // line edge.
+                    let writes_delimiter = match tag {
+                        "strong" | "b" | "em" | "i" | "s" | "del" | "strike" => true,
+                        "a" => parent.attr("href").and_then(safe_http_destination).is_some(),
+                        _ => false,
+                    };
+                    if is_block(tag) || (writes_delimiter && !self.plain) {
+                        return true;
+                    }
+                }
+            }
+            current = node.parent;
+        }
     }
 
     fn raw_text(&self, index: usize, line_break: &str, out: &mut String) {

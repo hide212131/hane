@@ -22,6 +22,26 @@ fn count_kind(markdown: &str, wanted: NodeKind) -> usize {
     .count()
 }
 
+/// The text each node of `wanted` covers (delimiters excluded), read from the
+/// parser's source ranges so a test can check that punctuation sits inside the
+/// span rather than only counting nodes.
+fn marked_texts(markdown: &str, wanted: NodeKind) -> Vec<String> {
+    parse_document(
+        Revision(1),
+        SourceRange::new(0, markdown.len()),
+        markdown,
+    )
+    .tree
+    .iter()
+    .filter(|(_, node)| node.kind == wanted)
+    .map(|(_, node)| {
+        markdown[node.source_range.start.0..node.source_range.end.0]
+            .trim_matches(['*', '~'])
+            .to_owned()
+    })
+    .collect()
+}
+
 /// The user's required condition: ordinary text and several links in one
 /// paragraph keep every label, destination and the surrounding sentences.
 #[test]
@@ -221,8 +241,10 @@ fn text_is_unicode_safe_and_whitespace_collapses() {
 fn emphasis_edges_with_multibyte_characters_do_not_panic() {
     assert_eq!(md("<p>前<strong>日本語</strong>後</p>"), "前**日本語**後");
     assert_eq!(md("<p>前<em>日本語</em>後</p>"), "前*日本語*後");
-    assert_eq!(md("<p>前<strong>「日本」</strong>後</p>"), "前「**日本**」後");
-    assert_eq!(md("<p><strong>日本語。</strong></p>"), "**日本語**。");
+    // Flanking rules cannot express this span next to a word, so the visible
+    // text is kept without the formatting.
+    assert_eq!(md("<p>前<strong>「日本」</strong>後</p>"), "前「日本」後");
+    assert_eq!(md("<p><strong>日本語。</strong></p>"), "**日本語。**");
 }
 
 #[test]
@@ -566,60 +588,88 @@ fn adjacent_and_punctuation_only_marks_keep_their_emphasis() {
     assert_eq!(count_kind(&linked, NodeKind::Link), 1);
 }
 
-/// A span whose first or last character is a Unicode punctuation / symbol is
-/// not flanked by `**` next to a word, so the punctuation moves outside the
-/// delimiters and no inline HTML is emitted.
+/// Punctuation and symbols at the edge of a mark stay inside the mark when the
+/// surrounding characters let CommonMark read the delimiters, and the parser
+/// reports the whole text under the formatting node.
 #[test]
-fn unicode_punctuation_edges_keep_their_emphasis() {
-    let both = md("<p>本文<strong>「重要」</strong>です</p>");
-    assert_eq!(both, "本文「**重要**」です");
-    assert_eq!(count_kind(&both, NodeKind::Strong), 1);
+fn unicode_punctuation_edges_stay_inside_the_mark() {
+    let both = md("<p>本文。<strong>「重要」</strong>。です</p>");
+    assert_eq!(both, "本文。**「重要」**。です");
+    assert_eq!(marked_texts(&both, NodeKind::Strong), ["「重要」"]);
     assert_eq!(count_kind(&both, NodeKind::InlineHtml), 0);
 
-    let leading = md("<p>本文<strong>「重要</strong>です</p>");
-    assert_eq!(leading, "本文「**重要**です");
-    assert_eq!(count_kind(&leading, NodeKind::Strong), 1);
-    assert_eq!(count_kind(&leading, NodeKind::InlineHtml), 0);
-
-    let trailing = md("<p>本文<em>重要。</em>です</p>");
-    assert_eq!(trailing, "本文*重要*。です");
-    assert_eq!(count_kind(&trailing, NodeKind::Emphasis), 1);
+    let trailing = md("<p>本文。<em>終わり。</em></p>");
+    assert_eq!(trailing, "本文。*終わり。*");
+    assert_eq!(marked_texts(&trailing, NodeKind::Emphasis), ["終わり。"]);
     assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 0);
 
-    let symbols = md("<p>本文<del>★重要☆</del>です</p>");
-    assert_eq!(symbols, "本文★~~重要~~☆です");
+    let symbols = md("<p>本文 <del>★重要☆</del> です</p>");
+    assert_eq!(symbols, "本文 ~~★重要☆~~ です");
+    assert_eq!(marked_texts(&symbols, NodeKind::Strikethrough), ["★重要☆"]);
     assert_eq!(count_kind(&symbols, NodeKind::InlineHtml), 0);
 
     let sentence = md("<p><strong>日本語。</strong></p>");
-    assert_eq!(count_kind(&sentence, NodeKind::Strong), 1);
+    assert_eq!(sentence, "**日本語。**");
+    assert_eq!(marked_texts(&sentence, NodeKind::Strong), ["日本語。"]);
     assert_eq!(count_kind(&sentence, NodeKind::InlineHtml), 0);
 }
 
-/// ASCII punctuation at the edge of a mark next to a word is not flanked by
-/// `**`, so it moves outside the delimiters instead of using inline HTML.
+/// When the delimiters cannot be written safely next to the surrounding word,
+/// the visible text is kept as plain text: no raw HTML, no punctuation moved
+/// out of the span, no partly formatted result.
 #[test]
-fn ascii_punctuation_edges_keep_their_emphasis() {
-    let strong = md("<p>foo<strong>!a!</strong>bar</p>");
-    assert_eq!(strong, "foo!**a**!bar");
-    assert_eq!(count_kind(&strong, NodeKind::Strong), 1);
-    assert_eq!(count_kind(&strong, NodeKind::InlineHtml), 0);
+fn unflankable_marks_fall_back_to_the_visible_text() {
+    for (html, expected) in [
+        ("<p>本文<strong>「重要」</strong>です</p>", "本文「重要」です"),
+        ("<p><strong>日本語。</strong>次</p>", "日本語。次"),
+        ("<p>本文<em>重要。</em>です</p>", "本文重要。です"),
+        ("<p>foo<strong>!a!</strong>bar</p>", "foo!a!bar"),
+        ("<p>foo<em>(a)</em>bar</p>", "foo(a)bar"),
+        ("<p>foo<em>a)</em>bar</p>", "fooa)bar"),
+        ("<p>foo<strong>a (b)</strong>bar</p>", "fooa (b)bar"),
+        ("<p>本文<strong>!重要。</strong>です</p>", "本文!重要。です"),
+        ("<p>a<strong><code>x</code></strong>b</p>", "a`x`b"),
+    ] {
+        let markdown = md(html);
+        assert_eq!(markdown, expected, "{html}");
+        assert_eq!(count_kind(&markdown, NodeKind::Strong), 0, "{html}");
+        assert_eq!(count_kind(&markdown, NodeKind::Emphasis), 0, "{html}");
+        assert_eq!(count_kind(&markdown, NodeKind::InlineHtml), 0, "{html}");
+    }
+}
 
-    let emphasis = md("<p>foo<em>(a)</em>bar</p>");
-    assert_eq!(emphasis, "foo(*a*)bar");
-    assert_eq!(count_kind(&emphasis, NodeKind::Emphasis), 1);
-    assert_eq!(count_kind(&emphasis, NodeKind::InlineHtml), 0);
+/// ASCII punctuation, brackets, nested links and code at the edge of a mark
+/// stay inside it when the neighbours allow the delimiters.
+#[test]
+fn ascii_punctuation_edges_stay_inside_the_mark() {
+    let paren = md("<p>foo. <strong>(a)</strong>, bar</p>");
+    assert_eq!(paren, "foo. **(a)**, bar");
+    assert_eq!(marked_texts(&paren, NodeKind::Strong), ["(a)"]);
+    assert_eq!(count_kind(&paren, NodeKind::InlineHtml), 0);
 
-    let trailing = md("<p>foo<em>a)</em>bar</p>");
-    assert_eq!(trailing, "foo*a*)bar");
-    assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 0);
+    let tail = md("<p><strong>foo (b)</strong></p>");
+    assert_eq!(tail, "**foo (b)**");
+    assert_eq!(marked_texts(&tail, NodeKind::Strong), ["foo (b)"]);
 
-    let mixed = md("<p>foo<strong>a (b)</strong>bar</p>");
-    assert_eq!(mixed, "foo**a (b**)bar");
-    assert_eq!(count_kind(&mixed, NodeKind::InlineHtml), 0);
+    let strike = md("<p>(<del>消す。</del>)</p>");
+    assert_eq!(strike, "(~~消す。~~)");
+    assert_eq!(marked_texts(&strike, NodeKind::Strikethrough), ["消す。"]);
 
-    let unicode = md("<p>本文<strong>!重要。</strong>です</p>");
-    assert_eq!(unicode, "本文!**重要**。です");
-    assert_eq!(count_kind(&unicode, NodeKind::InlineHtml), 0);
+    let link = md(
+        r#"<p>foo <strong>a, <a href="https://example.com/">b</a>。</strong></p>"#,
+    );
+    assert_eq!(link, "foo **a, [b](https://example.com/)。**");
+    assert_eq!(
+        marked_texts(&link, NodeKind::Strong),
+        ["a, [b](https://example.com/)。"]
+    );
+    assert_eq!(count_kind(&link, NodeKind::Link), 1);
+    assert_eq!(count_kind(&link, NodeKind::InlineHtml), 0);
+
+    let code = md("<p>見て <strong><code>x</code>。</strong></p>");
+    assert_eq!(code, "見て **`x`。**");
+    assert_eq!(marked_texts(&code, NodeKind::Strong), ["`x`。"]);
+    assert_eq!(count_kind(&code, NodeKind::InlineCode), 1);
 
     let linked = md(r#"<p><strong><a href="https://example.com/">太字</a></strong></p>"#);
     assert_eq!(linked, "**[太字](https://example.com/)**");
