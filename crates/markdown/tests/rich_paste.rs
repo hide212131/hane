@@ -51,7 +51,9 @@ fn paragraph_close_does_not_cross_a_dropped_subtree_boundary() {
 /// follows would leak out of the hidden subtree.
 #[test]
 fn end_tag_does_not_cross_a_dropped_subtree_boundary() {
-    let markdown = md("<div><template>x</div>secret</template>");
+    let markdown = md("<div>before<template>x</div>secret</template>after</div>");
+    assert!(markdown.contains("before"), "{markdown:?}");
+    assert!(markdown.contains("after"), "{markdown:?}");
     assert!(!markdown.contains("secret"), "{markdown:?}");
 }
 
