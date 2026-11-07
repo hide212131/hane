@@ -820,11 +820,37 @@ fn render(html: &str, limits: &HtmlLimits, plain: bool) -> Result<String, HtmlIm
 }
 
 fn join_blocks(blocks: &[Block], separator: &str) -> String {
-    blocks
-        .iter()
-        .map(|block| block.text.as_str())
-        .collect::<Vec<_>>()
-        .join(separator)
+    let mut out = String::new();
+    for (position, block) in blocks.iter().enumerate() {
+        if position > 0 {
+            out.push_str(separator);
+            // Markdown merges ordered lists separated only by a blank line, so
+            // the later list would lose its own start number.
+            if separator == "\n\n" && starts_ordered_list(block) && ends_ordered_list(&blocks[position - 1])
+            {
+                out.push_str("<!-- -->");
+                out.push_str(separator);
+            }
+        }
+        out.push_str(&block.text);
+    }
+    out
+}
+
+fn starts_ordered_list(block: &Block) -> bool {
+    block.list && is_ordered_marker(block.text.lines().next().unwrap_or(""))
+}
+
+/// A list block is ordered when its top-level (unindented) items are numbered;
+/// every item of one list uses the same marker kind.
+fn ends_ordered_list(block: &Block) -> bool {
+    starts_ordered_list(block)
+}
+
+fn is_ordered_marker(line: &str) -> bool {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &line[digits..];
+    digits > 0 && (rest == "." || rest.starts_with(". "))
 }
 
 fn prefix_lines(text: &str, prefix: &str, empty: &str) -> String {

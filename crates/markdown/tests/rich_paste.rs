@@ -266,6 +266,19 @@ fn lists_and_quotes_keep_their_structure() {
 }
 
 #[test]
+fn adjacent_ordered_lists_keep_their_own_boundary_and_start() {
+    let markdown = md("<ol><li>a</li><li>b</li></ol><ol start=\"5\"><li>c</li></ol>");
+    assert_eq!(markdown, "1. a\n2. b\n\n<!-- -->\n\n5. c");
+    assert_eq!(count_kind(&markdown, NodeKind::List { start: Some(1) }), 1);
+    assert_eq!(count_kind(&markdown, NodeKind::List { start: Some(5) }), 1);
+    // Unordered neighbours and ordinary items are unchanged.
+    assert_eq!(
+        md("<ol><li>a</li></ol><ul><li>b</li></ul>"),
+        "1. a\n\n- b"
+    );
+}
+
+#[test]
 fn unsupported_constructs_fall_back_instead_of_being_half_converted() {
     assert_eq!(
         html_to_markdown("<table><tr><td>a</td></tr></table>"),
